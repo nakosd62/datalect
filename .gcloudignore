@@ -18,8 +18,8 @@ run_tests.sh
 # Ignore testing files
 tests/
 
-# Ignore local stats DB
-translations_stats.db 
+# Ignore local state
+state/
 
 # Ignore README
 README.md

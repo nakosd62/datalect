@@ -14,8 +14,8 @@ gcp_deploy.sh
 .env
 .env-sample
 
-# Ignore local translatiom stats database
-translation_stats.db
+# Ignore local state
+state/
 
 # Ignore log files
 *.log

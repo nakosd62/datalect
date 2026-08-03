@@ -15,7 +15,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
 # Copy backend files
-COPY app.py .
+COPY server/* server/
 
 #  Copy Web frontend files
 COPY webClient/* webClient/
@@ -27,4 +27,4 @@ COPY crdb.crt .
 EXPOSE 3000
 
 # Start the Flask app
-CMD ["python", "app.py"]
+CMD ["python", "server/app.py"]

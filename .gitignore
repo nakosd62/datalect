@@ -19,5 +19,5 @@ env.yaml
 .env
 crdb.crt
 
-# Lovcal stats DB
-translation_stats.db 
+# Local state
+state/

@@ -13,7 +13,7 @@ from google import genai
 from google.genai import types
 from google.cloud import storage
 
-app = Flask(__name__, static_folder='webClient', static_url_path='')
+app = Flask(__name__, static_folder='../webClient', static_url_path='')
 CORS(app)
 
 DEFAULT_CONN = os.environ.get(
@@ -37,8 +37,10 @@ GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME")
 DB_FILENAME = os.environ.get("TRANSLATION_STATS_DB_FILENAME", "translation_stats.db")
 if GCS_BUCKET_NAME:
     TRANSLATION_STATS_DB_PATH = os.path.join("/tmp", DB_FILENAME)
+
 else:
-    TRANSLATION_STATS_DB_PATH = os.environ.get("TRANSLATION_STATS_DB_PATH", DB_FILENAME)
+    TRANSLATION_STATS_DB_PATH = "state/translation_stats.db"
+
 
 # --- Session Management via SQLite ---
 

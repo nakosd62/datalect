@@ -47,7 +47,7 @@ sleep 2
 
 # Start server
 echo "Starting Flask server..."
-nohup ./venv/bin/python3 app.py > app.log 2>&1 &
+nohup ./venv/bin/python3 server/app.py > app.log 2>&1 &
 # sleep 2
 
 # if command -v ngrok &> /dev/null; then
