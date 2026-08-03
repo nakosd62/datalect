@@ -34,12 +34,12 @@ DEFAULT_MODEL = os.environ.get("GEMINI_MODEL") or AVAILABLE_MODELS[0]
 
 # Use Cloud Run's writable ephemeral directory (/tmp) if running in CloudRun
 GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME")
-DB_FILENAME = os.environ.get("TRANSLATION_STATS_DB_FILENAME", "translation_stats.db")
+DB_FILENAME = os.environ.get("TRANSLATION_STATS_DB_FILENAME", "crbot_state.db")
 if GCS_BUCKET_NAME:
     TRANSLATION_STATS_DB_PATH = os.path.join("/tmp", DB_FILENAME)
 
 else:
-    TRANSLATION_STATS_DB_PATH = "state/translation_stats.db"
+    TRANSLATION_STATS_DB_PATH = "state/crbot_state.db"
 
 
 # --- Session Management via SQLite ---
@@ -126,7 +126,7 @@ def upload_db_to_gcs():
     except Exception as e:
         print(f"Error uploading stats DB to GCS: {e}")
 
-def init_translation_stats_db():
+def init_state_db():
     try:
         # Step 1: Pull existing DB from Cloud Storage if configured
         download_db_from_gcs()
@@ -546,5 +546,5 @@ def get_translation_history():
 if __name__ == '__main__':
     hostname = os.environ.get("CRBOT_HOSTNAME", "0.0.0.0")
     port = int(os.environ.get("CRBOT_PORT", 3000))
-    init_translation_stats_db()
+    init_state_db()
     app.run(host=hostname, port=port, debug=False, use_reloader=False)
