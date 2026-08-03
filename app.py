@@ -196,24 +196,12 @@ def mask_db_url(url_str):
     return re.sub(r'://([^:]+):([^@]+)@', r'://\1:*****@', url_str)
 
 def resolve_conn_str(conn_str):
-    """Replaces masked **** password in input URL with default connection password."""
-    if not conn_str or "****" not in conn_str:
-        return conn_str or DEFAULT_CONN
-    
-    try:
-        parsed_default = urlparse(DEFAULT_CONN)
-        parsed_target = urlparse(conn_str)
-        
-        username = parsed_target.username or ""
-        password = parsed_default.password or ""
-        hostname = parsed_target.hostname or ""
-        port = f":{parsed_target.port}" if parsed_target.port else ""
-        
-        netloc = f"{username}:{password}@{hostname}{port}"
-        return urlunparse(parsed_target._replace(netloc=netloc))
-    except Exception as e:
-        print(f"Error resolving connection string password: {e}")
-        return conn_str
+    """
+    Returns provided connection string if valid, otherwise falls back to default.
+    """
+    if not conn_str or "****" in conn_str:
+        return DEFAULT_CONN
+    return conn_str
 
 def record_translation(conn_str, nl_prompt, sql_command, gemini_model, duration, input_tokens, output_tokens, total_tokens, thinking_tokens, cached_content_tokens):
     try:
@@ -391,12 +379,16 @@ def handle_config():
     
     if request.method == 'POST':
         data = request.get_json() or {}
-        new_db_url = data.get('database_url') 
-        if new_db_url:
-            resolved_url = resolve_conn_str(new_db_url)
-            set_session_db_url(session_id, resolved_url)
+        new_db_url = data.get('database_url')
+        
+        # If user didn't modify the masked input field (contains ****), keep existing connection URL
+        if new_db_url and '****' in new_db_url:
+            pass 
+        elif new_db_url:
+            set_session_db_url(session_id, new_db_url)
+        else:
+            set_session_db_url(session_id, DEFAULT_CONN)
 
-    # Fetch active DB URL for this session
     active_conn_str = get_session_db_url(session_id)
     
     db_name, username = "Unknown", "Unknown"
@@ -417,6 +409,7 @@ def handle_config():
     resp = jsonify({
         'session_id': session_id,
         'default_database_url': DEFAULT_CONN,
+        'active_database_url': mask_db_url(active_conn_str),
         'default_model': DEFAULT_MODEL,
         'available_models': AVAILABLE_MODELS,
         'database_name': db_name,

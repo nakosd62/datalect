@@ -2,6 +2,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   let chatHistory = [];
 
   let DEFAULT_DB_URL = "";
+  let ACTIVE_DB_URL = "";
   let DEFAULT_MODEL = "";
   let AVAILABLE_MODELS = [""];
 
@@ -70,6 +71,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     sqlEditor.setSize('100%', '100%');
   }
 
+  // Helper to enable/disable action buttons during active processing
+  function setButtonsDisabled(disabled) {
+    if (translateBtn) translateBtn.disabled = disabled;
+    if (luckyBtn) luckyBtn.disabled = disabled;
+    if (runBtn) runBtn.disabled = disabled;
+  }
+
   function getSqlQuery() {
     return sqlEditor ? sqlEditor.getValue().trim() : (sqlQueryTextarea ? sqlQueryTextarea.value.trim() : '');
   }
@@ -85,14 +93,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
-  // Helper function to empty out the results display section
   function clearResultsDisplay() {
     if (resultsTabsNav) resultsTabsNav.classList.add('hidden');
     if (resultsHeader) resultsHeader.innerHTML = '';
     if (resultsBody) resultsBody.innerHTML = '';
   }
 
-  // Helper function to reset execution stats to Ready with dashes
   function resetExecutionStats() {
     if (execStatus) {
       execStatus.textContent = "Ready";
@@ -111,24 +117,35 @@ document.addEventListener('DOMContentLoaded', async () => {
     clearMsgEl.style.color = 'var(--text-muted, #94a3b8)';
   }
 
+  function updateConnectionDetails(data) {
+    if (data && data.database_name && data.username) {
+      const dbName = data.database_name;
+      const username = data.username;
+
+      if (connDbName) connDbName.textContent = dbName;
+      if (connDbUser) connDbUser.textContent = username;
+
+      document.title = `CRBot : Talk to your CockroachDB. Connected to ${dbName} as ${username}`;
+    }
+  }
+
   async function fetchBackendConfig() {
     try {
       const response = await fetch('/api/config', { credentials: 'same-origin' });
       const data = await response.json();
 
       DEFAULT_DB_URL = data.default_database_url || "";
+      ACTIVE_DB_URL = data.active_database_url || maskConnectionDbUrl(DEFAULT_DB_URL);
       DEFAULT_MODEL = data.default_model || "";
       if (Array.isArray(data.available_models) && data.available_models.length > 0) {
         AVAILABLE_MODELS = data.available_models;
       }
 
-      // If stored model isn't in available list or isn't set, default to default model
       const storedModel = localStorage.getItem('crbot_model');
       if (!storedModel || !AVAILABLE_MODELS.includes(storedModel)) {
         localStorage.setItem('crbot_model', DEFAULT_MODEL);
       }
       
-      // DB URL is session-scoped only; do not carry over from prior browser sessions.
       localStorage.removeItem('crbot_db_url');
       if (!sessionStorage.getItem('crbot_db_url') && DEFAULT_DB_URL) {
         sessionStorage.setItem('crbot_db_url', DEFAULT_DB_URL);
@@ -136,7 +153,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       renderModelRadioButtons();
       loadConfigIntoUI();
-      await triggerConfigSave({ closeModal: false });
+      
+      // Update header elements with returned DB name and user on initial fetch
+      updateConnectionDetails(data);
     } catch (err) {
       console.error("Failed to fetch backend configuration:", err);
     }
@@ -159,13 +178,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   function loadConfig() {
     return {
       model: localStorage.getItem('crbot_model') || DEFAULT_MODEL,
-      dbUrl: sessionStorage.getItem('crbot_db_url') || DEFAULT_DB_URL
+      dbUrl: ""
     };
-  }
-
-  function saveConfig(model, dbUrl) {
-    if (model) localStorage.setItem('crbot_model', model);
-    if (dbUrl !== undefined) sessionStorage.setItem('crbot_db_url', dbUrl);
   }
 
   function maskConnectionDbUrl(url) {
@@ -175,25 +189,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       return `${match[1]}${match[2]}:****${match[4]}`;
     }
     return url;
-  }
-
-  function unmaskConnectionDbUrl(inputValue, originalValue) {
-    if (!inputValue) return "";
-    if (inputValue.includes("****")) {
-      if (DEFAULT_DB_URL) {
-        const defaultMatch = DEFAULT_DB_URL.match(/^(postgresql:\/\/[^:]+):([^@]+)(@.+)$/);
-        if (defaultMatch) {
-          return inputValue.replace("****", defaultMatch[2]);
-        }
-      }
-      if (originalValue) {
-        const origMatch = originalValue.match(/^(postgresql:\/\/[^:]+):([^@]+)(@.+)$/);
-        if (origMatch) {
-          return inputValue.replace("****", origMatch[2]);
-        }
-      }
-    }
-    return inputValue;
   }
 
   function loadConfigIntoUI() {
@@ -211,63 +206,82 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     const modalDbUrl = document.getElementById('modalDbUrl');
     if (modalDbUrl) {
-      modalDbUrl.value = maskConnectionDbUrl(config.dbUrl);
+      modalDbUrl.value = ACTIVE_DB_URL || maskConnectionDbUrl(config.dbUrl || DEFAULT_DB_URL);
     }
 
     updateHistoryTurnsSubtitle();
   }
+  
+  async function triggerConfigSave({ closeModal = false, dbUrl = null, model = null } = {}) {
+    const modalDbUrlInput = document.getElementById('modalDbUrl');
+    const dbUrlValue = dbUrl !== null ? dbUrl : (modalDbUrlInput ? modalDbUrlInput.value.trim() : "");
+    
+    let selectedModel = model;
+    if (!selectedModel) {
+      const selectedModelRadio = document.querySelector('input[name="gemini_model"]:checked');
+      selectedModel = selectedModelRadio ? selectedModelRadio.value : DEFAULT_MODEL;
+    }
 
-  async function updateConnectionDetails() {
-    const config = loadConfig();
+    localStorage.setItem('crbot_model', selectedModel);
+
     try {
       const response = await fetch('/api/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'same-origin',
-        body: JSON.stringify({ database_url: config.dbUrl })
+        body: JSON.stringify({
+          database_url: dbUrlValue,
+          model: selectedModel
+        })
       });
-  
-      const data = await response.json();
-  
-      if (data.database_name && data.username) {
-        const dbName = data.database_name;
-        const username = data.username;
-  
-        if (connDbName) connDbName.textContent = dbName;
-        if (connDbUser) connDbUser.textContent = username;
-  
-        document.title = `CRBot : Talk to your CockroachDB. Connected to ${dbName} as ${username}`;
+
+      if (response.ok) {
+        const data = await response.json();
+        if (data.active_database_url) {
+          ACTIVE_DB_URL = data.active_database_url;
+          sessionStorage.setItem('crbot_db_url', ACTIVE_DB_URL);
+        }
+        
+        updateConnectionDetails(data);
       }
     } catch (err) {
-      console.error("Failed to fetch connection metadata:", err);
+      console.error("Failed to save backend configuration:", err);
+    }
+
+    if (closeModal) {
+      closeConfigModal();
     }
   }
 
-  async function triggerConfigSave(options = { closeModal: true }) {
-    const selectedModel = document.querySelector('input[name="gemini_model"]:checked')?.value || DEFAULT_MODEL;
+  function closeConfigModal() {
+    if (configModal) configModal.classList.add('hidden');
+  }
 
-    const modalDbUrlInput = document.getElementById('modalDbUrl')?.value.trim() || "";
-    const currentConfig = loadConfig();
-    const unmaskedDbUrl = unmaskConnectionDbUrl(modalDbUrlInput, currentConfig.dbUrl);
+  if (configResetBtn) {
+    configResetBtn.addEventListener('click', async () => {
+      localStorage.removeItem('crbot_model');
+      sessionStorage.removeItem('crbot_db_url');
 
-    saveConfig(selectedModel, unmaskedDbUrl);
+      ACTIVE_DB_URL = maskConnectionDbUrl(DEFAULT_DB_URL);
 
-    try {
-      await fetch('/api/config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'same-origin',
-        body: JSON.stringify({ database_url: unmaskedDbUrl })
+      const modalDbUrl = document.getElementById('modalDbUrl');
+      if (modalDbUrl) {
+        modalDbUrl.value = ACTIVE_DB_URL;
+      }
+
+      const defaultModelRadio = document.querySelector(`input[name="gemini_model"][value="${DEFAULT_MODEL}"]`);
+      if (defaultModelRadio) {
+        defaultModelRadio.checked = true;
+      } else {
+        renderModelRadioButtons();
+      }
+
+      await triggerConfigSave({ 
+        closeModal: false, 
+        dbUrl: "", 
+        model: DEFAULT_MODEL 
       });
-    } catch (err) {
-      console.error("Failed to update session config on server:", err);
-    }
-
-    if (options.closeModal && configModal) {
-      configModal.classList.add('hidden');
-    }
-
-    await updateConnectionDetails();
+    });
   }
 
   if (configBtn && configModal) {
@@ -278,9 +292,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   if (modalCloseBtn && configModal) {
-    modalCloseBtn.addEventListener('click', () => {
-      configModal.classList.add('hidden');
-    });
+    modalCloseBtn.addEventListener('click', closeConfigModal);
   }
 
   if (helpBtn && helpModal) {
@@ -333,7 +345,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
     };
 
-    // Chart 1: Total Translations per Day
     const ctxCount = document.getElementById('chartTranslationsPerDay')?.getContext('2d');
     if (ctxCount) {
       if (chartCountInstance) chartCountInstance.destroy();
@@ -353,7 +364,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       });
     }
 
-    // Chart 2: Total Tokens per Day
     const ctxTotalTokens = document.getElementById('chartTotalTokensPerDay')?.getContext('2d');
     if (ctxTotalTokens) {
       if (chartTotalTokensInstance) chartTotalTokensInstance.destroy();
@@ -373,7 +383,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       });
     }
 
-    // Chart 3: Input Tokens per Day
     const ctxInputTokens = document.getElementById('chartInputTokensPerDay')?.getContext('2d');
     if (ctxInputTokens) {
       if (chartInputTokensInstance) chartInputTokensInstance.destroy();
@@ -470,16 +479,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
-  if (configResetBtn) {
-    configResetBtn.addEventListener('click', async () => {
-      localStorage.removeItem('crbot_model');
-      sessionStorage.removeItem('crbot_db_url');
-
-      loadConfigIntoUI();
-      await triggerConfigSave({ closeModal: false });
-    });
-  }
-
   function renderTableResult(result) {
     if (!resultsHeader || !resultsBody) return;
     resultsHeader.innerHTML = '';
@@ -562,13 +561,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     resetExecutionStats();
 
     const promptText = aiPrompt ? aiPrompt.value.trim() : "";
-    if (!promptText) return;
+    if (!promptText) return false;
+
+    setButtonsDisabled(true);
 
     if (transStatus) {
       transStatus.textContent = "Working...";
       transStatus.className = "stat-val status-working";
     }
 
+    let success = false;
     const config = loadConfig();
     try {
       const response = await fetch('/api/translate', {
@@ -593,6 +595,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
         if (transTime) transTime.textContent = `${data.duration} ms`;
         if (tokensTotal) tokensTotal.textContent = data.total_tokens || "—";
+        success = true;
       } else {
         setSqlQuery('');
 
@@ -654,7 +657,10 @@ document.addEventListener('DOMContentLoaded', async () => {
             </td>
           </tr>`;
       }
+    } finally {
+      setButtonsDisabled(false);
     }
+    return success;
   }
 
   async function executeSql() {
@@ -662,6 +668,8 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     const sql = getSqlQuery();
     if (!sql) return;
+
+    setButtonsDisabled(true);
 
     if (execStatus) {
       execStatus.textContent = "Executing...";
@@ -729,6 +737,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         execStatus.className = "stat-val status-error";
       }
       console.error("Failed to execute SQL:", err);
+    } finally {
+      setButtonsDisabled(false);
     }
   }
 
@@ -759,8 +769,10 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   if (luckyBtn) {
     luckyBtn.addEventListener('click', async () => {
-      await translatePrompt();
-      await executeSql();
+      const translated = await translatePrompt();
+      if (translated) {
+        await executeSql();
+      }
     });
   }
 
