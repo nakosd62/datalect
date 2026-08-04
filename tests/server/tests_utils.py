@@ -1,6 +1,6 @@
 import pytest
 from unittest.mock import patch, MagicMock
-from app import resolve_conn_str, get_database_schema, record_translation
+from server.app import resolve_conn_str, get_database_schema, record_translation
 
 def test_resolve_conn_str_no_mask():
     """Should return connection string as-is if no mask is present."""

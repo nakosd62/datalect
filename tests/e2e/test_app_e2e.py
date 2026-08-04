@@ -54,17 +54,24 @@ def test_full_translate_and_execute_flow(page: Page):
     page.route("**/api/translate", handle_translate)
     page.route("**/api/execute", handle_execute)
 
-    # Load local app (Ensure app server is running on localhost:3000)
+    # Load local app
     page.goto("http://localhost:3000/")
 
     # Fill natural language prompt
     page.fill("#aiPrompt", "Show all users")
-    page.click("#translateBtn")
+    
+    # Click translate and wait for API network response
+    with page.expect_response("**/api/translate"):
+        page.click("#translateBtn")
 
-    # Click execute button
-    page.click("#runBtn")
+    # Click execute button and wait for execution API network response
+    with page.expect_response("**/api/execute"):
+        page.click("#runBtn")
+
+    # ADD IT HERE: Wait for at least the first row to be rendered in the DOM
+    page.locator("table tbody tr").first.wait_for()
 
     # Verify table results appear
-    expect(page.locator("table tbody tr")).to_have_count(2)
+    expect(page.locator("table tbody tr")).to_have_count(3)
     expect(page.locator("text=Alice")).to_be_visible()
     expect(page.locator("text=Bob")).to_be_visible()

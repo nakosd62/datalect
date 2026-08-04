@@ -13,6 +13,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const runBtn = document.getElementById('runBtn');
   const luckyBtn = document.getElementById('luckyBtn');
   const clearHistoryBtn = document.getElementById('clearHistoryBtn');
+  const micBtn = document.getElementById('micBtn');
 
   // DOM Elements - Status & Stats
   const transStatus = document.getElementById('transStatus');
@@ -58,6 +59,64 @@ document.addEventListener('DOMContentLoaded', async () => {
   let chartTotalTokensInstance = null;
   let chartInputTokensInstance = null;
 
+  // Speech Recognition Instance
+  let recognition = null;
+  let isListening = false;
+
+  // Speech Synthesis Helper
+  function speakMessage(text) {
+    if ('speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(text);
+      window.speechSynthesis.speak(utterance);
+    }
+  }
+
+  // Speech Recognition Setup
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (SpeechRecognition) {
+    recognition = new SpeechRecognition();
+    recognition.continuous = false;
+    recognition.interimResults = false;
+    recognition.lang = 'en-US';
+
+    recognition.onstart = () => {
+      isListening = true;
+      if (micBtn) micBtn.classList.add('listening');
+    };
+
+    recognition.onresult = (event) => {
+      const transcript = event.results[0][0].transcript;
+      if (aiPrompt) {
+        aiPrompt.value = transcript;
+        aiPrompt.dispatchEvent(new Event('input'));
+      }
+    };
+
+    recognition.onerror = (event) => {
+      console.error('Speech recognition error:', event.error);
+      if (micBtn) micBtn.classList.remove('listening');
+      isListening = false;
+    };
+
+    recognition.onend = () => {
+      if (micBtn) micBtn.classList.remove('listening');
+      isListening = false;
+    };
+  } else if (micBtn) {
+    micBtn.style.display = 'none';
+  }
+
+  if (micBtn && recognition) {
+    micBtn.addEventListener('click', () => {
+      if (isListening) {
+        recognition.stop();
+      } else {
+        recognition.start();
+      }
+    });
+  }
+
   // CodeMirror Setup
   let sqlEditor = null;
   if (sqlQueryTextarea && window.CodeMirror) {
@@ -76,20 +135,34 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (translateBtn) translateBtn.disabled = disabled;
     if (luckyBtn) luckyBtn.disabled = disabled;
     if (runBtn) runBtn.disabled = disabled;
+    if (micBtn) micBtn.disabled = disabled;
   }
 
   function getSqlQuery() {
     return sqlEditor ? sqlEditor.getValue().trim() : (sqlQueryTextarea ? sqlQueryTextarea.value.trim() : '');
   }
 
+  function formatSql(sql) {
+    if (window.sqlFormatter && typeof window.sqlFormatter.format === 'function') {
+      try {
+        return window.sqlFormatter.format(sql, { language: 'postgresql' });
+      } catch (err) {
+        console.warn('SQL formatting failed, returning raw SQL:', err);
+        return sql;
+      }
+    }
+    return sql;
+  }
+
   function setSqlQuery(val) {
+    const formattedVal = val ? formatSql(val) : '';
     if (sqlEditor) {
-      sqlEditor.setValue(val);
+      sqlEditor.setValue(formattedVal);
       requestAnimationFrame(() => {
         sqlEditor.refresh();
       });
     } else if (sqlQueryTextarea) {
-      sqlQueryTextarea.value = val;
+      sqlQueryTextarea.value = formattedVal;
     }
   }
 
@@ -154,7 +227,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       renderModelRadioButtons();
       loadConfigIntoUI();
       
-      // Update header elements with returned DB name and user on initial fetch
       updateConnectionDetails(data);
     } catch (err) {
       console.error("Failed to fetch backend configuration:", err);
@@ -335,9 +407,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       responsive: true,
       maintainAspectRatio: false,
       plugins: { 
-        legend: { 
-          display: false
-        } 
+        legend: { display: false } 
       },
       scales: {
         x: { ticks: { color: '#94a3b8', font: { size: 10 } }, grid: { color: 'rgba(255,255,255,0.05)' } },
@@ -608,7 +678,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         resetExecutionStats();
 
-        console.error("Translation Error:", data.error || "Unknown error");
+        const errMsg = data.error || "An error occurred during translation.";
+        console.error("Translation Error:", errMsg);
+        speakMessage(`Translation failed: ${errMsg}`);
 
         if (resultsTabsNav) resultsTabsNav.classList.add('hidden');
         if (resultsHeader) resultsHeader.innerHTML = '';
@@ -620,7 +692,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                   <span class="error-icon">⚠️</span>
                   <div class="error-details">
                     <strong>Translation Error</strong>
-                    <p>${data.error || "An error occurred during translation."}</p>
+                    <p>${errMsg}</p>
                   </div>
                 </div>
               </td>
@@ -639,7 +711,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       resetExecutionStats();
 
+      const errMsg = err.message || "Failed to reach the translation backend server.";
       console.error("Failed to translate prompt:", err);
+      speakMessage(`Translation network error: ${errMsg}`);
 
       if (resultsTabsNav) resultsTabsNav.classList.add('hidden');
       if (resultsHeader) resultsHeader.innerHTML = '';
@@ -651,7 +725,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 <span class="error-icon">⚠️</span>
                 <div class="error-details">
                   <strong>Translation Network Error</strong>
-                  <p>${err.message || "Failed to reach the translation backend server."}</p>
+                  <p>${errMsg}</p>
                 </div>
               </div>
             </td>
@@ -716,6 +790,8 @@ document.addEventListener('DOMContentLoaded', async () => {
           execStatus.textContent = "Error";
           execStatus.className = "stat-val status-error";
         }
+        const errMsg = data.error || "An error occurred during SQL execution.";
+        speakMessage(`Execution error: ${errMsg}`);
         if (resultsBody) {
           resultsBody.innerHTML = `
             <tr>
@@ -724,7 +800,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                   <span class="error-icon">⚠️</span>
                   <div class="error-details">
                     <strong>Execution Error</strong>
-                    <p>${data.error || "An error occurred during SQL execution."}</p>
+                    <p>${errMsg}</p>
                   </div>
                 </div>
               </td>
@@ -736,7 +812,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         execStatus.textContent = "Error";
         execStatus.className = "stat-val status-error";
       }
+      const errMsg = err.message || "Failed to reach the execution backend server.";
       console.error("Failed to execute SQL:", err);
+      speakMessage(`Execution network error: ${errMsg}`);
     } finally {
       setButtonsDisabled(false);
     }

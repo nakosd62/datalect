@@ -21,6 +21,9 @@ tests/
 # Ignore local state
 state/
 
+# Igbnore mobile all
+mobile/
+
 # Ignore README
 README.md
 

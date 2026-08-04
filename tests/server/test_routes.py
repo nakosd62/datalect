@@ -1,7 +1,7 @@
 import pytest
 from unittest.mock import patch, MagicMock
 
-from app import redact_connection_url
+from server.app import redact_connection_url
 
 def test_redact_connection_url_masks_password():
     conn_str = "postgresql://bankclerk:secret@host:26257/kitchenbank?sslmode=verify-full"
@@ -11,7 +11,7 @@ def test_redact_connection_url_without_password():
     conn_str = "postgresql://bankclerk@host:26257/kitchenbank"
     assert redact_connection_url(conn_str) == conn_str
 
-@patch("app.sqlite3.connect")
+@patch("server.app.sqlite3.connect")
 def test_record_translation_redacts_connection_url(mock_sqlite_connect):
     """Should store connection URL with password redacted."""
     mock_conn = MagicMock()
@@ -19,7 +19,7 @@ def test_record_translation_redacts_connection_url(mock_sqlite_connect):
     mock_sqlite_connect.return_value.__enter__.return_value = mock_conn
     mock_conn.cursor.return_value = mock_cursor
 
-    from app import record_translation
+    from server.app import record_translation
 
     record_translation(
         conn_str="postgresql://user:secret@host:26257/mydb",
@@ -43,7 +43,7 @@ def test_index_route(client):
     response = client.get('/')
     assert response.status_code == 200
 
-@patch("app.get_db_connection")
+@patch("server.app.get_db_connection")
 def test_get_config_route(mock_get_db, client):
     """Should return active database configuration and default settings."""
     mock_conn = MagicMock()
@@ -72,9 +72,9 @@ def test_translate_query_empty_prompt(client):
     assert response.status_code == 400
     assert "Prompt cannot be empty" in response.get_json()['error']
 
-@patch("app.get_database_schema")
-@patch("app.genai.Client")
-@patch("app.record_translation")
+@patch("server.app.get_database_schema")
+@patch("server.app.genai.Client")
+@patch("server.app.record_translation")
 def test_translate_query_success_strips_markdown(mock_record, mock_genai_client, mock_schema, client):
     """Should send prompt to Gemini, strip markdown backticks, and return formatted response."""
     mock_schema.return_value = "Table: users"
@@ -111,7 +111,7 @@ def test_execute_query_empty_sql(client):
     assert response.status_code == 400
     assert "Query cannot be empty" in response.get_json()['error']
 
-@patch("app.get_db_connection")
+@patch("server.app.get_db_connection")
 def test_execute_query_success(mock_get_db, client):
     """Should split and execute SQL statements, converting database types to JSON-friendly formats."""
     mock_conn = MagicMock()
@@ -138,7 +138,7 @@ def test_execute_query_success(mock_get_db, client):
         {"id": 2, "name": "Bob"}
     ]
 
-@patch("app.get_db_connection")
+@patch("server.app.get_db_connection")
 def test_execute_query_database_error(mock_get_db, client):
     """Should return HTTP 400 on database execution failure."""
     mock_get_db.side_effect = Exception("Syntax error in SQL")
