@@ -33,9 +33,11 @@ jobs:
           docker push $IMAGE_TAG
           docker push $LATEST_TAG
 
-      - name: Write env.yaml from Secret
+        - name: Write env.yaml from Secret
+        env:
+          ENV_YAML_CONTENT: ${{ secrets.ENV_YAML }}
         run: |
-          echo "${{ secrets.ENV_YAML }}" > env.yaml
+          echo "$ENV_YAML_CONTENT" > env.yaml
 
       - name: Deploy to Cloud Run
         run: |
