@@ -1468,3 +1468,134 @@ textarea:focus {
     width: 100%;
   }
 }
+
+/* ==========================================================================
+   MOBILE RESPONSIVE OVERRIDES (Phones / Small Screens)
+   ========================================================================== */
+
+/* Target phones and small mobile viewports directly */
+@media screen and (max-width: 600px) {
+  /* Convert grid container to flex column stack */
+  .controls-layout-grid {
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 0.75rem;
+  }
+
+  .inputs-column {
+    width: 100%;
+    max-width: 100%;
+  }
+
+  /* Keep action buttons side-by-side */
+  .action-buttons-column {
+    width: 100%;
+    display: flex !important;
+    flex-direction: row !important;
+    justify-content: space-between;
+    gap: 0.35rem;
+    padding: 0;
+  }
+
+  .action-buttons-column .btn {
+    flex: 1 1 0%;
+    min-width: 0; /* Prevents flex items from overflowing container */
+    height: 38px;
+    padding: 0 0.2rem;
+    font-size: 0.7rem;
+    white-space: normal; /* Allows text to wrap cleanly if needed */
+    text-align: center;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  /* Keep Translation & SQL Execution Stats side-by-side */
+  .stats-column {
+    width: 100%;
+    display: flex !important;
+    flex-direction: row !important;
+    gap: 0.5rem;
+    align-items: stretch;
+  }
+
+  .stats-column #translationStats,
+  .stats-column #executionStats {
+    margin: 0;
+    flex: 1 1 50%;
+    min-width: 0;
+  }
+
+  /* Compact stat cards for tight mobile layouts */
+  .stats-card-vertical {
+    padding: 0.35rem 0.4rem;
+    font-size: 0.65rem;
+  }
+
+  .stat-card-title {
+    font-size: 0.68rem;
+    padding-bottom: 0.15rem;
+    margin-bottom: 0.2rem;
+  }
+
+  .stat-label {
+    font-size: 0.6rem;
+  }
+
+  .stat-val {
+    font-size: 0.68rem;
+    word-break: break-word;
+  }
+}
+
+/* --- Mobile Portrait Screens (max-width: 600px) --- */
+@media screen and (max-width: 600px) {
+
+  /* Compress padding and margin on header */
+  .crbot-header {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 0.15rem;
+    padding-bottom: 0.15rem;
+  }
+
+  /* Reduce SVG Icon size */
+  .crbot-icon-wrapper svg {
+    width: 32px;
+    height: 32px;
+  }
+
+  /* Make Title compact and fit inline with top action buttons */
+  .header-title {
+    font-size: 1.25rem;
+    line-height: 1.2;
+  }
+
+  /* Hide connection info details on phone screens or make it extremely compact */
+  .header-subtitle {
+    display: none !important; /* Hides long "Talk to your Database. Connected to..." text on phones */
+  }
+
+  /* Compact top-right icon buttons (Help, History, Gear) */
+  .header-actions {
+    width: auto;
+    gap: 0.25rem;
+  }
+
+  .gear-btn, .help-btn, .history-btn {
+    width: 34px;
+    height: 34px;
+    padding: 0.2rem;
+  }
+
+  .gear-btn svg, .help-btn svg, .history-btn svg {
+    width: 20px;
+    height: 20px;
+  }
+
+  /* Reduce container padding on small screens */
+  .app-container {
+    padding: 0.5rem 0.75rem;
+  }
+}
