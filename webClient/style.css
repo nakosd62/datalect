@@ -1330,3 +1330,141 @@ textarea:focus {
     box-shadow: 0 0 0 0 rgba(248, 113, 113, 0);
   }
 }
+
+/* ==========================================================================
+   RESPONSIVE MEDIA QUERIES (CRBot Mobile & Tablet Adaptations)
+   ========================================================================== */
+
+/* --- Tablet / Medium Screens (max-width: 1024px) --- */
+@media screen and (max-width: 1024px) {
+  .app-container {
+    padding: 1rem;
+  }
+
+  .vertical-chart-card {
+    width: 90%;
+  }
+}
+
+/* --- Small Tablets / Mobile (max-width: 900px) --- */
+@media screen and (max-width: 900px) {
+
+  /* 1. Header Adaptations */
+  .crbot-header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.75rem;
+  }
+
+  .crbot-title-group {
+    flex-wrap: wrap;
+  }
+
+  .header-subtitle {
+    display: block;
+    margin-left: 0 !important;
+    margin-top: 0.25rem;
+  }
+
+  .header-actions {
+    align-self: flex-end;
+  }
+
+  /* 2. Controls Grid Reflow */
+  .controls-layout-grid {
+    flex-direction: column;
+    gap: 1rem;
+  }
+
+  .inputs-column {
+    max-width: 100%; /* Override fixed calc width */
+  }
+
+  .action-buttons-column {
+    width: 100%;
+    flex-direction: row;
+    gap: 0.5rem;
+  }
+
+  .action-buttons-column .btn {
+    flex: 1;
+    height: 38px; /* Slightly larger tap target for touch */
+    font-size: 0.8rem;
+  }
+
+  .stats-column {
+    width: 100%;
+    flex-direction: row;
+    gap: 0.75rem;
+  }
+
+  .stats-column #translationStats,
+  .stats-column #executionStats {
+    margin: 0;
+  }
+
+  .stats-card-vertical {
+    padding: 0.5rem 0.75rem;
+  }
+
+  /* 3. Modal Adjustments */
+  .modal-card {
+    width: 95vw;
+    max-height: 90vh;
+  }
+
+  .modal-card-large {
+    width: 95vw;
+  }
+
+  .stats-charts-vertical-container {
+    height: auto;
+    gap: 1rem;
+  }
+
+  .vertical-chart-card {
+    width: 100%;
+    height: 220px;
+  }
+}
+
+/* --- Mobile Portrait Screens (max-width: 600px) --- */
+@media screen and (max-width: 600px) {
+  
+  .header-actions {
+    width: 100%;
+    justify-content: flex-end;
+  }
+
+  .gear-btn, .help-btn, .history-btn {
+    width: 42px;
+    height: 42px;
+  }
+
+  /* Stack control buttons vertically if screen is very narrow */
+  .action-buttons-column {
+    flex-direction: column;
+  }
+
+  /* Stats side-by-side stack vertically on small phones */
+  .stats-column {
+    flex-direction: column;
+  }
+
+  .results-container {
+    height: 450px; /* Reduced fixed height for mobile viewports */
+  }
+
+  .modal-actions {
+    flex-direction: column;
+    align-items: stretch !important;
+  }
+
+  .modal-actions button {
+    width: 100%;
+  }
+
+  .modal-actions > div {
+    width: 100%;
+  }
+}

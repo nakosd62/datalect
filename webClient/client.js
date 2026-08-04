@@ -130,6 +130,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     sqlEditor.setSize('100%', '100%');
   }
 
+  // Refresh CodeMirror when window resizes to fit container changes
+  window.addEventListener('resize', () => {
+    if (sqlEditor) {
+      sqlEditor.refresh();
+    }
+  });
+
   // Helper to enable/disable action buttons during active processing
   function setButtonsDisabled(disabled) {
     if (translateBtn) translateBtn.disabled = disabled;

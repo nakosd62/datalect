@@ -6,9 +6,10 @@
 venv/
 
 # Ignore bash scripts
-launch_app.sh
-kill_app.sh
+run_server.sh
+kill_server.sh
 gcp_deploy.sh
+run_tests.sh
 
 # Ignre env files containing secrets
 .env
@@ -16,6 +17,9 @@ gcp_deploy.sh
 
 # Ignore local state
 state/
+
+# Ignore mobile all
+mobile/
 
 # Ignore log files
 *.log

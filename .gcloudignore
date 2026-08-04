@@ -10,8 +10,8 @@ venv/
 .env-sample
 
 # Ignore utility scripts
-launch_app.sh
-kill_app.sh
+run_server.sh
+kill_server.sh
 gcp_deploy.sh
 run_tests.sh
 
@@ -21,7 +21,7 @@ tests/
 # Ignore local state
 state/
 
-# Igbnore mobile all
+# Ignore mobile all
 mobile/
 
 # Ignore README
