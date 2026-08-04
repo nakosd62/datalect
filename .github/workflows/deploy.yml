@@ -22,12 +22,12 @@ jobs:
         uses: google-github-actions/setup-gcloud@v2
 
       - name: Configure Docker for Artifact Registry
-        run: gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+        run: gcloud auth configure-docker us-east1-docker.pkg.dev --quiet
 
       - name: Build and Push Docker Image with Git SHA
         run: |
-          IMAGE_TAG="us-central1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/cloud-run-apps/${{ github.event.repository.name }}:${{ github.sha }}"
-          LATEST_TAG="us-central1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/cloud-run-apps/${{ github.event.repository.name }}:latest"
+          IMAGE_TAG="us-east1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/cloud-run-apps/${{ github.event.repository.name }}:${{ github.sha }}"
+          LATEST_TAG="us-east1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/cloud-run-apps/${{ github.event.repository.name }}:latest"
           
           docker build -t $IMAGE_TAG -t $LATEST_TAG .
           docker push $IMAGE_TAG
@@ -41,7 +41,7 @@ jobs:
 
       - name: Deploy to Cloud Run
         run: |
-          IMAGE_TAG="us-central1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/cloud-run-apps/${{ github.event.repository.name }}:${{ github.sha }}"
+          IMAGE_TAG="us-east1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/cloud-run-apps/${{ github.event.repository.name }}:${{ github.sha }}"
           gcloud run deploy ${{ github.event.repository.name }} \
             --image $IMAGE_TAG \
             --region us-east1 \
