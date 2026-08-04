@@ -44,7 +44,7 @@ jobs:
           IMAGE_TAG="us-central1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/cloud-run-apps/${{ github.event.repository.name }}:${{ github.sha }}"
           gcloud run deploy ${{ github.event.repository.name }} \
             --image $IMAGE_TAG \
-            --region us-central1 \
+            --region us-east1 \
             --platform managed \
             --port 3000 \
             --env-vars-file=env.yaml
