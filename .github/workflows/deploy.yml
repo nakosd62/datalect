@@ -46,6 +46,7 @@ jobs:
             --image $IMAGE_TAG \
             --region us-central1 \
             --platform managed \
+            --port 3000 \
             --env-vars-file=env.yaml
 
       - name: Clean up temporary env.yaml
