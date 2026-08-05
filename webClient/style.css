@@ -34,15 +34,19 @@
   padding: 0;
 }
 
+html, body {
+  height: 100%;
+  height: 100dvh; /* Dynamic viewport height to handle dynamic browser bars */
+  overflow: hidden; /* Lock entire body viewport and eliminate main page scrolling */
+}
+
 body {
   background-color: var(--bg-dark);
   color: var(--text-primary);
   font-family: var(--font-sans);
-  min-height: 100vh;
   display: flex;
   flex-direction: column;
   position: relative;
-  overflow-x: hidden;
 }
 
 /* Background Gradients/Decorations */
@@ -70,12 +74,12 @@ body {
 .app-container {
   max-width: 1400px;
   width: 100%;
+  height: 100%;
   margin: 0 auto;
-  padding: 0.75rem 1.5rem;
+  padding: 0.5rem 1.5rem 0.25rem 1.5rem;
   display: flex;
   flex-direction: column;
-  gap: 0.75rem;
-  flex: 1;
+  gap: 0.5rem;
 }
 
 .status-badge {
@@ -104,6 +108,8 @@ body {
   display: flex;
   flex-direction: column;
   gap: 0.35rem;
+  flex: 1; /* Fills remaining space above footer */
+  min-height: 0; /* Allows flex items to shrink below content size */
 }
 
 select {
@@ -146,12 +152,15 @@ select:focus {
 
 .editor-card {
   margin-top: 0;
+  flex-shrink: 0; /* Prevents top controls card from scaling down */
 }
 
-/* Fixed-Height Results Section */
+/* Dynamic Dynamic-Height Results Section */
 .table-card {
   padding: 0.75rem;
-  max-height: 400px;
+  flex: 1; /* Consumes all remaining available height */
+  min-height: 150px;
+  max-height: none; /* Removes fixed 350px restraint */
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -475,9 +484,10 @@ textarea:focus {
   transform: none;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4), inset 0 0 12px rgba(16, 185, 129, 0.08);
   padding: 6px;
+  box-sizing: border-box;
 }
 
-/* SQL Container Variation - LOCKED DIMENSIONS & MANUAL RESIZE ONLY */
+/* SQL Container Variation - MANUAL RESIZE & FLEX CONTAINER */
 .speech-bubble-wrapper.sql-bubble {
   background: #0f172a;
   border: 3px solid #334155;
@@ -488,8 +498,9 @@ textarea:focus {
   max-height: 600px;
   resize: vertical;
   overflow: hidden;
-  position: relative; /* Provides clean relative anchor */
-  display: block;    /* Standard block context for CodeMirror wrapper */
+  position: relative;
+  display: flex;
+  flex-direction: column;
   box-sizing: border-box;
 }
 
@@ -566,7 +577,8 @@ textarea:focus {
   width: 100% !important;
   background: transparent !important;
   border-radius: 0;
-  position: relative !important; /* Changed from absolute to relative */
+  position: relative !important;
+  flex: 1;
 }
 
 .speech-bubble-wrapper.sql-bubble .CodeMirror-scroll {
@@ -782,12 +794,13 @@ textarea:focus {
 
 /* Footer */
 .app-footer {
+  flex-shrink: 0; /* Keeps footer pinned to the bottom without being squeezed */
   text-align: center;
-  padding: 1.5rem 0;
+  padding: 0.5rem 0;
   border-top: 1px solid var(--bg-card-border);
   color: var(--text-muted);
   font-size: 0.825rem;
-  margin-top: auto;
+  margin-top: 0.5rem;
 }
 
 /* Radio Button Group Styles */
@@ -829,7 +842,8 @@ textarea:focus {
 .results-container {
   display: flex;
   flex-direction: column;
-  height: 650px;
+  height: 100%; /* Expands dynamically to parent .table-card */
+  flex: 1;
   background-color: #0f172a;
   border-radius: 8px;
   overflow: hidden;
@@ -1311,7 +1325,7 @@ textarea:focus {
 /* --- Tablet / Medium Screens (max-width: 1024px) --- */
 @media screen and (max-width: 1024px) {
   .app-container {
-    padding: 1rem;
+    padding: 0.75rem;
   }
 
   .vertical-chart-card {
@@ -1435,7 +1449,7 @@ textarea:focus {
 
   /* Reduce container padding on small screens */
   .app-container {
-    padding: 0.5rem 0.75rem;
+    padding: 0.5rem 0.5rem 0.25rem 0.5rem;
   }
 
   /* Convert grid container to flex column stack */
