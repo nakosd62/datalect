@@ -125,14 +125,27 @@ document.addEventListener('DOMContentLoaded', async () => {
       theme: 'dracula',
       lineNumbers: true,
       lineWrapping: true,
-      viewportMargin: 10
+      viewportMargin: Infinity
     });
     sqlEditor.setSize('100%', '100%');
   }
 
-  // Refresh CodeMirror when window resizes to fit container changes
+  // Handle Manual Element Resizing using ResizeObserver
+  const sqlContainer = document.querySelector('.speech-bubble-wrapper.sql-bubble');
+
+  if (sqlContainer && sqlEditor && window.ResizeObserver) {
+    const resizeObserver = new ResizeObserver(() => {
+      // Force CodeMirror to recalculate height and redraw scrollbars on manual resize
+      sqlEditor.setSize('100%', '100%');
+      sqlEditor.refresh();
+    });
+    resizeObserver.observe(sqlContainer);
+  }
+
+  // Refresh CodeMirror when window resizes to fit viewport changes
   window.addEventListener('resize', () => {
     if (sqlEditor) {
+      sqlEditor.setSize('100%', '100%');
       sqlEditor.refresh();
     }
   });
@@ -166,6 +179,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (sqlEditor) {
       sqlEditor.setValue(formattedVal);
       requestAnimationFrame(() => {
+        sqlEditor.setSize('100%', '100%');
         sqlEditor.refresh();
       });
     } else if (sqlQueryTextarea) {
