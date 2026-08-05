@@ -202,10 +202,14 @@ def redact_connection_url(conn_str):
     return conn_str
 
 def mask_db_url(url_str):
-    return re.sub(r'://([^:]+):([^@]+)@', r'://\1:*****@', url_str)
+    if not url_str:
+        return url_str
+    return re.sub(r'://([^:]+):([^@]+)@', r'://\1:****@', url_str)
 
-def resolve_conn_str(conn_str):
-    if not conn_str or "****" in conn_str:
+def resolve_conn_str(conn_str=None, session_id=None):
+    if not conn_str or "*" in conn_str:
+        if session_id:
+            return get_session_db_url(session_id)
         return DEFAULT_CONN
     return conn_str
 
@@ -233,13 +237,13 @@ def record_translation(conn_str, nl_prompt, sql_command, gemini_model, duration,
     except Exception as e:
         print(f"Error recording translation: {e}")
 
-def get_db_connection(conn_str=None):
-    return psycopg2.connect(resolve_conn_str(conn_str))
+def get_db_connection(conn_str=None, session_id=None):
+    return psycopg2.connect(resolve_conn_str(conn_str, session_id))
 
-def get_database_schema(conn_str=None):
+def get_database_schema(conn_str=None, session_id=None):
     conn = None
     try:
-        conn = get_db_connection(conn_str)
+        conn = get_db_connection(conn_str, session_id)
         schema_parts = []
         
         with conn.cursor() as cursor:
@@ -387,12 +391,12 @@ def translate_query():
         return jsonify({'error': 'Prompt cannot be empty'}), 400
         
     session_id = get_or_create_session_id()
-    conn_str = data.get('database_url') or get_session_db_url(session_id)
+    conn_str = resolve_conn_str(data.get('database_url'), session_id)
 
     history = data.get('history', [])[-10:]
 
     try:
-        schema = get_database_schema(conn_str)
+        schema = get_database_schema(conn_str, session_id)
         client = genai.Client(api_key=api_key)
         
         system_instruction = (
@@ -489,7 +493,7 @@ def handle_config():
         data = request.get_json() or {}
         new_db_url = data.get('database_url')
         
-        if new_db_url and '****' in new_db_url:
+        if new_db_url and '*' in new_db_url:
             pass 
         elif new_db_url:
             set_session_db_url(session_id, new_db_url)
@@ -501,7 +505,7 @@ def handle_config():
     db_name, username = "Unknown", "Unknown"
     conn = None
     try:
-        conn = get_db_connection(active_conn_str)
+        conn = get_db_connection(active_conn_str, session_id)
         with conn.cursor() as cursor:
             cursor.execute("SELECT current_database(), CURRENT_USER;")
             row = cursor.fetchone()
@@ -530,7 +534,7 @@ def execute_query():
     session_id = get_or_create_session_id()
     data = request.get_json() or {}
     
-    conn_str = data.get('database_url') or get_session_db_url(session_id)
+    conn_str = resolve_conn_str(data.get('database_url'), session_id)
     
     raw_query = (data.get('sql') or data.get('query') or '').strip()
     if not raw_query:
@@ -540,7 +544,7 @@ def execute_query():
     start_time = time.time()
     
     try:
-        conn = get_db_connection(conn_str)
+        conn = get_db_connection(conn_str, session_id)
         conn.autocommit = True
         
         statements = [s.strip() for s in sqlparse.split(raw_query) if s.strip()]

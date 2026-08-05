@@ -63,14 +63,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   let recognition = null;
   let isListening = false;
 
-  function speakMessage(text) {
-    if ('speechSynthesis' in window) {
-      window.speechSynthesis.cancel();
-      const utterance = new SpeechSynthesisUtterance(text);
-      window.speechSynthesis.speak(utterance);
-    }
-  }
-
   const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (SpeechRecognition) {
     recognition = new SpeechRecognition();
@@ -196,12 +188,15 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function updateHistoryTurnsSubtitle() {
-    const clearMsgEl = document.getElementById('clearHistoryMsg');
-    if (!clearMsgEl) return;
-
     const turns = Math.floor(chatHistory.length / 2);
-    clearMsgEl.textContent = `${turns} turn${turns === 1 ? '' : 's'} in history`;
-    clearMsgEl.style.color = 'var(--text-muted, #94a3b8)';
+    const clearTitleEl = document.querySelector('.btn-clear-title');
+    if (clearTitleEl) {
+      clearTitleEl.textContent = `Clear Chat History (${turns})`;
+    }
+    const clearMsgEl = document.getElementById('clearHistoryMsg');
+    if (clearMsgEl) {
+      clearMsgEl.textContent = '';
+    }
   }
 
   function updateConnectionDetails(data) {
@@ -212,8 +207,24 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (connDbName) connDbName.textContent = dbName;
       if (connDbUser) connDbUser.textContent = username;
 
-      document.title = `YDYL`;
+      document.title = `yDyL`;
     }
+  }
+
+  function maskConnectionDbUrl(url) {
+    if (!url) return "";
+    const match = url.match(/^(postgresql:\/\/)([^:]+):([^@]+)(@.+)$/);
+    if (match) {
+      return `${match[1]}${match[2]}:****${match[4]}`;
+    }
+    return url;
+  }
+
+  function getMatchingPresetUrl(targetUrl) {
+    if (!targetUrl || !CONFIGURED_DBS || CONFIGURED_DBS.length === 0) return null;
+    const maskedTarget = maskConnectionDbUrl(targetUrl);
+    const found = CONFIGURED_DBS.find(db => db.url === targetUrl || maskConnectionDbUrl(db.url) === maskedTarget);
+    return found ? found.url : null;
   }
 
   async function fetchBackendConfig() {
@@ -229,13 +240,20 @@ document.addEventListener('DOMContentLoaded', async () => {
         AVAILABLE_MODELS = data.available_models;
       }
 
-      const storedModel = localStorage.getItem('crbot_model');
+      // Sync model state in sessionStorage
+      const storedModel = sessionStorage.getItem('crbot_model');
       if (!storedModel || !AVAILABLE_MODELS.includes(storedModel)) {
-        localStorage.setItem('crbot_model', DEFAULT_MODEL);
+        sessionStorage.setItem('crbot_model', DEFAULT_MODEL);
       }
       
+      // Clean up legacy localStorage items if present
       localStorage.removeItem('crbot_db_url');
-      if (!sessionStorage.getItem('crbot_db_url') && DEFAULT_DB_URL) {
+      localStorage.removeItem('crbot_model');
+
+      // Sync active database URL with latest backend state
+      if (data.active_database_url) {
+        sessionStorage.setItem('crbot_db_url', data.active_database_url);
+      } else if (!sessionStorage.getItem('crbot_db_url') && DEFAULT_DB_URL) {
         sessionStorage.setItem('crbot_db_url', DEFAULT_DB_URL);
       }
 
@@ -249,39 +267,55 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
-  function renderDbRadioButtons() {
+  function renderDbRadioButtons(currentDbUrl) {
     const radioGroup = document.getElementById('modalDbRadioGroup');
     if (!radioGroup) return;
 
+    const activeUrl = currentDbUrl || sessionStorage.getItem('crbot_db_url') || ACTIVE_DB_URL || DEFAULT_DB_URL;
+    const matchedPresetUrl = getMatchingPresetUrl(activeUrl);
+
     let html = '';
     
-    CONFIGURED_DBS.forEach((db, idx) => {
-      const isDefault = idx === 0;
+    CONFIGURED_DBS.forEach((db) => {
+      const isSelected = Boolean(matchedPresetUrl && db.url === matchedPresetUrl);
       html += `
         <label class="radio-option">
-          <input type="radio" name="db_connection_option" value="${db.url}" ${isDefault ? 'checked' : ''}>
+          <input type="radio" name="db_connection_option" value="${db.url}" ${isSelected ? 'checked' : ''}>
           <span class="radio-label">${db.name}</span>
         </label>
       `;
     });
 
+    const isCustom = !matchedPresetUrl && Boolean(activeUrl);
+    const customValue = isCustom ? activeUrl : '';
+
     html += `
       <label class="radio-option" style="display: flex; align-items: center; gap: 0.5rem;">
-        <input type="radio" name="db_connection_option" value="custom" id="radioCustomDb">
-        <input type="text" id="modalCustomDbUrl" class="config-input" placeholder="postgresql://user:password@host:5432/dbname" style="flex: 1;" autocomplete="off">
+        <input type="radio" name="db_connection_option" value="custom" id="radioCustomDb" ${isCustom ? 'checked' : ''}>
+        <input type="text" id="modalCustomDbUrl" class="config-input" placeholder="postgresql://user:password@host:5432/dbname" value="${customValue}" style="flex: 1;" autocomplete="off">
       </label>
     `;
 
     radioGroup.innerHTML = html;
 
     const customInput = document.getElementById('modalCustomDbUrl');
+    const customRadio = document.getElementById('radioCustomDb');
+
+    // Add event listeners to radio options to clear custom URL when preset radio buttons are clicked
+    const dbRadios = radioGroup.querySelectorAll('input[name="db_connection_option"]');
+    dbRadios.forEach(radio => {
+      radio.addEventListener('change', () => {
+        if (radio.value !== 'custom' && radio.checked) {
+          if (customInput) customInput.value = '';
+        }
+      });
+    });
+
     if (customInput) {
       customInput.addEventListener('focus', () => {
-        const customRadio = document.getElementById('radioCustomDb');
         if (customRadio) customRadio.checked = true;
       });
       customInput.addEventListener('input', () => {
-        const customRadio = document.getElementById('radioCustomDb');
         if (customRadio) customRadio.checked = true;
       });
     }
@@ -291,7 +325,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const radioGroup = document.getElementById('modalGeminiModelGroup');
     if (!radioGroup) return;
 
-    const currentSelected = localStorage.getItem('crbot_model') || DEFAULT_MODEL;
+    const currentSelected = sessionStorage.getItem('crbot_model') || DEFAULT_MODEL;
 
     radioGroup.innerHTML = AVAILABLE_MODELS.map(model => `
       <label class="radio-option">
@@ -303,24 +337,15 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   function loadConfig() {
     return {
-      model: localStorage.getItem('crbot_model') || DEFAULT_MODEL,
-      dbUrl: ""
+      model: sessionStorage.getItem('crbot_model') || DEFAULT_MODEL,
+      dbUrl: sessionStorage.getItem('crbot_db_url') || ACTIVE_DB_URL || DEFAULT_DB_URL
     };
-  }
-
-  function maskConnectionDbUrl(url) {
-    if (!url) return "";
-    const match = url.match(/^(postgresql:\/\/)([^:]+):([^@]+)(@.+)$/);
-    if (match) {
-      return `${match[1]}${match[2]}:****${match[4]}`;
-    }
-    return url;
   }
 
   function loadConfigIntoUI() {
     const config = loadConfig();
 
-    renderDbRadioButtons();
+    renderDbRadioButtons(config.dbUrl);
     renderModelRadioButtons();
 
     const modelRadios = document.querySelectorAll('input[name="gemini_model"]');
@@ -343,6 +368,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (selectedDbRadio.value === 'custom') {
           const customInput = document.getElementById('modalCustomDbUrl');
           dbUrlValue = customInput ? customInput.value.trim() : "";
+          if (!dbUrlValue && CONFIGURED_DBS.length > 0) {
+            dbUrlValue = DEFAULT_DB_URL || CONFIGURED_DBS[0].url;
+          }
         } else {
           dbUrlValue = selectedDbRadio.value;
         }
@@ -357,7 +385,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       selectedModel = selectedModelRadio ? selectedModelRadio.value : DEFAULT_MODEL;
     }
 
-    localStorage.setItem('crbot_model', selectedModel);
+    sessionStorage.setItem('crbot_model', selectedModel);
 
     try {
       const response = await fetch('/api/config', {
@@ -393,8 +421,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   if (configBtn && configModal) {
-    configBtn.addEventListener('click', () => {
-      loadConfigIntoUI();
+    configBtn.addEventListener('click', async () => {
+      await fetchBackendConfig();
       configModal.classList.remove('hidden');
     });
   }
@@ -696,7 +724,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (response.ok && data.sql) {
         setSqlQuery(data.sql);
 
-        // Record User Prompt and SQL Statement response into chatHistory
         chatHistory.push({
           role: 'user',
           text: promptText
@@ -729,7 +756,6 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         const errMsg = data.error || "An error occurred during translation.";
         console.error("Translation Error:", errMsg);
-        speakMessage(`Translation failed: ${errMsg}`);
 
         if (resultsTabsNav) resultsTabsNav.classList.add('hidden');
         if (resultsHeader) resultsHeader.innerHTML = '';
@@ -762,7 +788,6 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       const errMsg = err.message || "Failed to reach the translation backend server.";
       console.error("Failed to translate prompt:", err);
-      speakMessage(`Translation network error: ${errMsg}`);
 
       if (resultsTabsNav) resultsTabsNav.classList.add('hidden');
       if (resultsHeader) resultsHeader.innerHTML = '';
@@ -827,7 +852,6 @@ document.addEventListener('DOMContentLoaded', async () => {
           execStatus.className = "stat-val status-error";
         }
         const errMsg = data.error || "An error occurred during SQL execution.";
-        speakMessage(`Execution error: ${errMsg}`);
         if (resultsBody) {
           resultsBody.innerHTML = `
             <tr>
@@ -850,7 +874,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
       const errMsg = err.message || "Failed to reach the execution backend server.";
       console.error("Failed to execute SQL:", err);
-      speakMessage(`Execution network error: ${errMsg}`);
     } finally {
       setButtonsDisabled(false);
     }
