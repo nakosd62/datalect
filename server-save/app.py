@@ -21,50 +21,38 @@ DEFAULT_CONN = os.environ.get(
     "postgresql://postgres:password@host:23456/defaultdb?sslmode=verify-full"
 )
 
-# Parse pre-configured DB names and URLs from env variables
-raw_db_names = os.environ.get("DATABASE_NAMES", "Default DB")
-raw_db_urls = os.environ.get("DATABASE_URLS", DEFAULT_CONN)
-
-PRESET_DB_NAMES = [n.strip() for n in raw_db_names.split(",") if n.strip()]
-PRESET_DB_URLS = [u.strip() for u in raw_db_urls.split(",") if u.strip()]
-
-# Pair positional name and address
-CONFIGURED_DBS = []
-for idx, name in enumerate(PRESET_DB_NAMES):
-    url = PRESET_DB_URLS[idx] if idx < len(PRESET_DB_URLS) else DEFAULT_CONN
-    CONFIGURED_DBS.append({"name": name, "url": url})
-
-# Ensure at least one default fallback exists
-if not CONFIGURED_DBS:
-    CONFIGURED_DBS = [{"name": "Default DB", "url": DEFAULT_CONN}]
-
-# First name/address pair is default
-DEFAULT_CONN = CONFIGURED_DBS[0]["url"]
-
 # --- Model Configuration ---
+# Parse available models from GEMINI_AVAILABLE_MODELS env var (comma-separated).
+# Fallback to default models if env variable is unset or empty.
 raw_models_env = os.environ.get("GEMINI_AVAILABLE_MODELS", "")
 AVAILABLE_MODELS = [m.strip() for m in raw_models_env.split(",") if m.strip()]
 if not AVAILABLE_MODELS:
     AVAILABLE_MODELS = ["gemini-3.6-flash", "gemini-3.5-flash-lite"]
 
+# First model in the list is the default model
 DEFAULT_MODEL = os.environ.get("GEMINI_MODEL") or AVAILABLE_MODELS[0]
 
+# Use Cloud Run's writable ephemeral directory (/tmp) if running in CloudRun
 GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME")
 DB_FILENAME = os.environ.get("TRANSLATION_STATS_DB_FILENAME", "crbot_state.db")
 if GCS_BUCKET_NAME:
     TRANSLATION_STATS_DB_PATH = os.path.join("/tmp", DB_FILENAME)
+
 else:
     TRANSLATION_STATS_DB_PATH = "state/crbot_state.db"
+
 
 # --- Session Management via SQLite ---
 
 def get_or_create_session_id():
+    """Extracts session_id from request cookies or header, or generates a new one."""
     session_id = request.cookies.get('crbot_session_id') or request.headers.get('X-Session-ID')
     if not session_id:
         session_id = str(uuid.uuid4())
     return session_id
 
 def set_session_db_url(session_id, db_url):
+    """Persists or updates the database connection URL for a specific session in SQLite."""
     try:
         with sqlite3.connect(TRANSLATION_STATS_DB_PATH) as conn:
             cursor = conn.cursor()
@@ -77,11 +65,13 @@ def set_session_db_url(session_id, db_url):
             """, (session_id, db_url))
             conn.commit()
 
+        # Sync update back to GCS
         upload_db_to_gcs()
     except Exception as e:
         print(f"Error saving session to SQLite: {e}")
 
 def get_session_db_url(session_id):
+    """Retrieves the active DB URL for a session from SQLite or defaults to DEFAULT_CONN."""
     try:
         with sqlite3.connect(TRANSLATION_STATS_DB_PATH) as conn:
             cursor = conn.cursor()
@@ -94,18 +84,20 @@ def get_session_db_url(session_id):
     return DEFAULT_CONN
 
 def apply_session_cookie(response, session_id):
+    """Attaches the session cookie to the Flask HTTP response."""
     response.set_cookie(
         'crbot_session_id',
         session_id,
         httponly=True,
         samesite='Lax',
-        max_age=86400
+        max_age=86400  # 1 day session
     )
     return response
 
 # --- GCS Helper Functions ---
 
 def download_db_from_gcs():
+    """Downloads SQLite DB file from GCS to local container path on startup."""
     if not GCS_BUCKET_NAME:
         return
     try:
@@ -122,6 +114,7 @@ def download_db_from_gcs():
         print(f"Error downloading stats DB from GCS: {e}")
 
 def upload_db_to_gcs():
+    """Uploads the local SQLite DB file back to GCS."""
     if not GCS_BUCKET_NAME or not os.path.exists(TRANSLATION_STATS_DB_PATH):
         return
     try:
@@ -135,11 +128,14 @@ def upload_db_to_gcs():
 
 def init_state_db():
     try:
+        # Step 1: Pull existing DB from Cloud Storage if configured
         download_db_from_gcs()
 
+        # Step 2: Initialize SQLite tables locally
         with sqlite3.connect(TRANSLATION_STATS_DB_PATH) as conn:
             cursor = conn.cursor()
             
+            # Translations telemetry table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS translations (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -157,6 +153,7 @@ def init_state_db():
                 );
             """)
 
+            # Sessions table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS sessions (
                     session_id TEXT PRIMARY KEY,
@@ -166,6 +163,7 @@ def init_state_db():
             """)
             conn.commit()
 
+        # Step 3: Push initialized DB back to GCS
         upload_db_to_gcs()
 
     except Exception as e:
@@ -174,26 +172,20 @@ def init_state_db():
 def get_gemini_api_keys():
     """Collect Gemini API keys from env (preset list + optional single key)."""
     keys = []
-    
-    # 1. Check for comma-separated list of keys
     preset_keys_env = os.environ.get("GEMINI_PRESET_KEYS", "")
     if preset_keys_env:
         keys.extend(k.strip() for k in preset_keys_env.split(",") if k.strip())
-        
-    # 2. Check for standard single key as a fallback/addition
-    single_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    if single_key and single_key.strip() not in keys:
-        keys.append(single_key.strip())
-        
     return keys
 
 def pick_gemini_api_key():
+    """Randomly select a Gemini API key from configured env keys."""
     keys = get_gemini_api_keys()
     if not keys:
         return None
     return random.choice(keys)
 
 def redact_connection_url(conn_str):
+    """Return connection URL with password blanked for logging/stats."""
     if not conn_str:
         return conn_str
     match = re.match(r'^(postgresql://)([^:]+):([^@]+)(@.+)$', conn_str)
@@ -202,9 +194,13 @@ def redact_connection_url(conn_str):
     return conn_str
 
 def mask_db_url(url_str):
+    """Masks credentials in a database connection URL for display."""
     return re.sub(r'://([^:]+):([^@]+)@', r'://\1:*****@', url_str)
 
 def resolve_conn_str(conn_str):
+    """
+    Returns provided connection string if valid, otherwise falls back to default.
+    """
     if not conn_str or "****" in conn_str:
         return DEFAULT_CONN
     return conn_str
@@ -228,6 +224,7 @@ def record_translation(conn_str, nl_prompt, sql_command, gemini_model, duration,
             ))
             conn.commit()
 
+        # Sync DB back to GCS on write
         upload_db_to_gcs()
 
     except Exception as e:
@@ -386,6 +383,7 @@ def handle_config():
         data = request.get_json() or {}
         new_db_url = data.get('database_url')
         
+        # If user didn't modify the masked input field (contains ****), keep existing connection URL
         if new_db_url and '****' in new_db_url:
             pass 
         elif new_db_url:
@@ -412,7 +410,6 @@ def handle_config():
 
     resp = jsonify({
         'session_id': session_id,
-        'configured_databases': CONFIGURED_DBS,
         'default_database_url': DEFAULT_CONN,
         'active_database_url': mask_db_url(active_conn_str),
         'default_model': DEFAULT_MODEL,
@@ -512,9 +509,10 @@ def execute_query():
 def get_translation_history():
     try:
         with sqlite3.connect(TRANSLATION_STATS_DB_PATH) as conn:
-            conn.row_factory = sqlite3.Row
+            conn.row_factory = sqlite3.Row  # Enables column-name access
             cursor = conn.cursor()
 
+            # Fetch table history records
             cursor.execute("""
                 SELECT nl_prompt, sql_command, created_at
                 FROM translations
@@ -523,6 +521,7 @@ def get_translation_history():
             """)
             rows = [dict(row) for row in cursor.fetchall()]
 
+            # Fetch daily stats grouped by date
             cursor.execute("""
                 SELECT 
                     DATE(created_at) as day_date,

@@ -6,15 +6,21 @@
   <title>CRBot</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 160 160' fill='none'><defs><linearGradient id='bgGradDark' x1='0%' y1='0%' x2='100%' y2='100%'><stop offset='0%' stop-color='%231E293B'/><stop offset='100%' stop-color='%230F172A'/></linearGradient><linearGradient id='roachShellBright' x1='0%' y1='0%' x2='0%' y2='100%'><stop offset='0%' stop-color='%23475569'/><stop offset='100%' stop-color='%231E293B'/></linearGradient><filter id='neonGlowBolder' x='-30%' y='-30%' width='160%' height='160%'><feGaussianBlur stdDeviation='4' result='blur'/><feComposite in='SourceGraphic' in2='blur' operator='over'/></filter></defs><path d='M 30 25 H 130 A 15 15 0 0 1 145 40 V 105 A 15 15 0 0 1 130 120 H 65 L 40 142 V 120 H 30 A 15 15 0 0 1 15 105 V 40 A 15 15 0 0 1 30 25 Z' fill='url(%23bgGradDark)' stroke='%2338BDF8' stroke-width='6' stroke-linecap='round' stroke-linejoin='round'/><g filter='url(%23neonGlowBolder)'><path d='M 68 52 C 58 36, 44 34, 38 36' stroke='%2334D399' stroke-width='5' stroke-linecap='round' fill='none'/><path d='M 92 52 C 102 36, 116 34, 122 36' stroke='%2334D399' stroke-width='5' stroke-linecap='round' fill='none'/><circle cx='38' cy='36' r='4.5' fill='%236EE7B7'/><circle cx='122' cy='36' r='4.5' fill='%236EE7B7'/></g><path d='M 52 64 L 30 56' stroke='%23CBD5E1' stroke-width='5.5' stroke-linecap='round'/><path d='M 108 64 L 130 56' stroke='%23CBD5E1' stroke-width='5.5' stroke-linecap='round'/><path d='M 50 78 L 26 78' stroke='%23CBD5E1' stroke-width='5.5' stroke-linecap='round'/><path d='M 110 78 L 134 78' stroke='%23CBD5E1' stroke-width='5.5' stroke-linecap='round'/><path d='M 52 92 L 30 100' stroke='%23CBD5E1' stroke-width='5.5' stroke-linecap='round'/><path d='M 108 92 L 130 100' stroke='%23CBD5E1' stroke-width='5.5' stroke-linecap='round'/><rect x='52' y='52' width='56' height='52' rx='20' fill='url(%23roachShellBright)' stroke='%23F1F5F9' stroke-width='4'/><line x1='80' y1='68' x2='80' y2='100' stroke='%2364748B' stroke-width='3' stroke-linecap='round'/><g filter='url(%23neonGlowBolder)'><circle cx='68' cy='64' r='7' fill='%2310B981'/><circle cx='92' cy='64' r='7' fill='%2310B981'/><circle cx='70' cy='62' r='2.5' fill='%23FFFFFF'/><circle cx='94' cy='62' r='2.5' fill='%23FFFFFF'/></g><circle cx='70' cy='88' r='2.5' fill='%2334D399'/><circle cx='80' cy='88' r='2.5' fill='%2334D399'/><circle cx='90' cy='88' r='2.5' fill='%2334D399'/></svg>">
   
+  <!-- Google Fonts -->
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
   
+  <!-- CodeMirror Syntax Highlighting CSS -->
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/codemirror.min.css">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/theme/dracula.min.css">
+
+  <!-- Stylesheet -->
   <link rel="stylesheet" href="style.css">
 
+  <!-- Add Chart.js to <head> -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
 </head>
 <body>
   <div class="background-decor animate-pulse"></div>
@@ -23,6 +29,7 @@
   <div class="app-container">
     <main class="vertical-layout">
       
+      <!-- Main Header / CRBot Title & Top-Right Buttons -->
       <div class="crbot-header">
         <div class="crbot-title-group">
           <div class="crbot-icon-wrapper">
@@ -76,10 +83,18 @@
               <circle cx="90" cy="88" r="2.5" fill="#34D399"/>
             </svg>
           </div>
-          <h1 class="header-title">Your Database Your Language</h1>
+          <h1 class="header-title">
+            Your Database Your Language
+            <!--
+            <span class="header-subtitle" style="font-size: 0.4em; font-weight: normal; opacity: 0.75;">
+              (<span id="connDbUser" style="color: #38bdf8;">--</span> @ <span id="connDbName" style="color: #38bdf8;">--</span>)
+            </span>
+            -->
+          </h1>
         </div>
 
         <div class="header-actions">
+          <!-- Help Icon Button -->
           <button id="helpBtn" class="help-btn" title="Help">
             <svg width="29" height="29" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <circle cx="12" cy="12" r="10"></circle>
@@ -88,6 +103,7 @@
             </svg>
           </button>
 
+          <!-- History Icon Button -->
           <button id="historyBtn" class="history-btn" title="Translation History">
             <svg width="29" height="29" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <circle cx="12" cy="12" r="10"></circle>
@@ -95,6 +111,7 @@
             </svg>
           </button>
 
+          <!-- Gear Icon Button -->
           <button id="configBtn" class="gear-btn" title="Configuration">
             <svg width="29" height="29" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <circle cx="12" cy="12" r="3"></circle>
@@ -104,9 +121,13 @@
         </div>
       </div>
 
+      <!-- Section: Main Card Controls -->
       <section class="card editor-card">
         <div class="controls-layout-grid">
+          
+          <!-- Column 1: Text Inputs -->
           <div class="inputs-column">
+            <!-- Natural Language Row -->
             <div class="input-row">
               <div class="speech-bubble-wrapper">
                 <textarea id="aiPrompt" rows="2" placeholder="Type your question here..."></textarea>
@@ -121,6 +142,7 @@
               </div>
             </div>
 
+            <!-- SQL Command Row -->
             <div class="input-row">
               <div class="speech-bubble-wrapper sql-bubble">
                 <textarea id="sqlQuery" name="query" rows="3" placeholder="If you are fluent in SQL, feel free to bypass me and type it here and click 'Execute SQL'"></textarea>
@@ -128,13 +150,16 @@
             </div>
           </div>
 
+          <!-- Column 2: Action Buttons Stacked (Translate, I feel lucky, Execute SQL) -->
           <div class="action-buttons-column">
             <button type="button" id="translateBtn" class="btn btn-primary btn-control-block">Translate Prompt</button>
             <button type="button" id="luckyBtn" class="btn btn-primary btn-control-block">I feel lucky</button>
             <button type="button" id="runBtn" class="btn btn-primary btn-control-block">Execute SQL</button>
           </div>
 
+          <!-- Column 3: Stats Stacked (Translation on top, SQL execution on bottom) -->
           <div class="stats-column">
+            <!-- Translate Stats (Top) -->
             <div id="translationStats" class="stats-card-vertical">
               <div class="stat-card-title">Translation Stats</div>
               <div class="stat-item-inline">
@@ -151,6 +176,7 @@
               </div>
             </div>
 
+            <!-- SQL Execution Stats (Bottom) -->
             <div id="executionStats" class="stats-card-vertical">
               <div class="stat-card-title">SQL Execution Stats</div>
               <div class="stat-item-inline">
@@ -167,12 +193,17 @@
               </div>
             </div>
           </div>
+
         </div>
       </section>
 
+      <!-- Section: Results -->
       <section class="card table-card">
         <div class="results-container">
+          <!-- Pinned Tab Bar -->
           <div id="resultsTabsNav" class="results-tabs-nav hidden"></div>
+        
+          <!-- Scrollable Table Wrapper -->
           <div class="results-table-wrapper">
             <table>
               <thead>
@@ -197,6 +228,7 @@
     </footer>
   </div>
 
+  <!-- Help Modal Dialog -->
   <div id="helpModal" class="modal-overlay hidden">
     <div class="modal-card">
       <div class="modal-header">
@@ -229,6 +261,7 @@
     </div>
   </div>
 
+  <!-- History Modal Dialog -->
   <div id="historyModal" class="modal-overlay hidden">
     <div class="modal-card modal-card-large">
       <div class="modal-header">
@@ -242,6 +275,7 @@
         <button id="historyModalCloseBtn" class="modal-close-btn" type="button">&times;</button>
       </div>
       
+      <!-- Chrome-Style Navigation Tabs -->
       <div id="historyTabsNav" class="results-tabs-nav">
         <button type="button" id="tabBtnTranslations" class="result-tab-btn active">
           <span class="result-tab-title">Translations</span>
@@ -254,6 +288,7 @@
       </div>
 
       <div class="modal-body">
+        <!-- Tab 1: Translations Table -->
         <div id="historyTabTranslations" class="history-tab-content">
           <div class="results-container history-results-container">
             <div class="results-table-wrapper">
@@ -271,6 +306,7 @@
           </div>
         </div>
 
+        <!-- Tab 2: Statistics Charts -->
         <div id="historyTabStatistics" class="history-tab-content hidden">
           <div class="stats-charts-vertical-container">
             <div class="chart-card vertical-chart-card">
@@ -297,6 +333,7 @@
     </div>
   </div>
 
+
   <!-- Configuration Modal Dialog -->
   <div id="configModal" class="modal-overlay hidden">
     <div class="modal-card">
@@ -306,12 +343,17 @@
       </div>
 
       <form id="configForm" class="modal-body" onsubmit="event.preventDefault();">
-        <!-- Section 1: Database Connection Radio Group -->
+        <!-- Section 1: Database Connection URL -->
         <div class="config-section">
-          <span class="config-label">Database Connection</span>
-          <div class="radio-group" id="modalDbRadioGroup">
-            <!-- Dynamically populated radio options from backend configured_databases -->
-          </div>
+          <label for="modalDbUrl" class="config-label">Database Connection</label>
+          <input 
+            type="text" 
+            id="modalDbUrl" 
+            class="config-input" 
+            value=""
+            placeholder="postgresql://user:password@host:5432/dbname"
+            autocomplete="off"
+          />
         </div>
 
         <!-- Section 2: Gemini Model Choice (Radio Group) -->
@@ -322,6 +364,7 @@
           </div>
         </div>
 
+        <!-- Modal Action Buttons Alignment -->
         <div class="modal-actions" style="display: flex; gap: 0.5rem; justify-content: flex-end; align-items: center;">
           <button type="button" id="configResetBtn" class="btn btn-modal-secondary">Reset Defaults</button>
           <button type="button" id="configSaveBtn" class="btn btn-primary">Save Changes</button>
@@ -330,9 +373,15 @@
     </div>
   </div>
   
+  <!-- Client Scripts -->
+  <!-- 1. SQL Formatting Library -->
   <script src="https://cdn.jsdelivr.net/npm/sql-formatter@15.4.0/dist/sql-formatter.min.js"></script>
+  
+  <!-- 2. CodeMirror Core and SQL Mode Scripts -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/codemirror.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/mode/sql/sql.min.js"></script>
+
+  <!-- 3. Local configuration (optional) and Application JavaScript -->
   <script src="client.js"></script>
 </body>
 </html>

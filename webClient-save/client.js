@@ -5,7 +5,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   let ACTIVE_DB_URL = "";
   let DEFAULT_MODEL = "";
   let AVAILABLE_MODELS = [""];
-  let CONFIGURED_DBS = [];
 
   // DOM Elements - Primary Controls
   const aiPrompt = document.getElementById('aiPrompt');
@@ -64,6 +63,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   let recognition = null;
   let isListening = false;
 
+  // Speech Synthesis Helper
   function speakMessage(text) {
     if ('speechSynthesis' in window) {
       window.speechSynthesis.cancel();
@@ -72,6 +72,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
+  // Speech Recognition Setup
   const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (SpeechRecognition) {
     recognition = new SpeechRecognition();
@@ -116,6 +117,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
+  // CodeMirror Setup
   let sqlEditor = null;
   if (sqlQueryTextarea && window.CodeMirror) {
     sqlEditor = window.CodeMirror.fromTextArea(sqlQueryTextarea, {
@@ -128,16 +130,19 @@ document.addEventListener('DOMContentLoaded', async () => {
     sqlEditor.setSize('100%', '100%');
   }
 
+  // Handle Manual Element Resizing using ResizeObserver
   const sqlContainer = document.querySelector('.speech-bubble-wrapper.sql-bubble');
 
   if (sqlContainer && sqlEditor && window.ResizeObserver) {
     const resizeObserver = new ResizeObserver(() => {
+      // Force CodeMirror to recalculate height and redraw scrollbars on manual resize
       sqlEditor.setSize('100%', '100%');
       sqlEditor.refresh();
     });
     resizeObserver.observe(sqlContainer);
   }
 
+  // Refresh CodeMirror when window resizes to fit viewport changes
   window.addEventListener('resize', () => {
     if (sqlEditor) {
       sqlEditor.setSize('100%', '100%');
@@ -145,6 +150,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   });
 
+  // Helper to enable/disable action buttons during active processing
   function setButtonsDisabled(disabled) {
     if (translateBtn) translateBtn.disabled = disabled;
     if (luckyBtn) luckyBtn.disabled = disabled;
@@ -222,7 +228,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       const response = await fetch('/api/config', { credentials: 'same-origin' });
       const data = await response.json();
 
-      CONFIGURED_DBS = data.configured_databases || [];
       DEFAULT_DB_URL = data.default_database_url || "";
       ACTIVE_DB_URL = data.active_database_url || maskConnectionDbUrl(DEFAULT_DB_URL);
       DEFAULT_MODEL = data.default_model || "";
@@ -240,54 +245,12 @@ document.addEventListener('DOMContentLoaded', async () => {
         sessionStorage.setItem('crbot_db_url', DEFAULT_DB_URL);
       }
 
-      renderDbRadioButtons();
       renderModelRadioButtons();
       loadConfigIntoUI();
       
       updateConnectionDetails(data);
     } catch (err) {
       console.error("Failed to fetch backend configuration:", err);
-    }
-  }
-
-  function renderDbRadioButtons() {
-    const radioGroup = document.getElementById('modalDbRadioGroup');
-    if (!radioGroup) return;
-
-    let html = '';
-    
-    // Configured DB name radio buttons
-    CONFIGURED_DBS.forEach((db, idx) => {
-      const isDefault = idx === 0;
-      html += `
-        <label class="radio-option">
-          <input type="radio" name="db_connection_option" value="${db.url}" ${isDefault ? 'checked' : ''}>
-          <span class="radio-label">${db.name}</span>
-        </label>
-      `;
-    });
-
-    // Third radio button with custom text box
-    html += `
-      <label class="radio-option" style="display: flex; align-items: center; gap: 0.5rem;">
-        <input type="radio" name="db_connection_option" value="custom" id="radioCustomDb">
-        <input type="text" id="modalCustomDbUrl" class="config-input" placeholder="postgresql://user:password@host:5432/dbname" style="flex: 1;" autocomplete="off">
-      </label>
-    `;
-
-    radioGroup.innerHTML = html;
-
-    // Auto-select custom radio button when user types in the input box
-    const customInput = document.getElementById('modalCustomDbUrl');
-    if (customInput) {
-      customInput.addEventListener('focus', () => {
-        const customRadio = document.getElementById('radioCustomDb');
-        if (customRadio) customRadio.checked = true;
-      });
-      customInput.addEventListener('input', () => {
-        const customRadio = document.getElementById('radioCustomDb');
-        if (customRadio) customRadio.checked = true;
-      });
     }
   }
 
@@ -324,7 +287,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   function loadConfigIntoUI() {
     const config = loadConfig();
 
-    renderDbRadioButtons();
     renderModelRadioButtons();
 
     const modelRadios = document.querySelectorAll('input[name="gemini_model"]');
@@ -335,25 +297,17 @@ document.addEventListener('DOMContentLoaded', async () => {
       modelRadios[0].checked = true;
     }
 
+    const modalDbUrl = document.getElementById('modalDbUrl');
+    if (modalDbUrl) {
+      modalDbUrl.value = ACTIVE_DB_URL || maskConnectionDbUrl(config.dbUrl || DEFAULT_DB_URL);
+    }
+
     updateHistoryTurnsSubtitle();
   }
   
   async function triggerConfigSave({ closeModal = false, dbUrl = null, model = null } = {}) {
-    let dbUrlValue = dbUrl;
-    
-    if (dbUrlValue === null) {
-      const selectedDbRadio = document.querySelector('input[name="db_connection_option"]:checked');
-      if (selectedDbRadio) {
-        if (selectedDbRadio.value === 'custom') {
-          const customInput = document.getElementById('modalCustomDbUrl');
-          dbUrlValue = customInput ? customInput.value.trim() : "";
-        } else {
-          dbUrlValue = selectedDbRadio.value;
-        }
-      } else {
-        dbUrlValue = DEFAULT_DB_URL;
-      }
-    }
+    const modalDbUrlInput = document.getElementById('modalDbUrl');
+    const dbUrlValue = dbUrl !== null ? dbUrl : (modalDbUrlInput ? modalDbUrlInput.value.trim() : "");
     
     let selectedModel = model;
     if (!selectedModel) {
@@ -403,12 +357,21 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       ACTIVE_DB_URL = maskConnectionDbUrl(DEFAULT_DB_URL);
 
-      renderDbRadioButtons();
-      renderModelRadioButtons();
+      const modalDbUrl = document.getElementById('modalDbUrl');
+      if (modalDbUrl) {
+        modalDbUrl.value = ACTIVE_DB_URL;
+      }
+
+      const defaultModelRadio = document.querySelector(`input[name="gemini_model"][value="${DEFAULT_MODEL}"]`);
+      if (defaultModelRadio) {
+        defaultModelRadio.checked = true;
+      } else {
+        renderModelRadioButtons();
+      }
 
       await triggerConfigSave({ 
         closeModal: false, 
-        dbUrl: DEFAULT_DB_URL, 
+        dbUrl: "", 
         model: DEFAULT_MODEL 
       });
     });
