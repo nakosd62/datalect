@@ -223,8 +223,10 @@
 
         <h3>5. Selecting AI Model</h3>
         <p>By default, the application uses Gemini 3.6 Flash. You can change that in the configuration popup (<strong>gear icon</strong>).</p>
+
         <h3>6. Multi-turn conversations</h3>
-        <p>CRBot remembers the last 10 queries/prompts and takes them int account before responding. If you want to reset chat histroy open the History popup (clock icon) and click <strong>Clear Chat History</strong>.</p>
+        <p>CRBot remembers the last 5 prompt-response pairs and takes them into account before responding. If you want to reset chat histroy open the History popup (clock icon) and click <strong>Clear Chat History</strong>.</p>
+        
       </div>
     </div>
   </div>
@@ -323,7 +325,6 @@
         </div>
 
         <div class="modal-actions" style="display: flex; gap: 0.5rem; justify-content: flex-end; align-items: center;">
-          <button type="button" id="configResetBtn" class="btn btn-modal-secondary">Reset Defaults</button>
           <button type="button" id="configSaveBtn" class="btn btn-primary">Save Changes</button>
         </div>
       </form>

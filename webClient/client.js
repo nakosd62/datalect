@@ -29,7 +29,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   const configBtn = document.getElementById('configBtn');
   const modalCloseBtn = document.getElementById('modalCloseBtn');
   const configSaveBtn = document.getElementById('configSaveBtn');
-  const configResetBtn = document.getElementById('configResetBtn');
   const connDbName = document.getElementById('connDbName');
   const connDbUser = document.getElementById('connDbUser');
 
@@ -213,7 +212,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (connDbName) connDbName.textContent = dbName;
       if (connDbUser) connDbUser.textContent = username;
 
-      document.title = `CRBot : Talk to your CockroachDB. Connected to ${dbName} as ${username}`;
+      document.title = `YDYL`;
     }
   }
 
@@ -396,24 +395,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (configModal) configModal.classList.add('hidden');
   }
 
-  if (configResetBtn) {
-    configResetBtn.addEventListener('click', async () => {
-      localStorage.removeItem('crbot_model');
-      sessionStorage.removeItem('crbot_db_url');
-
-      ACTIVE_DB_URL = maskConnectionDbUrl(DEFAULT_DB_URL);
-
-      renderDbRadioButtons();
-      renderModelRadioButtons();
-
-      await triggerConfigSave({ 
-        closeModal: false, 
-        dbUrl: DEFAULT_DB_URL, 
-        model: DEFAULT_MODEL 
-      });
-    });
-  }
-
   if (configBtn && configModal) {
     configBtn.addEventListener('click', () => {
       loadConfigIntoUI();
@@ -590,6 +571,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   if (historyBtn && historyModal) {
     historyBtn.addEventListener('click', () => {
+      updateHistoryTurnsSubtitle(); // Ensure subtitle turn count is updated when modal opens
       historyModal.classList.remove('hidden');
       loadHistoryData();
     });

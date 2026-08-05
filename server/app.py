@@ -292,12 +292,11 @@ def translate_query():
         client = genai.Client(api_key=api_key)
         
         system_instruction = (
-            "You are an expert SQL generation assistant for CockroachDB which is a robust, distributed, PostgreSQL-compatible RDBMS.\n"
+            "You are an expert SQL generation assistant for PostgreSQL-compatible RDBMSs.\n"
             "Given the user's natural language request and the database schema, translate the request into SQL.\n"
             "It is EXTREMELY important to respect the database schema, i.e. column names, type, constraints, checks, etc.\n"
             "You may return one or more independent SQL statements. Do not attempt to join the result sets.\n"
             "You may use PL/pgSQL Functions or Procedures, if appropriate.\n"
-            "For a complete list of SQL syntax supported by CockroachDB, see https://www.cockroachlabs.com/docs/v26.2/sql-statements\n"
             "Format the result data to be easily readable. For example, format timestamps as date:hour:min:sec.\n"
             "Return ONLY the raw SQL code block. Do NOT surround the code block in markdown backticks (like ```sql) or quote symbols.\n"
             "Do NOT include explanations or other text. Just the executable SQL statement itself.\n"
