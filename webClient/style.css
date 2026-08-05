@@ -1475,3 +1475,70 @@ textarea:focus {
 .history-clear-wrapper .history-turns-subtitle {
   margin-top: 0;
 }
+
+/* History Modal Header Layout */
+.history-header-left {
+  display: flex;
+  align-items: center;
+  gap: 1.25rem;
+  flex-wrap: wrap;
+}
+
+.history-clear-wrapper {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Subtitle positioned directly under Clear Chat History button */
+.history-turns-subtitle {
+  font-size: 0.68rem;
+  margin-top: 0.25rem;
+  min-height: 1.1em;
+  font-weight: 500;
+  color: var(--text-muted, #94a3b8);
+  text-align: center;
+  white-space: nowrap;
+}
+
+/* Responsive adjustment for narrow screens */
+@media screen and (max-width: 640px) {
+  .history-header-left {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.5rem;
+  }
+  
+  .history-clear-wrapper {
+    align-items: flex-start;
+  }
+  
+  .history-turns-subtitle {
+    text-align: left;
+  }
+}
+
+/* History Modal Header Layout */
+.history-header-left {
+  display: flex;
+  align-items: center;
+  gap: 1.25rem;
+  flex-wrap: nowrap;
+}
+
+.history-clear-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+/* Side-by-side turns subtitle badge */
+.history-turns-subtitle {
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: var(--text-muted, #94a3b8);
+  white-space: nowrap;
+  margin-top: 0;
+  line-height: 1;
+}

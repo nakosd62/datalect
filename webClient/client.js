@@ -200,7 +200,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (!clearMsgEl) return;
 
     const turns = Math.floor(chatHistory.length / 2);
-    clearMsgEl.textContent = `${turns} turn${turns === 1 ? '' : 's'} in history (max 5)`;
+    clearMsgEl.textContent = `${turns} turn${turns === 1 ? '' : 's'} in history`;
     clearMsgEl.style.color = 'var(--text-muted, #94a3b8)';
   }
 
