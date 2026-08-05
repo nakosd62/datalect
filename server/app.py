@@ -240,23 +240,127 @@ def get_database_schema(conn_str=None):
     conn = None
     try:
         conn = get_db_connection(conn_str)
+        schema_parts = []
+        
         with conn.cursor() as cursor:
-            cursor.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public';")
-            tables = [r[0] for r in cursor.fetchall()]
+            # 1. Fetch Tables and Columns (including Defaults & Nullability)
+            cursor.execute("""
+                SELECT 
+                    c.table_name, 
+                    c.column_name, 
+                    c.data_type, 
+                    c.is_nullable, 
+                    c.column_default
+                FROM information_schema.columns c
+                JOIN information_schema.tables t 
+                  ON c.table_name = t.table_name AND c.table_schema = t.table_schema
+                WHERE c.table_schema = 'public' 
+                  AND t.table_type = 'BASE TABLE'
+                ORDER BY c.table_name, c.ordinal_position;
+            """)
+            columns_data = cursor.fetchall()
             
-            schema_parts = []
-            for table in tables:
-                cursor.execute("""
-                    SELECT column_name, data_type, is_nullable
-                    FROM information_schema.columns
-                    WHERE table_name = %s AND table_schema = 'public'
-                    ORDER BY ordinal_position;
-                """, (table,))
-                columns = cursor.fetchall()
-                col_strings = [f"  {col[0]} {col[1]} ({'NULL' if col[2] == 'YES' else 'NOT NULL'})" for col in columns]
-                schema_parts.append(f"Table: {table}\n" + "\n".join(col_strings))
-                
-            return "\n\n".join(schema_parts)
+            tables = {}
+            for table_name, col_name, data_type, is_nullable, col_default in columns_data:
+                if table_name not in tables:
+                    tables[table_name] = []
+                default_str = f" DEFAULT {col_default}" if col_default else ""
+                null_str = "NULL" if is_nullable == "YES" else "NOT NULL"
+                tables[table_name].append(f"  {col_name} {data_type} {null_str}{default_str}")
+
+            for table_name, col_defs in tables.items():
+                schema_parts.append(f"Table: {table_name}\n" + "\n".join(col_defs))
+
+            # 2. Primary Keys, Foreign Keys, Unique & Check Constraints
+            cursor.execute("""
+                SELECT 
+                    tc.table_name, 
+                    tc.constraint_name, 
+                    tc.constraint_type,
+                    kcu.column_name,
+                    ccu.table_name AS foreign_table_name,
+                    ccu.column_name AS foreign_column_name
+                FROM information_schema.table_constraints AS tc
+                LEFT JOIN information_schema.key_column_usage AS kcu
+                  ON tc.constraint_name = kcu.constraint_name
+                 AND tc.table_schema = kcu.table_schema
+                LEFT JOIN information_schema.constraint_column_usage AS ccu
+                  ON ccu.constraint_name = tc.constraint_name
+                 AND ccu.table_schema = tc.table_schema
+                WHERE tc.table_schema = 'public'
+                ORDER BY tc.table_name, tc.constraint_name;
+            """)
+            constraints = cursor.fetchall()
+            if constraints:
+                constraint_lines = []
+                for tbl, c_name, c_type, col, f_tbl, f_col in constraints:
+                    if c_type == 'FOREIGN KEY':
+                        constraint_lines.append(f"  [{tbl}] {c_name} ({c_type}): {col} -> {f_tbl}({f_col})")
+                    elif col:
+                        constraint_lines.append(f"  [{tbl}] {c_name} ({c_type}): {col}")
+                    else:
+                        constraint_lines.append(f"  [{tbl}] {c_name} ({c_type})")
+                schema_parts.append("Constraints:\n" + "\n".join(constraint_lines))
+
+            # 3. Indexes (from pg_catalog)
+            cursor.execute("""
+                SELECT 
+                    tablename, 
+                    indexname, 
+                    indexdef 
+                FROM pg_indexes 
+                WHERE schemaname = 'public'
+                ORDER BY tablename, indexname;
+            """)
+            indexes = cursor.fetchall()
+            if indexes:
+                idx_lines = [f"  [{row[0]}] {row[1]}: {row[2]}" for row in indexes]
+                schema_parts.append("Indexes:\n" + "\n".join(idx_lines))
+
+            # 4. Views and View Definitions
+            cursor.execute("""
+                SELECT 
+                    table_name, 
+                    view_definition 
+                FROM information_schema.views 
+                WHERE table_schema = 'public';
+            """)
+            views = cursor.fetchall()
+            if views:
+                view_lines = [f"  View {v[0]}: {v[1].strip()}" for v in views]
+                schema_parts.append("Views:\n" + "\n".join(view_lines))
+
+            # 5. Table Grants / Permissions
+            cursor.execute("""
+                SELECT 
+                    grantee, 
+                    table_name, 
+                    privilege_type 
+                FROM information_schema.role_table_grants 
+                WHERE table_schema = 'public'
+                ORDER BY table_name, grantee;
+            """)
+            grants = cursor.fetchall()
+            if grants:
+                grant_lines = [f"  Grant {g[2]} on {g[1]} to {g[0]}" for g in grants]
+                schema_parts.append("Grants:\n" + "\n".join(grant_lines))
+
+            # 6. Triggers
+            cursor.execute("""
+                SELECT 
+                    event_object_table, 
+                    trigger_name, 
+                    event_manipulation, 
+                    action_statement 
+                FROM information_schema.triggers 
+                WHERE event_object_schema = 'public';
+            """)
+            triggers = cursor.fetchall()
+            if triggers:
+                trig_lines = [f"  [{t[0]}] {t[1]} ({t[2]}): {t[3]}" for t in triggers]
+                schema_parts.append("Triggers:\n" + "\n".join(trig_lines))
+
+        return "\n\n".join(schema_parts) if schema_parts else "No schema description available."
     except Exception as e:
         print(f"Error fetching schema: {e}")
         return "No schema description available."

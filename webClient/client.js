@@ -255,7 +255,6 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     let html = '';
     
-    // Configured DB name radio buttons
     CONFIGURED_DBS.forEach((db, idx) => {
       const isDefault = idx === 0;
       html += `
@@ -266,7 +265,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       `;
     });
 
-    // Third radio button with custom text box
     html += `
       <label class="radio-option" style="display: flex; align-items: center; gap: 0.5rem;">
         <input type="radio" name="db_connection_option" value="custom" id="radioCustomDb">
@@ -276,7 +274,6 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     radioGroup.innerHTML = html;
 
-    // Auto-select custom radio button when user types in the input box
     const customInput = document.getElementById('modalCustomDbUrl');
     if (customInput) {
       customInput.addEventListener('focus', () => {
@@ -571,7 +568,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   if (historyBtn && historyModal) {
     historyBtn.addEventListener('click', () => {
-      updateHistoryTurnsSubtitle(); // Ensure subtitle turn count is updated when modal opens
+      updateHistoryTurnsSubtitle();
       historyModal.classList.remove('hidden');
       loadHistoryData();
     });
@@ -699,6 +696,18 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (response.ok && data.sql) {
         setSqlQuery(data.sql);
 
+        // Record User Prompt and SQL Statement response into chatHistory
+        chatHistory.push({
+          role: 'user',
+          text: promptText
+        });
+        chatHistory.push({
+          role: 'model',
+          text: data.sql
+        });
+        chatHistory = chatHistory.slice(-10);
+        updateHistoryTurnsSubtitle();
+
         if (transStatus) {
           transStatus.textContent = "Success";
           transStatus.className = "stat-val status-success";
@@ -810,19 +819,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
         if (execTime) execTime.textContent = `${data.executionTimeMs} ms`;
         if (execRows) execRows.textContent = data.rowCount;
-
-        if (aiPrompt && aiPrompt.value.trim()) {
-          chatHistory.push({
-            role: 'user',
-            text: aiPrompt.value.trim()
-          });
-          chatHistory.push({
-            role: 'model',
-            text: sql
-          });
-          chatHistory = chatHistory.slice(-10);
-          updateHistoryTurnsSubtitle();
-        }
 
         renderMultiTurnResults(data.results);
       } else {
