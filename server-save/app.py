@@ -12,7 +12,6 @@ from flask_cors import CORS
 from google import genai
 from google.genai import types
 from google.cloud import storage
-from google.cloud import firestore
 
 app = Flask(__name__, static_folder='../webClient', static_url_path='')
 CORS(app)
@@ -57,19 +56,7 @@ if GCS_BUCKET_NAME:
 else:
     TRANSLATION_STATS_DB_PATH = "state/crbot_state.db"
 
-# --- Firestore / Local DB Configuration ---
-GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID")
-IS_CLOUD_RUN = bool(os.environ.get("K_SERVICE"))
-
-firestore_client = None
-if IS_CLOUD_RUN and GCP_PROJECT_ID:
-    try:
-        firestore_client = firestore.Client(project=GCP_PROJECT_ID, database="ydyl")
-        print("Initialized Cloud Firestore client for database 'ydyl'.")
-    except Exception as e:
-        print(f"Error initializing Firestore client: {e}")
-
-# --- Session Management ---
+# --- Session Management via SQLite ---
 
 def get_or_create_session_id():
     session_id = request.cookies.get('crbot_session_id') or request.headers.get('X-Session-ID')
@@ -78,18 +65,6 @@ def get_or_create_session_id():
     return session_id
 
 def set_session_db_url(session_id, db_url):
-    if firestore_client:
-        try:
-            doc_ref = firestore_client.collection("sessions").document(session_id)
-            doc_ref.set({
-                "database_url": db_url,
-                "updated_at": firestore.SERVER_TIMESTAMP
-            }, merge=True)
-            return
-        except Exception as e:
-            print(f"Error saving session to Firestore: {e}")
-            return
-
     try:
         with sqlite3.connect(TRANSLATION_STATS_DB_PATH) as conn:
             cursor = conn.cursor()
@@ -107,18 +82,6 @@ def set_session_db_url(session_id, db_url):
         print(f"Error saving session to SQLite: {e}")
 
 def get_session_db_url(session_id):
-    if firestore_client:
-        try:
-            doc_ref = firestore_client.collection("sessions").document(session_id)
-            doc = doc_ref.get()
-            if doc.exists:
-                data = doc.to_dict()
-                if data and data.get("database_url"):
-                    return data.get("database_url")
-        except Exception as e:
-            print(f"Error fetching session from Firestore: {e}")
-        return DEFAULT_CONN
-
     try:
         with sqlite3.connect(TRANSLATION_STATS_DB_PATH) as conn:
             cursor = conn.cursor()
@@ -171,10 +134,6 @@ def upload_db_to_gcs():
         print(f"Error uploading stats DB to GCS: {e}")
 
 def init_state_db():
-    if firestore_client:
-        print("Firestore is active; skipping local SQLite state database setup.")
-        return
-
     try:
         download_db_from_gcs()
 
@@ -255,26 +214,6 @@ def resolve_conn_str(conn_str=None, session_id=None):
     return conn_str
 
 def record_translation(conn_str, nl_prompt, sql_command, gemini_model, duration, input_tokens, output_tokens, total_tokens, thinking_tokens, cached_content_tokens):
-    if firestore_client:
-        try:
-            firestore_client.collection("translations").add({
-                "connect_string": redact_connection_url(conn_str),
-                "nl_prompt": nl_prompt,
-                "sql_command": sql_command,
-                "model": gemini_model,
-                "duration": duration,
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "total_tokens": total_tokens,
-                "thinking_tokens": thinking_tokens,
-                "cached_content_tokens": cached_content_tokens,
-                "created_at": firestore.SERVER_TIMESTAMP
-            })
-            return
-        except Exception as e:
-            print(f"Error recording translation in Firestore: {e}")
-            return
-
     try:
         with sqlite3.connect(TRANSLATION_STATS_DB_PATH) as conn:
             cursor = conn.cursor()
@@ -678,60 +617,6 @@ def execute_query():
 
 @app.route('/api/history', methods=['GET'])
 def get_translation_history():
-    if firestore_client:
-        try:
-            docs = (
-                firestore_client.collection("translations")
-                .order_by("created_at", direction=firestore.Query.DESCENDING)
-                .limit(20)
-                .stream()
-            )
-            rows = []
-            for doc in docs:
-                d = doc.to_dict()
-                created_at = d.get("created_at")
-                if hasattr(created_at, "isoformat"):
-                    created_at = created_at.isoformat()
-                rows.append({
-                    "nl_prompt": d.get("nl_prompt", ""),
-                    "sql_command": d.get("sql_command", ""),
-                    "created_at": created_at
-                })
-
-            docs_all = firestore_client.collection("translations").stream()
-            daily = {}
-            for doc in docs_all:
-                d = doc.to_dict()
-                dt = d.get("created_at")
-                if dt:
-                    if hasattr(dt, "strftime"):
-                        day_str = dt.strftime("%Y-%m-%d")
-                    else:
-                        day_str = str(dt)[:10]
-                else:
-                    continue
-
-                if day_str not in daily:
-                    daily[day_str] = {
-                        "day_date": day_str,
-                        "total_translations": 0,
-                        "sum_total_tokens": 0,
-                        "sum_input_tokens": 0
-                    }
-                daily[day_str]["total_translations"] += 1
-                daily[day_str]["sum_total_tokens"] += d.get("total_tokens", 0) or 0
-                daily[day_str]["sum_input_tokens"] += d.get("input_tokens", 0) or 0
-
-            stats = sorted(daily.values(), key=lambda x: x["day_date"])
-
-            return jsonify({
-                'success': True,
-                'history': rows,
-                'stats': stats
-            })
-        except Exception as e:
-            return jsonify({'success': False, 'error': f"Firestore error: {str(e)}"}), 500
-
     try:
         with sqlite3.connect(TRANSLATION_STATS_DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
