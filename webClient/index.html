@@ -211,8 +211,8 @@
         <p>Welcome to <strong>CRBot</strong>! Here is a quick guide on how to interact with it.</p>
         
         <h3>1. General</h3>
-        <p>By default, you are connected to a sample database called <strong>KitchenBank</strong> as a user called <strong>BankClerk</strong> that you may use as playground.</p>
-        <p>If you prefer to use your own database, click the <strong>gear icon</strong> on the upper right corner to configure your connection. Custom connection settings apply only for the current browser session and are cleared when you close the tab or window.</p>
+        <p>By default, you are connected to a simple banking database hosted in CockroachDB. You may use it as a playground. You may also select to experiment with an ECommerce database hosted in GCP CloudSQL by clicking on the <strong>gear icon</strong> on the upper right corner.</p>
+        <p>Or you may connect to your own postgres-complaint database by providing a connection URL in the same configuration screen. Custom connections as bound to a particular web browser session.</p>
 
         <h3>2. Natural Language Query</h3>
         <p>Type your query or instruction into the top text box in plain English or any other language. Click <strong>Translate Prompt</strong> to preview the generated SQL statement.</p>
@@ -222,13 +222,13 @@
         <p>Review the SQL in the middle editor box. You can manually edit the statement or write custom queries from scratch. Click <strong>Execute SQL</strong> to run the command against your database.</p>
 
         <h3>4. 'I feel lucky' Mode</h3>
-        <p>Clicking <strong>I feel lucky</strong> will automatically translate your natural language prompt and execute the resulting SQL in one seamless step. Use this mode judiciously.</p>
+        <p>Clicking <strong>I feel lucky</strong> will automatically translate your natural language prompt and execute the resulting SQL in one step. Use this mode judiciously.</p>
 
         <h3>5. Selecting AI Model</h3>
         <p>By default, the application uses Gemini 3.6 Flash. You can change that in the configuration popup (<strong>gear icon</strong>).</p>
 
         <h3>6. Multi-turn conversations</h3>
-        <p>CRBot remembers the last 5 prompt-response pairs and takes them into account before responding. If you want to reset chat histroy open the History popup (clock icon) and click <strong>Clear Chat History</strong>.</p>
+        <p>CRBot remembers the last 5 prompt-response pairs and takes them into account before responding. If you want to reset chat histroy, open the History popup (clock icon) and click <strong>Clear Chat History</strong>.</p>
 
       </div>
     </div>
