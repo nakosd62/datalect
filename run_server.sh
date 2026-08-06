@@ -42,6 +42,7 @@ if command -v lsof &> /dev/null; then
     fi
 fi
 pkill -9 -f "app.py" 2>/dev/null
+pkill -9 -f "cloud-sql-proxy" 2>/dev/null
 # pkill -9 -f "ngrok http" 2>/dev/null
 sleep 2
 
@@ -57,6 +58,9 @@ nohup ./venv/bin/python3 server/app.py > app.log 2>&1 &
 #     echo "Notice: ngrok command not found. Skipping ngrok tunnel."
 #    echo "The application is running locally at http://localhost:$CRBOT_PORT"
 # fi
+
+# Run the Cloud SQL Auth Proxy to access GCP CloudSQL databases
+cloud-sql-proxy grand-cosmos-716:us-east1:trial > cloud-sql-proxy.log 2>&1 &
 
 # Monitor output log
 echo "Tail app.log for standard output / error."

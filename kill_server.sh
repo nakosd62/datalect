@@ -20,4 +20,7 @@ pkill -9 -f "app.py" 2>/dev/null
 # 3. Kill the ngrok tunnel process
 pkill -9 -f "ngrok http" 2>/dev/null
 
+# 4. Kill CloudSQL Proxy
+pkill -9 -f "cloud-sql-proxy" 2>/dev/null
+
 echo "Done."
