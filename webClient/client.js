@@ -1,6 +1,5 @@
 document.addEventListener('DOMContentLoaded', async () => {
   let chatHistory = [];
-
   let DEFAULT_DB_URL = "";
   let ACTIVE_DB_URL = "";
   let DEFAULT_MODEL = "";
