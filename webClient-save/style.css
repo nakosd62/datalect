@@ -94,8 +94,8 @@ body {
   border-radius: 9999px;
   background: rgba(255, 255, 255, 0.03);
   border: 1px solid var(--bg-card-border);
-  padding: 0.2rem 0.65rem;
-  font-size: 0.8125rem;
+  padding: 0.1rem 0.5rem;
+  font-size: 0.70rem; /* Smaller font for DB connection details */
   color: var(--text-secondary);
   line-height: 1.2;
 }
@@ -1487,15 +1487,4 @@ textarea:focus {
   .modal-body {
     padding: 0.85rem 1rem;
   }
-}
-
-/* Clickable Badge Style for Triggering Config */
-.clickable-badge {
-  cursor: pointer;
-  transition: var(--transition);
-}
-
-.clickable-badge:hover {
-  background: rgba(255, 255, 255, 0.08);
-  border-color: var(--primary);
 }

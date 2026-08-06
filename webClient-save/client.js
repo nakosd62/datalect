@@ -2,6 +2,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   let chatHistory = [];
   let DEFAULT_DB_URL = "";
   let ACTIVE_DB_URL = "";
+  let DEFAULT_MODEL = "";
+  let AVAILABLE_MODELS = [""];
   let CONFIGURED_DBS = [];
 
   // DOM Elements - Primary Controls
@@ -23,7 +25,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // DOM Elements - Config Modal & Connection Status
   const configModal = document.getElementById('configModal');
-  const configTriggerBadge = document.getElementById('configTriggerBadge');
+  const configBtn = document.getElementById('configBtn');
   const modalCloseBtn = document.getElementById('modalCloseBtn');
   const configSaveBtn = document.getElementById('configSaveBtn');
   const connDbName = document.getElementById('connDbName');
@@ -236,11 +238,22 @@ document.addEventListener('DOMContentLoaded', async () => {
       CONFIGURED_DBS = data.configured_databases || [];
       DEFAULT_DB_URL = data.default_database_url || "";
       ACTIVE_DB_URL = data.active_database_url || maskConnectionDbUrl(DEFAULT_DB_URL);
+      DEFAULT_MODEL = data.default_model || "";
+      if (Array.isArray(data.available_models) && data.available_models.length > 0) {
+        AVAILABLE_MODELS = data.available_models;
+      }
 
+      // Sync model state in sessionStorage
+      const storedModel = sessionStorage.getItem('crbot_model');
+      if (!storedModel || !AVAILABLE_MODELS.includes(storedModel)) {
+        sessionStorage.setItem('crbot_model', DEFAULT_MODEL);
+      }
+      
+      // Clean up legacy localStorage items if present
       localStorage.removeItem('crbot_db_url');
       localStorage.removeItem('crbot_model');
-      sessionStorage.removeItem('crbot_model');
 
+      // Sync active database URL with latest backend state
       if (data.active_database_url) {
         sessionStorage.setItem('crbot_db_url', data.active_database_url);
       } else if (!sessionStorage.getItem('crbot_db_url') && DEFAULT_DB_URL) {
@@ -248,6 +261,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
 
       renderDbRadioButtons();
+      renderModelRadioButtons();
       loadConfigIntoUI();
       
       updateConnectionDetails(data);
@@ -290,6 +304,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const customInput = document.getElementById('modalCustomDbUrl');
     const customRadio = document.getElementById('radioCustomDb');
 
+    // Add event listeners to radio options to clear custom URL when preset radio buttons are clicked
     const dbRadios = radioGroup.querySelectorAll('input[name="db_connection_option"]');
     dbRadios.forEach(radio => {
       radio.addEventListener('change', () => {
@@ -309,19 +324,45 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
+  function renderModelRadioButtons() {
+    const radioGroup = document.getElementById('modalGeminiModelGroup');
+    if (!radioGroup) return;
+
+    const currentSelected = sessionStorage.getItem('crbot_model') || DEFAULT_MODEL;
+
+    radioGroup.innerHTML = AVAILABLE_MODELS.map(model => `
+      <label class="radio-option">
+        <input type="radio" name="gemini_model" value="${model}" ${model === currentSelected ? 'checked' : ''}>
+        <span class="radio-label">${model}</span>
+      </label>
+    `).join('');
+  }
+
   function loadConfig() {
     return {
+      model: sessionStorage.getItem('crbot_model') || DEFAULT_MODEL,
       dbUrl: sessionStorage.getItem('crbot_db_url') || ACTIVE_DB_URL || DEFAULT_DB_URL
     };
   }
 
   function loadConfigIntoUI() {
     const config = loadConfig();
+
     renderDbRadioButtons(config.dbUrl);
+    renderModelRadioButtons();
+
+    const modelRadios = document.querySelectorAll('input[name="gemini_model"]');
+    let matchingModelRadio = document.querySelector(`input[name="gemini_model"][value="${config.model}"]`);
+    if (matchingModelRadio) {
+      matchingModelRadio.checked = true;
+    } else if (modelRadios.length > 0) {
+      modelRadios[0].checked = true;
+    }
+
     updateHistoryTurnsSubtitle();
   }
   
-  async function triggerConfigSave({ closeModal = false, dbUrl = null } = {}) {
+  async function triggerConfigSave({ closeModal = false, dbUrl = null, model = null } = {}) {
     let dbUrlValue = dbUrl;
     
     if (dbUrlValue === null) {
@@ -340,6 +381,14 @@ document.addEventListener('DOMContentLoaded', async () => {
         dbUrlValue = DEFAULT_DB_URL;
       }
     }
+    
+    let selectedModel = model;
+    if (!selectedModel) {
+      const selectedModelRadio = document.querySelector('input[name="gemini_model"]:checked');
+      selectedModel = selectedModelRadio ? selectedModelRadio.value : DEFAULT_MODEL;
+    }
+
+    sessionStorage.setItem('crbot_model', selectedModel);
 
     try {
       const response = await fetch('/api/config', {
@@ -347,7 +396,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         headers: { 'Content-Type': 'application/json' },
         credentials: 'same-origin',
         body: JSON.stringify({
-          database_url: dbUrlValue
+          database_url: dbUrlValue,
+          model: selectedModel
         })
       });
 
@@ -373,8 +423,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (configModal) configModal.classList.add('hidden');
   }
 
-  if (configTriggerBadge && configModal) {
-    configTriggerBadge.addEventListener('click', async () => {
+  if (configBtn && configModal) {
+    configBtn.addEventListener('click', async () => {
       await fetchBackendConfig();
       configModal.classList.remove('hidden');
     });
@@ -668,6 +718,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         body: JSON.stringify({
           prompt: promptText,
           history: chatHistory,
+          gemini_model: config.model,
           database_url: config.dbUrl
         })
       });

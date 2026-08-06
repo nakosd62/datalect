@@ -46,9 +46,11 @@
                 </filter>
               </defs>
 
+              <!-- Outer Chat Bubble Container -->
               <path d="M 28 24 H 132 A 16 16 0 0 1 148 40 V 104 A 16 16 0 0 1 132 120 H 68 L 44 140 V 120 H 28 A 16 16 0 0 1 12 104 V 40 A 16 16 0 0 1 28 24 Z" 
                     fill="url(#crbotBgGrad)" stroke="#38BDF8" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
 
+              <!-- Database Symbol (Left) -->
               <g filter="url(#crbotGlow)">
                 <ellipse cx="50" cy="50" rx="22" ry="7" fill="none" stroke="#FFFFFF" stroke-width="4.5"/>
                 <path d="M 28 50 V 66 C 28 70 38 73 50 73 C 62 73 72 70 72 66 V 50" fill="none" stroke="#38BDF8" stroke-width="4.5"/>
@@ -58,16 +60,20 @@
                 <circle cx="60" cy="82" r="3" fill="#34D399"/>
               </g>
 
+              <!-- Natural Language Speech Bubble (Right) -->
               <g filter="url(#crbotGlow)">
                 <rect x="88" y="44" width="44" height="34" rx="8" fill="none" stroke="#34D399" stroke-width="4.5"/>
                 <path d="M 98 78 L 92 86 V 78" stroke="#34D399" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+                <!-- High-contrast internal text brackets -->
                 <path d="M 103 54 C 100 54, 99 56, 99 58 C 99 60, 97 61, 95 61 C 97 61, 99 62, 99 64 C 99 66, 100 68, 103 68" stroke="#FFFFFF" stroke-width="3" stroke-linecap="round" fill="none"/>
                 <path d="M 117 54 C 120 54, 121 56, 121 58 C 121 60, 123 61, 125 61 C 123 61, 121 62, 121 64 C 121 66, 120 68, 117 68" stroke="#FFFFFF" stroke-width="3" stroke-linecap="round" fill="none"/>
               </g>
 
+              <!-- Exchange Arrows (Center) -->
               <path d="M 74 58 H 82 L 78 54" stroke="#FFFFFF" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
               <path d="M 86 68 H 78 L 82 72" stroke="#FFFFFF" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
 
+              <!-- Bottom Progress / Tech Bar -->
               <line x1="42" y1="102" x2="118" y2="102" stroke="#475569" stroke-width="4" stroke-linecap="round"/>
               <line x1="42" y1="102" x2="85" y2="102" stroke="#34D399" stroke-width="4" stroke-linecap="round" filter="url(#crbotGlow)"/>
               <circle cx="85" cy="102" r="4" fill="#FFFFFF" filter="url(#crbotGlow)"/>
@@ -76,14 +82,10 @@
         </div>
 
         <div class="header-actions">
-          <div id="configTriggerBadge" class="status-badge connected clickable-badge" title="Connection Info (Click to configure)">
+          <div class="status-badge connected" title="Connection Info">
             <span class="status-dot"></span>
-            <span id="connDbUser" style="font-size: 1.0rem; color: var(--text-secondary); font-weight: 500; padding: 0.1rem 0.1rem;"></span>
-            <span style="font-size: 1.0rem; color: var(--text-secondary); font-weight: 500; padding: 0 0.1rem;">@</span>
-            <span id="connDbName" style="font-size: 1.0rem; color: var(--text-secondary); font-weight: 500; padding: 0.1rem 0.1rem;"></span>
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-left: 2px; margin-right: 3px; color: var(--text-secondary);">
-              <path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"></path>
-            </svg>
+            <span id="connDbName" style="font-size: 0.70rem; color: var(--text-secondary); font-weight: 500; padding: 0.1rem 0.3rem;"></span>
+            <span id="connDbUser" style="font-size: 0.70rem; color: var(--text-muted); padding-right: 0.3rem;"></span>
           </div>
 
           <button id="helpBtn" class="help-btn" title="Help">
@@ -98,6 +100,13 @@
             <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <circle cx="12" cy="12" r="10"></circle>
               <polyline points="12 6 12 12 16 14"></polyline>
+            </svg>
+          </button>
+
+          <button id="configBtn" class="gear-btn" title="Configuration">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="3"></circle>
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
             </svg>
           </button>
         </div>
@@ -207,7 +216,7 @@
         <p>Welcome to <strong>CRBot</strong>! Here is a quick guide on how to interact with it.</p>
         
         <h3>1. General</h3>
-        <p>By default, you are connected to a simple banking database hosted in CockroachDB. You may use it as a playground. You may also select to experiment with an ECommerce database hosted in GCP CloudSQL by clicking on the <strong>database connection info</strong> on the upper right corner.</p>
+        <p>By default, you are connected to a simple banking database hosted in CockroachDB. You may use it as a playground. You may also select to experiment with an ECommerce database hosted in GCP CloudSQL by clicking on the <strong>gear icon</strong> on the upper right corner.</p>
         <p>Or you may connect to your own postgres-complaint database by providing a connection URL in the same configuration screen. Custom connections as bound to a particular web browser session.</p>
 
         <h3>2. Natural Language Query</h3>
@@ -220,8 +229,11 @@
         <h3>4. 'I feel lucky' Mode</h3>
         <p>Clicking <strong>I feel lucky</strong> will automatically translate your natural language prompt and execute the resulting SQL in one step. Use this mode judiciously.</p>
 
-        <h3>5. Multi-turn conversations</h3>
-        <p>CRBot remembers the last 5 prompt-response pairs and takes them into account before responding. If you want to reset chat history, open the History popup (clock icon) and click <strong>Clear Chat History</strong>.</p>
+        <h3>5. Selecting AI Model</h3>
+        <p>By default, the application uses Gemini 3.6 Flash. You can change that in the configuration popup (<strong>gear icon</strong>).</p>
+
+        <h3>6. Multi-turn conversations</h3>
+        <p>CRBot remembers the last 5 prompt-response pairs and takes them into account before responding. If you want to reset chat histroy, open the History popup (clock icon) and click <strong>Clear Chat History</strong>.</p>
 
       </div>
     </div>
@@ -299,7 +311,7 @@
   <div id="configModal" class="modal-overlay hidden">
     <div class="modal-card">
       <div class="modal-header">
-        <h2 class="modal-title"></h2>
+        <h2 class="modal-title">⚙️ System Configuration</h2>
         <button id="modalCloseBtn" class="modal-close-btn" type="button">&times;</button>
       </div>
 
@@ -307,6 +319,12 @@
         <div class="config-section">
           <span class="config-label">Database Connection</span>
           <div class="radio-group" id="modalDbRadioGroup">
+          </div>
+        </div>
+
+        <div class="config-section">
+          <span class="config-label">Gemini Model Choice</span>
+          <div class="radio-group" id="modalGeminiModelGroup">
           </div>
         </div>
 
