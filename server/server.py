@@ -295,12 +295,28 @@ def resolve_conn_str(conn_str=None, user_id=None):
         return DEFAULT_CONN
     return conn_str
 
+def get_conn_identifier(conn_str):
+    """Extracts username@dbname from a PostgreSQL connection string."""
+    if not conn_str:
+        return "unknown@unknown"
+    try:
+        parsed = urlparse(conn_str)
+        username = parsed.username or "unknown"
+        dbname = parsed.path.lstrip('/')
+        if '?' in dbname:
+            dbname = dbname.split('?')[0]
+        return f"{username}@{dbname or 'unknown'}"
+    except Exception:
+        return "unknown@unknown"
+
 def record_translation(user_id, conn_str, nl_prompt, sql_command, gemini_model, duration, input_tokens, output_tokens, total_tokens, thinking_tokens, cached_content_tokens):
+    conn_identifier = get_conn_identifier(conn_str)
+
     if firestore_client:
         try:
             firestore_client.collection("translations").add({
                 "user_id": user_id,
-                "connect_string": redact_connection_url(conn_str),
+                "connect_string": conn_identifier,
                 "nl_prompt": nl_prompt,
                 "sql_command": sql_command,
                 "model": gemini_model,
@@ -330,7 +346,7 @@ def record_translation(user_id, conn_str, nl_prompt, sql_command, gemini_model, 
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 user_id,
-                redact_connection_url(conn_str), 
+                conn_identifier, 
                 nl_prompt, sql_command, 
                 gemini_model, 
                 duration, input_tokens, output_tokens, total_tokens, thinking_tokens, cached_content_tokens
