@@ -36,8 +36,8 @@
 
 html, body {
   height: 100%;
-  height: 100dvh; /* Dynamic viewport height to handle dynamic browser bars */
-  overflow: hidden; /* Lock entire body viewport and eliminate main page scrolling */
+  height: 100dvh; /* Dynamic viewport height lock */
+  overflow: hidden; /* Lock viewport on all screen sizes */
 }
 
 body {
@@ -58,6 +58,7 @@ body {
   height: 500px;
   background: radial-gradient(circle, rgba(16, 185, 129, 0.06) 0%, rgba(0,0,0,0) 70%);
   z-index: -1;
+  pointer-events: none;
 }
 
 .background-decor-2 {
@@ -68,27 +69,35 @@ body {
   height: 600px;
   background: radial-gradient(circle, rgba(99, 102, 241, 0.04) 0%, rgba(0,0,0,0) 70%);
   z-index: -1;
+  pointer-events: none;
 }
 
 /* App Container */
 .app-container {
   max-width: 1400px;
   width: 100%;
-  height: 100%;
+  height: 100dvh;
   margin: 0 auto;
   padding: 0.5rem 1.5rem 0.25rem 1.5rem;
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
+  overflow: hidden;
 }
 
-.status-badge {
-  display: flex;
+/* DB Connection & Status Badge (Positioned below title) */
+.status-badge,
+.db-connection-info {
+  display: inline-flex;
   align-items: center;
-  gap: 0.4rem;
+  gap: 0.35rem;
   border-radius: 9999px;
   background: rgba(255, 255, 255, 0.03);
   border: 1px solid var(--bg-card-border);
+  padding: 0.1rem 0.5rem;
+  font-size: 0.70rem; /* Smaller font for DB connection details */
+  color: var(--text-secondary);
+  line-height: 1.2;
 }
 
 .status-badge.connected .status-dot {
@@ -110,6 +119,7 @@ body {
   gap: 0.35rem;
   flex: 1; /* Fills remaining space above footer */
   min-height: 0; /* Allows flex items to shrink below content size */
+  overflow: hidden;
 }
 
 select {
@@ -155,12 +165,12 @@ select:focus {
   flex-shrink: 0; /* Prevents top controls card from scaling down */
 }
 
-/* Dynamic Dynamic-Height Results Section */
+/* Dynamic Height Results Section */
 .table-card {
   padding: 0.75rem;
-  flex: 1; /* Consumes all remaining available height */
-  min-height: 150px;
-  max-height: none; /* Removes fixed 350px restraint */
+  flex: 1; /* Consumes all remaining available vertical space */
+  min-height: 0;
+  max-height: none;
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -391,21 +401,25 @@ textarea:focus {
   width: 100%;
 }
 
+/* Title Group: Vertical Stack putting DB Info under Title */
 .crbot-title-group {
   display: flex;
-  align-items: center;
-  gap: 0.75rem;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 0.15rem;
   min-width: 0;
   flex: 1 1 auto;
 }
 
 .crbot-title,
 .header-title {
-  font-size: clamp(0.9rem, 2.5vw, 1.5rem);
+  font-size: clamp(0.9rem, 2.5vw, 1.4rem);
   font-weight: 700;
   color: #f8fafc;
   letter-spacing: -0.02em;
   margin: 0;
+  margin-top: -0.15rem; /* Pushes the title up slightly */
   display: flex;
   align-items: center;
   gap: 0.5rem;
@@ -657,6 +671,7 @@ textarea:focus {
   justify-content: center;
   z-index: 1000;
   transition: opacity 0.2s ease;
+  padding: 1rem;
 }
 
 .modal-overlay.hidden {
@@ -792,15 +807,15 @@ textarea:focus {
   background: rgba(255, 255, 255, 0.2);
 }
 
-/* Footer */
+/* Permanently Visible Footer */
 .app-footer {
-  flex-shrink: 0; /* Keeps footer pinned to the bottom without being squeezed */
+  flex-shrink: 0; /* Pinned to viewport bottom without pushing out */
   text-align: center;
-  padding: 0.5rem 0;
+  padding: 0.35rem 0;
   border-top: 1px solid var(--bg-card-border);
   color: var(--text-muted);
   font-size: 0.825rem;
-  margin-top: 0.5rem;
+  margin-top: 0.25rem;
 }
 
 /* Radio Button Group Styles */
@@ -842,8 +857,9 @@ textarea:focus {
 .results-container {
   display: flex;
   flex-direction: column;
-  height: 100%; /* Expands dynamically to parent .table-card */
-  flex: 1;
+  height: 100%;
+  flex: 1; /* Takes all available vertical space in table-card */
+  min-height: 0;
   background-color: #0f172a;
   border-radius: 8px;
   overflow: hidden;
@@ -960,6 +976,7 @@ textarea:focus {
 
 .results-table-wrapper {
   flex: 1;
+  min-height: 0;
   overflow: auto;
   position: relative;
 }
@@ -1022,12 +1039,13 @@ textarea:focus {
   font-family: var(--font-mono, monospace);
 }
 
-/* Layout Grid for Compact Vertical Controls */
+/* Dynamic Controls Layout Grid */
 .controls-layout-grid {
   display: flex;
   gap: 1rem;
   align-items: stretch;
   width: 100%;
+  flex-wrap: nowrap;
 }
 
 .inputs-column {
@@ -1035,7 +1053,7 @@ textarea:focus {
   display: flex;
   flex-direction: column;
   gap: 0.75rem;
-  max-width: calc(100% - 305px);
+  min-width: 0;
 }
 
 .input-row {
@@ -1257,37 +1275,23 @@ textarea:focus {
   background: rgba(5, 8, 16, 0.4);
   border: 1px solid var(--bg-card-border);
   border-radius: 8px;
-  padding: 0.25rem 0.5rem;
+  padding: 0.25rem 0;
 }
 
-.vertical-chart-card h3 {
-  font-size: 0.7rem;
-  font-weight: 600;
-  color: var(--text-secondary);
-  text-transform: uppercase;
-  margin-bottom: 0.15rem;
-}
-
-.vertical-chart-card .chart-wrapper {
-  flex: 1;
-  position: relative;
-  min-height: 0;
-  width: 100%;
-}
-
+/* Microphone Icon Absolute Positioning inside Prompt Box */
 .mic-btn {
   position: absolute;
-  top: 6px;
+  top: 8px;
   right: 8px;
   background: transparent;
   border: none;
   color: var(--text-muted);
-  cursor: pointer;
   padding: 4px;
-  border-radius: 50%;
+  cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
+  border-radius: 4px;
   transition: var(--transition);
   z-index: 5;
 }
@@ -1297,297 +1301,18 @@ textarea:focus {
   background: rgba(255, 255, 255, 0.08);
 }
 
-/* Red pulsing animation while recording */
 .mic-btn.listening {
-  color: var(--danger, #f87171);
-  animation: pulse-red 1.2s infinite;
-  background: var(--danger-glow, rgba(248, 113, 113, 0.2));
+  color: #ef4444;
+  animation: pulse 1.5s infinite;
 }
 
-@keyframes pulse-red {
-  0% {
-    box-shadow: 0 0 0 0 rgba(248, 113, 113, 0.6);
-  }
-  70% {
-    box-shadow: 0 0 0 8px rgba(248, 113, 113, 0);
-  }
-  100% {
-    box-shadow: 0 0 0 0 rgba(248, 113, 113, 0);
-  }
-}
-
-/* ==========================================================================
-   RESPONSIVE MEDIA QUERIES (CRBot Mobile & Tablet Adaptations)
-   ========================================================================== */
-
-/* --- Tablet / Medium Screens (max-width: 1024px) --- */
-@media screen and (max-width: 1024px) {
-  .app-container {
-    padding: 0.75rem;
-  }
-
-  .vertical-chart-card {
-    width: 90%;
-  }
-}
-
-/* --- Small Tablets / Intermediate Viewports (max-width: 900px) --- */
-@media screen and (max-width: 900px) {
-
-  /* 1. Header Adaptations - Preserve single-line layout */
-  .crbot-header {
-    flex-direction: row;
-    align-items: center;
-    justify-content: space-between;
-    gap: 0.5rem;
-  }
-
-  .crbot-title-group {
-    flex-wrap: nowrap;
-  }
-
-  .header-subtitle {
-    display: block;
-    margin-left: 0 !important;
-    margin-top: 0.25rem;
-  }
-
-  .header-actions {
-    align-self: center;
-  }
-
-  /* 2. Controls Grid Reflow */
-  .controls-layout-grid {
-    flex-direction: column;
-    gap: 1rem;
-  }
-
-  .inputs-column {
-    max-width: 100%; /* Override fixed calc width */
-  }
-
-  .action-buttons-column {
-    width: 100%;
-    flex-direction: row;
-    gap: 0.5rem;
-  }
-
-  .action-buttons-column .btn {
-    flex: 1;
-    height: 38px; /* Slightly larger tap target for touch */
-    font-size: 0.8rem;
-  }
-
-  .stats-column {
-    width: 100%;
-    flex-direction: row;
-    gap: 0.75rem;
-  }
-
-  .stats-column #translationStats,
-  .stats-column #executionStats {
-    margin: 0;
-  }
-
-  .stats-card-vertical {
-    padding: 0.5rem 0.75rem;
-  }
-
-  /* 3. Modal Adjustments */
-  .modal-card {
-    width: 95vw;
-    max-height: 90vh;
-  }
-
-  .modal-card-large {
-    width: 95vw;
-  }
-
-  .stats-charts-vertical-container {
-    height: auto;
-    gap: 1rem;
-  }
-
-  .vertical-chart-card {
-    width: 100%;
-    height: 220px;
-  }
-}
-
-/* ==========================================================================
-   MOBILE RESPONSIVE OVERRIDES (Phones / Small Screens)
-   ========================================================================== */
-
-@media screen and (max-width: 600px) {
-  /* Compress padding and margin on header */
-  .crbot-header {
-    flex-direction: row;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: 0.15rem;
-    padding-bottom: 0.15rem;
-  }
-
-  /* Reduce SVG Icon size */
-  .crbot-icon-wrapper svg {
-    width: 32px;
-    height: 32px;
-  }
-
-  /* Hide connection info details on phone screens */
-  .header-subtitle {
-    display: none !important;
-  }
-
-  /* Compact top-right icon buttons */
-  .header-actions {
-    width: auto;
-    gap: 0.25rem;
-  }
-
-  /* Reduce container padding on small screens */
-  .app-container {
-    padding: 0.5rem 0.5rem 0.25rem 0.5rem;
-  }
-
-  /* Convert grid container to flex column stack */
-  .controls-layout-grid {
-    display: flex !important;
-    flex-direction: column !important;
-  }
-}
-
-/* History Modal Header Specific Layout */
+/* History Modal Header Horizontal Alignment */
 .history-header-left {
   display: flex;
   align-items: center;
-  gap: 1.25rem;
-}
-
-.history-clear-wrapper {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-}
-
-.history-clear-wrapper .history-turns-subtitle {
-  margin-top: 0;
-}
-
-/* History Modal Header Layout */
-.history-header-left {
-  display: flex;
-  align-items: center;
-  gap: 1.25rem;
-  flex-wrap: wrap;
-}
-
-.history-clear-wrapper {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-}
-
-/* Subtitle positioned directly under Clear Chat History button */
-.history-turns-subtitle {
-  font-size: 0.68rem;
-  margin-top: 0.25rem;
-  min-height: 1.1em;
-  font-weight: 500;
-  color: var(--text-muted, #94a3b8);
-  text-align: center;
-  white-space: nowrap;
-}
-
-/* Responsive adjustment for narrow screens */
-@media screen and (max-width: 640px) {
-  .history-header-left {
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 0.5rem;
-  }
-  
-  .history-clear-wrapper {
-    align-items: flex-start;
-  }
-  
-  .history-turns-subtitle {
-    text-align: left;
-  }
-}
-
-/* History Modal Header Layout */
-.history-header-left {
-  display: flex;
-  align-items: center;
-  gap: 1.25rem;
+  gap: 0.85rem;
   flex-wrap: nowrap;
-}
-
-.history-clear-wrapper {
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-}
-
-/* Side-by-side turns subtitle badge */
-.history-turns-subtitle {
-  font-size: 0.75rem;
-  font-weight: 500;
-  color: var(--text-muted, #94a3b8);
-  white-space: nowrap;
-  margin-top: 0;
-  line-height: 1;
-}
-
-/* History Modal Clear Button & Integrated Subtitle */
-.btn-clear-history {
-  display: inline-flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  height: auto;
-  min-height: 42px;
-  padding: 0.35rem 0.9rem;
-  background-color: #3f444d;
-  color: #f5f6f8;
-  border-radius: 8px;
-  border: none;
-  cursor: pointer;
-  line-height: 1.25;
-  transition: var(--transition);
-}
-
-.btn-clear-history:hover {
-  background-color: #4b525d;
-}
-
-.btn-clear-title {
-  font-size: 0.70rem;
-  font-weight: 600;
-}
-
-.history-turns-subtitle {
-  font-size: 0.58rem;
-  font-weight: 400;
-  margin-top: 2px;
-  color: #94a3b8;
-  text-align: center;
-  white-space: nowrap;
-  min-height: 1.1em;
-}
-
-.history-header-left {
-  display: flex;
-  align-items: center;
-  gap: 1.25rem;
-  flex-wrap: nowrap;
-}
-
-.history-header-left .modal-title {
-  margin: 0;
-  white-space: nowrap;
+  min-width: 0;
 }
 
 .history-clear-wrapper {
@@ -1596,27 +1321,170 @@ textarea:focus {
   flex-shrink: 0;
 }
 
-/* History Modal Header Layout */
-.history-header-left {
-  display: flex;
-  align-items: center;
-  gap: 1rem;
-  flex-wrap: nowrap;
+/* ==========================================================================
+   RESPONSIVE MEDIA QUERIES (Preserves Viewport Lock & Full Results Space)
+   ========================================================================== */
+
+/* Laptop / Medium Screen Adaptation */
+@media (max-width: 1024px) {
+  html, body {
+    overflow: hidden; /* Maintained viewport lock */
+  }
+
+  .app-container {
+    padding: 0.5rem 1rem;
+    height: 100dvh;
+  }
+
+  .controls-layout-grid {
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  .inputs-column {
+    width: 100%;
+    flex: none;
+  }
+
+  /* 3 Action Buttons full width side-by-side */
+  .action-buttons-column {
+    width: 100%;
+    flex-direction: row;
+    gap: 0.5rem;
+    justify-content: space-between;
+  }
+
+  .action-buttons-column .btn {
+    height: 32px;
+    flex: 1;
+    white-space: nowrap;
+  }
+
+  /* 2 Stats Sections full width side-by-side under buttons */
+  .stats-column {
+    width: 100%;
+    flex-direction: row;
+    gap: 0.5rem;
+    align-items: stretch;
+  }
+
+  .stats-column #translationStats,
+  .stats-column #executionStats {
+    margin: 0;
+    flex: 1;
+  }
+
+  .table-card {
+    flex: 1;
+    min-height: 0;
+  }
 }
 
-/* Reduced Height Clear History Button (~25% shorter: 34px -> 26px) */
-.btn-clear-history {
-  height: 26px;
-  padding: 0 0.85rem;
-  font-size: 0.68rem;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 0.5rem;
+/* Tablet & Smaller Screen Adaptation */
+@media (max-width: 768px) {
+  .crbot-header {
+    flex-wrap: nowrap;
+    gap: 0.5rem;
+  }
+
+  .crbot-title-group {
+    width: auto;
+  }
+
+  .controls-layout-grid {
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  .action-buttons-column,
+  .stats-column {
+    width: 100%;
+    flex-direction: row;
+    gap: 0.5rem;
+  }
+
+  .action-buttons-column .btn {
+    flex: 1;
+    height: 32px;
+  }
+
+  .stats-column #translationStats,
+  .stats-column #executionStats {
+    flex: 1;
+    margin: 0;
+  }
+
+  .speech-bubble-wrapper.sql-bubble {
+    height: 100px;
+    min-height: 80px;
+  }
+
+  .modal-card,
+  .modal-card-large {
+    width: 95vw;
+    max-height: 90vh;
+  }
+
+  .charts-grid,
+  .modal-stats-container {
+    grid-template-columns: 1fr;
+    height: auto;
+    max-height: 60vh;
+    overflow-y: auto;
+  }
+
+  .vertical-chart-card {
+    width: 100%;
+  }
+
+  .history-header-left {
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
 }
 
-/* Align inline subtitle inside shorter button */
-.btn-clear-history .history-turns-subtitle {
-  margin-top: 0;
-  font-size: 0.65rem;
+/* Mobile Screen Adaptation */
+@media (max-width: 480px) {
+  .card {
+    padding: 0.4rem 0.6rem;
+  }
+
+  .crbot-title,
+  .header-title {
+    font-size: 1.05rem;
+  }
+
+  .status-badge,
+  .db-connection-info {
+    font-size: 0.65rem;
+  }
+
+  .action-buttons-column {
+    gap: 0.35rem;
+  }
+
+  .action-buttons-column .btn {
+    padding: 0 0.25rem;
+    font-size: 0.68rem;
+  }
+
+  .result-tab-btn {
+    min-width: 90px;
+    padding: 0 10px;
+    font-size: 0.75rem;
+  }
+
+  .results-table-wrapper th,
+  .results-table-wrapper td {
+    padding: 8px 10px;
+    font-size: 0.75rem;
+  }
+
+  .modal-header {
+    padding: 0.85rem 1rem;
+  }
+
+  .modal-body {
+    padding: 0.85rem 1rem;
+  }
 }

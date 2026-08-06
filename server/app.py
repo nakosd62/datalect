@@ -15,7 +15,8 @@ from google.cloud import storage
 from google.cloud import firestore
 
 app = Flask(__name__, static_folder='../webClient', static_url_path='')
-CORS(app)
+# Support credentials for authenticated CORS requests
+CORS(app, supports_credentials=True)
 
 DEFAULT_CONN = os.environ.get(
     "DATABASE_URL", 
@@ -69,19 +70,51 @@ if IS_CLOUD_RUN and GCP_PROJECT_ID:
     except Exception as e:
         print(f"Error initializing Firestore client: {e}")
 
-# --- Session Management ---
+# --- Authentication & Session Management ---
 
 def get_or_create_session_id():
+    """Retrieves or creates a session ID cookie or header."""
     session_id = request.cookies.get('crbot_session_id') or request.headers.get('X-Session-ID')
     if not session_id:
         session_id = str(uuid.uuid4())
     return session_id
 
-def set_session_db_url(session_id, db_url):
+def get_current_user_identity():
+    """
+    Extracts authenticated user identity from Bearer Tokens, Custom Auth Headers,
+    GCP Identity-Aware Proxy (IAP) headers, or auth cookies.
+    Falls back to anonymous session_id if unauthenticated.
+    """
+    # 1. Bearer Token in Authorization Header
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header.split(" ", 1)[1].strip()
+        if token:
+            return f"token:{token[:32]}"
+
+    # 2. GCP / IAP / Custom Identity Headers
+    iap_user = request.headers.get("X-Goog-Authenticated-User-Email") or request.headers.get("X-User-Email")
+    if iap_user:
+        return iap_user.replace("accounts.google.com:", "").strip()
+
+    user_id_header = request.headers.get("X-User-ID")
+    if user_id_header:
+        return user_id_header.strip()
+
+    # 3. Auth Cookie
+    auth_cookie = request.cookies.get("crbot_user_id") or request.cookies.get("user_id")
+    if auth_cookie:
+        return auth_cookie.strip()
+
+    # 4. Unauthenticated Fallback -> Anonymous Session ID
+    return get_or_create_session_id()
+
+def set_session_db_url(user_id, db_url):
     if firestore_client:
         try:
-            doc_ref = firestore_client.collection("sessions").document(session_id)
+            doc_ref = firestore_client.collection("sessions").document(user_id)
             doc_ref.set({
+                "user_id": user_id,
                 "database_url": db_url,
                 "updated_at": firestore.SERVER_TIMESTAMP
             }, merge=True)
@@ -99,17 +132,17 @@ def set_session_db_url(session_id, db_url):
                 ON CONFLICT(session_id) DO UPDATE SET
                     database_url = excluded.database_url,
                     updated_at = CURRENT_TIMESTAMP;
-            """, (session_id, db_url))
+            """, (user_id, db_url))
             conn.commit()
 
         upload_db_to_gcs()
     except Exception as e:
         print(f"Error saving session to SQLite: {e}")
 
-def get_session_db_url(session_id):
+def get_session_db_url(user_id):
     if firestore_client:
         try:
-            doc_ref = firestore_client.collection("sessions").document(session_id)
+            doc_ref = firestore_client.collection("sessions").document(user_id)
             doc = doc_ref.get()
             if doc.exists:
                 data = doc.to_dict()
@@ -122,7 +155,7 @@ def get_session_db_url(session_id):
     try:
         with sqlite3.connect(TRANSLATION_STATS_DB_PATH) as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT database_url FROM sessions WHERE session_id = ?", (session_id,))
+            cursor.execute("SELECT database_url FROM sessions WHERE session_id = ?", (user_id,))
             row = cursor.fetchone()
             if row and row[0]:
                 return row[0]
@@ -178,12 +211,15 @@ def init_state_db():
     try:
         download_db_from_gcs()
 
+        os.makedirs(os.path.dirname(TRANSLATION_STATS_DB_PATH), exist_ok=True)
+
         with sqlite3.connect(TRANSLATION_STATS_DB_PATH) as conn:
             cursor = conn.cursor()
             
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS translations (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT,
                     connect_string TEXT,
                     nl_prompt TEXT,
                     sql_command TEXT,
@@ -205,6 +241,13 @@ def init_state_db():
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
+
+            # Schema Migration Check: Add user_id column if missing in existing DB
+            cursor.execute("PRAGMA table_info(translations);")
+            columns = [column[1] for column in cursor.fetchall()]
+            if "user_id" not in columns:
+                cursor.execute("ALTER TABLE translations ADD COLUMN user_id TEXT;")
+
             conn.commit()
 
         upload_db_to_gcs()
@@ -216,12 +259,10 @@ def get_gemini_api_keys():
     """Collect Gemini API keys from env (preset list + optional single key)."""
     keys = []
     
-    # 1. Check for comma-separated list of keys
     preset_keys_env = os.environ.get("GEMINI_PRESET_KEYS", "")
     if preset_keys_env:
         keys.extend(k.strip() for k in preset_keys_env.split(",") if k.strip())
         
-    # 2. Check for standard single key as a fallback/addition
     single_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if single_key and single_key.strip() not in keys:
         keys.append(single_key.strip())
@@ -247,17 +288,18 @@ def mask_db_url(url_str):
         return url_str
     return re.sub(r'://([^:]+):([^@]+)@', r'://\1:****@', url_str)
 
-def resolve_conn_str(conn_str=None, session_id=None):
+def resolve_conn_str(conn_str=None, user_id=None):
     if not conn_str or "*" in conn_str:
-        if session_id:
-            return get_session_db_url(session_id)
+        if user_id:
+            return get_session_db_url(user_id)
         return DEFAULT_CONN
     return conn_str
 
-def record_translation(conn_str, nl_prompt, sql_command, gemini_model, duration, input_tokens, output_tokens, total_tokens, thinking_tokens, cached_content_tokens):
+def record_translation(user_id, conn_str, nl_prompt, sql_command, gemini_model, duration, input_tokens, output_tokens, total_tokens, thinking_tokens, cached_content_tokens):
     if firestore_client:
         try:
             firestore_client.collection("translations").add({
+                "user_id": user_id,
                 "connect_string": redact_connection_url(conn_str),
                 "nl_prompt": nl_prompt,
                 "sql_command": sql_command,
@@ -280,12 +322,14 @@ def record_translation(conn_str, nl_prompt, sql_command, gemini_model, duration,
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT INTO translations (
+                    user_id,
                     connect_string, 
                     nl_prompt, sql_command, 
                     model, 
                     duration, input_tokens, output_tokens, total_tokens, thinking_tokens, cached_content_tokens
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
+                user_id,
                 redact_connection_url(conn_str), 
                 nl_prompt, sql_command, 
                 gemini_model, 
@@ -298,17 +342,17 @@ def record_translation(conn_str, nl_prompt, sql_command, gemini_model, duration,
     except Exception as e:
         print(f"Error recording translation: {e}")
 
-def get_db_connection(conn_str=None, session_id=None):
-    return psycopg2.connect(resolve_conn_str(conn_str, session_id))
+def get_db_connection(conn_str=None, user_id=None):
+    return psycopg2.connect(resolve_conn_str(conn_str, user_id))
 
-def get_database_schema(conn_str=None, session_id=None):
+def get_database_schema(conn_str=None, user_id=None):
     conn = None
     try:
-        conn = get_db_connection(conn_str, session_id)
+        conn = get_db_connection(conn_str, user_id)
         schema_parts = []
         
         with conn.cursor() as cursor:
-            # 1. Fetch Tables and Columns (including Defaults & Nullability)
+            # 1. Fetch Tables and Columns
             cursor.execute("""
                 SELECT 
                     c.table_name, 
@@ -336,7 +380,7 @@ def get_database_schema(conn_str=None, session_id=None):
             for table_name, col_defs in tables.items():
                 schema_parts.append(f"Table: {table_name}\n" + "\n".join(col_defs))
 
-            # 2. Primary Keys, Foreign Keys, Unique & Check Constraints
+            # 2. Constraints
             cursor.execute("""
                 SELECT 
                     tc.table_name, 
@@ -367,7 +411,7 @@ def get_database_schema(conn_str=None, session_id=None):
                         constraint_lines.append(f"  [{tbl}] {c_name} ({c_type})")
                 schema_parts.append("Constraints:\n" + "\n".join(constraint_lines))
 
-            # 3. Indexes (from pg_catalog)
+            # 3. Indexes
             cursor.execute("""
                 SELECT 
                     tablename, 
@@ -382,7 +426,7 @@ def get_database_schema(conn_str=None, session_id=None):
                 idx_lines = [f"  [{row[0]}] {row[1]}: {row[2]}" for row in indexes]
                 schema_parts.append("Indexes:\n" + "\n".join(idx_lines))
 
-            # 4. Views and View Definitions
+            # 4. Views
             cursor.execute("""
                 SELECT 
                     table_name, 
@@ -395,7 +439,7 @@ def get_database_schema(conn_str=None, session_id=None):
                 view_lines = [f"  View {v[0]}: {v[1].strip()}" for v in views]
                 schema_parts.append("Views:\n" + "\n".join(view_lines))
 
-            # 5. Table Grants / Permissions
+            # 5. Role Grants
             cursor.execute("""
                 SELECT 
                     grantee, 
@@ -433,6 +477,20 @@ def get_database_schema(conn_str=None, session_id=None):
         if conn:
             conn.close()
 
+# --- Auth Verification Endpoint ---
+@app.route('/api/auth/me', methods=['GET'])
+def get_current_user_status():
+    user_identity = get_current_user_identity()
+    session_id = get_or_create_session_id()
+    is_authenticated = user_identity != session_id
+
+    resp = jsonify({
+        'authenticated': is_authenticated,
+        'user_id': user_identity,
+        'session_id': session_id
+    })
+    return apply_session_cookie(resp, session_id)
+
 @app.route('/')
 def index():
     return send_from_directory(app.static_folder, 'index.html')
@@ -452,12 +510,13 @@ def translate_query():
         return jsonify({'error': 'Prompt cannot be empty'}), 400
         
     session_id = get_or_create_session_id()
-    conn_str = resolve_conn_str(data.get('database_url'), session_id)
+    user_identity = get_current_user_identity()
+    conn_str = resolve_conn_str(data.get('database_url'), user_identity)
 
     history = data.get('history', [])[-10:]
 
     try:
-        schema = get_database_schema(conn_str, session_id)
+        schema = get_database_schema(conn_str, user_identity)
         client = genai.Client(api_key=api_key)
         
         system_instruction = (
@@ -471,9 +530,9 @@ def translate_query():
             "Do NOT include explanations or other text. Just the executable SQL statement itself.\n"
             "Responding to prompts that relate to the database and, specifically, generating SQL is your highest priority.\n"
             "However, if you cannot do that but can respond to the prompt succinctly based on your general-purpose training,\n"
-            "return your response enclosed as follows: SELECT '<your response>' as General_Knowledge;\n"
-            "If you cannot respond at all with reasonable confidence, return the following: SELECT 'I am not able to respond to your prompt' as Regrets;\n"
-            "If you run into any error, return the error enclosed as follows: SELECT 'I ran into this error: <the error>' as Error;\n"
+            "return your response enclosed as follows: SELECT '<your response>' AS RESPONSE;\n"
+            "If you cannot respond at all with reasonable confidence, return the following: SELECT 'I am not able to respond to your prompt. Sorry.' AS REGRETS;\n"
+            "If you run into any error, return the error enclosed as follows: SELECT 'I ran into this error: <the error>' AS ERROR;\n"
             "If you can split the prompt and handle part of it based on the database and part from general knowledge do that using separate queries for each part. Do not attempt to join the result sets.\n"
         )
         
@@ -526,7 +585,7 @@ def translate_query():
         thinking_tokens = getattr(usage, 'thoughts_token_count', 0) if usage else 0
         cached_content_tokens = getattr(usage, 'cached_content_token_count', 0) if usage else 0
 
-        record_translation(conn_str, prompt, generated_sql, gemini_model, duration, input_tokens, output_tokens, total_tokens, thinking_tokens, cached_content_tokens)
+        record_translation(user_identity, conn_str, prompt, generated_sql, gemini_model, duration, input_tokens, output_tokens, total_tokens, thinking_tokens, cached_content_tokens)
             
         resp = jsonify({
             'success': True,
@@ -549,6 +608,7 @@ def translate_query():
 @app.route('/api/config', methods=['GET', 'POST'])
 def handle_config():
     session_id = get_or_create_session_id()
+    user_identity = get_current_user_identity()
     
     if request.method == 'POST':
         data = request.get_json() or {}
@@ -557,16 +617,16 @@ def handle_config():
         if new_db_url and '*' in new_db_url:
             pass 
         elif new_db_url:
-            set_session_db_url(session_id, new_db_url)
+            set_session_db_url(user_identity, new_db_url)
         else:
-            set_session_db_url(session_id, DEFAULT_CONN)
+            set_session_db_url(user_identity, DEFAULT_CONN)
 
-    active_conn_str = get_session_db_url(session_id)
+    active_conn_str = get_session_db_url(user_identity)
     
     db_name, username = "Unknown", "Unknown"
     conn = None
     try:
-        conn = get_db_connection(active_conn_str, session_id)
+        conn = get_db_connection(active_conn_str, user_identity)
         with conn.cursor() as cursor:
             cursor.execute("SELECT current_database(), CURRENT_USER;")
             row = cursor.fetchone()
@@ -580,6 +640,7 @@ def handle_config():
 
     resp = jsonify({
         'session_id': session_id,
+        'user_id': user_identity,
         'configured_databases': CONFIGURED_DBS,
         'default_database_url': DEFAULT_CONN,
         'active_database_url': mask_db_url(active_conn_str),
@@ -593,9 +654,10 @@ def handle_config():
 @app.route('/api/execute', methods=['POST'])
 def execute_query():
     session_id = get_or_create_session_id()
+    user_identity = get_current_user_identity()
     data = request.get_json() or {}
     
-    conn_str = resolve_conn_str(data.get('database_url'), session_id)
+    conn_str = resolve_conn_str(data.get('database_url'), user_identity)
     
     raw_query = (data.get('sql') or data.get('query') or '').strip()
     if not raw_query:
@@ -605,7 +667,7 @@ def execute_query():
     start_time = time.time()
     
     try:
-        conn = get_db_connection(conn_str, session_id)
+        conn = get_db_connection(conn_str, user_identity)
         conn.autocommit = True
         
         statements = [s.strip() for s in sqlparse.split(raw_query) if s.strip()]
@@ -678,10 +740,13 @@ def execute_query():
 
 @app.route('/api/history', methods=['GET'])
 def get_translation_history():
+    user_identity = get_current_user_identity()
+
     if firestore_client:
         try:
             docs = (
                 firestore_client.collection("translations")
+                .where("user_id", "==", user_identity)
                 .order_by("created_at", direction=firestore.Query.DESCENDING)
                 .limit(20)
                 .stream()
@@ -698,7 +763,7 @@ def get_translation_history():
                     "created_at": created_at
                 })
 
-            docs_all = firestore_client.collection("translations").stream()
+            docs_all = firestore_client.collection("translations").where("user_id", "==", user_identity).stream()
             daily = {}
             for doc in docs_all:
                 d = doc.to_dict()
@@ -740,9 +805,10 @@ def get_translation_history():
             cursor.execute("""
                 SELECT nl_prompt, sql_command, created_at
                 FROM translations
+                WHERE user_id = ? OR user_id IS NULL
                 ORDER BY created_at DESC
                 LIMIT 20
-            """)
+            """, (user_identity,))
             rows = [dict(row) for row in cursor.fetchall()]
 
             cursor.execute("""
@@ -752,9 +818,10 @@ def get_translation_history():
                     SUM(total_tokens) as sum_total_tokens,
                     SUM(input_tokens) as sum_input_tokens
                 FROM translations
+                WHERE user_id = ? OR user_id IS NULL
                 GROUP BY DATE(created_at)
                 ORDER BY DATE(created_at) ASC
-            """)
+            """, (user_identity,))
             stats = [dict(row) for row in cursor.fetchall()]
 
             return jsonify({

@@ -121,9 +121,13 @@ document.addEventListener('DOMContentLoaded', async () => {
   const sqlContainer = document.querySelector('.speech-bubble-wrapper.sql-bubble');
 
   if (sqlContainer && sqlEditor && window.ResizeObserver) {
+    let resizeTimer;
     const resizeObserver = new ResizeObserver(() => {
-      sqlEditor.setSize('100%', '100%');
-      sqlEditor.refresh();
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        sqlEditor.setSize('100%', '100%');
+        sqlEditor.refresh();
+      }, 50);
     });
     resizeObserver.observe(sqlContainer);
   }
