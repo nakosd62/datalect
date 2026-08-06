@@ -4,6 +4,16 @@ document.addEventListener('DOMContentLoaded', async () => {
   let ACTIVE_DB_URL = "";
   let CONFIGURED_DBS = [];
 
+  // Helper function to include Google ID tokens or auth headers in fetch requests
+  function getApiHeaders() {
+    const headers = { 'Content-Type': 'application/json' };
+    const googleToken = sessionStorage.getItem('google_id_token');
+    if (googleToken) {
+      headers['Authorization'] = `Bearer ${googleToken}`;
+    }
+    return headers;
+  }
+
   // DOM Elements - Primary Controls
   const aiPrompt = document.getElementById('aiPrompt');
   const sqlQueryTextarea = document.getElementById('sqlQuery');
@@ -137,6 +147,22 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   });
 
+  // Initialize Google Sign-In if container/button exists
+  function initGoogleAuth() {
+    if (window.google && window.google.accounts) {
+      google.accounts.id.initialize({
+        client_id: 'YOUR_GCP_OAUTH_CLIENT_ID.apps.googleusercontent.com',
+        callback: (response) => {
+          if (response.credential) {
+            sessionStorage.setItem('google_id_token', response.credential);
+            console.log("Google ID token acquired and stored.");
+          }
+        }
+      });
+      // Optional: Render standard Sign-In button or prompt
+    }
+  }  
+
   function setButtonsDisabled(disabled) {
     if (translateBtn) translateBtn.disabled = disabled;
     if (luckyBtn) luckyBtn.disabled = disabled;
@@ -230,7 +256,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   async function fetchBackendConfig() {
     try {
-      const response = await fetch('/api/config', { credentials: 'same-origin' });
+      const response = await fetch('/api/config', { headers: getApiHeaders(), credentials: 'same-origin' });
       const data = await response.json();
 
       CONFIGURED_DBS = data.configured_databases || [];
@@ -344,7 +370,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     try {
       const response = await fetch('/api/config', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getApiHeaders(),
         credentials: 'same-origin',
         body: JSON.stringify({
           database_url: dbUrlValue
@@ -497,7 +523,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     historyTableBody.innerHTML = '<tr><td class="text-center text-muted py-8">Loading history...</td></tr>';
 
     try {
-      const response = await fetch('/api/history', { credentials: 'same-origin' });
+      const response = await fetch('/api/history', { headers: getApiHeaders(), credentials: 'same-origin' });
       const data = await response.json();
 
       if (response.ok && data.success) {
@@ -663,7 +689,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     try {
       const response = await fetch('/api/translate', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getApiHeaders(),
         credentials: 'same-origin',
         body: JSON.stringify({
           prompt: promptText,
@@ -780,7 +806,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     try {
       const response = await fetch('/api/execute', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getApiHeaders(),
         credentials: 'same-origin',
         body: JSON.stringify({
           sql: sql,

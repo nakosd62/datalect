@@ -13,6 +13,8 @@ from google import genai
 from google.genai import types
 from google.cloud import storage
 from google.cloud import firestore
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
 
 app = Flask(__name__, static_folder='../webClient', static_url_path='')
 # Support credentials for authenticated CORS requests
@@ -58,12 +60,14 @@ if GCS_BUCKET_NAME:
 else:
     TRANSLATION_STATS_DB_PATH = "state/crbot_state.db"
 
-# --- Firestore / Local DB Configuration ---
+# --- Authentication & State Configuration ---
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
+AUTH_ENABLED = bool(GOOGLE_CLIENT_ID)
 GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID")
 IS_CLOUD_RUN = bool(os.environ.get("K_SERVICE"))
 
 firestore_client = None
-if IS_CLOUD_RUN and GCP_PROJECT_ID:
+if (AUTH_ENABLED or IS_CLOUD_RUN) and GCP_PROJECT_ID:
     try:
         firestore_client = firestore.Client(project=GCP_PROJECT_ID, database="ydyl")
         print("Initialized Cloud Firestore client for database 'ydyl'.")
@@ -81,16 +85,26 @@ def get_or_create_session_id():
 
 def get_current_user_identity():
     """
-    Extracts authenticated user identity from Bearer Tokens, Custom Auth Headers,
+    Extracts authenticated user identity from Bearer Tokens (verified via Google OAuth),
     GCP Identity-Aware Proxy (IAP) headers, or auth cookies.
-    Falls back to anonymous session_id if unauthenticated.
+    Falls back to anonymous session_id only if authentication is disabled locally.
     """
-    # 1. Bearer Token in Authorization Header
+    # 1. Bearer Token in Authorization Header (Google ID Token)
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
         token = auth_header.split(" ", 1)[1].strip()
         if token:
-            return f"token:{token[:32]}"
+            if GOOGLE_CLIENT_ID:
+                try:
+                    idinfo = id_token.verify_oauth2_token(
+                        token, google_requests.Request(), GOOGLE_CLIENT_ID
+                    )
+                    return idinfo.get("email")
+                except Exception as e:
+                    print(f"Google ID token verification failed: {e}")
+                    return None
+            else:
+                return f"token:{token[:32]}"
 
     # 2. GCP / IAP / Custom Identity Headers
     iap_user = request.headers.get("X-Goog-Authenticated-User-Email") or request.headers.get("X-User-Email")
@@ -106,7 +120,11 @@ def get_current_user_identity():
     if auth_cookie:
         return auth_cookie.strip()
 
-    # 4. Unauthenticated Fallback -> Anonymous Session ID
+    # 4. If auth is enabled, unauthenticated requests return None
+    if GOOGLE_CLIENT_ID:
+        return None
+
+    # 5. Local fallback -> Anonymous Session ID
     return get_or_create_session_id()
 
 def set_session_db_url(user_id, db_url):
@@ -498,12 +516,13 @@ def get_database_schema(conn_str=None, user_id=None):
 def get_current_user_status():
     user_identity = get_current_user_identity()
     session_id = get_or_create_session_id()
-    is_authenticated = user_identity != session_id
+    is_authenticated = bool(user_identity and user_identity != session_id)
 
     resp = jsonify({
         'authenticated': is_authenticated,
         'user_id': user_identity,
-        'session_id': session_id
+        'session_id': session_id,
+        'auth_required': AUTH_ENABLED
     })
     return apply_session_cookie(resp, session_id)
 
