@@ -85,7 +85,7 @@ body {
   overflow: hidden;
 }
 
-/* DB Connection & Status Badge (Positioned below title) */
+/* DB Connection & Status Badge (Responsive text & icon scaling) */
 .status-badge,
 .db-connection-info {
   display: inline-flex;
@@ -98,6 +98,21 @@ body {
   font-size: 0.8125rem;
   color: var(--text-secondary);
   line-height: 1.2;
+}
+
+.status-badge .conn-badge-text {
+  font-size: clamp(0.65rem, 1.2vw, 0.9rem);
+  color: var(--text-secondary);
+  font-weight: 500;
+  padding: 0.1rem;
+}
+
+.status-badge .conn-badge-icon {
+  margin-left: 2px;
+  margin-right: 3px;
+  color: var(--text-secondary);
+  width: clamp(10px, 1.5vw, 14px);
+  height: clamp(10px, 1.5vw, 14px);
 }
 
 .status-badge.connected .status-dot {
@@ -116,7 +131,7 @@ body {
 .vertical-layout {
   display: flex;
   flex-direction: column;
-  gap: 0.35rem;
+  gap: 0.175rem;
   flex: 1; /* Fills remaining space above footer */
   min-height: 0; /* Allows flex items to shrink below content size */
   overflow: hidden;
@@ -392,7 +407,7 @@ textarea:focus {
 /* Header Section */
 .crbot-header {
   margin-bottom: 0;
-  padding-bottom: 0.15rem;
+  padding-bottom: 0.075rem;
   display: flex;
   align-items: center;
   justify-content: space-between;
