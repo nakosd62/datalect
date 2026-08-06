@@ -147,19 +147,32 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   });
 
-  // Initialize Google Sign-In if container/button exists
-  function initGoogleAuth() {
-    if (window.google && window.google.accounts) {
+  // Initialize Google Sign-In with dynamic client ID
+  function initGoogleAuth(clientId) {
+    if (window.google && window.google.accounts && clientId) {
       google.accounts.id.initialize({
-        client_id: 'YOUR_GCP_OAUTH_CLIENT_ID.apps.googleusercontent.com',
+        client_id: clientId,
         callback: (response) => {
           if (response.credential) {
             sessionStorage.setItem('google_id_token', response.credential);
             console.log("Google ID token acquired and stored.");
+            fetchBackendConfig();
           }
         }
       });
-      // Optional: Render standard Sign-In button or prompt
+
+      // Render standard Google Sign-In button if container exists
+      const container = document.getElementById('g_id_signin');
+      if (container) {
+        google.accounts.id.renderButton(container, {
+          theme: 'outline',
+          size: 'small',
+          type: 'standard'
+        });
+      }
+
+      // Trigger One Tap popup prompt automatically
+      google.accounts.id.prompt();
     }
   }  
 
@@ -262,6 +275,11 @@ document.addEventListener('DOMContentLoaded', async () => {
       CONFIGURED_DBS = data.configured_databases || [];
       DEFAULT_DB_URL = data.default_database_url || "";
       ACTIVE_DB_URL = data.active_database_url || maskConnectionDbUrl(DEFAULT_DB_URL);
+
+      // Initialize Google Auth if enabled and client ID is provided
+      if (data.auth_enabled && data.google_client_id) {
+        initGoogleAuth(data.google_client_id);
+      }
 
       localStorage.removeItem('crbot_db_url');
       localStorage.removeItem('crbot_model');
