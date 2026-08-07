@@ -487,6 +487,7 @@ textarea:focus {
 .crbot-icon-wrapper {
   display: flex;
   align-items: center;
+  gap: 0.5rem;          /* Gap between SVG icon and text label */
   justify-content: center;
   filter: drop-shadow(0px 0px 10px rgba(56, 189, 248, 0.35));
   flex-shrink: 0;
@@ -1691,4 +1692,66 @@ textarea:focus {
     opacity: 1;
     transform: translateY(0);
   }
+}
+
+/* Layout container for icon + label */
+.crbot-icon-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-shrink: 0;
+}
+
+/* Label container locked to 40px (matching the SVG height) */
+.header-icon-label {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  height: 40px;
+  line-height: 1;
+  font-family: var(--font-sans);
+  font-weight: 600;
+  color: var(--text-primary);
+  user-select: none;
+  line-height: 1.2; /* Tightens vertical line spacing */
+}
+
+.label-line {
+  margin: 0;
+  padding: 0;
+}
+
+/* Default state (Large Screens) */
+.header-icon-label .full-text {
+  display: inline;
+}
+.header-icon-label .short-text {
+  display: none;
+}
+
+/* Medium / Mobile screens: Switch to "yD" / "yL" */
+@media (max-width: 768px) {
+  .header-icon-label .full-text {
+    display: none;
+  }
+  .header-icon-label .short-text {
+    display: inline;
+  }
+}
+
+/* Very narrow screens: Remove label entirely to preserve header space */
+@media (max-width: 480px) {
+  .header-icon-label {
+    display: none;
+  }
+}
+
+/* 1st line ("your Database") moved down */
+.header-icon-label .label-line:first-child {
+  transform: translateY(3px);
+}
+
+/* 2nd line ("your Language") moved up */
+.header-icon-label .label-line:last-child {
+  transform: translateY(-3px);
 }
