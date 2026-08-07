@@ -94,17 +94,27 @@ body {
   border-radius: 9999px;
   background: rgba(255, 255, 255, 0.03);
   border: 1px solid var(--bg-card-border);
-  padding: 0.2rem 0.65rem;
+  padding: 0.2rem 0.75rem;
   font-size: 0.8125rem;
   color: var(--text-secondary);
   line-height: 1.2;
+  min-width: 0;            /* Allows flex child to shrink below intrinsic content width */
+  max-width: min(600px, 60vw); /* Replaced 25vw cap to allow natural expansion */
 }
 
 .status-badge .conn-badge-text {
-  font-size: clamp(0.65rem, 1.2vw, 0.9rem);
+  font-size: 0.8125rem; /* Fixed readable font size */
   color: var(--text-secondary);
   font-weight: 500;
-  padding: 0.1rem;
+  padding: 0 0.05rem;
+  white-space: nowrap;
+  flex-shrink: 0; /* Prevents text from squeezing into ellipses prematurely */
+}
+
+/* Enable truncation on the badge wrapper as a whole only when squeezed by the window */
+.status-badge.connected {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .status-badge .conn-badge-icon {
@@ -113,18 +123,6 @@ body {
   color: var(--text-secondary);
   width: clamp(10px, 1.5vw, 14px);
   height: clamp(10px, 1.5vw, 14px);
-}
-
-.status-badge.connected .status-dot {
-  background-color: var(--primary);
-  box-shadow: 0 0 8px var(--primary);
-}
-
-.status-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background-color: var(--text-muted);
 }
 
 /* Layout Vertical */
@@ -450,8 +448,8 @@ textarea:focus {
   display: flex;
   align-items: center;
   gap: 0.5rem;
-  flex-shrink: 0;
-}
+  flex-shrink: 1; /* Allow badge inside actions to shrink when space is tight */
+  min-width: 0;}
 
 .gear-btn, .help-btn, .history-btn {
   background: rgba(255, 255, 255, 0.05);

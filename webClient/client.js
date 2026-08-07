@@ -372,18 +372,11 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     const atSpan = connDbUser?.nextElementSibling;
 
-    if (fullStr.length > 25) {
-      if (connDbUser) connDbUser.textContent = fullStr.slice(0, 25) + '...';
-      if (connDbName) connDbName.textContent = '';
-      if (atSpan && atSpan.textContent.trim() === '@') {
-        atSpan.style.display = 'none';
-      }
-    } else {
-      if (connDbUser) connDbUser.textContent = username;
-      if (connDbName) connDbName.textContent = dbName;
-      if (atSpan && atSpan.textContent.trim() === '@') {
-        atSpan.style.display = '';
-      }
+    // Always output full values; CSS handles overflowing layout dynamically
+    if (connDbUser) connDbUser.textContent = username;
+    if (connDbName) connDbName.textContent = dbName;
+    if (atSpan && atSpan.textContent.trim() === '@') {
+      atSpan.style.display = '';
     }
 
     document.title = `yDyL`;

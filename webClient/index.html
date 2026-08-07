@@ -79,7 +79,6 @@
 
         <div class="header-actions">
           <div id="configTriggerBadge" class="status-badge connected clickable-badge" title="Connection Info (Click to configure)">
-            <span class="status-dot"></span>
             <span id="connDbUser" class="conn-badge-text"></span>
             <span class="conn-badge-text">@</span>
             <span id="connDbName" class="conn-badge-text"></span>
@@ -213,8 +212,8 @@
         <p>Welcome to <strong>yDyL</strong>! Here is a quick guide on how to interact with it.</p>
         
         <h3>1. General</h3>
-        <p>By default, you are connected to a simple banking database hosted in CockroachDB. You may use it as a playground. You may also select to experiment with an ECommerce database hosted in GCP CloudSQL by clicking on the <strong>database connection info</strong> on the upper right corner.</p>
-        <p>Or you may connect to your own postgres-complaint database by providing a connection URL in the same configuration screen. Custom connections as bound to a particular web browser session.</p>
+        <p>By default, you are connected to a simple database that you may use as a playground.</p>
+        <p>You may change the database connection by clicking on the database connection information. Either select one of the pre-configured choices or connect to your own postgres-complaint database by providing a connection URL. Custom connections are user-scoped, i.e. other users cannot see what you enter.</p>
 
         <h3>2. Natural Language Query</h3>
         <p>Type your query or instruction into the top text box in plain English or any other language. Click <strong>Translate Prompt</strong> to preview the generated SQL statement.</p>
