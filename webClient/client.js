@@ -3,6 +3,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   let DEFAULT_DB_URL = "";
   let ACTIVE_DB_URL = "";
   let CONFIGURED_DBS = [];
+  let currentGoogleClientId = null;
 
   // Helper function to include Google ID tokens or auth headers in fetch requests
   function getApiHeaders() {
@@ -148,33 +149,144 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
 
   // Initialize Google Sign-In with dynamic client ID
-  function initGoogleAuth(clientId) {
-    if (window.google && window.google.accounts && clientId) {
-      google.accounts.id.initialize({
-        client_id: clientId,
-        callback: (response) => {
-          if (response.credential) {
-            sessionStorage.setItem('google_id_token', response.credential);
-            console.log("Google ID token acquired and stored.");
-            fetchBackendConfig();
-          }
-        }
+  let isGoogleAuthInitialized = false;
+
+  // Helper to parse JWT claims client-side
+  function parseJwt(token) {
+    try {
+      const base64Url = token.split('.')[1];
+      const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+      const jsonPayload = decodeURIComponent(atob(base64).split('').map(c => {
+        return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
+      }).join(''));
+      return JSON.parse(jsonPayload);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function handleLogout() {
+    sessionStorage.removeItem('google_id_token');
+    if (window.google && google.accounts && google.accounts.id) {
+      google.accounts.id.disableAutoSelect();
+    }
+    // Reset UI and reload configuration
+    renderAuthUI(currentGoogleClientId);
+    fetchBackendConfig();
+  }
+
+  function renderAuthUI(clientId) {
+    if (clientId) currentGoogleClientId = clientId;
+    const container = document.getElementById('g_id_signin');
+    if (!container) return;
+
+    const existingToken = sessionStorage.getItem('google_id_token');
+    const payload = existingToken ? parseJwt(existingToken) : null;
+
+    // Check token expiration if payload exists
+    const isExpired = payload && payload.exp && (payload.exp * 1000 < Date.now());
+
+    if (existingToken && payload && !isExpired) {
+      // Authenticated State: Compact Circular Avatar with Dropdown Menu
+      const userEmail = payload.email || 'Authenticated';
+      const initial = userEmail.charAt(0).toUpperCase() || 'U';
+      const avatarContent = payload.picture 
+        ? `<img src="${payload.picture}" class="auth-avatar-img" alt="Avatar">` 
+        : `<span class="auth-avatar-initial">${initial}</span>`;
+
+      container.innerHTML = `
+        <div class="auth-menu-wrapper">
+          <button type="button" id="authAvatarBtn" class="auth-avatar-circle" title="${userEmail}" aria-expanded="false" aria-haspopup="true">
+            ${avatarContent}
+          </button>
+          <div id="authDropdown" class="auth-dropdown-menu hidden">
+            <div class="auth-dropdown-header">
+              <span class="auth-dropdown-email">${userEmail}</span>
+            </div>
+            <div class="auth-dropdown-divider"></div>
+            <button id="logoutBtn" class="auth-dropdown-item" type="button">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path>
+                <polyline points="16 17 21 12 16 7"></polyline>
+                <line x1="21" y1="12" x2="9" y2="12"></line>
+              </svg>
+              Log out
+            </button>
+          </div>
+        </div>
+      `;
+
+      const avatarBtn = document.getElementById('authAvatarBtn');
+      const dropdown = document.getElementById('authDropdown');
+
+      // Toggle dropdown menu on avatar click
+      avatarBtn?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const isHidden = dropdown.classList.toggle('hidden');
+        avatarBtn.setAttribute('aria-expanded', !isHidden);
       });
 
-      // Render standard Google Sign-In button if container exists
-      const container = document.getElementById('g_id_signin');
-      if (container) {
-        google.accounts.id.renderButton(container, {
-          theme: 'outline',
-          size: 'small',
-          type: 'standard'
-        });
+      // Handle logout click
+      document.getElementById('logoutBtn')?.addEventListener('click', handleLogout);
+
+      // Close dropdown when clicking anywhere outside
+      const closeDropdownOnOutside = (e) => {
+        if (dropdown && !dropdown.classList.contains('hidden') && !container.contains(e.target)) {
+          dropdown.classList.add('hidden');
+          avatarBtn?.setAttribute('aria-expanded', 'false');
+        }
+      };
+
+      document.removeEventListener('click', window._authDropdownClickListener);
+      window._authDropdownClickListener = closeDropdownOnOutside;
+      document.addEventListener('click', window._authDropdownClickListener);
+
+    } else {
+      // Clean up outside click listener when unauthenticated
+      if (window._authDropdownClickListener) {
+        document.removeEventListener('click', window._authDropdownClickListener);
+        window._authDropdownClickListener = null;
       }
 
-      // Trigger One Tap popup prompt automatically
-      google.accounts.id.prompt();
+      if (isExpired) {
+        sessionStorage.removeItem('google_id_token');
+      }
+
+      container.innerHTML = '';
+      const targetClientId = clientId || currentGoogleClientId;
+      if (window.google && google.accounts && targetClientId) {
+        google.accounts.id.initialize({
+          client_id: targetClientId,
+          callback: (response) => {
+            if (response.credential) {
+              sessionStorage.setItem('google_id_token', response.credential);
+              renderAuthUI(targetClientId);
+              fetchBackendConfig();
+            }
+          }
+        });
+
+        // Renders standard rectangular button clearly labeled "Sign in with Google"
+        google.accounts.id.renderButton(container, {
+          theme: 'filled_black',
+          size: 'medium',
+          shape: 'rectangular',
+          type: 'standard',
+          text: 'signin',
+          logo_alignment: 'left'
+        });
+
+        if (!isGoogleAuthInitialized) {
+          isGoogleAuthInitialized = true;
+          google.accounts.id.prompt();
+        }
+      }
     }
-  }  
+  }
+
+  function initGoogleAuth(clientId) {
+    renderAuthUI(clientId);
+  }
 
   function setButtonsDisabled(disabled) {
     if (translateBtn) translateBtn.disabled = disabled;
@@ -240,15 +352,41 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function updateConnectionDetails(data) {
-    if (data && data.database_name && data.username) {
-      const dbName = data.database_name;
-      const username = data.username;
+    const badge = document.getElementById('configTriggerBadge');
 
-      if (connDbName) connDbName.textContent = dbName;
-      if (connDbUser) connDbUser.textContent = username;
-
-      document.title = `yDyL`;
+    // Hide badge if running on Cloud Run and unauthenticated or if connection info is empty
+    if ((data && data.is_cloud_run && !data.authenticated) || !data?.database_name || !data?.username) {
+      if (badge) badge.style.display = 'none';
+      return;
     }
+
+    if (badge) badge.style.display = '';
+
+    const username = data.username;
+    const dbName = data.database_name;
+    const fullStr = `${username}@${dbName}`;
+
+    if (configTriggerBadge) {
+      configTriggerBadge.title = `${fullStr} (Click to configure)`;
+    }
+
+    const atSpan = connDbUser?.nextElementSibling;
+
+    if (fullStr.length > 25) {
+      if (connDbUser) connDbUser.textContent = fullStr.slice(0, 25) + '...';
+      if (connDbName) connDbName.textContent = '';
+      if (atSpan && atSpan.textContent.trim() === '@') {
+        atSpan.style.display = 'none';
+      }
+    } else {
+      if (connDbUser) connDbUser.textContent = username;
+      if (connDbName) connDbName.textContent = dbName;
+      if (atSpan && atSpan.textContent.trim() === '@') {
+        atSpan.style.display = '';
+      }
+    }
+
+    document.title = `yDyL`;
   }
 
   function maskConnectionDbUrl(url) {
@@ -536,25 +674,25 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   async function loadHistoryData() {
     if (!historyTableHeader || !historyTableBody) return;
-
+  
     historyTableHeader.innerHTML = '';
     historyTableBody.innerHTML = '<tr><td class="text-center text-muted py-8">Loading history...</td></tr>';
-
+  
     try {
       const response = await fetch('/api/history', { headers: getApiHeaders(), credentials: 'same-origin' });
       const data = await response.json();
-
+  
       if (response.ok && data.success) {
         if (data.history && data.history.length > 0) {
           const rows = data.history;
           const columns = Object.keys(rows[0]);
-
+  
           columns.forEach(col => {
             const th = document.createElement('th');
             th.textContent = col;
             historyTableHeader.appendChild(th);
           });
-
+  
           historyTableBody.innerHTML = '';
           rows.forEach(row => {
             const tr = document.createElement('tr');
@@ -571,8 +709,24 @@ document.addEventListener('DOMContentLoaded', async () => {
         } else {
           historyTableBody.innerHTML = '<tr><td class="text-center text-muted py-8">No history records found.</td></tr>';
         }
-
+  
         renderStatisticsCharts(data.stats || []);
+      } else {
+        const errMsg = response.status === 401 
+          ? "Authentication required. Please click 'Sign in with Google' in the top-right corner to authenticate." 
+          : (data.error || `Server returned status ${response.status}`);
+        historyTableBody.innerHTML = `
+          <tr>
+            <td class="error-cell">
+              <div class="error-container">
+                <span class="error-icon">⚠️</span>
+                <div class="error-details">
+                  <strong>Error Loading History</strong>
+                  <p>${errMsg}</p>
+                </div>
+              </div>
+            </td>
+          </tr>`;
       }
     } catch (err) {
       console.error("Failed to fetch history:", err);
@@ -589,7 +743,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           </td>
         </tr>`;
     }
-  }
+  }  
 
   if (historyBtn && historyModal) {
     historyBtn.addEventListener('click', () => {
@@ -750,7 +904,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         resetExecutionStats();
 
-        const errMsg = data.error || "An error occurred during translation.";
+        const errMsg = response.status === 401 
+          ? "Authentication required. Please click 'Sign in with Google' in the top-right corner to log in."
+          : (data.error || "An error occurred during translation.");
         console.error("Translation Error:", errMsg);
 
         if (resultsTabsNav) resultsTabsNav.classList.add('hidden');
@@ -847,7 +1003,9 @@ document.addEventListener('DOMContentLoaded', async () => {
           execStatus.textContent = "Error";
           execStatus.className = "stat-val status-error";
         }
-        const errMsg = data.error || "An error occurred during SQL execution.";
+        const errMsg = response.status === 401 
+          ? "Authentication required. Please click 'Sign in with Google' in the top-right corner to log in."
+          : (data.error || "An error occurred during SQL execution.");
         if (resultsBody) {
           resultsBody.innerHTML = `
             <tr>

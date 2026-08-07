@@ -15,10 +15,57 @@ from google.cloud import storage
 from google.cloud import firestore
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
+from flask import request, redirect, url_for, session
+
+# 1. Environment & Cloud Run Detection
+GCP_PROJECT_ID = (
+    os.environ.get("GCP_PROJECT_ID") 
+    or os.environ.get("GOOGLE_CLOUD_PROJECT") 
+    or os.environ.get("GCP_PROJECT")
+)
+IS_CLOUD_RUN = bool(os.environ.get("K_SERVICE"))
+
+# 2. Firestore Initialization
+firestore_client = None
+if GCP_PROJECT_ID:
+    try:
+        firestore_client = firestore.Client(project=GCP_PROJECT_ID, database="ydyl")
+        print(f"Initialized Firestore client for project '{GCP_PROJECT_ID}'.", flush=True)
+    except Exception as e:
+        print(f"Error initializing Firestore client: {e}", flush=True)
+
+# --- Authentication & State Configuration ---
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
+AUTH_ENABLED = bool(GOOGLE_CLIENT_ID)
+
+# ADD THE CHECK HERE (Startup / Module Scope)
+if IS_CLOUD_RUN and not firestore_client:
+    raise RuntimeError(
+        f"CRITICAL: Service running on Cloud Run (K_SERVICE={os.environ.get('K_SERVICE')}), "
+        f"but Firestore client failed to initialize (GCP_PROJECT_ID={GCP_PROJECT_ID}). "
+        "Halting startup to prevent ephemeral SQLite fallback."
+    )
+
 
 app = Flask(__name__, static_folder='../webClient', static_url_path='')
 # Support credentials for authenticated CORS requests
 CORS(app, supports_credentials=True)
+
+# Endpoints that don't require logging in
+#EXEMPT_ENDPOINTS = {'login', 'auth_callback', 'static'}
+#@app.before_request
+#def enforce_cloud_run_auth():
+#    # Only enforce if running on Cloud Run
+#    if not IS_CLOUD_RUN:
+#        return
+#
+#    # Allow access to login/auth routes and static files
+#    if request.endpoint in EXEMPT_ENDPOINTS or request.endpoint is None:
+#        return
+#
+#    # Check if the user is logged in (adjust session key to match your auth logic)
+#    if 'user_id' not in session:
+#        return redirect(url_for('login'))
 
 DEFAULT_CONN = os.environ.get(
     "DATABASE_URL", 
@@ -46,33 +93,13 @@ if not CONFIGURED_DBS:
 DEFAULT_CONN = CONFIGURED_DBS[0]["url"]
 
 # --- Model Configuration ---
-raw_models_env = os.environ.get("GEMINI_AVAILABLE_MODELS", "")
-AVAILABLE_MODELS = [m.strip() for m in raw_models_env.split(",") if m.strip()]
-if not AVAILABLE_MODELS:
-    AVAILABLE_MODELS = ["gemini-3.6-flash", "gemini-3.5-flash-lite"]
+DEFAULT_MODEL = os.environ.get("GEMINI_MODEL")
 
-DEFAULT_MODEL = os.environ.get("GEMINI_MODEL") or AVAILABLE_MODELS[0]
+# --- State DB file in local mode ---
+TRANSLATION_STATS_DB_PATH = "state/crbot_state.db"
 
-GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME")
-DB_FILENAME = os.environ.get("TRANSLATION_STATS_DB_FILENAME", "crbot_state.db")
-if GCS_BUCKET_NAME:
-    TRANSLATION_STATS_DB_PATH = os.path.join("/tmp", DB_FILENAME)
-else:
-    TRANSLATION_STATS_DB_PATH = "state/crbot_state.db"
 
-# --- Authentication & State Configuration ---
-GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
-AUTH_ENABLED = bool(GOOGLE_CLIENT_ID)
-GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID")
-IS_CLOUD_RUN = bool(os.environ.get("K_SERVICE"))
 
-firestore_client = None
-if (AUTH_ENABLED or IS_CLOUD_RUN) and GCP_PROJECT_ID:
-    try:
-        firestore_client = firestore.Client(project=GCP_PROJECT_ID, database="ydyl")
-        print("Initialized Cloud Firestore client for database 'ydyl'.")
-    except Exception as e:
-        print(f"Error initializing Firestore client: {e}")
 
 # --- Authentication & Session Management ---
 
@@ -126,6 +153,40 @@ def get_current_user_identity():
 
     # 5. Local fallback -> Anonymous Session ID
     return get_or_create_session_id()
+
+
+# List of Flask endpoint names that do not require authentication
+EXEMPT_ENDPOINTS = {
+    'index', 
+    'get_current_user_status', 
+    'static',
+    'handle_config',      # <-- Added handle_config (/api/config)
+    # Add any login/auth endpoint names used in your app here, for example:
+    'login', 
+    'google_login', 
+    'oauth_callback',
+    'auth_login'
+}
+
+@app.before_request
+def enforce_authentication():
+    # 1. Allow static assets and options preflight requests (CORS)
+    if request.method == 'OPTIONS' or request.endpoint == 'static':
+        return
+
+    # 2. Allow any request path starting with authentication endpoints (e.g., /api/auth/*)
+    if request.path.startswith('/api/auth/') or request.path in ['/', '/login']:
+        return
+
+    # 3. Allow explicit exempt endpoints
+    if request.endpoint in EXEMPT_ENDPOINTS or request.endpoint is None:
+        return
+
+    # 4. Enforce auth for all other routes if running on Cloud Run or AUTH_ENABLED is True
+    if IS_CLOUD_RUN or AUTH_ENABLED:
+        user_identity = get_current_user_identity()
+        if not user_identity:
+            return jsonify({'error': 'Unauthorized: Authentication required'}), 401
 
 def set_session_db_url(user_id, db_url):
     if firestore_client:
@@ -644,6 +705,7 @@ def translate_query():
 def handle_config():
     session_id = get_or_create_session_id()
     user_identity = get_current_user_identity()
+    is_authenticated = bool(user_identity and user_identity != session_id)
     
     if request.method == 'POST':
         data = request.get_json() or {}
@@ -658,29 +720,40 @@ def handle_config():
 
     active_conn_str = get_session_db_url(user_identity)
     
-    db_name, username = "Unknown", "Unknown"
-    conn = None
-    try:
-        conn = get_db_connection(active_conn_str, user_identity)
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT current_database(), CURRENT_USER;")
-            row = cursor.fetchone()
-            if row:
-                db_name, username = row[0], row[1]
-    except Exception as e:
-        print(f"Error fetching connection info: {e}")
-    finally:
-        if conn:
-            conn.close()
+    # Hide DB connection info on Cloud Run if the user is not authenticated
+    if IS_CLOUD_RUN and not is_authenticated:
+        db_name, username = "", ""
+        active_conn_str_masked = ""
+        configured_dbs = []
+    else:
+        db_name, username = "Unknown", "Unknown"
+        conn = None
+        try:
+            conn = get_db_connection(active_conn_str, user_identity)
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT current_database(), CURRENT_USER;")
+                row = cursor.fetchone()
+                if row:
+                    db_name, username = row[0], row[1]
+        except Exception as e:
+            print(f"Error fetching connection info: {e}")
+        finally:
+            if conn:
+                conn.close()
+        active_conn_str_masked = mask_db_url(active_conn_str)
+        configured_dbs = CONFIGURED_DBS
 
     resp = jsonify({
+        'auth_enabled': AUTH_ENABLED,
+        'google_client_id': os.getenv("GOOGLE_CLIENT_ID"),
         'session_id': session_id,
         'user_id': user_identity,
-        'configured_databases': CONFIGURED_DBS,
-        'default_database_url': DEFAULT_CONN,
-        'active_database_url': mask_db_url(active_conn_str),
+        'authenticated': is_authenticated,
+        'is_cloud_run': IS_CLOUD_RUN,
+        'configured_databases': configured_dbs,
+        'default_database_url': DEFAULT_CONN if (not IS_CLOUD_RUN or is_authenticated) else "",
+        'active_database_url': active_conn_str_masked,
         'default_model': DEFAULT_MODEL,
-        'available_models': AVAILABLE_MODELS,
         'database_name': db_name,
         'username': username
     })
@@ -783,7 +856,7 @@ def get_translation_history():
                 firestore_client.collection("translations")
                 .where("user_id", "==", user_identity)
                 .order_by("created_at", direction=firestore.Query.DESCENDING)
-                .limit(20)
+                .limit(50)
                 .stream()
             )
             rows = []
@@ -842,7 +915,7 @@ def get_translation_history():
                 FROM translations
                 WHERE user_id = ? OR user_id IS NULL
                 ORDER BY created_at DESC
-                LIMIT 20
+                LIMIT 50
             """, (user_identity,))
             rows = [dict(row) for row in cursor.fetchall()]
 

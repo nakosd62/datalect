@@ -1,7 +1,3 @@
 #!/bin/bash
 
-gcloud run deploy crbot \
-  --source . \
-  --port 3000 \
-  --allow-unauthenticated \
-  --env-vars-file=env.yaml
+gcloud run deploy ydyl --source . --port 3000 --allow-unauthenticated --env-vars-file=env.yaml

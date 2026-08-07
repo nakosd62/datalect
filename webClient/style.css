@@ -1514,3 +1514,183 @@ textarea:focus {
   background: rgba(255, 255, 255, 0.08);
   border-color: var(--primary);
 }
+
+/* Authenticated Header User Badge */
+.auth-container {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.auth-user-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--bg-card-border);
+  border-radius: 9999px;
+  padding: 0.2rem 0.6rem;
+  font-size: 0.78rem;
+  color: var(--text-primary);
+}
+
+.auth-user-avatar {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  object-fit: cover;
+}
+
+.auth-user-email {
+  max-width: 140px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+}
+
+.btn-logout {
+  background: transparent;
+  border: none;
+  color: var(--danger, #f87171);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 0.15rem 0.4rem;
+  border-radius: 4px;
+  transition: var(--transition);
+}
+
+.btn-logout:hover {
+  background: rgba(248, 113, 113, 0.15);
+  color: #ef4444;
+}
+
+/* --- Avatar & Dropdown Styles --- */
+.auth-container {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.auth-menu-wrapper {
+  position: relative;
+  display: inline-block;
+}
+
+.auth-avatar-circle {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--primary), var(--secondary));
+  color: #ffffff;
+  font-weight: 600;
+  font-size: 0.95rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 2px solid var(--bg-card-border);
+  cursor: pointer;
+  transition: var(--transition);
+  outline: none;
+  padding: 0;
+  overflow: hidden;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
+.auth-avatar-circle:hover {
+  transform: scale(1.05);
+  border-color: var(--primary);
+  box-shadow: 0 0 10px var(--primary-glow);
+}
+
+.auth-avatar-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 50%;
+}
+
+.auth-avatar-initial {
+  line-height: 1;
+  text-transform: uppercase;
+}
+
+/* Dropdown Menu */
+.auth-dropdown-menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  width: 220px;
+  background-color: rgba(15, 23, 42, 0.95);
+  border: 1px solid var(--bg-card-border);
+  border-radius: 10px;
+  padding: 0.5rem;
+  box-shadow: 0 10px 25px rgba(0, 0, 0, 0.5);
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  animation: dropdownFadeIn 0.15s ease-out;
+}
+
+.auth-dropdown-menu.hidden {
+  display: none !important;
+}
+
+.auth-dropdown-header {
+  padding: 0.5rem 0.75rem;
+  display: flex;
+  flex-direction: column;
+}
+
+.auth-dropdown-email {
+  font-size: 0.8125rem;
+  color: var(--text-primary);
+  font-weight: 500;
+  word-break: break-all;
+}
+
+.auth-dropdown-divider {
+  height: 1px;
+  background-color: var(--bg-card-border);
+  margin: 0.35rem 0;
+}
+
+.auth-dropdown-item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  width: 100%;
+  padding: 0.5rem 0.75rem;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  color: var(--danger);
+  font-size: 0.85rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: var(--transition);
+  text-align: left;
+}
+
+.auth-dropdown-item:hover {
+  background-color: var(--danger-glow);
+  color: var(--danger-hover);
+}
+
+@keyframes dropdownFadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
