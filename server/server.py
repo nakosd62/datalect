@@ -4,7 +4,7 @@ import re
 import time
 import uuid
 from urllib.parse import urlparse, urlunparse
-from flask import Flask, request, jsonify, make_response, send_from_directory
+from flask import Flask, request, jsonify, make_response, send_from_directory, redirect, url_for, session
 import psycopg2
 import sqlparse
 import sqlite3
@@ -15,7 +15,6 @@ from google.cloud import storage
 from google.cloud import firestore
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
-from flask import request, redirect, url_for, session
 
 # 1. Environment & Cloud Run Detection
 GCP_PROJECT_ID = (
@@ -38,7 +37,7 @@ if GCP_PROJECT_ID:
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
 AUTH_ENABLED = bool(GOOGLE_CLIENT_ID)
 
-# ADD THE CHECK HERE (Startup / Module Scope)
+# Startup / Module Scope Guard
 if IS_CLOUD_RUN and not firestore_client:
     raise RuntimeError(
         f"CRITICAL: Service running on Cloud Run (K_SERVICE={os.environ.get('K_SERVICE')}), "
@@ -46,26 +45,9 @@ if IS_CLOUD_RUN and not firestore_client:
         "Halting startup to prevent ephemeral SQLite fallback."
     )
 
-
 app = Flask(__name__, static_folder='../webClient', static_url_path='')
 # Support credentials for authenticated CORS requests
 CORS(app, supports_credentials=True)
-
-# Endpoints that don't require logging in
-#EXEMPT_ENDPOINTS = {'login', 'auth_callback', 'static'}
-#@app.before_request
-#def enforce_cloud_run_auth():
-#    # Only enforce if running on Cloud Run
-#    if not IS_CLOUD_RUN:
-#        return
-#
-#    # Allow access to login/auth routes and static files
-#    if request.endpoint in EXEMPT_ENDPOINTS or request.endpoint is None:
-#        return
-#
-#    # Check if the user is logged in (adjust session key to match your auth logic)
-#    if 'user_id' not in session:
-#        return redirect(url_for('login'))
 
 DEFAULT_CONN = os.environ.get(
     "DATABASE_URL", 
@@ -97,8 +79,8 @@ DEFAULT_MODEL = os.environ.get("GEMINI_MODEL")
 
 # --- State DB file in local mode ---
 TRANSLATION_STATS_DB_PATH = "state/crbot_state.db"
-
-
+GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME")
+DB_FILENAME = os.environ.get("DB_FILENAME", "crbot_state.db")
 
 
 # --- Authentication & Session Management ---
@@ -114,7 +96,7 @@ def get_current_user_identity():
     """
     Extracts authenticated user identity from Bearer Tokens (verified via Google OAuth),
     GCP Identity-Aware Proxy (IAP) headers, or auth cookies.
-    Falls back to anonymous session_id only if authentication is disabled locally.
+    Falls back to 'global' state key when running locally.
     """
     # 1. Bearer Token in Authorization Header (Google ID Token)
     auth_header = request.headers.get("Authorization", "")
@@ -147,12 +129,12 @@ def get_current_user_identity():
     if auth_cookie:
         return auth_cookie.strip()
 
-    # 4. If auth is enabled, unauthenticated requests return None
-    if GOOGLE_CLIENT_ID:
+    # 4. If auth is enabled (Cloud Run), unauthenticated requests return None
+    if GOOGLE_CLIENT_ID or IS_CLOUD_RUN:
         return None
 
-    # 5. Local fallback -> Anonymous Session ID
-    return get_or_create_session_id()
+    # 5. Local fallback -> Single 'global' user identity
+    return "global"
 
 
 # List of Flask endpoint names that do not require authentication
@@ -160,8 +142,7 @@ EXEMPT_ENDPOINTS = {
     'index', 
     'get_current_user_status', 
     'static',
-    'handle_config',      # <-- Added handle_config (/api/config)
-    # Add any login/auth endpoint names used in your app here, for example:
+    'handle_config',
     'login', 
     'google_login', 
     'oauth_callback',
@@ -189,7 +170,13 @@ def enforce_authentication():
             return jsonify({'error': 'Unauthorized: Authentication required'}), 401
 
 def set_session_db_url(user_id, db_url):
+    if not db_url:
+        return
+
+    # Cloud Run / Firestore mode: Store per authenticated user_id
     if firestore_client:
+        if not user_id:
+            return  # Prevent Firestore error on unauthenticated requests
         try:
             doc_ref = firestore_client.collection("sessions").document(user_id)
             doc_ref.set({
@@ -202,6 +189,8 @@ def set_session_db_url(user_id, db_url):
             print(f"Error saving session to Firestore: {e}")
             return
 
+    # Local SQLite mode: Use fixed 'global' state key
+    key = "global"
     try:
         with sqlite3.connect(TRANSLATION_STATS_DB_PATH) as conn:
             cursor = conn.cursor()
@@ -211,7 +200,7 @@ def set_session_db_url(user_id, db_url):
                 ON CONFLICT(session_id) DO UPDATE SET
                     database_url = excluded.database_url,
                     updated_at = CURRENT_TIMESTAMP;
-            """, (user_id, db_url))
+            """, (key, db_url))
             conn.commit()
 
         upload_db_to_gcs()
@@ -219,7 +208,10 @@ def set_session_db_url(user_id, db_url):
         print(f"Error saving session to SQLite: {e}")
 
 def get_session_db_url(user_id):
+    # Cloud Run / Firestore mode: Retrieve per authenticated user_id
     if firestore_client:
+        if not user_id:
+            return DEFAULT_CONN
         try:
             doc_ref = firestore_client.collection("sessions").document(user_id)
             doc = doc_ref.get()
@@ -231,10 +223,12 @@ def get_session_db_url(user_id):
             print(f"Error fetching session from Firestore: {e}")
         return DEFAULT_CONN
 
+    # Local SQLite mode: Retrieve 'global' state
+    key = "global"
     try:
         with sqlite3.connect(TRANSLATION_STATS_DB_PATH) as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT database_url FROM sessions WHERE session_id = ?", (user_id,))
+            cursor.execute("SELECT database_url FROM sessions WHERE session_id = ?", (key,))
             row = cursor.fetchone()
             if row and row[0]:
                 return row[0]
@@ -354,21 +348,8 @@ def pick_gemini_api_key():
         return None
     return random.choice(keys)
 
-def redact_connection_url(conn_str):
-    if not conn_str:
-        return conn_str
-    match = re.match(r'^(postgresql://)([^:]+):([^@]+)(@.+)$', conn_str)
-    if match:
-        return f"{match.group(1)}{match.group(2)}:****{match.group(4)}"
-    return conn_str
-
-def mask_db_url(url_str):
-    if not url_str:
-        return url_str
-    return re.sub(r'://([^:]+):([^@]+)@', r'://\1:****@', url_str)
-
 def resolve_conn_str(conn_str=None, user_id=None):
-    if not conn_str or "*" in conn_str:
+    if not conn_str:
         if user_id:
             return get_session_db_url(user_id)
         return DEFAULT_CONN
@@ -390,11 +371,12 @@ def get_conn_identifier(conn_str):
 
 def record_translation(user_id, conn_str, nl_prompt, sql_command, gemini_model, duration, input_tokens, output_tokens, total_tokens, thinking_tokens, cached_content_tokens):
     conn_identifier = get_conn_identifier(conn_str)
+    effective_user = user_id or "global"
 
     if firestore_client:
         try:
             firestore_client.collection("translations").add({
-                "user_id": user_id,
+                "user_id": effective_user,
                 "connect_string": conn_identifier,
                 "nl_prompt": nl_prompt,
                 "sql_command": sql_command,
@@ -424,7 +406,7 @@ def record_translation(user_id, conn_str, nl_prompt, sql_command, gemini_model, 
                     duration, input_tokens, output_tokens, total_tokens, thinking_tokens, cached_content_tokens
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                user_id,
+                effective_user,
                 conn_identifier, 
                 nl_prompt, sql_command, 
                 gemini_model, 
@@ -711,9 +693,7 @@ def handle_config():
         data = request.get_json() or {}
         new_db_url = data.get('database_url')
         
-        if new_db_url and '*' in new_db_url:
-            pass 
-        elif new_db_url:
+        if new_db_url:
             set_session_db_url(user_identity, new_db_url)
         else:
             set_session_db_url(user_identity, DEFAULT_CONN)
@@ -723,7 +703,7 @@ def handle_config():
     # Hide DB connection info on Cloud Run if the user is not authenticated
     if IS_CLOUD_RUN and not is_authenticated:
         db_name, username = "", ""
-        active_conn_str_masked = ""
+        active_conn_str_out = ""
         configured_dbs = []
     else:
         db_name, username = "Unknown", "Unknown"
@@ -740,7 +720,7 @@ def handle_config():
         finally:
             if conn:
                 conn.close()
-        active_conn_str_masked = mask_db_url(active_conn_str)
+        active_conn_str_out = active_conn_str
         configured_dbs = CONFIGURED_DBS
 
     resp = jsonify({
@@ -752,7 +732,7 @@ def handle_config():
         'is_cloud_run': IS_CLOUD_RUN,
         'configured_databases': configured_dbs,
         'default_database_url': DEFAULT_CONN if (not IS_CLOUD_RUN or is_authenticated) else "",
-        'active_database_url': active_conn_str_masked,
+        'active_database_url': active_conn_str_out,
         'default_model': DEFAULT_MODEL,
         'database_name': db_name,
         'username': username
@@ -905,18 +885,21 @@ def get_translation_history():
         except Exception as e:
             return jsonify({'success': False, 'error': f"Firestore error: {str(e)}"}), 500
 
+    effective_user = user_identity or "global"
+
     try:
         with sqlite3.connect(TRANSLATION_STATS_DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
 
+            # Filter strictly by user_id for SQLite storage
             cursor.execute("""
                 SELECT nl_prompt, sql_command, created_at
                 FROM translations
-                WHERE user_id = ? OR user_id IS NULL
+                WHERE user_id = ?
                 ORDER BY created_at DESC
                 LIMIT 50
-            """, (user_identity,))
+            """, (effective_user,))
             rows = [dict(row) for row in cursor.fetchall()]
 
             cursor.execute("""
@@ -926,10 +909,10 @@ def get_translation_history():
                     SUM(total_tokens) as sum_total_tokens,
                     SUM(input_tokens) as sum_input_tokens
                 FROM translations
-                WHERE user_id = ? OR user_id IS NULL
+                WHERE user_id = ?
                 GROUP BY DATE(created_at)
                 ORDER BY DATE(created_at) ASC
-            """, (user_identity,))
+            """, (effective_user,))
             stats = [dict(row) for row in cursor.fetchall()]
 
             return jsonify({

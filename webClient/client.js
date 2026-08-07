@@ -148,10 +148,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   });
 
-  // Initialize Google Sign-In with dynamic client ID
   let isGoogleAuthInitialized = false;
 
-  // Helper to parse JWT claims client-side
   function parseJwt(token) {
     try {
       const base64Url = token.split('.')[1];
@@ -170,7 +168,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (window.google && google.accounts && google.accounts.id) {
       google.accounts.id.disableAutoSelect();
     }
-    // Reset UI and reload configuration
     renderAuthUI(currentGoogleClientId);
     fetchBackendConfig();
   }
@@ -182,12 +179,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     const existingToken = sessionStorage.getItem('google_id_token');
     const payload = existingToken ? parseJwt(existingToken) : null;
-
-    // Check token expiration if payload exists
     const isExpired = payload && payload.exp && (payload.exp * 1000 < Date.now());
 
     if (existingToken && payload && !isExpired) {
-      // Authenticated State: Compact Circular Avatar with Dropdown Menu
       const userEmail = payload.email || 'Authenticated';
       const initial = userEmail.charAt(0).toUpperCase() || 'U';
       const avatarContent = payload.picture 
@@ -219,17 +213,14 @@ document.addEventListener('DOMContentLoaded', async () => {
       const avatarBtn = document.getElementById('authAvatarBtn');
       const dropdown = document.getElementById('authDropdown');
 
-      // Toggle dropdown menu on avatar click
       avatarBtn?.addEventListener('click', (e) => {
         e.stopPropagation();
         const isHidden = dropdown.classList.toggle('hidden');
         avatarBtn.setAttribute('aria-expanded', !isHidden);
       });
 
-      // Handle logout click
       document.getElementById('logoutBtn')?.addEventListener('click', handleLogout);
 
-      // Close dropdown when clicking anywhere outside
       const closeDropdownOnOutside = (e) => {
         if (dropdown && !dropdown.classList.contains('hidden') && !container.contains(e.target)) {
           dropdown.classList.add('hidden');
@@ -242,7 +233,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       document.addEventListener('click', window._authDropdownClickListener);
 
     } else {
-      // Clean up outside click listener when unauthenticated
       if (window._authDropdownClickListener) {
         document.removeEventListener('click', window._authDropdownClickListener);
         window._authDropdownClickListener = null;
@@ -266,7 +256,6 @@ document.addEventListener('DOMContentLoaded', async () => {
           }
         });
 
-        // Renders standard rectangular button clearly labeled "Sign in with Google"
         google.accounts.id.renderButton(container, {
           theme: 'filled_black',
           size: 'medium',
@@ -354,7 +343,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   function updateConnectionDetails(data) {
     const badge = document.getElementById('configTriggerBadge');
 
-    // Hide badge if running on Cloud Run and unauthenticated or if connection info is empty
     if ((data && data.is_cloud_run && !data.authenticated) || !data?.database_name || !data?.username) {
       if (badge) badge.style.display = 'none';
       return;
@@ -372,7 +360,6 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     const atSpan = connDbUser?.nextElementSibling;
 
-    // Always output full values; CSS handles overflowing layout dynamically
     if (connDbUser) connDbUser.textContent = username;
     if (connDbName) connDbName.textContent = dbName;
     if (atSpan && atSpan.textContent.trim() === '@') {
@@ -382,19 +369,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     document.title = `yDyL`;
   }
 
-  function maskConnectionDbUrl(url) {
-    if (!url) return "";
-    const match = url.match(/^(postgresql:\/\/)([^:]+):([^@]+)(@.+)$/);
-    if (match) {
-      return `${match[1]}${match[2]}:****${match[4]}`;
-    }
-    return url;
-  }
-
   function getMatchingPresetUrl(targetUrl) {
     if (!targetUrl || !CONFIGURED_DBS || CONFIGURED_DBS.length === 0) return null;
-    const maskedTarget = maskConnectionDbUrl(targetUrl);
-    const found = CONFIGURED_DBS.find(db => db.url === targetUrl || maskConnectionDbUrl(db.url) === maskedTarget);
+    const found = CONFIGURED_DBS.find(db => db.url === targetUrl);
     return found ? found.url : null;
   }
 
@@ -405,9 +382,8 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       CONFIGURED_DBS = data.configured_databases || [];
       DEFAULT_DB_URL = data.default_database_url || "";
-      ACTIVE_DB_URL = data.active_database_url || maskConnectionDbUrl(DEFAULT_DB_URL);
+      ACTIVE_DB_URL = data.active_database_url || DEFAULT_DB_URL;
 
-      // Initialize Google Auth if enabled and client ID is provided
       if (data.auth_enabled && data.google_client_id) {
         initGoogleAuth(data.google_client_id);
       }
@@ -440,6 +416,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     let html = '';
     
+    // 1. Render Preset Databases
     CONFIGURED_DBS.forEach((db) => {
       const isSelected = Boolean(matchedPresetUrl && db.url === matchedPresetUrl);
       html += `
@@ -451,8 +428,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
 
     const isCustom = !matchedPresetUrl && Boolean(activeUrl);
-    const customValue = isCustom ? activeUrl : '';
+    const customValue = isCustom ? activeUrl : (sessionStorage.getItem('crbot_custom_db_url') || '');
 
+    // 2. Render Custom Input Box
     html += `
       <label class="radio-option" style="display: flex; align-items: center; gap: 0.5rem;">
         <input type="radio" name="db_connection_option" value="custom" id="radioCustomDb" ${isCustom ? 'checked' : ''}>
@@ -465,49 +443,36 @@ document.addEventListener('DOMContentLoaded', async () => {
     const customInput = document.getElementById('modalCustomDbUrl');
     const customRadio = document.getElementById('radioCustomDb');
 
-    const dbRadios = radioGroup.querySelectorAll('input[name="db_connection_option"]');
-    dbRadios.forEach(radio => {
-      radio.addEventListener('change', () => {
-        if (radio.value !== 'custom' && radio.checked) {
-          if (customInput) customInput.value = '';
-        }
-      });
-    });
-
     if (customInput) {
       customInput.addEventListener('focus', () => {
         if (customRadio) customRadio.checked = true;
       });
       customInput.addEventListener('input', () => {
         if (customRadio) customRadio.checked = true;
+        const val = customInput.value.trim();
+        if (val) {
+          sessionStorage.setItem('crbot_custom_db_url', val);
+        }
       });
     }
   }
 
-  function loadConfig() {
-    return {
-      dbUrl: sessionStorage.getItem('crbot_db_url') || ACTIVE_DB_URL || DEFAULT_DB_URL
-    };
-  }
-
-  function loadConfigIntoUI() {
-    const config = loadConfig();
-    renderDbRadioButtons(config.dbUrl);
-    updateHistoryTurnsSubtitle();
-  }
-  
   async function triggerConfigSave({ closeModal = false, dbUrl = null } = {}) {
     let dbUrlValue = dbUrl;
     
+    const customInput = document.getElementById('modalCustomDbUrl');
+    if (customInput) {
+      const inputVal = customInput.value.trim();
+      if (inputVal) {
+        sessionStorage.setItem('crbot_custom_db_url', inputVal);
+      }
+    }
+
     if (dbUrlValue === null) {
       const selectedDbRadio = document.querySelector('input[name="db_connection_option"]:checked');
       if (selectedDbRadio) {
         if (selectedDbRadio.value === 'custom') {
-          const customInput = document.getElementById('modalCustomDbUrl');
           dbUrlValue = customInput ? customInput.value.trim() : "";
-          if (!dbUrlValue && CONFIGURED_DBS.length > 0) {
-            dbUrlValue = DEFAULT_DB_URL || CONFIGURED_DBS[0].url;
-          }
         } else {
           dbUrlValue = selectedDbRadio.value;
         }
@@ -542,6 +507,18 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (closeModal) {
       closeConfigModal();
     }
+  }
+
+  function loadConfig() {
+    return {
+      dbUrl: sessionStorage.getItem('crbot_db_url') || ACTIVE_DB_URL || DEFAULT_DB_URL
+    };
+  }
+
+  function loadConfigIntoUI() {
+    const config = loadConfig();
+    renderDbRadioButtons(config.dbUrl);
+    updateHistoryTurnsSubtitle();
   }
 
   function closeConfigModal() {
@@ -836,6 +813,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   async function translatePrompt() {
+    await fetchBackendConfig();
+
     clearResultsDisplay();
     resetExecutionStats();
 
@@ -957,6 +936,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   async function executeSql() {
+    await fetchBackendConfig();
+    
     clearResultsDisplay();
 
     const sql = getSqlQuery();
