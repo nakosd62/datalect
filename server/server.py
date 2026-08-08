@@ -826,6 +826,81 @@ def execute_query():
         if conn:
             conn.close()
 
+
+@app.route('/api/interrogate', methods=['POST'])
+def interrogate_results():
+    data = request.get_json() or {}
+
+    gemini_model = data.get('gemini_model') or DEFAULT_MODEL
+    api_key = pick_gemini_api_key()
+
+    if not api_key:
+        return jsonify({'error': 'Gemini API key is not configured.'}), 400
+
+    original_prompt = data.get('original_prompt', '').strip()
+    sql_query = data.get('sql_query', '').strip()
+    results_table = data.get('results_table', {})
+    followup_prompt = data.get('followup_prompt', '').strip()
+
+    if not followup_prompt:
+        return jsonify({'error': 'Follow-up prompt cannot be empty'}), 400
+
+    session_id = get_or_create_session_id()
+    user_identity = get_current_user_identity()
+
+    try:
+        client = genai.Client(api_key=api_key)
+
+        # 1. System Prompt (can be fine-tuned or overridden)
+        system_instruction = data.get('system_prompt') or (
+            "You are an expert data analyst assistant that can slice, dice and analyze tabular data sets. "
+            "You are provided with: "
+            "(1) the user's original natural language request that got translated to SQL, "
+            "(2) the SQL query that was generated from the translation and executed, "
+            "(3) the resulting data table, and "
+            "(4) a follow-up request asking to analyze these results.\n"
+            "Analyze the data thoroughly and answer the follow-up request as concisely as possible."
+        )
+
+        # Format results table into text representation
+        cols = results_table.get('columns') or []
+        rows = results_table.get('rows') or []
+        
+        table_text = f"Columns: {', '.join(cols)}\nTotal Rows: {len(rows)}\nSample/Full Data:\n"
+        table_text += "\n".join([str(r) for r in rows[:500]])
+
+        user_content = (
+            f"Original Natural Language Prompt: {original_prompt}\n\n"
+            f"Executed SQL Query:\n{sql_query}\n\n"
+            f"Query Results Table:\n{table_text}\n\n"
+            f"Follow-up Question on Results: {followup_prompt}"
+        )
+
+        response = client.models.generate_content(
+            model=gemini_model,
+            contents=user_content,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                temperature=0.2
+            )
+        )
+
+        answer = response.text.strip() if response.text else "No answer generated."
+
+        resp = jsonify({
+            'success': True,
+            'answer': answer
+        })
+        return apply_session_cookie(resp, session_id)
+    except Exception as e:
+        resp = jsonify({
+            'success': False,
+            'error': f"Interrogation Error: {str(e)}"
+        })
+        return apply_session_cookie(resp, session_id), 500
+
+    
+
 @app.route('/api/history', methods=['GET'])
 def get_translation_history():
     user_identity = get_current_user_identity()

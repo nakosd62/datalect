@@ -5,6 +5,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   let CONFIGURED_DBS = [];
   let currentGoogleClientId = null;
 
+  // Active state tracker for multi-tab results & interrogation
+  let currentResultsList = [];
+  let activeResultIndex = 0;
+
   // Helper function to include Google ID tokens or auth headers in fetch requests
   function getApiHeaders() {
     const headers = { 'Content-Type': 'application/json' };
@@ -62,14 +66,24 @@ document.addEventListener('DOMContentLoaded', async () => {
   const resultsHeader = document.getElementById('resultsHeader');
   const resultsBody = document.getElementById('resultsBody');
 
+  // DOM Elements - Interrogation Controls
+  const interrogateWrapper = document.querySelector('.interrogate-wrapper');
+  const interrogatePrompt = document.getElementById('interrogatePrompt');
+  const interrogateResponse = document.getElementById('interrogateResponse');
+  const interrogateResponseWrapper = document.getElementById('interrogateResponseWrapper');
+  const closeInterrogateBtn = document.getElementById('closeInterrogateBtn');
+  const interrogateMicBtn = document.getElementById('interrogateMicBtn');
+
   // Chart.js Instances
   let chartCountInstance = null;
   let chartTotalTokensInstance = null;
   let chartInputTokensInstance = null;
 
-  // Speech Recognition Instance
+  // Speech Recognition Instance & Multi-target Handler
   let recognition = null;
   let isListening = false;
+  let activeMicBtn = null;
+  let activeTargetInput = null;
 
   const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (SpeechRecognition) {
@@ -80,40 +94,48 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     recognition.onstart = () => {
       isListening = true;
-      if (micBtn) micBtn.classList.add('listening');
+      if (activeMicBtn) activeMicBtn.classList.add('listening');
     };
 
     recognition.onresult = (event) => {
       const transcript = event.results[0][0].transcript;
-      if (aiPrompt) {
-        aiPrompt.value = transcript;
-        aiPrompt.dispatchEvent(new Event('input'));
+      if (activeTargetInput) {
+        activeTargetInput.value = transcript;
+        activeTargetInput.dispatchEvent(new Event('input'));
       }
     };
 
     recognition.onerror = (event) => {
       console.error('Speech recognition error:', event.error);
-      if (micBtn) micBtn.classList.remove('listening');
+      if (activeMicBtn) activeMicBtn.classList.remove('listening');
       isListening = false;
     };
 
     recognition.onend = () => {
-      if (micBtn) micBtn.classList.remove('listening');
+      if (activeMicBtn) activeMicBtn.classList.remove('listening');
       isListening = false;
     };
-  } else if (micBtn) {
-    micBtn.style.display = 'none';
+  } else {
+    if (micBtn) micBtn.style.display = 'none';
+    if (interrogateMicBtn) interrogateMicBtn.style.display = 'none';
   }
 
-  if (micBtn && recognition) {
-    micBtn.addEventListener('click', () => {
+  function setupMicButton(btn, targetInput) {
+    if (!btn || !recognition) return;
+    btn.addEventListener('click', () => {
       if (isListening) {
         recognition.stop();
-      } else {
-        recognition.start();
+        if (activeMicBtn === btn) return;
       }
+      activeMicBtn = btn;
+      activeTargetInput = targetInput;
+      recognition.start();
     });
   }
+
+  // Attach speech recognition handlers to prompt and interrogation inputs
+  setupMicButton(micBtn, aiPrompt);
+  setupMicButton(interrogateMicBtn, interrogatePrompt);
 
   let sqlEditor = null;
   if (sqlQueryTextarea && window.CodeMirror) {
@@ -313,10 +335,53 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
+  function setInterrogateResponseText(text) {
+    if (!interrogateResponse) return;
+    interrogateResponse.value = text;
+    if (interrogateResponseWrapper) interrogateResponseWrapper.classList.remove('hidden');
+    interrogateResponse.classList.remove('hidden');
+
+    // Auto-fit height up to a maximum of 50% of the overall results container
+    interrogateResponse.style.height = 'auto';
+    const resultsContainer = document.querySelector('.results-container');
+    const maxAllowedHeight = resultsContainer ? (resultsContainer.clientHeight * 0.25) : 125;
+    
+    interrogateResponse.style.height = `${Math.min(interrogateResponse.scrollHeight, maxAllowedHeight)}px`;
+  }
+
+  function clearInterrogateBoxes() {
+    if (interrogatePrompt) interrogatePrompt.value = '';
+    if (interrogateResponse) {
+      interrogateResponse.value = '';
+      interrogateResponse.style.height = '';
+      interrogateResponse.classList.add('hidden');
+    }
+    if (interrogateResponseWrapper) {
+      interrogateResponseWrapper.classList.add('hidden');
+    }
+  }
+
+  if (closeInterrogateBtn) {
+    closeInterrogateBtn.addEventListener('click', () => {
+      if (interrogateResponse) {
+        interrogateResponse.value = '';
+        interrogateResponse.style.height = '';
+        interrogateResponse.classList.add('hidden');
+      }
+      if (interrogateResponseWrapper) {
+        interrogateResponseWrapper.classList.add('hidden');
+      }
+    });
+  }
+
   function clearResultsDisplay() {
     if (resultsTabsNav) resultsTabsNav.classList.add('hidden');
+    if (interrogateWrapper) interrogateWrapper.classList.add('hidden');
     if (resultsHeader) resultsHeader.innerHTML = '';
     if (resultsBody) resultsBody.innerHTML = '';
+    currentResultsList = [];
+    activeResultIndex = 0;
+    clearInterrogateBoxes();
   }
 
   function resetExecutionStats() {
@@ -775,12 +840,18 @@ document.addEventListener('DOMContentLoaded', async () => {
   function renderMultiTurnResults(results) {
     if (!resultsTabsNav) return;
     resultsTabsNav.innerHTML = '';
+    currentResultsList = results || [];
+    activeResultIndex = 0;
 
     if (!results || results.length === 0) {
       resultsTabsNav.classList.add('hidden');
+      if (interrogateWrapper) interrogateWrapper.classList.add('hidden');
       renderTableResult(null);
       return;
     }
+
+    // Display interrogation controls when results exist
+    if (interrogateWrapper) interrogateWrapper.classList.remove('hidden');
 
     if (results.length === 1) {
       resultsTabsNav.classList.add('hidden');
@@ -804,12 +875,65 @@ document.addEventListener('DOMContentLoaded', async () => {
       btn.addEventListener('click', () => {
         document.querySelectorAll('.result-tab-btn').forEach(b => b.classList.remove('active'));
         btn.classList.add('active');
+        activeResultIndex = idx;
+        clearInterrogateBoxes();
         renderTableResult(res);
       });
       resultsTabsNav.appendChild(btn);
     });
 
     renderTableResult(results[0]);
+  }
+
+  async function processInterrogate() {
+    const followupText = interrogatePrompt ? interrogatePrompt.value.trim() : '';
+    if (!followupText) return;
+
+    if (!currentResultsList || currentResultsList.length === 0) {
+      setInterrogateResponseText("No query results available to analyze.");
+      return;
+    }
+
+    const focusedResult = currentResultsList[activeResultIndex] || currentResultsList[0];
+    const originalNlPrompt = aiPrompt ? aiPrompt.value.trim() : '';
+    const sqlExecuted = focusedResult.statement || focusedResult.query || focusedResult.sql || getSqlQuery();
+
+    setInterrogateResponseText("Analyzing results...");
+
+    try {
+      const response = await fetch('/api/interrogate', {
+        method: 'POST',
+        headers: getApiHeaders(),
+        credentials: 'same-origin',
+        body: JSON.stringify({
+          original_prompt: originalNlPrompt,
+          sql_query: sqlExecuted,
+          results_table: {
+            columns: focusedResult.columns || [],
+            rows: focusedResult.rows || []
+          },
+          followup_prompt: followupText
+        })
+      });
+
+      const data = await response.json();
+      if (response.ok && data.success) {
+        setInterrogateResponseText(data.answer);
+      } else {
+        setInterrogateResponseText(`Error: ${data.error || 'Failed to interrogate results.'}`);
+      }
+    } catch (err) {
+      setInterrogateResponseText(`Network Error: ${err.message || 'Server request failed.'}`);
+    }
+  }
+
+  if (interrogatePrompt) {
+    interrogatePrompt.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        processInterrogate();
+      }
+    });
   }
 
   async function translatePrompt() {

@@ -11,6 +11,7 @@ kill_server.sh
 gcp_deploy.sh
 run_tests.sh
 run_android_app.sh
+dump_state.sh
 
 
 # Ignre env files containing secrets

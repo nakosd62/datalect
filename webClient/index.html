@@ -75,7 +75,6 @@
               <circle cx="85" cy="102" r="4" fill="#FFFFFF" filter="url(#crbotGlow)"/>
             </svg>
 
-            <!-- Two-line responsive label -->
             <div class="header-icon-label">
               <div class="label-line">
                 <span class="full-text">your Database</span>
@@ -115,7 +114,6 @@
             </svg>
           </button>
 
-          <!-- Google Sign-In Button Target -->
           <div id="g_id_signin" class="auth-container"></div>
 
         </div>
@@ -202,6 +200,25 @@
               </tbody>
             </table>
           </div>
+
+          <div class="interrogate-wrapper hidden">
+            <div id="interrogateResponseWrapper" class="interrogate-response-wrapper hidden">
+              <button type="button" id="closeInterrogateBtn" class="interrogate-close-btn" title="Close interrogation results">&times;</button>
+              <textarea id="interrogateResponse" class="interrogate-response-box" readonly rows="2" placeholder="Analysis of results will appear here..."></textarea>
+            </div>
+            <div class="speech-bubble-wrapper">
+              <textarea id="interrogatePrompt" class="interrogate-textbox" rows="1" placeholder="Ask question about these results..."></textarea>
+              <button type="button" id="interrogateMicBtn" class="mic-btn" title="Voice-to-text input">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+                  <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                  <line x1="12" y1="19" x2="12" y2="23"></line>
+                  <line x1="8" y1="23" x2="16" y2="23"></line>
+                </svg>
+              </button>
+            </div>
+          </div>
+
         </div>
       </section>
 
