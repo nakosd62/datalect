@@ -149,7 +149,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       lineNumbers: true,
       lineWrapping: true,
       viewportMargin: Infinity,
-      placeholder: sqlQueryTextarea.getAttribute('placeholder') || "If you know SQL, you may type it here and execute it..."
+      placeholder: sqlQueryTextarea.getAttribute('placeholder') || "You may enter SQL here and execute it..."
     });
     sqlEditor.setSize('100%', '100%');
   }
@@ -1236,7 +1236,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (transStatus) transStatus.textContent = "Ready";
         resetExecutionStats();
         clearResultsDisplay();
-        if (resultsBody) resultsBody.innerHTML = '<tr><td class="text-center text-muted py-8">The answer will be displayed here.</td></tr>';
+        if (resultsBody) resultsBody.innerHTML = '<tr><td class="text-center text-muted py-8">The answer will appear here...</td></tr>';
 
         updateHistoryTurnsSubtitle();
         const msgEl = document.getElementById('historyActionMsg');
@@ -1316,7 +1316,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       // 5. Clear Results Display
       clearResultsDisplay();
       if (resultsBody) {
-        resultsBody.innerHTML = '<tr><td class="text-center text-muted py-8">The answer will appear here....</td></tr>';
+        resultsBody.innerHTML = '<tr><td class="text-center text-muted py-8">The answer will appear here...</td></tr>';
       }
     });
   }
