@@ -257,6 +257,7 @@ textarea:focus {
   font-size: 0.78rem;
   line-height: 1.2;
   white-space: nowrap;
+  flex: 1; /* Ensures all 4 buttons take equal height/space */
 }
 
 /* Microphone Button Styles */
@@ -559,6 +560,23 @@ textarea:focus {
   }
 }
 
+/* Responsive Layout for Narrow Screens */
+@media (max-width: 900px) {
+  .action-buttons-column {
+    flex-direction: row;
+    justify-content: space-between;
+    align-items: center;
+    gap: 0.5rem;
+    width: 100%;
+  }
+
+  .btn-control-block {
+    flex: 1; /* Distributes all 4 buttons equally across row width */
+    width: auto;
+  }
+}
+
+
 /* Natural Language & SQL Row Layouts */
 .nl-prompt-row,
 .sql-prompt-row {
@@ -683,6 +701,7 @@ textarea.interrogate-textbox {
   overflow-y: auto !important;
   overflow-x: auto !important;
 }
+
 
 /* Interrogation UI Styles */
 .interrogate-wrapper {
@@ -1102,15 +1121,6 @@ textarea.interrogate-textbox {
   font-family: var(--font-mono, monospace);
 }
 
-/* Dynamic Controls Layout Grid */
-.controls-layout-grid {
-  display: flex;
-  gap: 1rem;
-  align-items: stretch;
-  width: 100%;
-  flex-wrap: nowrap;
-}
-
 .inputs-column {
   flex: 1;
   display: flex;
@@ -1133,14 +1143,12 @@ textarea.interrogate-textbox {
 
 /* Action Buttons Column */
 .action-buttons-column {
-  width: 125px;
-  flex-shrink: 0;
   display: flex;
   flex-direction: column;
-  justify-content: space-evenly;
-  align-self: stretch;
-  padding: 0;
-}
+  justify-content: space-between;
+  gap: 0.5rem;
+  height: 100%;
+  }
 
 .action-buttons-column .btn {
   flex: none;
@@ -1299,41 +1307,6 @@ textarea.interrogate-textbox {
 .auth-dropdown-item:hover {
   background-color: rgba(255, 255, 255, 0.05);
   color: var(--danger);
-}
-
-@media (max-width: 768px) {
-  .controls-layout-grid {
-    flex-direction: column;
-    flex-wrap: wrap;
-    gap: 0.75rem;
-  }
-
-  .action-buttons-column {
-    width: 100%;
-    flex-direction: row;
-    justify-content: space-between;
-    gap: 0.5rem;
-    align-self: auto;
-  }
-
-  .action-buttons-column .btn {
-    flex: 1;
-    height: 36px;
-    font-size: 0.75rem;
-  }
-
-  .stats-column {
-    width: 100%;
-    flex-direction: row;
-    gap: 0.5rem;
-    justify-content: space-between;
-  }
-
-  .stats-column #translationStats,
-  .stats-column #executionStats {
-    margin: 0 !important;
-    flex: 1;
-  }
 }
 
 /* Auth Avatar and Menu Styles matching header buttons */
@@ -1537,4 +1510,112 @@ textarea.interrogate-textbox {
   position: relative;
   height: 200px;
   width: 100%;
+}
+
+/* Dynamic Controls Layout Grid Base */
+.controls-layout-grid {
+  display: flex;
+  gap: 1rem;
+  align-items: stretch;
+  width: 100%;
+  flex-wrap: nowrap;
+}
+
+/* Wide Screen Layout (> 900px) */
+@media (min-width: 901px) {
+  .action-buttons-column {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 0.7rem;
+    padding: 0.25rem 0;
+    height: 100%;
+  }
+
+  .action-buttons-column .btn {
+    flex: 0 0 auto;
+    padding: 0.35rem 0.75rem;
+    font-size: 0.78rem;
+    line-height: 1.2;
+    white-space: nowrap;
+    width: 100%;
+  }
+
+  .stats-column {
+    width: 160px;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    justify-content: space-between;
+  }
+}
+
+/* Narrow Screens Layout (<= 900px) */
+@media (max-width: 900px) {
+  .controls-layout-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    width: 100%;
+  }
+
+  .inputs-column {
+    width: 100%;
+  }
+
+  /* 4 Action Buttons placed side-by-side under SQL box */
+  .action-buttons-column {
+    width: 100%;
+    display: flex;
+    flex-direction: row;
+    justify-content: space-between;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.25rem 0;
+  }
+
+  .action-buttons-column .btn,
+  .btn-control-block {
+    flex: 1; /* Distributes all 4 buttons equally across row width */
+    height: 36px;
+    width: auto;
+    font-size: 0.75rem;
+    padding: 0 0.35rem;
+  }
+
+  /* 2 Stats areas placed side-by-side UNDER the 4 action buttons */
+  .stats-column {
+    width: 100%;
+    display: flex;
+    flex-direction: row;
+    gap: 0.75rem;
+    justify-content: space-between;
+    align-items: stretch;
+  }
+
+  .stats-column #translationStats,
+  .stats-column #executionStats,
+  .stats-column .stats-card-vertical {
+    flex: 1;
+    margin: 0 !important;
+    width: 50%;
+  }
+}
+/* Empty state placeholder in results table */
+#resultsBody .text-muted {
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  font-style: italic;
+  color: #64748b;
+  opacity: 0.8;
+}
+
+/* CodeMirror Placeholder Styling */
+.CodeMirror-placeholder {
+  color: #64748b !important;
+  font-family: var(--font-mono) !important;
+  font-size: 0.9rem !important;
+  font-style: italic !important;
+  opacity: 0.8 !important;
 }

@@ -28,6 +28,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const translateBtn = document.getElementById('translateBtn');
   const runBtn = document.getElementById('runBtn');
   const luckyBtn = document.getElementById('luckyBtn');
+  const clearAllBtn = document.getElementById('clearAllBtn'); 
   const clearHistoryBtn = document.getElementById('clearHistoryBtn');
   const purgeHistoryBtn = document.getElementById('purgeHistoryBtn');
   const micBtn = document.getElementById('micBtn');
@@ -147,7 +148,8 @@ document.addEventListener('DOMContentLoaded', async () => {
       theme: 'dracula',
       lineNumbers: true,
       lineWrapping: true,
-      viewportMargin: Infinity
+      viewportMargin: Infinity,
+      placeholder: sqlQueryTextarea.getAttribute('placeholder') || "If you know SQL, you may type it here and execute it..."
     });
     sqlEditor.setSize('100%', '100%');
   }
@@ -306,6 +308,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (translateBtn) translateBtn.disabled = disabled;
     if (luckyBtn) luckyBtn.disabled = disabled;
     if (runBtn) runBtn.disabled = disabled;
+    if (clearAllBtn) clearAllBtn.disabled = disabled; 
     if (micBtn) micBtn.disabled = disabled;
   }
 
@@ -390,7 +393,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   function resetExecutionStats() {
     if (execStatus) {
       execStatus.textContent = "Ready";
-      execStatus.className = "stat-val";
+      execStatus.className = "stat-val status-unknown";
     }
     if (execTime) execTime.textContent = "—";
     if (execRows) execRows.textContent = "—";
@@ -1196,7 +1199,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       if (transStatus) {
         transStatus.textContent = "Ready";
-        transStatus.className = "stat-val";
+        transStatus.className = "stat-val status-unknown";
       }
       if (transTime) transTime.textContent = "—";
       if (tokensTotal) tokensTotal.textContent = "—";
@@ -1287,6 +1290,33 @@ document.addEventListener('DOMContentLoaded', async () => {
           msgEl.textContent = 'Network error purging history';
           msgEl.style.color = 'var(--danger, #f87171)';
         }
+      }
+    });
+  }
+
+  if (clearAllBtn) {
+    clearAllBtn.addEventListener('click', () => {
+      // 1. Clear Natural Language Prompt
+      if (aiPrompt) aiPrompt.value = '';
+  
+      // 2. Clear SQL Command (CodeMirror & Textarea)
+      setSqlQuery('');
+  
+      // 3. Reset Translation Stats
+      if (transStatus) {
+        transStatus.textContent = "Ready";
+        transStatus.className = "stat-val status-unknown";
+      }
+      if (transTime) transTime.textContent = "—";
+      if (tokensTotal) tokensTotal.textContent = "—";
+  
+      // 4. Reset Execution Stats
+      resetExecutionStats();
+  
+      // 5. Clear Results Display
+      clearResultsDisplay();
+      if (resultsBody) {
+        resultsBody.innerHTML = '<tr><td class="text-center text-muted py-8">The answer will appear here....</td></tr>';
       }
     });
   }

@@ -124,7 +124,7 @@
           <div class="inputs-column">
             <div class="input-row">
               <div class="speech-bubble-wrapper">
-                <textarea id="aiPrompt" rows="1" placeholder="Type your question here..."></textarea>
+                <textarea id="aiPrompt" rows="1" placeholder="Ask your question here by typing or using the mic..."></textarea>
                 <button type="button" id="micBtn" class="mic-btn" title="Voice-to-text input">
                   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                     <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
@@ -138,15 +138,16 @@
 
             <div class="input-row">
               <div class="speech-bubble-wrapper sql-bubble">
-                <textarea id="sqlQuery" name="query" rows="2" placeholder="If you are fluent in SQL, feel free to bypass me and type it here and click 'Execute SQL'"></textarea>
+                <textarea id="sqlQuery" name="query" rows="2" placeholder="If you know SQL, you may type it here and execute it..."></textarea>
               </div>
             </div>
           </div>
 
           <div class="action-buttons-column">
-            <button type="button" id="translateBtn" class="btn btn-primary btn-control-block">Translate Prompt</button>
+            <button type="button" id="translateBtn" class="btn btn-primary btn-control-block">Translate</button>
             <button type="button" id="luckyBtn" class="btn btn-primary btn-control-block">I feel lucky</button>
             <button type="button" id="runBtn" class="btn btn-primary btn-control-block">Execute SQL</button>
+            <button type="button" id="clearAllBtn" class="btn btn-primary btn-control-block">Clear All</button>
           </div>
 
           <div class="stats-column">
@@ -195,7 +196,7 @@
               </thead>
               <tbody id="resultsBody">
                 <tr>
-                  <td class="text-center text-muted py-8">The answer will be displayed here.</td>
+                  <td class="text-center text-muted py-8">The answer will appear here...</td>
                 </tr>
               </tbody>
             </table>
@@ -207,7 +208,7 @@
               <textarea id="interrogateResponse" class="interrogate-response-box" readonly rows="2" placeholder="Analysis of results will appear here..."></textarea>
             </div>
             <div class="speech-bubble-wrapper">
-              <textarea id="interrogatePrompt" class="interrogate-textbox" rows="1" placeholder="Ask question about these results..."></textarea>
+              <textarea id="interrogatePrompt" class="interrogate-textbox" rows="1" placeholder="Interrogate these results by typing or using the mic..."></textarea>
               <button type="button" id="interrogateMicBtn" class="mic-btn" title="Voice-to-text input">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                   <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
@@ -378,6 +379,7 @@
   <script src="https://cdn.jsdelivr.net/npm/sql-formatter@15.4.0/dist/sql-formatter.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/codemirror.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/mode/sql/sql.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/addon/display/placeholder.min.js"></script>
   <script src="client.js"></script>
 </body>
 </html>
