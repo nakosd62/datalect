@@ -826,7 +826,6 @@ def execute_query():
         if conn:
             conn.close()
 
-
 @app.route('/api/interrogate', methods=['POST'])
 def interrogate_results():
     data = request.get_json() or {}
@@ -847,18 +846,21 @@ def interrogate_results():
 
     session_id = get_or_create_session_id()
     user_identity = get_current_user_identity()
+    conn_str = resolve_conn_str(data.get('database_url'), user_identity)
 
     try:
+        schema = get_database_schema(conn_str, user_identity)
         client = genai.Client(api_key=api_key)
 
-        # 1. System Prompt (can be fine-tuned or overridden)
+        # 1. System Prompt
         system_instruction = data.get('system_prompt') or (
             "You are an expert data analyst assistant that can slice, dice and analyze tabular data sets. "
             "You are provided with: "
-            "(1) the user's original natural language request that got translated to SQL, "
-            "(2) the SQL query that was generated from the translation and executed, "
-            "(3) the resulting data table, and "
-            "(4) a follow-up request asking to analyze these results.\n"
+            "(1) the database schema, "
+            "(2) the user's original natural language request that got translated to SQL, "
+            "(3) the SQL query that was generated from the translation and executed, "
+            "(4) the resulting data table, and "
+            "(5) a follow-up request asking to analyze these results.\n"
             "Analyze the data thoroughly and answer the follow-up request as concisely as possible."
         )
 
@@ -870,6 +872,7 @@ def interrogate_results():
         table_text += "\n".join([str(r) for r in rows[:500]])
 
         user_content = (
+            f"Database Schema:\n{schema}\n\n"
             f"Original Natural Language Prompt: {original_prompt}\n\n"
             f"Executed SQL Query:\n{sql_query}\n\n"
             f"Query Results Table:\n{table_text}\n\n"
@@ -898,9 +901,7 @@ def interrogate_results():
             'error': f"Interrogation Error: {str(e)}"
         })
         return apply_session_cookie(resp, session_id), 500
-
     
-
 @app.route('/api/history', methods=['GET'])
 def get_translation_history():
     user_identity = get_current_user_identity()
@@ -918,8 +919,13 @@ def get_translation_history():
             for doc in docs:
                 d = doc.to_dict()
                 created_at = d.get("created_at")
-                if hasattr(created_at, "isoformat"):
-                    created_at = created_at.isoformat()
+                if created_at:
+                    if hasattr(created_at, "strftime"):
+                        created_at = created_at.strftime("%Y-%m-%d %H:%M:%S")
+                    else:
+                        created_at = str(created_at)
+                else:
+                    created_at = ""
                 rows.append({
                     "nl_prompt": d.get("nl_prompt", ""),
                     "sql_command": d.get("sql_command", ""),
@@ -928,8 +934,10 @@ def get_translation_history():
 
             docs_all = firestore_client.collection("translations").where("user_id", "==", user_identity).stream()
             daily = {}
+            total_count = 0  # Track total translation count[cite: 48]
             for doc in docs_all:
                 d = doc.to_dict()
+                total_count += 1
                 dt = d.get("created_at")
                 if dt:
                     if hasattr(dt, "strftime"):
@@ -955,7 +963,8 @@ def get_translation_history():
             return jsonify({
                 'success': True,
                 'history': rows,
-                'stats': stats
+                'stats': stats,
+                'total_count': total_count  # Return total count[cite: 48]
             })
         except Exception as e:
             return jsonify({'success': False, 'error': f"Firestore error: {str(e)}"}), 500
@@ -967,7 +976,15 @@ def get_translation_history():
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
 
-            # Filter strictly by user_id for SQLite storage
+            # Get total count of translation records[cite: 48]
+            cursor.execute("""
+                SELECT COUNT(*) as total_count
+                FROM translations
+                WHERE user_id = ?
+            """, (effective_user,))
+            total_row = cursor.fetchone()
+            total_count = total_row["total_count"] if total_row else 0
+
             cursor.execute("""
                 SELECT nl_prompt, sql_command, created_at
                 FROM translations
@@ -993,11 +1010,66 @@ def get_translation_history():
             return jsonify({
                 'success': True, 
                 'history': rows,
-                'stats': stats
+                'stats': stats,
+                'total_count': total_count  # Return total count[cite: 48]
             })
 
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/history/purge', methods=['DELETE', 'POST'])
+def purge_translation_history():
+    user_identity = get_current_user_identity()
+    effective_user = user_identity or "global"
+
+    # 1. Firestore / Cloud Run Mode
+    if firestore_client:
+        try:
+            docs = firestore_client.collection("translations").where("user_id", "==", effective_user).stream()
+            batch = firestore_client.batch()
+            count = 0
+            for doc in docs:
+                batch.delete(doc.reference)
+                count += 1
+                # Commit in batches to respect Firestore batch limits (max 500)
+                if count >= 400:
+                    batch.commit()
+                    batch = firestore_client.batch()
+                    count = 0
+            if count > 0:
+                batch.commit()
+                
+            return jsonify({
+                'success': True, 
+                'message': 'Translation history purged successfully from Firestore.'
+            })
+        except Exception as e:
+            return jsonify({
+                'success': False, 
+                'error': f"Firestore purge error: {str(e)}"
+            }), 500
+
+    # 2. Local SQLite Mode
+    try:
+        with sqlite3.connect(TRANSLATION_STATS_DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM translations WHERE user_id = ?", (effective_user,))
+            conn.commit()
+        
+        # Sync updated SQLite state to Google Cloud Storage if configured
+        upload_db_to_gcs()
+        
+        return jsonify({
+            'success': True, 
+            'message': 'Translation history purged successfully from local database.'
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False, 
+            'error': f"SQLite purge error: {str(e)}"
+        }), 500
+
 
 if __name__ == '__main__':
     hostname = os.environ.get("CRBOT_HOSTNAME", "0.0.0.0")

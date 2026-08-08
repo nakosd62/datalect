@@ -4,6 +4,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   let ACTIVE_DB_URL = "";
   let CONFIGURED_DBS = [];
   let currentGoogleClientId = null;
+  let googleIdToken = null;
+  let customDbUrl = "";
+  let activeModel = "";
+  let geminiPresetKeys = [];
 
   // Active state tracker for multi-tab results & interrogation
   let currentResultsList = [];
@@ -12,9 +16,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Helper function to include Google ID tokens or auth headers in fetch requests
   function getApiHeaders() {
     const headers = { 'Content-Type': 'application/json' };
-    const googleToken = sessionStorage.getItem('google_id_token');
-    if (googleToken) {
-      headers['Authorization'] = `Bearer ${googleToken}`;
+    if (googleIdToken) {
+      headers['Authorization'] = `Bearer ${googleIdToken}`;
     }
     return headers;
   }
@@ -26,6 +29,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const runBtn = document.getElementById('runBtn');
   const luckyBtn = document.getElementById('luckyBtn');
   const clearHistoryBtn = document.getElementById('clearHistoryBtn');
+  const purgeHistoryBtn = document.getElementById('purgeHistoryBtn');
   const micBtn = document.getElementById('micBtn');
 
   // DOM Elements - Status & Stats
@@ -77,7 +81,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Chart.js Instances
   let chartCountInstance = null;
   let chartTotalTokensInstance = null;
-  let chartInputTokensInstance = null;
 
   // Speech Recognition Instance & Multi-target Handler
   let recognition = null;
@@ -186,7 +189,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function handleLogout() {
-    sessionStorage.removeItem('google_id_token');
+    googleIdToken = null;
     if (window.google && google.accounts && google.accounts.id) {
       google.accounts.id.disableAutoSelect();
     }
@@ -199,7 +202,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const container = document.getElementById('g_id_signin');
     if (!container) return;
 
-    const existingToken = sessionStorage.getItem('google_id_token');
+    const existingToken = googleIdToken;
     const payload = existingToken ? parseJwt(existingToken) : null;
     const isExpired = payload && payload.exp && (payload.exp * 1000 < Date.now());
 
@@ -261,7 +264,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
 
       if (isExpired) {
-        sessionStorage.removeItem('google_id_token');
+        googleIdToken = null;
       }
 
       container.innerHTML = '';
@@ -271,7 +274,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           client_id: targetClientId,
           callback: (response) => {
             if (response.credential) {
-              sessionStorage.setItem('google_id_token', response.credential);
+              googleIdToken = response.credential;
               renderAuthUI(targetClientId);
               fetchBackendConfig();
             }
@@ -341,7 +344,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (interrogateResponseWrapper) interrogateResponseWrapper.classList.remove('hidden');
     interrogateResponse.classList.remove('hidden');
 
-    // Auto-fit height up to a maximum of 50% of the overall results container
+    // Auto-fit height up to a maximum of 25% of the overall results container
     interrogateResponse.style.height = 'auto';
     const resultsContainer = document.querySelector('.results-container');
     const maxAllowedHeight = resultsContainer ? (resultsContainer.clientHeight * 0.25) : 125;
@@ -397,9 +400,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     const turns = Math.floor(chatHistory.length / 2);
     const clearTitleEl = document.querySelector('.btn-clear-title');
     if (clearTitleEl) {
-      clearTitleEl.textContent = `Clear Chat History (${turns})`;
+      clearTitleEl.textContent = `(${turns})`;
     }
-    const clearMsgEl = document.getElementById('clearHistoryMsg');
+    const clearMsgEl = document.getElementById('historyActionMsg');
     if (clearMsgEl) {
       clearMsgEl.textContent = '';
     }
@@ -448,19 +451,21 @@ document.addEventListener('DOMContentLoaded', async () => {
       CONFIGURED_DBS = data.configured_databases || [];
       DEFAULT_DB_URL = data.default_database_url || "";
       ACTIVE_DB_URL = data.active_database_url || DEFAULT_DB_URL;
+      geminiPresetKeys = data.gemini_preset_keys || data.models || [];
+      if (data.active_model) {
+        activeModel = data.active_model;
+      } else if (geminiPresetKeys.length > 0 && !activeModel) {
+        activeModel = geminiPresetKeys[0];
+      }
 
       if (data.auth_enabled && data.google_client_id) {
         initGoogleAuth(data.google_client_id);
       }
 
-      localStorage.removeItem('crbot_db_url');
-      localStorage.removeItem('crbot_model');
-      sessionStorage.removeItem('crbot_model');
-
       if (data.active_database_url) {
-        sessionStorage.setItem('crbot_db_url', data.active_database_url);
-      } else if (!sessionStorage.getItem('crbot_db_url') && DEFAULT_DB_URL) {
-        sessionStorage.setItem('crbot_db_url', DEFAULT_DB_URL);
+        ACTIVE_DB_URL = data.active_database_url;
+      } else if (!ACTIVE_DB_URL && DEFAULT_DB_URL) {
+        ACTIVE_DB_URL = DEFAULT_DB_URL;
       }
 
       renderDbRadioButtons();
@@ -476,7 +481,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const radioGroup = document.getElementById('modalDbRadioGroup');
     if (!radioGroup) return;
 
-    const activeUrl = currentDbUrl || sessionStorage.getItem('crbot_db_url') || ACTIVE_DB_URL || DEFAULT_DB_URL;
+    const activeUrl = currentDbUrl || ACTIVE_DB_URL || DEFAULT_DB_URL;
     const matchedPresetUrl = getMatchingPresetUrl(activeUrl);
 
     let html = '';
@@ -493,7 +498,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
 
     const isCustom = !matchedPresetUrl && Boolean(activeUrl);
-    const customValue = isCustom ? activeUrl : (sessionStorage.getItem('crbot_custom_db_url') || '');
+    const customValue = isCustom ? activeUrl : (customDbUrl || '');
 
     // 2. Render Custom Input Box
     html += `
@@ -516,7 +521,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (customRadio) customRadio.checked = true;
         const val = customInput.value.trim();
         if (val) {
-          sessionStorage.setItem('crbot_custom_db_url', val);
+          customDbUrl = val;
         }
       });
     }
@@ -529,7 +534,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (customInput) {
       const inputVal = customInput.value.trim();
       if (inputVal) {
-        sessionStorage.setItem('crbot_custom_db_url', inputVal);
+        customDbUrl = inputVal;
       }
     }
 
@@ -552,7 +557,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         headers: getApiHeaders(),
         credentials: 'same-origin',
         body: JSON.stringify({
-          database_url: dbUrlValue
+          database_url: dbUrlValue,
+          model: activeModel
         })
       });
 
@@ -560,7 +566,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         const data = await response.json();
         if (data.active_database_url) {
           ACTIVE_DB_URL = data.active_database_url;
-          sessionStorage.setItem('crbot_db_url', ACTIVE_DB_URL);
+        }
+        if (data.active_model) {
+          activeModel = data.active_model;
         }
         
         updateConnectionDetails(data);
@@ -576,7 +584,8 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   function loadConfig() {
     return {
-      dbUrl: sessionStorage.getItem('crbot_db_url') || ACTIVE_DB_URL || DEFAULT_DB_URL
+      dbUrl: ACTIVE_DB_URL || DEFAULT_DB_URL,
+      model: activeModel
     };
   }
 
@@ -626,6 +635,12 @@ document.addEventListener('DOMContentLoaded', async () => {
       tabBtnTranslations.classList.remove('active');
       if (historyTabStatistics) historyTabStatistics.classList.remove('hidden');
       if (historyTabTranslations) historyTabTranslations.classList.add('hidden');
+
+      // Force Chart.js to recalculate dimensions once the container is visible
+      requestAnimationFrame(() => {
+        if (chartCountInstance) chartCountInstance.resize();
+        if (chartTotalTokensInstance) chartTotalTokensInstance.resize();
+      });
     });
   }
 
@@ -687,24 +702,48 @@ document.addEventListener('DOMContentLoaded', async () => {
       });
     }
 
-    const ctxInputTokens = document.getElementById('chartInputTokensPerDay')?.getContext('2d');
-    if (ctxInputTokens) {
-      if (chartInputTokensInstance) chartInputTokensInstance.destroy();
-      chartInputTokensInstance = new window.Chart(ctxInputTokens, {
-        type: 'bar',
-        data: {
-          labels: dates,
-          datasets: [{
-            label: 'Sum of Input Tokens',
-            data: sumInputTokens,
-            backgroundColor: 'rgba(168, 85, 247, 0.6)',
-            borderColor: '#a855f7',
-            borderWidth: 1
-          }]
-        },
-        options: commonOptions
-      });
-    }
+  }
+
+  // Custom confirmation modal helper
+  function showConfirmDialog(message) {
+    return new Promise((resolve) => {
+      const modal = document.getElementById('confirmModal');
+      const textEl = document.getElementById('confirmModalText');
+      const okBtn = document.getElementById('confirmModalOkBtn');
+      const cancelBtn = document.getElementById('confirmModalCancelBtn');
+      const closeBtn = document.getElementById('confirmModalCloseBtn');
+
+      if (!modal || !textEl || !okBtn || !cancelBtn) {
+        resolve(confirm(message));
+        return;
+      }
+
+      textEl.textContent = message;
+      modal.classList.remove('hidden');
+
+      let cleanedUp = false;
+      const cleanup = (result) => {
+        if (cleanedUp) return;
+        cleanedUp = true;
+        modal.classList.add('hidden');
+        okBtn.removeEventListener('click', onOk);
+        cancelBtn.removeEventListener('click', onCancel);
+        closeBtn?.removeEventListener('click', onCancel);
+        modal.removeEventListener('click', onOutside);
+        resolve(result);
+      };
+
+      const onOk = () => cleanup(true);
+      const onCancel = () => cleanup(false);
+      const onOutside = (e) => {
+        if (e.target === modal) cleanup(false);
+      };
+
+      okBtn.addEventListener('click', onOk);
+      cancelBtn.addEventListener('click', onCancel);
+      closeBtn?.addEventListener('click', onCancel);
+      modal.addEventListener('click', onOutside);
+    });
   }
 
   async function loadHistoryData() {
@@ -712,12 +751,24 @@ document.addEventListener('DOMContentLoaded', async () => {
   
     historyTableHeader.innerHTML = '';
     historyTableBody.innerHTML = '<tr><td class="text-center text-muted py-8">Loading history...</td></tr>';
+
+    // Remove existing subtitle element if present in DOM
+    document.getElementById('historyCountSubtitle')?.remove();
   
     try {
       const response = await fetch('/api/history', { headers: getApiHeaders(), credentials: 'same-origin' });
       const data = await response.json();
   
       if (response.ok && data.success) {
+        const totalCount = (data.total_count !== undefined && data.total_count !== null && data.total_count > 0) 
+          ? data.total_count 
+          : (data.history ? data.history.length : 0);
+
+        const purgeTitleEl = document.querySelector('.btn-purge-title');
+        if (purgeTitleEl) {
+          purgeTitleEl.textContent = `(${totalCount})`;
+        }
+
         if (data.history && data.history.length > 0) {
           const rows = data.history;
           const columns = Object.keys(rows[0]);
@@ -778,11 +829,16 @@ document.addEventListener('DOMContentLoaded', async () => {
           </td>
         </tr>`;
     }
-  }  
+  }
 
   if (historyBtn && historyModal) {
     historyBtn.addEventListener('click', () => {
       updateHistoryTurnsSubtitle();
+      // Set initial state for purge title while fetching
+      const purgeTitleEl = document.querySelector('.btn-purge-title');
+      if (purgeTitleEl) {
+        purgeTitleEl.textContent = '(...)';
+      }
       historyModal.classList.remove('hidden');
       loadHistoryData();
     });
@@ -912,7 +968,8 @@ document.addEventListener('DOMContentLoaded', async () => {
             columns: focusedResult.columns || [],
             rows: focusedResult.rows || []
           },
-          followup_prompt: followupText
+          followup_prompt: followupText,
+          model: activeModel
         })
       });
 
@@ -962,7 +1019,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         body: JSON.stringify({
           prompt: promptText,
           history: chatHistory,
-          database_url: config.dbUrl
+          database_url: config.dbUrl,
+          model: config.model
         })
       });
 
@@ -1082,7 +1140,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         credentials: 'same-origin',
         body: JSON.stringify({
           sql: sql,
-          database_url: config.dbUrl
+          database_url: config.dbUrl,
+          model: config.model
         })
       });
 
@@ -1177,12 +1236,56 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (resultsBody) resultsBody.innerHTML = '<tr><td class="text-center text-muted py-8">The answer will be displayed here.</td></tr>';
 
         updateHistoryTurnsSubtitle();
+        const msgEl = document.getElementById('historyActionMsg');
+        if (msgEl) {
+          msgEl.textContent = 'Chat history cleared successfully.';
+          msgEl.style.color = 'var(--primary, #10b981)';
+        }
       } catch (err) {
         console.error("Failed to clear chat history:", err);
-        const clearMsgEl = document.getElementById('clearHistoryMsg');
-        if (clearMsgEl) {
-          clearMsgEl.textContent = 'Failed to clear chat history';
-          clearMsgEl.style.color = 'var(--danger, #f87171)';
+        const msgEl = document.getElementById('historyActionMsg');
+        if (msgEl) {
+          msgEl.textContent = 'Failed to clear chat history';
+          msgEl.style.color = 'var(--danger, #f87171)';
+        }
+      }
+    });
+  }
+
+  if (purgeHistoryBtn) {
+    purgeHistoryBtn.addEventListener('click', async () => {
+      const confirmed = await showConfirmDialog('Are you sure you want to purge history records within the current scope? This action cannot be undone.');
+      if (!confirmed) {
+        return;
+      }
+      const msgEl = document.getElementById('historyActionMsg');
+      try {
+        const response = await fetch('/api/history/purge', {
+          method: 'DELETE',
+          headers: getApiHeaders(),
+          credentials: 'same-origin'
+        });
+        const data = await response.json();
+        if (response.ok && data.success) {
+          if (msgEl) {
+            msgEl.textContent = 'Purged successfully.';
+            msgEl.style.color = 'var(--primary, #10b981)';
+          }
+          await loadHistoryData();
+        } else {
+          const errMsg = response.status === 401 
+            ? "Authentication required." 
+            : (data.error || "Failed to purge history.");
+          if (msgEl) {
+            msgEl.textContent = errMsg;
+            msgEl.style.color = 'var(--danger, #f87171)';
+          }
+        }
+      } catch (err) {
+        console.error("Failed to purge history:", err);
+        if (msgEl) {
+          msgEl.textContent = 'Network error purging history';
+          msgEl.style.color = 'var(--danger, #f87171)';
         }
       }
     });

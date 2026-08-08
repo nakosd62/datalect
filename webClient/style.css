@@ -100,6 +100,7 @@ body {
   line-height: 1.2;
   min-width: 0;
   max-width: min(600px, 60vw);
+  cursor: pointer; /* Ensures a hand pointer appears on hover */
 }
 
 .status-badge .conn-badge-text {
@@ -1180,7 +1181,6 @@ textarea.interrogate-textbox {
 
 /* Button height consistency in modals */
 .modal-actions .btn-primary,
-#clearHistoryBtn,
 .btn-modal-secondary {
   height: 34px;
   padding: 0.4rem 1.25rem;
@@ -1220,17 +1220,17 @@ textarea.interrogate-textbox {
   background: rgba(255, 255, 255, 0.05);
   border: 1px solid var(--bg-card-border);
   color: var(--text-primary);
-  padding: 0;
+  padding: 0.35rem; /* Match header buttons padding */
   border-radius: 50%;
   cursor: pointer;
   transition: var(--transition);
   display: flex;
   align-items: center;
   justify-content: center;
-  width: clamp(36px, 4vw, 50px);
-  height: clamp(36px, 4vw, 50px);
-  overflow: hidden;
+  width: clamp(32px, 3.2vw, 42px); /* Reduced to match standard header buttons */
+  height: clamp(32px, 3.2vw, 42px);
   flex-shrink: 0;
+  overflow: hidden;
 }
 
 .auth-avatar-circle:hover {
@@ -1334,4 +1334,207 @@ textarea.interrogate-textbox {
     margin: 0 !important;
     flex: 1;
   }
+}
+
+/* Auth Avatar and Menu Styles matching header buttons */
+.auth-menu-wrapper {
+  position: relative;
+  display: inline-block;
+  flex-shrink: 0;
+}
+
+.auth-avatar-circle {
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--bg-card-border);
+  color: var(--text-primary);
+  padding: 0;
+  border-radius: 50%;
+  cursor: pointer;
+  transition: var(--transition);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: clamp(36px, 4vw, 50px);
+  height: clamp(36px, 4vw, 50px);
+  flex-shrink: 0;
+  overflow: hidden;
+}
+
+.auth-avatar-circle:hover {
+  background: rgba(255, 255, 255, 0.12);
+  color: var(--primary);
+  border-color: var(--primary);
+}
+
+.auth-avatar-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 50%;
+}
+
+.auth-avatar-initial {
+  font-size: clamp(0.9rem, 1.5vw, 1.1rem);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+/* Auth Dropdown Menu */
+.auth-dropdown-menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 8px);
+  background-color: #0f172a;
+  border: 1px solid var(--bg-card-border);
+  border-radius: 8px;
+  box-shadow: 0 10px 25px rgba(0, 0, 0, 0.5);
+  min-width: 180px;
+  z-index: 100;
+  padding: 0.5rem 0;
+}
+
+.auth-dropdown-menu.hidden {
+  display: none !important;
+}
+
+.auth-dropdown-header {
+  padding: 0.5rem 1rem;
+}
+
+.auth-dropdown-email {
+  font-size: 0.8125rem;
+  color: var(--text-secondary);
+  word-break: break-all;
+}
+
+.auth-dropdown-divider {
+  height: 1px;
+  background-color: var(--bg-card-border);
+  margin: 0.25rem 0;
+}
+
+.auth-dropdown-item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  width: 100%;
+  padding: 0.5rem 1rem;
+  background: transparent;
+  border: none;
+  color: var(--text-primary);
+  font-size: 0.85rem;
+  cursor: pointer;
+  text-align: left;
+  transition: var(--transition);
+}
+
+.auth-dropdown-item:hover {
+  background-color: rgba(255, 255, 255, 0.05);
+  color: var(--primary);
+}
+
+.history-modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+}
+
+.history-header-left {
+  display: flex;
+  align-items: center;
+  gap: 1.25rem;
+  flex-wrap: nowrap; /* Forces items to stay on the same line */
+  min-width: 0;
+  flex: 1;
+}
+
+.history-header-left .modal-title {
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.history-clear-wrapper {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+@media (max-width: 600px) {
+  .history-header-left {
+    gap: 0.5rem;
+  }
+  
+  .history-clear-wrapper .btn {
+    padding: 0.3rem 0.6rem;
+    font-size: 0.65rem;
+  }
+}
+
+.history-turns-subtitle:empty {
+  display: none;
+}
+
+/* History Action Buttons Sizing & Layout */
+
+.modal-header h2,
+.modal-header h5.modal-title {
+  font-size: 1.15rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 0;
+}
+
+.history-modal-header {
+  display: flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: 1rem;
+}
+
+.history-clear-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.history-action-btn {
+  flex: 1;
+  min-width: 120px;
+  height: auto; /* Allows both buttons to expand evenly for 2 lines */
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 0.1rem 0.1rem;
+  gap: 0.1rem; /* Controls spacing between the 2 lines cleanly */
+  line-height: 1.2;
+}
+
+.history-action-btn .btn-clear-title,
+.history-action-btn .btn-purge-title {
+  display: block;
+  font-size: 0.68rem;
+  opacity: 0.8;
+  margin-top: 0; /* Clear margin so flex gap does all the spacing */
+}
+
+.modal-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.history-title-icon {
+  width: 1.15em;
+  height: 1.15em;
+  stroke: currentColor;
+  flex-shrink: 0;
+}
+
+.chart-wrapper {
+  position: relative;
+  height: 200px;
+  width: 100%;
 }
