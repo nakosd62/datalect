@@ -43,5 +43,5 @@ def dump_all_tables(db_path):
 
 if __name__ == "__main__":
     # Pass the database path via command-line argument, or default to 'your_database.db'
-    db_file = sys.argv[1] if len(sys.argv) > 1 else "../state/crbot_state.db"
+    db_file = sys.argv[1] if len(sys.argv) > 1 else "../state/ydyl_state.db"
     dump_all_tables(db_file)

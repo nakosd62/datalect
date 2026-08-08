@@ -78,9 +78,7 @@ DEFAULT_CONN = CONFIGURED_DBS[0]["url"]
 DEFAULT_MODEL = os.environ.get("GEMINI_MODEL")
 
 # --- State DB file in local mode ---
-TRANSLATION_STATS_DB_PATH = "state/crbot_state.db"
-GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME")
-DB_FILENAME = os.environ.get("DB_FILENAME", "crbot_state.db")
+TRANSLATION_STATS_DB_PATH = "state/ydyl_state.db"
 
 
 # --- Authentication & Session Management ---
@@ -202,8 +200,6 @@ def set_session_db_url(user_id, db_url):
                     updated_at = CURRENT_TIMESTAMP;
             """, (key, db_url))
             conn.commit()
-
-        upload_db_to_gcs()
     except Exception as e:
         print(f"Error saving session to SQLite: {e}")
 
@@ -246,44 +242,12 @@ def apply_session_cookie(response, session_id):
     )
     return response
 
-# --- GCS Helper Functions ---
-
-def download_db_from_gcs():
-    if not GCS_BUCKET_NAME:
-        return
-    try:
-        storage_client = storage.Client()
-        bucket = storage_client.bucket(GCS_BUCKET_NAME)
-        blob = bucket.blob(DB_FILENAME)
-        
-        if blob.exists():
-            blob.download_to_filename(TRANSLATION_STATS_DB_PATH)
-            print(f"Downloaded {DB_FILENAME} from GCS bucket {GCS_BUCKET_NAME}.")
-        else:
-            print(f"File {DB_FILENAME} not found in bucket. A new DB will be created and uploaded.")
-    except Exception as e:
-        print(f"Error downloading stats DB from GCS: {e}")
-
-def upload_db_to_gcs():
-    if not GCS_BUCKET_NAME or not os.path.exists(TRANSLATION_STATS_DB_PATH):
-        return
-    try:
-        storage_client = storage.Client()
-        bucket = storage_client.bucket(GCS_BUCKET_NAME)
-        blob = bucket.blob(DB_FILENAME)
-        blob.upload_from_filename(TRANSLATION_STATS_DB_PATH)
-        print(f"Uploaded {DB_FILENAME} to GCS bucket {GCS_BUCKET_NAME}.")
-    except Exception as e:
-        print(f"Error uploading stats DB to GCS: {e}")
-
 def init_state_db():
     if firestore_client:
         print("Firestore is active; skipping local SQLite state database setup.")
         return
 
     try:
-        download_db_from_gcs()
-
         os.makedirs(os.path.dirname(TRANSLATION_STATS_DB_PATH), exist_ok=True)
 
         with sqlite3.connect(TRANSLATION_STATS_DB_PATH) as conn:
@@ -320,11 +284,7 @@ def init_state_db():
             columns = [column[1] for column in cursor.fetchall()]
             if "user_id" not in columns:
                 cursor.execute("ALTER TABLE translations ADD COLUMN user_id TEXT;")
-
             conn.commit()
-
-        upload_db_to_gcs()
-
     except Exception as e:
         print(f"Error initializing SQLite stats DB: {e}")
 
@@ -413,9 +373,6 @@ def record_translation(user_id, conn_str, nl_prompt, sql_command, gemini_model, 
                 duration, input_tokens, output_tokens, total_tokens, thinking_tokens, cached_content_tokens
             ))
             conn.commit()
-
-        upload_db_to_gcs()
-
     except Exception as e:
         print(f"Error recording translation: {e}")
 
@@ -1055,11 +1012,7 @@ def purge_translation_history():
         with sqlite3.connect(TRANSLATION_STATS_DB_PATH) as conn:
             cursor = conn.cursor()
             cursor.execute("DELETE FROM translations WHERE user_id = ?", (effective_user,))
-            conn.commit()
-        
-        # Sync updated SQLite state to Google Cloud Storage if configured
-        upload_db_to_gcs()
-        
+            conn.commit()        
         return jsonify({
             'success': True, 
             'message': 'Translation history purged successfully from local database.'
