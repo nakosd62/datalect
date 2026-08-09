@@ -1619,3 +1619,29 @@ textarea.interrogate-textbox {
   font-style: italic !important;
   opacity: 0.8 !important;
 }
+
+/* DB Connection Dot Indicator */
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  flex-shrink: 0;
+  margin-right: 2px;
+  background-color: var(--text-muted);
+  transition: var(--transition);
+}
+
+.status-dot.connected,
+.status-dot.success {
+  background-color: var(--primary);
+  box-shadow: 0 0 6px var(--primary);
+}
+
+.status-dot.disconnected,
+.status-dot.failed,
+.status-dot.error {
+  background-color: var(--danger);
+  box-shadow: 0 0 6px var(--danger);
+}
+

@@ -48,6 +48,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const modalCloseBtn = document.getElementById('modalCloseBtn');
   const configSaveBtn = document.getElementById('configSaveBtn');
   const connDbName = document.getElementById('connDbName');
+  const connDbDot = document.getElementById('connDbDot');
   const connDbUser = document.getElementById('connDbUser');
 
   // DOM Elements - Help Modal
@@ -409,33 +410,58 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
-  function updateConnectionDetails(data) {
+  async function checkDbStatus() {
+    if (!connDbDot) return;
+
+    const config = loadConfig();
+    try {
+      const response = await fetch('/api/execute', {
+        method: 'POST',
+        headers: getApiHeaders(),
+        credentials: 'same-origin',
+        body: JSON.stringify({
+          sql: 'SELECT current_user, current_database();',
+          database_url: config.dbUrl,
+          model: config.model
+        })
+      });
+
+      const data = await response.json();
+      if (response.ok && data.success) {
+        connDbDot.className = 'status-dot connected';
+      } else {
+        connDbDot.className = 'status-dot disconnected';
+      }
+    } catch (err) {
+      connDbDot.className = 'status-dot disconnected';
+    }
+  }
+
+  async function updateConnectionDetails(data) {
     const badge = document.getElementById('configTriggerBadge');
 
-    if ((data && data.is_cloud_run && !data.authenticated) || !data?.database_name || !data?.username) {
+    if ((data && data.is_cloud_run && !data.authenticated) || (!data?.database_name && !data?.custom_database_name)) {
       if (badge) badge.style.display = 'none';
       return;
     }
 
     if (badge) badge.style.display = '';
 
-    const username = data.username;
-    const dbName = data.database_name;
-    const fullStr = `${username}@${dbName}`;
+    // Prefer configured/custom friendly name, fallback to raw PostgreSQL current_database()
+    const matchedPreset = CONFIGURED_DBS.find(db => db.url === data.active_database_url);
+    const dbDisplayName = matchedPreset?.name || data.custom_database_name || data.database_name || "Database";
 
     if (configTriggerBadge) {
-      configTriggerBadge.title = `${fullStr} (Click to configure)`;
+      configTriggerBadge.title = `Connected to: ${dbDisplayName} (Click to configure)`;
     }
 
-    const atSpan = connDbUser?.nextElementSibling;
-
-    if (connDbUser) connDbUser.textContent = username;
-    if (connDbName) connDbName.textContent = dbName;
-    if (atSpan && atSpan.textContent.trim() === '@') {
-      atSpan.style.display = '';
+    if (connDbName) {
+      connDbName.textContent = dbDisplayName;
     }
 
     document.title = `yDyL`;
+
+    await checkDbStatus();
   }
 
   function getMatchingPresetUrl(targetUrl) {
@@ -482,9 +508,10 @@ document.addEventListener('DOMContentLoaded', async () => {
       renderDbRadioButtons();
       loadConfigIntoUI();
       
-      updateConnectionDetails(data);
+      await updateConnectionDetails(data);
     } catch (err) {
       console.error("Failed to fetch backend configuration:", err);
+      if (connDbDot) connDbDot.className = 'status-dot disconnected';
     }
   }
 
@@ -617,10 +644,11 @@ document.addEventListener('DOMContentLoaded', async () => {
           activeModel = data.active_model;
         }
         
-        updateConnectionDetails(data);
+        await updateConnectionDetails(data);
       }
     } catch (err) {
       console.error("Failed to save backend configuration:", err);
+      if (connDbDot) connDbDot.className = 'status-dot disconnected';
     }
 
     if (closeModal) {
@@ -1197,6 +1225,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (execRows) execRows.textContent = data.rowCount;
 
         renderMultiTurnResults(data.results);
+        if (connDbDot) connDbDot.className = 'status-dot connected';
       } else {
         if (execStatus) {
           execStatus.textContent = "Error";
