@@ -1,3 +1,3 @@
 #!/bin/bash
 
-python tools/dump_state.py state/ydyl_state.db
+./venv/bin/python3 tools/dump_state.py state/ydyl_state.db

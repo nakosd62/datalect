@@ -6,7 +6,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   let currentGoogleClientId = null;
   let googleIdToken = null;
   let customDbUrl = "";
-  let customDbName = "";
   let activeModel = "";
   let geminiPresetKeys = [];
 
@@ -138,6 +137,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
+  // Attach speech recognition handlers to prompt and interrogation inputs
   setupMicButton(micBtn, aiPrompt);
   setupMicButton(interrogateMicBtn, interrogatePrompt);
 
@@ -148,7 +148,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       theme: 'dracula',
       lineNumbers: true,
       lineWrapping: true,
-      viewportMargin: Infinity,
+      viewportMargin: Infinity, // Prevents CodeMirror from expanding height based on lines
       placeholder: sqlQueryTextarea.getAttribute('placeholder') || "You may enter SQL here and execute it..."
     });
     sqlEditor.setSize('100%', '100%');
@@ -333,12 +333,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (sqlEditor) {
       sqlEditor.setValue(formattedVal);
       requestAnimationFrame(() => {
+      //  sqlEditor.setSize('100%', '100%');
         sqlEditor.refresh();
       });
     } else if (sqlQueryTextarea) {
       sqlQueryTextarea.value = formattedVal;
     }
   }
+  
 
   function setInterrogateResponseText(text) {
     if (!interrogateResponse) return;
@@ -346,6 +348,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (interrogateResponseWrapper) interrogateResponseWrapper.classList.remove('hidden');
     interrogateResponse.classList.remove('hidden');
 
+    // Auto-fit height up to a maximum of 25% of the overall results container
     interrogateResponse.style.height = 'auto';
     const resultsContainer = document.querySelector('.results-container');
     const maxAllowedHeight = resultsContainer ? (resultsContainer.clientHeight * 0.25) : 125;
@@ -452,19 +455,9 @@ document.addEventListener('DOMContentLoaded', async () => {
       CONFIGURED_DBS = data.configured_databases || [];
       DEFAULT_DB_URL = data.default_database_url || "";
       ACTIVE_DB_URL = data.active_database_url || DEFAULT_DB_URL;
-      
-      if (data.custom_database_name !== undefined) {
-        customDbName = data.custom_database_name;
-      }
-      if (data.custom_database_url !== undefined) {
-        customDbUrl = data.custom_database_url;
-      }
-
       geminiPresetKeys = data.gemini_preset_keys || data.models || [];
       if (data.active_model) {
         activeModel = data.active_model;
-      } else if (data.default_model) {
-        activeModel = data.default_model;
       } else if (geminiPresetKeys.length > 0 && !activeModel) {
         activeModel = geminiPresetKeys[0];
       }
@@ -495,50 +488,34 @@ document.addEventListener('DOMContentLoaded', async () => {
     const activeUrl = currentDbUrl || ACTIVE_DB_URL || DEFAULT_DB_URL;
     const matchedPresetUrl = getMatchingPresetUrl(activeUrl);
 
-    const isCustom = !matchedPresetUrl;
-
     let html = '';
     
     // 1. Render Preset Databases
     CONFIGURED_DBS.forEach((db) => {
-      const isSelected = !isCustom && Boolean(matchedPresetUrl && db.url === matchedPresetUrl);
+      const isSelected = Boolean(matchedPresetUrl && db.url === matchedPresetUrl);
       html += `
         <label class="radio-option">
-          <input type="radio" name="db_connection_option" value="${db.url}" data-dbname="${db.name}" ${isSelected ? 'checked' : ''}>
+          <input type="radio" name="db_connection_option" value="${db.url}" ${isSelected ? 'checked' : ''}>
           <span class="radio-label">${db.name}</span>
         </label>
       `;
     });
 
-    const customValue = customDbUrl || (isCustom ? activeUrl : '');
-    const customNameValue = customDbName || '';
+    const isCustom = !matchedPresetUrl && Boolean(activeUrl);
+    const customValue = isCustom ? activeUrl : (customDbUrl || '');
 
-    // 2. Render Custom Option
+    // 2. Render Custom Input Box
     html += `
-      <label class="radio-option" style="display: flex; align-items: center; gap: 0.6rem; width: 100%;">
-        <input type="radio" name="db_connection_option" value="custom" id="radioCustomDb" data-dbname="${customNameValue || 'Custom'}" ${isCustom ? 'checked' : ''}>
-        <input type="text" id="modalCustomDbName" class="config-input" placeholder="Custom Name" value="${customNameValue}" style="width: 130px; flex-shrink: 0;" autocomplete="off">
+      <label class="radio-option" style="display: flex; align-items: center; gap: 0.5rem;">
+        <input type="radio" name="db_connection_option" value="custom" id="radioCustomDb" ${isCustom ? 'checked' : ''}>
         <input type="text" id="modalCustomDbUrl" class="config-input" placeholder="postgresql://user:password@host:5432/dbname" value="${customValue}" style="flex: 1;" autocomplete="off">
       </label>
     `;
 
     radioGroup.innerHTML = html;
 
-    const customNameInput = document.getElementById('modalCustomDbName');
     const customInput = document.getElementById('modalCustomDbUrl');
     const customRadio = document.getElementById('radioCustomDb');
-
-    if (customNameInput) {
-      customNameInput.addEventListener('focus', () => {
-        if (customRadio) customRadio.checked = true;
-      });
-      customNameInput.addEventListener('input', () => {
-        if (customRadio) customRadio.checked = true;
-        const val = customNameInput.value.trim();
-        customDbName = val;
-        if (customRadio) customRadio.dataset.dbname = val || "Custom";
-      });
-    }
 
     if (customInput) {
       customInput.addEventListener('focus', () => {
@@ -547,45 +524,34 @@ document.addEventListener('DOMContentLoaded', async () => {
       customInput.addEventListener('input', () => {
         if (customRadio) customRadio.checked = true;
         const val = customInput.value.trim();
-        customDbUrl = val;
+        if (val) {
+          customDbUrl = val;
+        }
       });
     }
   }
 
-  async function triggerConfigSave({ closeModal = false, dbUrl = null, dbName = null } = {}) {
+  async function triggerConfigSave({ closeModal = false, dbUrl = null } = {}) {
     let dbUrlValue = dbUrl;
-    let dbNameValue = dbName;
-    let isCustomOption = false;
-
-    const customNameInput = document.getElementById('modalCustomDbName');
-    if (customNameInput) {
-      const nameVal = customNameInput.value.trim();
-      if (nameVal) customDbName = nameVal;
-    }
-
+    
     const customInput = document.getElementById('modalCustomDbUrl');
     if (customInput) {
       const inputVal = customInput.value.trim();
-      if (inputVal) customDbUrl = inputVal;
+      if (inputVal) {
+        customDbUrl = inputVal;
+      }
     }
 
-    if (dbUrlValue === null || dbNameValue === null) {
+    if (dbUrlValue === null) {
       const selectedDbRadio = document.querySelector('input[name="db_connection_option"]:checked');
       if (selectedDbRadio) {
         if (selectedDbRadio.value === 'custom') {
-          isCustomOption = true;
-          dbNameValue = customNameInput ? (customNameInput.value.trim() || "Custom") : (customDbName || "Custom");
-          dbUrlValue = customInput ? customInput.value.trim() : (customDbUrl || "");
-          customDbName = dbNameValue;
-          customDbUrl = dbUrlValue;
+          dbUrlValue = customInput ? customInput.value.trim() : "";
         } else {
           dbUrlValue = selectedDbRadio.value;
-          const matchedDb = CONFIGURED_DBS.find(db => db.url === dbUrlValue);
-          dbNameValue = matchedDb ? matchedDb.name : "Preset DB";
         }
       } else {
         dbUrlValue = DEFAULT_DB_URL;
-        dbNameValue = "Default DB";
       }
     }
 
@@ -595,9 +561,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         headers: getApiHeaders(),
         credentials: 'same-origin',
         body: JSON.stringify({
-          database_name: dbNameValue,
           database_url: dbUrlValue,
-          is_custom: isCustomOption,
           model: activeModel
         })
       });
@@ -606,12 +570,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         const data = await response.json();
         if (data.active_database_url) {
           ACTIVE_DB_URL = data.active_database_url;
-        }
-        if (data.custom_database_name !== undefined) {
-          customDbName = data.custom_database_name;
-        }
-        if (data.custom_database_url !== undefined) {
-          customDbUrl = data.custom_database_url;
         }
         if (data.active_model) {
           activeModel = data.active_model;
@@ -682,6 +640,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (historyTabStatistics) historyTabStatistics.classList.remove('hidden');
       if (historyTabTranslations) historyTabTranslations.classList.add('hidden');
 
+      // Force Chart.js to recalculate dimensions once the container is visible
       requestAnimationFrame(() => {
         if (chartCountInstance) chartCountInstance.resize();
         if (chartTotalTokensInstance) chartTotalTokensInstance.resize();
@@ -695,6 +654,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const dates = statsData.map(item => item.day_date || item.date || 'Unknown');
     const totalTranslations = statsData.map(item => item.total_translations || 0);
     const sumTotalTokens = statsData.map(item => item.sum_total_tokens || 0);
+    const sumInputTokens = statsData.map(item => item.sum_input_tokens || 0);
 
     const commonOptions = {
       responsive: true,
@@ -748,6 +708,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   }
 
+  // Custom confirmation modal helper
   function showConfirmDialog(message) {
     return new Promise((resolve) => {
       const modal = document.getElementById('confirmModal');
@@ -795,6 +756,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     historyTableHeader.innerHTML = '';
     historyTableBody.innerHTML = '<tr><td class="text-center text-muted py-8">Loading history...</td></tr>';
 
+    // Remove existing subtitle element if present in DOM
     document.getElementById('historyCountSubtitle')?.remove();
   
     try {
@@ -876,6 +838,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   if (historyBtn && historyModal) {
     historyBtn.addEventListener('click', () => {
       updateHistoryTurnsSubtitle();
+      // Set initial state for purge title while fetching
       const purgeTitleEl = document.querySelector('.btn-purge-title');
       if (purgeTitleEl) {
         purgeTitleEl.textContent = '(...)';
@@ -947,6 +910,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       return;
     }
 
+    // Display interrogation controls when results exist
     if (interrogateWrapper) interrogateWrapper.classList.remove('hidden');
 
     if (results.length === 1) {
@@ -1009,8 +973,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             rows: focusedResult.rows || []
           },
           followup_prompt: followupText,
-          model: activeModel,
-          gemini_model: activeModel
+          model: activeModel
         })
       });
 
@@ -1061,8 +1024,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           prompt: promptText,
           history: chatHistory,
           database_url: config.dbUrl,
-          model: config.model,
-          gemini_model: config.model
+          model: config.model
         })
       });
 
@@ -1335,9 +1297,13 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   if (clearAllBtn) {
     clearAllBtn.addEventListener('click', () => {
+      // 1. Clear Natural Language Prompt
       if (aiPrompt) aiPrompt.value = '';
+  
+      // 2. Clear SQL Command (CodeMirror & Textarea)
       setSqlQuery('');
   
+      // 3. Reset Translation Stats
       if (transStatus) {
         transStatus.textContent = "Ready";
         transStatus.className = "stat-val status-unknown";
@@ -1345,7 +1311,10 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (transTime) transTime.textContent = "—";
       if (tokensTotal) tokensTotal.textContent = "—";
   
+      // 4. Reset Execution Stats
       resetExecutionStats();
+  
+      // 5. Clear Results Display
       clearResultsDisplay();
       if (resultsBody) {
         resultsBody.innerHTML = '<tr><td class="text-center text-muted py-8">The answer will appear here...</td></tr>';

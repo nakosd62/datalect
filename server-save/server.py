@@ -75,11 +75,7 @@ if not CONFIGURED_DBS:
 DEFAULT_CONN = CONFIGURED_DBS[0]["url"]
 
 # --- Model Configuration ---
-DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-raw_preset_models = os.environ.get("GEMINI_PRESET_MODELS", "gemini-2.5-flash,gemini-2.5-pro")
-PRESET_MODELS = [m.strip() for m in raw_preset_models.split(",") if m.strip()]
-if DEFAULT_MODEL not in PRESET_MODELS:
-    PRESET_MODELS.insert(0, DEFAULT_MODEL)
+DEFAULT_MODEL = os.environ.get("GEMINI_MODEL")
 
 # --- State DB file in local mode ---
 TRANSLATION_STATS_DB_PATH = "state/ydyl_state.db"
@@ -171,133 +167,70 @@ def enforce_authentication():
         if not user_identity:
             return jsonify({'error': 'Unauthorized: Authentication required'}), 401
 
-def set_user_db_connection(user_id, db_name, db_url):
-    """Saves user-specific DB connection details to Firestore or SQLite db_connections table."""
-    effective_user = user_id or "global"
+def set_session_db_url(user_id, db_url):
+    if not db_url:
+        return
+
+    # Cloud Run / Firestore mode: Store per authenticated user_id
     if firestore_client:
         if not user_id:
-            return
+            return  # Prevent Firestore error on unauthenticated requests
         try:
-            doc_ref = firestore_client.collection("db_connections").document(effective_user)
+            doc_ref = firestore_client.collection("sessions").document(user_id)
             doc_ref.set({
-                "user_id": effective_user,
-                "database_name": db_name,
+                "user_id": user_id,
                 "database_url": db_url,
                 "updated_at": firestore.SERVER_TIMESTAMP
             }, merge=True)
             return
         except Exception as e:
-            print(f"Error saving db_connection to Firestore: {e}")
-            return
-
-    try:
-        with sqlite3.connect(TRANSLATION_STATS_DB_PATH) as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO db_connections (user_id, database_name, database_url)
-                VALUES (?, ?, ?)
-                ON CONFLICT(user_id) DO UPDATE SET
-                    database_name = excluded.database_name,
-                    database_url = excluded.database_url;
-            """, (effective_user, db_name, db_url))
-            conn.commit()
-    except Exception as e:
-        print(f"Error saving db_connection to SQLite: {e}")
-
-def get_user_db_connection(user_id):
-    """Retrieves user-specific DB connection details from Firestore or SQLite db_connections table."""
-    effective_user = user_id or "global"
-    if firestore_client:
-        if not user_id:
-            return None, None
-        try:
-            doc_ref = firestore_client.collection("db_connections").document(effective_user)
-            doc = doc_ref.get()
-            if doc.exists:
-                data = doc.to_dict()
-                if data and data.get("database_url"):
-                    return data.get("database_name", ""), data.get("database_url", "")
-        except Exception as e:
-            print(f"Error fetching db_connection from Firestore: {e}")
-        return None, None
-
-    try:
-        with sqlite3.connect(TRANSLATION_STATS_DB_PATH) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT database_name, database_url FROM db_connections WHERE user_id = ?", (effective_user,))
-            row = cursor.fetchone()
-            if row:
-                return row[0], row[1]
-    except Exception as e:
-        print(f"Error fetching db_connection from SQLite: {e}")
-    return None, None
-
-def set_session_db_url(user_id, db_url, model=None):
-    if not db_url and not model:
-        return
-
-    effective_user = user_id or "global"
-    update_data = {"updated_at": firestore.SERVER_TIMESTAMP if firestore_client else None}
-    if db_url:
-        update_data["database_url"] = db_url
-    if model:
-        update_data["active_model"] = model
-
-    # Cloud Run / Firestore mode
-    if firestore_client:
-        if not user_id:
-            return
-        try:
-            doc_ref = firestore_client.collection("sessions").document(user_id)
-            doc_ref.set(update_data, merge=True)
-            return
-        except Exception as e:
             print(f"Error saving session to Firestore: {e}")
             return
 
-    # Local SQLite mode
+    # Local SQLite mode: Use fixed 'global' state key
+    key = "global"
     try:
         with sqlite3.connect(TRANSLATION_STATS_DB_PATH) as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                INSERT INTO sessions (session_id, database_url, active_model, updated_at)
-                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                INSERT INTO sessions (session_id, database_url, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(session_id) DO UPDATE SET
-                    database_url = COALESCE(excluded.database_url, sessions.database_url),
-                    active_model = COALESCE(excluded.active_model, sessions.active_model),
+                    database_url = excluded.database_url,
                     updated_at = CURRENT_TIMESTAMP;
-            """, (effective_user, db_url or DEFAULT_CONN, model or DEFAULT_MODEL))
+            """, (key, db_url))
             conn.commit()
     except Exception as e:
         print(f"Error saving session to SQLite: {e}")
 
 def get_session_db_url(user_id):
-    effective_user = user_id or "global"
-
+    # Cloud Run / Firestore mode: Retrieve per authenticated user_id
     if firestore_client:
         if not user_id:
-            return DEFAULT_CONN, DEFAULT_MODEL
+            return DEFAULT_CONN
         try:
             doc_ref = firestore_client.collection("sessions").document(user_id)
             doc = doc_ref.get()
             if doc.exists:
                 data = doc.to_dict()
-                if data:
-                    return data.get("database_url", DEFAULT_CONN), data.get("active_model", DEFAULT_MODEL)
+                if data and data.get("database_url"):
+                    return data.get("database_url")
         except Exception as e:
             print(f"Error fetching session from Firestore: {e}")
-        return DEFAULT_CONN, DEFAULT_MODEL
+        return DEFAULT_CONN
 
+    # Local SQLite mode: Retrieve 'global' state
+    key = "global"
     try:
         with sqlite3.connect(TRANSLATION_STATS_DB_PATH) as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT database_url, active_model FROM sessions WHERE session_id = ?", (effective_user,))
+            cursor.execute("SELECT database_url FROM sessions WHERE session_id = ?", (key,))
             row = cursor.fetchone()
-            if row:
-                return (row[0] or DEFAULT_CONN), (row[1] or DEFAULT_MODEL)
+            if row and row[0]:
+                return row[0]
     except Exception as e:
         print(f"Error fetching session from SQLite: {e}")
-    return DEFAULT_CONN, DEFAULT_MODEL
+    return DEFAULT_CONN
 
 def apply_session_cookie(response, session_id):
     response.set_cookie(
@@ -342,7 +275,6 @@ def init_state_db():
                 CREATE TABLE IF NOT EXISTS sessions (
                     session_id TEXT PRIMARY KEY,
                     database_url TEXT NOT NULL,
-                    active_model TEXT,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
@@ -355,16 +287,11 @@ def init_state_db():
                 );
             """)
 
+            # Schema Migration Check: Add user_id column if missing in existing DB
             cursor.execute("PRAGMA table_info(translations);")
             columns = [column[1] for column in cursor.fetchall()]
             if "user_id" not in columns:
                 cursor.execute("ALTER TABLE translations ADD COLUMN user_id TEXT;")
-
-            cursor.execute("PRAGMA table_info(sessions);")
-            session_columns = [column[1] for column in cursor.fetchall()]
-            if "active_model" not in session_columns:
-                cursor.execute("ALTER TABLE sessions ADD COLUMN active_model TEXT;")
-
             conn.commit()
     except Exception as e:
         print(f"Error initializing SQLite stats DB: {e}")
@@ -392,8 +319,7 @@ def pick_gemini_api_key():
 def resolve_conn_str(conn_str=None, user_id=None):
     if not conn_str:
         if user_id:
-            db_url, _ = get_session_db_url(user_id)
-            return db_url
+            return get_session_db_url(user_id)
         return DEFAULT_CONN
     return conn_str
 
@@ -616,7 +542,7 @@ def index():
 def translate_query():
     data = request.get_json() or {}
 
-    gemini_model = data.get('gemini_model') or data.get('model') or DEFAULT_MODEL
+    gemini_model = data.get('gemini_model') or DEFAULT_MODEL
     api_key = pick_gemini_api_key()
 
     if not api_key:
@@ -728,26 +654,18 @@ def handle_config():
     user_identity = get_current_user_identity()
     is_authenticated = bool(user_identity and user_identity != session_id)
     
-    preset_urls = {db["url"] for db in CONFIGURED_DBS}
-
     if request.method == 'POST':
         data = request.get_json() or {}
         new_db_url = data.get('database_url')
-        new_db_name = data.get('database_name')
-        new_model = data.get('model') or data.get('gemini_model')
-        is_custom = data.get('is_custom', False)
         
-        if new_db_url or new_model:
-            set_session_db_url(user_identity, new_db_url or DEFAULT_CONN, new_model)
-            if new_db_url and (is_custom or (new_db_url not in preset_urls)):
-                if new_db_name:
-                    set_user_db_connection(user_identity, new_db_name, new_db_url)
+        if new_db_url:
+            set_session_db_url(user_identity, new_db_url)
         else:
-            set_session_db_url(user_identity, DEFAULT_CONN, DEFAULT_MODEL)
+            set_session_db_url(user_identity, DEFAULT_CONN)
 
-    active_conn_str, active_model_str = get_session_db_url(user_identity)
-    user_custom_name, user_custom_url = get_user_db_connection(user_identity)
+    active_conn_str = get_session_db_url(user_identity)
     
+    # Hide DB connection info on Cloud Run if the user is not authenticated
     if IS_CLOUD_RUN and not is_authenticated:
         db_name, username = "", ""
         active_conn_str_out = ""
@@ -780,12 +698,7 @@ def handle_config():
         'configured_databases': configured_dbs,
         'default_database_url': DEFAULT_CONN if (not IS_CLOUD_RUN or is_authenticated) else "",
         'active_database_url': active_conn_str_out,
-        'custom_database_name': user_custom_name or "",
-        'custom_database_url': user_custom_url or "",
         'default_model': DEFAULT_MODEL,
-        'active_model': active_model_str or DEFAULT_MODEL,
-        'gemini_preset_keys': PRESET_MODELS,
-        'models': PRESET_MODELS,
         'database_name': db_name,
         'username': username
     })
@@ -882,7 +795,7 @@ def execute_query():
 def interrogate_results():
     data = request.get_json() or {}
 
-    gemini_model = data.get('gemini_model') or data.get('model') or DEFAULT_MODEL
+    gemini_model = data.get('gemini_model') or DEFAULT_MODEL
     api_key = pick_gemini_api_key()
 
     if not api_key:
@@ -904,6 +817,7 @@ def interrogate_results():
         schema = get_database_schema(conn_str, user_identity)
         client = genai.Client(api_key=api_key)
 
+        # 1. System Prompt
         system_instruction = data.get('system_prompt') or (
             "You are an expert data analyst assistant that can slice, dice and analyze tabular data sets. "
             "You are provided with: "
@@ -915,6 +829,7 @@ def interrogate_results():
             "Analyze the data thoroughly and answer the follow-up request as concisely as possible."
         )
 
+        # Format results table into text representation
         cols = results_table.get('columns') or []
         rows = results_table.get('rows') or []
         
@@ -984,7 +899,7 @@ def get_translation_history():
 
             docs_all = firestore_client.collection("translations").where("user_id", "==", user_identity).stream()
             daily = {}
-            total_count = 0
+            total_count = 0  # Track total translation count[cite: 48]
             for doc in docs_all:
                 d = doc.to_dict()
                 total_count += 1
@@ -1014,7 +929,7 @@ def get_translation_history():
                 'success': True,
                 'history': rows,
                 'stats': stats,
-                'total_count': total_count
+                'total_count': total_count  # Return total count[cite: 48]
             })
         except Exception as e:
             return jsonify({'success': False, 'error': f"Firestore error: {str(e)}"}), 500
@@ -1026,6 +941,7 @@ def get_translation_history():
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
 
+            # Get total count of translation records[cite: 48]
             cursor.execute("""
                 SELECT COUNT(*) as total_count
                 FROM translations
@@ -1060,7 +976,7 @@ def get_translation_history():
                 'success': True, 
                 'history': rows,
                 'stats': stats,
-                'total_count': total_count
+                'total_count': total_count  # Return total count[cite: 48]
             })
 
     except Exception as e:
@@ -1081,6 +997,7 @@ def purge_translation_history():
             for doc in docs:
                 batch.delete(doc.reference)
                 count += 1
+                # Commit in batches to respect Firestore batch limits (max 500)
                 if count >= 400:
                     batch.commit()
                     batch = firestore_client.batch()
