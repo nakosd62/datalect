@@ -148,7 +148,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       theme: 'dracula',
       lineNumbers: true,
       lineWrapping: true,
-      viewportMargin: Infinity,
+      viewportMargin: Infinity, // Prevents CodeMirror from expanding height based on lines
       placeholder: sqlQueryTextarea.getAttribute('placeholder') || "You may enter SQL here and execute it..."
     });
     sqlEditor.setSize('100%', '100%');
@@ -333,13 +333,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (sqlEditor) {
       sqlEditor.setValue(formattedVal);
       requestAnimationFrame(() => {
-        sqlEditor.setSize('100%', '100%');
+      //  sqlEditor.setSize('100%', '100%');
         sqlEditor.refresh();
       });
     } else if (sqlQueryTextarea) {
       sqlQueryTextarea.value = formattedVal;
     }
   }
+  
 
   function setInterrogateResponseText(text) {
     if (!interrogateResponse) return;
