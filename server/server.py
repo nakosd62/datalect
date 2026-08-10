@@ -171,66 +171,119 @@ def enforce_authentication():
         if not user_identity:
             return jsonify({'error': 'Unauthorized: Authentication required'}), 401
 
-def set_user_db_connection(user_id, db_name, db_url):
+def set_user_db_connection(user_id, db_name, db_url, custom_databases=None):
     """Saves user-specific DB connection details to Firestore or SQLite db_connections table."""
     effective_user = user_id or "global"
-    if firestore_client:
-        if not user_id:
+    import hashlib
+    
+    # If custom_databases list is provided, we replace the entire user list of records
+    if custom_databases is not None:
+        if firestore_client:
+            try:
+                # Delete existing
+                docs = firestore_client.collection("db_connections").where("user_id", "==", effective_user).stream()
+                for doc in docs:
+                    doc.reference.delete()
+                # Insert new list
+                for db in custom_databases:
+                    u = db.get("url")
+                    n = db.get("name")
+                    if u:
+                        url_hash = hashlib.sha256(u.encode('utf-8')).hexdigest()
+                        doc_id = f"{effective_user}_{url_hash}"
+                        firestore_client.collection("db_connections").document(doc_id).set({
+                            "user_id": effective_user,
+                            "database_name": n or "Custom",
+                            "database_url": u,
+                            "updated_at": firestore.SERVER_TIMESTAMP
+                        })
+            except Exception as e:
+                print(f"Error replacing custom connections in Firestore: {e}")
             return
+
         try:
-            doc_ref = firestore_client.collection("db_connections").document(effective_user)
+            with sqlite3.connect(TRANSLATION_STATS_DB_PATH) as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM db_connections WHERE user_id = ?", (effective_user,))
+                for db in custom_databases:
+                    u = db.get("url")
+                    n = db.get("name")
+                    if u:
+                        cursor.execute("""
+                            INSERT OR REPLACE INTO db_connections (user_id, database_name, database_url)
+                            VALUES (?, ?, ?);
+                        """, (effective_user, n or "Custom", u))
+                conn.commit()
+        except Exception as e:
+            print(f"Error replacing custom connections in SQLite: {e}")
+        return
+
+    # Fallback to single record insert/update
+    if firestore_client:
+        try:
+            url_hash = hashlib.sha256(db_url.encode('utf-8')).hexdigest()
+            doc_id = f"{effective_user}_{url_hash}"
+            doc_ref = firestore_client.collection("db_connections").document(doc_id)
             doc_ref.set({
                 "user_id": effective_user,
                 "database_name": db_name,
                 "database_url": db_url,
                 "updated_at": firestore.SERVER_TIMESTAMP
-            }, merge=True)
-            return
+            })
         except Exception as e:
-            print(f"Error saving db_connection to Firestore: {e}")
-            return
+            print(f"Error saving single db_connection to Firestore: {e}")
+        return
 
     try:
         with sqlite3.connect(TRANSLATION_STATS_DB_PATH) as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                INSERT INTO db_connections (user_id, database_name, database_url)
-                VALUES (?, ?, ?)
-                ON CONFLICT(user_id) DO UPDATE SET
-                    database_name = excluded.database_name,
-                    database_url = excluded.database_url;
+                INSERT OR REPLACE INTO db_connections (user_id, database_name, database_url)
+                VALUES (?, ?, ?);
             """, (effective_user, db_name, db_url))
             conn.commit()
     except Exception as e:
-        print(f"Error saving db_connection to SQLite: {e}")
+        print(f"Error saving single db_connection to SQLite: {e}")
 
 def get_user_db_connection(user_id):
     """Retrieves user-specific DB connection details from Firestore or SQLite db_connections table."""
     effective_user = user_id or "global"
+    custom_dbs = []
+    
     if firestore_client:
         if not user_id:
-            return None, None
+            return None, None, []
         try:
-            doc_ref = firestore_client.collection("db_connections").document(effective_user)
-            doc = doc_ref.get()
-            if doc.exists:
+            docs = firestore_client.collection("db_connections").where("user_id", "==", effective_user).stream()
+            for doc in docs:
                 data = doc.to_dict()
                 if data and data.get("database_url"):
-                    return data.get("database_name", ""), data.get("database_url", "")
+                    custom_dbs.append({
+                        "name": data.get("database_name", "Custom"),
+                        "url": data.get("database_url", "")
+                    })
         except Exception as e:
             print(f"Error fetching db_connection from Firestore: {e}")
-        return None, None
+            
+        if custom_dbs:
+            return custom_dbs[0]["name"], custom_dbs[0]["url"], custom_dbs
+        return None, None, []
 
     try:
         with sqlite3.connect(TRANSLATION_STATS_DB_PATH) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT database_name, database_url FROM db_connections WHERE user_id = ?", (effective_user,))
-            row = cursor.fetchone()
-            if row:
-                return row[0], row[1]
+            rows = cursor.fetchall()
+            for r in rows:
+                custom_dbs.append({
+                    "name": r[0],
+                    "url": r[1]
+                })
+            if custom_dbs:
+                return custom_dbs[0]["name"], custom_dbs[0]["url"], custom_dbs
     except Exception as e:
         print(f"Error fetching db_connection from SQLite: {e}")
-    return None, None
+    return None, None, []
 
 def set_session_db_url(user_id, db_url, model=None):
     if not db_url and not model:
@@ -347,11 +400,25 @@ def init_state_db():
                 );
             """)
 
+            # Drop table if it exists under the old schema (where user_id was the single primary key)
+            # or if the temporary custom_databases column is present.
+            try:
+                cursor.execute("PRAGMA table_info(db_connections);")
+                cols = cursor.fetchall()
+                if cols:
+                    col_names = [c[1] for c in cols]
+                    pk_cols = [c[1] for c in cols if c[5] > 0]
+                    if (len(pk_cols) == 1 and pk_cols[0] == "user_id") or "custom_databases" in col_names:
+                        cursor.execute("DROP TABLE db_connections;")
+            except Exception:
+                pass
+
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS db_connections (
-                    user_id TEXT PRIMARY KEY,
+                    user_id TEXT,
                     database_name TEXT NOT NULL,
-                    database_url TEXT NOT NULL
+                    database_url TEXT NOT NULL,
+                    PRIMARY KEY (user_id, database_url)
                 );
             """)
 
@@ -736,17 +803,27 @@ def handle_config():
         new_db_name = data.get('database_name')
         new_model = data.get('model') or data.get('gemini_model')
         is_custom = data.get('is_custom', False)
+        custom_databases = data.get('custom_databases')
         
         if new_db_url or new_model:
             set_session_db_url(user_identity, new_db_url or DEFAULT_CONN, new_model)
             if new_db_url and (is_custom or (new_db_url not in preset_urls)):
-                if new_db_name:
-                    set_user_db_connection(user_identity, new_db_name, new_db_url)
+                db_name_to_save = new_db_name
+                if not db_name_to_save:
+                    try:
+                        parsed = urlparse(new_db_url)
+                        dbname = parsed.path.lstrip('/')
+                        if '?' in dbname:
+                            dbname = dbname.split('?')[0]
+                        db_name_to_save = dbname or "Custom"
+                    except Exception:
+                        db_name_to_save = "Custom"
+                set_user_db_connection(user_identity, db_name_to_save, new_db_url, custom_databases)
         else:
             set_session_db_url(user_identity, DEFAULT_CONN, DEFAULT_MODEL)
 
     active_conn_str, active_model_str = get_session_db_url(user_identity)
-    user_custom_name, user_custom_url = get_user_db_connection(user_identity)
+    user_custom_name, user_custom_url, custom_databases = get_user_db_connection(user_identity)
     
     if IS_CLOUD_RUN and not is_authenticated:
         db_name, username = "", ""
@@ -782,6 +859,7 @@ def handle_config():
         'active_database_url': active_conn_str_out,
         'custom_database_name': user_custom_name or "",
         'custom_database_url': user_custom_url or "",
+        'custom_databases': custom_databases or [],
         'default_model': DEFAULT_MODEL,
         'active_model': active_model_str or DEFAULT_MODEL,
         'gemini_preset_keys': PRESET_MODELS,

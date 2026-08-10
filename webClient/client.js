@@ -7,8 +7,62 @@ document.addEventListener('DOMContentLoaded', async () => {
   let googleIdToken = null;
   let customDbUrl = "";
   let customDbName = "";
+  let customDatabases = [];
   let activeModel = "";
   let geminiPresetKeys = [];
+
+  function getDatabaseNameFromUrl(urlStr) {
+    if (!urlStr) return "Custom";
+    try {
+      let urlToParse = urlStr;
+      if (!urlStr.includes("://") && !urlStr.startsWith("/")) {
+        urlToParse = "postgresql://" + urlStr;
+      }
+      const url = new URL(urlToParse);
+      let dbname = url.pathname.replace(/^\//, '');
+      if (dbname.includes('?')) {
+        dbname = dbname.split('?')[0];
+      }
+      return dbname || "Custom";
+    } catch (e) {
+      try {
+        const match = urlStr.match(/\/([^/?#]+)(\?|#|$)/);
+        if (match && match[1]) {
+          return match[1];
+        }
+      } catch (err) {}
+      return "Custom";
+    }
+  }
+
+  function maskConnectionUrl(urlStr) {
+    if (!urlStr) return "";
+    try {
+      const match = urlStr.match(/^([^:]+:\/\/)([^:]+):([^@]+)(@.+)$/);
+      if (match) {
+        return `${match[1]}${match[2]}:******${match[4]}`;
+      }
+      return urlStr;
+    } catch (e) {
+      return urlStr;
+    }
+  }
+
+  function unmaskConnectionUrl(newValue, originalUrl) {
+    if (!newValue) return "";
+    if (newValue.includes(":******@") && originalUrl) {
+      try {
+        const origMatch = originalUrl.match(/^([^:]+:\/\/)([^:]+):([^@]+)(@.+)$/);
+        if (origMatch) {
+          const originalPassword = origMatch[3];
+          return newValue.replace(/:[*]{6}@/, `:${originalPassword}@`);
+        }
+      } catch (e) {
+        console.error("Failed to unmask URL:", e);
+      }
+    }
+    return newValue;
+  }
 
   // Active state tracker for multi-tab results & interrogation
   let currentResultsList = [];
@@ -149,10 +203,10 @@ document.addEventListener('DOMContentLoaded', async () => {
       theme: 'dracula',
       lineNumbers: true,
       lineWrapping: true,
-      viewportMargin: Infinity,
+      /* viewportMargin: Infinity,*/
       placeholder: sqlQueryTextarea.getAttribute('placeholder') || "You may enter SQL here and execute it..."
     });
-    sqlEditor.setSize('100%', '100%');
+    /* sqlEditor.setSize('100%', '100%'); */
   }
 
   const sqlContainer = document.querySelector('.speech-bubble-wrapper.sql-bubble');
@@ -485,6 +539,13 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (data.custom_database_url !== undefined) {
         customDbUrl = data.custom_database_url;
       }
+      if (data.custom_databases !== undefined) {
+        customDatabases = data.custom_databases;
+      } else if (customDbUrl) {
+        customDatabases = [{ name: customDbName || "Custom", url: customDbUrl }];
+      } else {
+        customDatabases = [];
+      }
 
       geminiPresetKeys = data.gemini_preset_keys || data.models || [];
       if (data.active_model) {
@@ -515,6 +576,82 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
+  function renderCustomDbRows(activeUrl) {
+    const container = document.getElementById('customDbsContainer');
+    if (!container) return;
+
+    const rows = customDatabases.filter(db => db.url && db.url.trim() !== "");
+
+    let html = '';
+    rows.forEach((db, index) => {
+      const maskedVal = maskConnectionUrl(db.url);
+      const isSelected = activeUrl === db.url;
+      html += `
+        <label class="radio-option" style="display: flex; align-items: center; gap: 0.6rem; width: 100%;">
+          <input type="radio" name="db_connection_option" value="custom-${index}" data-dbname="${db.name}" ${isSelected ? 'checked' : ''}>
+          <input type="text" class="config-input custom-db-url-input" data-index="${index}" placeholder="postgresql://user:password@host:5432/dbname" value="${maskedVal}" style="flex: 1;" autocomplete="off">
+        </label>
+      `;
+    });
+
+    const nextIndex = rows.length;
+    html += `
+      <label class="radio-option" style="display: flex; align-items: center; gap: 0.6rem; width: 100%;">
+        <input type="radio" name="db_connection_option" value="custom-${nextIndex}" data-dbname="Custom" id="radioNewCustomDb">
+        <input type="text" class="config-input custom-db-url-input" data-index="${nextIndex}" placeholder="postgresql://user:password@host:5432/dbname" value="" style="flex: 1;" autocomplete="off">
+      </label>
+    `;
+
+    container.innerHTML = html;
+
+    const inputs = container.querySelectorAll('.custom-db-url-input');
+    inputs.forEach(input => {
+      const index = parseInt(input.dataset.index);
+      const radio = container.querySelector(`input[value="custom-${index}"]`);
+
+      input.addEventListener('focus', () => {
+        if (radio) radio.checked = true;
+      });
+
+      input.addEventListener('input', () => {
+        if (radio) radio.checked = true;
+        const val = input.value.trim();
+
+        if (index < customDatabases.length) {
+          if (val === "") {
+            customDatabases.splice(index, 1);
+            renderCustomDbRows(activeUrl);
+            const currentInputs = container.querySelectorAll('.custom-db-url-input');
+            if (currentInputs.length > 0) {
+              const targetInp = currentInputs[Math.min(index, currentInputs.length - 1)];
+              if (targetInp) targetInp.focus();
+            }
+            return;
+          }
+          const unmaskedUrl = unmaskConnectionUrl(val, customDatabases[index].url);
+          customDatabases[index].url = unmaskedUrl;
+          customDatabases[index].name = getDatabaseNameFromUrl(unmaskedUrl);
+          if (radio) radio.dataset.dbname = customDatabases[index].name;
+        } else {
+          const unmaskedUrl = unmaskConnectionUrl(val, "");
+          customDatabases.push({
+            name: getDatabaseNameFromUrl(unmaskedUrl),
+            url: unmaskedUrl
+          });
+          if (radio) radio.dataset.dbname = customDatabases[index].name;
+
+          renderCustomDbRows(activeUrl);
+          const newInputs = container.querySelectorAll('.custom-db-url-input');
+          const matchingInput = Array.from(newInputs).find(inp => parseInt(inp.dataset.index) === index);
+          if (matchingInput) {
+            matchingInput.focus();
+            matchingInput.setSelectionRange(val.length, val.length);
+          }
+        }
+      });
+    });
+  }
+
   function renderDbRadioButtons(currentDbUrl) {
     const radioGroup = document.getElementById('modalDbRadioGroup');
     if (!radioGroup) return;
@@ -537,46 +674,12 @@ document.addEventListener('DOMContentLoaded', async () => {
       `;
     });
 
-    const customValue = customDbUrl || (isCustom ? activeUrl : '');
-    const customNameValue = customDbName || '';
-
-    // 2. Render Custom Option
-    html += `
-      <label class="radio-option" style="display: flex; align-items: center; gap: 0.6rem; width: 100%;">
-        <input type="radio" name="db_connection_option" value="custom" id="radioCustomDb" data-dbname="${customNameValue || 'Custom'}" ${isCustom ? 'checked' : ''}>
-        <input type="text" id="modalCustomDbName" class="config-input" placeholder="Custom Name" value="${customNameValue}" style="width: 130px; flex-shrink: 0;" autocomplete="off">
-        <input type="text" id="modalCustomDbUrl" class="config-input" placeholder="postgresql://user:password@host:5432/dbname" value="${customValue}" style="flex: 1;" autocomplete="off">
-      </label>
-    `;
+    // 2. Render Custom Options Container
+    html += `<div id="customDbsContainer" style="display: flex; flex-direction: column; gap: 0.5rem; width: 100%;"></div>`;
 
     radioGroup.innerHTML = html;
 
-    const customNameInput = document.getElementById('modalCustomDbName');
-    const customInput = document.getElementById('modalCustomDbUrl');
-    const customRadio = document.getElementById('radioCustomDb');
-
-    if (customNameInput) {
-      customNameInput.addEventListener('focus', () => {
-        if (customRadio) customRadio.checked = true;
-      });
-      customNameInput.addEventListener('input', () => {
-        if (customRadio) customRadio.checked = true;
-        const val = customNameInput.value.trim();
-        customDbName = val;
-        if (customRadio) customRadio.dataset.dbname = val || "Custom";
-      });
-    }
-
-    if (customInput) {
-      customInput.addEventListener('focus', () => {
-        if (customRadio) customRadio.checked = true;
-      });
-      customInput.addEventListener('input', () => {
-        if (customRadio) customRadio.checked = true;
-        const val = customInput.value.trim();
-        customDbUrl = val;
-      });
-    }
+    renderCustomDbRows(activeUrl);
   }
 
   async function triggerConfigSave({ closeModal = false, dbUrl = null, dbName = null } = {}) {
@@ -584,25 +687,48 @@ document.addEventListener('DOMContentLoaded', async () => {
     let dbNameValue = dbName;
     let isCustomOption = false;
 
-    const customNameInput = document.getElementById('modalCustomDbName');
-    if (customNameInput) {
-      const nameVal = customNameInput.value.trim();
-      if (nameVal) customDbName = nameVal;
-    }
-
-    const customInput = document.getElementById('modalCustomDbUrl');
-    if (customInput) {
-      const inputVal = customInput.value.trim();
-      if (inputVal) customDbUrl = inputVal;
+    const container = document.getElementById('customDbsContainer');
+    if (container) {
+      const inputs = container.querySelectorAll('.custom-db-url-input');
+      inputs.forEach(input => {
+        const index = parseInt(input.dataset.index);
+        const val = input.value.trim();
+        if (val) {
+          if (index < customDatabases.length) {
+            const unmasked = unmaskConnectionUrl(val, customDatabases[index].url);
+            customDatabases[index].url = unmasked;
+            customDatabases[index].name = getDatabaseNameFromUrl(unmasked);
+          } else {
+            const unmasked = unmaskConnectionUrl(val, "");
+            customDatabases.push({
+              name: getDatabaseNameFromUrl(unmasked),
+              url: unmasked
+            });
+          }
+        }
+      });
     }
 
     if (dbUrlValue === null || dbNameValue === null) {
       const selectedDbRadio = document.querySelector('input[name="db_connection_option"]:checked');
       if (selectedDbRadio) {
-        if (selectedDbRadio.value === 'custom') {
+        if (selectedDbRadio.value.startsWith('custom-')) {
           isCustomOption = true;
-          dbNameValue = customNameInput ? (customNameInput.value.trim() || "Custom") : (customDbName || "Custom");
-          dbUrlValue = customInput ? customInput.value.trim() : (customDbUrl || "");
+          const index = parseInt(selectedDbRadio.value.split('-')[1]);
+          const selectedDb = customDatabases[index];
+          if (selectedDb && selectedDb.url) {
+            dbUrlValue = selectedDb.url;
+            dbNameValue = selectedDb.name;
+          } else {
+            const firstCustom = customDatabases.find(d => d.url && d.url.trim() !== "");
+            if (firstCustom) {
+              dbUrlValue = firstCustom.url;
+              dbNameValue = firstCustom.name;
+            } else {
+              dbUrlValue = DEFAULT_DB_URL;
+              dbNameValue = "Default DB";
+            }
+          }
           customDbName = dbNameValue;
           customDbUrl = dbUrlValue;
         } else {
@@ -625,7 +751,8 @@ document.addEventListener('DOMContentLoaded', async () => {
           database_name: dbNameValue,
           database_url: dbUrlValue,
           is_custom: isCustomOption,
-          model: activeModel
+          model: activeModel,
+          custom_databases: customDatabases.filter(d => d.url && d.url.trim() !== "")
         })
       });
 
@@ -639,6 +766,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
         if (data.custom_database_url !== undefined) {
           customDbUrl = data.custom_database_url;
+        }
+        if (data.custom_databases !== undefined) {
+          customDatabases = data.custom_databases;
         }
         if (data.active_model) {
           activeModel = data.active_model;

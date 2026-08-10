@@ -629,6 +629,7 @@ textarea:focus {
 }
 
 .sql-prompt-row .speech-bubble-wrapper.sql-bubble {
+  height: 100px;
   min-height: 100px;
   max-height: 600px;
   resize: vertical;
@@ -669,7 +670,7 @@ textarea.interrogate-textbox {
 
 .speech-bubble-wrapper.sql-bubble textarea#sqlQuery {
   width: 100%;
-  height: auto; /*100%;*/
+  height: 100px;
   background: transparent !important;
   border: none !important;
   box-shadow: none !important;
@@ -686,22 +687,11 @@ textarea.interrogate-textbox {
 }
 
 .speech-bubble-wrapper.sql-bubble .CodeMirror {
-  height: auto !important;  
+  height: 100% !important; 
   width: 100% !important;
   background: transparent !important;
   border-radius: 0;
-  /* position: relative !important;*/
-  /* flex: 1; */
 }
-
-.speech-bubble-wrapper.sql-bubble .CodeMirror-scroll {
-  height: 100% !important;
-  max-height: 100% !important;
-  min-height: 100% !important;
-  overflow-y: auto !important;
-  overflow-x: auto !important;
-}
-
 
 /* Interrogation UI Styles */
 .interrogate-wrapper {
@@ -1134,11 +1124,6 @@ textarea.interrogate-textbox {
   align-items: center;
   gap: 0.75rem;
   min-height: 52px;
-}
-
-.input-row .speech-bubble-wrapper {
-  height: 100%;
-  flex: 1;
 }
 
 /* Action Buttons Column */
