@@ -983,14 +983,16 @@ def interrogate_results():
         client = genai.Client(api_key=api_key)
 
         system_instruction = data.get('system_prompt') or (
-            "You are an expert data analyst assistant that can slice, dice and analyze tabular data sets. "
-            "You are provided with: "
-            "(1) the database schema, "
-            "(2) the user's original natural language request that got translated to SQL, "
-            "(3) the SQL query that was generated from the translation and executed, "
-            "(4) the resulting data table, and "
+            "You are an expert data analyst assistant that can slice, dice and analyze tabular data sets.\n"
+            "You are provided with:\n"
+            "(1) the database schema,\n"
+            "(2) the user's original natural language request that got translated to SQL,\n"
+            "(3) the SQL query that was generated from the translation and executed,\n"
+            "(4) the resulting data table, and\n"
             "(5) a follow-up request asking to analyze these results.\n"
-            "Analyze the data thoroughly and answer the follow-up request as concisely as possible."
+            "Analyze the data thoroughly and answer the follow-up request as concisely as possible.\n"
+            "If necessary, please suggest an alternative SQL query to execute in response to the follow-up request\n." 
+            "In that case, return the text '***NEW SQL***\n' and ONLY the raw SQL code block. Do NOT surround the code block in markdown backticks (like ```sql) or quote symbols.\n"
         )
 
         cols = results_table.get('columns') or []

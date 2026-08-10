@@ -1174,7 +1174,13 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       const data = await response.json();
       if (response.ok && data.success) {
-        setInterrogateResponseText(data.answer);
+        if (data.answer && data.answer.startsWith('***NEW SQL***')) {
+          setInterrogateResponseText("Updated SQL Command suggested (see above). Review and execute.");
+          const newSql = data.answer.slice('***NEW SQL***'.length).trim();
+          setSqlQuery(newSql);
+        } else {
+          setInterrogateResponseText(data.answer);
+        }
       } else {
         setInterrogateResponseText(`Error: ${data.error || 'Failed to interrogate results.'}`);
       }
