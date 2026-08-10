@@ -133,6 +133,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const interrogateResponse = document.getElementById('interrogateResponse');
   const interrogateResponseWrapper = document.getElementById('interrogateResponseWrapper');
   const closeInterrogateBtn = document.getElementById('closeInterrogateBtn');
+  const runInterrogateSqlBtn = document.getElementById('runInterrogateSqlBtn');
   const interrogateMicBtn = document.getElementById('interrogateMicBtn');
 
   // Chart.js Instances
@@ -203,10 +204,41 @@ document.addEventListener('DOMContentLoaded', async () => {
       theme: 'dracula',
       lineNumbers: true,
       lineWrapping: true,
-      /* viewportMargin: Infinity,*/
       placeholder: sqlQueryTextarea.getAttribute('placeholder') || "You may enter SQL here and execute it..."
     });
-    /* sqlEditor.setSize('100%', '100%'); */
+  }
+
+  // Dynamic CodeMirror Management for Interrogation Response Area
+  let interrogateEditor = null;
+
+  function initInterrogateCodeMirror() {
+    if (!interrogateEditor && interrogateResponse && window.CodeMirror) {
+      interrogateEditor = window.CodeMirror.fromTextArea(interrogateResponse, {
+        mode: 'text/x-sql',
+        theme: 'dracula',
+        lineNumbers: true,
+        lineWrapping: true,
+        readOnly: false,
+        placeholder: interrogateResponse.getAttribute('placeholder') || "Analysis or suggested SQL will appear here...",
+        extraKeys: {
+          "Enter": function(cm) {
+            if (suggestedSqlToExecute || isSqlText(cm.getValue())) {
+              executeInterrogateSql();
+            } else {
+              return window.CodeMirror.Pass;
+            }
+          }
+        }
+      });
+      interrogateEditor.setSize('100%', '70px');
+    }
+  }
+
+  function destroyInterrogateCodeMirror() {
+    if (interrogateEditor) {
+      interrogateEditor.toTextArea();
+      interrogateEditor = null;
+    }
   }
 
   const sqlContainer = document.querySelector('.speech-bubble-wrapper.sql-bubble');
@@ -227,6 +259,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (sqlEditor) {
       sqlEditor.setSize('100%', '100%');
       sqlEditor.refresh();
+    }
+    if (interrogateEditor) {
+      interrogateEditor.setSize('100%', '70px');
+      interrogateEditor.refresh();
     }
   });
 
@@ -395,21 +431,48 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
-  function setInterrogateResponseText(text) {
-    if (!interrogateResponse) return;
-    interrogateResponse.value = text;
-    if (interrogateResponseWrapper) interrogateResponseWrapper.classList.remove('hidden');
-    interrogateResponse.classList.remove('hidden');
+  function isSqlText(text) {
+    if (!text) return false;
+    const trimmed = text.trim();
+    if (trimmed.startsWith('***NEW SQL***')) return true;
+    return /^(SELECT|WITH|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|GRANT|REVOKE)\b/i.test(trimmed);
+  }
 
-    interrogateResponse.style.height = 'auto';
-    const resultsContainer = document.querySelector('.results-container');
-    const maxAllowedHeight = resultsContainer ? (resultsContainer.clientHeight * 0.25) : 125;
-    
-    interrogateResponse.style.height = `${Math.min(interrogateResponse.scrollHeight, maxAllowedHeight)}px`;
+  function setInterrogateResponseText(text, forceSql = false) {
+    if (!interrogateResponse) return;
+
+    let rawText = text || '';
+    if (rawText.startsWith('***NEW SQL***')) {
+      rawText = rawText.slice('***NEW SQL***'.length).trim();
+    }
+
+    const isSql = forceSql || isSqlText(rawText);
+    const textToDisplay = isSql ? formatSql(rawText) : rawText;
+
+    if (isSql) {
+      initInterrogateCodeMirror();
+      if (interrogateEditor) {
+        interrogateEditor.setValue(textToDisplay);
+        interrogateEditor.setSize('100%', '70px');
+        requestAnimationFrame(() => {
+          interrogateEditor.refresh();
+        });
+      }
+    } else {
+      destroyInterrogateCodeMirror();
+      if (interrogateResponse) {
+        interrogateResponse.value = textToDisplay;
+        interrogateResponse.style.height = '70px';
+      }
+    }
+
+    if (interrogateResponseWrapper) interrogateResponseWrapper.classList.remove('hidden');
+    if (interrogateResponse) interrogateResponse.classList.remove('hidden');
   }
 
   function clearInterrogateBoxes() {
     if (interrogatePrompt) interrogatePrompt.value = '';
+    destroyInterrogateCodeMirror();
     if (interrogateResponse) {
       interrogateResponse.value = '';
       interrogateResponse.style.height = '';
@@ -418,29 +481,27 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (interrogateResponseWrapper) {
       interrogateResponseWrapper.classList.add('hidden');
     }
+    if (runInterrogateSqlBtn) {
+      runInterrogateSqlBtn.classList.add('hidden');
+    }
   }
 
   if (closeInterrogateBtn) {
     closeInterrogateBtn.addEventListener('click', () => {
-      if (interrogateResponse) {
-        interrogateResponse.value = '';
-        interrogateResponse.style.height = '';
-        interrogateResponse.classList.add('hidden');
-      }
-      if (interrogateResponseWrapper) {
-        interrogateResponseWrapper.classList.add('hidden');
-      }
+      clearInterrogateBoxes();
     });
   }
 
-  function clearResultsDisplay() {
+  function clearResultsDisplay(keepInterrogate = false) {
     if (resultsTabsNav) resultsTabsNav.classList.add('hidden');
-    if (interrogateWrapper) interrogateWrapper.classList.add('hidden');
+    if (interrogateWrapper && !keepInterrogate) interrogateWrapper.classList.add('hidden');
     if (resultsHeader) resultsHeader.innerHTML = '';
     if (resultsBody) resultsBody.innerHTML = '';
     currentResultsList = [];
     activeResultIndex = 0;
-    clearInterrogateBoxes();
+    if (!keepInterrogate) {
+      clearInterrogateBoxes();
+    }
   }
 
   function resetExecutionStats() {
@@ -501,7 +562,6 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     if (badge) badge.style.display = '';
 
-    // Prefer configured/custom friendly name, fallback to raw PostgreSQL current_database()
     const matchedPreset = CONFIGURED_DBS.find(db => db.url === data.active_database_url);
     const dbDisplayName = matchedPreset?.name || data.custom_database_name || data.database_name || "Database";
 
@@ -663,7 +723,6 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     let html = '';
     
-    // 1. Render Preset Databases
     CONFIGURED_DBS.forEach((db) => {
       const isSelected = !isCustom && Boolean(matchedPresetUrl && db.url === matchedPresetUrl);
       html += `
@@ -674,7 +733,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       `;
     });
 
-    // 2. Render Custom Options Container
     html += `<div id="customDbsContainer" style="display: flex; flex-direction: column; gap: 0.5rem; width: 100%;"></div>`;
 
     radioGroup.innerHTML = html;
@@ -1139,12 +1197,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     renderTableResult(results[0]);
   }
 
+  // Variable to store suggested SQL for keypress/button execution
+  let suggestedSqlToExecute = "";
+
   async function processInterrogate() {
     const followupText = interrogatePrompt ? interrogatePrompt.value.trim() : '';
     if (!followupText) return;
 
     if (!currentResultsList || currentResultsList.length === 0) {
-      setInterrogateResponseText("No query results available to analyze.");
+      setInterrogateResponseText("No query results available to analyze.", false);
+      if (runInterrogateSqlBtn) runInterrogateSqlBtn.classList.add('hidden');
       return;
     }
 
@@ -1152,7 +1214,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     const originalNlPrompt = aiPrompt ? aiPrompt.value.trim() : '';
     const sqlExecuted = focusedResult.statement || focusedResult.query || focusedResult.sql || getSqlQuery();
 
-    setInterrogateResponseText("Analyzing results...");
+    if (runInterrogateSqlBtn) runInterrogateSqlBtn.classList.add('hidden');
+    setInterrogateResponseText("Analyzing results...", false);
 
     try {
       const response = await fetch('/api/interrogate', {
@@ -1175,18 +1238,53 @@ document.addEventListener('DOMContentLoaded', async () => {
       const data = await response.json();
       if (response.ok && data.success) {
         if (data.answer && data.answer.startsWith('***NEW SQL***')) {
-          setInterrogateResponseText("Updated SQL Command suggested (see above). Review and execute.");
           const newSql = data.answer.slice('***NEW SQL***'.length).trim();
-          setSqlQuery(newSql);
+          const formattedSql = formatSql(newSql);
+          suggestedSqlToExecute = formattedSql;
+          setInterrogateResponseText(formattedSql, true);
+          if (runInterrogateSqlBtn) runInterrogateSqlBtn.classList.remove('hidden');
+        } else if (data.answer && isSqlText(data.answer)) {
+          const formattedSql = formatSql(data.answer);
+          suggestedSqlToExecute = formattedSql;
+          setInterrogateResponseText(formattedSql, true);
+          if (runInterrogateSqlBtn) runInterrogateSqlBtn.classList.remove('hidden');
         } else {
-          setInterrogateResponseText(data.answer);
+          suggestedSqlToExecute = "";
+          setInterrogateResponseText(data.answer, false);
+          if (runInterrogateSqlBtn) runInterrogateSqlBtn.classList.add('hidden');
         }
       } else {
-        setInterrogateResponseText(`Error: ${data.error || 'Failed to interrogate results.'}`);
+        setInterrogateResponseText(`Error: ${data.error || 'Failed to interrogate results.'}`, false);
+        if (runInterrogateSqlBtn) runInterrogateSqlBtn.classList.add('hidden');
       }
     } catch (err) {
-      setInterrogateResponseText(`Network Error: ${err.message || 'Server request failed.'}`);
+      setInterrogateResponseText(`Network Error: ${err.message || 'Server request failed.'}`, false);
+      if (runInterrogateSqlBtn) runInterrogateSqlBtn.classList.add('hidden');
     }
+  }
+
+  // Function to execute SQL directly from the interrogation response area
+  async function executeInterrogateSql() {
+    const editorVal = interrogateEditor ? interrogateEditor.getValue().trim() : '';
+    const textareaVal = interrogateResponse ? interrogateResponse.value.trim() : '';
+    const sqlToRun = editorVal || textareaVal || suggestedSqlToExecute;
+    if (!sqlToRun) return;
+
+    await executeSql(sqlToRun, true);
+  }
+
+  // Keyboard listener for Interrogate Response Area (Carriage Return / Enter)
+  if (interrogateResponse) {
+    interrogateResponse.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey && suggestedSqlToExecute) {
+        e.preventDefault();
+        executeInterrogateSql();
+      }
+    });
+  }
+
+  if (runInterrogateSqlBtn) {
+    runInterrogateSqlBtn.addEventListener('click', executeInterrogateSql);
   }
 
   if (interrogatePrompt) {
@@ -1323,21 +1421,21 @@ document.addEventListener('DOMContentLoaded', async () => {
     return success;
   }
 
-  async function executeSql() {
+  async function executeSql(customSql = null, keepInterrogate = false) {
     await fetchBackendConfig();
     
-    clearResultsDisplay();
-
-    const sql = getSqlQuery();
+    clearResultsDisplay(keepInterrogate);
+  
+    const sql = customSql || getSqlQuery();
     if (!sql) return;
-
+  
     setButtonsDisabled(true);
-
+  
     if (execStatus) {
       execStatus.textContent = "Executing...";
       execStatus.className = "stat-val status-working";
     }
-
+  
     const config = loadConfig();
     try {
       const response = await fetch('/api/execute', {
@@ -1350,7 +1448,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           model: config.model
         })
       });
-
+  
       const data = await response.json();
       if (response.ok && data.success) {
         if (execStatus) {
@@ -1359,7 +1457,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
         if (execTime) execTime.textContent = `${data.executionTimeMs} ms`;
         if (execRows) execRows.textContent = data.rowCount;
-
+  
         renderMultiTurnResults(data.results);
         if (connDbDot) connDbDot.className = 'status-dot connected';
       } else {
@@ -1420,7 +1518,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   if (translateBtn) translateBtn.addEventListener('click', translatePrompt);
-  if (runBtn) runBtn.addEventListener('click', executeSql);
+  if (runBtn) runBtn.addEventListener('click', () => executeSql());
 
   if (luckyBtn) {
     luckyBtn.addEventListener('click', async () => {

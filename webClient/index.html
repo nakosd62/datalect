@@ -203,8 +203,11 @@
 
           <div class="interrogate-wrapper hidden">
             <div id="interrogateResponseWrapper" class="interrogate-response-wrapper hidden">
-              <button type="button" id="closeInterrogateBtn" class="interrogate-close-btn" title="Close interrogation results">&times;</button>
-              <textarea id="interrogateResponse" class="interrogate-response-box" readonly rows="2" placeholder="Analysis of results will appear here..."></textarea>
+              <div class="interrogate-header-actions">
+                <button id="runInterrogateSqlBtn" class="btn btn-primary btn-interrogate-exec hidden" title="Execute this suggested SQL">Execute SQL</button>
+                <button type="button" id="closeInterrogateBtn" class="interrogate-close-btn" title="Close interrogation results">&times;</button>
+              </div>
+              <textarea id="interrogateResponse" class="interrogate-response-box" readonly placeholder="Analysis or suggested SQL will appear here..."></textarea>
             </div>
             <div class="speech-bubble-wrapper">
               <textarea id="interrogatePrompt" class="interrogate-textbox" rows="1" placeholder="Interrogate these results by typing or using the mic..."></textarea>

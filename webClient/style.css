@@ -694,54 +694,93 @@ textarea.interrogate-textbox {
 }
 
 /* Interrogation UI Styles */
+
 .interrogate-wrapper {
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
   padding: 0.75rem;
-  background: rgba(15, 23, 42, 0.9);
+  background: rgba(15, 23, 42, 0.9); 
   border-top: 1px solid var(--bg-card-border);
   flex-shrink: 0;
 }
 
 .interrogate-response-wrapper {
   position: relative;
-  background: #1e293b;
-  border: 1px solid var(--bg-card-border);
-  border-radius: 8px;
-  padding: 0.75rem 2rem 0.75rem 0.75rem;
+  width: 100%;
+  margin-bottom: 0;
 }
 
-.interrogate-close-btn {
+.interrogate-response-box {
+  width: 100%;
+  height: 100px;
+  min-height: 100px;
+  max-height: 200px;
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  color: #ffffff !important;
+  font-family: var(--font-mono) !important;
+  font-size: 0.85rem;
+  line-height: 1.25;
+  padding: 0.25rem 0.6rem;
+  padding-right: 2.2rem !important;
+  resize: none; 
+  outline: none;
+  transform: none;
+  border-radius: 0;
+  box-sizing: border-box;
+}
+
+.interrogate-response-wrapper .CodeMirror {
+  height: 100px !important;
+  border: 1px solid var(--bg-card-border);
+  border-radius: 8px;
+}
+
+.interrogateResponseWrapper .CodeMirror-gutters {
+  background-color: var(--bg-input) !important;
+  border-right: 1px solid var(--bg-card-border) !important;
+}
+
+.interrogateResponseWrapper .CodeMirror-activeline-background {
+  background: rgba(255, 255, 255, 0.03) !important;
+}
+
+.interrogate-header-actions {
   position: absolute;
   top: 6px;
   right: 8px;
-  background: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  z-index: 10;
+}
+
+.interrogate-close-btn {
+  background: transparent;
   border: none;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-size: 1.25rem;
-  cursor: pointer;
   line-height: 1;
-  padding: 2px 6px;
+  cursor: pointer;
+  padding: 0 4px;
 }
 
 .interrogate-close-btn:hover {
   color: var(--text-primary);
 }
 
-.interrogate-response-box {
-  width: 100%;
-  background: transparent !important;
-  border: none !important;
-  box-shadow: none !important;
-  color: var(--text-secondary) !important;
-  font-family: var(--font-mono) !important;
-  font-size: 0.85rem;
-  line-height: 1.4;
-  resize: none;
-  outline: none;
-  padding: 0;
+.btn-interrogate-exec {
+  padding: 2px 8px;
+  font-size: 0.68rem;
+  line-height: 1.2;
+  border-radius: 4px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
 }
+
 
 /* Stats Cards */
 .stats-card-vertical {
@@ -1220,8 +1259,10 @@ textarea.interrogate-textbox {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: clamp(32px, 3.2vw, 42px); /* Reduced to match standard header buttons */
-  height: clamp(32px, 3.2vw, 42px);
+  width: 18px; 
+  height: 18px; 
+  /*width: clamp(32px, 3.2vw, 42px);*/ /* Reduced to match standard header buttons */
+  /*height: clamp(32px, 3.2vw, 42px);*/
   flex-shrink: 0;
   overflow: hidden;
 }
@@ -1240,7 +1281,8 @@ textarea.interrogate-textbox {
 }
 
 .auth-avatar-initial {
-  font-size: clamp(0.9rem, 1.5vw, 1.1rem);
+  font-size: 0.55rem;
+  /*font-size: clamp(0.9rem, 1.5vw, 1.1rem);*/
   font-weight: 600;
   color: var(--primary);
 }
