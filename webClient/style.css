@@ -707,16 +707,24 @@ textarea.interrogate-textbox {
 }
 
 .interrogate-response-wrapper {
+  flex: 0 0 auto;
   position: relative;
   width: 100%;
+  height: 80px;
+  min-height: 44px;
+  max-height: 480px;
   margin-bottom: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
 }
 
 .interrogate-response-box {
   width: 100%;
-  height: 80px;
-  min-height: 80px;
-  max-height: 160px;
+  height: 100%;
+  flex: 1;
+  min-height: 0;
   background: transparent !important;
   border: none !important;
   box-shadow: none !important;
@@ -734,7 +742,7 @@ textarea.interrogate-textbox {
 }
 
 .interrogate-response-wrapper .CodeMirror {
-  height: 80px !important;
+  height: 100% !important;
   border-radius: 8px;
   background: transparent !important;
   border: none !important;
@@ -756,11 +764,46 @@ textarea.interrogate-textbox {
 .interrogate-header-actions {
   position: absolute;
   top: 6px;
-  right: 8px;
+  right: 26px;
   display: flex;
   align-items: center;
   gap: 6px;
   z-index: 10;
+}
+
+.interrogate-resize-handle {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 16px;
+  height: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-secondary);
+  cursor: ns-resize;
+  border-radius: 4px;
+  touch-action: none;
+  z-index: 11;
+}
+
+.interrogate-resize-handle:hover {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.interrogate-resize-handle.dragging {
+  color: #38bdf8;
+  background: rgba(56, 189, 248, 0.12);
+}
+
+/* The prompt row (below the response box) sits in the same vertical flex
+   column and would otherwise inherit .speech-bubble-wrapper's flex:1,
+   which is meant for horizontal rows - pin it to its natural height. */
+.interrogate-wrapper > .speech-bubble-wrapper:not(.interrogate-response-wrapper) {
+  flex: 0 0 auto;
+  height: 42px;
+  min-height: 42px;
 }
 
 
@@ -1097,6 +1140,22 @@ textarea.interrogate-textbox {
   font-weight: 500;
   border-radius: 8px 8px 0 0;
   z-index: 3;
+}
+
+/* Tabs created by running SQL suggested during an interrogation follow-up */
+.result-tab-followup {
+  font-style: italic;
+}
+
+.result-tab-followup::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 6px;
+  border-radius: 50%;
+  background-color: #a78bfa;
+  flex-shrink: 0;
 }
 
 .results-table-wrapper {
@@ -1678,4 +1737,3 @@ textarea.interrogate-textbox {
   background-color: var(--danger);
   box-shadow: 0 0 6px var(--danger);
 }
-

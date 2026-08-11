@@ -38,5 +38,5 @@ __pycache__/
 *.pyo
 *.pyd
 *-save*
-*.save
+*.save*
 .DS_Store

@@ -135,6 +135,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const closeInterrogateBtn = document.getElementById('closeInterrogateBtn');
   const runInterrogateSqlBtn = document.getElementById('runInterrogateSqlBtn');
   const interrogateMicBtn = document.getElementById('interrogateMicBtn');
+  const interrogateResizeHandle = document.getElementById('interrogateResizeHandle');
 
   // Chart.js Instances
   let chartCountInstance = null;
@@ -230,7 +231,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           }
         }
       });
-      interrogateEditor.setSize('100%', '70px');
+      interrogateEditor.setSize('100%', '100%');
     }
   }
 
@@ -239,6 +240,69 @@ document.addEventListener('DOMContentLoaded', async () => {
       interrogateEditor.toTextArea();
       interrogateEditor = null;
     }
+  }
+
+  // Manual resize (top-right handle, drag upward to grow). The wrapper sits
+  // above the results table inside an overflow:hidden flex column, so
+  // growing its height naturally eats into the table's space above it -
+  // exactly the "resize upward" effect, no layout tricks required.
+  const INTERROGATE_BOX_MIN_HEIGHT = 44;
+  const INTERROGATE_BOX_MAX_HEIGHT = 480;
+
+  function setInterrogateBoxHeight(px) {
+    const clamped = Math.max(INTERROGATE_BOX_MIN_HEIGHT, Math.min(INTERROGATE_BOX_MAX_HEIGHT, px));
+    if (interrogateResponseWrapper) {
+      interrogateResponseWrapper.style.height = `${clamped}px`;
+    }
+    if (interrogateEditor) {
+      interrogateEditor.setSize('100%', '100%');
+      interrogateEditor.refresh();
+    }
+    return clamped;
+  }
+
+  if (interrogateResizeHandle && interrogateResponseWrapper) {
+    let dragging = false;
+    let dragStartY = 0;
+    let dragStartHeight = 0;
+
+    const onDragMove = (e) => {
+      if (!dragging) return;
+      const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+      // Moving the pointer up (smaller clientY) should grow the box.
+      const delta = dragStartY - clientY;
+      setInterrogateBoxHeight(dragStartHeight + delta);
+      e.preventDefault();
+    };
+
+    const onDragEnd = () => {
+      if (!dragging) return;
+      dragging = false;
+      interrogateResizeHandle.classList.remove('dragging');
+      document.body.style.userSelect = '';
+      document.body.style.cursor = '';
+      window.removeEventListener('mousemove', onDragMove);
+      window.removeEventListener('mouseup', onDragEnd);
+      window.removeEventListener('touchmove', onDragMove);
+      window.removeEventListener('touchend', onDragEnd);
+    };
+
+    const onDragStart = (e) => {
+      dragging = true;
+      dragStartY = e.touches ? e.touches[0].clientY : e.clientY;
+      dragStartHeight = interrogateResponseWrapper.getBoundingClientRect().height;
+      interrogateResizeHandle.classList.add('dragging');
+      document.body.style.userSelect = 'none';
+      document.body.style.cursor = 'ns-resize';
+      window.addEventListener('mousemove', onDragMove);
+      window.addEventListener('mouseup', onDragEnd);
+      window.addEventListener('touchmove', onDragMove, { passive: false });
+      window.addEventListener('touchend', onDragEnd);
+      e.preventDefault();
+    };
+
+    interrogateResizeHandle.addEventListener('mousedown', onDragStart);
+    interrogateResizeHandle.addEventListener('touchstart', onDragStart, { passive: false });
   }
 
   const sqlContainer = document.querySelector('.speech-bubble-wrapper.sql-bubble');
@@ -261,7 +325,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       sqlEditor.refresh();
     }
     if (interrogateEditor) {
-      interrogateEditor.setSize('100%', '70px');
+      interrogateEditor.setSize('100%', '100%');
       interrogateEditor.refresh();
     }
   });
@@ -453,7 +517,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       initInterrogateCodeMirror();
       if (interrogateEditor) {
         interrogateEditor.setValue(textToDisplay);
-        interrogateEditor.setSize('100%', '70px');
+        interrogateEditor.setSize('100%', '100%');
         requestAnimationFrame(() => {
           interrogateEditor.refresh();
         });
@@ -462,7 +526,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       destroyInterrogateCodeMirror();
       if (interrogateResponse) {
         interrogateResponse.value = textToDisplay;
-        interrogateResponse.style.height = '70px';
       }
     }
 
@@ -475,11 +538,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     destroyInterrogateCodeMirror();
     if (interrogateResponse) {
       interrogateResponse.value = '';
-      interrogateResponse.style.height = '';
       interrogateResponse.classList.add('hidden');
     }
     if (interrogateResponseWrapper) {
       interrogateResponseWrapper.classList.add('hidden');
+      interrogateResponseWrapper.style.height = '';
     }
     if (runInterrogateSqlBtn) {
       runInterrogateSqlBtn.classList.add('hidden');
@@ -1150,51 +1213,75 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
-  function renderMultiTurnResults(results) {
+  // Rebuilds the tab-strip buttons from currentResultsList / activeResultIndex.
+  // Safe to call any time the list or the active tab changes; never touches
+  // resultsBody itself, so it never clobbers whichever tab is showing.
+  function buildResultsTabsNav() {
     if (!resultsTabsNav) return;
     resultsTabsNav.innerHTML = '';
-    currentResultsList = results || [];
-    activeResultIndex = 0;
 
-    if (!results || results.length === 0) {
+    if (!currentResultsList || currentResultsList.length <= 1) {
       resultsTabsNav.classList.add('hidden');
-      if (interrogateWrapper) interrogateWrapper.classList.add('hidden');
-      renderTableResult(null);
-      return;
-    }
-
-    if (interrogateWrapper) interrogateWrapper.classList.remove('hidden');
-
-    if (results.length === 1) {
-      resultsTabsNav.classList.add('hidden');
-      renderTableResult(results[0]);
       return;
     }
 
     resultsTabsNav.classList.remove('hidden');
-    results.forEach((res, idx) => {
+    currentResultsList.forEach((res, idx) => {
       const btn = document.createElement('button');
-      btn.className = `result-tab-btn ${idx === 0 ? 'active' : ''}`;
-      
+      btn.className = `result-tab-btn ${idx === activeResultIndex ? 'active' : ''}`;
+
       const sqlText = res.query || res.sql || res.statement || '';
       if (sqlText) {
         btn.setAttribute('title', sqlText);
       }
 
       const count = res.rowCount !== undefined ? res.rowCount : (res.rows ? res.rows.length : 0);
-      btn.textContent = `Query ${idx + 1} (${count})`;
+      const label = res._fromInterrogate ? 'Follow-up' : 'Query';
+      btn.textContent = `${label} ${idx + 1} (${count})`;
+      if (res._fromInterrogate) btn.classList.add('result-tab-followup');
 
       btn.addEventListener('click', () => {
-        document.querySelectorAll('.result-tab-btn').forEach(b => b.classList.remove('active'));
-        btn.classList.add('active');
         activeResultIndex = idx;
         clearInterrogateBoxes();
+        buildResultsTabsNav();
         renderTableResult(res);
       });
       resultsTabsNav.appendChild(btn);
     });
+  }
 
-    renderTableResult(results[0]);
+  // Replaces the entire results area (used for a fresh "Run" of the main SQL box).
+  function renderMultiTurnResults(results) {
+    currentResultsList = results || [];
+    activeResultIndex = 0;
+
+    if (!currentResultsList.length) {
+      if (resultsTabsNav) resultsTabsNav.classList.add('hidden');
+      if (interrogateWrapper) interrogateWrapper.classList.add('hidden');
+      renderTableResult(null);
+      return;
+    }
+
+    if (interrogateWrapper) interrogateWrapper.classList.remove('hidden');
+    buildResultsTabsNav();
+    renderTableResult(currentResultsList[activeResultIndex]);
+  }
+
+  // Adds new result(s) as additional tab(s) alongside whatever is already
+  // showing, then switches to the first newly-added tab. Used when a SQL
+  // statement suggested during interrogation is executed, so the results
+  // being interrogated stay available in their own tab instead of being
+  // replaced by the new query's results.
+  function appendResultsAsTabs(newResults) {
+    if (!newResults || newResults.length === 0) return;
+
+    const taggedResults = newResults.map(r => ({ ...r, _fromInterrogate: true }));
+    currentResultsList = (currentResultsList || []).concat(taggedResults);
+    activeResultIndex = currentResultsList.length - newResults.length;
+
+    if (interrogateWrapper) interrogateWrapper.classList.remove('hidden');
+    buildResultsTabsNav();
+    renderTableResult(currentResultsList[activeResultIndex]);
   }
 
   // Variable to store suggested SQL for keypress/button execution
@@ -1283,7 +1370,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     const sqlToRun = editorVal || textareaVal || suggestedSqlToExecute;
     if (!sqlToRun) return;
 
-    await executeSql(sqlToRun, true);
+    // keepInterrogate=true, appendAsTab=true: the results currently being
+    // interrogated stay put in their own tab; the new query's results land
+    // in a fresh tab that becomes active.
+    await executeSql(sqlToRun, true, true);
   }
 
   // Keyboard listener for Interrogate Response Area (Carriage Return / Enter)
@@ -1434,10 +1524,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     return success;
   }
 
-  async function executeSql(customSql = null, keepInterrogate = false) {
+  async function executeSql(customSql = null, keepInterrogate = false, appendAsTab = false) {
     await fetchBackendConfig();
-    
-    clearResultsDisplay(keepInterrogate);
+
+    // When appending, leave the existing tabs/results alone entirely -
+    // only a successful response should touch the results area.
+    if (!appendAsTab) {
+      clearResultsDisplay(keepInterrogate);
+    }
   
     const sql = customSql || getSqlQuery();
     if (!sql) return;
@@ -1471,7 +1565,11 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (execTime) execTime.textContent = `${data.executionTimeMs} ms`;
         if (execRows) execRows.textContent = data.rowCount;
   
-        renderMultiTurnResults(data.results);
+        if (appendAsTab) {
+          appendResultsAsTabs(data.results);
+        } else {
+          renderMultiTurnResults(data.results);
+        }
         if (connDbDot) connDbDot.className = 'status-dot connected';
       } else {
         if (execStatus) {

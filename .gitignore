@@ -18,3 +18,7 @@ crdb.crt
 
 # Local state
 state/
+
+# Temporary files
+*-save*
+*.save*
