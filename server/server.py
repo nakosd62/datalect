@@ -697,7 +697,7 @@ def translate_query():
     user_identity = get_current_user_identity()
     conn_str = resolve_conn_str(data.get('database_url'), user_identity)
 
-    history = data.get('history', [])[-10:]
+    history = data.get('history', [])[-20:]
 
     try:
         schema = get_database_schema(conn_str, user_identity)
@@ -785,7 +785,7 @@ def translate_query():
     except Exception as e:
         resp = jsonify({
             'success': False,
-            'error': f"Gemini Error: {str(e)}"
+            'error': f"Translation Error: {str(e)}"
         })
         return apply_session_cookie(resp, session_id), 500
 
@@ -978,6 +978,8 @@ def interrogate_results():
     user_identity = get_current_user_identity()
     conn_str = resolve_conn_str(data.get('database_url'), user_identity)
 
+    history = data.get('history', [])[-20:]
+
     try:
         schema = get_database_schema(conn_str, user_identity)
         client = genai.Client(api_key=api_key)
@@ -1008,21 +1010,58 @@ def interrogate_results():
             f"Query Results Table:\n{table_text}\n\n"
             f"Follow-up Question on Results: {followup_prompt}"
         )
-
-        response = client.models.generate_content(
-            model=gemini_model,
-            contents=user_content,
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                temperature=0.2
+      
+        contents = []
+        for msg in history:
+            role = msg.get("role")
+            text = msg.get("text")
+            if role and text:
+                contents.append(
+                    types.Content(
+                        role=role,
+                        parts=[types.Part.from_text(text=text)]
+                    )
+                )
+            
+        contents.append(
+            types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=user_content)]
             )
         )
+   
+        start_time = time.perf_counter()
+        response = client.models.generate_content(
+            model=gemini_model,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                temperature=0.1
+            )
+        )
+        end_time = time.perf_counter()
 
         answer = response.text.strip() if response.text else "No answer generated."
 
+        duration = round(1000 * (end_time - start_time))
+        usage = response.usage_metadata
+        input_tokens = usage.prompt_token_count if usage else 0
+        output_tokens = usage.candidates_token_count if usage else 0
+        total_tokens = usage.total_token_count if usage else 0
+        thinking_tokens = getattr(usage, 'thoughts_token_count', 0) if usage else 0
+        cached_content_tokens = getattr(usage, 'cached_content_token_count', 0) if usage else 0
+
+        record_translation(user_identity, conn_str, followup_prompt, answer, gemini_model, duration, input_tokens, output_tokens, total_tokens, thinking_tokens, cached_content_tokens)
+
         resp = jsonify({
             'success': True,
-            'answer': answer
+            'answer': answer,
+            'input_tokens': input_tokens,
+            'output_tokens': output_tokens,
+            'total_tokens': total_tokens,
+            'thinking_tokens': thinking_tokens,
+            'cached_content_tokens': cached_content_tokens,
+            'duration': duration
         })
         return apply_session_cookie(resp, session_id)
     except Exception as e:

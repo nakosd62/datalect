@@ -202,7 +202,19 @@
           </div>
 
           <div class="interrogate-wrapper hidden">
-            <div id="interrogateResponseWrapper" class="interrogate-response-wrapper hidden">
+            <div id="interrogateResponseWrapper" class="speech-bubble-wrapper interrogate-response-wrapper hidden">
+
+              <!-- Top-Right Resize Handle -->
+              <!--
+              <div id="interrogateResizeHandle" class="interrogate-resize-handle" title="Drag to resize">
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+                  <line x1="11" y1="1" x2="1" y2="11"></line>
+                  <line x1="11" y1="5" x2="5" y2="11"></line>
+                  <line x1="11" y1="9" x2="9" y2="11"></line>
+                </svg>
+              </div>
+              -->
+
               <div class="interrogate-header-actions">
                 <button id="runInterrogateSqlBtn" class="btn btn-primary btn-interrogate-exec hidden" title="Execute this suggested SQL">Execute SQL</button>
                 <button type="button" id="closeInterrogateBtn" class="interrogate-close-btn" title="Close interrogation results">&times;</button>
@@ -259,7 +271,7 @@
         <p>Clicking <strong>I feel lucky</strong> will automatically translate your natural language prompt and execute the resulting SQL in one step. Use this mode judiciously.</p>
 
         <h3>5. Multi-turn conversations</h3>
-        <p>yDyL remembers the last 5 prompt-response pairs and takes them into account before responding. If you want to reset chat history, open the History popup (clock icon) and click <strong>Clear Chat History</strong>.</p>
+        <p>yDyL remembers the last 10 prompt-response pairs and takes them into account before responding. You may reset chat and translation history from the history popup window.</p>
 
       </div>
     </div>
@@ -286,6 +298,7 @@
               <span>Purge Translations</span>
               <span class="btn-purge-title">(0)</span>
             </button>
+            <div id="historyActionMsg" class="history-action-msg"></div>
           </div>
         </div>
         <button id="historyModalCloseBtn" class="modal-close-btn" type="button">&times;</button>

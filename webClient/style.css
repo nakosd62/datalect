@@ -695,6 +695,7 @@ textarea.interrogate-textbox {
 
 /* Interrogation UI Styles */
 
+
 .interrogate-wrapper {
   display: flex;
   flex-direction: column;
@@ -713,9 +714,9 @@ textarea.interrogate-textbox {
 
 .interrogate-response-box {
   width: 100%;
-  height: 100px;
-  min-height: 100px;
-  max-height: 200px;
+  height: 80px;
+  min-height: 80px;
+  max-height: 160px;
   background: transparent !important;
   border: none !important;
   box-shadow: none !important;
@@ -733,9 +734,13 @@ textarea.interrogate-textbox {
 }
 
 .interrogate-response-wrapper .CodeMirror {
-  height: 100px !important;
-  border: 1px solid var(--bg-card-border);
+  height: 80px !important;
   border-radius: 8px;
+  background: transparent !important;
+  border: none !important;
+  font-family: var(--font-mono);
+  font-size: 0.9rem;
+  color: var(--text-primary);
 }
 
 .interrogateResponseWrapper .CodeMirror-gutters {
@@ -747,6 +752,7 @@ textarea.interrogate-textbox {
   background: rgba(255, 255, 255, 0.03) !important;
 }
 
+
 .interrogate-header-actions {
   position: absolute;
   top: 6px;
@@ -756,6 +762,7 @@ textarea.interrogate-textbox {
   gap: 6px;
   z-index: 10;
 }
+
 
 .interrogate-close-btn {
   background: transparent;

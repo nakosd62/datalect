@@ -1230,6 +1230,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             rows: focusedResult.rows || []
           },
           followup_prompt: followupText,
+          history: chatHistory, // 1. Pass the active chat history
           model: activeModel,
           gemini_model: activeModel
         })
@@ -1237,6 +1238,18 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       const data = await response.json();
       if (response.ok && data.success) {
+        // 2. Append interrogation turns to history
+        chatHistory.push({
+          role: 'user',
+          text: followupText
+        });
+        chatHistory.push({
+          role: 'model',
+          text: data.answer
+        });
+        chatHistory = chatHistory.slice(-20);
+        updateHistoryTurnsSubtitle(); // 3. Update UI badge count
+
         if (data.answer && data.answer.startsWith('***NEW SQL***')) {
           const newSql = data.answer.slice('***NEW SQL***'.length).trim();
           const formattedSql = formatSql(newSql);
@@ -1340,7 +1353,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           role: 'model',
           text: data.sql
         });
-        chatHistory = chatHistory.slice(-10);
+        chatHistory = chatHistory.slice(-20);
         updateHistoryTurnsSubtitle();
 
         if (transStatus) {
