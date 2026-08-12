@@ -251,19 +251,10 @@ textarea:focus {
   background-color: rgba(255, 255, 255, 0.08);
 }
 
-.btn-control-block {
-  width: 100%;
-  padding: 0.15rem 0.5rem;
-  font-size: 0.78rem;
-  line-height: 1.2;
-  white-space: nowrap;
-  flex: 1; /* Ensures all 4 buttons take equal height/space */
-}
-
 /* Microphone Button Styles */
 .mic-btn {
   position: absolute;
-  right: 8px;
+  right: 2px;
   top: 50%;
   transform: translateY(-50%);
   background: transparent;
@@ -560,23 +551,6 @@ textarea:focus {
   }
 }
 
-/* Responsive Layout for Narrow Screens */
-@media (max-width: 900px) {
-  .action-buttons-column {
-    flex-direction: row;
-    justify-content: space-between;
-    align-items: center;
-    gap: 0.5rem;
-    width: 100%;
-  }
-
-  .btn-control-block {
-    flex: 1; /* Distributes all 4 buttons equally across row width */
-    width: auto;
-  }
-}
-
-
 /* Natural Language & SQL Row Layouts */
 .nl-prompt-row,
 .sql-prompt-row {
@@ -639,9 +613,7 @@ textarea:focus {
 }
 
 /* Textarea Box Styles */
-.speech-bubble-wrapper textarea#aiPrompt,
-.speech-bubble-wrapper textarea#interrogatePrompt,
-textarea.interrogate-textbox {
+.speech-bubble-wrapper textarea#aiPrompt {
   width: 100%;
   height: 34px;
   background: transparent !important;
@@ -660,8 +632,7 @@ textarea.interrogate-textbox {
   box-sizing: border-box;
 }
 
-.speech-bubble-wrapper textarea#aiPrompt::placeholder,
-.speech-bubble-wrapper textarea#interrogatePrompt::placeholder {
+.speech-bubble-wrapper textarea#aiPrompt::placeholder {
   color: #64748b;
   font-weight: 400;
   font-style: italic;
@@ -686,6 +657,41 @@ textarea.interrogate-textbox {
   box-sizing: border-box;
 }
 
+/* Position the Execute button in the top-right corner */
+#runBtn.sql-overlay-btn {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.2rem 0.45rem;
+  font-size: 0.65rem;
+  font-weight: 500;
+  line-height: 1;
+  gap: 0.25rem;          /* reduced spacing between icon and text */
+  border-radius: 4px;    /* scaled down radius */
+  z-index: 2;
+  /* z-index: 10; Ensures it renders on top of CodeMirror scroll/gutters */
+  background: rgba(16, 185, 129, 0.85); /* Emerald accent */
+  color: #ffffff;
+  border: 1px solid rgba(52, 211, 153, 0.4);
+  border-radius: 6px;
+  backdrop-filter: blur(4px);
+  cursor: pointer;
+  transition: all 0.15s ease-in-out;
+}
+
+#runBtn.sql-overlay-btn:hover:not(:disabled) {
+  background: rgba(16, 185, 129, 1);
+  box-shadow: 0 0 10px rgba(16, 185, 129, 0.4);
+}
+
+#runBtn.sql-overlay-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .speech-bubble-wrapper.sql-bubble .CodeMirror {
   height: 100% !important; 
   width: 100% !important;
@@ -693,144 +699,9 @@ textarea.interrogate-textbox {
   border-radius: 0;
 }
 
-/* Interrogation UI Styles */
-
-
-.interrogate-wrapper {
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
-  padding: 0.75rem;
-  background: rgba(15, 23, 42, 0.9); 
-  border-top: 1px solid var(--bg-card-border);
-  flex-shrink: 0;
+.sql-bubble .CodeMirror-lines {
+  padding-right: 120px;
 }
-
-.interrogate-response-wrapper {
-  flex: 0 0 auto;
-  position: relative;
-  width: 100%;
-  height: 80px;
-  min-height: 44px;
-  max-height: 480px;
-  margin-bottom: 0;
-  overflow: hidden;
-  display: flex;
-  flex-direction: column;
-  box-sizing: border-box;
-}
-
-.interrogate-response-box {
-  width: 100%;
-  height: 100%;
-  flex: 1;
-  min-height: 0;
-  background: transparent !important;
-  border: none !important;
-  box-shadow: none !important;
-  color: #ffffff !important;
-  font-family: var(--font-mono) !important;
-  font-size: 0.85rem;
-  line-height: 1.25;
-  padding: 0.25rem 0.6rem;
-  padding-right: 2.2rem !important;
-  resize: none; 
-  outline: none;
-  transform: none;
-  border-radius: 0;
-  box-sizing: border-box;
-}
-
-.interrogate-response-wrapper .CodeMirror {
-  height: 100% !important;
-  border-radius: 8px;
-  background: transparent !important;
-  border: none !important;
-  font-family: var(--font-mono);
-  font-size: 0.9rem;
-  color: var(--text-primary);
-}
-
-.interrogateResponseWrapper .CodeMirror-gutters {
-  background-color: var(--bg-input) !important;
-  border-right: 1px solid var(--bg-card-border) !important;
-}
-
-.interrogateResponseWrapper .CodeMirror-activeline-background {
-  background: rgba(255, 255, 255, 0.03) !important;
-}
-
-
-.interrogate-header-actions {
-  position: absolute;
-  top: 6px;
-  right: 26px;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  z-index: 10;
-}
-
-.interrogate-resize-handle {
-  position: absolute;
-  top: 6px;
-  right: 6px;
-  width: 16px;
-  height: 16px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--text-secondary);
-  cursor: ns-resize;
-  border-radius: 4px;
-  touch-action: none;
-  z-index: 11;
-}
-
-.interrogate-resize-handle:hover {
-  color: var(--text-primary);
-  background: rgba(255, 255, 255, 0.08);
-}
-
-.interrogate-resize-handle.dragging {
-  color: #38bdf8;
-  background: rgba(56, 189, 248, 0.12);
-}
-
-/* The prompt row (below the response box) sits in the same vertical flex
-   column and would otherwise inherit .speech-bubble-wrapper's flex:1,
-   which is meant for horizontal rows - pin it to its natural height. */
-.interrogate-wrapper > .speech-bubble-wrapper:not(.interrogate-response-wrapper) {
-  flex: 0 0 auto;
-  height: 42px;
-  min-height: 42px;
-}
-
-
-.interrogate-close-btn {
-  background: transparent;
-  border: none;
-  color: var(--text-secondary);
-  font-size: 1.25rem;
-  line-height: 1;
-  cursor: pointer;
-  padding: 0 4px;
-}
-
-.interrogate-close-btn:hover {
-  color: var(--text-primary);
-}
-
-.btn-interrogate-exec {
-  padding: 2px 8px;
-  font-size: 0.68rem;
-  line-height: 1.2;
-  border-radius: 4px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.03em;
-}
-
 
 /* Stats Cards */
 .stats-card-vertical {
@@ -1140,22 +1011,6 @@ textarea.interrogate-textbox {
   font-weight: 500;
   border-radius: 8px 8px 0 0;
   z-index: 3;
-}
-
-/* Tabs created by running SQL suggested during an interrogation follow-up */
-.result-tab-followup {
-  font-style: italic;
-}
-
-.result-tab-followup::before {
-  content: "";
-  display: inline-block;
-  width: 6px;
-  height: 6px;
-  margin-right: 6px;
-  border-radius: 50%;
-  background-color: #a78bfa;
-  flex-shrink: 0;
 }
 
 .results-table-wrapper {
@@ -1736,4 +1591,85 @@ textarea.interrogate-textbox {
 .status-dot.error {
   background-color: var(--danger);
   box-shadow: 0 0 6px var(--danger);
+}
+
+.response-cell {
+  padding: 1rem 1.25rem;
+}
+
+.response-text {
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 0.9rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  margin: 0;
+}
+
+/* Inline History Navigation Control inside NL Prompt */
+.speech-bubble-wrapper .inline-history-nav {
+  position: absolute;
+  right: 28px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: inline-flex;
+  align-items: center;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 4px;
+  overflow: hidden;
+  height: 24px;
+  z-index: 5;
+}
+
+.speech-bubble-wrapper .inline-history-nav button,
+.speech-bubble-wrapper .inline-history-nav span {
+  padding: 0 0.35rem;
+  font-size: 0.7rem;
+  font-weight: 500;
+  height: 100%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  user-select: none;
+}
+
+.speech-bubble-wrapper .inline-history-nav button {
+  cursor: pointer;
+  transition: var(--transition);
+}
+
+.speech-bubble-wrapper .inline-history-nav button:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--text-primary);
+}
+
+.speech-bubble-wrapper .inline-history-nav button:first-child {
+  border-right: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.speech-bubble-wrapper .inline-history-nav button:last-child {
+  border-left: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.speech-bubble-wrapper .inline-history-nav button:disabled,
+.speech-bubble-wrapper .inline-history-nav button.is-boundary {
+  color: var(--text-muted);
+  opacity: 0.35;
+  cursor: not-allowed;
+  background: transparent;
+}
+
+.speech-bubble-wrapper .inline-history-nav button:disabled:hover,
+.speech-bubble-wrapper .inline-history-nav button.is-boundary:hover {
+  background: transparent;
+  color: var(--text-muted);
+}
+
+/* Adjust textarea padding to prevent text overlap with the inline controls & mic */
+.speech-bubble-wrapper textarea#aiPrompt {
+  padding-right: 125px !important;
 }

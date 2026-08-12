@@ -1,5 +1,11 @@
 document.addEventListener('DOMContentLoaded', async () => {
   let chatHistory = [];
+  let futureChatHistory = [];
+  // Points at the most recent chatHistory entry that generated SQL which
+  // hasn't yet been executed. When that SQL is run, its results get attached
+  // to this entry so future chat turns have access to what data actually
+  // came back - not just what SQL/text was generated. Cleared once consumed.
+  let pendingSqlHistoryEntry = null;
   let DEFAULT_DB_URL = "";
   let ACTIVE_DB_URL = "";
   let CONFIGURED_DBS = [];
@@ -64,7 +70,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     return newValue;
   }
 
-  // Active state tracker for multi-tab results & interrogation
+  // Active state tracker for multi-tab query results
   let currentResultsList = [];
   let activeResultIndex = 0;
 
@@ -82,19 +88,12 @@ document.addEventListener('DOMContentLoaded', async () => {
   const sqlQueryTextarea = document.getElementById('sqlQuery');
   const translateBtn = document.getElementById('translateBtn');
   const runBtn = document.getElementById('runBtn');
-  const luckyBtn = document.getElementById('luckyBtn');
-  const clearAllBtn = document.getElementById('clearAllBtn'); 
   const clearHistoryBtn = document.getElementById('clearHistoryBtn');
   const purgeHistoryBtn = document.getElementById('purgeHistoryBtn');
+  const goBackBtn = document.getElementById('goBackBtn');
+  const goForwardBtn = document.getElementById('goForwardBtn');
+  updateHistoryNavButtons();
   const micBtn = document.getElementById('micBtn');
-
-  // DOM Elements - Status & Stats
-  const transStatus = document.getElementById('transStatus');
-  const transTime = document.getElementById('transTime');
-  const tokensTotal = document.getElementById('tokensTotal');
-  const execStatus = document.getElementById('execStatus');
-  const execTime = document.getElementById('execTime');
-  const execRows = document.getElementById('execRows');
 
   // DOM Elements - Config Modal & Connection Status
   const configModal = document.getElementById('configModal');
@@ -104,6 +103,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const connDbName = document.getElementById('connDbName');
   const connDbDot = document.getElementById('connDbDot');
   const connDbUser = document.getElementById('connDbUser');
+  const modelSelect = document.getElementById('modelSelect');
 
   // DOM Elements - Help Modal
   const helpModal = document.getElementById('helpModal');
@@ -126,16 +126,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   const resultsTabsNav = document.getElementById('resultsTabsNav');
   const resultsHeader = document.getElementById('resultsHeader');
   const resultsBody = document.getElementById('resultsBody');
-
-  // DOM Elements - Interrogation Controls
-  const interrogateWrapper = document.querySelector('.interrogate-wrapper');
-  const interrogatePrompt = document.getElementById('interrogatePrompt');
-  const interrogateResponse = document.getElementById('interrogateResponse');
-  const interrogateResponseWrapper = document.getElementById('interrogateResponseWrapper');
-  const closeInterrogateBtn = document.getElementById('closeInterrogateBtn');
-  const runInterrogateSqlBtn = document.getElementById('runInterrogateSqlBtn');
-  const interrogateMicBtn = document.getElementById('interrogateMicBtn');
-  const interrogateResizeHandle = document.getElementById('interrogateResizeHandle');
 
   // Chart.js Instances
   let chartCountInstance = null;
@@ -179,7 +169,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     };
   } else {
     if (micBtn) micBtn.style.display = 'none';
-    if (interrogateMicBtn) interrogateMicBtn.style.display = 'none';
   }
 
   function setupMicButton(btn, targetInput) {
@@ -196,7 +185,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   setupMicButton(micBtn, aiPrompt);
-  setupMicButton(interrogateMicBtn, interrogatePrompt);
 
   let sqlEditor = null;
   if (sqlQueryTextarea && window.CodeMirror) {
@@ -207,102 +195,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       lineWrapping: true,
       placeholder: sqlQueryTextarea.getAttribute('placeholder') || "You may enter SQL here and execute it..."
     });
-  }
-
-  // Dynamic CodeMirror Management for Interrogation Response Area
-  let interrogateEditor = null;
-
-  function initInterrogateCodeMirror() {
-    if (!interrogateEditor && interrogateResponse && window.CodeMirror) {
-      interrogateEditor = window.CodeMirror.fromTextArea(interrogateResponse, {
-        mode: 'text/x-sql',
-        theme: 'dracula',
-        lineNumbers: true,
-        lineWrapping: true,
-        readOnly: false,
-        placeholder: interrogateResponse.getAttribute('placeholder') || "Analysis or suggested SQL will appear here...",
-        extraKeys: {
-          "Enter": function(cm) {
-            if (suggestedSqlToExecute || isSqlText(cm.getValue())) {
-              executeInterrogateSql();
-            } else {
-              return window.CodeMirror.Pass;
-            }
-          }
-        }
-      });
-      interrogateEditor.setSize('100%', '100%');
-    }
-  }
-
-  function destroyInterrogateCodeMirror() {
-    if (interrogateEditor) {
-      interrogateEditor.toTextArea();
-      interrogateEditor = null;
-    }
-  }
-
-  // Manual resize (top-right handle, drag upward to grow). The wrapper sits
-  // above the results table inside an overflow:hidden flex column, so
-  // growing its height naturally eats into the table's space above it -
-  // exactly the "resize upward" effect, no layout tricks required.
-  const INTERROGATE_BOX_MIN_HEIGHT = 44;
-  const INTERROGATE_BOX_MAX_HEIGHT = 480;
-
-  function setInterrogateBoxHeight(px) {
-    const clamped = Math.max(INTERROGATE_BOX_MIN_HEIGHT, Math.min(INTERROGATE_BOX_MAX_HEIGHT, px));
-    if (interrogateResponseWrapper) {
-      interrogateResponseWrapper.style.height = `${clamped}px`;
-    }
-    if (interrogateEditor) {
-      interrogateEditor.setSize('100%', '100%');
-      interrogateEditor.refresh();
-    }
-    return clamped;
-  }
-
-  if (interrogateResizeHandle && interrogateResponseWrapper) {
-    let dragging = false;
-    let dragStartY = 0;
-    let dragStartHeight = 0;
-
-    const onDragMove = (e) => {
-      if (!dragging) return;
-      const clientY = e.touches ? e.touches[0].clientY : e.clientY;
-      // Moving the pointer up (smaller clientY) should grow the box.
-      const delta = dragStartY - clientY;
-      setInterrogateBoxHeight(dragStartHeight + delta);
-      e.preventDefault();
-    };
-
-    const onDragEnd = () => {
-      if (!dragging) return;
-      dragging = false;
-      interrogateResizeHandle.classList.remove('dragging');
-      document.body.style.userSelect = '';
-      document.body.style.cursor = '';
-      window.removeEventListener('mousemove', onDragMove);
-      window.removeEventListener('mouseup', onDragEnd);
-      window.removeEventListener('touchmove', onDragMove);
-      window.removeEventListener('touchend', onDragEnd);
-    };
-
-    const onDragStart = (e) => {
-      dragging = true;
-      dragStartY = e.touches ? e.touches[0].clientY : e.clientY;
-      dragStartHeight = interrogateResponseWrapper.getBoundingClientRect().height;
-      interrogateResizeHandle.classList.add('dragging');
-      document.body.style.userSelect = 'none';
-      document.body.style.cursor = 'ns-resize';
-      window.addEventListener('mousemove', onDragMove);
-      window.addEventListener('mouseup', onDragEnd);
-      window.addEventListener('touchmove', onDragMove, { passive: false });
-      window.addEventListener('touchend', onDragEnd);
-      e.preventDefault();
-    };
-
-    interrogateResizeHandle.addEventListener('mousedown', onDragStart);
-    interrogateResizeHandle.addEventListener('touchstart', onDragStart, { passive: false });
   }
 
   const sqlContainer = document.querySelector('.speech-bubble-wrapper.sql-bubble');
@@ -323,10 +215,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (sqlEditor) {
       sqlEditor.setSize('100%', '100%');
       sqlEditor.refresh();
-    }
-    if (interrogateEditor) {
-      interrogateEditor.setSize('100%', '100%');
-      interrogateEditor.refresh();
     }
   });
 
@@ -461,10 +349,18 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   function setButtonsDisabled(disabled) {
     if (translateBtn) translateBtn.disabled = disabled;
-    if (luckyBtn) luckyBtn.disabled = disabled;
     if (runBtn) runBtn.disabled = disabled;
-    if (clearAllBtn) clearAllBtn.disabled = disabled; 
     if (micBtn) micBtn.disabled = disabled;
+    document.body.style.cursor = disabled ? 'wait' : 'default';
+
+    if (disabled) {
+      if (goBackBtn) goBackBtn.disabled = true;
+      if (goForwardBtn) goForwardBtn.disabled = true;
+    } else {
+      // Re-enabling: defer to the boundary logic rather than unconditionally
+      // turning them back on (e.g. stay disabled if already at the oldest turn).
+      updateHistoryNavButtons();
+    }
   }
 
   function getSqlQuery() {
@@ -495,85 +391,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
-  function isSqlText(text) {
-    if (!text) return false;
-    const trimmed = text.trim();
-    if (trimmed.startsWith('***NEW SQL***')) return true;
-    return /^(SELECT|WITH|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|GRANT|REVOKE)\b/i.test(trimmed);
-  }
-
-  function setInterrogateResponseText(text, forceSql = false) {
-    if (!interrogateResponse) return;
-
-    let rawText = text || '';
-    if (rawText.startsWith('***NEW SQL***')) {
-      rawText = rawText.slice('***NEW SQL***'.length).trim();
-    }
-
-    const isSql = forceSql || isSqlText(rawText);
-    const textToDisplay = isSql ? formatSql(rawText) : rawText;
-
-    if (isSql) {
-      initInterrogateCodeMirror();
-      if (interrogateEditor) {
-        interrogateEditor.setValue(textToDisplay);
-        interrogateEditor.setSize('100%', '100%');
-        requestAnimationFrame(() => {
-          interrogateEditor.refresh();
-        });
-      }
-    } else {
-      destroyInterrogateCodeMirror();
-      if (interrogateResponse) {
-        interrogateResponse.value = textToDisplay;
-      }
-    }
-
-    if (interrogateResponseWrapper) interrogateResponseWrapper.classList.remove('hidden');
-    if (interrogateResponse) interrogateResponse.classList.remove('hidden');
-  }
-
-  function clearInterrogateBoxes() {
-    if (interrogatePrompt) interrogatePrompt.value = '';
-    destroyInterrogateCodeMirror();
-    if (interrogateResponse) {
-      interrogateResponse.value = '';
-      interrogateResponse.classList.add('hidden');
-    }
-    if (interrogateResponseWrapper) {
-      interrogateResponseWrapper.classList.add('hidden');
-      interrogateResponseWrapper.style.height = '';
-    }
-    if (runInterrogateSqlBtn) {
-      runInterrogateSqlBtn.classList.add('hidden');
-    }
-  }
-
-  if (closeInterrogateBtn) {
-    closeInterrogateBtn.addEventListener('click', () => {
-      clearInterrogateBoxes();
-    });
-  }
-
-  function clearResultsDisplay(keepInterrogate = false) {
+  function clearResultsDisplay() {
     if (resultsTabsNav) resultsTabsNav.classList.add('hidden');
-    if (interrogateWrapper && !keepInterrogate) interrogateWrapper.classList.add('hidden');
     if (resultsHeader) resultsHeader.innerHTML = '';
     if (resultsBody) resultsBody.innerHTML = '';
     currentResultsList = [];
     activeResultIndex = 0;
-    if (!keepInterrogate) {
-      clearInterrogateBoxes();
-    }
-  }
-
-  function resetExecutionStats() {
-    if (execStatus) {
-      execStatus.textContent = "Ready";
-      execStatus.className = "stat-val status-unknown";
-    }
-    if (execTime) execTime.textContent = "—";
-    if (execRows) execRows.textContent = "—";
   }
 
   function updateHistoryTurnsSubtitle() {
@@ -585,6 +408,26 @@ document.addEventListener('DOMContentLoaded', async () => {
     const clearMsgEl = document.getElementById('historyActionMsg');
     if (clearMsgEl) {
       clearMsgEl.textContent = '';
+    }
+    updateHistoryNavButtons();
+  }
+
+  function updateHistoryNavButtons() {
+    // chatHistory holds [user, model] pairs. When only one turn (2 entries)
+    // remains, it's already the oldest turn on screen - going back from
+    // there would pop it and leave the UI blank, so disable one step early.
+    const atOldestTurn = chatHistory.length <= 2;
+    const atNewestTurn = futureChatHistory.length < 2;
+
+    if (goBackBtn) {
+      goBackBtn.disabled = atOldestTurn;
+      goBackBtn.classList.toggle('is-boundary', atOldestTurn);
+      goBackBtn.title = atOldestTurn ? "No earlier turns" : "Go back to previous turn";
+    }
+    if (goForwardBtn) {
+      goForwardBtn.disabled = atNewestTurn;
+      goForwardBtn.classList.toggle('is-boundary', atNewestTurn);
+      goForwardBtn.title = atNewestTurn ? "No later turns" : "Go forward to next turn";
     }
   }
 
@@ -645,6 +488,22 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (!targetUrl || !CONFIGURED_DBS || CONFIGURED_DBS.length === 0) return null;
     const found = CONFIGURED_DBS.find(db => db.url === targetUrl);
     return found ? found.url : null;
+  }
+
+  function renderModelSelect(currentModel) {
+    const modelSelectEl = document.getElementById('modelSelect') || modelSelect;
+    if (!modelSelectEl) return;
+    const models = geminiPresetKeys && geminiPresetKeys.length > 0 ? geminiPresetKeys : [currentModel].filter(Boolean);
+    if (models.length === 0) {
+      modelSelectEl.innerHTML = '<option value="">Default Model</option>';
+      return;
+    }
+    let html = '';
+    models.forEach(m => {
+      const isSelected = m === currentModel;
+      html += `<option value="${m}" ${isSelected ? 'selected' : ''}>${m}</option>`;
+    });
+    modelSelectEl.innerHTML = html;
   }
 
   async function fetchBackendConfig() {
@@ -808,6 +667,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     let dbNameValue = dbName;
     let isCustomOption = false;
 
+    const modelSelectEl = document.getElementById('modelSelect') || modelSelect;
+    if (modelSelectEl && modelSelectEl.value) {
+      activeModel = modelSelectEl.value.trim();
+    }
+
     const container = document.getElementById('customDbsContainer');
     if (container) {
       const inputs = container.querySelectorAll('.custom-db-url-input');
@@ -917,6 +781,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   function loadConfigIntoUI() {
     const config = loadConfig();
     renderDbRadioButtons(config.dbUrl);
+    renderModelSelect(config.model);
     updateHistoryTurnsSubtitle();
   }
 
@@ -1024,7 +889,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         options: commonOptions
       });
     }
-
   }
 
   function showConfirmDialog(message) {
@@ -1213,9 +1077,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
-  // Rebuilds the tab-strip buttons from currentResultsList / activeResultIndex.
-  // Safe to call any time the list or the active tab changes; never touches
-  // resultsBody itself, so it never clobbers whichever tab is showing.
   function buildResultsTabsNav() {
     if (!resultsTabsNav) return;
     resultsTabsNav.innerHTML = '';
@@ -1236,13 +1097,11 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
 
       const count = res.rowCount !== undefined ? res.rowCount : (res.rows ? res.rows.length : 0);
-      const label = res._fromInterrogate ? 'Follow-up' : 'Query';
-      btn.textContent = `${label} ${idx + 1} (${count})`;
-      if (res._fromInterrogate) btn.classList.add('result-tab-followup');
+      const rowLabel = count === 1 ? '1 row' : `${count} rows`;
+      btn.textContent = `Query ${idx + 1} (${rowLabel})`;
 
       btn.addEventListener('click', () => {
         activeResultIndex = idx;
-        clearInterrogateBoxes();
         buildResultsTabsNav();
         renderTableResult(res);
       });
@@ -1250,224 +1109,131 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
-  // Replaces the entire results area (used for a fresh "Run" of the main SQL box).
   function renderMultiTurnResults(results) {
     currentResultsList = results || [];
     activeResultIndex = 0;
 
     if (!currentResultsList.length) {
       if (resultsTabsNav) resultsTabsNav.classList.add('hidden');
-      if (interrogateWrapper) interrogateWrapper.classList.add('hidden');
       renderTableResult(null);
       return;
     }
 
-    if (interrogateWrapper) interrogateWrapper.classList.remove('hidden');
     buildResultsTabsNav();
     renderTableResult(currentResultsList[activeResultIndex]);
   }
+  
+  function renderNoSqlResponse(rawText) {
+    const cleanText = (rawText || '').replace(/^\*\*\*\s*NO\s*SQL\s*\*\*\*\s*/i, '').trim() || rawText || '';
 
-  // Adds new result(s) as additional tab(s) alongside whatever is already
-  // showing, then switches to the first newly-added tab. Used when a SQL
-  // statement suggested during interrogation is executed, so the results
-  // being interrogated stay available in their own tab instead of being
-  // replaced by the new query's results.
-  function appendResultsAsTabs(newResults) {
-    if (!newResults || newResults.length === 0) return;
+    if (resultsTabsNav) resultsTabsNav.classList.add('hidden');
+    if (resultsHeader) resultsHeader.innerHTML = '';
+    if (resultsBody) {
+      resultsBody.innerHTML = '';
+      const tr = document.createElement('tr');
+      const td = document.createElement('td');
+      td.className = 'response-cell';
 
-    const taggedResults = newResults.map(r => ({ ...r, _fromInterrogate: true }));
-    currentResultsList = (currentResultsList || []).concat(taggedResults);
-    activeResultIndex = currentResultsList.length - newResults.length;
+      const p = document.createElement('p');
+      p.className = 'response-text';
+      p.textContent = cleanText;
 
-    if (interrogateWrapper) interrogateWrapper.classList.remove('hidden');
-    buildResultsTabsNav();
-    renderTableResult(currentResultsList[activeResultIndex]);
-  }
-
-  // Variable to store suggested SQL for keypress/button execution
-  let suggestedSqlToExecute = "";
-
-  async function processInterrogate() {
-    const followupText = interrogatePrompt ? interrogatePrompt.value.trim() : '';
-    if (!followupText) return;
-
-    if (!currentResultsList || currentResultsList.length === 0) {
-      setInterrogateResponseText("No query results available to analyze.", false);
-      if (runInterrogateSqlBtn) runInterrogateSqlBtn.classList.add('hidden');
-      return;
+      td.appendChild(p);
+      tr.appendChild(td);
+      resultsBody.appendChild(tr);
     }
-
-    const focusedResult = currentResultsList[activeResultIndex] || currentResultsList[0];
-    const originalNlPrompt = aiPrompt ? aiPrompt.value.trim() : '';
-    const sqlExecuted = focusedResult.statement || focusedResult.query || focusedResult.sql || getSqlQuery();
-
-    if (runInterrogateSqlBtn) runInterrogateSqlBtn.classList.add('hidden');
-    setInterrogateResponseText("Analyzing results...", false);
-
-    try {
-      const response = await fetch('/api/interrogate', {
-        method: 'POST',
-        headers: getApiHeaders(),
-        credentials: 'same-origin',
-        body: JSON.stringify({
-          original_prompt: originalNlPrompt,
-          sql_query: sqlExecuted,
-          results_table: {
-            columns: focusedResult.columns || [],
-            rows: focusedResult.rows || []
-          },
-          followup_prompt: followupText,
-          history: chatHistory, // 1. Pass the active chat history
-          model: activeModel,
-          gemini_model: activeModel
-        })
-      });
-
-      const data = await response.json();
-      if (response.ok && data.success) {
-        // 2. Append interrogation turns to history
-        chatHistory.push({
-          role: 'user',
-          text: followupText
-        });
-        chatHistory.push({
-          role: 'model',
-          text: data.answer
-        });
-        chatHistory = chatHistory.slice(-20);
-        updateHistoryTurnsSubtitle(); // 3. Update UI badge count
-
-        if (data.answer && data.answer.startsWith('***NEW SQL***')) {
-          const newSql = data.answer.slice('***NEW SQL***'.length).trim();
-          const formattedSql = formatSql(newSql);
-          suggestedSqlToExecute = formattedSql;
-          setInterrogateResponseText(formattedSql, true);
-          if (runInterrogateSqlBtn) runInterrogateSqlBtn.classList.remove('hidden');
-        } else if (data.answer && isSqlText(data.answer)) {
-          const formattedSql = formatSql(data.answer);
-          suggestedSqlToExecute = formattedSql;
-          setInterrogateResponseText(formattedSql, true);
-          if (runInterrogateSqlBtn) runInterrogateSqlBtn.classList.remove('hidden');
-        } else {
-          suggestedSqlToExecute = "";
-          setInterrogateResponseText(data.answer, false);
-          if (runInterrogateSqlBtn) runInterrogateSqlBtn.classList.add('hidden');
-        }
-      } else {
-        setInterrogateResponseText(`Error: ${data.error || 'Failed to interrogate results.'}`, false);
-        if (runInterrogateSqlBtn) runInterrogateSqlBtn.classList.add('hidden');
-      }
-    } catch (err) {
-      setInterrogateResponseText(`Network Error: ${err.message || 'Server request failed.'}`, false);
-      if (runInterrogateSqlBtn) runInterrogateSqlBtn.classList.add('hidden');
-    }
-  }
-
-  // Function to execute SQL directly from the interrogation response area
-  async function executeInterrogateSql() {
-    const editorVal = interrogateEditor ? interrogateEditor.getValue().trim() : '';
-    const textareaVal = interrogateResponse ? interrogateResponse.value.trim() : '';
-    const sqlToRun = editorVal || textareaVal || suggestedSqlToExecute;
-    if (!sqlToRun) return;
-
-    // keepInterrogate=true, appendAsTab=true: the results currently being
-    // interrogated stay put in their own tab; the new query's results land
-    // in a fresh tab that becomes active.
-    await executeSql(sqlToRun, true, true);
-  }
-
-  // Keyboard listener for Interrogate Response Area (Carriage Return / Enter)
-  if (interrogateResponse) {
-    interrogateResponse.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' && !e.shiftKey && suggestedSqlToExecute) {
-        e.preventDefault();
-        executeInterrogateSql();
-      }
-    });
-  }
-
-  if (runInterrogateSqlBtn) {
-    runInterrogateSqlBtn.addEventListener('click', executeInterrogateSql);
-  }
-
-  if (interrogatePrompt) {
-    interrogatePrompt.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' && !e.shiftKey) {
-        e.preventDefault();
-        processInterrogate();
-      }
-    });
   }
 
   async function translatePrompt() {
     await fetchBackendConfig();
 
     clearResultsDisplay();
-    resetExecutionStats();
 
     const promptText = aiPrompt ? aiPrompt.value.trim() : "";
-    if (!promptText) return false;
+    if (!promptText) return;
 
     setButtonsDisabled(true);
 
-    if (transStatus) {
-      transStatus.textContent = "Working...";
-      transStatus.className = "stat-val status-working";
+    const config = loadConfig();
+    let response = null;
+    let data = null;
+    let attempts = 0;
+    const maxAttempts = 5;
+
+    while (attempts < maxAttempts) {
+      attempts++;
+      try {
+        response = await fetch('/api/translate', {
+          method: 'POST',
+          headers: getApiHeaders(),
+          credentials: 'same-origin',
+          body: JSON.stringify({
+            prompt: promptText,
+            history: chatHistory,
+            database_url: config.dbUrl,
+            model: config.model,
+            gemini_model: config.model
+          })
+        });
+
+        data = await response.json();
+
+        const errMsg = data.error || (response.ok ? '' : `Server returned status ${response.status}`);
+        const errUpper = errMsg.toUpperCase();
+        const isResourceExhausted = errUpper.includes('429 RESOURCE_EXHAUSTED');
+        const isTemporaryFailure = errUpper.includes('503 UNAVAILABLE');
+
+        if ((!response.ok || !data.sql) && (isResourceExhausted || isTemporaryFailure) && attempts < maxAttempts) {
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          continue;
+        }
+        break;
+      } catch (err) {
+        if (attempts >= maxAttempts) {
+          throw err;
+        }
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      }
     }
 
-    let success = false;
-    const config = loadConfig();
     try {
-      const response = await fetch('/api/translate', {
-        method: 'POST',
-        headers: getApiHeaders(),
-        credentials: 'same-origin',
-        body: JSON.stringify({
-          prompt: promptText,
-          history: chatHistory,
-          database_url: config.dbUrl,
-          model: config.model,
-          gemini_model: config.model
-        })
-      });
+      if (response && response.ok && data && data.sql) {
+        const trimmedSql = data.sql.trim();
+        const isOpenHelp = trimmedSql.toUpperCase().includes('OPEN HELP POPUP');
+        const isNoSql = trimmedSql.startsWith('*** NO SQL ***');
 
-      const data = await response.json();
-      if (response.ok && data.sql) {
-        setSqlQuery(data.sql);
-
+        const modelEntry = { role: 'model', text: data.sql };
         chatHistory.push({
           role: 'user',
           text: promptText
         });
-        chatHistory.push({
-          role: 'model',
-          text: data.sql
-        });
+        chatHistory.push(modelEntry);
         chatHistory = chatHistory.slice(-20);
+        futureChatHistory = []; // Clear forward stack on new translation
         updateHistoryTurnsSubtitle();
 
-        if (transStatus) {
-          transStatus.textContent = "Success";
-          transStatus.className = "stat-val status-success";
+        if (isOpenHelp) {
+          setSqlQuery('');
+          pendingSqlHistoryEntry = null;
+          clearResultsDisplay();
+
+          if (helpModal) {
+            helpModal.classList.remove('hidden');
+          }
+        } else if (isNoSql) {
+          setSqlQuery('');
+          pendingSqlHistoryEntry = null;
+          renderNoSqlResponse(data.sql);
+        } else {
+          setSqlQuery(data.sql);
+          pendingSqlHistoryEntry = { entry: modelEntry, sql: normalizeSqlForCompare(data.sql) };
         }
-        if (transTime) transTime.textContent = `${data.duration} ms`;
-        if (tokensTotal) tokensTotal.textContent = data.total_tokens || "—";
-        success = true;
       } else {
         setSqlQuery('');
 
-        if (transStatus) {
-          transStatus.textContent = "Error";
-          transStatus.className = "stat-val status-error";
-        }
-        if (transTime) transTime.textContent = "—";
-        if (tokensTotal) tokensTotal.textContent = "—";
-
-        resetExecutionStats();
-
-        const errMsg = response.status === 401 
+        const errMsg = response && response.status === 401 
           ? "Authentication required. Please click 'Sign in with Google' in the top-right corner to log in."
-          : (data.error || "An error occurred during translation.");
+          : (data?.error || "An error occurred during translation.");
         console.error("Translation Error:", errMsg);
 
         if (resultsTabsNav) resultsTabsNav.classList.add('hidden');
@@ -1489,15 +1255,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
     } catch (err) {
       setSqlQuery('');
-
-      if (transStatus) {
-        transStatus.textContent = "Error";
-        transStatus.className = "stat-val status-error";
-      }
-      if (transTime) transTime.textContent = "—";
-      if (tokensTotal) tokensTotal.textContent = "—";
-
-      resetExecutionStats();
 
       const errMsg = err.message || "Failed to reach the translation backend server.";
       console.error("Failed to translate prompt:", err);
@@ -1521,27 +1278,37 @@ document.addEventListener('DOMContentLoaded', async () => {
     } finally {
       setButtonsDisabled(false);
     }
-    return success;
   }
 
-  async function executeSql(customSql = null, keepInterrogate = false, appendAsTab = false) {
+  function normalizeSqlForCompare(sql) {
+    return (sql || '').replace(/\s+/g, ' ').trim().replace(/;+\s*$/, '');
+  }
+
+  // NOTE: previously capped at 25 rows before entering chatHistory, which
+  // meant the model's context silently diverged from what the results table
+  // actually showed the user. Sending the full result set now instead, so
+  // "what's shown in the UI" and "what the model sees" stay in sync. This can
+  // bloat prompt size / token usage for large result sets - revisit with a
+  // smarter truncation (e.g. size-based cap with an explicit "...N more rows"
+  // marker) if that becomes a problem in practice.
+  function summarizeResultForHistory(result) {
+    const rows = result.rows || [];
+    return {
+      columns: result.columns || [],
+      rowCount: result.rowCount !== undefined ? result.rowCount : rows.length,
+      rows: rows
+    };
+  }
+
+  async function executeSql(customSql = null) {
     await fetchBackendConfig();
 
-    // When appending, leave the existing tabs/results alone entirely -
-    // only a successful response should touch the results area.
-    if (!appendAsTab) {
-      clearResultsDisplay(keepInterrogate);
-    }
+    clearResultsDisplay();
   
     const sql = customSql || getSqlQuery();
     if (!sql) return;
   
     setButtonsDisabled(true);
-  
-    if (execStatus) {
-      execStatus.textContent = "Executing...";
-      execStatus.className = "stat-val status-working";
-    }
   
     const config = loadConfig();
     try {
@@ -1558,24 +1325,41 @@ document.addEventListener('DOMContentLoaded', async () => {
   
       const data = await response.json();
       if (response.ok && data.success) {
-        if (execStatus) {
-          execStatus.textContent = "Success";
-          execStatus.className = "stat-val status-success";
+        renderMultiTurnResults(data.results);
+
+        const promptText = aiPrompt && aiPrompt.value.trim() ? aiPrompt.value.trim() : "[Direct SQL Execution]";
+        const summarizedResults = Array.isArray(data.results) ? data.results.map(summarizeResultForHistory) : [];
+
+        const pendingEntryIsCurrent =
+          pendingSqlHistoryEntry &&
+          pendingSqlHistoryEntry.entry &&
+          chatHistory.length >= 1 &&
+          chatHistory[chatHistory.length - 1] === pendingSqlHistoryEntry.entry;
+
+        if (pendingSqlHistoryEntry && !pendingEntryIsCurrent) {
+          // Stale reference (e.g. left over from navigating through a no-SQL
+          // turn) - drop it rather than risk mutating the wrong turn.
+          pendingSqlHistoryEntry = null;
         }
-        if (execTime) execTime.textContent = `${data.executionTimeMs} ms`;
-        if (execRows) execRows.textContent = data.rowCount;
-  
-        if (appendAsTab) {
-          appendResultsAsTabs(data.results);
+
+        if (pendingEntryIsCurrent) {
+          // SQL just generated by translate() and now executed for the first
+          // time - fill in its results rather than creating a duplicate turn.
+          pendingSqlHistoryEntry.entry.text = sql;
+          pendingSqlHistoryEntry.entry.results = summarizedResults;
+          pendingSqlHistoryEntry = null;
         } else {
-          renderMultiTurnResults(data.results);
+          // Any other execution (direct SQL entry, or re-running a query
+          // that isn't the pending just-generated one) is its own turn.
+          chatHistory.push({ role: 'user', text: promptText });
+          chatHistory.push({ role: 'model', text: sql, results: summarizedResults });
+          chatHistory = chatHistory.slice(-20);
+          futureChatHistory = [];
+          updateHistoryTurnsSubtitle();
         }
+
         if (connDbDot) connDbDot.className = 'status-dot connected';
       } else {
-        if (execStatus) {
-          execStatus.textContent = "Error";
-          execStatus.className = "stat-val status-error";
-        }
         const errMsg = response.status === 401 
           ? "Authentication required. Please click 'Sign in with Google' in the top-right corner to log in."
           : (data.error || "An error occurred during SQL execution.");
@@ -1595,10 +1379,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
       }
     } catch (err) {
-      if (execStatus) {
-        execStatus.textContent = "Error";
-        execStatus.className = "stat-val status-error";
-      }
       const errMsg = err.message || "Failed to reach the execution backend server.";
       console.error("Failed to execute SQL:", err);
     } finally {
@@ -1609,15 +1389,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   if (aiPrompt) {
     aiPrompt.addEventListener('input', () => {
       setSqlQuery('');
-
-      if (transStatus) {
-        transStatus.textContent = "Ready";
-        transStatus.className = "stat-val status-unknown";
-      }
-      if (transTime) transTime.textContent = "—";
-      if (tokensTotal) tokensTotal.textContent = "—";
-
-      resetExecutionStats();
     });
 
     aiPrompt.addEventListener('keydown', (e) => {
@@ -1631,11 +1402,77 @@ document.addEventListener('DOMContentLoaded', async () => {
   if (translateBtn) translateBtn.addEventListener('click', translatePrompt);
   if (runBtn) runBtn.addEventListener('click', () => executeSql());
 
-  if (luckyBtn) {
-    luckyBtn.addEventListener('click', async () => {
-      const translated = await translatePrompt();
-      if (translated) {
-        await executeSql();
+  function restoreLatestTurn() {
+    if (chatHistory.length >= 2) {
+      const lastUserEntry = chatHistory[chatHistory.length - 2];
+      const lastModelEntry = chatHistory[chatHistory.length - 1];
+      
+      if (aiPrompt) {
+        aiPrompt.value = (lastUserEntry && lastUserEntry.text !== "[Direct SQL Execution]") ? lastUserEntry.text : '';
+      }
+      
+      if (lastModelEntry && lastModelEntry.text) {
+        const sqlText = lastModelEntry.text;
+        const isNoSql = sqlText.startsWith('*** NO SQL ***');
+        
+        if (isNoSql) {
+          setSqlQuery('');
+          pendingSqlHistoryEntry = null;
+          renderNoSqlResponse(sqlText);
+        } else {
+          setSqlQuery(sqlText);
+
+          const alreadyExecuted = lastModelEntry.results && Array.isArray(lastModelEntry.results);
+          if (alreadyExecuted) {
+            // This turn is done - viewing it again must never let a
+            // subsequent Run overwrite its stored results in place.
+            pendingSqlHistoryEntry = null;
+            renderMultiTurnResults(lastModelEntry.results);
+          } else {
+            // Genuinely still awaiting its first execution.
+            pendingSqlHistoryEntry = { 
+              entry: lastModelEntry, 
+              sql: normalizeSqlForCompare(sqlText) 
+            };
+            clearResultsDisplay();
+          }
+        }
+      } else {
+        setSqlQuery('');
+        clearResultsDisplay();
+      }
+    } else {
+      if (aiPrompt) aiPrompt.value = '';
+      setSqlQuery('');
+      pendingSqlHistoryEntry = null;
+      clearResultsDisplay();
+    }
+  }
+
+  if (goBackBtn) {
+    goBackBtn.addEventListener('click', () => {
+      if (chatHistory.length >= 2) {
+        const modelEntry = chatHistory.pop();
+        const userEntry = chatHistory.pop();
+        futureChatHistory.push(userEntry);
+        futureChatHistory.push(modelEntry);
+        
+        updateHistoryTurnsSubtitle();
+        restoreLatestTurn();
+      }
+    });
+  }
+
+  if (goForwardBtn) {
+    goForwardBtn.addEventListener('click', () => {
+      if (futureChatHistory.length >= 2) {
+        const modelEntry = futureChatHistory.pop();
+        const userEntry = futureChatHistory.pop();
+        chatHistory.push(userEntry);
+        chatHistory.push(modelEntry);
+        
+        updateHistoryTurnsSubtitle();
+        restoreLatestTurn();
       }
     });
   }
@@ -1644,10 +1481,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     clearHistoryBtn.addEventListener('click', () => {
       try {
         chatHistory = [];
+        futureChatHistory = [];
+        pendingSqlHistoryEntry = null;
         setSqlQuery('');
         if (aiPrompt) aiPrompt.value = '';
-        if (transStatus) transStatus.textContent = "Ready";
-        resetExecutionStats();
         clearResultsDisplay();
         if (resultsBody) resultsBody.innerHTML = '<tr><td class="text-center text-muted py-8">The answer will appear here...</td></tr>';
 
@@ -1703,26 +1540,6 @@ document.addEventListener('DOMContentLoaded', async () => {
           msgEl.textContent = 'Network error purging history';
           msgEl.style.color = 'var(--danger, #f87171)';
         }
-      }
-    });
-  }
-
-  if (clearAllBtn) {
-    clearAllBtn.addEventListener('click', () => {
-      if (aiPrompt) aiPrompt.value = '';
-      setSqlQuery('');
-  
-      if (transStatus) {
-        transStatus.textContent = "Ready";
-        transStatus.className = "stat-val status-unknown";
-      }
-      if (transTime) transTime.textContent = "—";
-      if (tokensTotal) tokensTotal.textContent = "—";
-  
-      resetExecutionStats();
-      clearResultsDisplay();
-      if (resultsBody) {
-        resultsBody.innerHTML = '<tr><td class="text-center text-muted py-8">The answer will appear here...</td></tr>';
       }
     });
   }

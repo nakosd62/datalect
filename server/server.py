@@ -679,6 +679,50 @@ def get_current_user_status():
 def index():
     return send_from_directory(app.static_folder, 'index.html')
 
+def format_results_table_text(columns, rows, max_rows=500):
+    """Render a query result set as plain text suitable for an LLM prompt."""
+    cols = columns or []
+    rws = rows or []
+    text = f"Columns: {', '.join(cols)}\nTotal Rows: {len(rws)}\nSample/Full Data:\n"
+    text += "\n".join([str(r) for r in rws[:max_rows]])
+    return text
+
+def build_gemini_history_contents(history):
+    """
+    Turn the client-supplied chat history into Gemini `types.Content` objects.
+    Each history message is {role, text} and may optionally carry a `results`
+    list - one entry per SQL statement that was executed for that turn, each
+    shaped like {columns, rows, rowCount}. When present, the actual query
+    results are appended to that turn's text so later turns retain context
+    on what data was actually returned, not just what SQL/text was said.
+    """
+    contents = []
+    for msg in history:
+        role = msg.get("role")
+        text = msg.get("text")
+        if not (role and text):
+            continue
+
+        combined_text = text
+        hist_results = msg.get("results")
+        if hist_results:
+            result_blocks = []
+            for i, res in enumerate(hist_results):
+                cols = res.get('columns') or []
+                rws = res.get('rows') or []
+                row_count = res.get('rowCount', len(rws))
+                header = f"[Query Result {i + 1} - {row_count} row(s) total, showing {len(rws)}]"
+                result_blocks.append(header + "\n" + format_results_table_text(cols, rws, max_rows=len(rws)))
+            combined_text = combined_text + "\n\n" + "\n\n".join(result_blocks)
+
+        contents.append(
+            types.Content(
+                role=role,
+                parts=[types.Part.from_text(text=combined_text)]
+            )
+        )
+    return contents
+
 @app.route('/api/translate', methods=['POST'])
 def translate_query():
     data = request.get_json() or {}
@@ -706,6 +750,7 @@ def translate_query():
         system_instruction = (
             "You are an expert SQL generation assistant for PostgreSQL-compatible RDBMSs.\n"
             "Given the user's natural language request and the database schema, translate the request into SQL.\n"
+            "Previous chat interactions (prompt, sql, results)-triplets are also provided to help you focus your response.\n"
             "It is EXTREMELY important to respect the database schema, i.e. column names, type, constraints, checks, etc.\n"
             "You may return one or more independent SQL statements. Do not attempt to join the result sets.\n"
             "You may use PL/pgSQL Functions or Procedures, if appropriate.\n"
@@ -714,26 +759,17 @@ def translate_query():
             "Do NOT include explanations or other text. Just the executable SQL statement itself.\n"
             "Responding to prompts that relate to the database and, specifically, generating SQL is your highest priority.\n"
             "However, if you cannot do that but can respond to the prompt succinctly based on your general-purpose training,\n"
-            "return your response enclosed as follows: SELECT '<your response>' AS RESPONSE;\n"
-            "If you cannot respond at all with reasonable confidence, return the following: SELECT 'I am not able to respond to your prompt. Sorry.' AS REGRETS;\n"
-            "If you run into any error, return the error enclosed as follows: SELECT 'I ran into this error: <the error>' AS ERROR;\n"
+            "return your response prepended by the string '*** NO SQL ***'\n"
+            "If the prompt is about this app itself (yDyL) respond as follows: '*** NO SQL *** OPEN HELP POPUP ***'\n"
+            "If you cannot respond at all with reasonable confidence, return '*** NO SQL *** I am not able to respond to your prompt.'\n"
+            "If you run into any error, return '*** NO SQL *** I ran into this error: <the error>'\n"
             "If you can split the prompt and handle part of it based on the database and part from general knowledge do that using separate queries for each part. Do not attempt to join the result sets.\n"
+            "Feel free to use ascii art to render pictures.\n"
         )
         
         user_message_content = f"Database Schema:\n{schema}\n\nUser Request: {prompt}\n\nSQL Query:" 
         
-        contents = []
-        for msg in history:
-            role = msg.get("role")
-            text = msg.get("text")
-            if role and text:
-                contents.append(
-                    types.Content(
-                        role=role,
-                        parts=[types.Part.from_text(text=text)]
-                    )
-                )
-            
+        contents = build_gemini_history_contents(history)
         contents.append(
             types.Content(
                 role="user",
@@ -956,121 +992,6 @@ def execute_query():
         if conn:
             conn.close()
 
-@app.route('/api/interrogate', methods=['POST'])
-def interrogate_results():
-    data = request.get_json() or {}
-
-    gemini_model = data.get('gemini_model') or data.get('model') or DEFAULT_MODEL
-    api_key = pick_gemini_api_key()
-
-    if not api_key:
-        return jsonify({'error': 'Gemini API key is not configured.'}), 400
-
-    original_prompt = data.get('original_prompt', '').strip()
-    sql_query = data.get('sql_query', '').strip()
-    results_table = data.get('results_table', {})
-    followup_prompt = data.get('followup_prompt', '').strip()
-
-    if not followup_prompt:
-        return jsonify({'error': 'Follow-up prompt cannot be empty'}), 400
-
-    session_id = get_or_create_session_id()
-    user_identity = get_current_user_identity()
-    conn_str = resolve_conn_str(data.get('database_url'), user_identity)
-
-    history = data.get('history', [])[-20:]
-
-    try:
-        schema = get_database_schema(conn_str, user_identity)
-        client = genai.Client(api_key=api_key)
-
-        system_instruction = data.get('system_prompt') or (
-            "You are an expert data analyst assistant that can slice, dice and analyze tabular data sets.\n"
-            "You are provided with:\n"
-            "(1) the database schema,\n"
-            "(2) the user's original natural language request that got translated to SQL,\n"
-            "(3) the SQL query that was generated from the translation and executed,\n"
-            "(4) the resulting data table, and\n"
-            "(5) a follow-up request asking to analyze these results.\n"
-            "Analyze the data thoroughly and answer the follow-up request as concisely as possible.\n"
-            "If necessary, please suggest an alternative SQL query to execute in response to the follow-up request\n." 
-            "In that case, return the text '***NEW SQL***\n' and ONLY the raw SQL code block. Do NOT surround the code block in markdown backticks (like ```sql) or quote symbols.\n"
-        )
-
-        cols = results_table.get('columns') or []
-        rows = results_table.get('rows') or []
-        
-        table_text = f"Columns: {', '.join(cols)}\nTotal Rows: {len(rows)}\nSample/Full Data:\n"
-        table_text += "\n".join([str(r) for r in rows[:500]])
-
-        user_content = (
-            f"Database Schema:\n{schema}\n\n"
-            f"Original Natural Language Prompt: {original_prompt}\n\n"
-            f"Executed SQL Query:\n{sql_query}\n\n"
-            f"Query Results Table:\n{table_text}\n\n"
-            f"Follow-up Question on Results: {followup_prompt}"
-        )
-      
-        contents = []
-        for msg in history:
-            role = msg.get("role")
-            text = msg.get("text")
-            if role and text:
-                contents.append(
-                    types.Content(
-                        role=role,
-                        parts=[types.Part.from_text(text=text)]
-                    )
-                )
-            
-        contents.append(
-            types.Content(
-                role="user",
-                parts=[types.Part.from_text(text=user_content)]
-            )
-        )
-   
-        start_time = time.perf_counter()
-        response = client.models.generate_content(
-            model=gemini_model,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                temperature=0.1
-            )
-        )
-        end_time = time.perf_counter()
-
-        answer = response.text.strip() if response.text else "No answer generated."
-
-        duration = round(1000 * (end_time - start_time))
-        usage = response.usage_metadata
-        input_tokens = usage.prompt_token_count if usage else 0
-        output_tokens = usage.candidates_token_count if usage else 0
-        total_tokens = usage.total_token_count if usage else 0
-        thinking_tokens = getattr(usage, 'thoughts_token_count', 0) if usage else 0
-        cached_content_tokens = getattr(usage, 'cached_content_token_count', 0) if usage else 0
-
-        record_translation(user_identity, conn_str, followup_prompt, answer, gemini_model, duration, input_tokens, output_tokens, total_tokens, thinking_tokens, cached_content_tokens)
-
-        resp = jsonify({
-            'success': True,
-            'answer': answer,
-            'input_tokens': input_tokens,
-            'output_tokens': output_tokens,
-            'total_tokens': total_tokens,
-            'thinking_tokens': thinking_tokens,
-            'cached_content_tokens': cached_content_tokens,
-            'duration': duration
-        })
-        return apply_session_cookie(resp, session_id)
-    except Exception as e:
-        resp = jsonify({
-            'success': False,
-            'error': f"Interrogation Error: {str(e)}"
-        })
-        return apply_session_cookie(resp, session_id), 500
-    
 @app.route('/api/history', methods=['GET'])
 def get_translation_history():
     user_identity = get_current_user_identity()

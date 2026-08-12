@@ -16,7 +16,6 @@
   <link rel="stylesheet" href="style.css">
 
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-
   <script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
 
@@ -85,7 +84,6 @@
                 <span class="short-text">yL</span>
               </div>
             </div>
-            
           </div>
         </div>
 
@@ -114,16 +112,20 @@
           </button>
 
           <div id="g_id_signin" class="auth-container"></div>
-
         </div>
       </div>
 
       <section class="card editor-card">
         <div class="controls-layout-grid">
-          <div class="inputs-column">
+          <div class="inputs-column" style="width: 100%;">
             <div class="input-row">
               <div class="speech-bubble-wrapper">
                 <textarea id="aiPrompt" rows="1" placeholder="Ask your question here by typing or using the mic..."></textarea>
+                <div class="history-nav-group inline-history-nav">
+                  <button id="goBackBtn" class="btn-action-sm" type="button" title="Go back to previous turn">&lt;</button>
+                  <span id="historyLabel"></span>
+                  <button id="goForwardBtn" class="btn-action-sm" type="button" title="Go forward to next turn">&gt;</button>
+                </div>
                 <button type="button" id="micBtn" class="mic-btn" title="Voice-to-text input">
                   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                     <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
@@ -137,48 +139,13 @@
 
             <div class="input-row">
               <div class="speech-bubble-wrapper sql-bubble">
+                <button id="runBtn" class="btn btn-execute sql-overlay-btn" title="Execute SQL Query">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
+                    <polygon points="5 3 19 12 5 21 5 3"></polygon>
+                  </svg>
+                  <span>Execute</span>
+                </button>
                 <textarea id="sqlQuery" name="query" rows="2" placeholder="You may enter SQL here and execute it..."></textarea>
-              </div>
-            </div>
-          </div>
-
-          <div class="action-buttons-column">
-            <button type="button" id="translateBtn" class="btn btn-primary btn-control-block">Translate</button>
-            <button type="button" id="luckyBtn" class="btn btn-primary btn-control-block">I feel lucky</button>
-            <button type="button" id="runBtn" class="btn btn-primary btn-control-block">Execute SQL</button>
-            <button type="button" id="clearAllBtn" class="btn btn-primary btn-control-block">Clear All</button>
-          </div>
-
-          <div class="stats-column">
-            <div id="translationStats" class="stats-card-vertical">
-              <div class="stat-card-title">Translation Stats</div>
-              <div class="stat-item-inline">
-                <span class="stat-label">Status:</span>
-                <span id="transStatus" class="stat-val status-unknown">Ready</span>
-              </div>
-              <div class="stat-item-inline">
-                <span class="stat-label">Time:</span>
-                <span id="transTime" class="stat-val">—</span>
-              </div>
-              <div class="stat-item-inline">
-                <span class="stat-label">Tokens:</span>
-                <span id="tokensTotal" class="stat-val stat-highlight">—</span>
-              </div>
-            </div>
-
-            <div id="executionStats" class="stats-card-vertical">
-              <div class="stat-card-title">SQL Execution Stats</div>
-              <div class="stat-item-inline">
-                <span class="stat-label">Status:</span>
-                <span id="execStatus" class="stat-val status-unknown">Ready</span>
-              </div>
-              <div class="stat-item-inline">
-                <span class="stat-label">Time:</span>
-                <span id="execTime" class="stat-val">—</span>
-              </div>
-              <div class="stat-item-inline">
-                <span class="stat-label">Rows:</span>
-                <span id="execRows" class="stat-val">—</span>
               </div>
             </div>
           </div>
@@ -200,35 +167,6 @@
               </tbody>
             </table>
           </div>
-
-          <div class="interrogate-wrapper hidden">
-            <div id="interrogateResponseWrapper" class="speech-bubble-wrapper interrogate-response-wrapper hidden">
-              <div id="interrogateResizeHandle" class="interrogate-resize-handle" title="Drag to resize">
-                <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" style="transform: rotate(-90deg);">
-                  <line x1="11" y1="1" x2="1" y2="11"></line>
-                  <line x1="11" y1="5" x2="5" y2="11"></line>
-                  <line x1="11" y1="9" x2="9" y2="11"></line>
-                </svg>
-              </div>
-              <div class="interrogate-header-actions">
-                <button id="runInterrogateSqlBtn" class="btn btn-primary btn-interrogate-exec hidden" title="Execute this suggested SQL">Execute SQL</button>
-                <button type="button" id="closeInterrogateBtn" class="interrogate-close-btn" title="Close interrogation results">&times;</button>
-              </div>
-              <textarea id="interrogateResponse" class="interrogate-response-box" readonly placeholder="Analysis or suggested SQL will appear here..."></textarea>
-            </div>
-            <div class="speech-bubble-wrapper">
-              <textarea id="interrogatePrompt" class="interrogate-textbox" rows="1" placeholder="Interrogate these results by typing or using the mic..."></textarea>
-              <button type="button" id="interrogateMicBtn" class="mic-btn" title="Voice-to-text input">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
-                  <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
-                  <line x1="12" y1="19" x2="12" y2="23"></line>
-                  <line x1="8" y1="23" x2="16" y2="23"></line>
-                </svg>
-              </button>
-            </div>
-          </div>
-
         </div>
       </section>
 
@@ -251,23 +189,17 @@
       <div class="modal-body help-dialog-body">
         <p>Welcome to <strong>yDyL</strong>! Here is a quick guide on how to interact with it.</p>
         
-        <h3>1. General</h3>
-        <p>By default, you are connected to a simple database that you may use as a playground.</p>
-        <p>You may change the database connection by clicking on the database connection information. Either select one of the pre-configured choices or connect to your own postgres-complaint database by providing a connection URL. Custom connections are user-scoped, i.e. other users cannot see what you enter.</p>
+        <h3>1. Database Connection</h3>
+        <p>By default, you are connected to a simple database that you may use as a playground. You may change the database connection by clicking on the database connection information and entering your own postgres-complaint database connection. Custom connections are user-scoped, i.e. other users cannot see what you enter.</p>
 
         <h3>2. Natural Language Query</h3>
-        <p>Type your query or instruction into the top text box in plain English or any other language. Click <strong>Translate Prompt</strong> to preview the generated SQL statement.</p>
-        <p>Example queries: <em>"find all accounts with more than $5000"</em>, <em>"give Mike $100"</em>, <em>"allow Dary to browse client data"</em>, <em>"Show all users created last week"</em>.</p>
+        <p>Type your query or instruction into the top text box in plain English or any other language. Clieck return when you are done.</p>
         
         <h3>3. SQL Query</h3>
-        <p>Review the SQL in the middle editor box. You can manually edit the statement or write custom queries from scratch. Click <strong>Execute SQL</strong> to run the command against your database.</p>
+        <p>Review the SQL in the SQL editor box. You can manually edit the statement or write custom queries from scratch. Click <strong>Execute SQL</strong> to run the command.</p>
 
-        <h3>4. 'I feel lucky' Mode</h3>
-        <p>Clicking <strong>I feel lucky</strong> will automatically translate your natural language prompt and execute the resulting SQL in one step. Use this mode judiciously.</p>
-
-        <h3>5. Multi-turn conversations</h3>
-        <p>yDyL remembers the last 10 prompt-response pairs and takes them into account before responding. You may reset chat and translation history from the history popup window.</p>
-
+        <h3>4. Multi-turn Conversations</h3>
+        <p>yDyL remembers your last <strong>10 turns</strong>. Each contains the prompt, the SQL it generated, and the full result set that came back from the database. Use the <strong>◀ / ▶</strong> arrows to step back and forward through previous turns. Use the history popup to clear out chat turns or past translation records.</p>
       </div>
     </div>
   </div>
@@ -358,8 +290,7 @@
       <form id="configForm" class="modal-body" onsubmit="event.preventDefault();">
         <div class="config-section">
           <span class="config-label">Database Connection</span>
-          <div class="radio-group" id="modalDbRadioGroup">
-          </div>
+          <div class="radio-group" id="modalDbRadioGroup"></div>
         </div>
 
         <div class="modal-actions" style="display: flex; gap: 0.5rem; justify-content: flex-end; align-items: center;">
@@ -368,7 +299,6 @@
       </form>
     </div>
   </div>
-
 
   <div id="confirmModal" class="modal-overlay hidden">
     <div class="modal-card" style="max-width: 420px;">
