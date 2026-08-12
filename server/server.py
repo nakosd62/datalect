@@ -743,28 +743,27 @@ def translate_query():
 
     history = data.get('history', [])[-20:]
 
+    #print(f"-------------------------")
+    #for m in enumerate(history):
+    #    print(f"history={m}")
+    #print(f"-------------------------")
+
     try:
         schema = get_database_schema(conn_str, user_identity)
         client = genai.Client(api_key=api_key)
         
         system_instruction = (
             "You are an expert SQL generation assistant for PostgreSQL-compatible RDBMSs.\n"
-            "Given the user's natural language request and the database schema, translate the request into SQL.\n"
-            "Previous chat interactions (prompt, sql, results)-triplets are also provided to help you focus your response.\n"
-            "It is EXTREMELY important to respect the database schema, i.e. column names, type, constraints, checks, etc.\n"
-            "You may return one or more independent SQL statements. Do not attempt to join the result sets.\n"
-            "You may use PL/pgSQL Functions or Procedures, if appropriate.\n"
+            "Given the prpvided past chat interactions, the database schema and the user's natural language prompt, translate the request into SQL.\n"
+            "You may return one or more independent SQL statements. You may use PL/pgSQL Functions or Procedures, if appropriate.\n"
             "Format the result data to be easily readable. For example, format timestamps as date:hour:min:sec.\n"
             "Return ONLY the raw SQL code block. Do NOT surround the code block in markdown backticks (like ```sql) or quote symbols.\n"
             "Do NOT include explanations or other text. Just the executable SQL statement itself.\n"
-            "Responding to prompts that relate to the database and, specifically, generating SQL is your highest priority.\n"
-            "However, if you cannot do that but can respond to the prompt succinctly based on your general-purpose training,\n"
-            "return your response prepended by the string '*** NO SQL ***'\n"
+            "If you can respond to the prompt succinctly based on your general-purpose training, return your response prepended by the string '*** NO SQL ***'\n"
             "If the prompt is about this app itself (yDyL) respond as follows: '*** NO SQL *** OPEN HELP POPUP ***'\n"
             "If you cannot respond at all with reasonable confidence, return '*** NO SQL *** I am not able to respond to your prompt.'\n"
             "If you run into any error, return '*** NO SQL *** I ran into this error: <the error>'\n"
             "If you can split the prompt and handle part of it based on the database and part from general knowledge do that using separate queries for each part. Do not attempt to join the result sets.\n"
-            "Feel free to use ascii art to render pictures.\n"
         )
         
         user_message_content = f"Database Schema:\n{schema}\n\nUser Request: {prompt}\n\nSQL Query:" 
