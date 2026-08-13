@@ -7,6 +7,7 @@ venv/
 # Python cache
 __pycache__/
 *.pyc
+.pytest_cache/
 
 # macOS system files
 .DS_Store

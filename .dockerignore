@@ -29,6 +29,7 @@ mobile/
 
 # Ignore local Python cache and temporary files
 __pycache__/
+.pytest_cache/
 *.pyc
 *.pyo
 *.pyd
