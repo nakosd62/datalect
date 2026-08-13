@@ -15,7 +15,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
 # Copy backend files
-COPY server/server.py server/server.py
+COPY server/* server/
 
 #  Copy Web frontend files
 COPY webClient/* webClient/

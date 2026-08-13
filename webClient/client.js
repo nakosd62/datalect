@@ -1,11 +1,74 @@
 document.addEventListener('DOMContentLoaded', async () => {
-  let chatHistory = [];
-  let futureChatHistory = [];
-  // Points at the most recent chatHistory entry that generated SQL which
-  // hasn't yet been executed. When that SQL is run, its results get attached
-  // to this entry so future chat turns have access to what data actually
-  // came back - not just what SQL/text was generated. Cleared once consumed.
-  let pendingSqlHistoryEntry = null;
+  // Encapsulates the model's conversation memory: the turns sent to
+  // /api/translate as `history`, the undo/redo stacks behind the back/forward
+  // arrows, and the "SQL generated but not yet executed" pointer. Consolidating
+  // this here (instead of three loose variables mutated from five different
+  // places) means the turn cap, the "always push in pairs" rule, and the
+  // undo/redo bookkeeping only need to be correct in one place.
+  function createChatHistoryStore(maxTurns) {
+    const maxEntries = maxTurns * 2;
+    let history = [];
+    let future = [];
+    let pending = null; // { entry, sql } - see setPending()
+
+    return {
+      // Appends one (user, model) turn, enforces the cap, and clears the
+      // redo stack (a genuinely new turn invalidates any "future" branch).
+      pushTurn(userText, modelEntry) {
+        history.push({ role: 'user', text: userText });
+        history.push(modelEntry);
+        history = history.slice(-maxEntries);
+        future = [];
+      },
+      // Marks a chatHistory entry as "SQL generated, awaiting first
+      // execution" so executeSql() can fill in its results in place instead
+      // of creating a duplicate turn.
+      setPending(entry, sql) { pending = { entry, sql }; },
+      clearPending() { pending = null; },
+      getPending() { return pending; },
+      // True only if the pending entry is still the most recent turn (guards
+      // against a stale pointer left over from navigating away and back).
+      isPendingCurrent() {
+        return !!(pending && pending.entry && history.length >= 1 && history[history.length - 1] === pending.entry);
+      },
+      // Pops the latest turn onto the redo stack. Returns the popped turn, or
+      // null if there's nothing to undo.
+      undo() {
+        if (history.length < 2) return null;
+        const modelEntry = history.pop();
+        const userEntry = history.pop();
+        future.push(userEntry, modelEntry);
+        return { userEntry, modelEntry };
+      },
+      redo() {
+        if (future.length < 2) return null;
+        const modelEntry = future.pop();
+        const userEntry = future.pop();
+        history.push(userEntry, modelEntry);
+        return { userEntry, modelEntry };
+      },
+      clear() { history = []; future = []; pending = null; },
+      // The turn currently shown in the editor (undefined if history is empty).
+      lastTurn() {
+        return history.length >= 2
+          ? { userEntry: history[history.length - 2], modelEntry: history[history.length - 1] }
+          : null;
+      },
+      turnCount() { return Math.floor(history.length / 2); },
+      // Intentionally stricter than "undo() would succeed": with exactly one
+      // turn left, going back would pop it and leave the UI blank, so the
+      // nav button disables one step early even though undo() itself would
+      // still technically work at history.length === 2.
+      canUndo() { return history.length > 2; },
+      canRedo() { return future.length >= 2; },
+      // What gets sent to /api/translate as `history`.
+      toPayload() { return history; },
+    };
+  }
+
+  const MAX_HISTORY_TURNS = 10;
+  const chatStore = createChatHistoryStore(MAX_HISTORY_TURNS);
+
   let DEFAULT_DB_URL = "";
   let ACTIVE_DB_URL = "";
   let CONFIGURED_DBS = [];
@@ -14,8 +77,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   let customDbUrl = "";
   let customDbName = "";
   let customDatabases = [];
-  let activeModel = "";
-  let geminiPresetKeys = [];
 
   function getDatabaseNameFromUrl(urlStr) {
     if (!urlStr) return "Custom";
@@ -102,8 +163,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   const configSaveBtn = document.getElementById('configSaveBtn');
   const connDbName = document.getElementById('connDbName');
   const connDbDot = document.getElementById('connDbDot');
-  const connDbUser = document.getElementById('connDbUser');
-  const modelSelect = document.getElementById('modelSelect');
 
   // DOM Elements - Help Modal
   const helpModal = document.getElementById('helpModal');
@@ -400,7 +459,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function updateHistoryTurnsSubtitle() {
-    const turns = Math.floor(chatHistory.length / 2);
+    const turns = chatStore.turnCount();
     const clearTitleEl = document.querySelector('.btn-clear-title');
     if (clearTitleEl) {
       clearTitleEl.textContent = `(${turns})`;
@@ -413,11 +472,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function updateHistoryNavButtons() {
-    // chatHistory holds [user, model] pairs. When only one turn (2 entries)
-    // remains, it's already the oldest turn on screen - going back from
-    // there would pop it and leave the UI blank, so disable one step early.
-    const atOldestTurn = chatHistory.length <= 2;
-    const atNewestTurn = futureChatHistory.length < 2;
+    // chatStore holds [user, model] pairs. When only one turn remains,
+    // it's already the oldest turn on screen - going back from there would
+    // pop it and leave the UI blank, so disable one step early.
+    const atOldestTurn = !chatStore.canUndo();
+    const atNewestTurn = !chatStore.canRedo();
 
     if (goBackBtn) {
       goBackBtn.disabled = atOldestTurn;
@@ -442,8 +501,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         credentials: 'same-origin',
         body: JSON.stringify({
           sql: 'SELECT current_user, current_database();',
-          database_url: config.dbUrl,
-          model: config.model
+          database_url: config.dbUrl
         })
       });
 
@@ -490,22 +548,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     return found ? found.url : null;
   }
 
-  function renderModelSelect(currentModel) {
-    const modelSelectEl = document.getElementById('modelSelect') || modelSelect;
-    if (!modelSelectEl) return;
-    const models = geminiPresetKeys && geminiPresetKeys.length > 0 ? geminiPresetKeys : [currentModel].filter(Boolean);
-    if (models.length === 0) {
-      modelSelectEl.innerHTML = '<option value="">Default Model</option>';
-      return;
-    }
-    let html = '';
-    models.forEach(m => {
-      const isSelected = m === currentModel;
-      html += `<option value="${m}" ${isSelected ? 'selected' : ''}>${m}</option>`;
-    });
-    modelSelectEl.innerHTML = html;
-  }
-
   async function fetchBackendConfig() {
     try {
       const response = await fetch('/api/config', { headers: getApiHeaders(), credentials: 'same-origin' });
@@ -527,15 +569,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         customDatabases = [{ name: customDbName || "Custom", url: customDbUrl }];
       } else {
         customDatabases = [];
-      }
-
-      geminiPresetKeys = data.gemini_preset_keys || data.models || [];
-      if (data.active_model) {
-        activeModel = data.active_model;
-      } else if (data.default_model) {
-        activeModel = data.default_model;
-      } else if (geminiPresetKeys.length > 0 && !activeModel) {
-        activeModel = geminiPresetKeys[0];
       }
 
       if (data.auth_enabled && data.google_client_id) {
@@ -667,11 +700,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     let dbNameValue = dbName;
     let isCustomOption = false;
 
-    const modelSelectEl = document.getElementById('modelSelect') || modelSelect;
-    if (modelSelectEl && modelSelectEl.value) {
-      activeModel = modelSelectEl.value.trim();
-    }
-
     const container = document.getElementById('customDbsContainer');
     if (container) {
       const inputs = container.querySelectorAll('.custom-db-url-input');
@@ -736,7 +764,6 @@ document.addEventListener('DOMContentLoaded', async () => {
           database_name: dbNameValue,
           database_url: dbUrlValue,
           is_custom: isCustomOption,
-          model: activeModel,
           custom_databases: customDatabases.filter(d => d.url && d.url.trim() !== "")
         })
       });
@@ -755,9 +782,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (data.custom_databases !== undefined) {
           customDatabases = data.custom_databases;
         }
-        if (data.active_model) {
-          activeModel = data.active_model;
-        }
         
         await updateConnectionDetails(data);
       }
@@ -773,15 +797,13 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   function loadConfig() {
     return {
-      dbUrl: ACTIVE_DB_URL || DEFAULT_DB_URL,
-      model: activeModel
+      dbUrl: ACTIVE_DB_URL || DEFAULT_DB_URL
     };
   }
 
   function loadConfigIntoUI() {
     const config = loadConfig();
     renderDbRadioButtons(config.dbUrl);
-    renderModelSelect(config.model);
     updateHistoryTurnsSubtitle();
   }
 
@@ -1169,10 +1191,8 @@ document.addEventListener('DOMContentLoaded', async () => {
           credentials: 'same-origin',
           body: JSON.stringify({
             prompt: promptText,
-            history: chatHistory,
-            database_url: config.dbUrl,
-            model: config.model,
-            gemini_model: config.model
+            history: chatStore.toPayload(),
+            database_url: config.dbUrl
           })
         });
 
@@ -1203,18 +1223,12 @@ document.addEventListener('DOMContentLoaded', async () => {
         const isNoSql = trimmedSql.startsWith('*** NO SQL ***');
 
         const modelEntry = { role: 'model', text: data.sql };
-        chatHistory.push({
-          role: 'user',
-          text: promptText
-        });
-        chatHistory.push(modelEntry);
-        chatHistory = chatHistory.slice(-20);
-        futureChatHistory = []; // Clear forward stack on new translation
+        chatStore.pushTurn(promptText, modelEntry);
         updateHistoryTurnsSubtitle();
 
         if (isOpenHelp) {
           setSqlQuery('');
-          pendingSqlHistoryEntry = null;
+          chatStore.clearPending();
           clearResultsDisplay();
 
           if (helpModal) {
@@ -1222,11 +1236,11 @@ document.addEventListener('DOMContentLoaded', async () => {
           }
         } else if (isNoSql) {
           setSqlQuery('');
-          pendingSqlHistoryEntry = null;
+          chatStore.clearPending();
           renderNoSqlResponse(data.sql);
         } else {
           setSqlQuery(data.sql);
-          pendingSqlHistoryEntry = { entry: modelEntry, sql: normalizeSqlForCompare(data.sql) };
+          chatStore.setPending(modelEntry, normalizeSqlForCompare(data.sql));
         }
       } else {
         setSqlQuery('');
@@ -1318,8 +1332,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         credentials: 'same-origin',
         body: JSON.stringify({
           sql: sql,
-          database_url: config.dbUrl,
-          model: config.model
+          database_url: config.dbUrl
         })
       });
   
@@ -1330,31 +1343,23 @@ document.addEventListener('DOMContentLoaded', async () => {
         const promptText = aiPrompt && aiPrompt.value.trim() ? aiPrompt.value.trim() : "[Direct SQL Execution]";
         const summarizedResults = Array.isArray(data.results) ? data.results.map(summarizeResultForHistory) : [];
 
-        const pendingEntryIsCurrent =
-          pendingSqlHistoryEntry &&
-          pendingSqlHistoryEntry.entry &&
-          chatHistory.length >= 1 &&
-          chatHistory[chatHistory.length - 1] === pendingSqlHistoryEntry.entry;
-
-        if (pendingSqlHistoryEntry && !pendingEntryIsCurrent) {
+        if (chatStore.getPending() && !chatStore.isPendingCurrent()) {
           // Stale reference (e.g. left over from navigating through a no-SQL
           // turn) - drop it rather than risk mutating the wrong turn.
-          pendingSqlHistoryEntry = null;
+          chatStore.clearPending();
         }
 
-        if (pendingEntryIsCurrent) {
+        if (chatStore.isPendingCurrent()) {
           // SQL just generated by translate() and now executed for the first
           // time - fill in its results rather than creating a duplicate turn.
-          pendingSqlHistoryEntry.entry.text = sql;
-          pendingSqlHistoryEntry.entry.results = summarizedResults;
-          pendingSqlHistoryEntry = null;
+          const pending = chatStore.getPending();
+          pending.entry.text = sql;
+          pending.entry.results = summarizedResults;
+          chatStore.clearPending();
         } else {
           // Any other execution (direct SQL entry, or re-running a query
           // that isn't the pending just-generated one) is its own turn.
-          chatHistory.push({ role: 'user', text: promptText });
-          chatHistory.push({ role: 'model', text: sql, results: summarizedResults });
-          chatHistory = chatHistory.slice(-20);
-          futureChatHistory = [];
+          chatStore.pushTurn(promptText, { role: 'model', text: sql, results: summarizedResults });
           updateHistoryTurnsSubtitle();
         }
 
@@ -1403,10 +1408,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   if (runBtn) runBtn.addEventListener('click', () => executeSql());
 
   function restoreLatestTurn() {
-    if (chatHistory.length >= 2) {
-      const lastUserEntry = chatHistory[chatHistory.length - 2];
-      const lastModelEntry = chatHistory[chatHistory.length - 1];
-      
+    const turn = chatStore.lastTurn();
+    if (turn) {
+      const { userEntry: lastUserEntry, modelEntry: lastModelEntry } = turn;
+
       if (aiPrompt) {
         aiPrompt.value = (lastUserEntry && lastUserEntry.text !== "[Direct SQL Execution]") ? lastUserEntry.text : '';
       }
@@ -1417,7 +1422,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         
         if (isNoSql) {
           setSqlQuery('');
-          pendingSqlHistoryEntry = null;
+          chatStore.clearPending();
           renderNoSqlResponse(sqlText);
         } else {
           setSqlQuery(sqlText);
@@ -1426,14 +1431,11 @@ document.addEventListener('DOMContentLoaded', async () => {
           if (alreadyExecuted) {
             // This turn is done - viewing it again must never let a
             // subsequent Run overwrite its stored results in place.
-            pendingSqlHistoryEntry = null;
+            chatStore.clearPending();
             renderMultiTurnResults(lastModelEntry.results);
           } else {
             // Genuinely still awaiting its first execution.
-            pendingSqlHistoryEntry = { 
-              entry: lastModelEntry, 
-              sql: normalizeSqlForCompare(sqlText) 
-            };
+            chatStore.setPending(lastModelEntry, normalizeSqlForCompare(sqlText));
             clearResultsDisplay();
           }
         }
@@ -1444,19 +1446,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     } else {
       if (aiPrompt) aiPrompt.value = '';
       setSqlQuery('');
-      pendingSqlHistoryEntry = null;
+      chatStore.clearPending();
       clearResultsDisplay();
     }
   }
 
   if (goBackBtn) {
     goBackBtn.addEventListener('click', () => {
-      if (chatHistory.length >= 2) {
-        const modelEntry = chatHistory.pop();
-        const userEntry = chatHistory.pop();
-        futureChatHistory.push(userEntry);
-        futureChatHistory.push(modelEntry);
-        
+      if (chatStore.undo()) {
         updateHistoryTurnsSubtitle();
         restoreLatestTurn();
       }
@@ -1465,12 +1462,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   if (goForwardBtn) {
     goForwardBtn.addEventListener('click', () => {
-      if (futureChatHistory.length >= 2) {
-        const modelEntry = futureChatHistory.pop();
-        const userEntry = futureChatHistory.pop();
-        chatHistory.push(userEntry);
-        chatHistory.push(modelEntry);
-        
+      if (chatStore.redo()) {
         updateHistoryTurnsSubtitle();
         restoreLatestTurn();
       }
@@ -1480,9 +1472,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   if (clearHistoryBtn) {
     clearHistoryBtn.addEventListener('click', () => {
       try {
-        chatHistory = [];
-        futureChatHistory = [];
-        pendingSqlHistoryEntry = null;
+        chatStore.clear();
         setSqlQuery('');
         if (aiPrompt) aiPrompt.value = '';
         clearResultsDisplay();

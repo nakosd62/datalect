@@ -136,7 +136,6 @@
                 </button>
               </div>
             </div>
-
             <div class="input-row">
               <div class="speech-bubble-wrapper sql-bubble">
                 <button id="runBtn" class="btn btn-execute sql-overlay-btn" title="Execute SQL Query">
@@ -174,7 +173,7 @@
 
     <footer class="app-footer">
       <p> 
-        © 2026 yDyL All rights reserved • <a href="mailto:nakosd@gmail.com">nakosd@gmail.com</a>
+        © 2026 yDyL All rights reserved • Powered by Gemini
       </p>
     </footer>
   </div>
@@ -185,28 +184,29 @@
         <h2 class="modal-title">💡 Help & Documentation</h2>
         <button id="helpModalCloseBtn" class="modal-close-btn" type="button">&times;</button>
       </div>
-
       <div class="modal-body help-dialog-body">
-        <p>Welcome to <strong>yDyL</strong>! Here is a quick guide on how to interact with it.</p>
+        <p>Welcome to <strong>yDyL</strong>! It will help you talk to your Database in your Language. Here is a quick guide on how to interact with it.</p>
         
         <h3>1. Database Connection</h3>
-        <p>By default, you are connected to a simple database that you may use as a playground. You may change the database connection by clicking on the database connection information and entering your own postgres-complaint database connection. Custom connections are user-scoped, i.e. other users cannot see what you enter.</p>
+        <p>By default, you are connected to a simple database that you may use as a playground. You may change the database connection by clicking on the database badge in the header and entering your own postgres-complaint database connection (note: custom connections are user-scoped).</p>
 
-        <h3>2. Natural Language Query</h3>
-        <p>Type your query or instruction into the top text box in plain English or any other language. Clieck return when you are done.</p>
+        <h3>2. Natural Language Prompt</h3>
+        <p>Type your query or instruction into the top text box in plain English or any other language. Click return when you are done. You may use shift-return for multi-line prompts. </p>
         
         <h3>3. SQL Query</h3>
         <p>Review the SQL in the SQL editor box. You can manually edit the statement or write custom queries from scratch. Click <strong>Execute SQL</strong> to run the command.</p>
 
         <h3>4. Multi-turn Conversations</h3>
-        <p>yDyL remembers your last <strong>10 turns</strong>. Each contains the prompt, the SQL it generated, and the full result set that came back from the database. Use the <strong>◀ / ▶</strong> arrows to step back and forward through previous turns. Use the history popup to clear out chat turns or past translation records.</p>
+        <p>yDyL remembers your last <strong>10 turns</strong>. Each contains the prompt, the SQL it generated, and the results that came back from the database. Use the <strong>◀ / ▶</strong> arrows in the NL prompt tex box to step back and forward through previous turns. Use the history popup to clear out past chat turns or past translation records.</p>
+
+        <h3>5. Application Metadata</h3>
+        <p>yDyL was built by <a href="mailto:nakosd@gmail.com" target="_blank" rel="noopener noreferrer">nakosd@gmail.com</a> in 2026 and its source is available in <a href="https://github.com/nakosd62/ydyl" target="_blank" rel="noopener noreferrer">github</a>. If you have comments or questions, please send them along.</p>
       </div>
     </div>
   </div>
 
   <div id="historyModal" class="modal-overlay hidden">
     <div class="modal-card modal-card-large">
-
       <div class="modal-header history-modal-header">
         <div class="history-header-left">
           <h2 class="modal-title mb-0">
@@ -230,7 +230,6 @@
         </div>
         <button id="historyModalCloseBtn" class="modal-close-btn" type="button">&times;</button>
       </div>
-
       <div id="historyTabsNav" class="results-tabs-nav">
         <button type="button" id="tabBtnTranslations" class="result-tab-btn active">
           <span class="result-tab-title">Translations</span>
@@ -241,7 +240,6 @@
           <span class="result-tab-flare-right"></span>
         </button>
       </div>
-
       <div class="modal-body">
         <div id="historyTabTranslations" class="history-tab-content">
           <div class="results-container history-results-container">
@@ -259,7 +257,6 @@
             </div>
           </div>
         </div>
-
         <div id="historyTabStatistics" class="history-tab-content hidden">
           <div class="stats-charts-vertical-container">
             <div class="chart-card vertical-chart-card">
@@ -286,13 +283,11 @@
         <h2 class="modal-title"></h2>
         <button id="modalCloseBtn" class="modal-close-btn" type="button">&times;</button>
       </div>
-
       <form id="configForm" class="modal-body" onsubmit="event.preventDefault();">
         <div class="config-section">
           <span class="config-label">Database Connection</span>
           <div class="radio-group" id="modalDbRadioGroup"></div>
         </div>
-
         <div class="modal-actions" style="display: flex; gap: 0.5rem; justify-content: flex-end; align-items: center;">
           <button type="button" id="configSaveBtn" class="btn btn-primary">Save Changes</button>
         </div>
@@ -321,5 +316,6 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/mode/sql/sql.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/addon/display/placeholder.min.js"></script>
   <script src="client.js"></script>
+
 </body>
 </html>
