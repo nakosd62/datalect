@@ -1,0 +1,199 @@
+doc_id,input_tokens,connect_string,sql_command,model,output_tokens,thinking_tokens,user_id,cached_content_tokens,total_tokens,nl_prompt,duration,created_at
+37zBLTGrAIFGJX5VKv0W,2364,postgres@helloworld-vector-1785975353349,"WITH cart_summary AS (
+    SELECT 
+        productid,
+        COUNT(*) AS cart_count,
+        SUM(quantity) AS cart_quantity
+    FROM shoppingcarts
+    GROUP BY productid
+),
+order_summary AS (
+    SELECT 
+        productid,
+        COUNT(*) AS order_count
+    FROM orderitems
+    GROUP BY productid
+)
+SELECT 
+    p.productid,
+    p.name,
+    (c.cart_count::numeric / (c.cart_count + COALESCE(o.order_count, 0))) AS abandonment_rate,
+    (c.cart_quantity * p.priceusd) AS total_potential_revenue_lost
+FROM cart_summary c
+JOIN products p ON c.productid = p.productid
+LEFT JOIN order_summary o ON c.productid = o.productid
+ORDER BY abandonment_rate DESC, total_potential_revenue_lost DESC
+LIMIT 5;",gemini-3.6-flash,215,3482,nakosd@gmail.com,,6061,"What are the top 5 products with the highest cart abandonment rate, and what is the total potential revenue lost from those items?",17754,2026-08-08 23:33:01.063000+00:00
+3gGngle7aRKfM64Rvyff,2572,postgres@helloworld-vector-1785975353349,"***NEW SQL***
+SELECT 
+  MIN(orderdate)::date AS earliest_order_date,
+  MAX(orderdate)::date AS latest_order_date,
+  ROUND(AVG(totalamountusd), 2) AS avg_order_value_usd,
+  (SELECT STRING_AGG(DISTINCT category, ', ') FROM products) AS product_categories,
+  (SELECT STRING_AGG(DISTINCT orderstatus, ', ') FROM orders) AS order_statuses,
+  (SELECT STRING_AGG(DISTINCT paymentmethod, ', ') FROM payments) AS payment_methods
+FROM orders;",gemini-3.6-flash,132,691,nakosd@gmail.com,,3395,what else do you kow about this database,5001,2026-08-11 22:09:41.471000+00:00
+4MrnnjOhcTVtw3FbgG5K,959,dimitris@kitchenbank,"SELECT c.number_street, c.city_state
+FROM clients c
+JOIN accounts a ON c.id = a.owner_id
+GROUP BY c.id, c.number_street, c.city_state
+ORDER BY SUM(a.balance) DESC
+LIMIT 1;",gemini-3.6-flash,62,723,nakosd@gmail.com,,1744,where does the wealthiest customer live,4584,2026-08-10 14:18:27.643000+00:00
+4oWAqLuW4OhcWIcuE6Mi,2350,postgres@helloworld-vector-1785975353349,"SELECT 'An interesting question to ask is: Which products are most frequently added to shopping carts but never purchased, and what is the total abandoned cart value?' AS RESPONSE;",gemini-3.6-flash,34,422,nakosd@gmail.com,,2806,what is the most interesting question i can ask abut this database,2906,2026-08-08 22:25:31.608000+00:00
+5blQp0DayBUhHZaSyKYD,2737,demo@helloworld-vector-1785975353349,"SELECT
+  u.user_id,
+  u.email,
+  COUNT(DISTINCT o.orderid) AS total_orders,
+  COALESCE(SUM(o.totalamountusd), 0) AS total_spent_usd,
+  COUNT(DISTINCT CASE WHEN LOWER(o.orderstatus) = 'cancelled' THEN o.orderid END) AS cancelled_orders,
+  COUNT(DISTINCT CASE WHEN LOWER(p.status) = 'failed' THEN p.paymentid END) AS failed_payments,
+  TO_CHAR(MAX(o.orderdate), 'YYYY-MM-DD:HH24:MI:SS') AS last_order_date
+FROM users u
+LEFT JOIN orders o ON u.user_id = o.userid
+LEFT JOIN payments p ON o.orderid = p.orderid
+GROUP BY u.user_id, u.email
+ORDER BY total_spent_usd ASC, cancelled_orders DESC;",gemini-3.6-flash,211,1439,nakosd@gmail.com,,4387,worst customer,9497,2026-08-14 00:18:12.733000+00:00
+817FTaCGS3j3SZfHx1t2,2299,demo@helloworld-vector-1785975353349,SELECT current_user AS connected_user;,gemini-3.6-flash,9,137,nakosd@gmail.com,,2445,who ami connected as,1922,2026-08-14 00:23:37.591000+00:00
+AEnkjpyyPO73kC8LDeD0,2298,demo@helloworld-vector-1785975353349,SELECT 1;,gemini-3.6-flash,4,75,nakosd@gmail.com,,2377,select 1,41991,2026-08-14 13:52:57.007000+00:00
+Bbs6yGictZgr2YHMVQvX,2343,postgres@helloworld-vector-1785975353349,"SELECT 'This database is for an e-commerce platform, managing users, products, shopping carts, orders, payments, and shipping addresses.' AS RESPONSE;",gemini-3.6-flash,30,476,nakosd@gmail.com,,2849,what s this database about,3221,2026-08-11 22:07:40.172000+00:00
+DQq1gpuYJTdzWoPQHOuS,2298,postgres@helloworld-vector-1785975353349,SELECT 1;,gemini-3.6-flash,4,135,nakosd@gmail.com,,2437,select 1,1452,2026-08-14 15:07:21.556000+00:00
+FgZi6kt8sqSsluiJFYaX,2283,postgres@helloworld-vector-1785975353349,"I am an AI data analysis assistant designed to help you analyze tabular data, write complex SQL queries, interpret database schemas, and extract actionable insights from your database. 
+
+Feel free to ask questions about your database—such as analyzing sales trends, customer purchasing behavior, order statuses, or product performance!",gemini-3.6-flash,60,176,nakosd@gmail.com,,2519,how smart are you,1783,2026-08-11 18:00:34.686000+00:00
+IOGOG684LVEmV7Gdd6NZ,2861,postgres@helloworld-vector-1785975353349,"*** NO SQL *** Η Αμερική (ΗΠΑ) δεν έχει πρωθυπουργό, αλλά Πρόεδρο. Σήμερα Πρόεδρος των ΗΠΑ είναι ο Τζο Μπάιντεν.",gemini-3.6-flash,44,220,nakosd@gmail.com,,3125,Ποιος είναι ο πρωθυπουργός της Αμερικής,1950,2026-08-14 01:41:55.379000+00:00
+L6ZY8piuoegy2gA414As,2457,postgres@helloworld-vector-1785975353349,"SELECT 
+    p.productid,
+    p.name,
+    (COALESCE(sc.cart_count, 0)::numeric / (COALESCE(sc.cart_count, 0) + COALESCE(oi.order_count, 0))) AS cart_abandonment_rate,
+    (COALESCE(sc.total_cart_quantity, 0) * p.priceusd) AS total_potential_revenue_lost
+FROM products p
+JOIN (
+    SELECT 
+        productid, 
+        COUNT(*) AS cart_count, 
+        SUM(quantity) AS total_cart_quantity
+    FROM shoppingcarts
+    GROUP BY productid
+) sc ON p.productid = sc.productid
+LEFT JOIN (
+    SELECT 
+        productid, 
+        COUNT(*) AS order_count
+    FROM orderitems
+    GROUP BY productid
+) oi ON p.productid = oi.productid
+ORDER BY cart_abandonment_rate DESC
+LIMIT 5;",gemini-3.6-flash,226,2720,nakosd@gmail.com,,5403,"What are the top 5 products with the highest cart abandonment rate, and what is the total potential revenue lost from those items?",13854,2026-08-08 22:26:27.527000+00:00
+LKdn9XZoKeKehw9nZKzW,2353,demo@helloworld-vector-1785975353349,SELECT current_user AS connected_as;,gemini-3.6-flash,9,100,nakosd@gmail.com,,2462,who am i connected as,1874,2026-08-14 00:17:33.606000+00:00
+MxaW2c4n5nnx4n0A6BhV,2817,postgres@helloworld-vector-1785975353349,*** NO SQL *** Ο σημερινός πρωθυπουργός της Ελλάδας είναι ο Κυριάκος Μητσοτάκης.,gemini-3.6-flash,28,120,nakosd@gmail.com,,2965,Ποιος είναι ο πρωθυπουργός της Ελλάδας,1102,2026-08-14 01:41:41.247000+00:00
+NTtF7uN4lnk5YeBbXtlK,955,dimitris@kitchenbank,SELECT current_database();,gemini-3.6-flash,5,546,nakosd@gmail.com,,1506,database name,23993,2026-08-09 13:31:53.407000+00:00
+PszI4gKaO7HA2sBCtacI,2321,postgres@helloworld-vector-1785975353349,"*** NO SQL *** Πρόκειται για μια σχεσιακή βάση δεδομένων PostgreSQL για μια εφαρμογή ηλεκτρονικού εμπορίου (e-commerce), η οποία περιλαμβάνει πίνακες για χρήστες (users), προϊόντα (products), παραγγελίες (orders), στοιχεία παραγγελιών (orderitems), πληρωμές (payments), καλάθια αγορών (shoppingcarts) και διευθύνσεις (addresses).",gemini-3.6-flash,95,343,nakosd@gmail.com,,2759,Τι βάση δεδομένων είναι αυτή,2640,2026-08-14 01:39:23.423000+00:00
+QabLg85VPph5S3OwT4Of,2339,postgres@helloworld-vector-1785975353349,SELECT * FROM users;,gemini-3.6-flash,5,361,nakosd@gmail.com,,2705,customers,2941,2026-08-08 19:07:11.108000+00:00
+R9PY9HQRG10Z7Y6B4uI2,2342,postgres@helloworld-vector-1785975353349,SELECT 'Hello! How can I help you with your database queries today?' AS RESPONSE;,gemini-3.6-flash,18,234,nakosd@gmail.com,,2594,what's up,1821,2026-08-11 18:00:09.464000+00:00
+TwgJGINmVo0n85HueyqM,2598,postgres@helloworld-vector-1785975353349,"SELECT
+  u.user_id,
+  u.email,
+  SUM(o.totalamountusd) AS total_spent
+FROM
+  users u
+  JOIN orders o ON u.user_id = o.userid
+GROUP BY
+  u.user_id,
+  u.email
+ORDER BY
+  total_spent ASC
+LIMIT 1;",gemini-3.6-flash,80,464,nakosd@gmail.com,,3142,Ο χειροτερος,3501,2026-08-14 01:40:35.929000+00:00
+U2UBZVd7X7mvD81eVSb0,2398,postgres@helloworld-vector-1785975353349,"SELECT 'What are the top 5 products with the highest cart abandonment rate, and what is the total potential revenue lost from those items?' AS RESPONSE;",gemini-3.6-flash,31,424,nakosd@gmail.com,,2853,what is the most interesting question i can ask abut this database,2949,2026-08-08 22:26:06.776000+00:00
+UsUyRGLcYCqMUvAKwabx,993,dimitris@kitchenbank,SELECT current_user;,gemini-3.6-flash,5,224,nakosd@gmail.com,,1222,who is the user logged on,2271,2026-08-09 13:33:11.585000+00:00
+WEChbPt209pRQGGGNS0g,2341,postgres@helloworld-vector-1785975353349,SELECT 'I do not have access to your personal identity.' AS RESPONSE;,gemini-3.6-flash,15,552,nakosd@gmail.com,,2908,who am i,3882,2026-08-08 21:10:32.833000+00:00
+YJ4SfJ7EBrRWoGEV94RM,2359,postgres@helloworld-vector-1785975353349,*** NO SQL *** I do not have access to or visibility into the API key being used.,gemini-3.6-flash,19,142,nakosd@gmail.com,,2520,What Gemini api key are you using,2730,2026-08-14 02:39:31.124000+00:00
+ZlMs4UIhGwp759xrifDX,2339,postgres@helloworld-vector-1785975353349,"SELECT user_id, email FROM users;",gemini-3.6-flash,9,404,nakosd@gmail.com,,2752,Customers,7606,2026-08-08 19:49:32.752000+00:00
+b531vmsA6HFYedCPfzh2,2339,postgres@helloworld-vector-1785975353349,"SELECT user_id, email FROM users;",gemini-3.6-flash,9,442,nakosd@gmail.com,,2790,clients,7537,2026-08-08 19:48:44.269000+00:00
+bleuLsm0zJXd5n0hCeS0,2417,demo@helloworld-vector-1785975353349,"SELECT 'users' AS table_name, COUNT(*) AS total_rows FROM users
+UNION ALL
+SELECT 'addresses', COUNT(*) FROM addresses
+UNION ALL
+SELECT 'products', COUNT(*) FROM products
+UNION ALL
+SELECT 'shoppingcarts', COUNT(*) FROM shoppingcarts
+UNION ALL
+SELECT 'orders', COUNT(*) FROM orders
+UNION ALL
+SELECT 'orderitems', COUNT(*) FROM orderitems
+UNION ALL
+SELECT 'payments', COUNT(*) FROM payments;",gemini-3.6-flash,94,371,nakosd@gmail.com,,2882,what data is it here,3009,2026-08-14 00:17:50.892000+00:00
+cFIPZbpyGKY3EVcZeBfh,2298,demo@helloworld-vector-1785975353349,SELECT 1;,gemini-3.6-flash,4,35,nakosd@gmail.com,,2337,select 1,249611,2026-08-14 13:55:07.188000+00:00
+ebeRyZJCJe78ktlfh9TY,2283,postgres@helloworld-vector-1785975353349,"I am an AI data analyst assistant trained to slice, dice, analyze complex relational databases, write and optimize SQL queries, and extract actionable insights across your e-commerce data (users, orders, payments, products, shopping carts, and shipping addresses). 
+
+How can I help analyze your data today?",gemini-3.6-flash,61,282,nakosd@gmail.com,,2626,how smart are you,17362,2026-08-11 18:00:45.851000+00:00
+ellKrVRPe0O9hZzNTo82,959,dimitris@kitchenbank,"SELECT
+  c.name,
+  c.number_street,
+  c.city_state,
+  SUM(a.balance) AS total_balance
+FROM clients c
+JOIN accounts a ON c.id = a.owner_id
+GROUP BY c.id, c.name, c.number_street, c.city_state
+ORDER BY total_balance DESC
+LIMIT 1;",gemini-3.6-flash,87,614,nakosd@gmail.com,,1660,where does the wealthiest customer live,4299,2026-08-10 15:10:46.681000+00:00
+epCDjLfyUsikGYl0DRtv,2329,postgres@helloworld-vector-1785975353349,"*** NO SQL *** I am Gemini 3.6 Flash, a large language model built by Google.",gemini-3.6-flash,21,153,nakosd@gmail.com,,2503,What Gemini model are you using,4708,2026-08-14 02:39:07.612000+00:00
+fx4fcMMEUPyuuMubCsiy,956,dimitris@kitchenbank,"SELECT 'To log in as a user in PostgreSQL, run: psql -U <username> -d <dbname>' AS RESPONSE;",gemini-3.6-flash,28,562,nakosd@gmail.com,,1546,logon on user,26475,2026-08-09 13:32:32.422000+00:00
+n9vz9Fmrm12vRP4UZvYM,2298,postgres@helloworld-vector-1785975353349,*** NO SQL *** OPEN HELP POPUP ***,gemini-3.6-flash,9,474,nakosd@gmail.com,,2781,what is this,13113,2026-08-13 23:34:36.216000+00:00
+nWPnerDUEH4U65nRIxpQ,2302,postgres@helloworld-vector-1785975353349,*** NO SQL *** OPEN HELP POPUP ***,gemini-3.6-flash,9,97,nakosd@gmail.com,,2408,Τι είναι αυτή η εφαρμογή,958,2026-08-14 01:38:49.358000+00:00
+o4FZUhgMXH9H7lsAQHpt,2323,postgres@helloworld-vector-1785975353349,"***NEW SQL***
+SELECT 
+  (SELECT COUNT(*) FROM users) AS total_users,
+  (SELECT COUNT(*) FROM products) AS total_products,
+  (SELECT COUNT(DISTINCT category) FROM products) AS total_categories,
+  (SELECT COUNT(*) FROM orders) AS total_orders,
+  (SELECT ROUND(SUM(totalamountusd), 2) FROM orders) AS total_revenue_usd;",gemini-3.6-flash,92,525,nakosd@gmail.com,,2940,tell me more,3573,2026-08-11 22:08:05.575000+00:00
+oz5269wy5fp3nPLYeujv,2429,postgres@helloworld-vector-1785975353349,"SELECT 
+    u.user_id,
+    u.email,
+    SUM(o.totalamountusd) AS total_spent
+FROM users u
+JOIN orders o ON u.user_id = o.userid
+GROUP BY u.user_id, u.email
+ORDER BY total_spent DESC
+LIMIT 1;",gemini-3.6-flash,72,491,nakosd@gmail.com,,2992,Ποιος είναι ο καλύτερος μου πελάτης,3553,2026-08-14 01:40:00.222000+00:00
+shi06BGJ90yMsIUA52Jl,2302,postgres@helloworld-vector-1785975353349,*** NO SQL *** I do not have access to the active database connection string or configuration settings.,gemini-3.6-flash,19,338,nakosd@gmail.com,,2659,What do connect strung are you using,2271,2026-08-14 02:38:40.157000+00:00
+uTFDgD2EPTOniKCY9u0P,2313,postgres@helloworld-vector-1785975353349,"SELECT 'users' AS table_name, COUNT(*) AS total_rows FROM users
+UNION ALL
+SELECT 'addresses' AS table_name, COUNT(*) AS total_rows FROM addresses
+UNION ALL
+SELECT 'products' AS table_name, COUNT(*) AS total_rows FROM products
+UNION ALL
+SELECT 'orders' AS table_name, COUNT(*) AS total_rows FROM orders
+UNION ALL
+SELECT 'orderitems' AS table_name, COUNT(*) AS total_rows FROM orderitems
+UNION ALL
+SELECT 'payments' AS table_name, COUNT(*) AS total_rows FROM payments
+UNION ALL
+SELECT 'shoppingcarts' AS table_name, COUNT(*) AS total_rows FROM shoppingcarts;",gemini-3.6-flash,148,599,nakosd@gmail.com,,3060,what data is here,16862,2026-08-13 23:35:21.880000+00:00
+vBwlpWDRct2SdcAEhPxH,2298,demo@helloworld-vector-1785975353349,SELECT 1;,gemini-3.6-flash,4,79,diminak64@gmail.com,,2381,select 1,1620,2026-08-14 14:34:21.799000+00:00
+vhJOkmMxwM6XxePqRPhB,962,bankclerk@kitchenbank,SELECT * FROM clients;,gemini-3.6-flash,5,172,nakosd@gmail.com,,1139,customers,1768,2026-08-08 19:07:25.725000+00:00
+vwiYK2aqYv1aS0TDT9mW,2716,postgres@helloworld-vector-1785975353349,"***NEW SQL***
+SELECT 
+  MIN(o.orderdate)::date AS earliest_order,
+  MAX(o.orderdate)::date AS latest_order,
+  ROUND(AVG(o.totalamountusd), 2) AS avg_order_usd,
+  (SELECT STRING_AGG(DISTINCT category, ', ') FROM products) AS product_categories,
+  (SELECT STRING_AGG(DISTINCT orderstatus, ', ') FROM orders) AS order_statuses,
+  (SELECT STRING_AGG(DISTINCT paymentmethod, ', ') FROM payments) AS payment_methods
+FROM orders o;",gemini-3.6-flash,133,1398,nakosd@gmail.com,,4247,what else do you knwo abotu this database,7347,2026-08-11 22:10:22.665000+00:00
+wW18qsD3Al3dbOxbRJGW,2769,postgres@helloworld-vector-1785975353349,"*** NO SQL *** Δεν μπορώ να γνωρίζω την ταυτότητά σας, καθώς δεν διαθέτω πληροφορίες για τον συνδεδεμένο χρήστη.",gemini-3.6-flash,34,450,nakosd@gmail.com,,3253,Εγώ ποιος είμαι,2851,2026-08-14 01:41:08.802000+00:00
+xZy5yJW6nUSxn675FfCt,7554,demo@helloworld-vector-1785975353349,"SELECT
+  u.user_id,
+  u.email,
+  COUNT(o.orderid) AS total_orders,
+  COALESCE(SUM(o.totalamountusd), 0) AS total_spent_usd,
+  TO_CHAR(MAX(o.orderdate), 'YYYY-MM-DD:HH24:MI:SS') AS last_order_date
+FROM
+  users u
+  JOIN orders o ON u.user_id = o.userid
+GROUP BY
+  u.user_id,
+  u.email
+ORDER BY
+  total_spent_usd DESC
+LIMIT 2;",gemini-3.6-flash,140,615,nakosd@gmail.com,,8309,best 2  customers,4799,2026-08-14 00:18:35.141000+00:00

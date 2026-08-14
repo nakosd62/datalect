@@ -40,9 +40,8 @@ class StateStore(ABC):
     """Backend-agnostic persistence for sessions, saved DB connections, and
     translation history/stats."""
 
-    def __init__(self, default_conn, default_model):
+    def __init__(self, default_conn):
         self.default_conn = default_conn
-        self.default_model = default_model
 
     @abstractmethod
     def init(self):
@@ -50,11 +49,11 @@ class StateStore(ABC):
 
     @abstractmethod
     def get_session(self, user_id):
-        """Returns (database_url, active_model) for a user/session id."""
+        """Returns the active database_url for a user/session id."""
 
     @abstractmethod
-    def set_session(self, user_id, db_url=None, model=None):
-        """Persists the active database_url and/or model for a user/session id."""
+    def set_session(self, user_id, db_url=None):
+        """Persists the active database_url for a user/session id."""
 
     @abstractmethod
     def get_db_connections(self, user_id):
@@ -85,8 +84,8 @@ class StateStore(ABC):
 # --------------------------------------------------------------------------
 
 class SqliteStateStore(StateStore):
-    def __init__(self, db_path, default_conn, default_model):
-        super().__init__(default_conn, default_model)
+    def __init__(self, db_path, default_conn):
+        super().__init__(default_conn)
         self.db_path = db_path
 
     def _connect(self):
@@ -121,7 +120,6 @@ class SqliteStateStore(StateStore):
                     CREATE TABLE IF NOT EXISTS sessions (
                         session_id TEXT PRIMARY KEY,
                         database_url TEXT NOT NULL,
-                        active_model TEXT,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     );
                 """)
@@ -154,11 +152,6 @@ class SqliteStateStore(StateStore):
                 if "user_id" not in columns:
                     cursor.execute("ALTER TABLE translations ADD COLUMN user_id TEXT;")
 
-                cursor.execute("PRAGMA table_info(sessions);")
-                session_columns = [column[1] for column in cursor.fetchall()]
-                if "active_model" not in session_columns:
-                    cursor.execute("ALTER TABLE sessions ADD COLUMN active_model TEXT;")
-
                 conn.commit()
         except Exception:
             logger.exception("Error initializing SQLite stats DB")
@@ -169,31 +162,30 @@ class SqliteStateStore(StateStore):
             with self._connect() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    "SELECT database_url, active_model FROM sessions WHERE session_id = ?",
+                    "SELECT database_url FROM sessions WHERE session_id = ?",
                     (effective_user,),
                 )
                 row = cursor.fetchone()
                 if row:
-                    return (row[0] or self.default_conn), (row[1] or self.default_model)
+                    return row[0] or self.default_conn
         except Exception:
             logger.exception("Error fetching session from SQLite")
-        return self.default_conn, self.default_model
+        return self.default_conn
 
-    def set_session(self, user_id, db_url=None, model=None):
-        if not db_url and not model:
+    def set_session(self, user_id, db_url=None):
+        if not db_url:
             return
         effective_user = _effective_user(user_id)
         try:
             with self._connect() as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
-                    INSERT INTO sessions (session_id, database_url, active_model, updated_at)
-                    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                    INSERT INTO sessions (session_id, database_url, updated_at)
+                    VALUES (?, ?, CURRENT_TIMESTAMP)
                     ON CONFLICT(session_id) DO UPDATE SET
-                        database_url = COALESCE(excluded.database_url, sessions.database_url),
-                        active_model = COALESCE(excluded.active_model, sessions.active_model),
+                        database_url = excluded.database_url,
                         updated_at = CURRENT_TIMESTAMP;
-                """, (effective_user, db_url or self.default_conn, model or self.default_model))
+                """, (effective_user, db_url))
                 conn.commit()
         except Exception:
             logger.exception("Error saving session to SQLite")
@@ -315,8 +307,8 @@ class SqliteStateStore(StateStore):
 # --------------------------------------------------------------------------
 
 class FirestoreStateStore(StateStore):
-    def __init__(self, client, default_conn, default_model):
-        super().__init__(default_conn, default_model)
+    def __init__(self, client, default_conn):
+        super().__init__(default_conn)
         self.client = client
 
     def init(self):
@@ -325,27 +317,20 @@ class FirestoreStateStore(StateStore):
 
     def get_session(self, user_id):
         if not user_id:
-            return self.default_conn, self.default_model
+            return self.default_conn
         try:
             doc = self.client.collection("sessions").document(user_id).get()
             if doc.exists:
                 data = doc.to_dict() or {}
-                return (
-                    data.get("database_url", self.default_conn),
-                    data.get("active_model", self.default_model),
-                )
+                return data.get("database_url", self.default_conn)
         except Exception:
             logger.exception("Error fetching session from Firestore")
-        return self.default_conn, self.default_model
+        return self.default_conn
 
-    def set_session(self, user_id, db_url=None, model=None):
-        if not user_id or (not db_url and not model):
+    def set_session(self, user_id, db_url=None):
+        if not user_id or not db_url:
             return
-        update_data = {"updated_at": firestore.SERVER_TIMESTAMP}
-        if db_url:
-            update_data["database_url"] = db_url
-        if model:
-            update_data["active_model"] = model
+        update_data = {"database_url": db_url, "updated_at": firestore.SERVER_TIMESTAMP}
         try:
             self.client.collection("sessions").document(user_id).set(update_data, merge=True)
         except Exception:

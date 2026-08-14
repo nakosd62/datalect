@@ -184,23 +184,8 @@
         <h2 class="modal-title">💡 Help & Documentation</h2>
         <button id="helpModalCloseBtn" class="modal-close-btn" type="button">&times;</button>
       </div>
-      <div class="modal-body help-dialog-body">
-        <p>Welcome to <strong>yDyL</strong>! It will help you talk to your Database in your Language. Here is a quick guide on how to interact with it.</p>
-        
-        <h3>1. Database Connection</h3>
-        <p>By default, you are connected to a simple database that you may use as a playground. The demo environment is read-only although the appliction can deal with DML and DDL equally well. You may change the database connection by clicking on the database badge in the header and entering your own postgres-complaint database connection (note: custom connections are user-scoped).</p>
-
-        <h3>2. Natural Language Prompt</h3>
-        <p>Type your query or instruction into the top text box in plain English or any other language. Click return when you are done. You may use shift-return for multi-line prompts. </p>
-        
-        <h3>3. SQL Query</h3>
-        <p>Review the SQL in the SQL editor box. You can manually edit the statement or write custom queries from scratch. Click <strong>Execute SQL</strong> to run the command.</p>
-
-        <h3>4. Multi-turn Conversations</h3>
-        <p>yDyL remembers your last <strong>10 turns</strong>. Each contains the prompt, the SQL it generated, and the results that came back from the database. Use the <strong>◀ / ▶</strong> arrows in the NL prompt tex box to step back and forward through previous turns. Use the history popup to clear out past chat turns or past translation records.</p>
-
-        <h3>5. Application Metadata</h3>
-        <p>yDyL was built by <a href="mailto:nakosd@gmail.com" target="_blank" rel="noopener noreferrer">nakosd@gmail.com</a> in 2026 and its source is available in <a href="https://github.com/nakosd62/ydyl" target="_blank" rel="noopener noreferrer">github</a>. If you have comments or questions, please send them along.</p>
+      <div id="helpModalBody" class="modal-body help-dialog-body">
+        <p class="text-muted">Loading documentation...</p>
       </div>
     </div>
   </div>
@@ -217,10 +202,6 @@
             <span>History</span>
           </h2>
           <div class="history-clear-wrapper">
-            <button type="button" id="clearHistoryBtn" class="btn btn-primary history-action-btn">
-              <span>Clear Chat Turns</span>
-              <span class="btn-clear-title">(0)</span>
-            </button>
             <button type="button" id="purgeHistoryBtn" class="btn btn-primary history-action-btn">
               <span>Purge Translations</span>
               <span class="btn-purge-title">(0)</span>

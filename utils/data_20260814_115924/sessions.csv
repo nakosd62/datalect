@@ -1,0 +1,2 @@
+doc_id,updated_at,database_url
+nakosd@gmail.com,2026-08-14 15:07:12.738000+00:00,postgresql://postgres:FooBar@/helloworld-vector-1785975353349?host=/cloudsql/grand-cosmos-716:us-east1:trial

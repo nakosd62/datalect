@@ -10,20 +10,18 @@ venv/
 .env-sample
 
 # Ignore utility scripts
-run_server.sh
-kill_server.sh
-gcp_deploy.sh
-run_tests.sh
-run_android_app.sh
-dump_state.sh
+*.sh
 
 # Ignore testing files
 tests/
 
+# Ignore utils
+utils/
+
 # Ignore local state
 state/
 
-# Ignore mobile all
+# Ignore mobile app
 mobile/
 
 # Ignore README

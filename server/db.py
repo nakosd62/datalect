@@ -25,8 +25,7 @@ _SCHEMA_FETCH_FAILED = "No schema description available."
 def resolve_conn_str(conn_str=None, user_id=None):
     if not conn_str:
         if user_id:
-            db_url, _ = state_store.get_session(user_id)
-            return db_url
+            return state_store.get_session(user_id)
         return DEFAULT_CONN
     return conn_str
 

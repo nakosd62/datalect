@@ -119,6 +119,6 @@ TRANSLATION_STATS_DB_PATH = "state/ydyl_state.db"
 
 # --- State Store: Firestore on Cloud Run, SQLite locally ---------------------
 if firestore_client:
-    state_store = FirestoreStateStore(firestore_client, DEFAULT_CONN, DEFAULT_MODEL)
+    state_store = FirestoreStateStore(firestore_client, DEFAULT_CONN)
 else:
-    state_store = SqliteStateStore(TRANSLATION_STATS_DB_PATH, DEFAULT_CONN, DEFAULT_MODEL)
+    state_store = SqliteStateStore(TRANSLATION_STATS_DB_PATH, DEFAULT_CONN)

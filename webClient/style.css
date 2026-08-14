@@ -1420,9 +1420,9 @@ textarea:focus {
 }
 
 .history-action-btn {
-  flex: 1;
+  flex: 0 0 auto;
   min-width: 120px;
-  height: auto; /* Allows both buttons to expand evenly for 2 lines */
+  height: auto; /* Allows the button to expand evenly for 2 lines */
   display: inline-flex;
   flex-direction: column;
   align-items: center;
@@ -1433,7 +1433,6 @@ textarea:focus {
   line-height: 1.2;
 }
 
-.history-action-btn .btn-clear-title,
 .history-action-btn .btn-purge-title {
   display: block;
   font-size: 0.68rem;

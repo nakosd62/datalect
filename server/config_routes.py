@@ -2,8 +2,10 @@
 config_routes.py
 
 The /api/config endpoint: reads/writes the current session's active
-database + model selection, and reports back everything the frontend
-needs to render its DB/session UI.
+database, and reports back everything the frontend needs to render its
+DB/session UI - including the server-configured list of available Gemini
+models (PRESET_MODELS), which the frontend may pass per-request to
+/api/translate, but which is not tied to or persisted on the session.
 """
 
 from urllib.parse import urlparse
@@ -11,7 +13,7 @@ from urllib.parse import urlparse
 from flask import Blueprint, request, jsonify
 
 from app_config import (
-    CONFIGURED_DBS, DEFAULT_CONN, DEFAULT_MODEL, PRESET_MODELS,
+    CONFIGURED_DBS, DEFAULT_CONN, PRESET_MODELS,
     AUTH_ENABLED, IS_CLOUD_RUN, state_store, logger,
 )
 import os
@@ -33,13 +35,12 @@ def handle_config():
         data = request.get_json() or {}
         new_db_url = data.get('database_url')
         new_db_name = data.get('database_name')
-        new_model = data.get('model') or data.get('gemini_model')
         is_custom = data.get('is_custom', False)
         custom_databases = data.get('custom_databases')
 
-        if new_db_url or new_model:
-            state_store.set_session(user_identity, new_db_url or DEFAULT_CONN, new_model)
-            if new_db_url and (is_custom or (new_db_url not in preset_urls)):
+        if new_db_url:
+            state_store.set_session(user_identity, new_db_url)
+            if is_custom or (new_db_url not in preset_urls):
                 db_name_to_save = new_db_name
                 if not db_name_to_save:
                     try:
@@ -52,9 +53,9 @@ def handle_config():
                         db_name_to_save = "Custom"
                 state_store.set_db_connections(user_identity, db_name_to_save, new_db_url, custom_databases)
         else:
-            state_store.set_session(user_identity, DEFAULT_CONN, DEFAULT_MODEL)
+            state_store.set_session(user_identity, DEFAULT_CONN)
 
-    active_conn_str, _ = state_store.get_session(user_identity)
+    active_conn_str = state_store.get_session(user_identity)
     custom_databases = state_store.get_db_connections(user_identity)
     user_custom_name = custom_databases[0]["name"] if custom_databases else None
     user_custom_url = custom_databases[0]["url"] if custom_databases else None

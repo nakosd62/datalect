@@ -149,7 +149,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   const sqlQueryTextarea = document.getElementById('sqlQuery');
   const translateBtn = document.getElementById('translateBtn');
   const runBtn = document.getElementById('runBtn');
-  const clearHistoryBtn = document.getElementById('clearHistoryBtn');
   const purgeHistoryBtn = document.getElementById('purgeHistoryBtn');
   const goBackBtn = document.getElementById('goBackBtn');
   const goForwardBtn = document.getElementById('goForwardBtn');
@@ -168,6 +167,38 @@ document.addEventListener('DOMContentLoaded', async () => {
   const helpModal = document.getElementById('helpModal');
   const helpBtn = document.getElementById('helpBtn');
   const helpModalCloseBtn = document.getElementById('helpModalCloseBtn');
+  const helpModalBody = document.getElementById('helpModalBody');
+
+  // Fetches help.html once and caches the result, so repeat opens of the
+  // modal don't re-fetch. help.html is a plain HTML fragment (not a full
+  // document) served as a static asset alongside index.html.
+  let helpContentPromise = null;
+  function loadHelpContent() {
+    if (!helpContentPromise) {
+      helpContentPromise = fetch('help.html')
+        .then(res => {
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          return res.text();
+        });
+    }
+    return helpContentPromise;
+  }
+
+  function openHelpModal() {
+    if (!helpModal) return;
+    helpModal.classList.remove('hidden');
+    if (!helpModalBody) return;
+    loadHelpContent()
+      .then(html => {
+        helpModalBody.innerHTML = html;
+      })
+      .catch(err => {
+        helpModalBody.innerHTML = '<p class="text-muted">Sorry, the documentation could not be loaded. Please try again.</p>';
+        console.error('Failed to load help.html:', err);
+        // Allow retrying on next open rather than caching the failure.
+        helpContentPromise = null;
+      });
+  }
 
   // DOM Elements - History Modal & Tabs
   const historyModal = document.getElementById('historyModal');
@@ -459,11 +490,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function updateHistoryTurnsSubtitle() {
-    const turns = chatStore.turnCount();
-    const clearTitleEl = document.querySelector('.btn-clear-title');
-    if (clearTitleEl) {
-      clearTitleEl.textContent = `(${turns})`;
-    }
     const clearMsgEl = document.getElementById('historyActionMsg');
     if (clearMsgEl) {
       clearMsgEl.textContent = '';
@@ -824,7 +850,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   if (helpBtn && helpModal) {
     helpBtn.addEventListener('click', () => {
-      helpModal.classList.remove('hidden');
+      openHelpModal();
     });
   }
 
@@ -1203,7 +1229,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         const isResourceExhausted = errUpper.includes('429 RESOURCE_EXHAUSTED');
         const isTemporaryFailure = errUpper.includes('503 UNAVAILABLE');
 
-        if ((!response.ok || !data.sql) && (isResourceExhausted || isTemporaryFailure) && attempts < maxAttempts) {
+        if ((!response.ok || !data.sql)  &&  isResourceExhausted  &&  attempts < maxAttempts) {
           await new Promise(resolve => setTimeout(resolve, 2000));
           continue;
         }
@@ -1232,7 +1258,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           clearResultsDisplay();
 
           if (helpModal) {
-            helpModal.classList.remove('hidden');
+            openHelpModal();
           }
         } else if (isNoSql) {
           setSqlQuery('');
@@ -1465,32 +1491,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (chatStore.redo()) {
         updateHistoryTurnsSubtitle();
         restoreLatestTurn();
-      }
-    });
-  }
-
-  if (clearHistoryBtn) {
-    clearHistoryBtn.addEventListener('click', () => {
-      try {
-        chatStore.clear();
-        setSqlQuery('');
-        if (aiPrompt) aiPrompt.value = '';
-        clearResultsDisplay();
-        if (resultsBody) resultsBody.innerHTML = '<tr><td class="text-center text-muted py-8">The answer will appear here...</td></tr>';
-
-        updateHistoryTurnsSubtitle();
-        const msgEl = document.getElementById('historyActionMsg');
-        if (msgEl) {
-          msgEl.textContent = 'Chat history cleared successfully.';
-          msgEl.style.color = 'var(--primary, #10b981)';
-        }
-      } catch (err) {
-        console.error("Failed to clear chat history:", err);
-        const msgEl = document.getElementById('historyActionMsg');
-        if (msgEl) {
-          msgEl.textContent = 'Failed to clear chat history';
-          msgEl.style.color = 'var(--danger, #f87171)';
-        }
       }
     });
   }

@@ -6,13 +6,10 @@
 venv/
 
 # Ignore bash scripts
-run_server.sh
-kill_server.sh
-gcp_deploy.sh
-run_tests.sh
-run_android_app.sh
-dump_state.sh
+*.sh
 
+# Ignore utils
+utils/
 
 # Ignre env files containing secrets
 .env
@@ -21,7 +18,7 @@ dump_state.sh
 # Ignore local state
 state/
 
-# Ignore mobile all
+# Ignore mobile app
 mobile/
 
 # Ignore log files
