@@ -20,6 +20,9 @@ crdb.crt
 # Local state
 state/
 
+# Data dumps
+utils/data_*
+
 # Temporary files
 *-save*
 *.save*
