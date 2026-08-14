@@ -21,6 +21,21 @@ from google.auth.transport import requests as google_requests
 
 auth_bp = Blueprint('auth', __name__)
 
+# Identity used for requests on Cloud Run / AUTH_ENABLED deployments that
+# don't carry any verified identity (no Bearer token, no IAP header, no
+# auth cookie). Rather than rejecting these requests outright, they're
+# treated as a distinct "anonymous" user: they get a fully working session
+# (translate/execute/default DB all work), but routes that are inherently
+# user-scoped (custom DB connections, translation history) explicitly
+# check for this value and refuse it - see `is_anonymous_user` below.
+ANONYMOUS_USER_ID = "anonymous"
+
+
+def is_anonymous_user(user_identity):
+    """True if `user_identity` represents the shared anonymous identity
+    (i.e. a Cloud Run / AUTH_ENABLED request with no verified login)."""
+    return user_identity == ANONYMOUS_USER_ID
+
 
 def get_or_create_session_id():
     """Retrieves or creates a session ID cookie or header."""
@@ -67,9 +82,11 @@ def get_current_user_identity():
     if auth_cookie:
         return auth_cookie.strip()
 
-    # 4. If auth is enabled (Cloud Run), unauthenticated requests return None
+    # 4. If auth is enabled (Cloud Run), requests carrying no verified
+    # identity are treated as the shared anonymous user rather than being
+    # rejected outright - see ANONYMOUS_USER_ID above.
     if GOOGLE_CLIENT_ID or IS_CLOUD_RUN:
-        return None
+        return ANONYMOUS_USER_ID
 
     # 5. Local fallback -> Single 'global' user identity
     return "global"
@@ -128,7 +145,9 @@ def apply_session_cookie(response, session_id):
 def get_current_user_status():
     user_identity = get_current_user_identity()
     session_id = get_or_create_session_id()
-    is_authenticated = bool(user_identity and user_identity != session_id)
+    is_authenticated = bool(
+        user_identity and user_identity != session_id and not is_anonymous_user(user_identity)
+    )
 
     resp = jsonify({
         'authenticated': is_authenticated,

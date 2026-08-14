@@ -502,6 +502,26 @@ textarea:focus {
   color: var(--primary);
 }
 
+/* Anonymous-user restricted state - applied to the DB config badge and
+   the history button when the current (Cloud Run) request has no
+   verified login. Visually grayed-out; clicking shows an explanatory
+   modal instead of the normal dialog (handled in client.js). */
+.history-btn.icon-disabled,
+.status-badge.badge-disabled {
+  opacity: 0.45;
+  filter: grayscale(1);
+  cursor: not-allowed;
+}
+
+.history-btn.icon-disabled:hover {
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-primary);
+}
+
+.status-badge.badge-disabled:hover {
+  background: rgba(255, 255, 255, 0.03);
+}
+
 .crbot-icon-wrapper {
   display: flex;
   align-items: center;
@@ -921,6 +941,23 @@ textarea:focus {
   word-break: normal;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.checkbox-option {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  font-size: 0.85rem;
+  color: var(--text-primary);
+  cursor: pointer;
+  user-select: none;
+}
+
+.checkbox-option input[type="checkbox"] {
+  accent-color: var(--primary);
+  width: 1rem;
+  height: 1rem;
+  cursor: pointer;
 }
 
 .results-container {

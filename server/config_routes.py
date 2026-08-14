@@ -2,10 +2,11 @@
 config_routes.py
 
 The /api/config endpoint: reads/writes the current session's active
-database, and reports back everything the frontend needs to render its
-DB/session UI - including the server-configured list of available Gemini
-models (PRESET_MODELS), which the frontend may pass per-request to
-/api/translate, but which is not tied to or persisted on the session.
+database and its "Automatic SQL Execution" preference, and reports back
+everything the frontend needs to render its DB/session UI - including the
+server-configured list of available Gemini models (PRESET_MODELS), which
+the frontend may pass per-request to /api/translate, but which is not
+tied to or persisted on the session.
 """
 
 from urllib.parse import urlparse
@@ -17,7 +18,10 @@ from app_config import (
     AUTH_ENABLED, IS_CLOUD_RUN, state_store, logger,
 )
 import os
-from auth import get_or_create_session_id, get_current_user_identity, apply_session_cookie
+from auth import (
+    get_or_create_session_id, get_current_user_identity, apply_session_cookie,
+    is_anonymous_user,
+)
 from db import get_db_connection
 
 config_bp = Blueprint('config', __name__)
@@ -27,20 +31,36 @@ config_bp = Blueprint('config', __name__)
 def handle_config():
     session_id = get_or_create_session_id()
     user_identity = get_current_user_identity()
-    is_authenticated = bool(user_identity and user_identity != session_id)
+    is_authenticated = bool(
+        user_identity and user_identity != session_id and not is_anonymous_user(user_identity)
+    )
 
     preset_urls = {db["url"] for db in CONFIGURED_DBS}
 
     if request.method == 'POST':
+        # The DB-connection / auto-SQL-execute config popup is a logged-in
+        # only feature (custom connections are user-scoped - see help.html)
+        # and the frontend never surfaces it to anonymous users. Reject any
+        # direct API call here too, rather than silently no-op'ing it.
+        if is_anonymous_user(user_identity):
+            resp = jsonify({
+                'success': False,
+                'error': 'Please log in to change database connection or execution settings.'
+            })
+            return apply_session_cookie(resp, session_id), 403
+
         data = request.get_json() or {}
         new_db_url = data.get('database_url')
         new_db_name = data.get('database_name')
         is_custom = data.get('is_custom', False)
         custom_databases = data.get('custom_databases')
+        new_auto_sql_execute = data.get('auto_sql_execute')
+        if not isinstance(new_auto_sql_execute, bool):
+            new_auto_sql_execute = None
 
-        if new_db_url:
-            state_store.set_session(user_identity, new_db_url)
-            if is_custom or (new_db_url not in preset_urls):
+        if new_db_url or new_auto_sql_execute is not None:
+            state_store.set_session(user_identity, new_db_url, new_auto_sql_execute)
+            if new_db_url and (is_custom or (new_db_url not in preset_urls)):
                 db_name_to_save = new_db_name
                 if not db_name_to_save:
                     try:
@@ -55,13 +75,20 @@ def handle_config():
         else:
             state_store.set_session(user_identity, DEFAULT_CONN)
 
-    active_conn_str = state_store.get_session(user_identity)
+    session_data = state_store.get_session(user_identity)
+    active_conn_str = session_data["database_url"]
+    auto_sql_execute = session_data["auto_sql_execute"]
     custom_databases = state_store.get_db_connections(user_identity)
     user_custom_name = custom_databases[0]["name"] if custom_databases else None
     user_custom_url = custom_databases[0]["url"] if custom_databases else None
 
     if IS_CLOUD_RUN and not is_authenticated:
-        db_name, username = "", ""
+        # Don't run the introspection query or expose usernames/connection
+        # strings/custom connections to anonymous users - but the preset
+        # display name (e.g. "Demo") is just a label, not a credential, so
+        # show that instead of a generic placeholder.
+        db_name = CONFIGURED_DBS[0]["name"] if CONFIGURED_DBS else "Database"
+        username = ""
         active_conn_str_out = ""
         configured_dbs = []
     else:
@@ -97,6 +124,7 @@ def handle_config():
         'custom_databases': custom_databases or [],
         'gemini_preset_keys': PRESET_MODELS,
         'models': PRESET_MODELS,
+        'auto_sql_execute': auto_sql_execute,
         'database_name': db_name,
         'username': username
     })

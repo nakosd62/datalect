@@ -7,14 +7,18 @@ Read and purge translation history for the current user.
 from flask import Blueprint, jsonify
 
 from app_config import state_store, log_and_generalize_error
-from auth import get_current_user_identity
+from auth import get_current_user_identity, is_anonymous_user
 
 history_bp = Blueprint('history', __name__)
+
+_ANONYMOUS_HISTORY_ERROR = 'Please log in to view or manage translation history.'
 
 
 @history_bp.route('/api/history', methods=['GET'])
 def get_translation_history():
     user_identity = get_current_user_identity()
+    if is_anonymous_user(user_identity):
+        return jsonify({'success': False, 'error': _ANONYMOUS_HISTORY_ERROR}), 403
     try:
         rows, stats, total_count = state_store.get_translation_history(user_identity)
         return jsonify({
@@ -31,6 +35,8 @@ def get_translation_history():
 @history_bp.route('/api/history/purge', methods=['DELETE', 'POST'])
 def purge_translation_history():
     user_identity = get_current_user_identity()
+    if is_anonymous_user(user_identity):
+        return jsonify({'success': False, 'error': _ANONYMOUS_HISTORY_ERROR}), 403
     try:
         state_store.purge_translation_history(user_identity)
         return jsonify({

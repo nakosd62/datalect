@@ -36,6 +36,13 @@ def _effective_user(user_id):
     return user_id or "global"
 
 
+# Default value for a session's "Automatic SQL Execution" preference before
+# it's ever been explicitly set. Applies to brand-new sessions in both
+# backends below (SQLite's schema default and Firestore's missing-field
+# fallback).
+DEFAULT_AUTO_SQL_EXECUTE = True
+
+
 class StateStore(ABC):
     """Backend-agnostic persistence for sessions, saved DB connections, and
     translation history/stats."""
@@ -49,11 +56,13 @@ class StateStore(ABC):
 
     @abstractmethod
     def get_session(self, user_id):
-        """Returns the active database_url for a user/session id."""
+        """Returns {"database_url", "auto_sql_execute"} for a user/session id."""
 
     @abstractmethod
-    def set_session(self, user_id, db_url=None):
-        """Persists the active database_url for a user/session id."""
+    def set_session(self, user_id, db_url=None, auto_sql_execute=None):
+        """Persists the active database_url and/or auto_sql_execute flag for
+        a user/session id. Only the fields passed (not None) are changed -
+        the other is left as-is."""
 
     @abstractmethod
     def get_db_connections(self, user_id):
@@ -120,9 +129,18 @@ class SqliteStateStore(StateStore):
                     CREATE TABLE IF NOT EXISTS sessions (
                         session_id TEXT PRIMARY KEY,
                         database_url TEXT NOT NULL,
+                        auto_sql_execute INTEGER NOT NULL DEFAULT 1,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     );
                 """)
+
+                # Migration: existing DBs created before auto_sql_execute existed.
+                cursor.execute("PRAGMA table_info(sessions);")
+                session_columns = [column[1] for column in cursor.fetchall()]
+                if "auto_sql_execute" not in session_columns:
+                    cursor.execute(
+                        "ALTER TABLE sessions ADD COLUMN auto_sql_execute INTEGER NOT NULL DEFAULT 1;"
+                    )
 
                 # Drop table if it exists under the old schema (where user_id was
                 # the single primary key) or if the temporary custom_databases
@@ -162,30 +180,56 @@ class SqliteStateStore(StateStore):
             with self._connect() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    "SELECT database_url FROM sessions WHERE session_id = ?",
+                    "SELECT database_url, auto_sql_execute FROM sessions WHERE session_id = ?",
                     (effective_user,),
                 )
                 row = cursor.fetchone()
                 if row:
-                    return row[0] or self.default_conn
+                    return {
+                        "database_url": row[0] or self.default_conn,
+                        "auto_sql_execute": bool(row[1]),
+                    }
         except Exception:
             logger.exception("Error fetching session from SQLite")
-        return self.default_conn
+        return {"database_url": self.default_conn, "auto_sql_execute": DEFAULT_AUTO_SQL_EXECUTE}
 
-    def set_session(self, user_id, db_url=None):
-        if not db_url:
+    def set_session(self, user_id, db_url=None, auto_sql_execute=None):
+        if db_url is None and auto_sql_execute is None:
             return
         effective_user = _effective_user(user_id)
         try:
             with self._connect() as conn:
                 cursor = conn.cursor()
+                # Ensure a row exists first (defaults for whichever field
+                # isn't being set), then patch only the field(s) actually
+                # passed in - so e.g. toggling auto_sql_execute alone never
+                # clobbers an already-saved database_url, or vice versa.
+                # A brand-new row that isn't explicitly setting
+                # auto_sql_execute here still gets DEFAULT_AUTO_SQL_EXECUTE
+                # (matching the column's own DEFAULT 1), not False.
+                insert_auto_sql_execute = (
+                    auto_sql_execute if auto_sql_execute is not None else DEFAULT_AUTO_SQL_EXECUTE
+                )
                 cursor.execute("""
-                    INSERT INTO sessions (session_id, database_url, updated_at)
-                    VALUES (?, ?, CURRENT_TIMESTAMP)
-                    ON CONFLICT(session_id) DO UPDATE SET
-                        database_url = excluded.database_url,
-                        updated_at = CURRENT_TIMESTAMP;
-                """, (effective_user, db_url))
+                    INSERT INTO sessions (session_id, database_url, auto_sql_execute)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(session_id) DO NOTHING;
+                """, (effective_user, db_url or self.default_conn, 1 if insert_auto_sql_execute else 0))
+
+                updates = []
+                params = []
+                if db_url is not None:
+                    updates.append("database_url = ?")
+                    params.append(db_url)
+                if auto_sql_execute is not None:
+                    updates.append("auto_sql_execute = ?")
+                    params.append(1 if auto_sql_execute else 0)
+                updates.append("updated_at = CURRENT_TIMESTAMP")
+                params.append(effective_user)
+                cursor.execute(
+                    f"UPDATE sessions SET {', '.join(updates)} WHERE session_id = ?",
+                    params,
+                )
                 conn.commit()
         except Exception:
             logger.exception("Error saving session to SQLite")
@@ -317,20 +361,27 @@ class FirestoreStateStore(StateStore):
 
     def get_session(self, user_id):
         if not user_id:
-            return self.default_conn
+            return {"database_url": self.default_conn, "auto_sql_execute": DEFAULT_AUTO_SQL_EXECUTE}
         try:
             doc = self.client.collection("sessions").document(user_id).get()
             if doc.exists:
                 data = doc.to_dict() or {}
-                return data.get("database_url", self.default_conn)
+                return {
+                    "database_url": data.get("database_url", self.default_conn),
+                    "auto_sql_execute": bool(data.get("auto_sql_execute", DEFAULT_AUTO_SQL_EXECUTE)),
+                }
         except Exception:
             logger.exception("Error fetching session from Firestore")
-        return self.default_conn
+        return {"database_url": self.default_conn, "auto_sql_execute": DEFAULT_AUTO_SQL_EXECUTE}
 
-    def set_session(self, user_id, db_url=None):
-        if not user_id or not db_url:
+    def set_session(self, user_id, db_url=None, auto_sql_execute=None):
+        if not user_id or (db_url is None and auto_sql_execute is None):
             return
-        update_data = {"database_url": db_url, "updated_at": firestore.SERVER_TIMESTAMP}
+        update_data = {"updated_at": firestore.SERVER_TIMESTAMP}
+        if db_url is not None:
+            update_data["database_url"] = db_url
+        if auto_sql_execute is not None:
+            update_data["auto_sql_execute"] = bool(auto_sql_execute)
         try:
             self.client.collection("sessions").document(user_id).set(update_data, merge=True)
         except Exception:

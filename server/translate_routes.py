@@ -13,12 +13,23 @@ import time
 from flask import Blueprint, request, jsonify
 from google import genai
 from google.genai import types
+from google.genai import errors as genai_errors
 
-from app_config import DEFAULT_MODEL, logger, log_and_generalize_error
-from auth import get_or_create_session_id, get_current_user_identity, apply_session_cookie
+# from app_config import DEFAULT_MODEL, logger, log_and_generalize_error
+from app_config import DEFAULT_MODEL, logger
+
+from auth import get_or_create_session_id, get_current_user_identity, apply_session_cookie, is_anonymous_user
 from db import resolve_conn_str, get_database_schema, record_translation
 
 translate_bp = Blueprint('translate', __name__)
+
+# Transient Gemini failures (rate limiting, or the server-side hiccups it
+# occasionally throws as a plain "500 INTERNAL") are worth a few automatic
+# retries - the same request usually succeeds a couple seconds later.
+# Anything else (bad request, invalid model, auth failure, etc.) will just
+# fail the same way again, so it's raised immediately instead.
+MAX_GEMINI_ATTEMPTS = 5
+GEMINI_RETRY_DELAY_SECONDS = 2
 
 
 def get_gemini_api_keys():
@@ -41,6 +52,32 @@ def pick_gemini_api_key():
     if not keys:
         return None
     return random.choice(keys)
+
+
+def _gemini_error_code(exc):
+    """Best-effort extraction of the HTTP-style status code the google-genai
+    SDK attaches to APIError subclasses. Different SDK versions have used
+    different attribute names, so this checks a couple."""
+    for attr in ("code", "status_code"):
+        val = getattr(exc, attr, None)
+        if isinstance(val, int):
+            return val
+    return None
+
+
+def _is_retryable_gemini_error(exc):
+    """429 (rate limit) and any 5xx (transient, server-side - e.g. the
+    "500 INTERNAL" Gemini occasionally returns) are worth retrying."""
+    code = _gemini_error_code(exc)
+    if code == 429:
+        return True
+    if isinstance(code, int) and 500 <= code < 600:
+        return True
+    # Fallback for SDK versions where APIError doesn't expose a numeric
+    # code attribute - ServerError is only ever raised for 5xx responses.
+    if isinstance(exc, genai_errors.ServerError):
+        return True
+    return False
 
 
 def format_results_table_text(columns, rows, max_rows=500):
@@ -139,14 +176,27 @@ def translate_query():
         )
 
         start_time = time.perf_counter()
-        response = client.models.generate_content(
-            model=gemini_model,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                temperature=0.1
-            )
-        )
+        response = None
+        for attempt in range(1, MAX_GEMINI_ATTEMPTS + 1):
+            try:
+                response = client.models.generate_content(
+                    model=gemini_model,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                        temperature=0.1
+                    )
+                )
+                break
+            except Exception as e:
+                if attempt < MAX_GEMINI_ATTEMPTS and _is_retryable_gemini_error(e):
+                    logger.warning(
+                        "Gemini call failed (attempt %d/%d), retrying in %ds: %s",
+                        attempt, MAX_GEMINI_ATTEMPTS, GEMINI_RETRY_DELAY_SECONDS, e
+                    )
+                    time.sleep(GEMINI_RETRY_DELAY_SECONDS)
+                    continue
+                raise
         end_time = time.perf_counter()
 
         generated_sql = response.text.strip() if response.text else ""
@@ -166,7 +216,12 @@ def translate_query():
         thinking_tokens = getattr(usage, 'thoughts_token_count', 0) if usage else 0
         cached_content_tokens = getattr(usage, 'cached_content_token_count', 0) if usage else 0
 
-        record_translation(user_identity, conn_str, prompt, generated_sql, gemini_model, duration, input_tokens, output_tokens, total_tokens, thinking_tokens, cached_content_tokens)
+        # Anonymous users share a single identity and can't view/purge
+        # history anyway (see history_routes.py) - skip logging their
+        # translations so the history table doesn't fill up with
+        # unreadable, unattributable rows.
+        if not is_anonymous_user(user_identity):
+            record_translation(user_identity, conn_str, prompt, generated_sql, gemini_model, duration, input_tokens, output_tokens, total_tokens, thinking_tokens, cached_content_tokens)
 
         resp = jsonify({
             'success': True,
@@ -179,10 +234,11 @@ def translate_query():
             'duration': duration
         })
         return apply_session_cookie(resp, session_id)
+
     except Exception as e:
-        safe_message = log_and_generalize_error("Translation failed", e)
+        logger.exception("Translation failed")
         resp = jsonify({
             'success': False,
-            'error': safe_message
+            'error': str(e) or f"{type(e).__name__} occurred during translation."
         })
         return apply_session_cookie(resp, session_id), 500

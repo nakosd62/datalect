@@ -77,6 +77,13 @@ document.addEventListener('DOMContentLoaded', async () => {
   let customDbUrl = "";
   let customDbName = "";
   let customDatabases = [];
+  let autoSqlExecuteEnabled = true;
+  // True when running on Cloud Run and the current request has no verified
+  // login (i.e. the backend resolved it to the shared "anonymous" user).
+  // Anonymous users get full translate/execute functionality, but the DB
+  // connection config popup and translation history popup are gated -
+  // see updateAnonymousRestrictions() / showLoginRequiredModal().
+  let isAnonymousUser = false;
 
   function getDatabaseNameFromUrl(urlStr) {
     if (!urlStr) return "Custom";
@@ -160,8 +167,56 @@ document.addEventListener('DOMContentLoaded', async () => {
   const configTriggerBadge = document.getElementById('configTriggerBadge');
   const modalCloseBtn = document.getElementById('modalCloseBtn');
   const configSaveBtn = document.getElementById('configSaveBtn');
+  const autoSqlExecuteCheckbox = document.getElementById('autoSqlExecuteCheckbox');
   const connDbName = document.getElementById('connDbName');
   const connDbDot = document.getElementById('connDbDot');
+
+  // DOM Elements - Login Required Modal (shown when an anonymous user
+  // clicks the DB config badge or the history button)
+  const loginRequiredModal = document.getElementById('loginRequiredModal');
+  const loginRequiredModalText = document.getElementById('loginRequiredModalText');
+  const loginRequiredModalCloseBtn = document.getElementById('loginRequiredModalCloseBtn');
+  const loginRequiredModalOkBtn = document.getElementById('loginRequiredModalOkBtn');
+
+  function showLoginRequiredModal(message) {
+    if (!loginRequiredModal) return;
+    if (loginRequiredModalText) loginRequiredModalText.textContent = message;
+    loginRequiredModal.classList.remove('hidden');
+  }
+
+  function closeLoginRequiredModal() {
+    if (loginRequiredModal) loginRequiredModal.classList.add('hidden');
+  }
+
+  if (loginRequiredModalCloseBtn) {
+    loginRequiredModalCloseBtn.addEventListener('click', closeLoginRequiredModal);
+  }
+  if (loginRequiredModalOkBtn) {
+    loginRequiredModalOkBtn.addEventListener('click', closeLoginRequiredModal);
+  }
+  if (loginRequiredModal) {
+    loginRequiredModal.addEventListener('click', (e) => {
+      if (e.target === loginRequiredModal) closeLoginRequiredModal();
+    });
+  }
+
+  // Grays out (and disables the normal behavior of) the DB config badge
+  // and the history button for anonymous users. Called whenever
+  // isAnonymousUser changes (i.e. every time fetchBackendConfig() resolves).
+  function updateAnonymousRestrictions() {
+    if (configTriggerBadge) {
+      configTriggerBadge.classList.toggle('badge-disabled', isAnonymousUser);
+      if (isAnonymousUser) {
+        configTriggerBadge.title = 'Log in to configure your database connection';
+      }
+    }
+    if (historyBtn) {
+      historyBtn.classList.toggle('icon-disabled', isAnonymousUser);
+      historyBtn.title = isAnonymousUser
+        ? 'Log in to view translation history'
+        : 'Translation History';
+    }
+  }
 
   // DOM Elements - Help Modal
   const helpModal = document.getElementById('helpModal');
@@ -308,8 +363,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   });
 
-  let isGoogleAuthInitialized = false;
-
   function parseJwt(token) {
     try {
       const base64Url = token.split('.')[1];
@@ -322,6 +375,8 @@ document.addEventListener('DOMContentLoaded', async () => {
       return null;
     }
   }
+
+  let lastRenderedAuthState = null;
 
   function handleLogout() {
     googleIdToken = null;
@@ -340,6 +395,23 @@ document.addEventListener('DOMContentLoaded', async () => {
     const existingToken = googleIdToken;
     const payload = existingToken ? parseJwt(existingToken) : null;
     const isExpired = payload && payload.exp && (payload.exp * 1000 < Date.now());
+
+    // renderAuthUI() runs on every fetchBackendConfig() call - including
+    // once per prompt/execute, since translatePrompt() re-syncs config
+    // first. When nothing about the auth state has actually changed,
+    // skip re-rendering: for a signed-out (anonymous) user the "no
+    // token" branch below tears down and rebuilds the Google Sign-In
+    // button (a real iframe) from scratch, which was causing visible
+    // header flicker/jitter on every single request. Signed-in users
+    // don't hit this because their branch renders a small static avatar
+    // div, and local (no-auth) mode never calls this function at all -
+    // which is why the jitter only showed up for anonymous Cloud Run use.
+    const signedIn = !!(existingToken && payload && !isExpired);
+    const authStateKey = signedIn ? `in:${payload.email || ''}` : `out:${currentGoogleClientId || ''}`;
+    if (authStateKey === lastRenderedAuthState) {
+      return;
+    }
+    lastRenderedAuthState = authStateKey;
 
     if (existingToken && payload && !isExpired) {
       const userEmail = payload.email || 'Authenticated';
@@ -425,10 +497,10 @@ document.addEventListener('DOMContentLoaded', async () => {
           logo_alignment: 'left'
         });
 
-        if (!isGoogleAuthInitialized) {
-          isGoogleAuthInitialized = true;
-          google.accounts.id.prompt();
-        }
+        // Deliberately no google.accounts.id.prompt() here - on Cloud Run
+        // the app supports anonymous use, so we don't want the One Tap
+        // sign-in prompt popping up unasked on every load. The rendered
+        // button above is always available for anyone who wants to log in.
       }
     }
   }
@@ -545,7 +617,19 @@ document.addEventListener('DOMContentLoaded', async () => {
   async function updateConnectionDetails(data) {
     const badge = document.getElementById('configTriggerBadge');
 
-    if ((data && data.is_cloud_run && !data.authenticated) || (!data?.database_name && !data?.custom_database_name)) {
+    if (isAnonymousUser) {
+      // The backend withholds usernames/connection strings/custom
+      // connections from anonymous requests, but does send back the
+      // preset display name (e.g. "Demo") in data.database_name since
+      // that's just a label, not a credential.
+      if (badge) badge.style.display = '';
+      if (connDbName) connDbName.textContent = data?.database_name || 'Database';
+      document.title = `yDyL`;
+      await checkDbStatus();
+      return;
+    }
+
+    if (!data?.database_name && !data?.custom_database_name) {
       if (badge) badge.style.display = 'none';
       return;
     }
@@ -579,6 +663,9 @@ document.addEventListener('DOMContentLoaded', async () => {
       const response = await fetch('/api/config', { headers: getApiHeaders(), credentials: 'same-origin' });
       const data = await response.json();
 
+      isAnonymousUser = Boolean(data && data.is_cloud_run && !data.authenticated);
+      updateAnonymousRestrictions();
+
       CONFIGURED_DBS = data.configured_databases || [];
       DEFAULT_DB_URL = data.default_database_url || "";
       ACTIVE_DB_URL = data.active_database_url || DEFAULT_DB_URL;
@@ -595,6 +682,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         customDatabases = [{ name: customDbName || "Custom", url: customDbUrl }];
       } else {
         customDatabases = [];
+      }
+
+      if (data.auto_sql_execute !== undefined) {
+        autoSqlExecuteEnabled = Boolean(data.auto_sql_execute);
       }
 
       if (data.auth_enabled && data.google_client_id) {
@@ -781,6 +872,10 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
     }
 
+    const autoSqlExecuteValue = autoSqlExecuteCheckbox
+      ? autoSqlExecuteCheckbox.checked
+      : autoSqlExecuteEnabled;
+
     try {
       const response = await fetch('/api/config', {
         method: 'POST',
@@ -790,7 +885,8 @@ document.addEventListener('DOMContentLoaded', async () => {
           database_name: dbNameValue,
           database_url: dbUrlValue,
           is_custom: isCustomOption,
-          custom_databases: customDatabases.filter(d => d.url && d.url.trim() !== "")
+          custom_databases: customDatabases.filter(d => d.url && d.url.trim() !== ""),
+          auto_sql_execute: autoSqlExecuteValue
         })
       });
 
@@ -808,7 +904,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (data.custom_databases !== undefined) {
           customDatabases = data.custom_databases;
         }
-        
+        if (data.auto_sql_execute !== undefined) {
+          autoSqlExecuteEnabled = Boolean(data.auto_sql_execute);
+        }
+
         await updateConnectionDetails(data);
       }
     } catch (err) {
@@ -831,6 +930,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     const config = loadConfig();
     renderDbRadioButtons(config.dbUrl);
     updateHistoryTurnsSubtitle();
+    if (autoSqlExecuteCheckbox) {
+      autoSqlExecuteCheckbox.checked = autoSqlExecuteEnabled;
+    }
   }
 
   function closeConfigModal() {
@@ -839,6 +941,12 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   if (configTriggerBadge && configModal) {
     configTriggerBadge.addEventListener('click', async () => {
+      if (isAnonymousUser) {
+        showLoginRequiredModal(
+          'Configuring a custom database connection is available to signed-in users only. Please log in with Google to access this feature.'
+        );
+        return;
+      }
       await fetchBackendConfig();
       configModal.classList.remove('hidden');
     });
@@ -1066,6 +1174,12 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   if (historyBtn && historyModal) {
     historyBtn.addEventListener('click', () => {
+      if (isAnonymousUser) {
+        showLoginRequiredModal(
+          'Viewing translation history is available to signed-in users only. Please log in with Google to access this feature.'
+        );
+        return;
+      }
       updateHistoryTurnsSubtitle();
       const purgeTitleEl = document.querySelector('.btn-purge-title');
       if (purgeTitleEl) {
@@ -1229,7 +1343,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         const isResourceExhausted = errUpper.includes('429 RESOURCE_EXHAUSTED');
         const isTemporaryFailure = errUpper.includes('503 UNAVAILABLE');
 
-        if ((!response.ok || !data.sql)  &&  isResourceExhausted  &&  attempts < maxAttempts) {
+        if ((!response.ok || !data.sql) && (isResourceExhausted || isTemporaryFailure) && attempts < maxAttempts) {
           await new Promise(resolve => setTimeout(resolve, 2000));
           continue;
         }
@@ -1267,6 +1381,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         } else {
           setSqlQuery(data.sql);
           chatStore.setPending(modelEntry, normalizeSqlForCompare(data.sql));
+
+          if (autoSqlExecuteEnabled) {
+            await executeSql();
+          }
         }
       } else {
         setSqlQuery('');
