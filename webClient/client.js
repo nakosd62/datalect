@@ -1842,7 +1842,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   // automatically once, showing the Quick Start section. Every later visit
   // (once ONBOARDING_SEEN_KEY is set) leaves this alone.
   if (!hasSeenOnboarding()) {
-    openHelpModal();
+    //openHelpModal();
     markOnboardingSeen();
   }
 

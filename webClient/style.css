@@ -819,13 +819,15 @@ textarea:focus {
 .modal-close-btn {
   background: none;
   border: none;
-  color: var(--text-muted);
+  color: var(--text-primary);
+  opacity: 0.75;
   font-size: 1.5rem;
   cursor: pointer;
 }
 
 .modal-close-btn:hover {
   color: var(--text-primary);
+  opacity: 1;
 }
 
 /* Shown inside the Help modal only when the "Quick prompts" row has been
@@ -1778,8 +1780,8 @@ textarea:focus {
   transform: translateY(-50%);
   display: inline-flex;
   align-items: center;
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.18);
   border-radius: 4px;
   overflow: hidden;
   height: 24px;
@@ -1790,14 +1792,14 @@ textarea:focus {
 .speech-bubble-wrapper .inline-history-nav span {
   padding: 0 0.35rem;
   font-size: 0.7rem;
-  font-weight: 500;
+  font-weight: 700;
   height: 100%;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   background: transparent;
   border: none;
-  color: var(--text-secondary);
+  color: var(--text-primary);
   user-select: none;
 }
 
@@ -1807,22 +1809,22 @@ textarea:focus {
 }
 
 .speech-bubble-wrapper .inline-history-nav button:hover {
-  background: rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.18);
   color: var(--text-primary);
 }
 
 .speech-bubble-wrapper .inline-history-nav button:first-child {
-  border-right: 1px solid rgba(255, 255, 255, 0.12);
+  border-right: 1px solid rgba(255, 255, 255, 0.18);
 }
 
 .speech-bubble-wrapper .inline-history-nav button:last-child {
-  border-left: 1px solid rgba(255, 255, 255, 0.12);
+  border-left: 1px solid rgba(255, 255, 255, 0.18);
 }
 
 .speech-bubble-wrapper .inline-history-nav button:disabled,
 .speech-bubble-wrapper .inline-history-nav button.is-boundary {
-  color: var(--text-muted);
-  opacity: 0.35;
+  color: var(--text-secondary);
+  opacity: 0.5;
   cursor: not-allowed;
   background: transparent;
 }
@@ -1830,7 +1832,7 @@ textarea:focus {
 .speech-bubble-wrapper .inline-history-nav button:disabled:hover,
 .speech-bubble-wrapper .inline-history-nav button.is-boundary:hover {
   background: transparent;
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 /* Adjust textarea padding to prevent text overlap with the inline controls & mic */
