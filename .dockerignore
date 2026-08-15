@@ -11,6 +11,9 @@ venv/
 # Ignore utils
 utils/
 
+# Ignore README
+README.md
+
 # Ignre env files containing secrets
 .env
 .env-sample

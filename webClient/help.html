@@ -1,49 +1,56 @@
 <p>
-Welcome to <strong>yDyL</strong>! It will help you talk to your Data in your Language. 
-Here is a quick guide on how to interact with it.
-</p>
-
-<h3>User Authentication</h3>
-<p>
-To use the full-featured application, you must authenticate using Google. 
-You may use a restricted version of the app as an anonymous user. 
-This is because some features need to be scoped by user to be safe.
-</p>
-
-<h3>Database Connection</h3>
-<p>
-By default, you are connected to a playground database. 
-The demo environment is read-only although the application can deal with DML and DDL as well. 
-You may change the database connection by clicking on the database badge in the header and 
-entering your own postgres-compliant database connection. 
-Note: custom connections are user-scoped so this featrue si only available to logged on users.
-</p>
-
-<h3>Natural Language Prompt</h3>
-<p>
-Type your query or instruction into the top text box in plain English or any other language. 
-Click return when you are done. You may use shift-return for multi-line prompts.
-</p>
-
-<h3>SQL Query</h3>
-<p>
-Review the SQL in the SQL editor box. You can manually edit the statement or write custom queries from scratch. 
-Click <strong>Execute SQL</strong> to run the command. 
-You may configure the application to run the SQL query automatically after successful prompt translation. 
-To do that use the database connections configuration popup dialog.
-</p>
-
-<h3>Multi-turn Conversations</h3>
-<p>
-The application remembers your last <strong>10 turns</strong>. 
-Each turn contains the prompt, the SQL it generated, and the results that came back from the database. 
-Use the <strong>◀ / ▶</strong> arrows in the NL prompt text box to step back and forward through previous turns. 
-Reloading the app will erase past chat history/turns.
-</p>
-
-<h3>Application Metadata</h3>
-<p>
-yDyL was built by <a href="mailto:nakosd@gmail.com" target="_blank" rel="noopener noreferrer">nakosd@gmail.com</a> in 2026 
-and its source is available on <a href="https://github.com/nakosd62/ydyl" target="_blank" rel="noopener noreferrer">GitHub</a>. 
-If you have comments or questions, please send them along.
-</p>
+    Welcome to <strong>yDyL</strong> - it helps you talk to your Data in your Language.
+    </p>
+    
+    <div class="help-quickstart">
+      <h3>Quick Start</h3>
+      <ol>
+        <li>Type a question in plain English into the top box (e.g. "What tables are in this database?") and hit <strong>Enter</strong>. You're automatically connected to a read-only demo database, so there's nothing to set up first.</li>
+        <li>yDyL translates it into SQL and fills in the box below - review it (or edit it) before running anything.</li>
+        <li>Click <strong>Execute</strong> to run the query and see the results at the bottom of the page.</li>
+      </ol>
+      <p>Not sure what to ask? Click one of the example prompts above the SQL box to see the whole flow in action.</p>
+    </div>
+    
+    <h3>Database Connection</h3>
+    <p>
+    By default, you're connected to a shared playground database, which is read-only even though the
+    application itself can handle DML and DDL. You can connect your own postgres-compliant database by
+    clicking the database badge in the header and entering a connection string.
+    Note: custom connections are user-scoped, so this feature is only available to logged-in users.
+    </p>
+    
+    <h3>User Authentication</h3>
+    <p>
+    To use the full-featured application, sign in with Google. You can also use a restricted version of
+    the app as an anonymous user - some features (custom database connections, translation history) need
+    to be scoped to a specific user to be safe, so they're only available once you're signed in.
+    </p>
+    
+    <h3>Natural Language Prompt</h3>
+    <p>
+    Type your query or instruction into the top text box in plain English or any other language.
+    Click return when you're done, or shift-return for multi-line prompts.
+    </p>
+    
+    <h3>SQL Query</h3>
+    <p>
+    Review the SQL in the SQL editor box. You can manually edit the statement or write custom queries from
+    scratch. Click <strong>Execute</strong> to run the command. You can also configure the app to run the
+    generated SQL automatically after each translation, from the database connection configuration popup.
+    </p>
+    
+    <h3>Multi-turn Conversations</h3>
+    <p>
+    The application remembers your last <strong>10 turns</strong>. Each turn contains the prompt, the SQL
+    it generated, and the results that came back from the database. Use the <strong>&#9664; / &#9654;</strong>
+    arrows in the NL prompt text box to step back and forward through previous turns. Reloading the app
+    will erase past chat history/turns.
+    </p>
+    
+    <h3>Application Metadata</h3>
+    <p>
+    yDyL was built by <a href="mailto:nakosd@gmail.com" target="_blank" rel="noopener noreferrer">nakosd@gmail.com</a> in 2026
+    and its source is available on <a href="https://github.com/nakosd62/ydyl" target="_blank" rel="noopener noreferrer">GitHub</a>.
+    If you have comments or questions, please send them along.
+    </p>

@@ -502,6 +502,21 @@ textarea:focus {
   color: var(--primary);
 }
 
+/* First-run onboarding cue: subtle glowing ring on the Help button so a
+   brand-new user notices there's something to click, without being as
+   disruptive as a tooltip or overlay. Removed permanently (see
+   ONBOARDING_SEEN_KEY in client.js) the first time Help is opened. */
+.help-btn-attention {
+  color: var(--primary);
+  border-color: var(--primary);
+  animation: help-btn-pulse 2s ease-in-out infinite;
+}
+
+@keyframes help-btn-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 var(--primary-glow); }
+  50% { box-shadow: 0 0 0 6px var(--primary-glow); }
+}
+
 /* Anonymous-user restricted state - applied to the DB config badge and
    the history button when the current (Cloud Run) request has no
    verified login. Visually grayed-out; clicking shows an explanatory
@@ -813,6 +828,31 @@ textarea:focus {
   color: var(--text-primary);
 }
 
+/* Shown inside the Help modal only when the "Quick prompts" row has been
+   dismissed - the real UI path back to it (see restoreQuickPrompts() in
+   client.js), so nobody has to reach for devtools/localStorage. */
+.help-modal-actions {
+  padding: 0.6rem 1.25rem;
+  border-bottom: 1px solid var(--bg-card-border);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.restore-quick-prompts-btn {
+  background: transparent;
+  border: 1px solid var(--bg-card-border);
+  color: var(--primary-hover);
+  font-size: 0.8rem;
+  padding: 0.3rem 0.75rem;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: var(--transition);
+}
+
+.restore-quick-prompts-btn:hover {
+  background: var(--primary-glow);
+  border-color: var(--primary);
+}
+
 .modal-body {
   padding: 1.25rem;
   display: flex;
@@ -837,6 +877,30 @@ textarea:focus {
 
 .help-dialog-body p {
   font-size: 0.85rem;
+}
+
+.help-dialog-body ol,
+.help-dialog-body ul {
+  font-size: 0.85rem;
+  padding-left: 1.25rem;
+  margin: 0.4rem 0;
+}
+
+.help-dialog-body li {
+  margin-bottom: 0.4rem;
+}
+
+.help-dialog-body .help-quickstart {
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--bg-card-border);
+  border-radius: 8px;
+  padding: 0.9rem 1rem 0.9rem 0.4rem;
+  margin-bottom: 1rem;
+}
+
+.help-dialog-body .help-quickstart h3 {
+  margin-top: 0;
+  padding-left: 0.6rem;
 }
 
 .config-section {
@@ -1121,6 +1185,70 @@ textarea:focus {
   align-items: center;
   gap: 0.75rem;
   min-height: 52px;
+}
+
+/* Zero-state guidance: clickable example prompts shown above the SQL box
+   so a first-time user with a blank prompt field has something concrete
+   to click instead of guessing what the app can do. */
+.example-prompts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0 0.25rem;
+}
+
+.example-prompts-label {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  margin-right: 0.15rem;
+}
+
+.example-chip {
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--bg-card-border);
+  color: var(--text-secondary);
+  padding: 0.3rem 0.75rem;
+  border-radius: 999px;
+  font-size: 0.8rem;
+  cursor: pointer;
+  transition: var(--transition);
+  white-space: nowrap;
+}
+
+.example-chip:hover {
+  background: var(--primary-glow);
+  border-color: var(--primary);
+  color: var(--primary-hover);
+}
+
+.example-chip:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.example-chip:disabled:hover {
+  background: rgba(255, 255, 255, 0.05);
+  border-color: var(--bg-card-border);
+  color: var(--text-secondary);
+}
+
+.example-prompts-dismiss {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-size: 1.1rem;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0.15rem 0.4rem;
+  margin-left: auto;
+  border-radius: 4px;
+  transition: var(--transition);
+}
+
+.example-prompts-dismiss:hover {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.08);
 }
 
 /* Action Buttons Column */

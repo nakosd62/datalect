@@ -47,10 +47,23 @@ def get_gemini_api_keys():
     return keys
 
 
-def pick_gemini_api_key():
+def pick_gemini_api_key(exclude=None):
+    """Pick a Gemini API key at random from the configured pool.
+
+    `exclude` is an optional set of keys already tried during this
+    request (e.g. one that just came back rate-limited) - those are
+    avoided when a fresh alternative exists. If every configured key is
+    already in `exclude`, falls back to the full pool rather than
+    returning None, so a request with more retry attempts than
+    configured keys still retries something instead of giving up early.
+    """
     keys = get_gemini_api_keys()
     if not keys:
         return None
+    if exclude:
+        remaining = [k for k in keys if k not in exclude]
+        if remaining:
+            return random.choice(remaining)
     return random.choice(keys)
 
 
@@ -65,19 +78,38 @@ def _gemini_error_code(exc):
     return None
 
 
-def _is_retryable_gemini_error(exc):
-    """429 (rate limit) and any 5xx (transient, server-side - e.g. the
-    "500 INTERNAL" Gemini occasionally returns) are worth retrying."""
+# Retry policy, keyed by failure type. This is the single place to add
+# retry behavior for a new kind of Gemini failure as it comes up - each
+# classifier below just needs to return a dict describing how to retry:
+#   - delay (float): seconds to sleep before the next attempt
+#   - rotate_key (bool): pick a different configured API key for the next
+#     attempt rather than reusing the one that just failed. Used for
+#     capacity/rate-limit errors, where the same key would likely just
+#     fail the same way again; transient server-side errors aren't
+#     key-related, so they retry with the same key.
+# Returning None means "don't retry this - raise immediately" (e.g. bad
+# request, invalid model, auth failure - these fail the same way every
+# time, so retrying wastes the attempt budget).
+
+def _classify_gemini_error(exc):
+    """Decide whether/how to retry a failed Gemini call. Returns a retry
+    action dict (see policy comment above) or None to raise immediately."""
     code = _gemini_error_code(exc)
+
+    # 429 - per-key rate limit / capacity exhausted. Rotate to a
+    # different configured key so the next attempt isn't just hitting
+    # the same limit again.
     if code == 429:
-        return True
-    if isinstance(code, int) and 500 <= code < 600:
-        return True
-    # Fallback for SDK versions where APIError doesn't expose a numeric
-    # code attribute - ServerError is only ever raised for 5xx responses.
-    if isinstance(exc, genai_errors.ServerError):
-        return True
-    return False
+        return {"rotate_key": True, "delay": GEMINI_RETRY_DELAY_SECONDS}
+
+    # 5xx - transient, server-side hiccup (e.g. the plain "500 INTERNAL"
+    # Gemini occasionally throws) unrelated to which key was used, so the
+    # same key is fine to retry with.
+    is_server_error = (isinstance(code, int) and 500 <= code < 600) or isinstance(exc, genai_errors.ServerError)
+    if is_server_error:
+        return {"rotate_key": False, "delay": GEMINI_RETRY_DELAY_SECONDS}
+
+    return None
 
 
 def format_results_table_text(columns, rows, max_rows=500):
@@ -131,10 +163,12 @@ def translate_query():
     data = request.get_json() or {}
 
     gemini_model = data.get('gemini_model') or data.get('model') or DEFAULT_MODEL
+    tried_gemini_keys = set()
     api_key = pick_gemini_api_key()
 
     if not api_key:
         return jsonify({'error': 'Gemini API key is not configured.'}), 400
+    tried_gemini_keys.add(api_key)
 
     prompt = data.get('prompt', '').strip()
     if not prompt:
@@ -189,14 +223,28 @@ def translate_query():
                 )
                 break
             except Exception as e:
-                if attempt < MAX_GEMINI_ATTEMPTS and _is_retryable_gemini_error(e):
+                retry_action = _classify_gemini_error(e)
+                if attempt >= MAX_GEMINI_ATTEMPTS or retry_action is None:
+                    raise
+
+                if retry_action["rotate_key"]:
+                    next_key = pick_gemini_api_key(exclude=tried_gemini_keys)
+                    if next_key != api_key:
+                        api_key = next_key
+                        client = genai.Client(api_key=api_key)
+                    tried_gemini_keys.add(api_key)
+                    logger.warning(
+                        "Gemini call failed (attempt %d/%d), rotating API key and retrying in %ds: %s",
+                        attempt, MAX_GEMINI_ATTEMPTS, retry_action["delay"], e
+                    )
+                else:
                     logger.warning(
                         "Gemini call failed (attempt %d/%d), retrying in %ds: %s",
-                        attempt, MAX_GEMINI_ATTEMPTS, GEMINI_RETRY_DELAY_SECONDS, e
+                        attempt, MAX_GEMINI_ATTEMPTS, retry_action["delay"], e
                     )
-                    time.sleep(GEMINI_RETRY_DELAY_SECONDS)
-                    continue
-                raise
+
+                time.sleep(retry_action["delay"])
+                continue
         end_time = time.perf_counter()
 
         generated_sql = response.text.strip() if response.text else ""

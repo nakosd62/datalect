@@ -1,4 +1,23 @@
+// =============================================================================
+// client.js - file map (in order; all sections share one closure/scope, see
+// the top-level DOMContentLoaded listener below):
+//   1. State & chat history store
+//   2. DOM element references + small modal wiring (login-required, help)
+//   3. Speech recognition (mic button)
+//   4. Shared UI helpers (button state, SQL formatting/display, DB status)
+//   5. Backend config sync + database connection config modal
+//   6. Help button onboarding (auto-open once, pulsing ring)
+//   7. History modal: tabs, stats charts, load/purge
+//   8. Results rendering helpers
+//   9. Translate (NL -> SQL) and Execute SQL
+//  10. Input wiring: NL prompt box, translate/execute buttons
+//  11. Quick prompts: dismiss / restore
+//  12. History navigation (back/forward through turns), purge, final init
+// =============================================================================
 document.addEventListener('DOMContentLoaded', async () => {
+  // ===========================================================================
+  // 1. STATE & CHAT HISTORY STORE
+  // ===========================================================================
   // Encapsulates the model's conversation memory: the turns sent to
   // /api/translate as `history`, the undo/redo stacks behind the back/forward
   // arrows, and the "SQL generated but not yet executed" pointer. Consolidating
@@ -151,6 +170,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     return headers;
   }
 
+  // ===========================================================================
+  // 2. DOM ELEMENT REFERENCES + SMALL MODAL WIRING
+  //    (login-required modal, help modal fetch/open logic - full onboarding
+  //    wiring for the help button lives further down, in section 6)
+  // ===========================================================================
   // DOM Elements - Primary Controls
   const aiPrompt = document.getElementById('aiPrompt');
   const sqlQueryTextarea = document.getElementById('sqlQuery');
@@ -242,6 +266,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   function openHelpModal() {
     if (!helpModal) return;
     helpModal.classList.remove('hidden');
+    updateRestoreQuickPromptsVisibility();
     if (!helpModalBody) return;
     loadHelpContent()
       .then(html => {
@@ -276,6 +301,9 @@ document.addEventListener('DOMContentLoaded', async () => {
   let chartCountInstance = null;
   let chartTotalTokensInstance = null;
 
+  // ===========================================================================
+  // 3. SPEECH RECOGNITION (mic button)
+  // ===========================================================================
   // Speech Recognition Instance & Multi-target Handler
   let recognition = null;
   let isListening = false;
@@ -509,10 +537,24 @@ document.addEventListener('DOMContentLoaded', async () => {
     renderAuthUI(clientId);
   }
 
+  // ===========================================================================
+  // 4. SHARED UI HELPERS
+  //    (button/textarea state, SQL formatting/display, results-display
+  //    resets, history-nav button state, live DB connection status)
+  // ===========================================================================
   function setButtonsDisabled(disabled) {
     if (translateBtn) translateBtn.disabled = disabled;
     if (runBtn) runBtn.disabled = disabled;
     if (micBtn) micBtn.disabled = disabled;
+    // Example prompt chips: queried live (rather than via the
+    // examplePromptButtons closure declared further down) so this works
+    // regardless of where in the file setButtonsDisabled is called from.
+    // Without this, clicking one chip while its translation is still in
+    // flight let someone click a second (or third) chip and stack up
+    // overlapping requests.
+    document.querySelectorAll('.example-chip').forEach(btn => {
+      btn.disabled = disabled;
+    });
     document.body.style.cursor = disabled ? 'wait' : 'default';
 
     if (disabled) {
@@ -658,6 +700,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     return found ? found.url : null;
   }
 
+  // ===========================================================================
+  // 5. BACKEND CONFIG SYNC + DATABASE CONNECTION CONFIG MODAL
+  //    (fetch /api/config, render preset/custom DB radio options, save
+  //    connection + auto-execute preference, config modal open/close)
+  // ===========================================================================
   async function fetchBackendConfig() {
     try {
       const response = await fetch('/api/config', { headers: getApiHeaders(), credentials: 'same-origin' });
@@ -956,18 +1003,70 @@ document.addEventListener('DOMContentLoaded', async () => {
     modalCloseBtn.addEventListener('click', closeConfigModal);
   }
 
+  // First-run onboarding: two independent things, both gated on their own
+  // localStorage flag so returning users don't see either again.
+  //   1. ONBOARDING_SEEN_KEY - controls the one-time auto-open of Help on
+  //      a brand-new session. Set as soon as Help has been shown once
+  //      (auto-opened or manually clicked), regardless of how it's closed.
+  //   2. HELP_PULSE_DISMISSED_KEY - controls the pulsing ring on the Help
+  //      button. This one is deliberately NOT cleared by the auto-open or
+  //      by closing the modal - it only stops pulsing once the user
+  //      actually clicks the Help button themselves, so someone who just
+  //      dismisses the auto-opened popup still has a visible cue that
+  //      there's a Help button worth clicking.
+  const ONBOARDING_SEEN_KEY = 'ydylOnboardingSeen';
+  const HELP_PULSE_DISMISSED_KEY = 'ydylHelpPulseDismissed';
+
+  // ===========================================================================
+  // 6. HELP BUTTON ONBOARDING (auto-open once, pulsing ring)
+  // ===========================================================================
+  function hasSeenOnboarding() {
+    try {
+      return localStorage.getItem(ONBOARDING_SEEN_KEY) === '1';
+    } catch (e) {
+      return true; // localStorage unavailable (private mode, etc.) - don't nag
+    }
+  }
+  function markOnboardingSeen() {
+    try {
+      localStorage.setItem(ONBOARDING_SEEN_KEY, '1');
+    } catch (e) { /* ignore */ }
+  }
+  function hasHelpPulseDismissed() {
+    try {
+      return localStorage.getItem(HELP_PULSE_DISMISSED_KEY) === '1';
+    } catch (e) {
+      return true; // localStorage unavailable - don't nag
+    }
+  }
+  function dismissHelpPulse() {
+    try {
+      localStorage.setItem(HELP_PULSE_DISMISSED_KEY, '1');
+    } catch (e) { /* ignore */ }
+    if (helpBtn) helpBtn.classList.remove('help-btn-attention');
+  }
+
   if (helpBtn && helpModal) {
+    if (!hasHelpPulseDismissed()) {
+      helpBtn.classList.add('help-btn-attention');
+    }
     helpBtn.addEventListener('click', () => {
       openHelpModal();
+      markOnboardingSeen();
+      dismissHelpPulse();
     });
   }
 
   if (helpModalCloseBtn && helpModal) {
     helpModalCloseBtn.addEventListener('click', () => {
       helpModal.classList.add('hidden');
+      markOnboardingSeen();
     });
   }
 
+  // ===========================================================================
+  // 7. HISTORY MODAL: TABS, STATS CHARTS, LOAD/PURGE
+  // ===========================================================================
   if (tabBtnTranslations && tabBtnStatistics) {
     tabBtnTranslations.addEventListener('click', () => {
       tabBtnTranslations.classList.add('active');
@@ -1202,6 +1301,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
+  // ===========================================================================
+  // 8. RESULTS RENDERING HELPERS
+  // ===========================================================================
   function renderTableResult(result) {
     if (!resultsHeader || !resultsBody) return;
     resultsHeader.innerHTML = '';
@@ -1306,6 +1408,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
+  // ===========================================================================
+  // 9. TRANSLATE (NL -> SQL) AND EXECUTE SQL
+  // ===========================================================================
   async function translatePrompt() {
     await fetchBackendConfig();
 
@@ -1535,9 +1640,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
+  // ===========================================================================
+  // 10. INPUT WIRING: NL PROMPT BOX, TRANSLATE/EXECUTE BUTTONS
+  // ===========================================================================
   if (aiPrompt) {
     aiPrompt.addEventListener('input', () => {
       setSqlQuery('');
+      clearResultsDisplay();
     });
 
     aiPrompt.addEventListener('keydown', (e) => {
@@ -1548,9 +1657,84 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
+  // ===========================================================================
+  // 11. QUICK PROMPTS: DISMISS / RESTORE
+  // ===========================================================================
+  // Example prompt chips: a permanent "Quick prompts" shortcut row, not
+  // onboarding-only - it stays in the UI for every visit until the user
+  // explicitly dismisses it via dismissExamplePromptsBtn, at which point
+  // that choice is remembered on this browser. Distinct from
+  // ONBOARDING_SEEN_KEY, which only tracks whether Help has been opened.
+  // Once dismissed, restoreQuickPromptsBtn (shown inside the Help modal -
+  // see updateRestoreQuickPromptsVisibility(), called from openHelpModal())
+  // is the real UI path back, so nobody has to reach for devtools/localStorage.
+  const EXAMPLE_PROMPTS_DISMISSED_KEY = 'ydylQuickPromptsDismissed';
+  const examplePrompts = document.getElementById('examplePrompts');
+  const dismissExamplePromptsBtn = document.getElementById('dismissExamplePromptsBtn');
+  const restoreQuickPromptsRow = document.getElementById('restoreQuickPromptsRow');
+  const restoreQuickPromptsBtn = document.getElementById('restoreQuickPromptsBtn');
+  function hasQuickPromptsDismissed() {
+    try {
+      return localStorage.getItem(EXAMPLE_PROMPTS_DISMISSED_KEY) === '1';
+    } catch (e) {
+      return false; // localStorage unavailable - just leave the row showing
+    }
+  }
+  function dismissQuickPrompts() {
+    try {
+      localStorage.setItem(EXAMPLE_PROMPTS_DISMISSED_KEY, '1');
+    } catch (e) { /* ignore */ }
+    if (examplePrompts) examplePrompts.classList.add('hidden');
+    updateRestoreQuickPromptsVisibility();
+  }
+  function restoreQuickPrompts() {
+    try {
+      localStorage.removeItem(EXAMPLE_PROMPTS_DISMISSED_KEY);
+    } catch (e) { /* ignore */ }
+    if (examplePrompts) examplePrompts.classList.remove('hidden');
+    updateRestoreQuickPromptsVisibility();
+  }
+  // Keeps the "Show quick prompts again" row (inside the Help modal) in
+  // sync with actual dismissed state - only relevant while it's dismissed.
+  function updateRestoreQuickPromptsVisibility() {
+    if (!restoreQuickPromptsRow) return;
+    restoreQuickPromptsRow.classList.toggle('hidden', !hasQuickPromptsDismissed());
+  }
+  if (hasQuickPromptsDismissed() && examplePrompts) {
+    examplePrompts.classList.add('hidden');
+  }
+  if (dismissExamplePromptsBtn) {
+    dismissExamplePromptsBtn.addEventListener('click', dismissQuickPrompts);
+  }
+  if (restoreQuickPromptsBtn) {
+    restoreQuickPromptsBtn.addEventListener('click', restoreQuickPrompts);
+  }
+
   if (translateBtn) translateBtn.addEventListener('click', translatePrompt);
   if (runBtn) runBtn.addEventListener('click', () => executeSql());
 
+  // Example prompt chips (zero-state guidance for first-time users): fill
+  // the NL prompt box with a working example and immediately run it, so
+  // someone who has never used the app can see the whole prompt -> SQL ->
+  // results flow without having to guess what to type first.
+  const examplePromptButtons = document.querySelectorAll('.example-chip');
+  if (examplePromptButtons.length && aiPrompt) {
+    examplePromptButtons.forEach(btn => {
+      btn.addEventListener('click', () => {
+        aiPrompt.value = btn.dataset.prompt || '';
+        // Setting .value directly doesn't fire the 'input' event, so the
+        // listener above (which clears stale SQL as the user types) never
+        // runs here - clear it explicitly so a chip click doesn't leave
+        // a previous prompt's SQL sitting in the editor.
+        setSqlQuery('');
+        translatePrompt();
+      });
+    });
+  }
+
+  // ===========================================================================
+  // 12. HISTORY NAVIGATION (back/forward through turns), PURGE, FINAL INIT
+  // ===========================================================================
   function restoreLatestTurn() {
     const turn = chatStore.lastTurn();
     if (turn) {
@@ -1653,6 +1837,14 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   await fetchBackendConfig();
+
+  // Brand-new session, nobody's told it what to do yet: open Help
+  // automatically once, showing the Quick Start section. Every later visit
+  // (once ONBOARDING_SEEN_KEY is set) leaves this alone.
+  if (!hasSeenOnboarding()) {
+    openHelpModal();
+    markOnboardingSeen();
+  }
 
   if (aiPrompt) aiPrompt.focus();
 });

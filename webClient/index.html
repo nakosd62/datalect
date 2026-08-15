@@ -136,6 +136,15 @@
                 </button>
               </div>
             </div>
+            <div id="examplePrompts" class="example-prompts">
+              <span class="example-prompts-label">Quick prompts:</span>
+              <button type="button" class="example-chip" data-prompt="What tables are in this database, and how are they related? Also, can you draw the ER diagram?">What's in here</button>
+              <button type="button" class="example-chip" data-prompt="Show me 20 sample rows from whichever 2 tables look most interesting.">Some data</button>
+              <button type="button" class="example-chip" data-prompt="Write a complicated query against this database and explain what it does.">Complicated query</button>
+              <button type="button" class="example-chip" data-prompt="Create a new table called demo with 2 columns and insert random data into it. Then query it. Then drop it. Finally, confirm it is gone.">DML/DDL</button>
+              <button type="button" class="example-chip" data-prompt="What are a few interesting questions to ask about the data">What to ask</button>
+              <button type="button" id="dismissExamplePromptsBtn" class="example-prompts-dismiss" title="Hide quick prompts">&times;</button>
+            </div>
             <div class="input-row">
               <div class="speech-bubble-wrapper sql-bubble">
                 <button id="runBtn" class="btn btn-execute sql-overlay-btn" title="Execute SQL Query">
@@ -183,6 +192,9 @@
       <div class="modal-header">
         <h2 class="modal-title">💡 Help & Documentation</h2>
         <button id="helpModalCloseBtn" class="modal-close-btn" type="button">&times;</button>
+      </div>
+      <div id="restoreQuickPromptsRow" class="help-modal-actions hidden">
+        <button type="button" id="restoreQuickPromptsBtn" class="restore-quick-prompts-btn">&#8635; Show quick prompts again</button>
       </div>
       <div id="helpModalBody" class="modal-body help-dialog-body">
         <p class="text-muted">Loading documentation...</p>
