@@ -139,7 +139,7 @@
             <div id="examplePrompts" class="example-prompts">
               <span class="example-prompts-label">Quick prompts:</span>
               <button type="button" class="example-chip" data-prompt="What tables are in this database, and how are they related? Also, can you draw the ER diagram?">What's in here</button>
-              <button type="button" class="example-chip" data-prompt="Muéstrame 20 filas de muestra de las dos tablas que parezcan más interesantes.">Muestra de datos</button>
+              <button type="button" class="example-chip" data-prompt="Show me 20 sample rows from whichever 2 tables look most interesting.">Sample the data</button>
               <button type="button" class="example-chip" data-prompt="Write a complicated query against this database and explain what it does.">Complicated query</button>
               <button type="button" class="example-chip" data-prompt="Create a new table called demo with 2 columns and insert random data into it. Then query it. Then drop it. Finally, confirm it is gone.">DML/DDL</button>
               <button type="button" class="example-chip" data-prompt="What are a few interesting questions to ask about the data">What to ask</button>
@@ -193,8 +193,9 @@
         <h2 class="modal-title">💡 Help & Documentation</h2>
         <button id="helpModalCloseBtn" class="modal-close-btn" type="button">&times;</button>
       </div>
-      <div id="restoreQuickPromptsRow" class="help-modal-actions hidden">
-        <button type="button" id="restoreQuickPromptsBtn" class="restore-quick-prompts-btn">&#8635; Show quick prompts again</button>
+      <div class="help-modal-actions">
+        <button type="button" id="replayTourBtn" class="restore-quick-prompts-btn">&#8635; Replay guided tour</button>
+        <button type="button" id="restoreQuickPromptsBtn" class="restore-quick-prompts-btn hidden">&#8635; Show quick prompts again</button>
       </div>
       <div id="helpModalBody" class="modal-body help-dialog-body">
         <p class="text-muted">Loading documentation...</p>
@@ -324,7 +325,23 @@
       </div>
     </div>
   </div>
-  
+
+  <div id="tourOverlay" class="tour-overlay hidden">
+    <div id="tourSpotlight" class="tour-spotlight"></div>
+    <div id="tourTooltip" class="tour-tooltip">
+      <div class="tour-tooltip-step" id="tourStepCounter"></div>
+      <h3 id="tourTooltipTitle"></h3>
+      <p id="tourTooltipBody"></p>
+      <div class="tour-tooltip-actions">
+        <button type="button" id="tourSkipBtn" class="tour-skip-btn">Skip</button>
+        <div class="tour-tooltip-actions-right">
+          <button type="button" id="tourBackBtn" class="btn btn-secondary tour-nav-btn">Back</button>
+          <button type="button" id="tourNextBtn" class="btn btn-primary tour-nav-btn">Next</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <script src="https://cdn.jsdelivr.net/npm/sql-formatter@15.4.0/dist/sql-formatter.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/codemirror.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/mode/sql/sql.min.js"></script>

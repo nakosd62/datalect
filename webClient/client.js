@@ -104,6 +104,12 @@ document.addEventListener('DOMContentLoaded', async () => {
   // see updateAnonymousRestrictions() / showLoginRequiredModal().
   let isAnonymousUser = false;
 
+  // True once /api/config reports Google Sign-In is configured (auth_enabled
+  // + a google_client_id). Used to skip tour/UI bits that point at the
+  // sign-in control when there's nothing there to point at (local/no-auth
+  // deployments).
+  let googleAuthEnabled = false;
+
   function getDatabaseNameFromUrl(urlStr) {
     if (!urlStr) return "Custom";
     try {
@@ -736,6 +742,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
 
       if (data.auth_enabled && data.google_client_id) {
+        googleAuthEnabled = true;
         initGoogleAuth(data.google_client_id);
       }
 
@@ -1003,6 +1010,179 @@ document.addEventListener('DOMContentLoaded', async () => {
     modalCloseBtn.addEventListener('click', closeConfigModal);
   }
 
+  // ===========================================================================
+  // GUIDED TOUR (first-run onboarding walkthrough)
+  // ===========================================================================
+  const tourOverlay = document.getElementById('tourOverlay');
+  const tourSpotlight = document.getElementById('tourSpotlight');
+  const tourTooltip = document.getElementById('tourTooltip');
+  const tourStepCounter = document.getElementById('tourStepCounter');
+  const tourTooltipTitle = document.getElementById('tourTooltipTitle');
+  const tourTooltipBody = document.getElementById('tourTooltipBody');
+  const tourSkipBtn = document.getElementById('tourSkipBtn');
+  const tourBackBtn = document.getElementById('tourBackBtn');
+  const tourNextBtn = document.getElementById('tourNextBtn');
+
+  let tourStepIndex = 0;
+  let tourResizeHandler = null;
+
+  function getTourSteps() {
+    const promptWrapper = aiPrompt ? aiPrompt.closest('.speech-bubble-wrapper') : null;
+    const sqlWrapper = document.querySelector('.sql-bubble');
+    const resultsCard = document.querySelector('.table-card');
+    const historyNav = document.querySelector('.inline-history-nav');
+    const authContainer = googleAuthEnabled ? document.getElementById('g_id_signin') : null;
+    const quickPrompts = document.getElementById('examplePrompts');
+    const quickPromptsVisible = quickPrompts && !quickPrompts.classList.contains('hidden');
+
+    const steps = [
+      {
+        target: promptWrapper,
+        title: 'Ask your question here',
+        body: "Type what you want to know in plain English (e.g. \u201cWhat tables are in this database?\u201d) and hit Enter. No SQL needed to get started."
+      },
+      {
+        target: quickPromptsVisible ? quickPrompts : null,
+        title: 'Not sure what to ask?',
+        body: 'Click one of these example prompts to see the whole flow in action, from question to SQL to results.'
+      },
+      {
+        target: sqlWrapper,
+        title: "We'll turn that into SQL",
+        body: "We'll translate your question into a SQL query here. Review it - or edit it by hand - then click Execute to run it."
+      },
+      {
+        target: resultsCard,
+        title: 'Your results land here',
+        body: 'Query results show up in this table, ready to scroll through or use to ask a follow-up question.'
+      },
+      {
+        target: historyNav,
+        title: 'Step back through past turns',
+        body: 'Use these arrows to move back and forward through your recent prompts, SQL, and results - handy for revisiting or tweaking an earlier question.'
+      },
+      {
+        target: configTriggerBadge,
+        title: "You're on a shared demo database",
+        body: "It's read-only-friendly and ready to go. Click this badge anytime to switch databases or connect your own."
+      },
+      {
+        target: historyBtn,
+        title: 'Past queries, saved',
+        body: isAnonymousUser
+          ? 'Once signed in, every translation you run is saved here so you can revisit or reuse it later.'
+          : 'Every translation you run is saved here so you can revisit or reuse it later.'
+      },
+      {
+        target: authContainer,
+        title: isAnonymousUser ? 'Sign in for the full experience' : "You're signed in",
+        body: isAnonymousUser
+          ? "Sign in with Google here to unlock custom database connections and saved query history."
+          : 'Manage your account or sign out from here anytime.'
+      },
+      {
+        target: helpBtn,
+        title: 'Stuck? Full docs are here',
+        body: 'Come back to this Help button anytime for the full walkthrough, tips on multi-turn conversations, and more.'
+      }
+    ];
+
+    return steps.filter(s => s.target);
+  }
+
+  function positionTourStep(step) {
+    const rect = step.target.getBoundingClientRect();
+    const pad = 6;
+
+    tourSpotlight.style.top = `${rect.top - pad}px`;
+    tourSpotlight.style.left = `${rect.left - pad}px`;
+    tourSpotlight.style.width = `${rect.width + pad * 2}px`;
+    tourSpotlight.style.height = `${rect.height + pad * 2}px`;
+
+    // Measure the tooltip so we can decide which side of the target it fits on.
+    tourTooltip.style.visibility = 'hidden';
+    tourTooltip.style.top = '0px';
+    tourTooltip.style.left = '0px';
+    const ttRect = tourTooltip.getBoundingClientRect();
+    const margin = 14;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+
+    const spaceBelow = vh - rect.bottom;
+    const spaceAbove = rect.top;
+    let top;
+    if (spaceBelow >= ttRect.height + margin || spaceBelow >= spaceAbove) {
+      top = Math.min(rect.bottom + margin, vh - ttRect.height - margin);
+    } else {
+      top = Math.max(rect.top - ttRect.height - margin, margin);
+    }
+    top = Math.max(top, margin);
+
+    let left = rect.left + rect.width / 2 - ttRect.width / 2;
+    left = Math.min(Math.max(left, margin), vw - ttRect.width - margin);
+
+    tourTooltip.style.top = `${top}px`;
+    tourTooltip.style.left = `${left}px`;
+    tourTooltip.style.visibility = 'visible';
+  }
+
+  function showTourStep(index) {
+    const steps = getTourSteps();
+    if (!steps.length) {
+      finishTour();
+      return;
+    }
+    tourStepIndex = Math.max(0, Math.min(index, steps.length - 1));
+    const step = steps[tourStepIndex];
+
+    tourStepCounter.textContent = `Step ${tourStepIndex + 1} of ${steps.length}`;
+    tourTooltipTitle.textContent = step.title;
+    tourTooltipBody.textContent = step.body;
+    tourBackBtn.style.visibility = tourStepIndex === 0 ? 'hidden' : 'visible';
+    tourNextBtn.textContent = tourStepIndex === steps.length - 1 ? 'Done' : 'Next';
+
+    positionTourStep(step);
+  }
+
+  function startGuidedTour() {
+    if (!tourOverlay) return;
+    tourOverlay.classList.remove('hidden');
+    tourStepIndex = 0;
+    showTourStep(0);
+
+    tourResizeHandler = () => {
+      const steps = getTourSteps();
+      if (steps[tourStepIndex]) positionTourStep(steps[tourStepIndex]);
+    };
+    window.addEventListener('resize', tourResizeHandler);
+  }
+
+  function finishTour() {
+    if (!tourOverlay) return;
+    tourOverlay.classList.add('hidden');
+    if (tourResizeHandler) {
+      window.removeEventListener('resize', tourResizeHandler);
+      tourResizeHandler = null;
+    }
+  }
+
+  if (tourNextBtn) {
+    tourNextBtn.addEventListener('click', () => {
+      const steps = getTourSteps();
+      if (tourStepIndex >= steps.length - 1) {
+        finishTour();
+      } else {
+        showTourStep(tourStepIndex + 1);
+      }
+    });
+  }
+  if (tourBackBtn) {
+    tourBackBtn.addEventListener('click', () => showTourStep(tourStepIndex - 1));
+  }
+  if (tourSkipBtn) {
+    tourSkipBtn.addEventListener('click', finishTour);
+  }
+
   // First-run onboarding: two independent things, both gated on their own
   // localStorage flag so returning users don't see either again.
   //   1. ONBOARDING_SEEN_KEY - controls the one-time auto-open of Help on
@@ -1061,6 +1241,17 @@ document.addEventListener('DOMContentLoaded', async () => {
     helpModalCloseBtn.addEventListener('click', () => {
       helpModal.classList.add('hidden');
       markOnboardingSeen();
+    });
+  }
+
+  // "Replay guided tour" - lives inside the Help modal (next to "Show
+  // quick prompts again") so anyone - not just during development - can
+  // re-run the walkthrough without digging through localStorage.
+  const replayTourBtn = document.getElementById('replayTourBtn');
+  if (replayTourBtn && helpModal) {
+    replayTourBtn.addEventListener('click', () => {
+      helpModal.classList.add('hidden');
+      startGuidedTour();
     });
   }
 
@@ -1671,7 +1862,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   const EXAMPLE_PROMPTS_DISMISSED_KEY = 'ydylQuickPromptsDismissed';
   const examplePrompts = document.getElementById('examplePrompts');
   const dismissExamplePromptsBtn = document.getElementById('dismissExamplePromptsBtn');
-  const restoreQuickPromptsRow = document.getElementById('restoreQuickPromptsRow');
   const restoreQuickPromptsBtn = document.getElementById('restoreQuickPromptsBtn');
   function hasQuickPromptsDismissed() {
     try {
@@ -1697,8 +1887,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Keeps the "Show quick prompts again" row (inside the Help modal) in
   // sync with actual dismissed state - only relevant while it's dismissed.
   function updateRestoreQuickPromptsVisibility() {
-    if (!restoreQuickPromptsRow) return;
-    restoreQuickPromptsRow.classList.toggle('hidden', !hasQuickPromptsDismissed());
+    if (!restoreQuickPromptsBtn) return;
+    restoreQuickPromptsBtn.classList.toggle('hidden', !hasQuickPromptsDismissed());
   }
   if (hasQuickPromptsDismissed() && examplePrompts) {
     examplePrompts.classList.add('hidden');
@@ -1838,11 +2028,12 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   await fetchBackendConfig();
 
-  // Brand-new session, nobody's told it what to do yet: open Help
-  // automatically once, showing the Quick Start section. Every later visit
-  // (once ONBOARDING_SEEN_KEY is set) leaves this alone.
+  // Brand-new session, nobody's told it what to do yet: walk them through
+  // the UI with a short guided tour (prompt box -> SQL/Execute -> results ->
+  // DB config -> history -> help). Every later visit (once ONBOARDING_SEEN_KEY
+  // is set) leaves this alone.
   if (!hasSeenOnboarding()) {
-    //openHelpModal();
+    startGuidedTour();
     markOnboardingSeen();
   }
 

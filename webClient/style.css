@@ -830,10 +830,100 @@ textarea:focus {
   opacity: 1;
 }
 
+/* ===========================================================================
+   GUIDED TOUR (first-run onboarding)
+   =========================================================================== */
+.tour-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+}
+
+.tour-overlay.hidden {
+  display: none;
+}
+
+.tour-spotlight {
+  position: fixed;
+  border-radius: 10px;
+  box-shadow: 0 0 0 9999px rgba(3, 6, 12, 0.78);
+  border: 2px solid var(--primary);
+  pointer-events: none;
+  transition: top 0.3s ease, left 0.3s ease, width 0.3s ease, height 0.3s ease;
+}
+
+.tour-tooltip {
+  position: fixed;
+  width: 300px;
+  max-width: calc(100vw - 2rem);
+  background: #0f1626;
+  border: 1px solid var(--bg-card-border);
+  border-radius: 12px;
+  padding: 1.1rem 1.15rem 1rem;
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(16, 185, 129, 0.15);
+  transition: top 0.3s ease, left 0.3s ease;
+}
+
+.tour-tooltip-step {
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--primary-hover);
+  margin-bottom: 0.4rem;
+}
+
+.tour-tooltip h3 {
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 0.4rem;
+}
+
+.tour-tooltip p {
+  font-size: 0.85rem;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+.tour-tooltip-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 1rem;
+}
+
+.tour-tooltip-actions-right {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.tour-nav-btn {
+  padding: 0.4rem 0.85rem;
+  font-size: 0.82rem;
+}
+
+.tour-skip-btn {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  cursor: pointer;
+  padding: 0.4rem 0.2rem;
+  transition: var(--transition);
+}
+
+.tour-skip-btn:hover {
+  color: var(--text-secondary);
+}
+
 /* Shown inside the Help modal only when the "Quick prompts" row has been
    dismissed - the real UI path back to it (see restoreQuickPrompts() in
    client.js), so nobody has to reach for devtools/localStorage. */
 .help-modal-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
   padding: 0.6rem 1.25rem;
   border-bottom: 1px solid var(--bg-card-border);
   background: rgba(255, 255, 255, 0.03);
