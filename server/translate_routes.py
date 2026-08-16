@@ -18,7 +18,7 @@ from google.genai import errors as genai_errors
 # from app_config import DEFAULT_MODEL, logger, log_and_generalize_error
 from app_config import DEFAULT_MODEL, logger
 
-from auth import get_or_create_session_id, get_current_user_identity, apply_session_cookie, is_anonymous_user
+from auth import get_or_create_session_id, get_current_user_identity, apply_session_cookie
 from db import resolve_conn_str, get_database_schema, record_translation
 
 translate_bp = Blueprint('translate', __name__)
@@ -265,11 +265,12 @@ def translate_query():
         cached_content_tokens = getattr(usage, 'cached_content_token_count', 0) if usage else 0
 
         # Anonymous users share a single identity and can't view/purge
-        # history anyway (see history_routes.py) - skip logging their
-        # translations so the history table doesn't fill up with
-        # unreadable, unattributable rows.
-        if not is_anonymous_user(user_identity):
-            record_translation(user_identity, conn_str, prompt, generated_sql, gemini_model, duration, input_tokens, output_tokens, total_tokens, thinking_tokens, cached_content_tokens)
+        # their own history via the app (see history_routes.py, still
+        # gated) - but the translation itself is still worth recording
+        # for aggregate usage/cost visibility (e.g. via export_state.py),
+        # so it's logged the same as any other user's, just attributed to
+        # the shared "anonymous" identity rather than a real one.
+        record_translation(user_identity, conn_str, prompt, generated_sql, gemini_model, duration, input_tokens, output_tokens, total_tokens, thinking_tokens, cached_content_tokens)
 
         resp = jsonify({
             'success': True,

@@ -1,0 +1,1517 @@
+_source,doc_id,input_tokens,output_tokens,sql_command,user_id,connect_string,nl_prompt,created_at,duration,thinking_tokens,model,total_tokens,cached_content_tokens,id
+firestore,37zBLTGrAIFGJX5VKv0W,2364,215,"WITH cart_summary AS (
+    SELECT 
+        productid,
+        COUNT(*) AS cart_count,
+        SUM(quantity) AS cart_quantity
+    FROM shoppingcarts
+    GROUP BY productid
+),
+order_summary AS (
+    SELECT 
+        productid,
+        COUNT(*) AS order_count
+    FROM orderitems
+    GROUP BY productid
+)
+SELECT 
+    p.productid,
+    p.name,
+    (c.cart_count::numeric / (c.cart_count + COALESCE(o.order_count, 0))) AS abandonment_rate,
+    (c.cart_quantity * p.priceusd) AS total_potential_revenue_lost
+FROM cart_summary c
+JOIN products p ON c.productid = p.productid
+LEFT JOIN order_summary o ON c.productid = o.productid
+ORDER BY abandonment_rate DESC, total_potential_revenue_lost DESC
+LIMIT 5;",nakosd@gmail.com,postgres@helloworld-vector-1785975353349,"What are the top 5 products with the highest cart abandonment rate, and what is the total potential revenue lost from those items?",2026-08-08 23:33:01.063000+00:00,17754,3482.0,gemini-3.6-flash,6061,,
+firestore,3gGngle7aRKfM64Rvyff,2572,132,"***NEW SQL***
+SELECT 
+  MIN(orderdate)::date AS earliest_order_date,
+  MAX(orderdate)::date AS latest_order_date,
+  ROUND(AVG(totalamountusd), 2) AS avg_order_value_usd,
+  (SELECT STRING_AGG(DISTINCT category, ', ') FROM products) AS product_categories,
+  (SELECT STRING_AGG(DISTINCT orderstatus, ', ') FROM orders) AS order_statuses,
+  (SELECT STRING_AGG(DISTINCT paymentmethod, ', ') FROM payments) AS payment_methods
+FROM orders;",nakosd@gmail.com,postgres@helloworld-vector-1785975353349,what else do you kow about this database,2026-08-11 22:09:41.471000+00:00,5001,691.0,gemini-3.6-flash,3395,,
+firestore,4MrnnjOhcTVtw3FbgG5K,959,62,"SELECT c.number_street, c.city_state
+FROM clients c
+JOIN accounts a ON c.id = a.owner_id
+GROUP BY c.id, c.number_street, c.city_state
+ORDER BY SUM(a.balance) DESC
+LIMIT 1;",nakosd@gmail.com,dimitris@kitchenbank,where does the wealthiest customer live,2026-08-10 14:18:27.643000+00:00,4584,723.0,gemini-3.6-flash,1744,,
+firestore,4oWAqLuW4OhcWIcuE6Mi,2350,34,"SELECT 'An interesting question to ask is: Which products are most frequently added to shopping carts but never purchased, and what is the total abandoned cart value?' AS RESPONSE;",nakosd@gmail.com,postgres@helloworld-vector-1785975353349,what is the most interesting question i can ask abut this database,2026-08-08 22:25:31.608000+00:00,2906,422.0,gemini-3.6-flash,2806,,
+firestore,5blQp0DayBUhHZaSyKYD,2737,211,"SELECT
+  u.user_id,
+  u.email,
+  COUNT(DISTINCT o.orderid) AS total_orders,
+  COALESCE(SUM(o.totalamountusd), 0) AS total_spent_usd,
+  COUNT(DISTINCT CASE WHEN LOWER(o.orderstatus) = 'cancelled' THEN o.orderid END) AS cancelled_orders,
+  COUNT(DISTINCT CASE WHEN LOWER(p.status) = 'failed' THEN p.paymentid END) AS failed_payments,
+  TO_CHAR(MAX(o.orderdate), 'YYYY-MM-DD:HH24:MI:SS') AS last_order_date
+FROM users u
+LEFT JOIN orders o ON u.user_id = o.userid
+LEFT JOIN payments p ON o.orderid = p.orderid
+GROUP BY u.user_id, u.email
+ORDER BY total_spent_usd ASC, cancelled_orders DESC;",nakosd@gmail.com,demo@helloworld-vector-1785975353349,worst customer,2026-08-14 00:18:12.733000+00:00,9497,1439.0,gemini-3.6-flash,4387,,
+firestore,7TstwELiGFE2Y2nGFCTV,882,209,"SELECT table_name 
+FROM information_schema.tables 
+WHERE table_schema = 'public' 
+  AND table_type = 'BASE TABLE';
+
+SELECT
+    tc.table_name AS source_table,
+    kcu.column_name AS source_column,
+    ccu.table_name AS target_table,
+    ccu.column_name AS target_column
+FROM information_schema.table_constraints AS tc
+JOIN information_schema.key_column_usage AS kcu
+  ON tc.constraint_name = kcu.constraint_name
+  AND tc.table_schema = kcu.table_schema
+JOIN information_schema.constraint_column_usage AS ccu
+  ON ccu.constraint_name = tc.constraint_name
+  AND ccu.table_schema = tc.table_schema
+WHERE tc.constraint_type = 'FOREIGN KEY'
+  AND tc.table_schema = 'public';",nakosd@gmail.com,dimitris@kitchenbank,"What tables are in this database, and how are they related? Also, can you draw the ER diagram?",2026-08-15 21:37:33.620000+00:00,9185,1221.0,gemini-3.6-flash,2312,,
+firestore,817FTaCGS3j3SZfHx1t2,2299,9,SELECT current_user AS connected_user;,nakosd@gmail.com,demo@helloworld-vector-1785975353349,who ami connected as,2026-08-14 00:23:37.591000+00:00,1922,137.0,gemini-3.6-flash,2445,,
+firestore,AEnkjpyyPO73kC8LDeD0,2298,4,SELECT 1;,nakosd@gmail.com,demo@helloworld-vector-1785975353349,select 1,2026-08-14 13:52:57.007000+00:00,41991,75.0,gemini-3.6-flash,2377,,
+firestore,BPVknKlCoijycI0agEBe,2317,6,SELECT COUNT(*) FROM users;,kyle.b.foster@gmail.com,demo@helloworld-vector-1785975353349,How many users do I have?,2026-08-14 18:32:31.526000+00:00,1681,70.0,gemini-3.6-flash,2393,,
+firestore,Bbs6yGictZgr2YHMVQvX,2343,30,"SELECT 'This database is for an e-commerce platform, managing users, products, shopping carts, orders, payments, and shipping addresses.' AS RESPONSE;",nakosd@gmail.com,postgres@helloworld-vector-1785975353349,what s this database about,2026-08-11 22:07:40.172000+00:00,3221,476.0,gemini-3.6-flash,2849,,
+firestore,DQq1gpuYJTdzWoPQHOuS,2298,4,SELECT 1;,nakosd@gmail.com,postgres@helloworld-vector-1785975353349,select 1,2026-08-14 15:07:21.556000+00:00,1452,135.0,gemini-3.6-flash,2437,,
+firestore,FgZi6kt8sqSsluiJFYaX,2283,60,"I am an AI data analysis assistant designed to help you analyze tabular data, write complex SQL queries, interpret database schemas, and extract actionable insights from your database. 
+
+Feel free to ask questions about your database—such as analyzing sales trends, customer purchasing behavior, order statuses, or product performance!",nakosd@gmail.com,postgres@helloworld-vector-1785975353349,how smart are you,2026-08-11 18:00:34.686000+00:00,1783,176.0,gemini-3.6-flash,2519,,
+firestore,Glg4J6YyXUkDEwm9R3Jb,2364,70,"SELECT 
+  (SELECT COUNT(*) FROM users) AS total_users,
+  (SELECT COUNT(*) FROM products) AS total_products,
+  (SELECT COUNT(DISTINCT userid) FROM shoppingcarts) AS total_shopping_carts,
+  (SELECT COUNT(*) FROM shoppingcarts) AS total_shopping_cart_items;",kyle.b.foster@gmail.com,demo@helloworld-vector-1785975353349,Tell me about the data itself. How many users? How many products and how many shopping carts are in the database?,2026-08-14 15:56:34.572000+00:00,7075,823.0,gemini-3.6-flash,3257,,
+firestore,GpltDBDjep0cX8VOw6sV,3259,178,"WITH top_products AS (
+  SELECT
+    p.productid,
+    p.name,
+    p.category,
+    SUM(oi.quantity) AS total_quantity_sold,
+    SUM(oi.quantity * oi.priceatorderusd) AS total_revenue_usd
+  FROM
+    products p
+    JOIN orderitems oi ON p.productid = oi.productid
+  GROUP BY
+    p.productid,
+    p.name,
+    p.category
+  ORDER BY
+    total_quantity_sold DESC
+  LIMIT 10
+)
+SELECT
+  productid,
+  name,
+  category,
+  total_quantity_sold,
+  total_revenue_usd
+FROM
+  top_products
+ORDER BY
+  total_revenue_usd DESC;",diminak64@gmail.com,demo@helloworld-vector-1785975353349,how much do i make from them,2026-08-14 21:28:07.590000+00:00,6610,854.0,gemini-3.6-flash,4291,,
+firestore,IOGOG684LVEmV7Gdd6NZ,2861,44,"*** NO SQL *** Η Αμερική (ΗΠΑ) δεν έχει πρωθυπουργό, αλλά Πρόεδρο. Σήμερα Πρόεδρος των ΗΠΑ είναι ο Τζο Μπάιντεν.",nakosd@gmail.com,postgres@helloworld-vector-1785975353349,Ποιος είναι ο πρωθυπουργός της Αμερικής,2026-08-14 01:41:55.379000+00:00,1950,220.0,gemini-3.6-flash,3125,,
+firestore,Jd5ePMjfEQaf2aT49Ipw,3776,23,"SELECT * FROM public.products LIMIT 20;
+SELECT * FROM public.orders LIMIT 20;",nakosd@gmail.com,postgres@helloworld-vector-1785975353349,Show me 20 sample rows from whichever 2 tables look most interesting.,2026-08-15 21:38:08.354000+00:00,1959,,gemini-3.6-flash,3799,,
+firestore,L6ZY8piuoegy2gA414As,2457,226,"SELECT 
+    p.productid,
+    p.name,
+    (COALESCE(sc.cart_count, 0)::numeric / (COALESCE(sc.cart_count, 0) + COALESCE(oi.order_count, 0))) AS cart_abandonment_rate,
+    (COALESCE(sc.total_cart_quantity, 0) * p.priceusd) AS total_potential_revenue_lost
+FROM products p
+JOIN (
+    SELECT 
+        productid, 
+        COUNT(*) AS cart_count, 
+        SUM(quantity) AS total_cart_quantity
+    FROM shoppingcarts
+    GROUP BY productid
+) sc ON p.productid = sc.productid
+LEFT JOIN (
+    SELECT 
+        productid, 
+        COUNT(*) AS order_count
+    FROM orderitems
+    GROUP BY productid
+) oi ON p.productid = oi.productid
+ORDER BY cart_abandonment_rate DESC
+LIMIT 5;",nakosd@gmail.com,postgres@helloworld-vector-1785975353349,"What are the top 5 products with the highest cart abandonment rate, and what is the total potential revenue lost from those items?",2026-08-08 22:26:27.527000+00:00,13854,2720.0,gemini-3.6-flash,5403,,
+firestore,LKdn9XZoKeKehw9nZKzW,2353,9,SELECT current_user AS connected_as;,nakosd@gmail.com,demo@helloworld-vector-1785975353349,who am i connected as,2026-08-14 00:17:33.606000+00:00,1874,100.0,gemini-3.6-flash,2462,,
+firestore,MxaW2c4n5nnx4n0A6BhV,2817,28,*** NO SQL *** Ο σημερινός πρωθυπουργός της Ελλάδας είναι ο Κυριάκος Μητσοτάκης.,nakosd@gmail.com,postgres@helloworld-vector-1785975353349,Ποιος είναι ο πρωθυπουργός της Ελλάδας,2026-08-14 01:41:41.247000+00:00,1102,120.0,gemini-3.6-flash,2965,,
+firestore,N7GIMrMNbt6Yx74u8IQq,2364,70,"SELECT 
+    (SELECT COUNT(*) FROM users) AS total_users,
+    (SELECT COUNT(*) FROM products) AS total_products,
+    (SELECT COUNT(DISTINCT userid) FROM shoppingcarts) AS total_shopping_carts,
+    (SELECT COUNT(*) FROM shoppingcarts) AS total_shopping_cart_items;",kyle.b.foster@gmail.com,demo@helloworld-vector-1785975353349,Tell me about the data itself. How many users? How many products and how many shopping carts are in the database?,2026-08-14 15:56:38.699000+00:00,4525,657.0,gemini-3.6-flash,3091,,
+firestore,NTtF7uN4lnk5YeBbXtlK,955,5,SELECT current_database();,nakosd@gmail.com,dimitris@kitchenbank,database name,2026-08-09 13:31:53.407000+00:00,23993,546.0,gemini-3.6-flash,1506,,
+firestore,PszI4gKaO7HA2sBCtacI,2321,95,"*** NO SQL *** Πρόκειται για μια σχεσιακή βάση δεδομένων PostgreSQL για μια εφαρμογή ηλεκτρονικού εμπορίου (e-commerce), η οποία περιλαμβάνει πίνακες για χρήστες (users), προϊόντα (products), παραγγελίες (orders), στοιχεία παραγγελιών (orderitems), πληρωμές (payments), καλάθια αγορών (shoppingcarts) και διευθύνσεις (addresses).",nakosd@gmail.com,postgres@helloworld-vector-1785975353349,Τι βάση δεδομένων είναι αυτή,2026-08-14 01:39:23.423000+00:00,2640,343.0,gemini-3.6-flash,2759,,
+firestore,QabLg85VPph5S3OwT4Of,2339,5,SELECT * FROM users;,nakosd@gmail.com,postgres@helloworld-vector-1785975353349,customers,2026-08-08 19:07:11.108000+00:00,2941,361.0,gemini-3.6-flash,2705,,
+firestore,R9PY9HQRG10Z7Y6B4uI2,2342,18,SELECT 'Hello! How can I help you with your database queries today?' AS RESPONSE;,nakosd@gmail.com,postgres@helloworld-vector-1785975353349,what's up,2026-08-11 18:00:09.464000+00:00,1821,234.0,gemini-3.6-flash,2594,,
+firestore,TwgJGINmVo0n85HueyqM,2598,80,"SELECT
+  u.user_id,
+  u.email,
+  SUM(o.totalamountusd) AS total_spent
+FROM
+  users u
+  JOIN orders o ON u.user_id = o.userid
+GROUP BY
+  u.user_id,
+  u.email
+ORDER BY
+  total_spent ASC
+LIMIT 1;",nakosd@gmail.com,postgres@helloworld-vector-1785975353349,Ο χειροτερος,2026-08-14 01:40:35.929000+00:00,3501,464.0,gemini-3.6-flash,3142,,
+firestore,U2UBZVd7X7mvD81eVSb0,2398,31,"SELECT 'What are the top 5 products with the highest cart abandonment rate, and what is the total potential revenue lost from those items?' AS RESPONSE;",nakosd@gmail.com,postgres@helloworld-vector-1785975353349,what is the most interesting question i can ask abut this database,2026-08-08 22:26:06.776000+00:00,2949,424.0,gemini-3.6-flash,2853,,
+firestore,UTLQhKMo2y8vpQelaNxZ,5939,102,"CREATE TABLE demo (
+  id INT PRIMARY KEY,
+  val TEXT
+);
+
+INSERT INTO demo (id, val)
+SELECT g, md5(random()::text)
+FROM generate_series(1, 5) g;
+
+SELECT id, val FROM demo;
+
+DROP TABLE demo;
+
+SELECT EXISTS (
+  SELECT 1 
+  FROM information_schema.tables 
+  WHERE table_name = 'demo'
+) AS demo_table_exists;",diminak64@gmail.com,demo@helloworld-vector-1785975353349,"Create a new table called demo with 2 columns and insert random data into it. Then query it. Then drop it. Finally, confirm it is gone.",2026-08-15 22:07:38.468000+00:00,10705,564.0,gemini-3.6-flash,6605,,
+firestore,UsUyRGLcYCqMUvAKwabx,993,5,SELECT current_user;,nakosd@gmail.com,dimitris@kitchenbank,who is the user logged on,2026-08-09 13:33:11.585000+00:00,2271,224.0,gemini-3.6-flash,1222,,
+firestore,WEChbPt209pRQGGGNS0g,2341,15,SELECT 'I do not have access to your personal identity.' AS RESPONSE;,nakosd@gmail.com,postgres@helloworld-vector-1785975353349,who am i,2026-08-08 21:10:32.833000+00:00,3882,552.0,gemini-3.6-flash,2908,,
+firestore,YJ4SfJ7EBrRWoGEV94RM,2359,19,*** NO SQL *** I do not have access to or visibility into the API key being used.,nakosd@gmail.com,postgres@helloworld-vector-1785975353349,What Gemini api key are you using,2026-08-14 02:39:31.124000+00:00,2730,142.0,gemini-3.6-flash,2520,,
+firestore,YX2z1YNWOeMSQjk7bWlJ,2311,82,"SELECT productid, name, description, imageurl, priceusd, category 
+FROM products 
+LIMIT 20;
+
+SELECT orderid, userid, TO_CHAR(orderdate, 'YYYY-MM-DD HH24:MI:SS') AS orderdate, shippingaddressid, paymentid, totalamountusd, orderstatus 
+FROM orders 
+LIMIT 20;",diminak64@gmail.com,demo@helloworld-vector-1785975353349,Show me 20 sample rows from whichever 2 tables look most interesting.,2026-08-15 22:07:00.702000+00:00,7181,711.0,gemini-3.6-flash,3104,,
+firestore,ZlMs4UIhGwp759xrifDX,2339,9,"SELECT user_id, email FROM users;",nakosd@gmail.com,postgres@helloworld-vector-1785975353349,Customers,2026-08-08 19:49:32.752000+00:00,7606,404.0,gemini-3.6-flash,2752,,
+firestore,aGy1PClwsYZQHNgqpq3R,2303,35,"*** NO SQL *** I can answer questions about the data in your database, including details on users, products, orders, order items, payments, shopping carts, and addresses.",kyle.b.foster@gmail.com,demo@helloworld-vector-1785975353349,What kind of questions can you answer?,2026-08-14 15:55:42.369000+00:00,4062,636.0,gemini-3.6-flash,2974,,
+firestore,b531vmsA6HFYedCPfzh2,2339,9,"SELECT user_id, email FROM users;",nakosd@gmail.com,postgres@helloworld-vector-1785975353349,clients,2026-08-08 19:48:44.269000+00:00,7537,442.0,gemini-3.6-flash,2790,,
+firestore,bleuLsm0zJXd5n0hCeS0,2417,94,"SELECT 'users' AS table_name, COUNT(*) AS total_rows FROM users
+UNION ALL
+SELECT 'addresses', COUNT(*) FROM addresses
+UNION ALL
+SELECT 'products', COUNT(*) FROM products
+UNION ALL
+SELECT 'shoppingcarts', COUNT(*) FROM shoppingcarts
+UNION ALL
+SELECT 'orders', COUNT(*) FROM orders
+UNION ALL
+SELECT 'orderitems', COUNT(*) FROM orderitems
+UNION ALL
+SELECT 'payments', COUNT(*) FROM payments;",nakosd@gmail.com,demo@helloworld-vector-1785975353349,what data is it here,2026-08-14 00:17:50.892000+00:00,3009,371.0,gemini-3.6-flash,2882,,
+firestore,cFIPZbpyGKY3EVcZeBfh,2298,4,SELECT 1;,nakosd@gmail.com,demo@helloworld-vector-1785975353349,select 1,2026-08-14 13:55:07.188000+00:00,249611,35.0,gemini-3.6-flash,2337,,
+firestore,ebeRyZJCJe78ktlfh9TY,2283,61,"I am an AI data analyst assistant trained to slice, dice, analyze complex relational databases, write and optimize SQL queries, and extract actionable insights across your e-commerce data (users, orders, payments, products, shopping carts, and shipping addresses). 
+
+How can I help analyze your data today?",nakosd@gmail.com,postgres@helloworld-vector-1785975353349,how smart are you,2026-08-11 18:00:45.851000+00:00,17362,282.0,gemini-3.6-flash,2626,,
+firestore,ellKrVRPe0O9hZzNTo82,959,87,"SELECT
+  c.name,
+  c.number_street,
+  c.city_state,
+  SUM(a.balance) AS total_balance
+FROM clients c
+JOIN accounts a ON c.id = a.owner_id
+GROUP BY c.id, c.name, c.number_street, c.city_state
+ORDER BY total_balance DESC
+LIMIT 1;",nakosd@gmail.com,dimitris@kitchenbank,where does the wealthiest customer live,2026-08-10 15:10:46.681000+00:00,4299,614.0,gemini-3.6-flash,1660,,
+firestore,epCDjLfyUsikGYl0DRtv,2329,21,"*** NO SQL *** I am Gemini 3.6 Flash, a large language model built by Google.",nakosd@gmail.com,postgres@helloworld-vector-1785975353349,What Gemini model are you using,2026-08-14 02:39:07.612000+00:00,4708,153.0,gemini-3.6-flash,2503,,
+firestore,fHuKkwa9nun3woGA7rlE,3104,654,"*** NO SQL ***
+The database contains 7 tables representing an e-commerce platform:
+
+### Tables and Relationships:
+1. **`users`**: Stores user account details (`user_id`, `email`).
+   - **One-to-Many** with `addresses` (`addresses.userid` -> `users.user_id`)
+   - **One-to-Many** with `orders` (`orders.userid` -> `users.user_id`)
+   - **One-to-Many** with `shoppingcarts` (`shoppingcarts.userid` -> `users.user_id`)
+
+2. **`addresses`**: Stores user shipping addresses (`addressid`, `userid`, `streetaddress`, etc.).
+   - Primary key: (`userid`, `addressid`).
+   - **One-to-Many** with `orders` (`orders.shippingaddressid` -> `addresses.addressid`)
+
+3. **`products`**: Contains catalog information (`productid`, `name`, `description`, `priceusd`, `category`, `productembedding`).
+   - **One-to-Many** with `orderitems` (`orderitems.productid` -> `products.productid`)
+   - **One-to-Many** with `shoppingcarts` (`shoppingcarts.productid` -> `products.productid`)
+
+4. **`orders`**: Contains purchase records (`orderid`, `userid`, `orderdate`, `shippingaddressid`, `paymentid`, `totalamountusd`, `orderstatus`).
+   - **One-to-Many** with `orderitems` (`orderitems.orderid` -> `orders.orderid`)
+   - References `payments` via `paymentid`
+
+5. **`payments`**: Records transaction processing details (`paymentid`, `orderid`, `userid`, `paymentdate`, `paymentmethod`, `transactionid`, `amountusd`, `status`).
+
+6. **`orderitems`**: Line items belonging to orders (`orderitemid`, `orderid`, `productid`, `quantity`, `priceatorderusd`).
+   - Primary key: (`orderid`, `orderitemid`).
+
+7. **`shoppingcarts`**: Holds active cart items prior to checkout (`userid`, `productid`, `quantity`, `addeddate`).
+   - Primary key: (`userid`, `productid`).
+
+---
+
+### Entity-Relationship Diagram (ERD):
+
+```
+       +---------------+
+       |     users     |
+       +---------------+
+        /      |      \
+       /       |       \
+      v        v        v
++-----------+ +--------+ +---------------+
+| addresses | | orders | | shoppingcarts |
++-----------+ +--------+ +---------------+
+      \        /   |           |
+       \      /    |           |
+        v    v     v           v
+       +--------+ +------------+
+       |payments| | orderitems |
+       +--------+ +------------+
+                       |
+                       v
+                 +----------+
+                 | products |
+                 +----------+
+```",nakosd@gmail.com,postgres@helloworld-vector-1785975353349,"What tables are in this database, and how are they related? Also, can you draw the ER diagram?",2026-08-15 21:37:59.491000+00:00,8971,834.0,gemini-3.6-flash,4592,,
+firestore,fbu2hkZxii0H4kYpYukx,191936,241,"*** NO SQL ***
+Here are a few interesting questions you can ask about this database:
+
+1. **Sales & Revenue Analysis**:
+   - What are the top 5 best-selling products by total revenue?
+   - What is the total revenue generated per product category?
+   - What is the average order value (AOV) across all orders?
+
+2. **Customer Insights**:
+   - Which users have spent the most money overall?
+   - How many users currently have active items in their shopping carts but haven't checked out?
+   - What are the top cities/states where most orders are shipped?
+
+3. **Order & Payment Performance**:
+   - What percentage of orders are in 'Shipped', 'Delivered', 'Pending', or 'Returned' status?
+   - Which payment methods (e.g., Credit Card, PayPal) are used most frequently, and what is their success/failure rate?
+
+4. **Product Recommendations / Search**:
+   - Which products are most frequently purchased together in the same order?
+   - Using product embeddings, what are the top 5 most similar products to a given product ID?",nakosd@gmail.com,postgres@helloworld-vector-1785975353349,What are a few interesting questions to ask about the data,2026-08-15 21:39:03.117000+00:00,36815,,gemini-3.6-flash,192177,,
+firestore,fx4fcMMEUPyuuMubCsiy,956,28,"SELECT 'To log in as a user in PostgreSQL, run: psql -U <username> -d <dbname>' AS RESPONSE;",nakosd@gmail.com,dimitris@kitchenbank,logon on user,2026-08-09 13:32:32.422000+00:00,26475,562.0,gemini-3.6-flash,1546,,
+firestore,iBlGKd1zlOPk8BgsfLxF,2939,105,"SELECT
+  p.productid,
+  p.name,
+  SUM(oi.quantity) AS total_quantity_sold,
+  SUM(oi.quantity * oi.priceatorderusd) AS total_revenue_usd
+FROM
+  products p
+  JOIN orderitems oi ON p.productid = oi.productid
+GROUP BY
+  p.productid,
+  p.name
+ORDER BY
+  total_quantity_sold DESC
+LIMIT
+  10;",kyle.b.foster@gmail.com,demo@helloworld-vector-1785975353349,How much have I made from each of those?,2026-08-14 18:34:24.329000+00:00,18634,1080.0,gemini-3.6-flash,4124,,
+firestore,kZXaHAdVM33uRLwG1QZd,2514,7,"SELECT
+  current_database();",nakosd@gmail.com,demo@helloworld-vector-1785975353349,what database am i connected to,2026-08-14 22:07:00.864000+00:00,1323,70.0,gemini-3.6-flash,2591,,
+firestore,n9vz9Fmrm12vRP4UZvYM,2298,9,*** NO SQL *** OPEN HELP POPUP ***,nakosd@gmail.com,postgres@helloworld-vector-1785975353349,what is this,2026-08-13 23:34:36.216000+00:00,13113,474.0,gemini-3.6-flash,2781,,
+firestore,nWPnerDUEH4U65nRIxpQ,2302,9,*** NO SQL *** OPEN HELP POPUP ***,nakosd@gmail.com,postgres@helloworld-vector-1785975353349,Τι είναι αυτή η εφαρμογή,2026-08-14 01:38:49.358000+00:00,958,97.0,gemini-3.6-flash,2408,,
+firestore,o4FZUhgMXH9H7lsAQHpt,2323,92,"***NEW SQL***
+SELECT 
+  (SELECT COUNT(*) FROM users) AS total_users,
+  (SELECT COUNT(*) FROM products) AS total_products,
+  (SELECT COUNT(DISTINCT category) FROM products) AS total_categories,
+  (SELECT COUNT(*) FROM orders) AS total_orders,
+  (SELECT ROUND(SUM(totalamountusd), 2) FROM orders) AS total_revenue_usd;",nakosd@gmail.com,postgres@helloworld-vector-1785975353349,tell me more,2026-08-11 22:08:05.575000+00:00,3573,525.0,gemini-3.6-flash,2940,,
+firestore,oJdZLLQm2FGSLwyYc3Ck,2380,10,SELECT SUM(totalamountusd) FROM orders;,kyle.b.foster@gmail.com,demo@helloworld-vector-1785975353349,How much money have I made?,2026-08-14 18:32:52.984000+00:00,3658,453.0,gemini-3.6-flash,2843,,
+firestore,oz5269wy5fp3nPLYeujv,2429,72,"SELECT 
+    u.user_id,
+    u.email,
+    SUM(o.totalamountusd) AS total_spent
+FROM users u
+JOIN orders o ON u.user_id = o.userid
+GROUP BY u.user_id, u.email
+ORDER BY total_spent DESC
+LIMIT 1;",nakosd@gmail.com,postgres@helloworld-vector-1785975353349,Ποιος είναι ο καλύτερος μου πελάτης,2026-08-14 01:40:00.222000+00:00,3553,491.0,gemini-3.6-flash,2992,,
+firestore,pc78wbkoG6ranaYexy15,2302,6,SELECT COUNT(*) FROM users;,kyle.b.foster@gmail.com,demo@helloworld-vector-1785975353349,How many users do I have?,2026-08-14 18:32:29.302000+00:00,1675,171.0,gemini-3.6-flash,2479,,
+firestore,shi06BGJ90yMsIUA52Jl,2302,19,*** NO SQL *** I do not have access to the active database connection string or configuration settings.,nakosd@gmail.com,postgres@helloworld-vector-1785975353349,What do connect strung are you using,2026-08-14 02:38:40.157000+00:00,2271,338.0,gemini-3.6-flash,2659,,
+firestore,uTFDgD2EPTOniKCY9u0P,2313,148,"SELECT 'users' AS table_name, COUNT(*) AS total_rows FROM users
+UNION ALL
+SELECT 'addresses' AS table_name, COUNT(*) AS total_rows FROM addresses
+UNION ALL
+SELECT 'products' AS table_name, COUNT(*) AS total_rows FROM products
+UNION ALL
+SELECT 'orders' AS table_name, COUNT(*) AS total_rows FROM orders
+UNION ALL
+SELECT 'orderitems' AS table_name, COUNT(*) AS total_rows FROM orderitems
+UNION ALL
+SELECT 'payments' AS table_name, COUNT(*) AS total_rows FROM payments
+UNION ALL
+SELECT 'shoppingcarts' AS table_name, COUNT(*) AS total_rows FROM shoppingcarts;",nakosd@gmail.com,postgres@helloworld-vector-1785975353349,what data is here,2026-08-13 23:35:21.880000+00:00,16862,599.0,gemini-3.6-flash,3060,,
+firestore,vBwlpWDRct2SdcAEhPxH,2298,4,SELECT 1;,diminak64@gmail.com,demo@helloworld-vector-1785975353349,select 1,2026-08-14 14:34:21.799000+00:00,1620,79.0,gemini-3.6-flash,2381,,
+firestore,vhJOkmMxwM6XxePqRPhB,962,5,SELECT * FROM clients;,nakosd@gmail.com,bankclerk@kitchenbank,customers,2026-08-08 19:07:25.725000+00:00,1768,172.0,gemini-3.6-flash,1139,,
+firestore,vrWIvFdZm6ruFoYbOTRa,2939,105,"SELECT
+  p.productid,
+  p.name,
+  SUM(oi.quantity) AS total_quantity_sold,
+  SUM(oi.quantity * oi.priceatorderusd) AS total_revenue_usd
+FROM
+  products p
+  JOIN orderitems oi ON p.productid = oi.productid
+GROUP BY
+  p.productid,
+  p.name
+ORDER BY
+  total_quantity_sold DESC
+LIMIT
+  10;",kyle.b.foster@gmail.com,demo@helloworld-vector-1785975353349,How much have I made from each of those?,2026-08-14 18:34:43.086000+00:00,47988,1193.0,gemini-3.6-flash,4237,,
+firestore,vsIUwD7dZUkT4dz4ujo9,2411,82,"SELECT productid, name, description, imageurl, priceusd, category 
+FROM products 
+LIMIT 20;
+
+SELECT orderid, userid, TO_CHAR(orderdate, 'YYYY-MM-DD HH24:MI:SS') AS orderdate, shippingaddressid, paymentid, totalamountusd, orderstatus 
+FROM orders 
+LIMIT 20;",diminak64@gmail.com,demo@helloworld-vector-1785975353349,Show me 20 sample rows from whichever 2 tables look most interesting.,2026-08-15 22:07:21.285000+00:00,4081,460.0,gemini-3.6-flash,2953,,
+firestore,vwiYK2aqYv1aS0TDT9mW,2716,133,"***NEW SQL***
+SELECT 
+  MIN(o.orderdate)::date AS earliest_order,
+  MAX(o.orderdate)::date AS latest_order,
+  ROUND(AVG(o.totalamountusd), 2) AS avg_order_usd,
+  (SELECT STRING_AGG(DISTINCT category, ', ') FROM products) AS product_categories,
+  (SELECT STRING_AGG(DISTINCT orderstatus, ', ') FROM orders) AS order_statuses,
+  (SELECT STRING_AGG(DISTINCT paymentmethod, ', ') FROM payments) AS payment_methods
+FROM orders o;",nakosd@gmail.com,postgres@helloworld-vector-1785975353349,what else do you knwo abotu this database,2026-08-11 22:10:22.665000+00:00,7347,1398.0,gemini-3.6-flash,4247,,
+firestore,wW18qsD3Al3dbOxbRJGW,2769,34,"*** NO SQL *** Δεν μπορώ να γνωρίζω την ταυτότητά σας, καθώς δεν διαθέτω πληροφορίες για τον συνδεδεμένο χρήστη.",nakosd@gmail.com,postgres@helloworld-vector-1785975353349,Εγώ ποιος είμαι,2026-08-14 01:41:08.802000+00:00,2851,450.0,gemini-3.6-flash,3253,,
+firestore,xZy5yJW6nUSxn675FfCt,7554,140,"SELECT
+  u.user_id,
+  u.email,
+  COUNT(o.orderid) AS total_orders,
+  COALESCE(SUM(o.totalamountusd), 0) AS total_spent_usd,
+  TO_CHAR(MAX(o.orderdate), 'YYYY-MM-DD:HH24:MI:SS') AS last_order_date
+FROM
+  users u
+  JOIN orders o ON u.user_id = o.userid
+GROUP BY
+  u.user_id,
+  u.email
+ORDER BY
+  total_spent_usd DESC
+LIMIT 2;",nakosd@gmail.com,demo@helloworld-vector-1785975353349,best 2  customers,2026-08-14 00:18:35.141000+00:00,4799,615.0,gemini-3.6-flash,8309,,
+firestore,zeDr4xzocWgzcybs3boY,2454,82,"SELECT
+  p.productid,
+  p.name,
+  SUM(oi.quantity) AS total_quantity_sold
+FROM
+  products p
+  JOIN orderitems oi ON p.productid = oi.productid
+GROUP BY
+  p.productid,
+  p.name
+ORDER BY
+  total_quantity_sold DESC
+LIMIT 10;",kyle.b.foster@gmail.com,demo@helloworld-vector-1785975353349,What are my top selling products?,2026-08-14 18:33:18.916000+00:00,4146,657.0,gemini-3.6-flash,3193,,
+sqlite,,2298,4,SELECT 1;,global,demo@helloworld-vector-1785975353349,select 1,2026-08-14 14:57:00,1728,95.0,gemini-3.6-flash,2397,,1.0
+sqlite,,2296,5,SELECT * FROM users;,global,demo@helloworld-vector-1785975353349,customers,2026-08-14 20:08:02,2212,304.0,gemini-3.6-flash,2605,,2.0
+sqlite,,2301,66,"SELECT p.productid, p.name, SUM(oi.quantity) AS total_quantity_sold
+FROM products p
+JOIN orderitems oi ON p.productid = oi.productid
+GROUP BY p.productid, p.name
+ORDER BY total_quantity_sold DESC
+LIMIT 1;",global,demo@helloworld-vector-1785975353349,what is my best selling product,2026-08-14 20:23:18,5727,435.0,gemini-3.6-flash,2802,,3.0
+sqlite,,2468,82,"SELECT
+  p.productid,
+  p.name,
+  SUM(oi.quantity) AS total_quantity_sold
+FROM
+  products p
+  JOIN orderitems oi ON p.productid = oi.productid
+GROUP BY
+  p.productid,
+  p.name
+ORDER BY
+  total_quantity_sold DESC
+LIMIT
+  5;",global,demo@helloworld-vector-1785975353349,what are my top selling products,2026-08-14 20:23:47,2765,313.0,gemini-3.6-flash,2863,,4.0
+sqlite,,2776,104,"SELECT
+  p.productid,
+  p.name,
+  SUM(oi.quantity) AS total_quantity_sold,
+  SUM(oi.quantity * oi.priceatorderusd) AS total_revenue_usd
+FROM
+  products p
+  JOIN orderitems oi ON p.productid = oi.productid
+GROUP BY
+  p.productid,
+  p.name
+ORDER BY
+  total_quantity_sold DESC
+LIMIT
+  5;",global,demo@helloworld-vector-1785975353349,how much did i make from them,2026-08-14 20:24:04,4373,711.0,gemini-3.6-flash,3591,,5.0
+sqlite,,3178,104,"SELECT
+  p.productid,
+  p.name,
+  SUM(oi.quantity) AS total_quantity_sold,
+  SUM(oi.quantity * oi.priceatorderusd) AS total_revenue_usd
+FROM
+  products p
+  JOIN orderitems oi ON p.productid = oi.productid
+GROUP BY
+  p.productid,
+  p.name
+ORDER BY
+  total_quantity_sold DESC
+LIMIT
+  5;",global,demo@helloworld-vector-1785975353349,how much did i make from them,2026-08-14 20:24:59,5130,998.0,gemini-3.6-flash,4280,,6.0
+sqlite,,3574,86,"SELECT
+  (SELECT COUNT(*) FROM users) AS total_users,
+  (SELECT COUNT(*) FROM products) AS total_products,
+  (SELECT COUNT(*) FROM orders) AS total_orders,
+  (SELECT SUM(quantity) FROM orderitems) AS total_items_sold,
+  (SELECT SUM(quantity * priceatorderusd) FROM orderitems) AS total_revenue_usd;",global,demo@helloworld-vector-1785975353349,summarize,2026-08-14 20:25:22,4651,840.0,gemini-3.6-flash,4500,,7.0
+sqlite,,3669,8,*** NO SQL *** 1 row.,global,demo@helloworld-vector-1785975353349,how many records did you return,2026-08-14 20:26:09,4590,846.0,gemini-3.6-flash,4523,,8.0
+sqlite,,3580,81,"SELECT
+  SUM(oi.quantity * oi.priceatorderusd) AS total_revenue_usd
+FROM
+  orderitems oi
+WHERE
+  oi.productid IN (
+    SELECT
+      productid
+    FROM
+      orderitems
+    GROUP BY
+      productid
+    ORDER BY
+      SUM(quantity) DESC
+    LIMIT
+      5
+  );",global,demo@helloworld-vector-1785975353349,how much did i make from them,2026-08-14 20:26:30,6521,1311.0,gemini-3.6-flash,4972,,9.0
+sqlite,,2303,117,"SELECT 
+    p.productid,
+    p.name,
+    p.category,
+    p.priceusd,
+    SUM(oi.quantity) AS total_quantity_sold,
+    SUM(oi.quantity * oi.priceatorderusd) AS total_revenue_usd
+FROM products p
+JOIN orderitems oi ON p.productid = oi.productid
+GROUP BY p.productid, p.name, p.category, p.priceusd
+ORDER BY total_quantity_sold DESC
+LIMIT 3;",global,demo@helloworld-vector-1785975353349,what's my best 3 products,2026-08-14 20:36:01,6388,637.0,gemini-3.6-flash,3057,,10.0
+sqlite,,2692,89,"WITH top_3_products AS (
+  SELECT
+    oi.productid,
+    SUM(oi.quantity * oi.priceatorderusd) AS revenue
+  FROM orderitems oi
+  GROUP BY oi.productid
+  ORDER BY SUM(oi.quantity) DESC
+  LIMIT 3
+)
+SELECT
+  SUM(revenue) AS total_revenue_usd
+FROM top_3_products;",global,demo@helloworld-vector-1785975353349,"how ,uch money have i made in total from them",2026-08-14 20:36:31,12689,699.0,gemini-3.6-flash,3480,,11.0
+sqlite,,2301,5,SELECT current_user;,global,demo@helloworld-vector-1785975353349,who am i logged on as,2026-08-14 21:19:39,2331,189.0,gemini-3.6-flash,2495,,12.0
+sqlite,,2362,5,SELECT current_database();,global,demo@helloworld-vector-1785975353349,what's thsi database,2026-08-14 21:20:05,3012,402.0,gemini-3.6-flash,2769,,13.0
+sqlite,,2516,7,"SELECT
+  current_database();",global,demo@helloworld-vector-1785975353349,what's thsi database,2026-08-14 21:20:43,3196,397.0,gemini-3.6-flash,2920,,14.0
+sqlite,,2593,7,"SELECT
+  current_user;",global,demo@helloworld-vector-1785975353349,who am i logged on as,2026-08-14 21:21:07,1387,78.0,gemini-3.6-flash,2678,,15.0
+sqlite,,2299,37,"*** NO SQL *** This is a PostgreSQL database for an e-commerce application, containing schema for managing users, addresses, products, shopping carts, orders, order items, and payments.",global,demo@helloworld-vector-1785975353349,what database is this,2026-08-14 22:05:55,4902,781.0,gemini-3.6-flash,3117,,16.0
+sqlite,,2344,5,SELECT current_database();,global,demo@helloworld-vector-1785975353349,what database am i connected to,2026-08-14 22:06:07,1520,134.0,gemini-3.6-flash,2483,,17.0
+sqlite,,2308,216,"SELECT table_name 
+FROM information_schema.tables 
+WHERE table_schema = 'public' 
+ORDER BY table_name;
+
+SELECT
+    tc.table_name AS source_table,
+    kcu.column_name AS source_column,
+    ccu.table_name AS target_table,
+    ccu.column_name AS target_column
+FROM information_schema.table_constraints AS tc
+JOIN information_schema.key_column_usage AS kcu
+    ON tc.constraint_name = kcu.constraint_name
+    AND tc.table_schema = kcu.table_schema
+JOIN information_schema.constraint_column_usage AS ccu
+    ON ccu.constraint_name = tc.constraint_name
+    AND ccu.table_schema = tc.table_schema
+WHERE tc.constraint_type = 'FOREIGN KEY'
+    AND tc.table_schema = 'public'
+ORDER BY source_table, source_column;",global,demo@helloworld-vector-1785975353349,"What tables are in this database, and how are they related?",2026-08-15 01:04:51,4736,747.0,gemini-3.6-flash,3271,,18.0
+sqlite,,2540,19,"SELECT productid, name, description, priceusd, category FROM products LIMIT 20;",global,demo@helloworld-vector-1785975353349,Show me 20 sample rows from whichever table looks most interesting.,2026-08-15 01:04:56,4523,904.0,gemini-3.6-flash,3463,,19.0
+sqlite,,4429,51,"*** NO SQL ***
+This database represents a standard e-commerce platform. It stores information about users, their saved shipping addresses, product inventory (including vectors for similarity search), active shopping carts, placed orders with itemized details, and payment transaction logs.",global,demo@helloworld-vector-1785975353349,Summarize this database in a few sentences for someone who has never seen it.,2026-08-15 01:05:00,1815,207.0,gemini-3.6-flash,4687,,20.0
+sqlite,,4495,227,"SELECT
+  table_name
+FROM
+  information_schema.tables
+WHERE
+  table_schema = 'public'
+ORDER BY
+  table_name;
+
+SELECT
+  tc.table_name AS source_table,
+  kcu.column_name AS source_column,
+  ccu.table_name AS target_table,
+  ccu.column_name AS target_column
+FROM
+  information_schema.table_constraints AS tc
+  JOIN information_schema.key_column_usage AS kcu ON tc.constraint_name = kcu.constraint_name
+  AND tc.table_schema = kcu.table_schema
+  JOIN information_schema.constraint_column_usage AS ccu ON ccu.constraint_name = tc.constraint_name
+  AND ccu.table_schema = tc.table_schema
+WHERE
+  tc.constraint_type = 'FOREIGN KEY'
+  AND tc.table_schema = 'public'
+ORDER BY
+  source_table,
+  source_column;",global,demo@helloworld-vector-1785975353349,"What tables are in this database, and how are they related?",2026-08-15 01:05:07,3241,428.0,gemini-3.6-flash,5150,,21.0
+sqlite,,2308,275,"*** NO SQL ***
+The database contains 7 main tables:
+
+1. **users**: Primary table for user accounts (`user_id`, `email`).
+2. **addresses**: Stores user address details. Related to `users` via `userid` -> `users.user_id`.
+3. **products**: Catalog of products (`productid`, name, price, category, etc.).
+4. **shoppingcarts**: Cart items for users. Related to `users` via `userid` -> `users.user_id` and `products` via `productid` -> `products.productid`.
+5. **orders**: Customer orders. Related to `users` via `userid` -> `users.user_id`, `addresses` via `shippingaddressid` -> `addresses.addressid`, and `payments` via `paymentid` -> `payments.paymentid`.
+6. **orderitems**: Individual line items in an order. Related to `orders` via `orderid` -> `orders.orderid` and `products` via `productid` -> `products.productid`.
+7. **payments**: Payment transactions for orders. Related to `users` via `userid` -> `users.user_id` and `orders` via `orderid` -> `orders.orderid`.",global,demo@helloworld-vector-1785975353349,"What tables are in this database, and how are they related?",2026-08-15 01:06:19,6601,1040.0,gemini-3.6-flash,3623,,22.0
+sqlite,,2309,22,"SELECT productid, name, description, imageurl, priceusd, category FROM products LIMIT 20;",global,demo@helloworld-vector-1785975353349,Show me 20 sample rows from whichever table looks most interesting.,2026-08-15 01:06:21,2780,436.0,gemini-3.6-flash,2767,,23.0
+sqlite,,4064,65,"*** NO SQL ***
+This database supports an e-commerce platform that manages users, product inventory, and customer purchasing activities. It tracks basic user profiles and addresses, product catalog information (including full-text search tokens and vector embeddings for semantic search), active shopping carts, placed orders, order line items, and payment transactions.",global,demo@helloworld-vector-1785975353349,Summarize this database in a few sentences for someone who has never seen it.,2026-08-15 01:06:26,1563,,gemini-3.6-flash,4129,,24.0
+sqlite,,4144,258,"*** NO SQL ***
+The database contains 7 main tables:
+
+1. **users**: Contains user accounts (`user_id`, `email`).
+2. **addresses**: Stores user address information. Related to `users` via `userid` -> `users.user_id`.
+3. **products**: Stores product information including prices, categories, full-text search tokens, and vector embeddings.
+4. **shoppingcarts**: Contains items users have added to their cart. Related to `users` via `userid` -> `users.user_id` and `products` via `productid` -> `products.productid`.
+5. **orders**: Holds customer order headers. Related to `users` (`userid`), `addresses` (`shippingaddressid`), and `payments` (`paymentid`).
+6. **orderitems**: Contains individual line items for orders. Related to `orders` via `orderid` -> `orders.orderid` and `products` via `productid` -> `products.productid`.
+7. **payments**: Stores payment transactions for orders. Related to `orders` via `orderid` -> `orders.orderid` and `users` via `userid` -> `users.user_id`.",global,demo@helloworld-vector-1785975353349,"What tables are in this database, and how are they related?",2026-08-15 01:06:44,4045,609.0,gemini-3.6-flash,5011,,25.0
+sqlite,,4064,87,"*** NO SQL ***
+This database supports an e-commerce platform that manages users, products, shopping carts, orders, and payment processing. It tracks customer accounts (`users`, `addresses`), product listings (`products`), items saved before purchase (`shoppingcarts`), completed transactions (`orders`, `orderitems`), and financial records (`payments`). Additionally, it includes advanced features like full-text search vector tokens and vector embeddings for semantic product discovery.",global,demo@helloworld-vector-1785975353349,Summarize this database in a few sentences for someone who has never seen it.,2026-08-15 01:09:16,1244,,gemini-3.6-flash,4151,,26.0
+sqlite,,2308,232,"SELECT table_name 
+FROM information_schema.tables 
+WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+ORDER BY table_name;
+
+SELECT
+    tc.table_name AS source_table,
+    kcu.column_name AS source_column,
+    ccu.table_name AS target_table,
+    ccu.column_name AS target_column,
+    tc.constraint_name
+FROM information_schema.table_constraints AS tc
+JOIN information_schema.key_column_usage AS kcu
+  ON tc.constraint_name = kcu.constraint_name
+  AND tc.table_schema = kcu.table_schema
+JOIN information_schema.constraint_column_usage AS ccu
+  ON ccu.constraint_name = tc.constraint_name
+  AND ccu.table_schema = tc.table_schema
+WHERE tc.constraint_type = 'FOREIGN KEY'
+  AND tc.table_schema = 'public'
+ORDER BY source_table, source_column;",global,demo@helloworld-vector-1785975353349,"What tables are in this database, and how are they related?",2026-08-15 01:10:10,4619,721.0,gemini-3.6-flash,3261,,27.0
+sqlite,,3282,33,"SELECT
+  productid,
+  name,
+  description,
+  priceusd,
+  category
+FROM
+  products
+LIMIT 20;",global,demo@helloworld-vector-1785975353349,Show me 20 sample rows from whichever table looks most interesting.,2026-08-15 01:10:16,3504,493.0,gemini-3.6-flash,3808,,28.0
+sqlite,,4619,60,"*** NO SQL ***
+This database is designed for an e-commerce application. It manages user accounts, addresses, product catalog details, and active shopping carts. It also records order histories, including individual order line items and payment transactions, while supporting full-text search and vector-based product embeddings.",global,demo@helloworld-vector-1785975353349,Summarize this database in a few sentences for someone who has never seen it.,2026-08-15 01:10:22,2392,219.0,gemini-3.6-flash,4898,,29.0
+sqlite,,2308,225,"SELECT table_name 
+FROM information_schema.tables 
+WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+ORDER BY table_name;
+
+SELECT
+    tc.table_name,
+    kcu.column_name,
+    ccu.table_name AS foreign_table_name,
+    ccu.column_name AS foreign_column_name
+FROM information_schema.table_constraints AS tc
+JOIN information_schema.key_column_usage AS kcu
+    ON tc.constraint_name = kcu.constraint_name
+    AND tc.table_schema = kcu.table_schema
+JOIN information_schema.constraint_column_usage AS ccu
+    ON ccu.constraint_name = tc.constraint_name
+    AND ccu.table_schema = tc.table_schema
+WHERE tc.constraint_type = 'FOREIGN KEY'
+    AND tc.table_schema = 'public'
+ORDER BY tc.table_name, kcu.column_name;",global,demo@helloworld-vector-1785975353349,"What tables are in this database, and how are they related?",2026-08-15 01:14:52,5214,835.0,gemini-3.6-flash,3368,,30.0
+sqlite,,2308,230,"SELECT table_name 
+FROM information_schema.tables 
+WHERE table_schema = 'public' AND table_type = 'BASE TABLE' 
+ORDER BY table_name;
+
+SELECT
+    tc.table_name,
+    kcu.column_name,
+    ccu.table_name AS foreign_table_name,
+    ccu.column_name AS foreign_column_name
+FROM 
+    information_schema.table_constraints AS tc 
+    JOIN information_schema.key_column_usage AS kcu
+      ON tc.constraint_name = kcu.constraint_name
+      AND tc.table_schema = kcu.table_schema
+    JOIN information_schema.constraint_column_usage AS ccu
+      ON ccu.constraint_name = tc.constraint_name
+      AND ccu.table_schema = tc.table_schema
+WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = 'public'
+ORDER BY tc.table_name, kcu.column_name;",global,demo@helloworld-vector-1785975353349,"What tables are in this database, and how are they related?",2026-08-15 01:37:12,6385,1053.0,gemini-3.6-flash,3591,,31.0
+sqlite,,3158,488,"*** NO SQL ***
+Here are the tables in the database and their relationships:
+
+### Tables:
+1. **users**: Contains user profile data (`user_id`, `email`).
+2. **addresses**: Stores user shipping/billing addresses (`addressid`, `userid`).
+3. **products**: Contains catalog products (`productid`, `name`, `priceusd`, etc.).
+4. **shoppingcarts**: Tracks items in user carts (`userid`, `productid`, `quantity`).
+5. **orders**: Holds customer orders (`orderid`, `userid`, `shippingaddressid`, `paymentid`).
+6. **orderitems**: Line items belonging to orders (`orderitemid`, `orderid`, `productid`).
+7. **payments**: Contains payment transactions (`paymentid`, `orderid`, `userid`).
+
+### ER Diagram:
+
+```text
+  +---------------+             +-----------------+
+  |     users     |-------------<   addresses     |
+  +---------------+             +-----------------+
+    |          |                         |
+    |          |                         |
+    |          v                         v
+    |   +---------------+       +-----------------+
+    |   | shoppingcarts |       |     orders      |>-------+
+    |   +---------------+       +-----------------+        |
+    |          |                         |                 |
+    v          v                         v                 v
+  +---------------+             +-----------------+   +---------------+
+  |   products    |<------------|   orderitems    |   |   payments    |
+  +---------------+             +-----------------+   +---------------+
+```
+
+### Key Relationships:
+- **users (1) -> (N) addresses**: A user can have multiple addresses.
+- **users (1) -> (N) orders**: A user can place multiple orders.
+- **users (1) -> (N) shoppingcarts (N) <- (1) products**: A junction table linking users to products in their cart.
+- **addresses (1) -> (N) orders**: An address can be used as the shipping address for multiple orders.
+- **payments (1) -> (N) orders**: Orders link to payment records via `paymentid`.
+- **orders (1) -> (N) orderitems (N) <- (1) products**: An order contains multiple order items representing purchased products.",global,demo@helloworld-vector-1785975353349,"What tables are in this database, and how are they related? draw an er diagram in ascii art",2026-08-15 01:37:42,5860,565.0,gemini-3.6-flash,4211,,32.0
+sqlite,,3662,31,"SELECT
+  productid,
+  name,
+  description,
+  priceusd,
+  category
+FROM products
+LIMIT 20;",global,demo@helloworld-vector-1785975353349,Show me 20 sample rows from whichever table looks most interesting.,2026-08-15 01:37:59,4623,788.0,gemini-3.6-flash,4481,,33.0
+sqlite,,2317,365,"*** NO SQL ***
+The database contains 7 tables representing an e-commerce system:
+
+1. **users**: Primary user accounts (`user_id`, `email`).
+2. **addresses**: User shipping/billing addresses (`addressid`, `userid`).
+3. **products**: Catalog of items available for purchase (`productid`, `name`, `priceusd`, etc.).
+4. **shoppingcarts**: Active cart line items linking users and products (`userid`, `productid`).
+5. **orders**: Completed or pending customer orders (`orderid`, `userid`, `shippingaddressid`, `paymentid`).
+6. **orderitems**: Individual products included in an order (`orderitemid`, `orderid`, `productid`).
+7. **payments**: Transaction details for orders (`paymentid`, `orderid`, `userid`).
+
+### ASCII ER Diagram
+
+```
+  +---------------+
+  |     users     |
+  +---------------+
+    | 1       | 1
+    |         |
+    | N       | N
+  +-------+ +---------------+
+  |addres-| | shoppingcarts |
+  |  ses  | +---------------+
+  +-------+         | N
+    ^ 1             |
+    |               v 1
+    |       +---------------+
+    |       |   products    |
+    |       +---------------+
+    | 1             ^
+  +---------------+ | N
+  |    orders     |--+
+  +---------------+
+    | 1     | 1
+    |       |
+    v N     v N
++-------+ +---------------+
+|payme- | |  orderitems   |
+|  nts  | +---------------+
++-------+
+```",global,demo@helloworld-vector-1785975353349,"What tables are in this database, and how are they related? Also, draw the ER diagram in ascii arct",2026-08-15 01:39:00,7847,1016.0,gemini-3.6-flash,3698,,34.0
+sqlite,,2698,22,"SELECT productid, name, description, imageurl, priceusd, category FROM products LIMIT 20;",global,demo@helloworld-vector-1785975353349,Show me 20 sample rows from whichever table looks most interesting.,2026-08-15 01:39:13,3699,615.0,gemini-3.6-flash,3335,,35.0
+sqlite,,4163,75,"*** NO SQL ***
+This database represents a standard e-commerce platform schema. It stores core customer information (`users`, `addresses`), product catalog details (`products`), active user shopping sessions (`shoppingcarts`), and transaction history (`orders`, `orderitems`, and `payments`). It also includes support for text search and vector embeddings on products for AI/similarity-based searches.",global,demo@helloworld-vector-1785975353349,Summarize this database in a few sentences for someone who has never seen it.,2026-08-15 01:39:21,1712,108.0,gemini-3.6-flash,4346,,36.0
+sqlite,,4247,124,"*** NO SQL ***
+Here are a few interesting questions you could ask about this database:
+
+1. **Top Revenue Products:** ""What are the top 5 highest revenue-generating products based on completed orders?""
+2. **Cart Abandonment:** ""Which users have items in their shopping carts but have not placed an order in the last 30 days?""
+3. **Geographic Distribution:** ""Which state or country accounts for the highest total order value?""
+4. **Product Recommendations / Vector Search:** ""Which products are most similar to product ID 123 based on their product embeddings?""",global,demo@helloworld-vector-1785975353349,ask an interesting question about the data,2026-08-15 01:40:16,3725,368.0,gemini-3.6-flash,4739,,37.0
+sqlite,,4381,153,"*** NO SQL ***
+Here are a few interesting questions you can ask based on the schema and available data:
+
+1. **Top Selling Products:** ""Which products have the highest total quantity sold across all completed orders?""
+2. **Abandoned Carts:** ""Which users have items in their shopping cart but have never placed an order?""
+3. **Revenue by State:** ""What is the total sales revenue generated from each US state based on shipping addresses?""
+4. **Order Value Analysis:** ""What is the average order value (AOV) per customer, and who are the top 10 highest-spending users?""
+5. **Payment Method Popularity:** ""What is the most popular payment method by transaction volume and total amount processed?""",global,demo@helloworld-vector-1785975353349,what are a few interesting questions to ask,2026-08-15 01:40:47,2256,,gemini-3.6-flash,4534,,38.0
+sqlite,,2307,155,"*** NO SQL *** Here are a few interesting questions you can ask about the data:
+
+1. **Top Selling Products:** What are the top 5 best-selling products by revenue and total quantity sold?
+2. **High-Value Customers:** Who are the top 10 customers based on total spending?
+3. **Abandoned Carts:** Which products are currently sitting in shopping carts but haven't been purchased yet?
+4. **Order & Revenue Trends:** What is the monthly breakdown of total orders and overall revenue?
+5. **Payment Method Preferences:** What percentage of transactions use each payment method (e.g., Credit Card, PayPal)?
+6. **Shipping Destinations:** Which cities or states account for the highest volume of order shipments?",global,demo@helloworld-vector-1785975353349,SWhat are a few interesting question to ask about the data,2026-08-15 01:41:41,2752,263.0,gemini-3.6-flash,2725,,39.0
+sqlite,,2311,78,"SELECT productid, name, description, imageurl, priceusd, category
+FROM products
+LIMIT 20;
+
+SELECT orderid, userid, TO_CHAR(orderdate, 'YYYY-MM-DD HH24:MI:SS') AS orderdate, shippingaddressid, paymentid, totalamountusd, orderstatus
+FROM orders
+LIMIT 20;",global,demo@helloworld-vector-1785975353349,Show me 20 sample rows from whichever 2 tables look most interesting.,2026-08-15 01:43:03,3938,728.0,gemini-3.6-flash,3117,,40.0
+sqlite,,2306,127,"*** NO SQL *** Here are a few interesting questions you could ask about this dataset:
+
+1. **Top Products**: What are the top 5 best-selling products by revenue and quantity sold?
+2. **High-Value Customers**: Which users have spent the most total money across all completed orders?
+3. **Cart Abandonment**: Which users currently have items in their shopping carts without recent completed orders?
+4. **Payment Insights**: What is the average order value broken down by payment method?
+5. **Order Trends**: How many orders are placed per month, and what is the distribution of order statuses?",global,demo@helloworld-vector-1785975353349,What are a few interesting questions to ask about the data,2026-08-15 13:48:25,8881,321.0,gemini-3.6-flash,2754,,41.0
+sqlite,,2451,68,"SELECT productid, name, description, priceusd, category
+FROM products
+LIMIT 20;
+
+SELECT orderid, userid, to_char(orderdate, 'YYYY-MM-DD HH24:MI:SS') AS orderdate, totalamountusd, orderstatus
+FROM orders
+LIMIT 20;",global,demo@helloworld-vector-1785975353349,Show me 20 sample rows from whichever 2 tables look most interesting.,2026-08-15 13:49:08,26379,594.0,gemini-3.6-flash,3113,,42.0
+sqlite,,5283,434,"*** NO SQL ***
+### Database Tables and Relationships
+
+1. **users**: Stores user accounts (`user_id`, `email`).
+2. **addresses**: Stores user shipping addresses (`addressid`, `userid`).
+   - Relates to `users` via `userid`.
+3. **products**: Stores product details, pricing, categories, and embeddings (`productid`).
+4. **orders**: Stores customer purchase orders (`orderid`, `userid`, `shippingaddressid`, `paymentid`).
+   - Relates to `users` via `userid`.
+   - Relates to `addresses` via `shippingaddressid`.
+   - Relates to `payments` via `paymentid`.
+5. **orderitems**: Line items belonging to each order (`orderitemid`, `orderid`, `productid`).
+   - Relates to `orders` via `orderid`.
+   - Relates to `products` via `productid`.
+6. **payments**: Payment details for orders (`paymentid`, `orderid`, `userid`).
+   - Relates to `orders` via `orderid`.
+7. **shoppingcarts**: Items currently held in user carts (`userid`, `productid`).
+   - Relates to `users` via `userid`.
+   - Relates to `products` via `productid`.
+
+---
+
+### ASCII ER Diagram
+
+```
+       +---------------+
+       |     users     |
+       +---------------+
+        |     |       |
+      1 |   1 |     1 |
+        |     |       +-------------------+
+        v     v                           v
+  +-----------+  +---------------+  +---------------+
+  | addresses |  | shoppingcarts |  |    orders     |
+  +-----------+  +---------------+  +---------------+
+        ^                |                  | 1
+        |                v                  |
+        |          +---------------+        v
+        +----------|   products    |<---+ orderitems
+                   +---------------+  N +---------------+
+                           ^
+                           |
+                     (productid)
+```",global,demo@helloworld-vector-1785975353349,"What tables are in this database, and how are they related? Also, draw the ER diagram in ascii art",2026-08-15 13:49:41,22683,350.0,gemini-3.6-flash,6067,,43.0
+sqlite,,5283,689,"*** NO SQL *** The database contains the following tables and relationships:
+
+### Tables
+1. **users**: Stores user accounts with `user_id` and `email`.
+2. **addresses**: Stores user shipping/billing addresses (`addressid`, `userid`, `streetaddress`, `city`, `state`, `country`, `zipcode`).
+3. **products**: Catalog of items (`productid`, `name`, `description`, `imageurl`, `priceusd`, `category`, `productembedding`).
+4. **orders**: Customer orders (`orderid`, `userid`, `orderdate`, `shippingaddressid`, `paymentid`, `totalamountusd`, `orderstatus`).
+5. **orderitems**: Line items within an order (`orderitemid`, `orderid`, `productid`, `quantity`, `priceatorderusd`).
+6. **payments**: Payment transactions (`paymentid`, `orderid`, `userid`, `paymentdate`, `paymentmethod`, `transactionid`, `amountusd`, `status`).
+7. **shoppingcarts**: Active shopping cart items per user (`userid`, `productid`, `quantity`, `addeddate`).
+
+---
+
+### Entity-Relationship (ER) Diagram
+
+```
+       +------------------+
+       |      USERS       |
+       +------------------+
+       | PK user_id       |
+       |    email         |
+       +--------+---------+
+                |
+     +----------+---------------------------------+
+     | 1-to-N   | 1-to-N                          | 1-to-N
+     v          v                                 v
++----+-----+ +--+-------+                     +---+------------+
+|ADDRESSES | | ORDERS   |<----+ 1-to-1        | SHOPPINGCARTS  |
++----------+ +--+-------+     |               +----------------+
+| PK add...|    | PK o..|     |               | PK,FK userid   |
+| FK user..|    | FK u..|     |               | PK,FK productid|
++----------+    | FK s..+--+  |               +-------+--------+
+                +---+---+  |  |                       |
+                    |      |  |                       |
+            1-to-N  |      |  |                       |
+                    v      |  |                       |
+              +-----+----+ |  |                       |
+              |ORDERITEMS| |  |                       |
+              +----------+ |  |                       |
+              | PK ord.. | |  |                       |
+              | PK,FK o..| |  |                       |
+              | FK prod..+-+--+-----------------------+
+              +-----+----+    |                       |
+                    |         |                       |
+                    | N-to-1  | N-to-1                | N-to-1
+                    v         v                       v
+               +----+---------+--+               +----+-----+
+               |    PAYMENTS     |               | PRODUCTS |
+               +-----------------+               +----------+
+               | PK paymentid    |               | PK prod..|
+               | FK orderid      |               +----------+
+               | FK userid       |
+               +-----------------+
+```",global,demo@helloworld-vector-1785975353349,"What tables are in this database, and how are they related? Also, draw the ER diagram in ascii art",2026-08-15 13:52:20,21460,,gemini-3.6-flash,5972,,44.0
+sqlite,,5990,126,"SELECT
+  paymentid,
+  orderid,
+  userid,
+  to_char(paymentdate, 'YYYY-MM-DD HH24:MI:SS') AS paymentdate,
+  paymentmethod,
+  transactionid,
+  amountusd,
+  status
+FROM
+  payments
+LIMIT
+  20;
+
+SELECT
+  userid,
+  productid,
+  quantity,
+  to_char(addeddate, 'YYYY-MM-DD HH24:MI:SS') AS addeddate
+FROM
+  shoppingcarts
+LIMIT
+  20;",global,demo@helloworld-vector-1785975353349,Show me 20 sample rows from whichever 2 tables look most interesting.,2026-08-15 13:52:44,21888,817.0,gemini-3.6-flash,6933,,45.0
+sqlite,,9402,129,"*** NO SQL *** Here are a few interesting questions you could ask about this dataset:
+
+1. **Sales by Category**: Which product categories generate the highest total revenue and order volume?
+2. **Customer Lifetime Value**: Who are the top 10 highest-spending customers based on total completed orders?
+3. **Cart Abandonment**: Which products are most commonly added to shopping carts but have no corresponding order placed?
+4. **Payment Method Analysis**: What is the success rate and average transaction size across different payment methods?
+5. **Geographic Order Trends**: Which states or cities account for the majority of shipped orders?",global,demo@helloworld-vector-1785975353349,What are a few interesting questions to ask about the data,2026-08-15 13:52:52,3457,328.0,gemini-3.6-flash,9859,,46.0
+sqlite,,9549,37,"SELECT user_id, email FROM users LIMIT 20;
+
+SELECT addressid, userid, streetaddress, city, state, country, zipcode FROM addresses LIMIT 20;",global,demo@helloworld-vector-1785975353349,Show me 20 sample rows from whichever 2 tables look most interesting.,2026-08-15 13:53:30,18171,423.0,gemini-3.6-flash,10009,,47.0
+sqlite,,11656,169,"*** NO SQL *** Here are a few interesting questions you could ask about this dataset:
+
+1. **Top Revenue Products**: Which products generated the most revenue, and how does that compare to their current price in the catalog?
+2. **Customer Lifetime Spend**: Who are the top 10 users by total spend across all placed orders, and what is their preferred payment method?
+3. **Cart Abandonment Analysis**: Which users currently have items in their shopping carts that haven't been purchased, and what is the estimated total value of those abandoned carts?
+4. **Order Fulfillment Performance**: What percentage of orders are in each status (e.g., Delivered, Shipped, Processing, Cancelled, Returned)?
+5. **Geographic Distribution**: Which states or cities generate the highest volume of orders and total revenue?",global,demo@helloworld-vector-1785975353349,What are a few interesting questions to ask about the data,2026-08-15 13:53:54,17591,206.0,gemini-3.6-flash,12031,,48.0
+sqlite,,2303,1080,"WITH user_order_summary AS (
+    SELECT 
+        o.userid,
+        COUNT(DISTINCT o.orderid) AS total_orders,
+        SUM(o.totalamountusd) AS total_spent_usd,
+        AVG(o.totalamountusd) AS avg_order_value_usd,
+        MIN(o.orderdate) AS first_order_date,
+        MAX(o.orderdate) AS last_order_date
+    FROM orders o
+    WHERE o.orderstatus != 'Cancelled'
+    GROUP BY o.userid
+),
+order_lag_analysis AS (
+    SELECT 
+        userid,
+        orderid,
+        orderdate,
+        LAG(orderdate) OVER (PARTITION BY userid ORDER BY orderdate) AS prev_order_date,
+        EXTRACT(EPOCH FROM (orderdate - LAG(orderdate) OVER (PARTITION BY userid ORDER BY orderdate))) / 86400.0 AS days_since_prev_order
+    FROM orders
+),
+user_avg_order_interval AS (
+    SELECT 
+        userid,
+        AVG(days_since_prev_order) AS avg_days_between_orders
+    FROM order_lag_analysis
+    WHERE prev_order_date IS NOT NULL
+    GROUP BY userid
+),
+user_cart_summary AS (
+    SELECT 
+        sc.userid,
+        SUM(sc.quantity) AS total_cart_items,
+        SUM(sc.quantity * p.priceusd) AS estimated_cart_value_usd
+    FROM shoppingcarts sc
+    JOIN products p ON sc.productid = p.productid
+    GROUP BY sc.userid
+),
+user_product_ranks AS (
+    SELECT 
+        o.userid,
+        oi.productid,
+        p.name AS product_name,
+        SUM(oi.quantity) AS total_quantity_bought,
+        SUM(oi.quantity * oi.priceatorderusd) AS total_product_spend,
+        ROW_NUMBER() OVER (PARTITION BY o.userid ORDER BY SUM(oi.quantity) DESC, SUM(oi.quantity * oi.priceatorderusd) DESC) AS product_rank
+    FROM orders o
+    JOIN orderitems oi ON o.orderid = oi.orderid
+    JOIN products p ON oi.productid = p.productid
+    GROUP BY o.userid, oi.productid, p.name
+),
+preferred_payment_method AS (
+    SELECT 
+        p.userid,
+        p.paymentmethod,
+        COUNT(*) AS usage_count,
+        ROW_NUMBER() OVER (PARTITION BY p.userid ORDER BY COUNT(*) DESC) AS payment_rank
+    FROM payments p
+    WHERE p.status = 'Completed'
+    GROUP BY p.userid, p.paymentmethod
+)
+SELECT 
+    u.user_id,
+    u.email,
+    COALESCE(uos.total_orders, 0) AS total_orders,
+    ROUND(COALESCE(uos.total_spent_usd, 0), 2) AS total_spent_usd,
+    ROUND(COALESCE(uos.avg_order_value_usd, 0), 2) AS avg_order_value_usd,
+    TO_CHAR(uos.first_order_date, 'YYYY-MM-DD HH24:MI:SS') AS first_order_date,
+    TO_CHAR(uos.last_order_date, 'YYYY-MM-DD HH24:MI:SS') AS last_order_date,
+    ROUND(COALESCE(uoi.avg_days_between_orders, 0), 2) AS avg_days_between_orders,
+    COALESCE(ucs.total_cart_items, 0) AS current_cart_items,
+    ROUND(COALESCE(ucs.estimated_cart_value_usd, 0), 2) AS current_cart_value_usd,
+    ppm.paymentmethod AS preferred_payment_method,
+    upr.product_name AS top_purchased_product,
+    upr.total_quantity_bought AS top_product_quantity
+FROM users u
+LEFT JOIN user_order_summary uos ON u.user_id = uos.userid
+LEFT JOIN user_avg_order_interval uoi ON u.user_id = uoi.userid
+LEFT JOIN user_cart_summary ucs ON u.user_id = ucs.userid
+LEFT JOIN preferred_payment_method ppm ON u.user_id = ppm.userid AND ppm.payment_rank = 1
+LEFT JOIN user_product_ranks upr ON u.user_id = upr.userid AND upr.product_rank = 1
+ORDER BY total_spent_usd DESC, total_orders DESC;",global,demo@helloworld-vector-1785975353349,write a very complicated query against this database,2026-08-15 13:59:29,19525,1929.0,gemini-3.6-flash,5312,,49.0
+sqlite,,12934,920,"WITH user_rfm AS (
+    SELECT 
+        u.user_id,
+        u.email,
+        COUNT(DISTINCT o.orderid) AS frequency,
+        COALESCE(SUM(o.totalamountusd), 0) AS monetary,
+        MAX(o.orderdate) AS last_order_date,
+        CURRENT_DATE - MAX(o.orderdate)::date AS recency_days
+    FROM users u
+    LEFT JOIN orders o ON u.user_id = o.userid AND o.orderstatus != 'Cancelled'
+    GROUP BY u.user_id, u.email
+),
+rfm_scores AS (
+    SELECT 
+        user_id,
+        email,
+        frequency,
+        monetary,
+        last_order_date,
+        recency_days,
+        NTILE(5) OVER (ORDER BY recency_days DESC NULLS LAST) AS r_score,
+        NTILE(5) OVER (ORDER BY frequency ASC) AS f_score,
+        NTILE(5) OVER (ORDER BY monetary ASC) AS m_score
+    FROM user_rfm
+),
+top_category AS (
+    SELECT 
+        o.userid,
+        p.category,
+        SUM(oi.quantity * oi.priceatorderusd) AS category_spend,
+        ROW_NUMBER() OVER (PARTITION BY o.userid ORDER BY SUM(oi.quantity * oi.priceatorderusd) DESC) AS rn
+    FROM orders o
+    JOIN orderitems oi ON o.orderid = oi.orderid
+    JOIN products p ON oi.productid = p.productid
+    WHERE o.orderstatus != 'Cancelled'
+    GROUP BY o.userid, p.category
+),
+cart_summary AS (
+    SELECT 
+        sc.userid,
+        COUNT(sc.productid) AS cart_item_count,
+        SUM(sc.quantity * p.priceusd) AS cart_total_value
+    FROM shoppingcarts sc
+    JOIN products p ON sc.productid = p.productid
+    GROUP BY sc.userid
+)
+SELECT 
+    r.user_id,
+    r.email,
+    r.frequency AS total_completed_orders,
+    ROUND(r.monetary, 2) AS total_lifetime_spend_usd,
+    TO_CHAR(r.last_order_date, 'YYYY-MM-DD HH24:MI:SS') AS last_order_timestamp,
+    r.r_score,
+    r.f_score,
+    r.m_score,
+    (r.r_score + r.f_score + r.m_score) AS rfm_total_score,
+    tc.category AS favorite_category,
+    COALESCE(cs.cart_item_count, 0) AS items_in_cart,
+    ROUND(COALESCE(cs.cart_total_value, 0), 2) AS abandoned_cart_value_usd
+FROM rfm_scores r
+LEFT JOIN top_category tc ON r.user_id = tc.userid AND tc.rn = 1
+LEFT JOIN cart_summary cs ON r.user_id = cs.userid
+ORDER BY rfm_total_score DESC, total_lifetime_spend_usd DESC;
+
+SELECT 
+    'This query performs a Customer RFM (Recency, Frequency, Monetary) segmentation analysis along with shopping cart and product category preferences: ' ||
+    '1. user_rfm CTE calculates order count, total spend, last order timestamp, and recency in days per user. ' ||
+    '2. rfm_scores CTE calculates 1-5 quantile scores (NTILE) for Recency, Frequency, and Monetary metrics. ' ||
+    '3. top_category CTE uses ROW_NUMBER() window functions to determine each user''s most spent product category. ' ||
+    '4. cart_summary CTE summarizes active items and total value currently sitting in each user''s shopping cart. ' ||
+    '5. The main SELECT aggregates all insights to segment users by overall value and engagement.' AS query_explanation;",global,demo@helloworld-vector-1785975353349,write a very complicated query against this database and tell me what it does,2026-08-15 14:00:59,26139,1859.0,gemini-3.6-flash,15713,,50.0
+sqlite,,2317,448,"*** NO SQL ***
+The database consists of the following tables and relationships:
+
+1. **users**: Contains user profile data (`user_id`, `email`).
+2. **addresses**: Stores user address details.
+   - Foreign key: `userid` → `users(user_id)`
+3. **products**: Stores product details (`productid`, `name`, `description`, `priceusd`, `category`, etc.).
+4. **shoppingcarts**: Represents a join table between users and products for items currently in cart.
+   - Foreign keys: `userid` → `users(user_id)`, `productid` → `products(productid)`
+5. **orders**: Contains order metadata (`orderid`, `userid`, `orderdate`, `totalamountusd`, `orderstatus`).
+   - Foreign keys: `userid` → `users(user_id)`, `shippingaddressid` → `addresses(addressid)`, `paymentid` → `payments(paymentid)`
+6. **orderitems**: Line items belonging to orders.
+   - Foreign keys: `orderid` → `orders(orderid)`, `productid` → `products(productid)`
+7. **payments**: Stores payment transactions linked to orders and users.
+
+---
+
+### Entity-Relationship (ER) Diagram
+
+```
+ +---------------+         +---------------+
+ |     users     |<-------1|   addresses   |
+ +---------------+         +---------------+
+   |        |                      ^
+   |1       |1                     |1
+   |        v                      |
+   |     +---------------+         |
+   |     | shoppingcarts |         |
+   |     +---------------+         |
+   |        |N                     |
+   v        v                      |N
+ +---------------+-----------------+
+ |    orders     |
+ +---------------+
+   |1           |1
+   |            v
+   |         +---------------+
+   |         |   payments    |
+   v         +---------------+
+ +---------------+
+ |  orderitems   |
+ +---------------+
+   |N
+   v
+ +---------------+
+ |   products    |
+ +---------------+
+```",global,demo@helloworld-vector-1785975353349,"What tables are in this database, and how are they related? Also, can you draw the ER diagram?",2026-08-15 14:07:47,9644,986.0,gemini-3.6-flash,3751,,51.0
+sqlite,,2783,68,"SELECT productid, name, description, priceusd, category
+FROM products
+LIMIT 20;
+
+SELECT orderid, userid, to_char(orderdate, 'YYYY-MM-DD HH24:MI:SS') AS orderdate, totalamountusd, orderstatus
+FROM orders
+LIMIT 20;",global,demo@helloworld-vector-1785975353349,Show me 20 sample rows from whichever 2 tables look most interesting.,2026-08-15 14:08:01,5761,692.0,gemini-3.6-flash,3543,,52.0
+sqlite,,5601,127,"CREATE TABLE IF NOT EXISTS product_reviews (
+  reviewid bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  productid bigint NOT NULL,
+  userid bigint NOT NULL,
+  rating integer NOT NULL CHECK (rating >= 1 AND rating <= 5),
+  title text,
+  comment text,
+  createdat timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT fk_reviews_products FOREIGN KEY (productid) REFERENCES products (productid) ON DELETE CASCADE,
+  CONSTRAINT fk_reviews_users FOREIGN KEY (userid) REFERENCES users (user_id) ON DELETE CASCADE
+);",global,demo@helloworld-vector-1785975353349,create a new table that extends this database,2026-08-15 14:10:05,6265,749.0,gemini-3.6-flash,6477,,53.0
+sqlite,,5784,55,"CREATE TABLE IF NOT EXISTS promotions (
+  promotion_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  code text NOT NULL,
+  discount_percent numeric NOT NULL,
+  valid_until timestamp without time zone
+);
+
+DROP TABLE IF EXISTS promotions;",global,demo@helloworld-vector-1785975353349,create a new table that extends this database and then drop it,2026-08-15 14:10:53,2043,186.0,gemini-3.6-flash,6025,,54.0
+sqlite,,6239,9,SELECT current_user AS connected_user;,global,demo@helloworld-vector-1785975353349,who am i connected as,2026-08-15 14:13:28,2565,106.0,gemini-3.6-flash,6354,,55.0
+sqlite,,6307,94,"INSERT INTO product_reviews (reviewid, productid, userid, rating, title, comment)
+VALUES (
+  (SELECT COALESCE(MAX(reviewid), 0) + 1 FROM product_reviews),
+  (SELECT productid FROM products LIMIT 1),
+  (SELECT user_id FROM users LIMIT 1),
+  5,
+  'Great Quality',
+  'Exceeded expectations in every way.'
+);",global,demo@helloworld-vector-1785975353349,add a new record in a table with constraints,2026-08-15 14:14:26,21489,898.0,gemini-3.6-flash,7299,,56.0
+sqlite,,6413,70,"SELECT
+  table_schema,
+  table_name,
+  privilege_type,
+  is_grantable
+FROM
+  information_schema.table_privileges
+WHERE
+  grantee = CURRENT_USER
+ORDER BY
+  table_schema,
+  table_name,
+  privilege_type;",global,demo@helloworld-vector-1785975353349,what priviledges do i have in this database,2026-08-15 14:17:02,3995,328.0,gemini-3.6-flash,6811,,57.0
+sqlite,,6818,414,"*** NO SQL ***
+The database contains 8 tables with the following relationships:
+
+1. **users**: Parent table storing user accounts.
+2. **addresses**: Stores user shipping/billing addresses (`userid` -> `users.user_id`).
+3. **products**: Catalog of available products.
+4. **orders**: Represents purchases (`userid` -> `users.user_id`, `shippingaddressid` -> `addresses.addressid`, `paymentid` -> `payments.paymentid`).
+5. **orderitems**: Line items within an order (`orderid` -> `orders.orderid`, `productid` -> `products.productid`).
+6. **payments**: Financial transactions linked to orders and users (`orderid` -> `orders.orderid`, `userid` -> `users.user_id`).
+7. **shoppingcarts**: Items currently in user carts (`userid` -> `users.user_id`, `productid` -> `products.productid`).
+8. **product_reviews**: User reviews for products (`userid` -> `users.user_id`, `productid` -> `products.productid`).
+
+### ER Diagram
+
+```
+ +---------------+            +---------------+
+ |     users     |<----------1|   addresses   |
+ +---------------+            +---------------+
+   | 1       | 1                    ^
+   |         |                      | 1
+   v         v                      |
++-------+ +---------------+         | (shippingaddressid)
+| carts | | product_review|         |
++-------+ +---------------+         |
+   | N       | N                    |
+   v         v                      v
++---------------+             +---------------+
+|   products    |<-----------N|  orderitems   |
++---------------+             +---------------+
+                                    ^ N
+                                    | 1
+                              +---------------+            +---------------+
+                              |    orders     |<----------1|   payments    |
+                              +---------------+            +---------------+
+```",global,demo@helloworld-vector-1785975353349,"What tables are in this database, and how are they related? Also, can you draw the ER diagram?",2026-08-15 14:17:41,6544,543.0,gemini-3.6-flash,7775,,58.0
+sqlite,,2630,55,"CREATE TABLE loyalty_programs (
+    program_id bigint PRIMARY KEY,
+    user_id bigint REFERENCES users(user_id),
+    points integer DEFAULT 0,
+    created_at timestamp DEFAULT CURRENT_TIMESTAMP
+);
+
+DROP TABLE loyalty_programs;",global,demo@helloworld-vector-1785975353349,Create a new table that extends this database and then drop it.,2026-08-15 14:18:39,3783,412.0,gemini-3.6-flash,3097,,59.0
+sqlite,,2695,44,"*** NO SQL *** Yes, you can create new tables in this database using the `CREATE TABLE` SQL statement, provided your database user role has the required privileges (such as `CREATE` privilege on the target schema).",global,demo@helloworld-vector-1785975353349,can i create new tables in this database,2026-08-15 14:19:17,3684,362.0,gemini-3.6-flash,3101,,60.0
+sqlite,,2754,55,"SELECT 
+    grantee, 
+    table_schema, 
+    table_name, 
+    privilege_type 
+FROM 
+    information_schema.table_privileges 
+WHERE 
+    grantee = CURRENT_USER;",global,demo@helloworld-vector-1785975353349,what privileges does the user i am connected as have in this database,2026-08-15 14:19:59,6477,700.0,gemini-3.6-flash,3509,,61.0
+sqlite,,3113,68,"SELECT
+  grantee,
+  table_schema,
+  table_name,
+  privilege_type
+FROM
+  information_schema.table_privileges
+WHERE
+  grantee = CURRENT_USER
+ORDER BY
+  table_schema,
+  table_name,
+  privilege_type;",global,demo@helloworld-vector-1785975353349,what privileges does the user i am connected as have in all tables of this database,2026-08-15 14:21:13,1591,,gemini-3.6-flash,3181,,62.0
+sqlite,,3489,59,*** NO SQL *** The query results show privileges only for the `product_reviews` table because the user you are currently connected as (`demo`) has only been explicitly granted table privileges on `product_reviews`. Privileges on the other tables in this database are granted to `cloudsqlsuperuser`.,global,demo@helloworld-vector-1785975353349,why are you showing me privileges for table product_reviews only,2026-08-15 14:21:50,4289,460.0,gemini-3.6-flash,4008,,63.0
+sqlite,,3560,95,"*** NO SQL *** If you are able to query other tables as `demo`, it is likely because `SELECT` permissions on those tables (or the entire `public` schema) have been granted to the `PUBLIC` role, which includes all users by default. The previous query filtered specifically for `grantee = CURRENT_USER` ('demo'), which only lists privileges explicitly granted to `demo` directly, rather than those inherited via `PUBLIC` or other role memberships.",global,demo@helloworld-vector-1785975353349,but i can query all other tables as user demo,2026-08-15 14:22:33,5978,400.0,gemini-3.6-flash,4055,,64.0
+sqlite,,3669,78,"SELECT
+  grantee,
+  table_schema,
+  table_name,
+  privilege_type
+FROM
+  information_schema.table_privileges
+WHERE
+  grantee IN (CURRENT_USER, 'PUBLIC')
+ORDER BY
+  table_schema,
+  table_name,
+  privilege_type,
+  grantee;",global,demo@helloworld-vector-1785975353349,can you include privileges granted to public when you list mine?,2026-08-15 14:23:42,3195,459.0,gemini-3.6-flash,4206,,65.0
+sqlite,,11286,55,"CREATE TABLE loyalty_programs (
+    program_id bigint PRIMARY KEY,
+    user_id bigint REFERENCES users(user_id),
+    points integer DEFAULT 0,
+    created_at timestamp DEFAULT CURRENT_TIMESTAMP
+);
+
+DROP TABLE loyalty_programs;",global,demo@helloworld-vector-1785975353349,Create a new table that extends this database and then drop it.,2026-08-15 14:30:43,3184,361.0,gemini-3.6-flash,11702,,66.0
+sqlite,,11441,67,"CREATE TABLE demo (
+    id integer PRIMARY KEY,
+    val text
+);
+
+INSERT INTO demo (id, val)
+SELECT
+    i,
+    md5(random()::text)
+FROM generate_series(1, 5) AS i;
+
+SELECT * FROM demo;
+
+DROP TABLE demo;",global,demo@helloworld-vector-1785975353349,Create a new table called demo with 2 columns and insert 5 random rows into it. Then query it. Finally drop it.,2026-08-15 14:33:06,4432,467.0,gemini-3.6-flash,11975,8109.0,67.0
+sqlite,,11827,109,"CREATE TABLE demo (
+  id integer PRIMARY KEY,
+  val text
+);
+
+INSERT INTO demo (id, val)
+SELECT i, md5(random()::text)
+FROM generate_series(1, 5) AS i;
+
+SELECT * FROM demo;
+
+DROP TABLE demo;
+
+SELECT EXISTS (
+  SELECT 1
+  FROM information_schema.tables
+  WHERE table_schema = 'public'
+    AND table_name = 'demo'
+) AS demo_table_exists;",global,demo@helloworld-vector-1785975353349,"Create a new table called demo with 2 columns and insert 5 random rows into it. Then query it. Then drop it. Finally, confirm it is gone.",2026-08-15 14:34:33,4536,712.0,gemini-3.6-flash,12648,,68.0
+sqlite,,2308,919,"/*
+  Query Explanation:
+  ------------------
+  This query performs Customer RFM (Recency, Frequency, Monetary) Segmentation & Category Analysis:
+  1. CustomerStats CTE: Aggregates lifetime orders, total spend, and last order date per user.
+  2. CustomerSegments CTE: Segments customers into tiers (VIP, High Value, Repeat, One-time, Inactive) 
+     and calculates spend quartiles using NTILE().
+  3. SegmentCategoryPerformance CTE: Calculates revenue and units sold per product category within 
+     each customer segment, ranking categories using DENSE_RANK().
+  4. Final Selection: Joins customer statistics with their top-performing category, formatting dates 
+     to 'YYYY-MM-DD HH24:MI:SS'.
+*/
+
+WITH CustomerStats AS (
+    SELECT 
+        u.user_id,
+        u.email,
+        COUNT(DISTINCT o.orderid) AS total_orders,
+        COALESCE(SUM(o.totalamountusd), 0) AS lifetime_value_usd,
+        MAX(o.orderdate) AS last_order_date
+    FROM users u
+    LEFT JOIN orders o ON u.user_id = o.userid
+    GROUP BY u.user_id, u.email
+),
+CustomerSegments AS (
+    SELECT 
+        user_id,
+        email,
+        total_orders,
+        lifetime_value_usd,
+        last_order_date,
+        NTILE(4) OVER (ORDER BY lifetime_value_usd DESC) AS spend_quartile,
+        CASE 
+            WHEN lifetime_value_usd > 1000 AND total_orders >= 5 THEN 'VIP / Champion'
+            WHEN lifetime_value_usd > 500 THEN 'High Value'
+            WHEN total_orders > 1 THEN 'Repeat Customer'
+            WHEN total_orders = 1 THEN 'One-time Buyer'
+            ELSE 'Inactive'
+        END AS customer_segment
+    FROM CustomerStats
+),
+SegmentCategoryPerformance AS (
+    SELECT 
+        cs.customer_segment,
+        p.category,
+        COUNT(DISTINCT cs.user_id) AS unique_buyers,
+        SUM(oi.quantity) AS total_units_sold,
+        SUM(oi.quantity * oi.priceatorderusd) AS total_revenue_usd,
+        DENSE_RANK() OVER (
+            PARTITION BY cs.customer_segment 
+            ORDER BY SUM(oi.quantity * oi.priceatorderusd) DESC NULLS LAST
+        ) AS category_rank_in_segment
+    FROM CustomerSegments cs
+    JOIN orders o ON cs.user_id = o.userid
+    JOIN orderitems oi ON o.orderid = oi.orderid
+    JOIN products p ON oi.productid = p.productid
+    GROUP BY cs.customer_segment, p.category
+)
+SELECT 
+    cs.customer_segment,
+    cs.spend_quartile,
+    COUNT(DISTINCT cs.user_id) AS segment_user_count,
+    ROUND(AVG(cs.lifetime_value_usd), 2) AS avg_segment_ltv_usd,
+    TO_CHAR(MAX(cs.last_order_date), 'YYYY-MM-DD HH24:MI:SS') AS most_recent_order_time,
+    scp.category AS top_performing_category,
+    scp.total_units_sold AS top_category_units_sold,
+    scp.total_revenue_usd AS top_category_revenue_usd
+FROM CustomerSegments cs
+LEFT JOIN SegmentCategoryPerformance scp 
+    ON cs.customer_segment = scp.customer_segment 
+   AND scp.category_rank_in_segment = 1
+GROUP BY 
+    cs.customer_segment, 
+    cs.spend_quartile, 
+    scp.category, 
+    scp.total_units_sold, 
+    scp.total_revenue_usd
+ORDER BY 
+    cs.spend_quartile ASC, 
+    avg_segment_ltv_usd DESC;",global,demo@helloworld-vector-1785975353349,Write a complicated query against this database and explain what it does.,2026-08-15 14:37:41,12817,1742.0,gemini-3.6-flash,4969,,69.0
+sqlite,,2296,17,*** NO SQL *** Hello! How can I help you with your database queries today?,global,demo@helloworld-vector-1785975353349,hello,2026-08-15 14:40:55,2320,147.0,gemini-3.6-flash,2460,,70.0
+sqlite,,2316,17,*** NO SQL *** Hello! How can I assist you with your database query today?,global,demo@helloworld-vector-1785975353349,hell,2026-08-15 14:41:02,1391,111.0,gemini-3.6-flash,2444,,71.0
+sqlite,,2357,576,"*** NO SQL *** The database contains 7 main tables representing an e-commerce platform:
+
+### Tables & Descriptions:
+1. **users**: Account information (`user_id`, `email`).
+2. **addresses**: Addresses associated with users (`addressid`, `userid`, `streetaddress`, `city`, `state`, `country`, `zipcode`).
+3. **products**: Product catalog (`productid`, `name`, `description`, `priceusd`, `category`, embeddings).
+4. **orders**: Orders placed by users (`orderid`, `userid`, `orderdate`, `shippingaddressid`, `paymentid`, `totalamountusd`, `orderstatus`).
+5. **orderitems**: Line items contained within each order (`orderitemid`, `orderid`, `productid`, `quantity`, `priceatorderusd`).
+6. **payments**: Payment transactions (`paymentid`, `orderid`, `userid`, `paymentdate`, `paymentmethod`, `transactionid`, `amountusd`, `status`).
+7. **shoppingcarts**: Items currently saved in users' carts (`userid`, `productid`, `quantity`, `addeddate`).
+
+---
+
+### Relationships:
+- **users (1) ── (N) addresses**: A user can have multiple saved addresses.
+- **users (1) ── (N) orders**: A user can place multiple orders.
+- **addresses (1) ── (N) orders**: An address can be referenced as the shipping address for multiple orders.
+- **orders (1) ── (1) payments**: An order is associated with a payment transaction.
+- **orders (1) ── (N) orderitems (N) ── (1) products**: Junction relationship connecting orders and products.
+- **users (1) ── (N) shoppingcarts (N) ── (1) products**: Junction relationship connecting users and products in active shopping carts.
+
+---
+
+### Entity-Relationship (ER) Diagram:
+
+```
+  +-----------+       1:N       +-----------+
+  |   users   |----------------<| addresses |
+  +-----------+                 +-----------+
+    |       |                         |
+    |1:N    |1:N                      |1:N
+    v       v                         v
++-------+ +---------------+     +-----------+
+| carts | |   payments    |<---1|  orders   |
++-------+ +---------------+     +-----------+
+    |                                 |
+    |N:1                              |1:N
+    v                                 v
++-----------+                   +-----------+
+| products  |<------------------| orderitems|
++-----------+        1:N        +-----------+
+```",global,demo@helloworld-vector-1785975353349,"What tables are in this database, and how are they related? Also, can you draw the ER diagram?",2026-08-15 14:41:33,10005,1317.0,gemini-3.6-flash,4250,,72.0
+sqlite,,2948,683,"-- Query Explanation:
+-- This query performs a Customer Lifetime Value (CLV) and Behavioral Analysis:
+-- 1. `user_order_stats`: Aggregates order count, lifetime spend, average order value, and order date ranges per user.
+-- 2. `user_category_preference`: Ranks product categories for each user based on total quantity purchased using `ROW_NUMBER()`.
+-- 3. `overall_stats`: Computes total revenue across all orders to determine each user's percentage contribution.
+-- 4. The main query joins these CTEs with the `users` table, formats timestamp fields as 'YYYY-MM-DD:HH24:MI:SS', and selects the top 10 highest-spending customers.
+
+WITH user_order_stats AS (
+    SELECT 
+        o.userid,
+        COUNT(DISTINCT o.orderid) AS total_orders,
+        SUM(o.totalamountusd) AS total_spent,
+        AVG(o.totalamountusd) AS avg_order_value,
+        MIN(o.orderdate) AS first_order_date,
+        MAX(o.orderdate) AS last_order_date
+    FROM orders o
+    GROUP BY o.userid
+),
+user_category_preference AS (
+    SELECT 
+        o.userid,
+        p.category,
+        SUM(oi.quantity) AS category_quantity,
+        ROW_NUMBER() OVER (PARTITION BY o.userid ORDER BY SUM(oi.quantity) DESC) AS rank
+    FROM orders o
+    JOIN orderitems oi ON o.orderid = oi.orderid
+    JOIN products p ON oi.productid = p.productid
+    GROUP BY o.userid, p.category
+),
+overall_stats AS (
+    SELECT 
+        SUM(totalamountusd) AS grand_total_revenue 
+    FROM orders
+)
+SELECT 
+    u.user_id,
+    u.email,
+    uos.total_orders,
+    ROUND(uos.total_spent, 2) AS total_spent_usd,
+    ROUND(uos.avg_order_value, 2) AS avg_order_value_usd,
+    ROUND((uos.total_spent / NULLIF(os.grand_total_revenue, 0)) * 100, 2) AS pct_of_total_revenue,
+    ucp.category AS favorite_category,
+    TO_CHAR(uos.first_order_date, 'YYYY-MM-DD:HH24:MI:SS') AS first_order_date,
+    TO_CHAR(uos.last_order_date, 'YYYY-MM-DD:HH24:MI:SS') AS last_order_date
+FROM users u
+JOIN user_order_stats uos ON u.user_id = uos.userid
+LEFT JOIN user_category_preference ucp ON u.user_id = ucp.userid AND ucp.rank = 1
+CROSS JOIN overall_stats os
+ORDER BY uos.total_spent DESC
+LIMIT 10;",global,demo@helloworld-vector-1785975353349,Write a complicated query against this database and explain what it does.,2026-08-15 14:42:19,12771,2016.0,gemini-3.6-flash,5647,,73.0
+sqlite,,2298,4,SELECT 1;,global,demo@helloworld-vector-1785975353349,select 1,2026-08-15 20:33:57,2116,101.0,gemini-3.6-flash,2403,,74.0
+sqlite,,2307,4,SELECT 2;,global,demo@helloworld-vector-1785975353349,select 2,2026-08-15 20:34:03,1872,192.0,gemini-3.6-flash,2503,,75.0
+sqlite,,2298,4,SELECT 1;,global,demo@helloworld-vector-1785975353349,select 1,2026-08-15 20:38:52,1623,99.0,gemini-3.6-flash,2401,,76.0
+sqlite,,2307,4,SELECT 2;,global,demo@helloworld-vector-1785975353349,select 2,2026-08-15 20:38:57,1405,105.0,gemini-3.6-flash,2416,,77.0
+sqlite,,2326,85,"SELECT 
+    u.user_id,
+    u.email,
+    COALESCE(SUM(oi.quantity), 0) AS total_productos_comprados
+FROM users u
+JOIN orders o ON u.user_id = o.userid
+JOIN orderitems oi ON o.orderid = oi.orderid
+GROUP BY u.user_id, u.email;",global,demo@helloworld-vector-1785975353349,Muestrame la cantidad de productos que cada usuario ha comprad,2026-08-15 20:41:51,9576,755.0,gemini-3.6-flash,3166,,78.0
+sqlite,,2315,82,"SELECT productid, name, description, imageurl, priceusd, category 
+FROM products 
+LIMIT 20;
+
+SELECT orderid, userid, TO_CHAR(orderdate, 'YYYY-MM-DD HH24:MI:SS') AS orderdate, shippingaddressid, paymentid, totalamountusd, orderstatus 
+FROM orders 
+LIMIT 20;",global,demo@helloworld-vector-1785975353349,Muéstrame 20 filas de muestra de las dos tablas que parezcan más interesantes.,2026-08-15 20:47:20,3266,463.0,gemini-3.6-flash,2860,,79.0
+sqlite,,5815,55,"SELECT
+  table_name,
+  constraint_name,
+  constraint_type
+FROM
+  information_schema.table_constraints
+WHERE
+  table_schema = 'public'
+ORDER BY
+  table_name,
+  constraint_name;",global,demo@helloworld-vector-1785975353349,show me all constraints,2026-08-15 20:50:02,2793,283.0,gemini-3.6-flash,6153,,80.0
