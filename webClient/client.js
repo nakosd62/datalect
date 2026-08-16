@@ -1039,7 +1039,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       {
         target: promptWrapper,
         title: 'Ask your question here',
-        body: "Type what you want to know in plain English (e.g. \u201cWhat tables are in this database?\u201d) and hit Enter. No SQL needed to get started."
+        body: "Type what you want to know in plain English or any other language and hit Enter."
       },
       {
         target: quickPromptsVisible ? quickPrompts : null,
