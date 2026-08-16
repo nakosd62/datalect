@@ -21,7 +21,7 @@ crdb.crt
 state/
 
 # Data dumps
-utils/data_*
+utils/data/
 
 # Temporary files
 *-save*
