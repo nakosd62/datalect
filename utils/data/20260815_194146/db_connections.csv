@@ -1,4 +1,0 @@
-_source,doc_id,updated_at,database_url,user_id,database_name
-firestore,nakosd@gmail.com_93cde4f613e7f4c980eb26c6d76a03a4de4c42972a5a51a06bca8163dd35e4db,2026-08-15 21:37:45.693000+00:00,postgresql://postgres:FooBar@/helloworld-vector-1785975353349?host=/cloudsql/grand-cosmos-716:us-east1:trial,nakosd@gmail.com,helloworld-vector-1785975353349
-firestore,nakosd@gmail.com_c5ee3afa7fcef28ccccdb2efbdeb9d066597b8b6448dace804ea4b0b204385fe,2026-08-15 21:37:45.724000+00:00,postgresql://dimitris:HmO8lJiiYJTO5-B6HvA-Ew@warm-katydid-17872.jxf.gcp-us-east1.cockroachlabs.cloud:26257/kitchenbank?sslmode=verify-full&sslrootcert=crdb.crt,nakosd@gmail.com,kitchenbank
-sqlite,,,postgresql://postgres:FooBar@127.0.0.1:5432/helloworld-vector-1785975353349,global,helloworld-vector-1785975353349

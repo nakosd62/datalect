@@ -1,4 +1,0 @@
-_source,doc_id,auto_sql_execute,updated_at,database_url,session_id
-firestore,diminak64@gmail.com,1,2026-08-15 22:07:09.548000+00:00,postgresql://demo:FooBar@/helloworld-vector-1785975353349?host=/cloudsql/grand-cosmos-716:us-east1:trial,
-firestore,nakosd@gmail.com,1,2026-08-15 21:37:45.574000+00:00,postgresql://postgres:FooBar@/helloworld-vector-1785975353349?host=/cloudsql/grand-cosmos-716:us-east1:trial,
-sqlite,,1,2026-08-15 20:42:10,postgresql://demo:FooBar@127.0.0.1:5432/helloworld-vector-1785975353349,global
