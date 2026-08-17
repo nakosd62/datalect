@@ -22,7 +22,8 @@ from auth import (
     get_or_create_session_id, get_current_user_identity, apply_session_cookie,
     is_anonymous_user,
 )
-from db import get_db_connection
+from db import get_db_connection, get_conn_identifier
+import schema_cache
 
 config_bp = Blueprint('config', __name__)
 
@@ -59,6 +60,17 @@ def handle_config():
             new_auto_sql_execute = None
 
         if new_db_url or new_auto_sql_execute is not None:
+            if new_db_url:
+                prior_conn_str = state_store.get_session(user_identity)["database_url"]
+                if new_db_url != prior_conn_str:
+                    # The DB connection is changing - drop any cached schema
+                    # for the connection we're switching to. Without this,
+                    # if that connection (by username@dbname) was cached
+                    # earlier - e.g. by another session/user on the same DB,
+                    # or from before the schema changed - /api/translate
+                    # would keep serving that stale schema for up to
+                    # SCHEMA_CACHE_TTL_SECONDS after the switch.
+                    schema_cache.invalidate(get_conn_identifier(new_db_url))
             state_store.set_session(user_identity, new_db_url, new_auto_sql_execute)
             if new_db_url and (is_custom or (new_db_url not in preset_urls)):
                 db_name_to_save = new_db_name
