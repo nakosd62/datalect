@@ -14,7 +14,10 @@ from urllib.parse import urlparse
 import psycopg2
 import sqlparse
 
-from .base import Backend
+from .base import (
+    Backend, SCHEMA_MAX_TABLE_NAMES_SCANNED, SCHEMA_MAX_TABLES,
+    group_date_sharded_tables, cap_kept_tables, cap_schema_text,
+)
 
 
 class PostgresBackend(Backend):
@@ -57,21 +60,57 @@ class PostgresBackend(Backend):
         schema_parts = []
 
         with connection.cursor() as cursor:
-            # 1. Tables and Columns
+            # Phase 1: cheap - just the distinct table names, bounded so a
+            # schema with an extreme number of tables can't make even this
+            # scan unbounded (SCHEMA_MAX_TABLE_NAMES_SCANNED). Grouped into
+            # date-shard families (e.g. events_20240101 .. events_20241231
+            # -> one "events" family) and capped to SCHEMA_MAX_TABLES
+            # entries (see backends/base.py) *before* any column/constraint/
+            # index/view/grant/trigger query runs - those all get scoped to
+            # this bounded set below, which is what actually keeps schema
+            # fetching tractable on a dataset with a huge number of tables,
+            # rather than fetching everything and truncating the text after
+            # the fact.
             cursor.execute("""
-                SELECT 
-                    c.table_name, 
-                    c.column_name, 
-                    c.data_type, 
-                    c.is_nullable, 
+                SELECT DISTINCT c.table_name
+                FROM information_schema.columns c
+                JOIN information_schema.tables t
+                  ON c.table_name = t.table_name AND c.table_schema = t.table_schema
+                WHERE c.table_schema = 'public'
+                  AND t.table_type = 'BASE TABLE'
+                ORDER BY c.table_name
+                LIMIT %s;
+            """, (SCHEMA_MAX_TABLE_NAMES_SCANNED,))
+            all_table_names = [row[0] for row in cursor.fetchall()]
+
+            if not all_table_names:
+                return None
+
+            kept_names, shard_groups = group_date_sharded_tables(all_table_names)
+            kept_names, shard_groups, omitted_count = cap_kept_tables(kept_names, shard_groups)
+            # Postgres has no wildcard-table query mechanism (unlike
+            # BigQuery - see backends/bigquery.py), so a shard family's
+            # representative is described under its own real, literal name;
+            # the heading below just also explains the naming pattern and
+            # member count, so Gemini can construct the literal name for
+            # whichever date the user means instead of inventing one.
+            shard_by_representative = {
+                members[-1]: (prefix, members) for prefix, members in shard_groups.items()
+            }
+
+            # 1. Tables and Columns - scoped to the bounded kept_names set.
+            cursor.execute("""
+                SELECT
+                    c.table_name,
+                    c.column_name,
+                    c.data_type,
+                    c.is_nullable,
                     c.column_default
                 FROM information_schema.columns c
-                JOIN information_schema.tables t 
-                  ON c.table_name = t.table_name AND c.table_schema = t.table_schema
-                WHERE c.table_schema = 'public' 
-                  AND t.table_type = 'BASE TABLE'
+                WHERE c.table_schema = 'public'
+                  AND c.table_name = ANY(%s)
                 ORDER BY c.table_name, c.ordinal_position;
-            """)
+            """, (kept_names,))
             columns_data = cursor.fetchall()
 
             tables = {}
@@ -82,14 +121,35 @@ class PostgresBackend(Backend):
                 null_str = "NULL" if is_nullable == "YES" else "NOT NULL"
                 tables[table_name].append(f"  {col_name} {data_type} {null_str}{default_str}")
 
-            for table_name, col_defs in tables.items():
-                schema_parts.append(f"Table: {table_name}\n" + "\n".join(col_defs))
+            for table_name in kept_names:
+                col_defs = tables.get(table_name)
+                if not col_defs:
+                    continue
+                if table_name in shard_by_representative:
+                    prefix, members = shard_by_representative[table_name]
+                    heading = (
+                        f"Table family: {prefix}_<date> ({len(members)} date-sharded tables, "
+                        f"e.g. {members[0]} .. {members[-1]}; identical columns in every "
+                        f"member - substitute the exact table name for whichever date is "
+                        f"meant, following this same naming pattern; never query "
+                        f"'{prefix}_<date>' literally)"
+                    )
+                else:
+                    heading = f"Table: {table_name}"
+                schema_parts.append(heading + "\n" + "\n".join(col_defs))
+
+            if omitted_count:
+                schema_parts.append(
+                    f"[... {omitted_count} more table(s)/table-family(ies) not shown - "
+                    f"this schema has more than the {SCHEMA_MAX_TABLES}-table summary "
+                    f"limit. Ask about a narrower set of tables to see the rest.]"
+                )
 
             # 2. Constraints
             cursor.execute("""
-                SELECT 
-                    tc.table_name, 
-                    tc.constraint_name, 
+                SELECT
+                    tc.table_name,
+                    tc.constraint_name,
                     tc.constraint_type,
                     kcu.column_name,
                     ccu.table_name AS foreign_table_name,
@@ -102,8 +162,9 @@ class PostgresBackend(Backend):
                   ON ccu.constraint_name = tc.constraint_name
                  AND ccu.table_schema = tc.table_schema
                 WHERE tc.table_schema = 'public'
+                  AND tc.table_name = ANY(%s)
                 ORDER BY tc.table_name, tc.constraint_name;
-            """)
+            """, (kept_names,))
             constraints = cursor.fetchall()
             if constraints:
                 constraint_lines = []
@@ -118,25 +179,35 @@ class PostgresBackend(Backend):
 
             # 3. Indexes
             cursor.execute("""
-                SELECT 
-                    tablename, 
-                    indexname, 
-                    indexdef 
-                FROM pg_indexes 
+                SELECT
+                    tablename,
+                    indexname,
+                    indexdef
+                FROM pg_indexes
                 WHERE schemaname = 'public'
+                  AND tablename = ANY(%s)
                 ORDER BY tablename, indexname;
-            """)
+            """, (kept_names,))
             indexes = cursor.fetchall()
             if indexes:
                 idx_lines = [f"  [{row[0]}] {row[1]}: {row[2]}" for row in indexes]
                 schema_parts.append("Indexes:\n" + "\n".join(idx_lines))
 
-            # 4. Views
+            # 4. Views - deliberately NOT scoped to kept_names: that set is
+            # built exclusively from BASE TABLE names (the phase-1 scan
+            # filters t.table_type = 'BASE TABLE'), so no view name could
+            # ever appear in it - scoping this query to kept_names would
+            # silently return zero views, always. Views are a categorically
+            # separate set and aren't subject to the same table-count
+            # blowup this whole cap/collapse scheme protects against (date-
+            # sharded *view* families aren't a thing BigQuery/Postgres users
+            # actually do), so leaving this unbounded is intentional, not
+            # an oversight.
             cursor.execute("""
-                SELECT 
-                    table_name, 
-                    view_definition 
-                FROM information_schema.views 
+                SELECT
+                    table_name,
+                    view_definition
+                FROM information_schema.views
                 WHERE table_schema = 'public';
             """)
             views = cursor.fetchall()
@@ -146,14 +217,15 @@ class PostgresBackend(Backend):
 
             # 5. Role Grants
             cursor.execute("""
-                SELECT 
-                    grantee, 
-                    table_name, 
-                    privilege_type 
-                FROM information_schema.role_table_grants 
+                SELECT
+                    grantee,
+                    table_name,
+                    privilege_type
+                FROM information_schema.role_table_grants
                 WHERE table_schema = 'public'
+                  AND table_name = ANY(%s)
                 ORDER BY table_name, grantee;
-            """)
+            """, (kept_names,))
             grants = cursor.fetchall()
             if grants:
                 grant_lines = [f"  Grant {g[2]} on {g[1]} to {g[0]}" for g in grants]
@@ -161,20 +233,23 @@ class PostgresBackend(Backend):
 
             # 6. Triggers
             cursor.execute("""
-                SELECT 
-                    event_object_table, 
-                    trigger_name, 
-                    event_manipulation, 
-                    action_statement 
-                FROM information_schema.triggers 
-                WHERE event_object_schema = 'public';
-            """)
+                SELECT
+                    event_object_table,
+                    trigger_name,
+                    event_manipulation,
+                    action_statement
+                FROM information_schema.triggers
+                WHERE event_object_schema = 'public'
+                  AND event_object_table = ANY(%s);
+            """, (kept_names,))
             triggers = cursor.fetchall()
             if triggers:
                 trig_lines = [f"  [{t[0]}] {t[1]} ({t[2]}): {t[3]}" for t in triggers]
                 schema_parts.append("Triggers:\n" + "\n".join(trig_lines))
 
-        return "\n\n".join(schema_parts) if schema_parts else None
+        if not schema_parts:
+            return None
+        return cap_schema_text("\n\n".join(schema_parts))
 
     def execute(self, connection, sql_text):
         connection.autocommit = True

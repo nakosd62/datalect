@@ -45,6 +45,7 @@ from auth import (
 )
 from db import get_conn_identifier, session_to_descriptor
 from backends import get_backend
+from state_store import compute_connection_key
 import schema_cache
 
 config_bp = Blueprint('config', __name__)
@@ -57,22 +58,33 @@ def _bigquery_url(project_id, dataset):
     return f"bigquery://{project_id}/{dataset}"
 
 
-def _resolve_bigquery_credentials(user_identity, project_id, dataset, provided_credentials_json):
+def _resolve_bigquery_credentials(user_identity, project_id, dataset, provided_credentials_json, name=None):
     """Returns the credentials_json to persist for a BigQuery connection:
     whatever was freshly provided in this request, else whatever was
     already stored for this exact project/dataset. Without this, simply
     re-selecting (or renaming) an already-saved custom BigQuery connection
     would look like "no credentials provided" and silently drop the
     stored key, since get_db_connections() never sends it back to the
-    frontend in the first place."""
+    frontend in the first place.
+
+    `name` disambiguates when *multiple* saved connections share this
+    project/dataset (now possible - see compute_connection_key's
+    docstring in state_store.py for why url/project/dataset alone isn't a
+    unique identity anymore): matched first, falling back to the first
+    project/dataset match if no name match is found (legacy behavior, and
+    still correct whenever there's genuinely only one)."""
     if provided_credentials_json:
         return provided_credentials_json
     target_url = _bigquery_url(project_id, dataset)
     existing = state_store.get_db_connections(user_identity, include_credentials=True)
-    for db in existing:
-        if db.get("type") == "bigquery" and db.get("url") == target_url:
-            return (db.get("config") or {}).get("credentials_json")
-    return None
+    matches = [db for db in existing if db.get("type") == "bigquery" and db.get("url") == target_url]
+    if not matches:
+        return None
+    if name:
+        named_match = next((db for db in matches if db.get("name") == name), None)
+        if named_match:
+            return (named_match.get("config") or {}).get("credentials_json")
+    return (matches[0].get("config") or {}).get("credentials_json")
 
 
 def _billing_project_from_credentials(credentials_json):
@@ -108,7 +120,8 @@ def _parse_incoming_connection(data, user_identity):
         db_url = _bigquery_url(project_id, dataset)
         db_config = {"project_id": project_id, "dataset": dataset}
         credentials_json = _resolve_bigquery_credentials(
-            user_identity, project_id, dataset, data.get('credentials_json')
+            user_identity, project_id, dataset, data.get('credentials_json'),
+            name=data.get('database_name'),
         )
         if credentials_json:
             db_config["credentials_json"] = credentials_json
@@ -139,11 +152,19 @@ def _parse_incoming_connection(data, user_identity):
 def _parse_incoming_custom_databases(custom_databases_in, user_identity):
     """Normalizes the frontend's `custom_databases` list (each item using
     the same flat per-type field shape as the top-level connection - see
-    _parse_incoming_connection) into the {"name", "type", "url", "config"}
-    shape state_store.set_db_connections expects, merging in previously
-    saved BigQuery credentials where the request didn't supply a fresh
-    key. Returns None if the request didn't include the field at all
-    (meaning "leave the saved list alone"), same as before."""
+    _parse_incoming_connection) into the {"connection_key", "name", "type",
+    "url", "config"} shape state_store.set_db_connections expects, merging
+    in previously saved BigQuery credentials where the request didn't
+    supply a fresh key. Returns None if the request didn't include the
+    field at all (meaning "leave the saved list alone"), same as before.
+
+    connection_key (see compute_connection_key's docstring in
+    state_store.py) is computed here, once, from the exact (name, url,
+    credentials_json) this function is about to persist - so it can also
+    be reused as-is for the session's custom_connection_key pointer when
+    this same request's active connection is one of these entries (see
+    handle_config), instead of that being recomputed separately and
+    risking drifting out of sync with what actually got saved."""
     if custom_databases_in is None:
         return None
 
@@ -158,15 +179,18 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
             url = _bigquery_url(project_id, dataset)
             config = {"project_id": project_id, "dataset": dataset}
             credentials_json = _resolve_bigquery_credentials(
-                user_identity, project_id, dataset, db.get('credentials_json')
+                user_identity, project_id, dataset, db.get('credentials_json'),
+                name=db.get('name'),
             )
             if credentials_json:
                 config["credentials_json"] = credentials_json
                 billing_project_id = _billing_project_from_credentials(credentials_json)
                 if billing_project_id:
                     config["billing_project_id"] = billing_project_id
+            name = db.get("name") or dataset or "Custom BigQuery"
             merged.append({
-                "name": db.get("name") or dataset or "Custom BigQuery",
+                "connection_key": compute_connection_key(name, url, credentials_json),
+                "name": name,
                 "type": "bigquery",
                 "url": url,
                 "config": config,
@@ -175,8 +199,10 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
             url = (db.get("url") or "").strip()
             if not url:
                 continue
+            name = db.get("name") or "Custom"
             merged.append({
-                "name": db.get("name") or "Custom",
+                "connection_key": compute_connection_key(name, url, None),
+                "name": name,
                 "type": "postgres",
                 "url": url,
                 "config": {},
@@ -249,6 +275,7 @@ def handle_config():
                 state_store.set_session(
                     user_identity, new_db_url, new_auto_sql_execute,
                     db_type=new_db_type, db_config=new_db_config, is_custom=False,
+                    custom_connection_key="",
                 )
 
         else:
@@ -271,10 +298,16 @@ def handle_config():
                         schema_cache.invalidate(get_conn_identifier(
                             {"type": new_db_type, "url": new_db_url, **new_db_config}
                         ))
-                state_store.set_session(
-                    user_identity, new_db_url, new_auto_sql_execute,
-                    db_type=new_db_type, db_config=new_db_config, is_custom=is_custom,
-                )
+
+                # Resolved once, up front (rather than inside the
+                # save-to-list block below), so the session's "which exact
+                # saved connection is this" pointer (custom_connection_key)
+                # and the actual saved-list row always agree on the same
+                # name - a blank database_name from the frontend falls back
+                # to a derived one, and computing the key before that
+                # fallback ran would silently point at a connection that
+                # was never actually saved under that name.
+                db_name_to_save = None
                 if new_db_url and (is_custom or (new_db_url not in preset_urls)):
                     db_name_to_save = new_db_name
                     if not db_name_to_save:
@@ -289,13 +322,31 @@ def handle_config():
                                 db_name_to_save = dbname or "Custom"
                             except Exception:
                                 db_name_to_save = "Custom"
+
+                # "" (not None) whenever the active connection isn't a
+                # custom one, so set_session actually clears any
+                # previously-pinned key rather than leaving a stale one
+                # behind from before the user switched to a preset.
+                active_connection_key = (
+                    compute_connection_key(db_name_to_save, new_db_url, new_db_config.get("credentials_json"))
+                    if is_custom and new_db_url else ""
+                )
+
+                state_store.set_session(
+                    user_identity, new_db_url, new_auto_sql_execute,
+                    db_type=new_db_type, db_config=new_db_config, is_custom=is_custom,
+                    custom_connection_key=active_connection_key,
+                )
+                if db_name_to_save is not None:
                     state_store.set_db_connections(
                         user_identity, db_name_to_save, new_db_type, new_db_url,
                         db_config=new_db_config, custom_databases=merged_custom_databases,
+                        connection_key=(active_connection_key or None),
                     )
             else:
                 state_store.set_session(
                     user_identity, DEFAULT_CONN, db_type='postgres', db_config={}, is_custom=False,
+                    custom_connection_key="",
                 )
 
     session_data = state_store.get_session(user_identity)
@@ -312,23 +363,41 @@ def handle_config():
         custom_databases = []
         user_custom_name = None
         user_custom_url = None
+        active_custom_connection_key = ""
+        active_uses_custom_credentials = False
     else:
         custom_databases = state_store.get_db_connections(user_identity)  # credentials stripped
-        # Must be whichever saved custom connection is actually active
-        # (matched by URL), not just custom_databases[0] - that was fine
-        # back when a user could only ever save one custom connection, but
-        # now that multiple can be saved, "the first one saved" and "the
-        # one currently selected" are frequently different, and the
-        # frontend's connection badge trusts this field over the
-        # live-introspected database_name (see updateConnectionDetails in
-        # client.js) - so picking the wrong one here made the badge appear
-        # to ignore the user's selection even though the session's
-        # connection had actually switched correctly.
-        active_custom_db = next(
-            (db for db in custom_databases if db.get("url") == active_conn_str), None
-        )
+        # Must be whichever saved custom connection is actually active, not
+        # just custom_databases[0] (fine back when a user could only ever
+        # save one) or a plain URL match (ambiguous once multiple saved
+        # connections can share a URL - e.g. two BigQuery connections on
+        # the same project/dataset with different service-account keys;
+        # see compute_connection_key's docstring in state_store.py).
+        # session_data's custom_connection_key is the precise pointer set
+        # at save time; only fall back to URL matching for a session saved
+        # before that field existed, so an already-active custom connection
+        # doesn't just appear unselected the first time this loads after
+        # upgrading.
+        active_custom_key = session_data.get("custom_connection_key") or ""
+        active_custom_db = None
+        if active_custom_key:
+            active_custom_db = next(
+                (db for db in custom_databases if db.get("connection_key") == active_custom_key), None
+            )
+        else:
+            active_custom_db = next(
+                (db for db in custom_databases if db.get("url") == active_conn_str), None
+            )
         user_custom_name = active_custom_db["name"] if active_custom_db else None
         user_custom_url = active_custom_db["url"] if active_custom_db else None
+        active_custom_connection_key = active_custom_db.get("connection_key", "") if active_custom_db else ""
+        # Whether the currently active connection is authenticating with its
+        # own pasted service-account key, as opposed to this app's ambient
+        # credentials (ADC) - surfaced so the frontend can tell the user
+        # which one is actually in effect, rather than leaving that
+        # invisible once the key itself is (correctly) never sent back. See
+        # state_store.get_db_connections' has_custom_credentials docstring.
+        active_uses_custom_credentials = bool(active_custom_db.get("has_custom_credentials")) if active_custom_db else False
 
     if IS_CLOUD_RUN and not is_authenticated:
         # Anonymous users may still open the DB config dialog and switch
@@ -395,6 +464,8 @@ def handle_config():
         'active_database_url': active_conn_str_out,
         'active_database_type': active_db_type_out,
         'active_is_custom': active_is_custom_out,
+        'active_custom_connection_key': active_custom_connection_key,
+        'active_uses_custom_credentials': active_uses_custom_credentials,
         'active_database_project_id': active_db_config.get("project_id", "") if active_db_type_out == "bigquery" else "",
         'active_database_dataset': active_db_config.get("dataset", "") if active_db_type_out == "bigquery" else "",
         'custom_database_name': user_custom_name or "",

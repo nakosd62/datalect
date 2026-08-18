@@ -47,7 +47,10 @@ from google.cloud import bigquery
 from google.oauth2 import service_account
 import sqlparse
 
-from .base import Backend
+from .base import (
+    Backend, SCHEMA_MAX_TABLE_NAMES_SCANNED, SCHEMA_MAX_TABLES,
+    group_date_sharded_tables, cap_kept_tables, cap_schema_text,
+)
 
 
 class BigQueryBackend(Backend):
@@ -111,11 +114,18 @@ class BigQueryBackend(Backend):
             return bigquery.DatasetReference(project_id, dataset)
         return None
 
-    def _run(self, connection, sql_text):
+    def _run(self, connection, sql_text, params=None):
         """Runs one query/statement scoped to this connection's dataset
         (so unqualified table names in generated SQL resolve the same way
-        Postgres's "public" schema does) and returns the finished job."""
-        job_config = bigquery.QueryJobConfig(default_dataset=self._default_dataset_ref(connection))
+        Postgres's "public" schema does) and returns the finished job.
+        `params`, when given, is a list of bigquery.ScalarQueryParameter/
+        ArrayQueryParameter objects for a parameterized query - used by
+        get_schema() below to scope INFORMATION_SCHEMA queries to a bounded
+        table-name set without string-formatting names into the SQL."""
+        job_config = bigquery.QueryJobConfig(
+            default_dataset=self._default_dataset_ref(connection),
+            query_parameters=params or [],
+        )
         return connection.query(sql_text, job_config=job_config)
 
     def get_schema(self, connection):
@@ -127,12 +137,52 @@ class BigQueryBackend(Backend):
         qualified = f"`{project_id}.{dataset}`"
         schema_parts = []
 
-        # 1. Tables and columns
+        # Phase 1: cheap - just the distinct table names, bounded so a
+        # dataset with an extreme number of tables can't make even this
+        # scan unbounded (SCHEMA_MAX_TABLE_NAMES_SCANNED). Grouped into
+        # date-shard families (e.g. events_20240101 .. events_20241231 ->
+        # one "events" family) and capped to SCHEMA_MAX_TABLES entries (see
+        # backends/base.py) *before* any column/constraint query runs -
+        # those get scoped to this bounded set below, which is what
+        # actually keeps schema fetching tractable on a dataset with a huge
+        # number of tables, rather than fetching everything and truncating
+        # the text after the fact. BASE TABLE only (matches postgres.py) -
+        # views are handled separately, unscoped, in section 3 below.
+        table_rows = list(self._run(connection, f"""
+            SELECT table_name
+            FROM {qualified}.INFORMATION_SCHEMA.TABLES
+            WHERE table_type = 'BASE TABLE'
+            ORDER BY table_name
+            LIMIT {int(SCHEMA_MAX_TABLE_NAMES_SCANNED)}
+        """).result())
+        all_table_names = [row.table_name for row in table_rows]
+
+        if not all_table_names:
+            return None
+
+        kept_names, shard_groups = group_date_sharded_tables(all_table_names)
+        kept_names, shard_groups, omitted_count = cap_kept_tables(kept_names, shard_groups)
+        # Unlike Postgres (no wildcard-table mechanism - see
+        # backends/postgres.py's shard_by_representative comment), BigQuery
+        # has a native syntax for querying a whole date-shard family at
+        # once: `project.dataset.prefix_*` plus the pseudo-column
+        # _TABLE_SUFFIX to filter/identify which shard each row came from.
+        # So a shard family's schema entry here describes that wildcard
+        # form directly - correctness-preserving, not just an explanatory
+        # note the way Postgres's representative-table approach is.
+        shard_by_representative = {
+            members[-1]: (prefix, members) for prefix, members in shard_groups.items()
+        }
+
+        kept_names_param = bigquery.ArrayQueryParameter("kept_names", "STRING", kept_names)
+
+        # 1. Tables and columns - scoped to the bounded kept_names set.
         columns_rows = list(self._run(connection, f"""
             SELECT table_name, column_name, data_type, is_nullable
             FROM {qualified}.INFORMATION_SCHEMA.COLUMNS
+            WHERE table_name IN UNNEST(@kept_names)
             ORDER BY table_name, ordinal_position
-        """).result())
+        """, params=[kept_names_param]).result())
 
         tables = {}
         for row in columns_rows:
@@ -140,15 +190,41 @@ class BigQueryBackend(Backend):
                 f"  {row.column_name} {row.data_type} "
                 f"{'NULL' if row.is_nullable == 'YES' else 'NOT NULL'}"
             )
-        for table_name, col_defs in tables.items():
-            schema_parts.append(f"Table: {table_name}\n" + "\n".join(col_defs))
+
+        for table_name in kept_names:
+            col_defs = tables.get(table_name)
+            if not col_defs:
+                continue
+            if table_name in shard_by_representative:
+                prefix, members = shard_by_representative[table_name]
+                wildcard = f"`{project_id}.{dataset}.{prefix}_*`"
+                heading = (
+                    f"Table family: {wildcard} ({len(members)} date-sharded tables, "
+                    f"e.g. {members[0]} .. {members[-1]}; identical columns in every "
+                    f"member - query this family with the wildcard form "
+                    f"{wildcard}, filtering/identifying the shard via the "
+                    f"_TABLE_SUFFIX pseudo-column (e.g. WHERE _TABLE_SUFFIX "
+                    f"BETWEEN '...' AND '...'); never query a single literal "
+                    f"date-suffixed table name from this family)"
+                )
+            else:
+                heading = f"Table: {table_name}"
+            schema_parts.append(heading + "\n" + "\n".join(col_defs))
+
+        if omitted_count:
+            schema_parts.append(
+                f"[... {omitted_count} more table(s)/table-family(ies) not shown - "
+                f"this dataset has more than the {SCHEMA_MAX_TABLES}-table summary "
+                f"limit. Ask about a narrower set of tables to see the rest.]"
+            )
 
         # 2. Constraints - unenforced in BigQuery, but still useful context
         # for the model (e.g. which columns are meant to be primary/foreign
         # keys). Best-effort: TABLE_CONSTRAINTS/KEY_COLUMN_USAGE can 404 on
         # datasets with no declared constraints at all on some BigQuery
         # versions/regions, so a failure here just means "skip this
-        # section", not "fail the whole schema fetch".
+        # section", not "fail the whole schema fetch". Scoped to
+        # kept_names, same as section 1.
         try:
             constraint_rows = list(self._run(connection, f"""
                 SELECT tc.table_name, tc.constraint_name, tc.constraint_type, kcu.column_name
@@ -156,8 +232,9 @@ class BigQueryBackend(Backend):
                 LEFT JOIN {qualified}.INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
                   ON tc.constraint_name = kcu.constraint_name
                  AND tc.table_name = kcu.table_name
+                WHERE tc.table_name IN UNNEST(@kept_names)
                 ORDER BY tc.table_name, tc.constraint_name
-            """).result())
+            """, params=[kept_names_param]).result())
             if constraint_rows:
                 lines = [
                     f"  [{r.table_name}] {r.constraint_name} ({r.constraint_type}): {r.column_name}"
@@ -167,7 +244,14 @@ class BigQueryBackend(Backend):
         except Exception:
             pass
 
-        # 3. Views
+        # 3. Views - deliberately NOT scoped to kept_names: that set is
+        # built exclusively from BASE TABLE names (phase 1 filters
+        # table_type = 'BASE TABLE'), so no view name could ever appear in
+        # it - scoping this query to kept_names would silently return zero
+        # views, always. Views are a categorically separate set and aren't
+        # subject to the same table-count blowup this whole cap/collapse
+        # scheme protects against, so leaving this unbounded is
+        # intentional, not an oversight (mirrors backends/postgres.py).
         try:
             view_rows = list(self._run(connection, f"""
                 SELECT table_name, view_definition
@@ -183,7 +267,9 @@ class BigQueryBackend(Backend):
         except Exception:
             pass
 
-        return "\n\n".join(schema_parts) if schema_parts else None
+        if not schema_parts:
+            return None
+        return cap_schema_text("\n\n".join(schema_parts))
 
     def execute(self, connection, sql_text):
         statements = [s.strip() for s in sqlparse.split(sql_text) if s.strip()]

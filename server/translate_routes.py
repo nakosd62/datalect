@@ -38,9 +38,17 @@ _DIALECT_PROMPT_INTROS = {
     ),
     "BigQuery Standard SQL": (
         "You are an expert SQL generation assistant for Google BigQuery (Standard SQL / GoogleSQL).\n"
-        "Given the provided past chat interactions, the database schema and the user's natural language prompt, translate the request into valid BigQuery Google SQL.\n"
+        "Given the provided past chat interactions, the database schema and the user's natural language prompt, translate the request into valid BigQuery Standard SQL.\n"
         "You may return one or more independent SQL statements, and BigQuery scripting (DECLARE/IF/LOOP) where appropriate.\n"
         "Use backticks for identifiers that need quoting; never use double quotes for identifiers - BigQuery treats double-quoted text as a string literal, not an identifier.\n"
+        "Some schema entries are labeled 'Table family: `project.dataset.prefix_*`' instead of a single table - "
+        "these describe a family of date-sharded tables (e.g. prefix_20240101, prefix_20240102, ...) that all "
+        "share the same columns. For these, NEVER query a literal single-date table name (e.g. `project.dataset.prefix_20240115`) "
+        "unless the user's request is unambiguously about exactly one specific date and that exact table is known to exist. "
+        "Instead, query the family using BigQuery's wildcard-table syntax exactly as shown in the schema (`project.dataset.prefix_*`), "
+        "and filter/select the relevant shard(s) using the _TABLE_SUFFIX pseudo-column, e.g. "
+        "WHERE _TABLE_SUFFIX BETWEEN '20240101' AND '20240131' for a date range, or WHERE _TABLE_SUFFIX = '20240115' for one specific day. "
+        "_TABLE_SUFFIX is only valid when the FROM clause uses the wildcard (`prefix_*`) form.\n"
     ),
 }
 _DEFAULT_DIALECT_PROMPT_INTRO = _DIALECT_PROMPT_INTROS["PostgreSQL"]

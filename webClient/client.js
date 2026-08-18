@@ -100,6 +100,23 @@ document.addEventListener('DOMContentLoaded', async () => {
   // shows). Always trust the freshest /api/config response's
   // active_is_custom over recomputing this from URLs.
   let ACTIVE_IS_CUSTOM = false;
+  // Which saved custom connection (see renderCustomDbRows()) is actually
+  // active, keyed by its server-computed connection_key rather than URL -
+  // two saved custom connections can themselves share a URL (e.g. two
+  // BigQuery connections on the same project/dataset with different
+  // service-account keys), so URL matching alone can't tell them apart
+  // either. "" whenever the active connection isn't a custom one, or for a
+  // session saved before this existed (renderCustomDbRows() falls back to
+  // URL matching in that case).
+  let ACTIVE_CUSTOM_CONNECTION_KEY = "";
+  // Whether the active connection is authenticating with its own pasted
+  // BigQuery service-account key, as opposed to this app's ambient
+  // credentials (ADC) - the key itself is never sent to the frontend (see
+  // state_store.get_db_connections' has_custom_credentials docstring), so
+  // without this flag there was no way for the UI to show a saved custom
+  // connection was actually using its own key rather than silently falling
+  // back to ADC. Used by updateConnectionDetails() to label the badge.
+  let ACTIVE_USES_CUSTOM_CREDENTIALS = false;
   // Index into CONFIGURED_DBS identifying the active preset, for anonymous
   // (Cloud Run, signed-out) users only - they never receive real preset
   // connection strings (see the redacted configured_databases the server
@@ -721,12 +738,24 @@ document.addEventListener('DOMContentLoaded', async () => {
       ? (data.custom_database_name || data.database_name || "Database")
       : (matchedPreset?.name || data.database_name || "Database");
 
+    // Surfaces whether the active connection is authenticating with its own
+    // pasted BigQuery service-account key, as opposed to this app's ambient
+    // credentials (ADC) - the key itself is never sent to the frontend, so
+    // this small badge label is the only place that distinction is visible
+    // at all once a custom connection is saved and its textarea goes blank
+    // again (see renderCustomDbRows() for the same indicator in the config
+    // dialog itself).
+    const usesCustomKey = Boolean(data.active_uses_custom_credentials);
+    const keySuffix = usesCustomKey ? ' \u{1F511}' : '';
+
     if (configTriggerBadge) {
-      configTriggerBadge.title = `Connected to: ${dbDisplayName} (Click to configure)`;
+      configTriggerBadge.title = usesCustomKey
+        ? `Connected to: ${dbDisplayName} (using a custom service-account key) (Click to configure)`
+        : `Connected to: ${dbDisplayName} (Click to configure)`;
     }
 
     if (connDbName) {
-      connDbName.textContent = dbDisplayName;
+      connDbName.textContent = dbDisplayName + keySuffix;
     }
 
     document.title = `yDyL`;
@@ -786,6 +815,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         ACTIVE_DB_URL = DEFAULT_DB_URL;
       }
       ACTIVE_IS_CUSTOM = Boolean(data.active_is_custom);
+      ACTIVE_CUSTOM_CONNECTION_KEY = data.active_custom_connection_key || "";
+      ACTIVE_USES_CUSTOM_CREDENTIALS = Boolean(data.active_uses_custom_credentials);
       ACTIVE_PRESET_INDEX = typeof data.active_preset_index === 'number' ? data.active_preset_index : null;
 
       renderDbRadioButtons();
@@ -833,7 +864,18 @@ document.addEventListener('DOMContentLoaded', async () => {
       // connection is actually the preset (ACTIVE_IS_CUSTOM false), no
       // custom row should show as selected even if one happens to share
       // that URL (see renderDbRadioButtons()'s matching isCustom check).
-      const isSelected = ACTIVE_IS_CUSTOM && Boolean(db.url) && activeUrl === db.url;
+      // Beyond that, prefer matching by connection_key over URL whenever
+      // the server gave us one - two saved custom connections can
+      // themselves share a URL (e.g. two BigQuery connections on the same
+      // project/dataset with different service-account keys), so URL
+      // matching alone can't tell which specific one is active. Falls back
+      // to URL matching only when ACTIVE_CUSTOM_CONNECTION_KEY is blank -
+      // a session saved before that field existed.
+      const isSelected = ACTIVE_IS_CUSTOM && Boolean(db.url) && (
+        ACTIVE_CUSTOM_CONNECTION_KEY
+          ? db.connection_key === ACTIVE_CUSTOM_CONNECTION_KEY
+          : activeUrl === db.url
+      );
 
       html += `
         <div class="custom-db-row" style="display: flex; flex-direction: column; gap: 0.4rem; width: 100%; padding: 0.5rem 0; border-bottom: 1px solid var(--border-color, #333);">
@@ -854,7 +896,16 @@ document.addEventListener('DOMContentLoaded', async () => {
           </div>
           ${isBigQuery ? `
           <div style="padding-left: 1.9rem;">
-            <textarea class="config-input custom-db-bq-creds" data-index="${index}" placeholder="Paste service-account key JSON (leave blank to keep the existing key)" rows="2" style="width: 100%; resize: vertical;" autocomplete="off"></textarea>
+            ${db.has_custom_credentials ? `
+            <div class="custom-db-creds-status" style="font-size: 0.78rem; opacity: 0.8; margin-bottom: 0.25rem;">
+              &#128273; Custom service-account key saved for this connection. Leave the box below blank to keep using it, or paste a new key to replace it.
+            </div>
+            ` : `
+            <div class="custom-db-creds-status" style="font-size: 0.78rem; opacity: 0.7; margin-bottom: 0.25rem;">
+              No custom key saved - this connection authenticates using this app's default credentials (ADC). Paste a service-account key below to use one instead.
+            </div>
+            `}
+            <textarea class="config-input custom-db-bq-creds" data-index="${index}" placeholder="${db.has_custom_credentials ? 'Paste a new service-account key JSON to replace the saved one (leave blank to keep it)' : 'Paste service-account key JSON (optional)'}" rows="2" style="width: 100%; resize: vertical;" autocomplete="off"></textarea>
           </div>
           ` : ``}
         </div>
@@ -1127,6 +1178,12 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
         if (data.active_is_custom !== undefined) {
           ACTIVE_IS_CUSTOM = Boolean(data.active_is_custom);
+        }
+        if (data.active_custom_connection_key !== undefined) {
+          ACTIVE_CUSTOM_CONNECTION_KEY = data.active_custom_connection_key || "";
+        }
+        if (data.active_uses_custom_credentials !== undefined) {
+          ACTIVE_USES_CUSTOM_CREDENTIALS = Boolean(data.active_uses_custom_credentials);
         }
         if (data.active_preset_index !== undefined) {
           ACTIVE_PRESET_INDEX = typeof data.active_preset_index === 'number' ? data.active_preset_index : null;
