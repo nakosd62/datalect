@@ -20,8 +20,30 @@ from app_config import DEFAULT_MODEL, logger
 
 from auth import get_or_create_session_id, get_current_user_identity, apply_session_cookie
 from db import resolve_conn_str, get_database_schema, record_translation
+from backends import get_backend
 
 translate_bp = Blueprint('translate', __name__)
+
+# Per-dialect opening lines for the system instruction below - the rest of
+# the instruction (output format, NO SQL sentinels, etc.) is identical
+# across dialects, only the "what SQL flavor am I writing" framing differs.
+# Keyed by Backend.dialect_name (see backends/base.py/postgres.py/
+# bigquery.py) so a new backend just needs an entry here to get a properly
+# targeted prompt instead of silently inheriting Postgres's.
+_DIALECT_PROMPT_INTROS = {
+    "PostgreSQL": (
+        "You are an expert SQL generation assistant for PostgreSQL-compatible RDBMSs.\n"
+        "Given the provided past chat interactions, the database schema and the user's natural language prompt, translate the request into valid SQL.\n"
+        "You may return one or more independent SQL statements. You may use PL/pgSQL Functions or Procedures, if appropriate.\n"
+    ),
+    "BigQuery Standard SQL": (
+        "You are an expert SQL generation assistant for Google BigQuery (Standard SQL / GoogleSQL).\n"
+        "Given the provided past chat interactions, the database schema and the user's natural language prompt, translate the request into valid BigQuery Google SQL.\n"
+        "You may return one or more independent SQL statements, and BigQuery scripting (DECLARE/IF/LOOP) where appropriate.\n"
+        "Use backticks for identifiers that need quoting; never use double quotes for identifiers - BigQuery treats double-quoted text as a string literal, not an identifier.\n"
+    ),
+}
+_DEFAULT_DIALECT_PROMPT_INTRO = _DIALECT_PROMPT_INTROS["PostgreSQL"]
 
 # Transient Gemini failures (rate limiting, or the server-side hiccups it
 # occasionally throws as a plain "500 INTERNAL") are worth a few automatic
@@ -33,18 +55,10 @@ GEMINI_RETRY_DELAY_SECONDS = 2
 
 
 def get_gemini_api_keys():
-    """Collect Gemini API keys from env (preset list + optional single key)."""
-    keys = []
-
+    """Collect Gemini API keys from GEMINI_PRESET_KEYS (comma-separated;
+    a single key is just a one-item list)."""
     preset_keys_env = os.environ.get("GEMINI_PRESET_KEYS", "")
-    if preset_keys_env:
-        keys.extend(k.strip() for k in preset_keys_env.split(",") if k.strip())
-
-    single_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    if single_key and single_key.strip() not in keys:
-        keys.append(single_key.strip())
-
-    return keys
+    return [k.strip() for k in preset_keys_env.split(",") if k.strip()]
 
 
 def pick_gemini_api_key(exclude=None):
@@ -185,10 +199,14 @@ def translate_query():
         schema = get_database_schema(conn_str, user_identity, force_refresh=force_schema_refresh)
         client = genai.Client(api_key=api_key)
 
+        try:
+            dialect_name = get_backend(conn_str).dialect_name
+        except Exception:
+            dialect_name = "PostgreSQL"
+        dialect_intro = _DIALECT_PROMPT_INTROS.get(dialect_name, _DEFAULT_DIALECT_PROMPT_INTRO)
+
         system_instruction = (
-            "You are an expert SQL generation assistant for PostgreSQL-compatible RDBMSs.\n"
-            "Given the provided past chat interactions, the database schema and the user's natural language prompt, translate the request into valid SQL.\n"
-            "You may return one or more independent SQL statements. You may use PL/pgSQL Functions or Procedures, if appropriate.\n"
+            dialect_intro +
             "Format the result data to be easily readable. For example, format timestamps as date:hour:min:sec.\n"
             "Return ONLY the raw SQL code block. Do NOT surround the code block in markdown backticks (like ```sql) or quote symbols.\n"
             "If you can respond to the prompt succinctly based on your general-purpose training, return your response prepended by the string '*** NO SQL ***'\n"

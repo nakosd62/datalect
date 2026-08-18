@@ -90,6 +90,23 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   let DEFAULT_DB_URL = "";
   let ACTIVE_DB_URL = "";
+  // Whether the active connection was explicitly selected as a saved custom
+  // connection, rather than a preset. Needed because a custom connection's
+  // URL can collide with a preset's (same postgresql://... string) - in that
+  // case matching by URL alone can't tell "the preset" from "my custom
+  // connection that happens to point at the same database" apart. See its
+  // use in renderDbRadioButtons()/renderCustomDbRows() (which radio actually
+  // ends up checked) and updateConnectionDetails() (which name the badge
+  // shows). Always trust the freshest /api/config response's
+  // active_is_custom over recomputing this from URLs.
+  let ACTIVE_IS_CUSTOM = false;
+  // Index into CONFIGURED_DBS identifying the active preset, for anonymous
+  // (Cloud Run, signed-out) users only - they never receive real preset
+  // connection strings (see the redacted configured_databases the server
+  // sends them), so URL matching can't tell which preset is active; this
+  // index is the anonymous-safe substitute. null/unused for signed-in users,
+  // who still match presets by URL as before.
+  let ACTIVE_PRESET_INDEX = null;
   let CONFIGURED_DBS = [];
   let currentGoogleClientId = null;
   let googleIdToken = null;
@@ -230,15 +247,18 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
-  // Grays out (and disables the normal behavior of) the DB config badge
-  // and the history button for anonymous users. Called whenever
-  // isAnonymousUser changes (i.e. every time fetchBackendConfig() resolves).
+  // Grays out (and disables the normal behavior of) the history button for
+  // anonymous users. The DB config badge stays fully clickable for
+  // anonymous users too - they may open the dialog and switch between
+  // admin-configured presets, just not save a custom connection (see
+  // renderCustomDbRows()'s isAnonymousUser guard and the server-side 403
+  // in config_routes.py). Called whenever isAnonymousUser changes (i.e.
+  // every time fetchBackendConfig() resolves).
   function updateAnonymousRestrictions() {
     if (configTriggerBadge) {
-      configTriggerBadge.classList.toggle('badge-disabled', isAnonymousUser);
-      if (isAnonymousUser) {
-        configTriggerBadge.title = 'Log in to configure your database connection';
-      }
+      configTriggerBadge.title = isAnonymousUser
+        ? 'Connection Info (Click to configure - sign in for custom connections)'
+        : 'Connection Info (Click to configure)';
     }
     if (historyBtn) {
       historyBtn.classList.toggle('icon-disabled', isAnonymousUser);
@@ -639,15 +659,22 @@ document.addEventListener('DOMContentLoaded', async () => {
   async function checkDbStatus() {
     if (!connDbDot) return;
 
-    const config = loadConfig();
     try {
       const response = await fetch('/api/execute', {
         method: 'POST',
         headers: getApiHeaders(),
         credentials: 'same-origin',
         body: JSON.stringify({
-          sql: 'SELECT current_user, current_database();',
-          database_url: config.dbUrl
+          // Deliberately dialect-agnostic: only response.ok/data.success
+          // below are ever inspected, never the returned value, so this
+          // just needs to be a trivial query every supported backend can
+          // run with no special permissions or existing tables/datasets.
+          // The previous "SELECT current_user, current_database();" was
+          // Postgres-specific - BigQuery Standard SQL has no
+          // current_database() function, so it always failed there and
+          // permanently showed the badge as disconnected even on a
+          // perfectly working BigQuery connection.
+          sql: 'SELECT 1;'
         })
       });
 
@@ -685,7 +712,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (badge) badge.style.display = '';
 
     const matchedPreset = CONFIGURED_DBS.find(db => db.url === data.active_database_url);
-    const dbDisplayName = matchedPreset?.name || data.custom_database_name || data.database_name || "Database";
+    // A custom connection's URL can collide with a preset's, so URL
+    // equality alone can't tell them apart - active_is_custom (the server's
+    // record of which one the user actually picked) breaks the tie. Without
+    // it, a colliding preset match would always win here even when the user
+    // explicitly selected their own custom connection with the same URL.
+    const dbDisplayName = data.active_is_custom
+      ? (data.custom_database_name || data.database_name || "Database")
+      : (matchedPreset?.name || data.database_name || "Database");
 
     if (configTriggerBadge) {
       configTriggerBadge.title = `Connected to: ${dbDisplayName} (Click to configure)`;
@@ -732,7 +766,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (data.custom_databases !== undefined) {
         customDatabases = data.custom_databases;
       } else if (customDbUrl) {
-        customDatabases = [{ name: customDbName || "Custom", url: customDbUrl }];
+        customDatabases = [{ name: customDbName || "Custom", type: 'postgres', url: customDbUrl, config: {} }];
       } else {
         customDatabases = [];
       }
@@ -751,6 +785,8 @@ document.addEventListener('DOMContentLoaded', async () => {
       } else if (!ACTIVE_DB_URL && DEFAULT_DB_URL) {
         ACTIVE_DB_URL = DEFAULT_DB_URL;
       }
+      ACTIVE_IS_CUSTOM = Boolean(data.active_is_custom);
+      ACTIVE_PRESET_INDEX = typeof data.active_preset_index === 'number' ? data.active_preset_index : null;
 
       renderDbRadioButtons();
       loadConfigIntoUI();
@@ -762,80 +798,163 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
+  function makeEmptyCustomDb(type) {
+    return type === 'bigquery'
+      ? { name: '', type: 'bigquery', url: '', config: { project_id: '', dataset: '', credentials_json: '' } }
+      : { name: '', type: 'postgres', url: '', config: {} };
+  }
+
+  // Renders every entry in `customDatabases` (including in-progress blank
+  // rows added via "+ Add custom connection") as an editable row with a
+  // dialect selector. Each row's inputs keep `customDatabases[index]` in
+  // sync live via their own 'input' listeners, so by the time
+  // triggerConfigSave() runs there's nothing left to harvest from the DOM.
   function renderCustomDbRows(activeUrl) {
     const container = document.getElementById('customDbsContainer');
     if (!container) return;
 
-    const rows = customDatabases.filter(db => db.url && db.url.trim() !== "");
+    // Anonymous (Cloud Run, signed-out) users may only pick from presets -
+    // no custom-connection rows, no "+ Add custom connection" button. The
+    // server also rejects any custom-connection save from this identity
+    // (see config_routes.py's handle_config), so this is belt-and-suspenders
+    // rather than the only enforcement, but it keeps the dialog from
+    // offering a control that would just come back as an error.
+    if (isAnonymousUser) {
+      container.innerHTML = '';
+      return;
+    }
 
     let html = '';
-    rows.forEach((db, index) => {
-      const maskedVal = maskConnectionUrl(db.url);
-      const isSelected = activeUrl === db.url;
+    customDatabases.forEach((db, index) => {
+      const cfg = db.config || {};
+      const isBigQuery = db.type === 'bigquery';
+      // ACTIVE_IS_CUSTOM gates this, not just URL equality - a custom
+      // connection's URL can collide with a preset's, and when the active
+      // connection is actually the preset (ACTIVE_IS_CUSTOM false), no
+      // custom row should show as selected even if one happens to share
+      // that URL (see renderDbRadioButtons()'s matching isCustom check).
+      const isSelected = ACTIVE_IS_CUSTOM && Boolean(db.url) && activeUrl === db.url;
+
       html += `
-        <label class="radio-option" style="display: flex; align-items: center; gap: 0.6rem; width: 100%;">
-          <input type="radio" name="db_connection_option" value="custom-${index}" data-dbname="${db.name}" ${isSelected ? 'checked' : ''}>
-          <input type="text" class="config-input custom-db-url-input" data-index="${index}" placeholder="postgresql://user:password@host:5432/dbname" value="${maskedVal}" style="flex: 1;" autocomplete="off">
-        </label>
+        <div class="custom-db-row" style="display: flex; flex-direction: column; gap: 0.4rem; width: 100%; padding: 0.5rem 0; border-bottom: 1px solid var(--border-color, #333);">
+          <div style="display: flex; align-items: center; gap: 0.5rem; width: 100%; flex-wrap: wrap;">
+            <input type="radio" name="db_connection_option" value="custom-${index}" data-dbname="${db.name || ''}" ${isSelected ? 'checked' : ''}>
+            <select class="config-input custom-db-type-select" data-index="${index}" style="flex: 0 0 auto; width: 8rem;">
+              <option value="postgres" ${!isBigQuery ? 'selected' : ''}>PostgreSQL</option>
+              <option value="bigquery" ${isBigQuery ? 'selected' : ''}>BigQuery</option>
+            </select>
+            <input type="text" class="config-input custom-db-name-input" data-index="${index}" placeholder="Name" size="10" value="${db.name || ''}" style="flex: 0 0 auto; width: 10ch;" autocomplete="off">
+            ${isBigQuery ? `
+            <input type="text" class="config-input custom-db-bq-project" data-index="${index}" placeholder="Project ID" value="${cfg.project_id || ''}" style="flex: 1 1 120px; min-width: 100px;" autocomplete="off">
+            <input type="text" class="config-input custom-db-bq-dataset" data-index="${index}" placeholder="Dataset" value="${cfg.dataset || ''}" style="flex: 1 1 120px; min-width: 100px;" autocomplete="off">
+            ` : `
+            <input type="text" class="config-input custom-db-url-input" data-index="${index}" placeholder="postgresql://user:password@host:5432/dbname" value="${maskConnectionUrl(db.url)}" style="flex: 1 1 200px; min-width: 150px;" autocomplete="off">
+            `}
+            <button type="button" class="btn btn-secondary custom-db-remove-btn" data-index="${index}" title="Remove this connection" style="padding: 0.15rem 0.6rem; line-height: 1;">&times;</button>
+          </div>
+          ${isBigQuery ? `
+          <div style="padding-left: 1.9rem;">
+            <textarea class="config-input custom-db-bq-creds" data-index="${index}" placeholder="Paste service-account key JSON (leave blank to keep the existing key)" rows="2" style="width: 100%; resize: vertical;" autocomplete="off"></textarea>
+          </div>
+          ` : ``}
+        </div>
       `;
     });
 
-    const nextIndex = rows.length;
-    html += `
-      <label class="radio-option" style="display: flex; align-items: center; gap: 0.6rem; width: 100%;">
-        <input type="radio" name="db_connection_option" value="custom-${nextIndex}" data-dbname="Custom" id="radioNewCustomDb">
-        <input type="text" class="config-input custom-db-url-input" data-index="${nextIndex}" placeholder="postgresql://user:password@host:5432/dbname" value="" style="flex: 1;" autocomplete="off">
-      </label>
-    `;
+    html += `<button type="button" id="addCustomDbBtn" class="btn btn-secondary" style="align-self: flex-start;">+ Add custom connection</button>`;
 
     container.innerHTML = html;
 
-    const inputs = container.querySelectorAll('.custom-db-url-input');
-    inputs.forEach(input => {
+    container.querySelectorAll('.custom-db-type-select').forEach(select => {
+      select.addEventListener('change', () => {
+        const index = parseInt(select.dataset.index);
+        const existingName = (customDatabases[index] && customDatabases[index].name) || '';
+        customDatabases[index] = makeEmptyCustomDb(select.value);
+        customDatabases[index].name = existingName;
+        renderCustomDbRows(activeUrl);
+      });
+    });
+
+    container.querySelectorAll('.custom-db-remove-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const index = parseInt(btn.dataset.index);
+        customDatabases.splice(index, 1);
+        renderCustomDbRows(activeUrl);
+      });
+    });
+
+    container.querySelectorAll('.custom-db-name-input').forEach(input => {
       const index = parseInt(input.dataset.index);
       const radio = container.querySelector(`input[value="custom-${index}"]`);
-
-      input.addEventListener('focus', () => {
+      input.addEventListener('focus', () => { if (radio) radio.checked = true; });
+      input.addEventListener('input', () => {
         if (radio) radio.checked = true;
+        customDatabases[index].name = input.value.trim();
+        if (radio) radio.dataset.dbname = customDatabases[index].name;
       });
+    });
 
+    container.querySelectorAll('.custom-db-url-input').forEach(input => {
+      const index = parseInt(input.dataset.index);
+      const radio = container.querySelector(`input[value="custom-${index}"]`);
+      input.addEventListener('focus', () => { if (radio) radio.checked = true; });
       input.addEventListener('input', () => {
         if (radio) radio.checked = true;
         const val = input.value.trim();
-
-        if (index < customDatabases.length) {
-          if (val === "") {
-            customDatabases.splice(index, 1);
-            renderCustomDbRows(activeUrl);
-            const currentInputs = container.querySelectorAll('.custom-db-url-input');
-            if (currentInputs.length > 0) {
-              const targetInp = currentInputs[Math.min(index, currentInputs.length - 1)];
-              if (targetInp) targetInp.focus();
-            }
-            return;
-          }
-          const unmaskedUrl = unmaskConnectionUrl(val, customDatabases[index].url);
-          customDatabases[index].url = unmaskedUrl;
+        const unmaskedUrl = unmaskConnectionUrl(val, customDatabases[index].url);
+        customDatabases[index].url = unmaskedUrl;
+        // Only auto-fill the name from the URL while the user hasn't typed
+        // one of their own in the name field above - an explicit name must
+        // never be silently overwritten by editing the URL afterwards.
+        if (!customDatabases[index].name) {
           customDatabases[index].name = getDatabaseNameFromUrl(unmaskedUrl);
-          if (radio) radio.dataset.dbname = customDatabases[index].name;
-        } else {
-          const unmaskedUrl = unmaskConnectionUrl(val, "");
-          customDatabases.push({
-            name: getDatabaseNameFromUrl(unmaskedUrl),
-            url: unmaskedUrl
-          });
-          if (radio) radio.dataset.dbname = customDatabases[index].name;
-
-          renderCustomDbRows(activeUrl);
-          const newInputs = container.querySelectorAll('.custom-db-url-input');
-          const matchingInput = Array.from(newInputs).find(inp => parseInt(inp.dataset.index) === index);
-          if (matchingInput) {
-            matchingInput.focus();
-            matchingInput.setSelectionRange(val.length, val.length);
-          }
+          const nameInput = container.querySelector(`.custom-db-name-input[data-index="${index}"]`);
+          if (nameInput) nameInput.value = customDatabases[index].name;
         }
+        if (radio) radio.dataset.dbname = customDatabases[index].name;
       });
     });
+
+    container.querySelectorAll('.custom-db-bq-project, .custom-db-bq-dataset, .custom-db-bq-creds').forEach(input => {
+      const index = parseInt(input.dataset.index);
+      const radio = container.querySelector(`input[value="custom-${index}"]`);
+      input.addEventListener('focus', () => { if (radio) radio.checked = true; });
+      input.addEventListener('input', () => {
+        if (radio) radio.checked = true;
+        const db = customDatabases[index];
+        if (!db.config) db.config = {};
+        if (input.classList.contains('custom-db-bq-project')) db.config.project_id = input.value.trim();
+        if (input.classList.contains('custom-db-bq-dataset')) db.config.dataset = input.value.trim();
+        if (input.classList.contains('custom-db-bq-creds')) db.config.credentials_json = input.value.trim();
+        // Synthetic (non-secret) identifier, kept in sync so radio-selection
+        // matching against activeUrl still works the same way it does for
+        // Postgres rows.
+        db.url = (db.config.project_id && db.config.dataset)
+          ? `bigquery://${db.config.project_id}/${db.config.dataset}`
+          : '';
+        // Same rule as the Postgres URL input above: don't clobber a name
+        // the user already typed themselves.
+        if (!db.name) {
+          db.name = db.config.dataset || 'Custom BigQuery';
+          const nameInput = container.querySelector(`.custom-db-name-input[data-index="${index}"]`);
+          if (nameInput) nameInput.value = db.name;
+        }
+        if (radio) radio.dataset.dbname = db.name;
+      });
+    });
+
+    const addBtn = document.getElementById('addCustomDbBtn');
+    if (addBtn) {
+      addBtn.addEventListener('click', () => {
+        customDatabases.push(makeEmptyCustomDb('postgres'));
+        renderCustomDbRows(activeUrl);
+        requestAnimationFrame(() => {
+          const inputs = container.querySelectorAll('.custom-db-name-input');
+          const last = inputs[inputs.length - 1];
+          if (last) last.focus();
+        });
+      });
+    }
   }
 
   function renderDbRadioButtons(currentDbUrl) {
@@ -845,15 +964,34 @@ document.addEventListener('DOMContentLoaded', async () => {
     const activeUrl = currentDbUrl || ACTIVE_DB_URL || DEFAULT_DB_URL;
     const matchedPresetUrl = getMatchingPresetUrl(activeUrl);
 
-    const isCustom = !matchedPresetUrl;
+    // Anonymous (Cloud Run, signed-out) users can never be on a custom
+    // connection (server-enforced - see config_routes.py) and are matched
+    // to a preset by index (ACTIVE_PRESET_INDEX), not URL, since they never
+    // receive real preset connection strings (configured_databases is
+    // redacted for them - see fetchBackendConfig()). For signed-in users,
+    // ACTIVE_IS_CUSTOM (the server's record of what was actually picked)
+    // takes priority over the URL match - a saved custom connection can
+    // share its URL with a preset, in which case matchedPresetUrl would be
+    // found either way and URL matching alone can't tell which is active.
+    // Falling back to !matchedPresetUrl covers the ordinary (no collision)
+    // case where a custom connection's URL simply isn't one of the presets.
+    const isCustom = isAnonymousUser ? false : (ACTIVE_IS_CUSTOM || !matchedPresetUrl);
 
     let html = '';
-    
-    CONFIGURED_DBS.forEach((db) => {
-      const isSelected = !isCustom && Boolean(matchedPresetUrl && db.url === matchedPresetUrl);
+
+    CONFIGURED_DBS.forEach((db, index) => {
+      // Anonymous users' preset objects have no "url" (redacted) - fall
+      // back to an index-based value, mirroring the "custom-N" pattern
+      // used for custom rows, and resolved server-side via preset_index.
+      const value = db.url || `preset-${index}`;
+      const isSelected = !isCustom && (
+        isAnonymousUser
+          ? ACTIVE_PRESET_INDEX === index
+          : Boolean(matchedPresetUrl && db.url === matchedPresetUrl)
+      );
       html += `
         <label class="radio-option">
-          <input type="radio" name="db_connection_option" value="${db.url}" data-dbname="${db.name}" ${isSelected ? 'checked' : ''}>
+          <input type="radio" name="db_connection_option" value="${value}" data-dbname="${db.name}" ${isSelected ? 'checked' : ''}>
           <span class="radio-label">${db.name}</span>
         </label>
       `;
@@ -866,88 +1004,132 @@ document.addEventListener('DOMContentLoaded', async () => {
     renderCustomDbRows(activeUrl);
   }
 
-  async function triggerConfigSave({ closeModal = false, dbUrl = null, dbName = null } = {}) {
-    let dbUrlValue = dbUrl;
-    let dbNameValue = dbName;
+  async function triggerConfigSave({ closeModal = false } = {}) {
+    let dbType = 'postgres';
+    let dbUrlValue = null;
+    let dbNameValue = null;
+    let dbProjectId = null;
+    let dbDataset = null;
+    let dbCredentialsJson = null;
     let isCustomOption = false;
+    // Set only for anonymous users picking a preset by index (see
+    // renderDbRadioButtons()) - the server resolves the real connection
+    // from this index itself, since anonymous users never receive one.
+    let presetIndex = null;
 
-    const container = document.getElementById('customDbsContainer');
-    if (container) {
-      const inputs = container.querySelectorAll('.custom-db-url-input');
-      inputs.forEach(input => {
-        const index = parseInt(input.dataset.index);
-        const val = input.value.trim();
-        if (val) {
-          if (index < customDatabases.length) {
-            const unmasked = unmaskConnectionUrl(val, customDatabases[index].url);
-            customDatabases[index].url = unmasked;
-            customDatabases[index].name = getDatabaseNameFromUrl(unmasked);
-          } else {
-            const unmasked = unmaskConnectionUrl(val, "");
-            customDatabases.push({
-              name: getDatabaseNameFromUrl(unmasked),
-              url: unmasked
-            });
-          }
-        }
-      });
-    }
+    const isCompleteBigQuery = (db) => db && db.type === 'bigquery' && db.config && db.config.project_id && db.config.dataset;
+    const isCompletePostgres = (db) => db && db.type !== 'bigquery' && db.url && db.url.trim() !== "";
 
-    if (dbUrlValue === null || dbNameValue === null) {
-      const selectedDbRadio = document.querySelector('input[name="db_connection_option"]:checked');
-      if (selectedDbRadio) {
-        if (selectedDbRadio.value.startsWith('custom-')) {
-          isCustomOption = true;
-          const index = parseInt(selectedDbRadio.value.split('-')[1]);
-          const selectedDb = customDatabases[index];
-          if (selectedDb && selectedDb.url) {
-            dbUrlValue = selectedDb.url;
-            dbNameValue = selectedDb.name;
-          } else {
-            const firstCustom = customDatabases.find(d => d.url && d.url.trim() !== "");
-            if (firstCustom) {
-              dbUrlValue = firstCustom.url;
-              dbNameValue = firstCustom.name;
-            } else {
-              dbUrlValue = DEFAULT_DB_URL;
-              dbNameValue = "Default DB";
-            }
-          }
-          customDbName = dbNameValue;
-          customDbUrl = dbUrlValue;
+    const selectedDbRadio = document.querySelector('input[name="db_connection_option"]:checked');
+    if (selectedDbRadio) {
+      if (selectedDbRadio.value.startsWith('custom-')) {
+        isCustomOption = true;
+        const index = parseInt(selectedDbRadio.value.split('-')[1]);
+        const selectedDb = customDatabases[index];
+        const chosen = isCompleteBigQuery(selectedDb) || isCompletePostgres(selectedDb)
+          ? selectedDb
+          : customDatabases.find(d => isCompleteBigQuery(d) || isCompletePostgres(d));
+
+        if (isCompleteBigQuery(chosen)) {
+          dbType = 'bigquery';
+          dbProjectId = chosen.config.project_id;
+          dbDataset = chosen.config.dataset;
+          // May be blank if the user didn't re-paste a key while just
+          // re-selecting/renaming an already-saved connection - the
+          // server reuses the previously-stored key in that case (it's
+          // never sent back to us to re-display, see get_db_connections).
+          dbCredentialsJson = chosen.config.credentials_json || null;
+          dbNameValue = chosen.name || dbDataset;
+          dbUrlValue = `bigquery://${dbProjectId}/${dbDataset}`;
+        } else if (isCompletePostgres(chosen)) {
+          dbType = 'postgres';
+          dbUrlValue = chosen.url;
+          dbNameValue = chosen.name;
         } else {
-          dbUrlValue = selectedDbRadio.value;
-          const matchedDb = CONFIGURED_DBS.find(db => db.url === dbUrlValue);
-          dbNameValue = matchedDb ? matchedDb.name : "Preset DB";
+          dbType = 'postgres';
+          dbUrlValue = DEFAULT_DB_URL;
+          dbNameValue = "Default DB";
+          isCustomOption = false;
         }
+
+        customDbName = dbNameValue;
+        customDbUrl = dbUrlValue;
+      } else if (selectedDbRadio.value.startsWith('preset-')) {
+        // Anonymous path: this preset's real URL was withheld from us
+        // (see fetchBackendConfig()'s redacted configured_databases), so
+        // we can only tell the server which index was picked and let it
+        // resolve the actual connection itself.
+        presetIndex = parseInt(selectedDbRadio.value.split('-')[1], 10);
+        const matchedDb = CONFIGURED_DBS[presetIndex];
+        dbType = (matchedDb && matchedDb.type) || 'postgres';
+        dbNameValue = matchedDb ? matchedDb.name : "Preset DB";
       } else {
-        dbUrlValue = DEFAULT_DB_URL;
-        dbNameValue = "Default DB";
+        dbUrlValue = selectedDbRadio.value;
+        const matchedDb = CONFIGURED_DBS.find(db => db.url === dbUrlValue);
+        dbType = (matchedDb && matchedDb.type) || 'postgres';
+        dbNameValue = matchedDb ? matchedDb.name : "Preset DB";
+        if (dbType === 'bigquery' && matchedDb) {
+          dbProjectId = matchedDb.project_id;
+          dbDataset = matchedDb.dataset;
+          // No credentials_json for admin presets - they authenticate via
+          // the app's own service account (ADC), not a per-connection key.
+        }
       }
+    } else {
+      dbUrlValue = DEFAULT_DB_URL;
+      dbNameValue = "Default DB";
     }
 
     const autoSqlExecuteValue = autoSqlExecuteCheckbox
       ? autoSqlExecuteCheckbox.checked
       : autoSqlExecuteEnabled;
 
+    const payload = {
+      database_name: dbNameValue,
+      database_type: dbType,
+      is_custom: isCustomOption,
+      custom_databases: customDatabases
+        .filter(d => isCompleteBigQuery(d) || isCompletePostgres(d))
+        .map(d => isCompleteBigQuery(d)
+          ? {
+              type: 'bigquery',
+              name: d.name,
+              project_id: d.config.project_id,
+              dataset: d.config.dataset,
+              credentials_json: d.config.credentials_json || undefined
+            }
+          : { type: 'postgres', name: d.name, url: d.url }
+        ),
+      auto_sql_execute: autoSqlExecuteValue
+    };
+    if (presetIndex !== null) {
+      payload.preset_index = presetIndex;
+    } else if (dbType === 'bigquery') {
+      payload.project_id = dbProjectId;
+      payload.dataset = dbDataset;
+      if (dbCredentialsJson) payload.credentials_json = dbCredentialsJson;
+    } else {
+      payload.database_url = dbUrlValue;
+    }
+
     try {
       const response = await fetch('/api/config', {
         method: 'POST',
         headers: getApiHeaders(),
         credentials: 'same-origin',
-        body: JSON.stringify({
-          database_name: dbNameValue,
-          database_url: dbUrlValue,
-          is_custom: isCustomOption,
-          custom_databases: customDatabases.filter(d => d.url && d.url.trim() !== ""),
-          auto_sql_execute: autoSqlExecuteValue
-        })
+        body: JSON.stringify(payload)
       });
 
       if (response.ok) {
         const data = await response.json();
         if (data.active_database_url) {
           ACTIVE_DB_URL = data.active_database_url;
+        }
+        if (data.active_is_custom !== undefined) {
+          ACTIVE_IS_CUSTOM = Boolean(data.active_is_custom);
+        }
+        if (data.active_preset_index !== undefined) {
+          ACTIVE_PRESET_INDEX = typeof data.active_preset_index === 'number' ? data.active_preset_index : null;
         }
         if (data.custom_database_name !== undefined) {
           customDbName = data.custom_database_name;
@@ -995,12 +1177,10 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   if (configTriggerBadge && configModal) {
     configTriggerBadge.addEventListener('click', async () => {
-      if (isAnonymousUser) {
-        showLoginRequiredModal(
-          'Configuring a custom database connection is available to signed-in users only. Please log in with Google to access this feature.'
-        );
-        return;
-      }
+      // Anonymous users may open this dialog too - they can switch between
+      // admin-configured presets, just not save a custom connection (the
+      // custom-connection UI itself is hidden for them - see
+      // renderCustomDbRows()).
       await fetchBackendConfig();
       configModal.classList.remove('hidden');
     });
@@ -1612,7 +1792,11 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     setButtonsDisabled(true);
 
-    const config = loadConfig();
+    // Not sending a database_url override here: fetchBackendConfig()
+    // above already synced session state, and the server resolves the
+    // active connection (Postgres or BigQuery, with its full descriptor)
+    // from that session. A bare URL override would only be able to
+    // express a Postgres connection, silently breaking a BigQuery session.
     let response = null;
     let data = null;
     let attempts = 0;
@@ -1627,8 +1811,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           credentials: 'same-origin',
           body: JSON.stringify({
             prompt: promptText,
-            history: chatStore.toPayload(),
-            database_url: config.dbUrl
+            history: chatStore.toPayload()
           })
         });
 
@@ -1763,16 +1946,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (!sql) return;
   
     setButtonsDisabled(true);
-  
-    const config = loadConfig();
+
+    // See the comment in translatePrompt() above - no database_url
+    // override here either, for the same reason.
     try {
       const response = await fetch('/api/execute', {
         method: 'POST',
         headers: getApiHeaders(),
         credentials: 'same-origin',
         body: JSON.stringify({
-          sql: sql,
-          database_url: config.dbUrl
+          sql: sql
         })
       });
   

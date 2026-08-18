@@ -5,4 +5,6 @@ google-genai>=1.0.0
 sqlparse>=0.5.0
 google-cloud-firestore
 google-cloud-datastore
+google-cloud-bigquery
 pandas
+python-dotenv

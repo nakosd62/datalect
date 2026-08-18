@@ -14,14 +14,12 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Copy backend files
-COPY server/* server/
-
-#  Copy Web frontend files
-COPY webClient/* webClient/
+# Copy code
+COPY ./server ./server
+COPY ./webClient ./webClient
 
 # Copy CRDB certificate 
-COPY crdb.crt .
+# COPY crdb.crt .
 
 # Expose container port (Cloud Run defaults to 8080, but we can configure it)
 EXPOSE 3000

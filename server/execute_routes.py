@@ -4,18 +4,24 @@ execute_routes.py
 Runs client-submitted SQL against the resolved connection and returns
 results. This is the one endpoint that intentionally returns raw database
 error messages to the client (see the comment in the except block) - it's
-a SQL runner, and the user needs the actual Postgres error to fix their
-query, same as any SQL client would show them.
+a SQL runner, and the user needs the actual DB error to fix their query,
+same as any SQL client would show them.
+
+Statement execution itself is delegated to the resolved Backend (see
+backends/base.py) - this route no longer knows or cares whether it's
+talking to psycopg2, a BigQuery job client, or anything else. Its own job
+is just: resolve the connection, time the call, shape the HTTP response,
+and translate any backend exception into the existing error JSON shape.
 """
 
 import time
 
 from flask import Blueprint, request, jsonify
-import sqlparse
 
 from app_config import logger
 from auth import get_or_create_session_id, get_current_user_identity, apply_session_cookie
-from db import resolve_conn_str, get_db_connection
+from db import resolve_conn_str
+from backends import get_backend
 
 execute_bp = Blueprint('execute', __name__)
 
@@ -26,64 +32,22 @@ def execute_query():
     user_identity = get_current_user_identity()
     data = request.get_json() or {}
 
-    conn_str = resolve_conn_str(data.get('database_url'), user_identity)
+    descriptor = resolve_conn_str(data.get('database_url'), user_identity)
 
     raw_query = (data.get('sql') or data.get('query') or '').strip()
     if not raw_query:
         return jsonify({'error': 'Query cannot be empty'}), 400
 
+    backend = None
     conn = None
     start_time = time.time()
 
     try:
-        conn = get_db_connection(conn_str, user_identity)
-        conn.autocommit = True
+        backend = get_backend(descriptor)
+        conn = backend.connect(descriptor)
 
-        statements = [s.strip() for s in sqlparse.split(raw_query) if s.strip()]
-        results = []
-        total_row_count = 0
-
-        with conn.cursor() as cursor:
-            for stmt in statements:
-                stmt_clean = stmt.rstrip(';').strip()
-                if not stmt_clean:
-                    continue
-
-                cursor.execute(stmt_clean)
-                row_count = cursor.rowcount
-
-                columns = None
-                rows = None
-
-                if cursor.description:
-                    columns = [desc[0] for desc in cursor.description]
-                    rows = []
-                    for r in cursor.fetchall():
-                        row_dict = {}
-                        for idx, col in enumerate(columns):
-                            val = r[idx]
-                            if hasattr(val, 'isoformat'):
-                                val = val.isoformat()
-                            elif hasattr(val, 'to_eng_string'):
-                                val = float(val)
-                            elif isinstance(val, bytes):
-                                val = val.decode('utf-8', errors='replace')
-                            elif type(val).__name__ == 'Decimal':
-                                val = float(val)
-                            row_dict[col] = val
-                        rows.append(row_dict)
-                    count = len(rows)
-                else:
-                    count = row_count if row_count >= 0 else 0
-
-                total_row_count += count
-
-                results.append({
-                    'statement': stmt_clean,
-                    'columns': columns,
-                    'rows': rows,
-                    'rowCount': count
-                })
+        results = backend.execute(conn, raw_query)
+        total_row_count = sum(r.get('rowCount', 0) for r in results)
 
         execution_time_ms = round((time.time() - start_time) * 1000)
 
@@ -99,7 +63,7 @@ def execute_query():
         execution_time_ms = round((time.time() - start_time) * 1000, 2)
         # Note: unlike the other handlers in this codebase, we intentionally
         # return the real database error message here. This endpoint runs
-        # SQL the user themselves supplied/approved, so the Postgres error
+        # SQL the user themselves supplied/approved, so the backend's error
         # (bad column, syntax error, constraint violation, etc.) *is* the
         # feedback they need to fix their query - same as any SQL client.
         # We still log it server-side for observability/correlation.
@@ -111,5 +75,5 @@ def execute_query():
         })
         return apply_session_cookie(resp, session_id), 400
     finally:
-        if conn:
-            conn.close()
+        if conn and backend:
+            backend.close(conn)
