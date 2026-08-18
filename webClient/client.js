@@ -738,24 +738,12 @@ document.addEventListener('DOMContentLoaded', async () => {
       ? (data.custom_database_name || data.database_name || "Database")
       : (matchedPreset?.name || data.database_name || "Database");
 
-    // Surfaces whether the active connection is authenticating with its own
-    // pasted BigQuery service-account key, as opposed to this app's ambient
-    // credentials (ADC) - the key itself is never sent to the frontend, so
-    // this small badge label is the only place that distinction is visible
-    // at all once a custom connection is saved and its textarea goes blank
-    // again (see renderCustomDbRows() for the same indicator in the config
-    // dialog itself).
-    const usesCustomKey = Boolean(data.active_uses_custom_credentials);
-    const keySuffix = usesCustomKey ? ' \u{1F511}' : '';
-
     if (configTriggerBadge) {
-      configTriggerBadge.title = usesCustomKey
-        ? `Connected to: ${dbDisplayName} (using a custom service-account key) (Click to configure)`
-        : `Connected to: ${dbDisplayName} (Click to configure)`;
+      configTriggerBadge.title = `Connected to: ${dbDisplayName} (Click to configure)`;
     }
 
     if (connDbName) {
-      connDbName.textContent = dbDisplayName + keySuffix;
+      connDbName.textContent = dbDisplayName;
     }
 
     document.title = `yDyL`;
@@ -831,7 +819,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   function makeEmptyCustomDb(type) {
     return type === 'bigquery'
-      ? { name: '', type: 'bigquery', url: '', config: { project_id: '', dataset: '', credentials_json: '' } }
+      ? { name: '', type: 'bigquery', url: '', config: { project_id: '', dataset: '', billing_project_id: '', credentials_json: '' } }
       : { name: '', type: 'postgres', url: '', config: {} };
   }
 
@@ -895,17 +883,15 @@ document.addEventListener('DOMContentLoaded', async () => {
             <button type="button" class="btn btn-secondary custom-db-remove-btn" data-index="${index}" title="Remove this connection" style="padding: 0.15rem 0.6rem; line-height: 1;">&times;</button>
           </div>
           ${isBigQuery ? `
-          <div style="padding-left: 1.9rem;">
-            ${db.has_custom_credentials ? `
-            <div class="custom-db-creds-status" style="font-size: 0.78rem; opacity: 0.8; margin-bottom: 0.25rem;">
-              &#128273; Custom service-account key saved for this connection. Leave the box below blank to keep using it, or paste a new key to replace it.
+          <div style="padding-left: 1.9rem; display: flex; flex-direction: column; gap: 0.35rem;">
+            <div style="display: flex; align-items: center; gap: 0.5rem;">
+              <label for="custom-db-bq-billing-${index}" style="font-size: 0.78rem; width: 7.5rem; flex: 0 0 auto;"><a href="https://cloud.google.com/bigquery/docs/managing-jobs" target="_blank" rel="noopener noreferrer" style="color: inherit; opacity: 0.85; text-decoration: underline dotted;" title="What a billing project is in BigQuery (Google Cloud docs)">Billing Project</a></label>
+              <input type="text" id="custom-db-bq-billing-${index}" class="config-input custom-db-bq-billing" data-index="${index}" placeholder="Billing project ID" value="${cfg.billing_project_id || ''}" style="flex: 1 1 auto; min-width: 0;" autocomplete="off">
             </div>
-            ` : `
-            <div class="custom-db-creds-status" style="font-size: 0.78rem; opacity: 0.7; margin-bottom: 0.25rem;">
-              No custom key saved - this connection authenticates using this app's default credentials (ADC). Paste a service-account key below to use one instead.
+            <div style="display: flex; align-items: center; gap: 0.5rem;">
+              <label for="custom-db-bq-creds-${index}" style="font-size: 0.78rem; width: 7.5rem; flex: 0 0 auto;"><a href="https://cloud.google.com/iam/docs/keys-create-delete" target="_blank" rel="noopener noreferrer" style="color: inherit; opacity: 0.85; text-decoration: underline dotted;" title="How to create a service account key (Google Cloud docs)">Service Account Key</a></label>
+              <textarea id="custom-db-bq-creds-${index}" class="config-input custom-db-bq-creds" data-index="${index}" placeholder="${db.has_custom_credentials ? 'Key saved - leave blank to keep it, or paste a new one to replace it' : 'Service-account key (JSON)'}" rows="2" style="flex: 1 1 auto; min-width: 0; resize: vertical;" autocomplete="off"></textarea>
             </div>
-            `}
-            <textarea class="config-input custom-db-bq-creds" data-index="${index}" placeholder="${db.has_custom_credentials ? 'Paste a new service-account key JSON to replace the saved one (leave blank to keep it)' : 'Paste service-account key JSON (optional)'}" rows="2" style="width: 100%; resize: vertical;" autocomplete="off"></textarea>
           </div>
           ` : ``}
         </div>
@@ -966,7 +952,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       });
     });
 
-    container.querySelectorAll('.custom-db-bq-project, .custom-db-bq-dataset, .custom-db-bq-creds').forEach(input => {
+    container.querySelectorAll('.custom-db-bq-project, .custom-db-bq-dataset, .custom-db-bq-billing, .custom-db-bq-creds').forEach(input => {
       const index = parseInt(input.dataset.index);
       const radio = container.querySelector(`input[value="custom-${index}"]`);
       input.addEventListener('focus', () => { if (radio) radio.checked = true; });
@@ -976,6 +962,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (!db.config) db.config = {};
         if (input.classList.contains('custom-db-bq-project')) db.config.project_id = input.value.trim();
         if (input.classList.contains('custom-db-bq-dataset')) db.config.dataset = input.value.trim();
+        if (input.classList.contains('custom-db-bq-billing')) db.config.billing_project_id = input.value.trim();
         if (input.classList.contains('custom-db-bq-creds')) db.config.credentials_json = input.value.trim();
         // Synthetic (non-secret) identifier, kept in sync so radio-selection
         // matching against activeUrl still works the same way it does for
@@ -1061,6 +1048,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     let dbNameValue = null;
     let dbProjectId = null;
     let dbDataset = null;
+    let dbBillingProjectId = null;
     let dbCredentialsJson = null;
     let isCustomOption = false;
     // Set only for anonymous users picking a preset by index (see
@@ -1068,7 +1056,19 @@ document.addEventListener('DOMContentLoaded', async () => {
     // from this index itself, since anonymous users never receive one.
     let presetIndex = null;
 
-    const isCompleteBigQuery = (db) => db && db.type === 'bigquery' && db.config && db.config.project_id && db.config.dataset;
+    // A custom BigQuery connection is only "complete"/selectable/saveable
+    // once it has BOTH its own billing project ID and its own key - either
+    // freshly entered, or (for the key only, since it's never redisplayed)
+    // already saved server-side (has_custom_credentials). Billing project
+    // isn't a secret and IS always redisplayed as-is, so it has no
+    // equivalent "already saved" bypass - it must actually be filled in.
+    // See config_routes.py's module docstring for why neither field ever
+    // falls back to a preset's or this app's own billing project for a
+    // custom connection.
+    const isCompleteBigQuery = (db) => db && db.type === 'bigquery' && db.config
+      && db.config.project_id && db.config.dataset
+      && db.config.billing_project_id
+      && (db.config.credentials_json || db.has_custom_credentials);
     const isCompletePostgres = (db) => db && db.type !== 'bigquery' && db.url && db.url.trim() !== "";
 
     const selectedDbRadio = document.querySelector('input[name="db_connection_option"]:checked');
@@ -1085,6 +1085,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           dbType = 'bigquery';
           dbProjectId = chosen.config.project_id;
           dbDataset = chosen.config.dataset;
+          dbBillingProjectId = chosen.config.billing_project_id;
           // May be blank if the user didn't re-paste a key while just
           // re-selecting/renaming an already-saved connection - the
           // server reuses the previously-stored key in that case (it's
@@ -1147,6 +1148,7 @@ document.addEventListener('DOMContentLoaded', async () => {
               name: d.name,
               project_id: d.config.project_id,
               dataset: d.config.dataset,
+              billing_project_id: d.config.billing_project_id,
               credentials_json: d.config.credentials_json || undefined
             }
           : { type: 'postgres', name: d.name, url: d.url }
@@ -1158,10 +1160,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     } else if (dbType === 'bigquery') {
       payload.project_id = dbProjectId;
       payload.dataset = dbDataset;
+      if (dbBillingProjectId) payload.billing_project_id = dbBillingProjectId;
       if (dbCredentialsJson) payload.credentials_json = dbCredentialsJson;
     } else {
       payload.database_url = dbUrlValue;
     }
+
+    const configSaveErrorEl = document.getElementById('configSaveError');
 
     try {
       const response = await fetch('/api/config', {
@@ -1201,7 +1206,28 @@ document.addEventListener('DOMContentLoaded', async () => {
           autoSqlExecuteEnabled = Boolean(data.auto_sql_execute);
         }
 
+        if (configSaveErrorEl) {
+          configSaveErrorEl.style.display = 'none';
+          configSaveErrorEl.textContent = '';
+        }
+
         await updateConnectionDetails(data);
+      } else {
+        // e.g. a custom BigQuery connection missing its required billing
+        // project ID / service-account key (see config_routes.py's
+        // _CUSTOM_BIGQUERY_MISSING_FIELDS_ERROR) - surfaced here rather
+        // than silently doing nothing, and the modal is kept open (see
+        // below) so the user can actually fix it.
+        let errorMessage = 'Failed to save configuration.';
+        try {
+          const errData = await response.json();
+          if (errData && errData.error) errorMessage = errData.error;
+        } catch (parseErr) { /* non-JSON error body - keep the generic message */ }
+        if (configSaveErrorEl) {
+          configSaveErrorEl.textContent = errorMessage;
+          configSaveErrorEl.style.display = '';
+        }
+        closeModal = false;
       }
     } catch (err) {
       console.error("Failed to save backend configuration:", err);
@@ -1239,6 +1265,11 @@ document.addEventListener('DOMContentLoaded', async () => {
       // custom-connection UI itself is hidden for them - see
       // renderCustomDbRows()).
       await fetchBackendConfig();
+      const configSaveErrorEl = document.getElementById('configSaveError');
+      if (configSaveErrorEl) {
+        configSaveErrorEl.style.display = 'none';
+        configSaveErrorEl.textContent = '';
+      }
       configModal.classList.remove('hidden');
     });
   }

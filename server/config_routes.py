@@ -20,13 +20,28 @@ frontend once saved (see state_store.get_db_connections'
 include_credentials param); _resolve_bigquery_credentials below is what
 lets a user re-select or rename a saved BigQuery connection, or just
 switch back to it, without re-pasting its service-account key every time.
-_billing_project_from_credentials derives billing_project_id the same way,
-from that same key, whenever a fresh/reused credentials_json is available.
-Admin-preset BigQuery connections (CONFIGURED_DBS, from BIGQUERY_* env
-vars in app_config.py) intentionally carry no credentials_json at all -
-they authenticate via the app's own Cloud Run service account (ADC), not
-a per-connection key; their billing_project_id is set in app_config.py
-instead (defaulting to GCP_PROJECT_ID).
+billing_project_id is NOT a credential (it's just a project id string) and
+always round-trips to the frontend as-is - see get_db_connections'
+_strip_credentials, which only strips credentials_json.
+
+Billing policy, by design: admin-configured presets (CONFIGURED_DBS, from
+DATABASE_PRESETS in app_config.py) authenticate via this app's own ambient
+identity (ADC) and never carry a credentials_json; an admin who wants a
+preset to bill anywhere other than its own project_id must say so
+explicitly via that preset's own "billing_project_id" - there is no env
+var or other implicit default, on purpose, so this app's own project never
+silently pays for a preset an admin didn't deliberately configure that way
+(see app_config.py). A user's own custom BigQuery connection is held to a
+stricter rule still: it must ALWAYS supply both its own billing_project_id
+and its own service-account key (credentials_json) - _parse_incoming_connection
+and _parse_incoming_custom_databases below reject/skip a custom BigQuery
+connection missing either, rather than falling back to a preset's or this
+app's billing project. The reasoning: only a key with actual
+bigquery.jobs.create rights on the given billing project can make that
+project pay for the job at all, so accepting a billing_project_id without
+requiring its own key would just fail at query time anyway - and never
+inferring one from the other keeps a user's billing choice explicit rather
+than a side effect of what happened to be embedded in their pasted key.
 """
 
 import json
@@ -87,66 +102,72 @@ def _resolve_bigquery_credentials(user_identity, project_id, dataset, provided_c
     return (matches[0].get("config") or {}).get("credentials_json")
 
 
-def _billing_project_from_credentials(credentials_json):
-    """The billing/job-execution project implied by a pasted service-account
-    key - its own home project (where it was minted), not necessarily the
-    project_id/dataset actually being queried (see backends/bigquery.py's
-    module docstring: those can point at any project the key has read
-    access to, including one the key's own project has no billing rights
-    on at all, like a public dataset). Returns None if credentials_json is
-    empty/unparseable/missing a project_id - the backend then falls back
-    to project_id itself, same as before this existed."""
-    if not credentials_json:
-        return None
-    try:
-        return (json.loads(credentials_json) or {}).get("project_id") or None
-    except Exception:
-        return None
 
 
-def _parse_incoming_connection(data, user_identity):
-    """Builds (db_type, db_url, db_config) from a POST body's top-level
-    active-connection fields. db_url is None if the request didn't supply
-    enough to identify a connection of the given type (e.g. a BigQuery
-    selection missing project_id/dataset) - callers treat that the same
-    as "no connection change requested"."""
+_CUSTOM_BIGQUERY_MISSING_FIELDS_ERROR = (
+    "Custom BigQuery connections require both a billing project ID and a "
+    "service-account key (JSON). This app's own project never pays for a "
+    "custom connection - only a key with billing rights on the project you "
+    "specify can actually run the query."
+)
+
+
+def _parse_incoming_connection(data, user_identity, is_custom):
+    """Builds (db_type, db_url, db_config, error) from a POST body's
+    top-level active-connection fields. db_url is None if the request
+    didn't supply enough to identify a connection of the given type (e.g. a
+    BigQuery selection missing project_id/dataset) - callers treat that the
+    same as "no connection change requested". `error`, when not None, means
+    this connection is invalid and MUST NOT be saved/activated - currently
+    only used for a custom BigQuery connection missing its required
+    billing_project_id and/or credentials_json (see module docstring)."""
     db_type = (data.get('database_type') or 'postgres').strip().lower()
 
     if db_type == 'bigquery':
         project_id = (data.get('project_id') or '').strip()
         dataset = (data.get('dataset') or '').strip()
         if not (project_id and dataset):
-            return db_type, None, {}
+            return db_type, None, {}, None
         db_url = _bigquery_url(project_id, dataset)
         db_config = {"project_id": project_id, "dataset": dataset}
-        credentials_json = _resolve_bigquery_credentials(
-            user_identity, project_id, dataset, data.get('credentials_json'),
-            name=data.get('database_name'),
-        )
-        if credentials_json:
+
+        if is_custom:
+            # A user's own connection: both fields are required, always
+            # explicit, never inferred from the other or from a preset/app
+            # default - see the module docstring for why. credentials_json
+            # still supports "leave blank to keep the previously-saved key"
+            # (it's the one field that never round-trips back to the
+            # frontend to redisplay); billing_project_id doesn't need that
+            # treatment since it's not a credential and is always shown/
+            # resent as-is by the frontend.
+            credentials_json = _resolve_bigquery_credentials(
+                user_identity, project_id, dataset, data.get('credentials_json'),
+                name=data.get('database_name'),
+            )
+            billing_project_id = (data.get('billing_project_id') or '').strip()
+            if not (credentials_json and billing_project_id):
+                return db_type, db_url, db_config, _CUSTOM_BIGQUERY_MISSING_FIELDS_ERROR
             db_config["credentials_json"] = credentials_json
-            billing_project_id = _billing_project_from_credentials(credentials_json)
-            if billing_project_id:
-                db_config["billing_project_id"] = billing_project_id
+            db_config["billing_project_id"] = billing_project_id
         else:
-            # No credentials at all for this project/dataset - an
-            # authenticated user selecting a preset by its real URL/fields
-            # (rather than a saved custom connection) lands here. Copy the
-            # matching preset's own billing_project_id (set in
-            # app_config.py) across, for the same reason the anonymous
-            # preset_index branch above needs to: without it, connect()
-            # falls back to project_id itself, breaking the moment the
-            # preset points at data outside the app's own project.
+            # A genuine admin-preset selection (matched by its real fields,
+            # not preset_index - see the anonymous branch in handle_config
+            # for that path). Presets are trusted/admin-configured: use
+            # their own explicit billing_project_id (app_config.py) if they
+            # have one; if not, don't invent one here either - the backend
+            # falls back to billing project_id itself, which will 403
+            # loudly if that's data this app doesn't own. There is
+            # deliberately no other fallback (see module docstring).
             preset_match = next(
                 (db for db in CONFIGURED_DBS if db.get("type") == "bigquery" and db.get("url") == db_url),
                 None,
             )
             if preset_match and preset_match.get("billing_project_id"):
                 db_config["billing_project_id"] = preset_match["billing_project_id"]
-        return db_type, db_url, db_config
+        return db_type, db_url, db_config, None
 
     # Default / explicit postgres.
-    return 'postgres', data.get('database_url'), {}
+    return 'postgres', data.get('database_url'), {}, None
 
 
 def _parse_incoming_custom_databases(custom_databases_in, user_identity):
@@ -157,6 +178,18 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
     in previously saved BigQuery credentials where the request didn't
     supply a fresh key. Returns None if the request didn't include the
     field at all (meaning "leave the saved list alone"), same as before.
+
+    A BigQuery entry missing its required billing_project_id and/or
+    credentials_json (see module docstring) is silently skipped - not
+    persisted - rather than erroring the whole batch save: this list can
+    legitimately include an in-progress row the user hasn't finished
+    filling in yet (e.g. a freshly-added blank "+ Add custom connection"
+    row), same as an incomplete Postgres row is already silently dropped
+    below. Trying to *activate* an incomplete BigQuery connection (as
+    opposed to just having it sit half-filled in the saved list) is what
+    actually gets rejected with a clear error - see
+    _parse_incoming_connection's `error` return, used for the active
+    selection, not this list.
 
     connection_key (see compute_connection_key's docstring in
     state_store.py) is computed here, once, from the exact (name, url,
@@ -177,16 +210,20 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
             if not (project_id and dataset):
                 continue
             url = _bigquery_url(project_id, dataset)
-            config = {"project_id": project_id, "dataset": dataset}
             credentials_json = _resolve_bigquery_credentials(
                 user_identity, project_id, dataset, db.get('credentials_json'),
                 name=db.get('name'),
             )
-            if credentials_json:
-                config["credentials_json"] = credentials_json
-                billing_project_id = _billing_project_from_credentials(credentials_json)
-                if billing_project_id:
-                    config["billing_project_id"] = billing_project_id
+            billing_project_id = (db.get('billing_project_id') or '').strip()
+            if not (credentials_json and billing_project_id):
+                # Incomplete - not ready to save yet (see docstring above).
+                continue
+            config = {
+                "project_id": project_id,
+                "dataset": dataset,
+                "credentials_json": credentials_json,
+                "billing_project_id": billing_project_id,
+            }
             name = db.get("name") or dataset or "Custom BigQuery"
             merged.append({
                 "connection_key": compute_connection_key(name, url, credentials_json),
@@ -260,14 +297,15 @@ def handle_config():
                     }
                     # Presets authenticate via this app's own ambient
                     # identity (ADC), never a per-user key, so their
-                    # billing project (set in app_config.py, defaulting to
-                    # GCP_PROJECT_ID) has to be copied across explicitly
-                    # here - without it, backends/bigquery.py's connect()
-                    # falls back to project_id itself, which is exactly
-                    # the "does not have bigquery.jobs.create permission"
-                    # 403 this was meant to fix whenever a preset points at
-                    # data outside the app's own project (e.g. a public
-                    # dataset).
+                    # billing project - set explicitly per-preset in
+                    # app_config.py, with no other fallback (see this
+                    # module's docstring) - has to be copied across
+                    # explicitly here - without it, backends/bigquery.py's
+                    # connect() falls back to project_id itself, which is
+                    # exactly the "does not have bigquery.jobs.create
+                    # permission" 403 this was meant to fix whenever a
+                    # preset points at data outside the app's own project
+                    # (e.g. a public dataset).
                     if preset.get("billing_project_id"):
                         new_db_config["billing_project_id"] = preset["billing_project_id"]
 
@@ -279,7 +317,18 @@ def handle_config():
                 )
 
         else:
-            new_db_type, new_db_url, new_db_config = _parse_incoming_connection(data, user_identity)
+            new_db_type, new_db_url, new_db_config, connection_error = _parse_incoming_connection(
+                data, user_identity, is_custom
+            )
+            if connection_error:
+                # Reject outright, before touching state_store - a
+                # half-valid save here (e.g. persisting project_id/dataset
+                # but silently dropping billing_project_id) would just
+                # surface as a confusing BigQuery 403 later at query time
+                # instead of a clear, immediate error now.
+                resp = jsonify({'success': False, 'error': connection_error})
+                return apply_session_cookie(resp, session_id), 400
+
             merged_custom_databases = _parse_incoming_custom_databases(
                 data.get('custom_databases'), user_identity
             )

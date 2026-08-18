@@ -679,16 +679,35 @@ class FirestoreStateStore(StateStore):
         if custom_connection_key is not None:
             update_data["custom_connection_key"] = custom_connection_key
         if db_config is not None:
-            # Overwrite (not merge) the config map itself, wrapped inside
-            # the merge=True call below - Firestore's merge=True only
-            # avoids clobbering *other top-level fields* on the document
-            # (like database_url); this nested map is still replaced
-            # wholesale, which is what we want (a stale bigquery config
-            # left behind after switching back to postgres would be
-            # confusing, not helpful).
             update_data["database_config"] = db_config
         try:
-            self.client.collection("sessions").document(user_id).set(update_data, merge=True)
+            # merge=list(update_data.keys()) - NOT the boolean merge=True -
+            # is what actually gives "patch these top-level fields, leave
+            # the rest of the document alone" semantics here. Firestore's
+            # boolean merge=True performs a *recursive* merge of nested map
+            # fields: a key absent from the new "database_config" (e.g.
+            # billing_project_id, when the new connection doesn't have one)
+            # is left as whatever it was in the OLD document, not cleared -
+            # so switching from a BigQuery connection with a
+            # billing_project_id/credentials_json to one without either
+            # would silently keep serving the previous connection's values.
+            # That's exactly how a customer BigQuery connection into
+            # bigquery-public-data/google_ads once appeared to "start
+            # working" after switching to a different dataset and back -
+            # what actually happened was it inherited a stale
+            # billing_project_id left over from the other dataset, not that
+            # anything was actually fixed. Passing the explicit list of
+            # field paths being written here (a list of strings, not a
+            # bool) tells Firestore to treat each of those fields -
+            # including the whole "database_config" map - as an atomic
+            # replacement, while still leaving any *other* top-level field
+            # (e.g. custom_connection_key, when this call doesn't pass one)
+            # untouched, which is what this method's callers actually rely
+            # on (see set_session's docstring/callers - most calls only
+            # pass a subset of fields).
+            self.client.collection("sessions").document(user_id).set(
+                update_data, merge=list(update_data.keys())
+            )
         except Exception:
             logger.exception("Error saving session to Firestore")
 

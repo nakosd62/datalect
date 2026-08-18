@@ -53,6 +53,16 @@ def log_and_generalize_error(context, exc):
 
 
 # --- 1. Environment & Cloud Run Detection -----------------------------------
+# GCP_PROJECT_ID picks which project's Firestore is used for state storage
+# (sessions, custom connections, translation history) - see the Firestore
+# Initialization section below. It is NOT a BigQuery billing default - there
+# is deliberately no env var that provides one. A BigQuery preset that reads
+# data outside this app's own project (e.g. a public dataset) MUST set its
+# own "billing_project_id" explicitly in DATABASE_PRESETS (see below); a
+# user's custom BigQuery connection must always supply its own
+# billing_project_id AND its own service-account key (see config_routes.py)
+# - this app's own project never silently pays for either. Leave this unset
+# locally to keep local state in SQLite.
 GCP_PROJECT_ID = (
     os.environ.get("GCP_PROJECT_ID")
     or os.environ.get("GOOGLE_CLOUD_PROJECT")
@@ -151,17 +161,30 @@ if raw_db_presets.strip():
             # here just say where the data lives, and that's allowed to be
             # a project this app has no billing rights on at all (a public
             # dataset, a partner's shared project, etc). Presets authenticate
-            # via this app's own ambient identity (ADC - ADC - the Cloud Run
+            # via this app's own ambient identity (ADC - the Cloud Run
             # service account, or local `gcloud auth application-default
-            # login`), which lives in GCP_PROJECT_ID, so that's the sensible
-            # default; an admin can still override per-preset (e.g. to bill
-            # a dedicated BigQuery-only project) via an explicit
-            # "billing_project_id" in this preset's DATABASE_PRESETS entry.
-            # See backends/bigquery.py's module docstring for why conflating
-            # the two causes a "does not have bigquery.jobs.create
-            # permission" 403 the moment project_id points at data you don't
-            # own.
-            billing_project_id = (entry.get("billing_project_id") or "").strip() or GCP_PROJECT_ID or project_id
+            # login`), so an admin who wants a preset to read data outside
+            # this app's own project MUST say explicitly who pays for it, via
+            # "billing_project_id" in this preset's DATABASE_PRESETS entry -
+            # there is deliberately no env var fallback for this (previously
+            # there was; it was removed on purpose, so nothing bills against
+            # this app's own project without an admin explicitly opting a
+            # specific preset into it). See backends/bigquery.py's module
+            # docstring for why conflating billing_project_id with project_id
+            # causes a "does not have bigquery.jobs.create permission" 403
+            # the moment project_id points at data you don't own.
+            billing_project_id = (entry.get("billing_project_id") or "").strip()
+            if not billing_project_id:
+                logger.warning(
+                    "BigQuery preset '%s' has no 'billing_project_id' set - "
+                    "queries will bill against project_id ('%s') itself, "
+                    "which will fail with a 403 unless this app's own "
+                    "identity has billing rights there. Set 'billing_project_id' "
+                    "explicitly on this preset in DATABASE_PRESETS if project_id "
+                    "is data you don't own (e.g. a public dataset).",
+                    name, project_id,
+                )
+                billing_project_id = project_id
             CONFIGURED_DBS.append({
                 "name": name,
                 "type": "bigquery",
