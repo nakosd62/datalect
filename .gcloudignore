@@ -9,6 +9,9 @@ venv/
 .env
 .env-sample
 
+# Ignore BQ key
+ydyl-bq-test-key.json
+
 # Ignore utility scripts
 *.sh
 

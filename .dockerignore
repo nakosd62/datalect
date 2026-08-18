@@ -18,6 +18,9 @@ README.md
 .env
 .env-sample
 
+# Ignore BQ key
+ydyl-bq-test-key.json
+
 # Ignore local state
 state/
 
