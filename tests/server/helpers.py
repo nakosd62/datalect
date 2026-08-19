@@ -1,0 +1,645 @@
+"""
+tests/server/helpers.py
+
+Shared test infrastructure for the backend suite. Not a test file itself
+(no test_ prefix - pytest won't collect it), just the machinery every
+test_*.py file in this directory imports.
+
+Why this exists: app_config.py has real import-time side effects (builds
+the Flask app, parses DATABASE_PRESETS, tries to connect to Firestore if
+GCP_PROJECT_ID is set, picks SqliteStateStore vs FirestoreStateStore) and
+every other server module imports shared singletons from it. Different
+tests need different environments (auth on/off, different presets,
+Cloud Run vs local, ...), so each test that cares gets a *fresh* import of
+these modules under its own controlled environment rather than reusing
+whatever the first test happened to configure - Python only imports a
+module once per process, so without this, test order would silently
+determine behavior.
+"""
+
+import json
+import os
+import sys
+import types
+from datetime import datetime, timedelta, timezone
+
+# server/ is not a package (no __init__.py) - it's run as the entrypoint's
+# own directory (`python server/server.py`), so its modules import each
+# other with bare names ("from app_config import app", not
+# "from server.app_config import app"). Tests need the same sys.path setup
+# to import them the same way the real app does.
+_TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.abspath(os.path.join(_TESTS_DIR, "..", ".."))
+SERVER_DIR = os.path.join(REPO_ROOT, "server")
+if SERVER_DIR not in sys.path:
+    sys.path.insert(0, SERVER_DIR)
+
+# Every module (by name) that needs to be dropped from sys.modules before a
+# fresh_import() so the next import re-executes app_config.py's top-level
+# side effects (and everything downstream of it) under the new environment,
+# rather than returning the previous test's cached module object.
+_APP_MODULE_NAMES = [
+    "app_config", "auth", "config_routes", "execute_routes",
+    "translate_routes", "history_routes", "db", "schema_cache", "state_store",
+]
+
+# Every env var any of the above modules reads at import or request time.
+# fresh_import() clears all of these before applying a test's own overrides,
+# so a variable set in the developer's real shell/.env (or left over from
+# dotenv loading the repo's real .env) never leaks into a test.
+_ENV_VARS_TO_CLEAR = [
+    "GCP_PROJECT_ID", "GOOGLE_CLOUD_PROJECT", "GCP_PROJECT", "K_SERVICE",
+    "GOOGLE_CLIENT_ID", "DATABASE_PRESETS", "GEMINI_API_KEY", "GOOGLE_API_KEY",
+    "GEMINI_PRESET_KEYS", "GEMINI_MODEL", "SCHEMA_CACHE_TTL_SECONDS",
+    "SCHEMA_MAX_TABLES", "SCHEMA_MAX_TABLE_NAMES_SCANNED",
+    "SCHEMA_MAX_SCHEMA_CHARS", "SCHEMA_SHARD_MIN_GROUP_SIZE", "LOG_LEVEL",
+    "CRBOT_HOSTNAME", "CRBOT_PORT",
+]
+
+
+def fresh_import(monkeypatch, tmp_path, env=None, register_blueprints=True, mock_firestore=False):
+    """The one entry point every test file uses to get a clean, isolated
+    instance of the app under a specific environment.
+
+    - Chdir's into `tmp_path` first: state_store.py's local SQLite path
+      ("state/ydyl_state.db") is a hardcoded *relative* path, resolved
+      against whatever the process's cwd happens to be - not configurable
+      via an env var. Without this, every test would share (and race on)
+      the real repo's state/ydyl_state.db. tmp_path is a fresh, empty
+      directory pytest gives each test, so each test gets its own SQLite
+      file and no cleanup is needed afterwards.
+    - Clears every env var the app reads, then applies `env`, so tests are
+      hermetic regardless of what's in the developer's actual shell/.env.
+    - Neutralizes app_config.py's `load_dotenv(override=True)` call - it
+      would otherwise search upward from cwd for a real .env file and
+      stomp the env vars just set above (unlikely to find one under a
+      pytest tmp dir, but this makes it deterministic rather than
+      "unlikely").
+    - Drops every app module from sys.modules so the next `import
+      app_config` (and everything it/the blueprints pull in) re-executes
+      from scratch under the new environment.
+    - Optionally wires up the auth guard + all blueprints exactly as
+      server.py does, and returns a ready-to-use Flask test client.
+
+    `mock_firestore=True` patches google.cloud.firestore.Client (BEFORE
+    importing app_config) with a constructor that returns a fresh
+    FakeFirestoreClient - use this whenever a test needs
+    IS_CLOUD_RUN/GCP_PROJECT_ID to actually select FirestoreStateStore
+    without erroring: this sandbox has no real GCP credentials, so the
+    real firestore.Client(...) call always fails (caught internally,
+    logged, and silently left as SqliteStateStore) - and if K_SERVICE is
+    set at the same time, app_config.py's own startup guard turns that
+    same failure into a hard RuntimeError ("Halting startup to prevent
+    ephemeral SQLite fallback"). The returned SimpleNamespace's
+    `.firestore_client` is the FakeFirestoreClient instance actually wired
+    up as `app_config.state_store.client`, when applicable.
+
+    Returns a SimpleNamespace with at least `.app_config`; when
+    register_blueprints=True (the default) also `.auth`, `.config_routes`,
+    `.execute_routes`, `.translate_routes`, `.history_routes`, and
+    `.client` (a Flask test client with state_store.init() already called).
+    """
+    os.makedirs(tmp_path, exist_ok=True)
+    monkeypatch.chdir(tmp_path)
+
+    for var in _ENV_VARS_TO_CLEAR:
+        monkeypatch.delenv(var, raising=False)
+    for key, value in (env or {}).items():
+        monkeypatch.setenv(key, value)
+
+    import dotenv
+    monkeypatch.setattr(dotenv, "load_dotenv", lambda *a, **k: False)
+
+    for mod_name in list(sys.modules):
+        if mod_name in _APP_MODULE_NAMES or mod_name.startswith("backends"):
+            del sys.modules[mod_name]
+
+    fake_firestore_holder = {}
+    if mock_firestore:
+        from google.cloud import firestore as firestore_module
+
+        def _make_fake_firestore_client(*args, **kwargs):
+            client = FakeFirestoreClient()
+            fake_firestore_holder["client"] = client
+            return client
+
+        monkeypatch.setattr(firestore_module, "Client", _make_fake_firestore_client)
+
+    import app_config
+    ns = types.SimpleNamespace(app_config=app_config)
+    ns.firestore_client = fake_firestore_holder.get("client")
+
+    if register_blueprints:
+        import auth
+        import config_routes
+        import execute_routes
+        import translate_routes
+        import history_routes
+
+        app_config.app.before_request(auth.enforce_authentication)
+        for bp in (
+            auth.auth_bp, config_routes.config_bp, execute_routes.execute_bp,
+            translate_routes.translate_bp, history_routes.history_bp,
+        ):
+            app_config.app.register_blueprint(bp)
+
+        ns.auth = auth
+        ns.config_routes = config_routes
+        ns.execute_routes = execute_routes
+        ns.translate_routes = translate_routes
+        ns.history_routes = history_routes
+
+        # Mirrors server.py's own '/' route registration (serves the SPA
+        # shell) - not a blueprint, so it's not picked up above, but it's
+        # part of "the real app" and EXEMPT_ENDPOINTS/enforce_authentication
+        # both special-case endpoint name 'index', so tests that touch auth
+        # gating need this route to actually exist.
+        if "index" not in app_config.app.view_functions:
+            from flask import send_from_directory
+
+            @app_config.app.route('/')
+            def index():
+                return send_from_directory(app_config.app.static_folder, 'index.html')
+
+    app_config.state_store.init()
+    app_config.app.config["TESTING"] = True
+    ns.client = app_config.app.test_client()
+    return ns
+
+
+def login_as(test_client, email):
+    """Sets the auth cookie get_current_user_identity() checks (auth.py's
+    step 3), giving a stable non-anonymous, non-"global" identity for a
+    Flask test client without mocking Google ID-token verification.
+
+    NOTE: Flask/Werkzeug's test client's own cookie jar takes precedence
+    over a manually-supplied `headers={"Cookie": ...}` dict on an
+    individual request (it gets silently dropped) - this is the one
+    reliable way to set a cookie for `client.get()`/`client.post()` calls."""
+    test_client.set_cookie("crbot_user_id", email)
+
+
+def database_presets_env(presets):
+    """JSON-encodes a list of preset dicts for the DATABASE_PRESETS env var
+    - just a thin wrapper so test files read declaratively rather than
+    sprinkling json.dumps(...) everywhere."""
+    return json.dumps(presets)
+
+
+# ---------------------------------------------------------------------------
+# Fake service-account key (BigQuery custom-connection credentials_json)
+# ---------------------------------------------------------------------------
+
+def make_service_account_key(project_id="fake-project", client_email=None):
+    """Returns a syntactically-real (but obviously not a real credential)
+    service-account key dict, suitable for json.dumps()-ing into a
+    credentials_json string and handed to
+    google.oauth2.service_account.Credentials.from_service_account_info(),
+    which validates the PEM structure - a hand-typed fake private_key
+    string won't parse. Generates a fresh throwaway RSA keypair per call
+    (cheap enough for tests; never reused, never a real credential)."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    private_pem = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode("utf-8")
+
+    email = client_email or f"svc@{project_id}.iam.gserviceaccount.com"
+    return {
+        "type": "service_account",
+        "project_id": project_id,
+        "private_key_id": "fake-key-id",
+        "private_key": private_pem,
+        "client_email": email,
+        "client_id": "111111111111111111111",
+        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+        "client_x509_cert_url": f"https://www.googleapis.com/robot/v1/metadata/x509/{email}",
+    }
+
+
+def make_service_account_key_json(project_id="fake-project", client_email=None):
+    return json.dumps(make_service_account_key(project_id, client_email))
+
+
+# ---------------------------------------------------------------------------
+# Fake BigQuery client harness
+# ---------------------------------------------------------------------------
+# Mirrors the shape of google-cloud-bigquery's own objects just enough for
+# backends/bigquery.py to work against: bigquery.Client(project=,
+# credentials=), .query(sql, job_config=).result() -> iterable of rows
+# supporting both attribute access (row.table_name, as get_schema() uses)
+# and item access (row[col], as execute() uses), plus .schema (a list of
+# objects with a .name attribute).
+
+class FakeBQField:
+    def __init__(self, name):
+        self.name = name
+
+
+class FakeBQRow:
+    def __init__(self, data):
+        self._data = data
+
+    def __getitem__(self, key):
+        return self._data[key]
+
+    def __getattr__(self, key):
+        try:
+            return self._data[key]
+        except KeyError:
+            raise AttributeError(key)
+
+
+class FakeBQRowIterator:
+    def __init__(self, rows, schema):
+        self._rows = rows
+        self.schema = schema
+
+    def __iter__(self):
+        return iter(self._rows)
+
+
+class FakeBQQueryJob:
+    def __init__(self, rows=None, columns=None, num_dml_affected_rows=None):
+        """`rows`: list of plain dicts. `columns`: explicit column-name
+        order (defaults to the keys of the first row, or [] if no rows -
+        matching how a real empty result set still has a schema when it's
+        an information_schema query with a WHERE that matched nothing;
+        pass columns explicitly for that case)."""
+        row_dicts = rows or []
+        if columns is None:
+            columns = list(row_dicts[0].keys()) if row_dicts else []
+        self._schema = [FakeBQField(c) for c in columns] if columns else []
+        self._rows = [FakeBQRow(r) for r in row_dicts]
+        self.num_dml_affected_rows = num_dml_affected_rows
+
+    def result(self):
+        return FakeBQRowIterator(self._rows, self._schema)
+
+
+class FakeBQDatasetReference:
+    def __init__(self, project, dataset):
+        self.project = project
+        self.dataset = dataset
+
+
+class FakeBQQueryJobConfig:
+    def __init__(self, default_dataset=None, query_parameters=None):
+        self.default_dataset = default_dataset
+        self.query_parameters = query_parameters or []
+
+
+class FakeBQArrayQueryParameter:
+    def __init__(self, name, type_, values):
+        self.name = name
+        self.type_ = type_
+        self.values = values
+
+
+class FakeBigQueryHarness:
+    """Installed via install_fake_bigquery(monkeypatch) below. `handler` is
+    a callable (sql_text, job_config) -> FakeBQQueryJob that each test
+    supplies to decide what a given query should return - matching on
+    substrings in `sql_text` (e.g. "INFORMATION_SCHEMA.COLUMNS") is the
+    simplest approach and is robust to backends/bigquery.py's actual call
+    order/try-except structure changing over time.
+    """
+
+    def __init__(self):
+        self.handler = None
+        self.client_calls = []  # list of {"project", "credentials"} dicts
+        self.query_calls = []  # list of (sql_text, job_config)
+
+    def set_handler(self, handler):
+        self.handler = handler
+
+    def make_client_class(harness):
+        class _FakeClient:
+            def __init__(self, project=None, credentials=None):
+                self.project = project
+                self.credentials = credentials
+                harness.client_calls.append({"project": project, "credentials": credentials})
+
+            def query(self, sql_text, job_config=None):
+                harness.query_calls.append((sql_text, job_config))
+                if harness.handler is None:
+                    return FakeBQQueryJob(rows=[])
+                return harness.handler(sql_text, job_config)
+
+            def close(self):
+                pass
+
+        return _FakeClient
+
+
+def install_fake_bigquery(monkeypatch):
+    """Patches backends.bigquery's bigquery.{Client,DatasetReference,
+    QueryJobConfig,ArrayQueryParameter} with fakes and returns the
+    FakeBigQueryHarness controlling them. Must be called *after* the
+    module has been imported (i.e. after fresh_import(), or after a bare
+    `import backends.bigquery`) since it patches the already-imported
+    module object's `bigquery` attribute in place."""
+    import backends.bigquery as bqmod
+
+    harness = FakeBigQueryHarness()
+    monkeypatch.setattr(bqmod.bigquery, "Client", harness.make_client_class())
+    monkeypatch.setattr(bqmod.bigquery, "DatasetReference", FakeBQDatasetReference)
+    monkeypatch.setattr(bqmod.bigquery, "QueryJobConfig", FakeBQQueryJobConfig)
+    monkeypatch.setattr(bqmod.bigquery, "ArrayQueryParameter", FakeBQArrayQueryParameter)
+    return harness
+
+
+def schema_query_handler(tables=(), columns=(), views=(), constraints=()):
+    """Builds a handler for install_fake_bigquery()'s harness.set_handler()
+    that answers backends/bigquery.py's get_schema() query sequence based
+    on matching a marker substring in the SQL text - good enough for schema
+    tests without needing to hardcode call order.
+
+    - tables: list of table-name strings (INFORMATION_SCHEMA.TABLES)
+    - columns: list of (table_name, column_name, data_type, is_nullable)
+    - views: list of (table_name, view_definition)
+    - constraints: list of (table_name, constraint_name, constraint_type, column_name)
+    """
+    def handler(sql_text, job_config):
+        if "INFORMATION_SCHEMA.TABLES" in sql_text:
+            return FakeBQQueryJob(
+                rows=[{"table_name": t} for t in tables], columns=["table_name"]
+            )
+        if "INFORMATION_SCHEMA.COLUMNS" in sql_text:
+            return FakeBQQueryJob(
+                rows=[
+                    {"table_name": t, "column_name": c, "data_type": d, "is_nullable": n}
+                    for (t, c, d, n) in columns
+                ],
+                columns=["table_name", "column_name", "data_type", "is_nullable"],
+            )
+        if "INFORMATION_SCHEMA.VIEWS" in sql_text:
+            return FakeBQQueryJob(
+                rows=[{"table_name": t, "view_definition": d} for (t, d) in views],
+                columns=["table_name", "view_definition"],
+            )
+        if "INFORMATION_SCHEMA.TABLE_CONSTRAINTS" in sql_text:
+            return FakeBQQueryJob(
+                rows=[
+                    {"table_name": t, "constraint_name": n, "constraint_type": ty, "column_name": c}
+                    for (t, n, ty, c) in constraints
+                ],
+                columns=["table_name", "constraint_name", "constraint_type", "column_name"],
+            )
+        return FakeBQQueryJob(rows=[])
+    return handler
+
+
+# ---------------------------------------------------------------------------
+# Fake Postgres (psycopg2-shaped) connection/cursor
+# ---------------------------------------------------------------------------
+# backends/postgres.py issues a fixed sequence of `with connection.cursor()
+# as cursor: cursor.execute(sql, params); cursor.fetchall()` calls. This
+# fake answers each execute() call from an ordered queue of canned
+# responses supplied by the test, in the exact order PostgresBackend issues
+# them - simpler than content-sniffing since Postgres's query sequence
+# (unlike BigQuery's, which has try/except-guarded optional sections) is
+# unconditional.
+
+class FakePgCursor:
+    def __init__(self, responses):
+        """`responses`: list of (rows, description, rowcount) tuples,
+        consumed one per execute() call. `description`: None for
+        get_schema()'s queries (never read), or a list of 1-tuples/objects
+        whose [0] is the column name for execute()'s DML/SELECT queries
+        (mirrors psycopg2's cursor.description shape - execute_routes.py's
+        row-shaping only ever reads desc[0])."""
+        self._responses = list(responses)
+        self.calls = []
+        self.description = None
+        self.rowcount = -1
+        self._rows = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def execute(self, sql, params=None):
+        self.calls.append((sql, params))
+        if self._responses:
+            rows, description, rowcount = self._responses.pop(0)
+        else:
+            rows, description, rowcount = [], None, -1
+        self._rows = rows
+        self.description = description
+        self.rowcount = rowcount if rowcount is not None else -1
+
+    def fetchall(self):
+        return self._rows
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+
+class FakePgConnection:
+    def __init__(self, cursor):
+        self._cursor = cursor
+        self.autocommit = False
+        self.closed = False
+
+    def cursor(self):
+        return self._cursor
+
+    def close(self):
+        self.closed = True
+
+
+def make_fake_pg_connection(responses):
+    cursor = FakePgCursor(responses)
+    return FakePgConnection(cursor), cursor
+
+
+# ---------------------------------------------------------------------------
+# Fake Firestore client
+# ---------------------------------------------------------------------------
+# A hand-built fake that reproduces real Firestore semantics closely enough
+# to catch the class of bug that motivated it: `.set(data, merge=True)`
+# (boolean) performs a *recursive* merge of nested map fields (a key
+# missing from a new nested map is left as whatever the old document had),
+# while `.set(data, merge=[<field paths>])` (a list) replaces each named
+# top-level field atomically, including whole nested maps, and leaves any
+# other top-level field alone. See state_store.py's FirestoreStateStore.
+# set_session for why this distinction matters in this app specifically.
+
+class _FakeFirestoreDoc:
+    def __init__(self, doc_id, data=None):
+        self.id = doc_id
+        self._data = dict(data) if data else None
+
+    @property
+    def exists(self):
+        return self._data is not None
+
+    def to_dict(self):
+        return dict(self._data) if self._data is not None else None
+
+
+class _FakeFirestoreDocRef:
+    def __init__(self, store, collection_name, doc_id):
+        self._store = store
+        self._collection_name = collection_name
+        self._doc_id = doc_id
+
+    def get(self):
+        coll = self._store._collections.setdefault(self._collection_name, {})
+        return _FakeFirestoreDoc(self._doc_id, coll.get(self._doc_id))
+
+    def set(self, data, merge=False):
+        coll = self._store._collections.setdefault(self._collection_name, {})
+        existing = coll.get(self._doc_id)
+        clean_data = {k: v for k, v in data.items() if k != "updated_at"}
+
+        if merge is True:
+            # Real Firestore boolean-merge semantics: recursively merge
+            # nested dicts (a key present in the old nested dict but absent
+            # from the new one survives), shallow-replace everything else.
+            def deep_merge(old, new):
+                if old is None:
+                    return dict(new)
+                merged = dict(old)
+                for k, v in new.items():
+                    if isinstance(v, dict) and isinstance(merged.get(k), dict):
+                        merged[k] = deep_merge(merged[k], v)
+                    else:
+                        merged[k] = v
+                return merged
+            coll[self._doc_id] = deep_merge(existing, clean_data)
+        elif isinstance(merge, (list, tuple, set)):
+            # Field-path merge: each named top-level field is replaced
+            # atomically (no recursive merge into it); every other
+            # existing top-level field is left untouched.
+            merged = dict(existing) if existing else {}
+            for field in merge:
+                if field in clean_data:
+                    merged[field] = clean_data[field]
+            coll[self._doc_id] = merged
+        else:
+            coll[self._doc_id] = dict(clean_data)
+
+    def delete(self):
+        coll = self._store._collections.setdefault(self._collection_name, {})
+        coll.pop(self._doc_id, None)
+
+    @property
+    def reference(self):
+        return self
+
+
+class _FakeFirestoreQuery:
+    def __init__(self, store, collection_name, filters=None, order=None, limit_n=None):
+        self._store = store
+        self._collection_name = collection_name
+        self._filters = filters or []
+        self._order = order
+        self._limit = limit_n
+
+    def where(self, field, op, value):
+        assert op == "==", f"fake Firestore only supports '==' filters, got {op!r}"
+        return _FakeFirestoreQuery(
+            self._store, self._collection_name, self._filters + [(field, value)],
+            self._order, self._limit,
+        )
+
+    def order_by(self, field, direction=None):
+        return _FakeFirestoreQuery(
+            self._store, self._collection_name, self._filters,
+            (field, direction), self._limit,
+        )
+
+    def limit(self, n):
+        return _FakeFirestoreQuery(
+            self._store, self._collection_name, self._filters, self._order, n,
+        )
+
+    def stream(self):
+        coll = self._store._collections.setdefault(self._collection_name, {})
+        docs = [
+            _FakeFirestoreDoc(doc_id, data) for doc_id, data in coll.items()
+            if all(data.get(f) == v for f, v in self._filters)
+        ]
+        # Give each returned doc a working .reference for
+        # purge_translation_history()'s batch.delete(doc.reference).
+        for d in docs:
+            d.reference = _FakeFirestoreDocRef(self._store, self._collection_name, d.id)
+        if self._order:
+            field, direction = self._order
+            reverse = str(direction).endswith("DESCENDING") if direction is not None else False
+            docs.sort(key=lambda d: d.to_dict().get(field) or "", reverse=reverse)
+        if self._limit is not None:
+            docs = docs[: self._limit]
+        return docs
+
+
+class _FakeFirestoreCollection:
+    def __init__(self, store, name):
+        self._store = store
+        self._name = name
+
+    def document(self, doc_id):
+        return _FakeFirestoreDocRef(self._store, self._name, doc_id)
+
+    def where(self, field, op, value):
+        return _FakeFirestoreQuery(self._store, self._name).where(field, op, value)
+
+    def add(self, data):
+        import uuid
+        doc_id = uuid.uuid4().hex
+        coll = self._store._collections.setdefault(self._name, {})
+        coll[doc_id] = dict(data)
+        return None, _FakeFirestoreDocRef(self._store, self._name, doc_id)
+
+    def stream(self):
+        return _FakeFirestoreQuery(self._store, self._name).stream()
+
+
+class _FakeFirestoreBatch:
+    def __init__(self, store):
+        self._store = store
+        self._deletes = []
+
+    def delete(self, ref):
+        self._deletes.append(ref)
+
+    def commit(self):
+        for ref in self._deletes:
+            ref.delete()
+        self._deletes = []
+
+
+class FakeFirestoreClient:
+    """A minimal, in-memory stand-in for google.cloud.firestore.Client -
+    enough surface area for state_store.py's FirestoreStateStore, with
+    accurate merge=True vs merge=[...] semantics (see module comment
+    above). Data lives in self._collections: {collection_name: {doc_id:
+    data_dict}} - inspect it directly in tests when convenient."""
+
+    def __init__(self):
+        self._collections = {}
+
+    def collection(self, name):
+        return _FakeFirestoreCollection(self, name)
+
+    def batch(self):
+        return _FakeFirestoreBatch(self)
+
+
+class _FakeFirestoreQueryModule:
+    DESCENDING = "DESCENDING"
+    ASCENDING = "ASCENDING"
+
+
+def days_ago(n):
+    return datetime.now(timezone.utc) - timedelta(days=n)

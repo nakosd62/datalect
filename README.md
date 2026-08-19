@@ -30,6 +30,7 @@ and run it — all from a single-page web app backed by a small Flask API.
 - [Authentication model](#authentication-model)
 - [Data persistence](#data-persistence)
 - [Frontend notes](#frontend-notes)
+- [Testing](#testing)
 - [Troubleshooting](#troubleshooting)
 
 ---
@@ -62,7 +63,12 @@ directly instead — see the system prompt in
 |── Various helper scripts     # run_server.sh, kill_server.sh, gcp_deploy.sh, run_tests.sh
 ├── Dockerfile
 ├── requirements.txt
-|── tests/                     # server-side unit tests and end-to-end tests
+├── requirements-dev.txt       # pytest + test-only deps (see Testing)
+|── tests/
+│   ├── server/                 # backend pytest suite (mocked, no external services)
+│   └── e2e/                    # frontend Playwright suite - package.json,
+│                                # playwright.config.js, and specs all live
+│                                # here together (real Flask server, mocked AI/DB calls)
 |── utils/                     # unrefined scripts to export the internal state of the app
 |── mobile/                    # unfinished mobile app client
 ├── server/
@@ -96,8 +102,8 @@ other server module imports shared state (`app`, `state_store`,
 
 ## Requirements
 
-- Python 3.9+ (the provided `Dockerfile` builds on `python:3.9-slim`;
-  newer 3.x should work too)
+- Python 3.10+ (the provided `Dockerfile` builds on `python:3.12-slim`;
+  see https://endoflife.ai/python before picking a different version)
 - A PostgreSQL-compatible database to query — the default connection
   string and the `crdb.crt` cert copied in by the Dockerfile both point
   to [CockroachDB](https://www.cockroachlabs.com/), though any
@@ -233,7 +239,7 @@ recycled at any time — see the `RuntimeError` in
 
 ## Docker
 
-The provided `Dockerfile` builds on `python:3.9-slim`, installs
+The provided `Dockerfile` builds on `python:3.12-slim`, installs
 `requirements.txt`, and copies in `server/`, `webClient/`, and a
 `crdb.crt` certificate (for verifying CockroachDB's TLS certificate —
 supply your own if you don't have one; the app's default connection
@@ -365,6 +371,56 @@ Notable pieces:
 - All of this — external CDN scripts, quick prompts, onboarding, help
   content — is documented in more detail via comments at the top of
   `client.js` and inside `help.html` itself.
+
+---
+
+## Testing
+
+Two independent suites, both runnable locally with no real credentials of
+any kind:
+
+- **`tests/server/`** — a pytest suite covering every server module
+  (auth, routes, both backends, both state-store implementations, the
+  full BigQuery billing-project policy). Everything is mocked at the
+  library boundary (fake `psycopg2`/`bigquery`/`firestore`/`genai`
+  clients) - no real Postgres, BigQuery, Firestore, or Gemini API key is
+  ever needed. Any service-account keys used in tests are freshly
+  generated, throwaway RSA keypairs, never real credentials.
+- **`tests/e2e/`** — a JS/TS Playwright suite driving a real browser
+  against a real Flask server + real (isolated, gitignored) SQLite state
+  store. Only `/api/translate` and `/api/execute` are intercepted at the
+  browser network layer (`page.route()`), so config/history/custom-
+  connection behavior is exercised for real while still never touching a
+  real Gemini key or a real target database.
+
+Run both:
+
+```bash
+./run_tests.sh
+```
+
+Or individually:
+
+```bash
+# Backend
+pip install -r requirements.txt -r requirements-dev.txt
+pytest tests/server/
+
+# E2E - package.json/playwright.config.js live under tests/e2e/, not the
+# repo root, so run npm/playwright commands from there (first time:
+# npm install && npx playwright install chromium)
+cd tests/e2e
+npm install
+npx playwright install chromium
+npx playwright test              # add --headed or --ui while debugging
+```
+
+The e2e suite starts its own Flask server on a dedicated port
+(`CRBOT_PORT=3100` by default, see `tests/e2e/playwright.config.js`) with a
+scratch working directory (`tests/e2e/.e2e-runtime/`, gitignored) so it
+never touches your real local `state/ydyl_state.db` or reads your real
+`.env` - see `app_config.py`'s `YDYL_SKIP_DOTENV` handling. It's safe to
+run alongside `./run_server.sh`'s normal dev server.
 
 ---
 

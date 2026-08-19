@@ -16,7 +16,6 @@ README.md
 
 # Ignre env files containing secrets
 .env
-.env-sample
 
 # Ignore BQ key
 ydyl-bq-test-key.json

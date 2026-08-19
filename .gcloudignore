@@ -7,7 +7,6 @@ venv/
 
 # Ignore env setting
 .env
-.env-sample
 
 # Ignore BQ key
 ydyl-bq-test-key.json
@@ -17,6 +16,7 @@ ydyl-bq-test-key.json
 
 # Ignore testing files
 tests/
+pytest.ini
 
 # Ignore utils
 utils/

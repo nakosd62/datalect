@@ -23,7 +23,18 @@ from google.cloud import firestore
 from state_store import SqliteStateStore, FirestoreStateStore
 
 from dotenv import load_dotenv
-load_dotenv(override=True)
+
+# YDYL_SKIP_DOTENV lets an isolated harness (see playwright.config.js's
+# webServer block, used by the e2e test suite) guarantee this process never
+# picks up a real local .env. load_dotenv() with no explicit path walks UP
+# the directory tree from this file's own location looking for a file named
+# .env, so it would find and load the real repo-root .env - real API keys,
+# real DATABASE_PRESETS connection strings - regardless of the child
+# process's cwd or any env vars explicitly passed to it (override=True
+# means .env's values win over those). Left unset (the default for every
+# normal run, e.g. via run_server.sh), behavior is unchanged.
+if os.environ.get("YDYL_SKIP_DOTENV") != "1":
+    load_dotenv(override=True)
 
 # --- Logging ---------------------------------------------------------------
 logging.basicConfig(

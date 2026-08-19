@@ -1,0 +1,13 @@
+# Dev-only dependencies for running the backend test suite (tests/server/).
+# Not needed in production - install alongside requirements.txt:
+#   pip install -r requirements.txt -r requirements-dev.txt
+#
+# The e2e suite (tests/e2e/) is separate: it's JS/TS Playwright, installed
+# via `npm install` (see package.json) rather than pip.
+
+pytest>=8.0.0
+
+# Used only by tests/server/helpers.py to mint fresh, throwaway
+# service-account keypairs for BigQuery credential tests - never a real
+# credential, generated locally per test run.
+cryptography>=42.0.0
