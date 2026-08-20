@@ -6,5 +6,9 @@ sqlparse>=0.5.0
 google-cloud-firestore
 google-cloud-datastore
 google-cloud-bigquery
+snowflake-connector-python
+PyMySQL
+databricks-sql-connector
+oracledb
 pandas
 python-dotenv

@@ -1,8 +1,9 @@
 # yDyL — your Data your Language
 
-yDyL is a natural-language-to-SQL assistant for PostgreSQL-compatible databases. 
-Type a question in plain English (or any language), review the SQL it generates, 
-and run it — all from a single-page web app backed by a small Flask API.
+yDyL is a natural-language-to-SQL assistant for PostgreSQL-compatible databases,
+MySQL-compatible databases, Google BigQuery, and Snowflake. Type a question in plain English (or any
+language), review the SQL it generates, and run it — all from a single-page
+web app backed by a small Flask API.
 
 - **NL → SQL** via Gemini, grounded in a live introspection of your
   database schema (tables, columns, constraints, indexes, views, grants,
@@ -11,9 +12,10 @@ and run it — all from a single-page web app backed by a small Flask API.
   results) are kept in memory so follow-up questions have context.
 - **Runs anywhere** — SQLite-backed for local development, Firestore-backed
   automatically when deployed on Cloud Run.
-- **Optional Google Sign-In** — works fully anonymously by default;
-  signing in unlocks custom database connections and persistent
-  translation history.
+- **Optional Google Sign-In** — works fully anonymously by default,
+  including translation history (scoped to your browser session, ~24h);
+  signing in unlocks custom database connections and history that follows
+  you across devices/sessions instead.
 
 ---
 
@@ -149,9 +151,8 @@ the root keeps that consistent with the Docker image's `WORKDIR /app`.
 # 1. Install dependencies
 pip install -r requirements.txt
 
-# 2. Set at least a Gemini API key and a target database
+# 2. Set at least a Gemini API key
 export GEMINI_API_KEY="your-gemini-api-key"
-export DATABASE_URL="postgresql://user:password@host:5432/yourdb?sslmode=require"
 
 # 3. Run it
 python server/server.py
@@ -162,6 +163,13 @@ browser — no GCP project, Firestore, or Google Sign-In setup is required
 for local use: the app falls back to a local SQLite file
 (`state/ydyl_state.db`) for sessions, saved connections, and translation
 history, and every request is treated as a single `"global"` local user.
+
+With no database configured, the app still starts and falls back to a
+single placeholder Postgres preset (not a real, reachable database) — add
+your own database from the connection badge in the header once it's
+running, or point `DATABASE_PRESETS_FILE` at a JSON file beforehand to
+have real presets available from the start. See
+[Database connections](#database-connections) below for both.
 
 ---
 
@@ -179,6 +187,8 @@ sensible default.
 | `GEMINI_PRESET_KEYS` | — | Comma-separated list of additional Gemini API keys. The app picks one at random per request and, on a rate-limit (429) error, automatically retries with a different key from the pool. See [`translate_routes.py`](./server/translate_routes.py) for the full retry policy. |
 | `GEMINI_MODEL` | `gemini-2.5-flash` | Default model used for translation. |
 | `GEMINI_PRESET_MODELS` | `gemini-2.5-flash,gemini-2.5-pro` | Comma-separated list of models offered in the UI. `GEMINI_MODEL` is auto-added if missing. |
+| `MAX_GEMINI_ATTEMPTS` | `5` | Max attempts (initial call + retries) for a single Gemini request before giving up. Only rate-limit/server-error failures are retried — see [`translate_routes.py`](./server/translate_routes.py). |
+| `GEMINI_RETRY_DELAY_SECONDS` | `1` | Seconds to wait between retry attempts. |
 
 At least one of `GEMINI_API_KEY`, `GOOGLE_API_KEY`, or
 `GEMINI_PRESET_KEYS` must be set, or `/api/translate` returns a 400
@@ -188,27 +198,69 @@ At least one of `GEMINI_API_KEY`, `GOOGLE_API_KEY`, or
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `DATABASE_URL` | `postgresql://postgres:password@host:23456/defaultdb?sslmode=verify-full` | Fallback connection string if `DATABASE_URLS` isn't set. |
-| `DATABASE_NAMES` | `Default DB` | Comma-separated display names for the preset connections shown in the UI. |
-| `DATABASE_URLS` | value of `DATABASE_URL` | Comma-separated connection strings, positionally paired with `DATABASE_NAMES`. The first pair is the default connection for new sessions. |
+| `DATABASE_PRESETS_FILE` | — (no presets) | Path to a JSON file listing the admin-configured preset connections shown in the UI. Supports Postgres, MySQL, and BigQuery presets — see the shape below. If unset, the app falls back to a single synthetic "Default DB" Postgres preset pointing at `postgresql://postgres:password@host:23456/defaultdb?sslmode=verify-full`. |
 
-Example — two preset databases:
+`DATABASE_PRESETS_FILE` points at a file rather than holding the JSON
+inline in an env var, so presets can be written multi-line and reviewed
+like normal code instead of squeezed onto one line. The file is a JSON
+array of preset objects, one per preset; every object needs `type` and
+`name`, and the rest of the shape is dialect-specific:
 
-```bash
-export DATABASE_NAMES="Demo (read-only),Staging"
-export DATABASE_URLS="postgresql://demo_user:pw@host:5432/demo,postgresql://stg_user:pw@host:5432/staging"
+```json
+[
+  {
+    "type": "postgres",
+    "name": "Demo (read-only)",
+    "url": "postgresql://demo_user:pw@host:5432/demo"
+  },
+  {
+    "type": "mysql",
+    "name": "Sales (MySQL)",
+    "url": "mysql://demo_user:pw@host:3306/sales"
+  },
+  {
+    "type": "bigquery",
+    "name": "Google Trends",
+    "project_id": "bigquery-public-data",
+    "dataset": "google_trends",
+    "billing_project_id": "my-billing-project"
+  }
+]
 ```
 
-Signed-in users can also add their own custom connection from the
-database badge in the header — those are saved per-user (see
-[Data persistence](#data-persistence)) and are **not** available to
-anonymous users.
+The first Postgres preset in the file is the default connection for new
+sessions. A MySQL preset is just a connection-string URL, the same as
+Postgres — no dialect-specific fields, ambient identity, or always-explicit
+credential to worry about. BigQuery presets authenticate as the app's own
+ambient identity
+(Application Default Credentials — the Cloud Run service account, or
+whatever `gcloud auth application-default login` set up locally); an
+admin who wants a BigQuery preset to read data outside the app's own
+project must say explicitly who pays for it via `billing_project_id` —
+there's no env var that supplies a default billing project, on purpose
+(see the comment above `DATABASE_PRESETS_FILE` in
+[`app_config.py`](./server/app_config.py) for the full rationale).
+
+Relative paths resolve against the process's working directory (run from
+the repo root, as the [Quick start](#quick-start-local) section above
+already asks for). Since a presets file typically embeds real connection
+credentials (a Postgres password, at minimum), keep it out of version
+control the same way you would `.env`/`env.yaml` — see
+[`database_presets.json`](./database_presets.json) for this repo's own
+gitignored local-dev copy, and [Docker](#docker) below for how it reaches
+the container image.
+
+Signed-in users can also add their own custom connection (Postgres,
+MySQL, BigQuery, or Snowflake) from the database badge in the header —
+those are saved per-user (see [Data persistence](#data-persistence)) and
+are **not** available to anonymous users. There's currently no admin-preset
+path for Snowflake — see `config_routes.py`'s module docstring.
 
 ### Authentication
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `GOOGLE_CLIENT_ID` | — | Enables Google Sign-In and ID-token verification. If unset, the app runs with auth disabled locally (or as a shared anonymous user on Cloud Run). |
+| `GOOGLE_CLIENT_ID` | — | Enables Google Sign-In and ID-token verification. If unset, the app runs with auth disabled locally (or as an anonymous user, one identity per browser session, on Cloud Run). |
 
 See [Authentication model](#authentication-model) for the full picture,
 including how identity is resolved and what anonymous users can/can't do.
@@ -240,17 +292,16 @@ recycled at any time — see the `RuntimeError` in
 ## Docker
 
 The provided `Dockerfile` builds on `python:3.12-slim`, installs
-`requirements.txt`, and copies in `server/`, `webClient/`, and a
-`crdb.crt` certificate (for verifying CockroachDB's TLS certificate —
-supply your own if you don't have one; the app's default connection
-string uses `sslmode=verify-full`, which requires it). The container
-runs `python server/server.py` and exposes port `3000`.
+`requirements.txt`, and copies in `server/`, `webClient/`, and
+`database_presets.json` (see [Database connections](#database-connections)
+above) — that file is gitignored, like `.env`/`env.yaml`, so it must exist
+locally (even as an empty `[]`) before building. The container runs
+`python server/server.py` and exposes port `3000`.
 
 ```bash
 docker build -t ydyl .
 docker run -p 3000:3000 \
   -e GEMINI_API_KEY="your-gemini-api-key" \
-  -e DATABASE_URL="postgresql://user:password@host:5432/yourdb?sslmode=require" \
   ydyl
 ```
 
@@ -264,19 +315,23 @@ configured to expect) or adjust `--port`/the `EXPOSE`/`CMD` to line up.
 On Cloud Run, the app automatically switches its state backend to
 Firestore and enforces authentication for every route except the
 handful listed in `EXEMPT_ENDPOINTS` (see [`auth.py`](./server/auth.py)) —
-signed-out requests are treated as a shared anonymous identity rather
-than rejected outright, with anonymous-only restrictions applied at the
-route level (custom connections, translation history).
+signed-out requests are treated as an anonymous identity (one per browser
+session, not shared across visitors — see
+[Authentication model](#authentication-model)) rather than being rejected
+outright, with one anonymous-only restriction applied at the route level:
+saving a custom database connection.
 
 Minimum environment for a Cloud Run deployment (built from the
-[Dockerfile](#docker) — remember the `CRBOT_PORT` note above):
+[Dockerfile](#docker) — remember the `CRBOT_PORT` note above, and that
+`database_presets.json` needs to exist locally before this builds):
 
 ```bash
 gcloud run deploy ydyl \
-  --set-env-vars GEMINI_API_KEY=...,GOOGLE_CLIENT_ID=...,GCP_PROJECT_ID=your-project,CRBOT_PORT=8080 \
-  --set-env-vars DATABASE_NAMES="Demo",DATABASE_URLS="postgresql://..." \
-  ...
+  --set-env-vars GEMINI_API_KEY=...,GOOGLE_CLIENT_ID=...,GCP_PROJECT_ID=your-project,CRBOT_PORT=8080
 ```
+
+See [`gcp_deploy.sh`](./gcp_deploy.sh) and [`env.yaml`](./env.yaml) for
+this repo's own version of the above.
 
 `GCP_PROJECT_ID` (or `GOOGLE_CLOUD_PROJECT`/`GCP_PROJECT`, which Cloud
 Run sets automatically) must resolve to a project with a Firestore
@@ -284,8 +339,9 @@ database named `ydyl` — see `firestore.Client(project=..., database="ydyl")`
 in [`app_config.py`](./server/app_config.py).
 
 `GOOGLE_CLIENT_ID` is optional even on Cloud Run, but without it every
-request is treated as the shared anonymous user — nobody gets to sign
-in, custom connections, or persistent history.
+request is treated as anonymous — nobody gets to sign in or save a custom
+connection (each visitor's browser session still gets its own isolated
+translation history, though).
 
 ---
 
@@ -299,11 +355,11 @@ assets require authentication when running on Cloud Run or when
 | Method & Path | Purpose |
 |---|---|
 | `GET /api/auth/me` | Who am I? Returns `authenticated`, `user_id`, `session_id`, `auth_required`. |
-| `GET/POST /api/config` | `GET`: current session's active DB, auto-execute preference, configured/custom databases, available models. `POST`: update active DB and/or auto-execute preference (rejected for anonymous users on Cloud Run). |
+| `GET/POST /api/config` | `GET`: current session's active DB, auto-execute preference, configured/custom databases, available models. `POST`: update active DB and/or auto-execute preference (saving a *custom* connection is rejected for anonymous users on Cloud Run). |
 | `POST /api/translate` | Body: `{ prompt, history, database_url?, gemini_model?, refresh_schema? }`. Returns `{ success, sql, *_tokens, duration }`. |
 | `POST /api/execute` | Body: `{ sql, database_url? }` — runs one or more `;`-separated statements and returns per-statement results. Returns the **raw** Postgres error message on failure (intentionally — this is a SQL runner, the user needs the real error to fix their query). |
-| `GET /api/history` | Signed-in users only. Returns recent translations plus per-day usage stats. |
-| `DELETE/POST /api/history/purge` | Signed-in users only. Deletes all translation history for the current user. |
+| `GET /api/history` | Returns recent translations plus per-day usage stats for the current identity — including anonymous Cloud Run visitors, whose history is isolated per browser session. |
+| `DELETE/POST /api/history/purge` | Deletes all translation history for the current identity (same per-session isolation for anonymous visitors as above). |
 
 ---
 
@@ -317,17 +373,25 @@ Identity is resolved in this order (see `get_current_user_identity` in
 2. **IAP / proxy headers** — `X-Goog-Authenticated-User-Email`,
    `X-User-Email`, or `X-User-ID`.
 3. **Auth cookie** — `crbot_user_id` or `user_id`.
-4. **Shared anonymous user** — if auth is enabled (Cloud Run or
-   `GOOGLE_CLIENT_ID` set) but none of the above are present, the
-   request is treated as a working-but-restricted anonymous identity
-   rather than being rejected.
+4. **Anonymous, scoped to the browser session** — if auth is enabled
+   (Cloud Run or `GOOGLE_CLIENT_ID` set) but none of the above are
+   present, the request is treated as a working-but-restricted anonymous
+   identity (`anonymous:<session_id>`, keyed off the `crbot_session_id`
+   cookie) rather than being rejected. Each browser session gets its own
+   identity — and so its own active-DB/auto-execute state — rather than
+   every anonymous visitor sharing one (see `ANONYMOUS_USER_ID_PREFIX` in
+   [`auth.py`](./server/auth.py)).
 5. **Local fallback** — a single `"global"` identity when auth isn't
-   enabled at all (typical local dev).
+   enabled at all (typical local dev) — unaffected by anonymous-user
+   scoping, since it's a separate fallback (step 5, not step 4).
 
 Anonymous users can translate and execute SQL against the default/preset
-databases, but cannot save custom database connections or view/purge
-translation history — those routes explicitly check
-`is_anonymous_user(...)` and return a friendly 403.
+databases, and can view/purge their own translation history too — it's
+isolated per browser session (see `ANONYMOUS_USER_ID_PREFIX` above), so
+there's nothing to protect it from. The one thing still off-limits is
+saving a custom database connection, which needs a more durable identity
+than a transient anonymous session — `config_routes.py` explicitly checks
+`is_anonymous_user(...)` there and returns a friendly 403.
 
 ---
 
@@ -380,11 +444,12 @@ Two independent suites, both runnable locally with no real credentials of
 any kind:
 
 - **`tests/server/`** — a pytest suite covering every server module
-  (auth, routes, both backends, both state-store implementations, the
-  full BigQuery billing-project policy). Everything is mocked at the
-  library boundary (fake `psycopg2`/`bigquery`/`firestore`/`genai`
-  clients) - no real Postgres, BigQuery, Firestore, or Gemini API key is
-  ever needed. Any service-account keys used in tests are freshly
+  (auth, routes, all four backends, both state-store implementations, the
+  full BigQuery billing-project policy and Snowflake credential policy).
+  Everything is mocked at the library boundary (fake
+  `psycopg2`/`pymysql`/`bigquery`/`snowflake.connector`/`firestore`/`genai`
+  clients) - no real Postgres, MySQL, BigQuery, Snowflake, Firestore, or
+  Gemini API key is ever needed. Any service-account keys used in tests are freshly
   generated, throwaway RSA keypairs, never real credentials.
 - **`tests/e2e/`** — a JS/TS Playwright suite driving a real browser
   against a real Flask server + real (isolated, gitignored) SQLite state
@@ -433,9 +498,11 @@ run alongside `./run_server.sh`'s normal dev server.
   project with a `ydyl` Firestore database, or the service account
   lacks Firestore access. This check is intentionally fatal rather than
   falling back to SQLite in a stateless container.
-- **Custom database connections / history don't show up** — you're
-  signed out (or being treated as the anonymous user on Cloud Run).
-  Sign in with Google to unlock both.
+- **Custom database connections don't show up** — you're signed out (or
+  being treated as an anonymous visitor on Cloud Run). Sign in with
+  Google to unlock these. (Translation history, unlike custom
+  connections, works while signed out too — it's just scoped to your
+  current browser session rather than following you across devices.)
 - **`/api/execute` errors look different from `/api/translate`
   errors** — that's intentional. `/api/execute` returns the real
   Postgres error text since it's a SQL runner; every other endpoint

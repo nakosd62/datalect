@@ -9,7 +9,10 @@ import-time side effects, the hardcoded relative SQLite path, ...).
 
 import pytest
 
-from helpers import fresh_import, install_fake_bigquery
+from helpers import (
+    fresh_import, install_fake_bigquery, install_fake_snowflake_connect,
+    install_fake_pymysql_connect, install_fake_databricks_connect, install_fake_oracle_connect,
+)
 
 
 @pytest.fixture
@@ -31,7 +34,7 @@ def app_env(app_factory):
     """The common case: one app instance, local dev defaults (no auth, no
     GCP project -> SQLite state, no presets -> the single synthetic
     "Default DB" fallback preset). Most tests that don't care about a
-    specific DATABASE_PRESETS/auth/Cloud Run configuration just want this."""
+    specific DATABASE_PRESETS_FILE/auth/Cloud Run configuration just want this."""
     return app_factory()
 
 
@@ -50,3 +53,39 @@ def bigquery_harness(monkeypatch):
     backends.bigquery fresh, the patch is lost. Order in the test function
     matters: build the app first, then install this."""
     return install_fake_bigquery(monkeypatch)
+
+
+@pytest.fixture
+def snowflake_harness(monkeypatch):
+    """Patches backends.snowflake's snowflake.connector.connect with a
+    fake that records kwargs instead of opening a real connection. Same
+    ordering caveat as bigquery_harness above: call this AFTER
+    app_factory/app_env in your test, not before."""
+    return install_fake_snowflake_connect(monkeypatch)
+
+
+@pytest.fixture
+def mysql_harness(monkeypatch):
+    """Patches backends.mysql's pymysql.connect with a fake that records
+    kwargs instead of opening a real connection. Same ordering caveat as
+    bigquery_harness/snowflake_harness above: call this AFTER
+    app_factory/app_env in your test, not before."""
+    return install_fake_pymysql_connect(monkeypatch)
+
+
+@pytest.fixture
+def databricks_harness(monkeypatch):
+    """Patches backends.databricks's databricks.sql.connect with a fake
+    that records kwargs instead of opening a real connection. Same ordering
+    caveat as bigquery_harness/snowflake_harness/mysql_harness above: call
+    this AFTER app_factory/app_env in your test, not before."""
+    return install_fake_databricks_connect(monkeypatch)
+
+
+@pytest.fixture
+def oracle_harness(monkeypatch):
+    """Patches backends.oracle's oracledb.connect with a fake that records
+    kwargs instead of opening a real connection. Same ordering caveat as
+    bigquery_harness/snowflake_harness/mysql_harness/databricks_harness
+    above: call this AFTER app_factory/app_env in your test, not before."""
+    return install_fake_oracle_connect(monkeypatch)

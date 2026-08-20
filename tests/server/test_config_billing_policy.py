@@ -15,16 +15,18 @@ right project).
 
 import pytest
 
-from helpers import install_fake_bigquery, make_service_account_key_json, login_as
+from helpers import (
+    install_fake_bigquery, make_service_account_key_json, login_as,
+    write_database_presets_file,
+)
 
 
-def test_authenticated_preset_selection_bills_against_presets_billing_project(app_factory, monkeypatch):
-    env = app_factory(env={
-        "DATABASE_PRESETS": (
-            '[{"type":"bigquery","name":"Public Data","project_id":"bigquery-public-data",'
-            '"dataset":"usa_names","billing_project_id":"my-own-billing-project"}]'
-        ),
-    })
+def test_authenticated_preset_selection_bills_against_presets_billing_project(app_factory, tmp_path, monkeypatch):
+    path = write_database_presets_file(tmp_path, [{
+        "type": "bigquery", "name": "Public Data", "project_id": "bigquery-public-data",
+        "dataset": "usa_names", "billing_project_id": "my-own-billing-project",
+    }])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
     harness = install_fake_bigquery(monkeypatch)
     login_as(env.client, "alice@example.com")
 
@@ -38,13 +40,14 @@ def test_authenticated_preset_selection_bills_against_presets_billing_project(ap
     assert harness.client_calls[-1]["project"] == "my-own-billing-project"
 
 
-def test_anonymous_preset_selection_bills_against_presets_billing_project(app_factory, monkeypatch):
+def test_anonymous_preset_selection_bills_against_presets_billing_project(app_factory, tmp_path, monkeypatch):
+    path = write_database_presets_file(tmp_path, [{
+        "type": "bigquery", "name": "Public Data", "project_id": "bigquery-public-data",
+        "dataset": "usa_names", "billing_project_id": "my-own-billing-project",
+    }])
     env = app_factory(env={
         "GOOGLE_CLIENT_ID": "fake.apps.googleusercontent.com",
-        "DATABASE_PRESETS": (
-            '[{"type":"bigquery","name":"Public Data","project_id":"bigquery-public-data",'
-            '"dataset":"usa_names","billing_project_id":"my-own-billing-project"}]'
-        ),
+        "DATABASE_PRESETS_FILE": path,
     })
     harness = install_fake_bigquery(monkeypatch)
 
@@ -55,15 +58,14 @@ def test_anonymous_preset_selection_bills_against_presets_billing_project(app_fa
     assert harness.client_calls[-1]["project"] == "my-own-billing-project"
 
 
-def test_preset_without_billing_project_id_falls_back_to_its_own_project_and_still_403_shaped(app_factory, monkeypatch):
+def test_preset_without_billing_project_id_falls_back_to_its_own_project_and_still_403_shaped(app_factory, tmp_path, monkeypatch):
     # No billing_project_id on this preset - app_config.py's fallback
     # (bare project_id, with a warning) is exercised here through the full
     # request path, not just the CONFIGURED_DBS parsing unit test.
-    env = app_factory(env={
-        "DATABASE_PRESETS": (
-            '[{"type":"bigquery","name":"No Billing","project_id":"bigquery-public-data","dataset":"usa_names"}]'
-        ),
-    })
+    path = write_database_presets_file(tmp_path, [
+        {"type": "bigquery", "name": "No Billing", "project_id": "bigquery-public-data", "dataset": "usa_names"},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
     harness = install_fake_bigquery(monkeypatch)
     login_as(env.client, "alice@example.com")
     env.client.post('/api/config', json={
@@ -149,13 +151,12 @@ def test_custom_connection_never_borrows_a_matching_presets_billing_project(app_
 
 # --- _parse_incoming_connection / _parse_incoming_custom_databases, direct ----
 
-def test_parse_incoming_connection_preset_uses_matching_preset_billing_project(app_factory):
-    env = app_factory(env={
-        "DATABASE_PRESETS": (
-            '[{"type":"bigquery","name":"Trends","project_id":"bigquery-public-data",'
-            '"dataset":"google_trends","billing_project_id":"preset-billing-proj"}]'
-        ),
-    })
+def test_parse_incoming_connection_preset_uses_matching_preset_billing_project(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [{
+        "type": "bigquery", "name": "Trends", "project_id": "bigquery-public-data",
+        "dataset": "google_trends", "billing_project_id": "preset-billing-proj",
+    }])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
     db_type, db_url, db_config, error = env.config_routes._parse_incoming_connection(
         {"database_type": "bigquery", "project_id": "bigquery-public-data", "dataset": "google_trends"},
         "alice@example.com", False,

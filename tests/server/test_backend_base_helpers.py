@@ -11,7 +11,33 @@ from helpers import SERVER_DIR
 if SERVER_DIR not in sys.path:
     sys.path.insert(0, SERVER_DIR)
 
-from backends.base import group_date_sharded_tables, cap_kept_tables, cap_schema_text
+from backends.base import Backend, group_date_sharded_tables, cap_kept_tables, cap_schema_text
+
+
+# --- Backend.liveness_sql ----------------------------------------------------
+# Regression coverage for the real-world bug that motivated this attribute:
+# /api/ping (execute_routes.py) used to be a hardcoded "SELECT 1;" POSTed
+# to /api/execute from client.js, which fails against Oracle (no
+# SELECT-without-FROM form there - see backends/oracle.py's override).
+# Pinning the base class's default here, separately from
+# test_oracle_backend.py's override test, so a future backend that forgets
+# it exists still inherits a safe, ANSI-valid default rather than silently
+# having no liveness_sql at all.
+
+def test_backend_base_class_defaults_liveness_sql_to_select_1():
+    assert Backend.liveness_sql == "SELECT 1"
+
+
+def test_every_registered_backend_except_oracle_uses_the_ansi_select_1_default():
+    from backends import _BACKENDS
+    for name, backend_cls in _BACKENDS.items():
+        if name == "oracle":
+            continue
+        assert backend_cls.liveness_sql == "SELECT 1", (
+            f"{name} backend overrides liveness_sql unexpectedly - if that's "
+            f"intentional (a dialect that also can't run bare SELECT 1), "
+            f"this test's exclusion list needs updating alongside it."
+        )
 
 
 # --- group_date_sharded_tables ---------------------------------------------

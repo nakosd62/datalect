@@ -50,6 +50,37 @@ _DIALECT_PROMPT_INTROS = {
         "WHERE _TABLE_SUFFIX BETWEEN '20240101' AND '20240131' for a date range, or WHERE _TABLE_SUFFIX = '20240115' for one specific day. "
         "_TABLE_SUFFIX is only valid when the FROM clause uses the wildcard (`prefix_*`) form.\n"
     ),
+    "Snowflake SQL": (
+        "You are an expert SQL generation assistant for Snowflake.\n"
+        "Given the provided past chat interactions, the database schema and the user's natural language prompt, translate the request into valid Snowflake SQL.\n"
+        "You may return one or more independent SQL statements, and Snowflake Scripting (DECLARE/BEGIN/IF/FOR) where appropriate.\n"
+        "Use double quotes for identifiers that need quoting (Snowflake's default, case-sensitive form); unquoted identifiers are treated as upper-case.\n"
+        "Snowflake has no enforced PK/FK/UNIQUE constraints - schema entries listing them are informational only, not something the database rejects violations of.\n"
+    ),
+    "MySQL": (
+        "You are an expert SQL generation assistant for MySQL-compatible RDBMSs.\n"
+        "Given the provided past chat interactions, the database schema and the user's natural language prompt, translate the request into valid MySQL SQL.\n"
+        "You may return one or more independent SQL statements, and MySQL stored-program constructs (DECLARE/IF/LOOP/WHILE) where appropriate.\n"
+        "Use backticks for identifiers that need quoting; MySQL treats double-quoted text as a string literal by default (like standard SQL), not an identifier.\n"
+        "MySQL has no schemas separate from databases - a schema and a database are the same thing here.\n"
+    ),
+    "Databricks SQL": (
+        "You are an expert SQL generation assistant for Databricks SQL (Spark SQL).\n"
+        "Given the provided past chat interactions, the database schema and the user's natural language prompt, translate the request into valid Databricks SQL.\n"
+        "You may return one or more independent SQL statements, and Databricks SQL scripting (DECLARE/IF/WHILE/FOR) where appropriate.\n"
+        "Use backticks for identifiers that need quoting.\n"
+        "The connection has a default catalog and schema already selected, so plain table names (not schema-qualified or catalog-qualified) resolve correctly - do not prefix table names with a catalog or schema unless the user explicitly asks to query a different one.\n"
+        "Databricks (Unity Catalog) does not enforce PK/FK/UNIQUE constraints - schema entries listing them are informational only, not something the database rejects violations of.\n"
+    ),
+    "Oracle Database": (
+        "You are an expert SQL generation assistant for Oracle Database.\n"
+        "Given the provided past chat interactions, the database schema and the user's natural language prompt, translate the request into valid Oracle SQL.\n"
+        "You may return one or more independent SQL statements, and PL/SQL (DECLARE/BEGIN/END blocks, or CREATE PROCEDURE/FUNCTION) where appropriate.\n"
+        "Use double quotes for identifiers that need quoting; unquoted identifiers are folded to upper-case, so schema entries shown in upper-case (the common case) resolve correctly unquoted - only quote an identifier if it needs to preserve lower/mixed case or contains special characters.\n"
+        "Oracle has no LIMIT clause - use FETCH FIRST n ROWS ONLY (or ROWNUM/ROW_NUMBER() for older-style pagination) to cap result rows.\n"
+        "Every SELECT must have a FROM clause - use FROM DUAL for a query that doesn't otherwise reference a table (e.g. SELECT SYSDATE FROM DUAL).\n"
+        "String literals use single quotes only; double quotes are exclusively for identifiers, never string values.\n"
+    ),
 }
 _DEFAULT_DIALECT_PROMPT_INTRO = _DIALECT_PROMPT_INTROS["PostgreSQL"]
 
@@ -57,9 +88,12 @@ _DEFAULT_DIALECT_PROMPT_INTRO = _DIALECT_PROMPT_INTROS["PostgreSQL"]
 # occasionally throws as a plain "500 INTERNAL") are worth a few automatic
 # retries - the same request usually succeeds a couple seconds later.
 # Anything else (bad request, invalid model, auth failure, etc.) will just
-# fail the same way again, so it's raised immediately instead.
-MAX_GEMINI_ATTEMPTS = 5
-GEMINI_RETRY_DELAY_SECONDS = 2
+# fail the same way again, so it's raised immediately instead. Both knobs
+# are configurable via env vars (e.g. to tune retry behavior for a noisier
+# Gemini rollout without a code change) - same int()/float()-on-getenv
+# pattern as SCHEMA_CACHE_TTL_SECONDS in schema_cache.py.
+MAX_GEMINI_ATTEMPTS = int(os.environ.get("MAX_GEMINI_ATTEMPTS", 5))
+GEMINI_RETRY_DELAY_SECONDS = float(os.environ.get("GEMINI_RETRY_DELAY_SECONDS", 1))
 
 
 def get_gemini_api_keys():
@@ -196,8 +230,11 @@ def translate_query():
     if not prompt:
         return jsonify({'error': 'Prompt cannot be empty'}), 400
 
+    # session_id resolved first and passed into get_current_user_identity()
+    # so an anonymous visitor's identity is scoped to THIS session, not a
+    # freshly-derived one - see that function's docstring in auth.py.
     session_id = get_or_create_session_id()
-    user_identity = get_current_user_identity()
+    user_identity = get_current_user_identity(session_id)
     conn_str = resolve_conn_str(data.get('database_url'), user_identity)
 
     history = data.get('history', [])[-20:]

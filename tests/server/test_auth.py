@@ -49,8 +49,37 @@ def test_anonymous_identity_used_when_auth_enabled_but_no_identity_given(app_fac
     env = app_factory(env={"GOOGLE_CLIENT_ID": "fake-client-id.apps.googleusercontent.com"})
     with env.app_config.app.test_request_context('/api/config'):
         identity = env.auth.get_current_user_identity()
-        assert identity == env.auth.ANONYMOUS_USER_ID
+        assert identity.startswith(env.auth.ANONYMOUS_USER_ID_PREFIX)
         assert env.auth.is_anonymous_user(identity) is True
+
+
+def test_anonymous_identity_is_scoped_to_the_session_id_passed_in(app_factory):
+    # The whole point of ANONYMOUS_USER_ID_PREFIX being a prefix rather
+    # than a single constant: two different browser sessions get two
+    # different (but both still "anonymous") identities, so their DB
+    # selection/auto-execute state doesn't collide - see auth.py's comment
+    # above ANONYMOUS_USER_ID_PREFIX for the bug this fixes.
+    env = app_factory(env={"GOOGLE_CLIENT_ID": "fake-client-id.apps.googleusercontent.com"})
+    with env.app_config.app.test_request_context('/api/config'):
+        identity_a = env.auth.get_current_user_identity(session_id="session-aaa")
+        identity_b = env.auth.get_current_user_identity(session_id="session-bbb")
+        assert identity_a != identity_b
+        assert identity_a == "anonymous:session-aaa"
+        assert identity_b == "anonymous:session-bbb"
+        assert env.auth.is_anonymous_user(identity_a) is True
+        assert env.auth.is_anonymous_user(identity_b) is True
+
+
+def test_anonymous_identity_without_an_explicit_session_id_falls_back_to_get_or_create(app_factory):
+    # Callers that don't have a session_id on hand (or don't need a stable
+    # one - e.g. the enforce_authentication guard) still get a valid
+    # anonymous identity, derived internally.
+    env = app_factory(env={"GOOGLE_CLIENT_ID": "fake-client-id.apps.googleusercontent.com"})
+    with env.app_config.app.test_request_context(
+        '/api/config', headers={"Cookie": "crbot_session_id=cookie-session-id"}
+    ):
+        identity = env.auth.get_current_user_identity()
+        assert identity == "anonymous:cookie-session-id"
 
 
 def test_cookie_identity_still_wins_even_when_auth_enabled(app_factory):
@@ -89,16 +118,25 @@ def test_auth_me_endpoint_is_always_exempt(app_factory):
     assert data["auth_required"] is True
 
 
-def test_protected_route_rejected_without_identity_when_auth_enabled(app_factory):
+def test_protected_route_not_rejected_without_identity_when_auth_enabled(app_factory):
     env = app_factory(env={"GOOGLE_CLIENT_ID": "fake-client-id.apps.googleusercontent.com"})
-    # /api/history isn't in EXEMPT_ENDPOINTS - with AUTH_ENABLED true, the
-    # guard demands *some* identity signal before the route even runs.
-    # Since get_current_user_identity() falls back to ANONYMOUS_USER_ID
-    # (a truthy string) whenever GOOGLE_CLIENT_ID is set, the guard itself
-    # never actually 401s in this app - it's is_anonymous_user() gating at
-    # the route level that does the real rejection (see test_history_routes.py).
-    resp = env.client.get('/api/history')
-    assert resp.status_code == 403  # anonymous-user rejection, not 401
+    # get_current_user_identity() falls back to an anonymous:<session>
+    # identity (a truthy string) whenever GOOGLE_CLIENT_ID is set, so the
+    # enforce_authentication guard itself never actually 401s anonymous
+    # requests in this app. There is currently no remaining
+    # is_anonymous_user() rejection anywhere at the route level either -
+    # /api/history and saving a custom DB connection were the two features
+    # that used to gate on it, and both are now fully un-gated once their
+    # per-session "anonymous:<session_id>" identity gives them the same
+    # isolation an authenticated user's identity would (see
+    # test_history_routes.py and test_config_custom_connections.py). This
+    # exercises the custom-connection save specifically, to prove the old
+    # 403 is gone.
+    resp = env.client.post('/api/config', json={
+        "database_type": "postgres", "database_url": "postgresql://u:p@h/mydb",
+        "database_name": "My DB", "is_custom": True,
+    })
+    assert resp.status_code == 200
 
 
 def test_config_route_is_always_exempt_from_auth_guard(app_factory):

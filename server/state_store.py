@@ -47,7 +47,17 @@ DEFAULT_AUTO_SQL_EXECUTE = True
 # returned by get_db_connections() unless include_credentials=True is
 # passed explicitly (server-side use only, e.g. merging a previously-saved
 # key back in when a user edits a connection without re-pasting it).
-_CREDENTIAL_CONFIG_FIELDS = {"credentials_json"}
+# "credentials_json" is BigQuery's service-account key; "password" and
+# "private_key"/"private_key_passphrase" are Snowflake's two supported
+# auth methods (see backends/snowflake.py's module docstring) - added here
+# even before config_routes.py's Snowflake wiring lands, so there's no
+# window where a Snowflake config field could round-trip to the frontend
+# unstripped. "access_token" is Databricks' Personal Access Token (see
+# backends/databricks.py's module docstring) - same reasoning. Oracle's
+# standalone password (backends/oracle.py - Oracle has no connection-
+# string url of its own to embed one in, unlike Postgres/MySQL) reuses
+# "password", already covered here.
+_CREDENTIAL_CONFIG_FIELDS = {"credentials_json", "password", "private_key", "private_key_passphrase", "access_token"}
 
 
 def _loads_config(raw_json):
@@ -67,6 +77,36 @@ def _strip_credentials(config):
     """Returns a copy of `config` with credential fields removed, for
     responses that may end up in an API response to the frontend."""
     return {k: v for k, v in (config or {}).items() if k not in _CREDENTIAL_CONFIG_FIELDS}
+
+
+def _has_any_credential(config):
+    """Whether `config` carries ANY credential field - not just BigQuery's
+    "credentials_json", since Snowflake's two auth methods use "password"
+    or "private_key" instead (see _CREDENTIAL_CONFIG_FIELDS above). Used
+    for the "has_custom_credentials" flag get_db_connections() returns, so
+    the frontend can tell "a key/password is saved server-side" apart from
+    "nothing saved yet" without ever seeing the credential itself."""
+    config = config or {}
+    return any(config.get(field) for field in _CREDENTIAL_CONFIG_FIELDS)
+
+
+def _credential_value_for_key(config):
+    """A single string folding in EVERY credential field `config` carries,
+    for feeding into compute_connection_key()'s credentials_json parameter
+    - that parameter is really just "fold this raw credential blob into
+    the key hash", not something that literally has to be BigQuery's
+    credentials_json. Concatenates every _CREDENTIAL_CONFIG_FIELDS value in
+    a fixed (sorted) field-name order - never just the first non-empty one
+    found, since iterating a set's natural order isn't guaranteed stable
+    across process restarts (Python's string hash randomization), which
+    would otherwise risk the same saved connection computing a *different*
+    connection_key after an app restart. Sorted-and-joined is also more
+    correct for Snowflake's key-pair auth specifically, where a config can
+    carry two credential fields at once (private_key AND
+    private_key_passphrase) - both must affect the hash, not just
+    whichever happened to be checked first."""
+    config = config or {}
+    return "\x00".join(str(config.get(field) or "") for field in sorted(_CREDENTIAL_CONFIG_FIELDS))
 
 
 def compute_connection_key(name, url, credentials_json=None):
@@ -495,7 +535,7 @@ class SqliteStateStore(StateStore):
                 )
                 for key, name, url, db_type, db_config_raw in cursor.fetchall():
                     config = _loads_config(db_config_raw)
-                    has_custom_credentials = bool(config.get("credentials_json"))
+                    has_custom_credentials = _has_any_credential(config)
                     if not include_credentials:
                         config = _strip_credentials(config)
                     custom_dbs.append({
@@ -524,7 +564,7 @@ class SqliteStateStore(StateStore):
                         n = db.get("name")
                         t = db.get("type") or "postgres"
                         cfg = db.get("config") or {}
-                        key = db.get("connection_key") or compute_connection_key(n, u, cfg.get("credentials_json"))
+                        key = db.get("connection_key") or compute_connection_key(n, u, _credential_value_for_key(cfg))
                         if u:
                             cursor.execute("""
                                 INSERT OR REPLACE INTO db_connections
@@ -537,7 +577,7 @@ class SqliteStateStore(StateStore):
             return
 
         try:
-            key = connection_key or compute_connection_key(db_name, db_url, (db_config or {}).get("credentials_json"))
+            key = connection_key or compute_connection_key(db_name, db_url, _credential_value_for_key(db_config))
             with self._connect() as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
@@ -722,7 +762,7 @@ class FirestoreStateStore(StateStore):
                 data = doc.to_dict()
                 if data and data.get("database_url"):
                     config = dict(data.get("database_config") or {})
-                    has_custom_credentials = bool(config.get("credentials_json"))
+                    has_custom_credentials = _has_any_credential(config)
                     if not include_credentials:
                         config = _strip_credentials(config)
                     custom_dbs.append({
@@ -754,7 +794,7 @@ class FirestoreStateStore(StateStore):
                     n = db.get("name")
                     t = db.get("type") or "postgres"
                     cfg = db.get("config") or {}
-                    key = db.get("connection_key") or compute_connection_key(n, u, cfg.get("credentials_json"))
+                    key = db.get("connection_key") or compute_connection_key(n, u, _credential_value_for_key(cfg))
                     if u:
                         doc_id = f"{effective_user}_{key}"
                         self.client.collection("db_connections").document(doc_id).set({
@@ -771,7 +811,7 @@ class FirestoreStateStore(StateStore):
             return
 
         try:
-            key = connection_key or compute_connection_key(db_name, db_url, (db_config or {}).get("credentials_json"))
+            key = connection_key or compute_connection_key(db_name, db_url, _credential_value_for_key(db_config))
             doc_id = f"{effective_user}_{key}"
             self.client.collection("db_connections").document(doc_id).set({
                 "user_id": effective_user,

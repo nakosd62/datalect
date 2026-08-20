@@ -14,11 +14,9 @@ utils/
 # Ignore README
 README.md
 
-# Ignre env files containing secrets
+# Ignre local env files containing secrets
 .env
-
-# Ignore BQ key
-ydyl-bq-test-key.json
+database_presets_local.json
 
 # Ignore local state
 state/

@@ -12,6 +12,10 @@ backends/base.py) - this route no longer knows or cares whether it's
 talking to psycopg2, a BigQuery job client, or anything else. Its own job
 is just: resolve the connection, time the call, shape the HTTP response,
 and translate any backend exception into the existing error JSON shape.
+
+Also owns /api/ping, a separate lightweight liveness check for the status
+dot (see that route's own docstring for why it isn't just /api/execute
+with a hardcoded query string).
 """
 
 import time
@@ -28,8 +32,11 @@ execute_bp = Blueprint('execute', __name__)
 
 @execute_bp.route('/api/execute', methods=['POST'])
 def execute_query():
+    # session_id resolved first and passed into get_current_user_identity()
+    # so an anonymous visitor's identity is scoped to THIS session, not a
+    # freshly-derived one - see that function's docstring in auth.py.
     session_id = get_or_create_session_id()
-    user_identity = get_current_user_identity()
+    user_identity = get_current_user_identity(session_id)
     data = request.get_json() or {}
 
     descriptor = resolve_conn_str(data.get('database_url'), user_identity)
@@ -73,6 +80,51 @@ def execute_query():
             'error': str(e),
             'executionTimeMs': execution_time_ms
         })
+        return apply_session_cookie(resp, session_id), 400
+    finally:
+        if conn and backend:
+            backend.close(conn)
+
+
+@execute_bp.route('/api/ping', methods=['GET'])
+def ping():
+    """Cheap "is the active connection alive" check for the status dot
+    client.js's checkDbStatus() polls - split out from /api/execute rather
+    than reusing it with a hardcoded "SELECT 1" query text, because no
+    single query string is valid across every dialect (Oracle has no
+    SELECT-without-FROM form - see backends/base.py's liveness_sql). Each
+    backend already knows its own dialect's quirks everywhere else in this
+    file's sibling modules; this just asks it for the one trivial
+    statement it knows is always safe to run, instead of the client
+    guessing one that happens to work for most dialects.
+
+    Deliberately its own route rather than a query param on /api/execute
+    (e.g. "?ping=1"): a GET (idempotent, cheap to poll on an interval) with
+    no request body, versus /api/execute's POST-with-arbitrary-SQL shape -
+    conflating the two would mean either accepting a GET with a SQL body
+    or bolting a "this one's not really user SQL" flag onto the one route
+    that intentionally returns raw DB errors straight to the client (see
+    the module docstring above)."""
+    session_id = get_or_create_session_id()
+    user_identity = get_current_user_identity(session_id)
+
+    descriptor = resolve_conn_str(None, user_identity)
+
+    backend = None
+    conn = None
+    try:
+        backend = get_backend(descriptor)
+        conn = backend.connect(descriptor)
+        backend.execute(conn, backend.liveness_sql)
+        resp = jsonify({'success': True})
+        return apply_session_cookie(resp, session_id)
+    except Exception as e:
+        # Same "log server-side, don't leak detail" posture as every other
+        # non-/api/execute route in this app - the status dot only ever
+        # shows connected/disconnected, never an error message, so there's
+        # no reason for the client to see the raw exception text here.
+        logger.warning("Ping (liveness check) failed for user=%s: %s", user_identity, e)
+        resp = jsonify({'success': False})
         return apply_session_cookie(resp, session_id), 400
     finally:
         if conn and backend:

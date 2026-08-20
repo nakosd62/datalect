@@ -6,9 +6,9 @@
 // (launched by playwright.config.js's webServer block, isolated under
 // .e2e-runtime/) - /api/config, /api/history, session handling, and the
 // custom-connection save/validation logic in config_routes.py are all the
-// genuine article. The only two endpoints ever mocked are /api/translate
-// and /api/execute - see below for why /api/execute gets a harmless
-// default mock even in specs that never mention it.
+// genuine article. The endpoints mocked are /api/translate, /api/execute,
+// and /api/ping - see below for why /api/execute and /api/ping both get a
+// harmless default mock even in specs that never mention them.
 //
 // TEST ISOLATION: with no GOOGLE_CLIENT_ID configured (local-dev default -
 // see auth.py's get_current_user_identity()), a request with no
@@ -24,8 +24,8 @@
 // users. Without this, config-modal.spec.js's custom BigQuery connections
 // (real fake keys) could still be "active" server-side when a completely
 // unrelated, parallel-running test's page loads and checkDbStatus() pings
-// the real /api/execute in the background - which is exactly what the
-// default execute mock below also guards against, belt-and-suspenders.
+// the real /api/ping in the background - which is exactly what the
+// default ping mock below also guards against, belt-and-suspenders.
 //
 // Every test also gets a fresh browser context (Playwright's default), so
 // without help every spec would see the first-run guided tour overlay
@@ -65,23 +65,36 @@ const test = isolatedTest.extend({
         window.localStorage.setItem('ydylHelpPulseDismissed', '1');
       } catch (e) { /* ignore */ }
     });
-    // client.js's checkDbStatus() fires a real "SELECT 1;" execute call
-    // after *every* fetchBackendConfig() - including the very first page
-    // load, and again after every config save - regardless of whether the
-    // test cares about execution at all. Left unmocked, a spec that saves
-    // a custom BigQuery connection (even with a throwaway fake key, e.g.
-    // config-modal.spec.js) would have this background ping attempt a
-    // real token exchange with Google before Postgres's much faster local
-    // connection-refused failure would apply instead - on a network that
-    // blocks that exchange, it hangs Flask's single-threaded dev server
-    // for many seconds and stalls every other test sharing it (state
-    // isolation above stops a *different* test's connection from being
-    // the one that's active, but a test that itself saves a fake-keyed
-    // BigQuery connection still needs this). mockExecute()/mockTranslate()
-    // calls made inside a test register their own route handler
-    // afterwards, and Playwright checks the most-recently-registered
-    // matching handler first - so a test's explicit mock always wins over
-    // this default.
+    // client.js's checkDbStatus() fires a real GET /api/ping call after
+    // *every* fetchBackendConfig() - including the very first page load,
+    // and again after every config save - regardless of whether the test
+    // cares about connection status at all. (Prior to backends/base.py's
+    // liveness_sql, this was a POST /api/execute "SELECT 1;" call instead -
+    // moved to its own route once a single hardcoded query string turned
+    // out not to be valid across every dialect, see execute_routes.py's
+    // /api/ping docstring - the mock here moved with it.) Left unmocked, a
+    // spec that saves a custom BigQuery connection (even with a throwaway
+    // fake key, e.g. config-modal.spec.js) would have this background ping
+    // attempt a real token exchange with Google before Postgres's much
+    // faster local connection-refused failure would apply instead - on a
+    // network that blocks that exchange, it hangs Flask's single-threaded
+    // dev server for many seconds and stalls every other test sharing it
+    // (state isolation above stops a *different* test's connection from
+    // being the one that's active, but a test that itself saves a
+    // fake-keyed BigQuery connection still needs this).
+    await page.route('**/api/ping', async (route) => {
+      if (route.request().method() !== 'GET') return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ success: true }),
+      });
+    });
+    // /api/execute itself (the "Run SQL" path, distinct from the status
+    // ping above) gets the same harmless default - mockExecute() calls
+    // made inside a test register their own route handler afterwards, and
+    // Playwright checks the most-recently-registered matching handler
+    // first, so a test's explicit mock always wins over this default.
     await page.route('**/api/execute', async (route) => {
       if (route.request().method() !== 'POST') return route.fallback();
       await route.fulfill({
@@ -107,19 +120,19 @@ const test = isolatedTest.extend({
  * settle - not just for the connection badge text to appear.
  *
  * updateConnectionDetails() sets #connDbName's text and THEN awaits
- * checkDbStatus() (a POST /api/execute "SELECT 1;" ping - mocked by
- * default, see the `test` fixture above) before the outer
- * fetchBackendConfig() promise actually resolves. A test that only waited
- * for the badge text and then immediately interacted with the page (e.g.
- * opening the config modal, which itself calls fetchBackendConfig() again)
- * could overlap with that still-in-flight initial call - whichever
- * response arrives *last* re-renders the DB radio group/custom-connection
- * list from its own (possibly now-stale) data, silently discarding
- * anything the test just did in between. Waiting for the initial
- * checkDbStatus() ping to complete here closes that window. */
+ * checkDbStatus() (a GET /api/ping ping - mocked by default, see the
+ * `test` fixture above) before the outer fetchBackendConfig() promise
+ * actually resolves. A test that only waited for the badge text and then
+ * immediately interacted with the page (e.g. opening the config modal,
+ * which itself calls fetchBackendConfig() again) could overlap with that
+ * still-in-flight initial call - whichever response arrives *last*
+ * re-renders the DB radio group/custom-connection list from its own
+ * (possibly now-stale) data, silently discarding anything the test just
+ * did in between. Waiting for the initial checkDbStatus() ping to
+ * complete here closes that window. */
 async function gotoApp(page) {
   const initialStatusPing = page.waitForResponse(
-    (resp) => resp.url().includes('/api/execute') && resp.request().method() === 'POST'
+    (resp) => resp.url().includes('/api/ping') && resp.request().method() === 'GET'
   );
   await page.goto('/');
   await initialStatusPing;

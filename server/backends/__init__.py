@@ -12,10 +12,18 @@ not touching any route or db.py dispatch logic.
 from .base import Backend
 from .postgres import PostgresBackend
 from .bigquery import BigQueryBackend
+from .snowflake import SnowflakeBackend
+from .mysql import MySQLBackend
+from .databricks import DatabricksBackend
+from .oracle import OracleBackend
 
 _BACKENDS = {
     "postgres": PostgresBackend(),
     "bigquery": BigQueryBackend(),
+    "snowflake": SnowflakeBackend(),
+    "mysql": MySQLBackend(),
+    "databricks": DatabricksBackend(),
+    "oracle": OracleBackend(),
 }
 
 

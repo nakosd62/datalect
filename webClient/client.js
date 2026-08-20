@@ -132,10 +132,15 @@ document.addEventListener('DOMContentLoaded', async () => {
   let customDatabases = [];
   let autoSqlExecuteEnabled = true;
   // True when running on Cloud Run and the current request has no verified
-  // login (i.e. the backend resolved it to the shared "anonymous" user).
-  // Anonymous users get full translate/execute functionality, but the DB
-  // connection config popup and translation history popup are gated -
-  // see updateAnonymousRestrictions() / showLoginRequiredModal().
+  // login (i.e. the backend resolved it to a per-session "anonymous:..."
+  // identity - see auth.py's ANONYMOUS_USER_ID_PREFIX). Anonymous users get
+  // full translate/execute functionality, their own (session-scoped,
+  // isolated) translation history, AND their own custom DB connections -
+  // nothing is gated behind sign-in anymore. This flag still matters for
+  // the UI, though: an anonymous visitor's admin-configured presets are
+  // matched by index (ACTIVE_PRESET_INDEX) rather than by URL, since
+  // (unlike their own custom connections) preset connection strings/
+  // credentials are still never sent to them - see renderDbRadioButtons().
   let isAnonymousUser = false;
 
   // True once /api/config reports Google Sign-In is configured (auth_enabled
@@ -235,8 +240,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   const connDbName = document.getElementById('connDbName');
   const connDbDot = document.getElementById('connDbDot');
 
-  // DOM Elements - Login Required Modal (shown when an anonymous user
-  // clicks the DB config badge or the history button)
+  // DOM Elements - Login Required Modal. Not currently triggered by
+  // anything: translation history and saving a custom DB connection were
+  // the two features this used to gate for anonymous visitors, and neither
+  // needs sign-in anymore (see isAnonymousUser's comment above). Left in
+  // place (and still wired below) in case a future gated feature needs it.
   const loginRequiredModal = document.getElementById('loginRequiredModal');
   const loginRequiredModalText = document.getElementById('loginRequiredModalText');
   const loginRequiredModalCloseBtn = document.getElementById('loginRequiredModalCloseBtn');
@@ -264,24 +272,17 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
-  // Grays out (and disables the normal behavior of) the history button for
-  // anonymous users. The DB config badge stays fully clickable for
-  // anonymous users too - they may open the dialog and switch between
-  // admin-configured presets, just not save a custom connection (see
-  // renderCustomDbRows()'s isAnonymousUser guard and the server-side 403
-  // in config_routes.py). Called whenever isAnonymousUser changes (i.e.
-  // every time fetchBackendConfig() resolves).
+  // The DB config badge is fully clickable for anonymous users - they may
+  // open the dialog, switch between admin-configured presets, AND save
+  // their own custom connections (see isAnonymousUser's comment above).
+  // Nothing is gated behind sign-in here anymore, so the badge's tooltip no
+  // longer needs to differ by identity - kept as a function (rather than
+  // inlined at the call site) in case a future gated feature needs it
+  // again. Called whenever isAnonymousUser changes (i.e. every time
+  // fetchBackendConfig() resolves).
   function updateAnonymousRestrictions() {
     if (configTriggerBadge) {
-      configTriggerBadge.title = isAnonymousUser
-        ? 'Connection Info (Click to configure - sign in for custom connections)'
-        : 'Connection Info (Click to configure)';
-    }
-    if (historyBtn) {
-      historyBtn.classList.toggle('icon-disabled', isAnonymousUser);
-      historyBtn.title = isAnonymousUser
-        ? 'Log in to view translation history'
-        : 'Translation History';
+      configTriggerBadge.title = 'Connection Info (Click to configure)';
     }
   }
 
@@ -454,6 +455,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (window.google && google.accounts && google.accounts.id) {
       google.accounts.id.disableAutoSelect();
     }
+    // Logging out drops back to a (new, distinct) anonymous session - the
+    // prompt/SQL/results on screen belonged to the just-logged-out user's
+    // identity and connection, so they're cleared the same way a DB
+    // connection change clears them (see clearActiveQueryState()).
+    clearActiveQueryState();
     renderAuthUI(currentGoogleClientId);
     fetchBackendConfig();
   }
@@ -553,6 +559,12 @@ document.addEventListener('DOMContentLoaded', async () => {
           callback: (response) => {
             if (response.credential) {
               googleIdToken = response.credential;
+              // A new user logging on takes over what was, until now, an
+              // anonymous (or a different user's) session - whatever
+              // prompt/SQL/results are on screen belong to that prior
+              // identity, not this one, so clear them the same way a DB
+              // connection change does (see clearActiveQueryState()).
+              clearActiveQueryState();
               renderAuthUI(targetClientId);
               fetchBackendConfig();
             }
@@ -646,6 +658,22 @@ document.addEventListener('DOMContentLoaded', async () => {
     activeResultIndex = 0;
   }
 
+  // Wipes everything tied to the connection that was just switched away
+  // from: the NL prompt, the generated SQL, the results grid, and the
+  // turn-navigation history (chatStore) - without clearing chatStore too,
+  // clicking "go back" after a connection change would silently restore
+  // the previous connection's prompt/SQL/results, defeating the point of
+  // clearing them here. Called from triggerConfigSave() only when the
+  // active connection identity actually changed (not on every save, e.g.
+  // re-saving the same connection or toggling auto-execute).
+  function clearActiveQueryState() {
+    if (aiPrompt) aiPrompt.value = '';
+    setSqlQuery('');
+    clearResultsDisplay();
+    chatStore.clear();
+    updateHistoryTurnsSubtitle();
+  }
+
   function updateHistoryTurnsSubtitle() {
     const clearMsgEl = document.getElementById('historyActionMsg');
     if (clearMsgEl) {
@@ -677,22 +705,24 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (!connDbDot) return;
 
     try {
-      const response = await fetch('/api/execute', {
-        method: 'POST',
+      // /api/ping (not /api/execute with a hardcoded query string) - no
+      // single SQL text is valid across every dialect this app supports.
+      // The previous "SELECT current_user, current_database();" was
+      // Postgres-specific and always failed against BigQuery (no
+      // current_database() function there); the "SELECT 1;" that replaced
+      // it was itself later found to always fail against Oracle (no
+      // SELECT-without-FROM form there). Both permanently showed the
+      // badge as disconnected on a perfectly working connection. Rather
+      // than clientside guess yet another string that happens to work for
+      // whatever dialects exist today, the server resolves the active
+      // connection's actual backend and asks it for its own
+      // always-correct liveness_sql (see backends/base.py) - the same
+      // place every other per-dialect SQL quirk in this app already
+      // lives, not duplicated here.
+      const response = await fetch('/api/ping', {
+        method: 'GET',
         headers: getApiHeaders(),
         credentials: 'same-origin',
-        body: JSON.stringify({
-          // Deliberately dialect-agnostic: only response.ok/data.success
-          // below are ever inspected, never the returned value, so this
-          // just needs to be a trivial query every supported backend can
-          // run with no special permissions or existing tables/datasets.
-          // The previous "SELECT current_user, current_database();" was
-          // Postgres-specific - BigQuery Standard SQL has no
-          // current_database() function, so it always failed there and
-          // permanently showed the badge as disconnected even on a
-          // perfectly working BigQuery connection.
-          sql: 'SELECT 1;'
-        })
       });
 
       const data = await response.json();
@@ -709,11 +739,16 @@ document.addEventListener('DOMContentLoaded', async () => {
   async function updateConnectionDetails(data) {
     const badge = document.getElementById('configTriggerBadge');
 
-    if (isAnonymousUser) {
-      // The backend withholds usernames/connection strings/custom
-      // connections from anonymous requests, but does send back the
-      // preset display name (e.g. "Demo") in data.database_name since
-      // that's just a label, not a credential.
+    if (isAnonymousUser && !data?.active_is_custom) {
+      // The backend withholds a PRESET's username/connection string from
+      // anonymous requests (an admin's credential, not the visitor's own),
+      // but does send back its display name (e.g. "Demo") in
+      // data.database_name since that's just a label, not a credential.
+      // This only applies while the anonymous visitor is actually ON a
+      // preset, though - once they're on their own self-supplied custom
+      // connection (active_is_custom), there's nothing of theirs being
+      // hidden from them, so that falls through to the same real-details
+      // path an authenticated user gets, below.
       if (badge) badge.style.display = '';
       if (connDbName) connDbName.textContent = data?.database_name || 'Database';
       document.title = `yDyL`;
@@ -818,9 +853,46 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function makeEmptyCustomDb(type) {
-    return type === 'bigquery'
-      ? { name: '', type: 'bigquery', url: '', config: { project_id: '', dataset: '', billing_project_id: '', credentials_json: '' } }
-      : { name: '', type: 'postgres', url: '', config: {} };
+    if (type === 'bigquery') {
+      return { name: '', type: 'bigquery', url: '', config: { project_id: '', dataset: '', billing_project_id: '', credentials_json: '' } };
+    }
+    if (type === 'snowflake') {
+      // auth_method is UI-only state (not a server field) deciding which
+      // of password/private_key gets sent - see the sf-auth-method select
+      // handler in renderCustomDbRows below.
+      return {
+        name: '', type: 'snowflake', url: '',
+        config: {
+          account: '', user: '', warehouse: '', database: '', schema: '', role: '',
+          auth_method: 'password', password: '', private_key: '', private_key_passphrase: '',
+        },
+      };
+    }
+    if (type === 'databricks') {
+      return {
+        name: '', type: 'databricks', url: '',
+        config: { server_hostname: '', http_path: '', catalog: '', schema: '', access_token: '' },
+      };
+    }
+    if (type === 'oracle') {
+      return {
+        name: '', type: 'oracle', url: '',
+        // ssl defaults to true (unlike every other field here) - most
+        // Oracle connections added through this dialog target Oracle
+        // Cloud, which requires it (see backends/oracle.py's module
+        // docstring); a plain on-prem/XE listener is the exception, not
+        // the common case, so it's opt-out rather than opt-in here.
+        config: { host: '', port: '', service_name: '', sid: '', schema: '', user: '', password: '', ssl: true },
+      };
+    }
+    // Postgres and MySQL share the same simple shape (a single URL field,
+    // no dialect-specific config) - see backends/mysql.py's module
+    // docstring - so both fall through here, preserving whichever of the
+    // two was actually selected rather than collapsing MySQL into
+    // Postgres. Any other/unrecognized value (there shouldn't be one -
+    // the dropdown only ever offers these six types) also lands on
+    // Postgres, matching this function's original default.
+    return { name: '', type: (type === 'mysql' ? 'mysql' : 'postgres'), url: '', config: {} };
   }
 
   // Renders every entry in `customDatabases` (including in-progress blank
@@ -832,21 +904,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     const container = document.getElementById('customDbsContainer');
     if (!container) return;
 
-    // Anonymous (Cloud Run, signed-out) users may only pick from presets -
-    // no custom-connection rows, no "+ Add custom connection" button. The
-    // server also rejects any custom-connection save from this identity
-    // (see config_routes.py's handle_config), so this is belt-and-suspenders
-    // rather than the only enforcement, but it keeps the dialog from
-    // offering a control that would just come back as an error.
-    if (isAnonymousUser) {
-      container.innerHTML = '';
-      return;
-    }
-
     let html = '';
     customDatabases.forEach((db, index) => {
       const cfg = db.config || {};
       const isBigQuery = db.type === 'bigquery';
+      const isSnowflake = db.type === 'snowflake';
+      const isMySQL = db.type === 'mysql';
+      const isDatabricks = db.type === 'databricks';
+      const isOracle = db.type === 'oracle';
+      const sfAuthMethod = cfg.auth_method || (cfg.private_key ? 'private_key' : 'password');
       // ACTIVE_IS_CUSTOM gates this, not just URL equality - a custom
       // connection's URL can collide with a preset's, and when the active
       // connection is actually the preset (ACTIVE_IS_CUSTOM false), no
@@ -865,40 +931,206 @@ document.addEventListener('DOMContentLoaded', async () => {
           : activeUrl === db.url
       );
 
+      // A connection_key is only ever present on a row that came back from
+      // the server (see config_routes.py's get_db_connections) - a row
+      // just added via "+ Add custom connection" this session never has
+      // one. That's the signal for "previously configured and shown so it
+      // can be selected": those default to collapsed (just type/name, an
+      // expand toggle, and remove), since their details aren't needed to
+      // pick them. A brand-new row defaults to expanded instead, since
+      // there's nothing to select yet without filling it in. Either way,
+      // _expanded (a client-only field, never sent to the server) tracks
+      // an explicit user override once they've toggled it, surviving
+      // re-renders since it lives on the object itself rather than index.
+      const isExpanded = db._expanded !== undefined ? db._expanded : !db.connection_key;
+
+      // Row 1 (all types): selection radio, dialect select, and Name -
+      // dialect-specific fields live on their own dedicated rows below,
+      // never crowding this first line.
       html += `
-        <div class="custom-db-row" style="display: flex; flex-direction: column; gap: 0.4rem; width: 100%; padding: 0.5rem 0; border-bottom: 1px solid var(--border-color, #333);">
-          <div style="display: flex; align-items: center; gap: 0.5rem; width: 100%; flex-wrap: wrap;">
+        <div class="custom-db-card">
+          <div class="custom-db-header-row">
             <input type="radio" name="db_connection_option" value="custom-${index}" data-dbname="${db.name || ''}" ${isSelected ? 'checked' : ''}>
-            <select class="config-input custom-db-type-select" data-index="${index}" style="flex: 0 0 auto; width: 8rem;">
-              <option value="postgres" ${!isBigQuery ? 'selected' : ''}>PostgreSQL</option>
+            <select class="config-input custom-db-type-select" data-index="${index}">
+              <option value="postgres" ${(!isBigQuery && !isSnowflake && !isMySQL && !isDatabricks && !isOracle) ? 'selected' : ''}>PostgreSQL</option>
+              <option value="mysql" ${isMySQL ? 'selected' : ''}>MySQL</option>
               <option value="bigquery" ${isBigQuery ? 'selected' : ''}>BigQuery</option>
+              <option value="snowflake" ${isSnowflake ? 'selected' : ''}>Snowflake</option>
+              <option value="databricks" ${isDatabricks ? 'selected' : ''}>Databricks</option>
+              <option value="oracle" ${isOracle ? 'selected' : ''}>Oracle</option>
             </select>
-            <input type="text" class="config-input custom-db-name-input" data-index="${index}" placeholder="Name" size="10" value="${db.name || ''}" style="flex: 0 0 auto; width: 10ch;" autocomplete="off">
-            ${isBigQuery ? `
-            <input type="text" class="config-input custom-db-bq-project" data-index="${index}" placeholder="Project ID" value="${cfg.project_id || ''}" style="flex: 1 1 120px; min-width: 100px;" autocomplete="off">
-            <input type="text" class="config-input custom-db-bq-dataset" data-index="${index}" placeholder="Dataset" value="${cfg.dataset || ''}" style="flex: 1 1 120px; min-width: 100px;" autocomplete="off">
-            ` : `
-            <input type="text" class="config-input custom-db-url-input" data-index="${index}" placeholder="postgresql://user:password@host:5432/dbname" value="${maskConnectionUrl(db.url)}" style="flex: 1 1 200px; min-width: 150px;" autocomplete="off">
-            `}
-            <button type="button" class="btn btn-secondary custom-db-remove-btn" data-index="${index}" title="Remove this connection" style="padding: 0.15rem 0.6rem; line-height: 1;">&times;</button>
-          </div>
-          ${isBigQuery ? `
-          <div style="padding-left: 1.9rem; display: flex; flex-direction: column; gap: 0.35rem;">
-            <div style="display: flex; align-items: center; gap: 0.5rem;">
-              <label for="custom-db-bq-billing-${index}" style="font-size: 0.78rem; width: 7.5rem; flex: 0 0 auto;"><a href="https://cloud.google.com/bigquery/docs/managing-jobs" target="_blank" rel="noopener noreferrer" style="color: inherit; opacity: 0.85; text-decoration: underline dotted;" title="What a billing project is in BigQuery (Google Cloud docs)">Billing Project</a></label>
-              <input type="text" id="custom-db-bq-billing-${index}" class="config-input custom-db-bq-billing" data-index="${index}" placeholder="Billing project ID" value="${cfg.billing_project_id || ''}" style="flex: 1 1 auto; min-width: 0;" autocomplete="off">
+            <div class="custom-db-field">
+              <label class="custom-db-field-label" for="custom-db-name-${index}">Name:</label>
+              <input type="text" id="custom-db-name-${index}" class="config-input custom-db-name-input" data-index="${index}" placeholder="e.g. My Database" value="${db.name || ''}" autocomplete="off">
             </div>
-            <div style="display: flex; align-items: center; gap: 0.5rem;">
-              <label for="custom-db-bq-creds-${index}" style="font-size: 0.78rem; width: 7.5rem; flex: 0 0 auto;"><a href="https://cloud.google.com/iam/docs/keys-create-delete" target="_blank" rel="noopener noreferrer" style="color: inherit; opacity: 0.85; text-decoration: underline dotted;" title="How to create a service account key (Google Cloud docs)">Service Account Key</a></label>
-              <textarea id="custom-db-bq-creds-${index}" class="config-input custom-db-bq-creds" data-index="${index}" placeholder="${db.has_custom_credentials ? 'Key saved - leave blank to keep it, or paste a new one to replace it' : 'Service-account key (JSON)'}" rows="2" style="flex: 1 1 auto; min-width: 0; resize: vertical;" autocomplete="off"></textarea>
+            <button type="button" class="btn btn-secondary custom-db-toggle-btn" data-index="${index}" aria-expanded="${isExpanded}" title="${isExpanded ? 'Hide connection details' : 'Show connection details'}">${isExpanded ? '▾' : '▸'}</button>
+            <button type="button" class="btn btn-secondary custom-db-remove-btn" data-index="${index}" title="Remove this connection">&times;</button>
+          </div>
+          ${isExpanded ? (isBigQuery ? `
+          <div class="custom-db-field-row">
+            <div class="custom-db-field">
+              <label class="custom-db-field-label" for="custom-db-bq-project-${index}">Project ID:</label>
+              <input type="text" id="custom-db-bq-project-${index}" class="config-input custom-db-bq-project" data-index="${index}" placeholder="Project ID" value="${cfg.project_id || ''}" autocomplete="off">
+            </div>
+            <div class="custom-db-field">
+              <label class="custom-db-field-label" for="custom-db-bq-dataset-${index}">Dataset:</label>
+              <input type="text" id="custom-db-bq-dataset-${index}" class="config-input custom-db-bq-dataset" data-index="${index}" placeholder="Dataset" value="${cfg.dataset || ''}" autocomplete="off">
             </div>
           </div>
-          ` : ``}
+          <div class="custom-db-field-row">
+            <div class="custom-db-field wide">
+              <label class="custom-db-field-label" for="custom-db-bq-billing-${index}"><a href="https://cloud.google.com/bigquery/docs/managing-jobs" target="_blank" rel="noopener noreferrer" title="What a billing project is in BigQuery (Google Cloud docs)">Billing Project ID:</a></label>
+              <input type="text" id="custom-db-bq-billing-${index}" class="config-input custom-db-bq-billing" data-index="${index}" placeholder="Billing project ID" value="${cfg.billing_project_id || ''}" autocomplete="off">
+            </div>
+          </div>
+          <div class="custom-db-field-row align-start">
+            <div class="custom-db-field wide">
+              <label class="custom-db-field-label" for="custom-db-bq-creds-${index}"><a href="https://cloud.google.com/iam/docs/keys-create-delete" target="_blank" rel="noopener noreferrer" title="How to create a service account key (Google Cloud docs)">Service Account Key:</a></label>
+              <textarea id="custom-db-bq-creds-${index}" class="config-input custom-db-bq-creds" data-index="${index}" placeholder="${db.has_custom_credentials ? 'Key saved - leave blank to keep it, or paste a new one to replace it' : 'Service-account key (JSON)'}" rows="3" autocomplete="off"></textarea>
+            </div>
+          </div>
+          ` : isSnowflake ? `
+          <div class="custom-db-field-row">
+            <div class="custom-db-field">
+              <label class="custom-db-field-label" for="custom-db-sf-warehouse-${index}">Warehouse:</label>
+              <input type="text" id="custom-db-sf-warehouse-${index}" class="config-input custom-db-sf-warehouse" data-index="${index}" placeholder="Warehouse" value="${cfg.warehouse || ''}" autocomplete="off">
+            </div>
+            <div class="custom-db-field">
+              <label class="custom-db-field-label" for="custom-db-sf-database-${index}">Database:</label>
+              <input type="text" id="custom-db-sf-database-${index}" class="config-input custom-db-sf-database" data-index="${index}" placeholder="Database" value="${cfg.database || ''}" autocomplete="off">
+            </div>
+            <div class="custom-db-field">
+              <label class="custom-db-field-label" for="custom-db-sf-schema-${index}">Schema: <span class="optional-hint">(optional)</span></label>
+              <input type="text" id="custom-db-sf-schema-${index}" class="config-input custom-db-sf-schema" data-index="${index}" placeholder="Schema" value="${cfg.schema || ''}" autocomplete="off">
+            </div>
+          </div>
+          <div class="custom-db-field-row">
+            <div class="custom-db-field">
+              <label class="custom-db-field-label" for="custom-db-sf-account-${index}">Account:</label>
+              <input type="text" id="custom-db-sf-account-${index}" class="config-input custom-db-sf-account" data-index="${index}" placeholder="e.g. xy12345.us-east-1" value="${cfg.account || ''}" autocomplete="off">
+            </div>
+            <div class="custom-db-field">
+              <label class="custom-db-field-label" for="custom-db-sf-user-${index}">User:</label>
+              <input type="text" id="custom-db-sf-user-${index}" class="config-input custom-db-sf-user" data-index="${index}" placeholder="Username" value="${cfg.user || ''}" autocomplete="off">
+            </div>
+            <div class="custom-db-field">
+              <label class="custom-db-field-label" for="custom-db-sf-role-${index}">Role: <span class="optional-hint">(optional)</span></label>
+              <input type="text" id="custom-db-sf-role-${index}" class="config-input custom-db-sf-role" data-index="${index}" placeholder="Role" value="${cfg.role || ''}" autocomplete="off">
+            </div>
+          </div>
+          <div class="custom-db-field-row">
+            <div class="custom-db-field wide">
+              <label class="custom-db-field-label" for="custom-db-sf-auth-${index}">Authentication Method:</label>
+              <select id="custom-db-sf-auth-${index}" class="config-input custom-db-sf-auth-method" data-index="${index}">
+                <option value="password" ${sfAuthMethod === 'password' ? 'selected' : ''}>Password</option>
+                <option value="private_key" ${sfAuthMethod === 'private_key' ? 'selected' : ''}>Key pair (private key)</option>
+              </select>
+            </div>
+          </div>
+          ${sfAuthMethod === 'private_key' ? `
+          <div class="custom-db-field-row align-start">
+            <div class="custom-db-field">
+              <label class="custom-db-field-label" for="custom-db-sf-private-key-${index}"><a href="https://docs.snowflake.com/en/user-guide/key-pair-auth" target="_blank" rel="noopener noreferrer" title="Key-pair authentication (Snowflake docs)">Private Key:</a></label>
+              <textarea id="custom-db-sf-private-key-${index}" class="config-input custom-db-sf-private-key" data-index="${index}" placeholder="${db.has_custom_credentials ? 'Key saved - leave blank to keep it, or paste a new one to replace it' : 'Private key (PEM)'}" rows="2" autocomplete="off"></textarea>
+            </div>
+            <div class="custom-db-field">
+              <label class="custom-db-field-label" for="custom-db-sf-passphrase-${index}">Passphrase: <span class="optional-hint">(if key is encrypted)</span></label>
+              <input type="password" id="custom-db-sf-passphrase-${index}" class="config-input custom-db-sf-passphrase" data-index="${index}" placeholder="Private key passphrase" value="${cfg.private_key_passphrase || ''}" autocomplete="off">
+            </div>
+          </div>
+          ` : `
+          <div class="custom-db-field-row">
+            <div class="custom-db-field wide">
+              <label class="custom-db-field-label" for="custom-db-sf-password-${index}">Password:</label>
+              <input type="password" id="custom-db-sf-password-${index}" class="config-input custom-db-sf-password" data-index="${index}" placeholder="${db.has_custom_credentials ? 'Password saved - leave blank to keep it, or type a new one to replace it' : 'Password'}" autocomplete="off">
+            </div>
+          </div>
+          `}
+          ` : isDatabricks ? `
+          <div class="custom-db-field-row">
+            <div class="custom-db-field wide">
+              <label class="custom-db-field-label" for="custom-db-dbx-hostname-${index}">Server Hostname:</label>
+              <input type="text" id="custom-db-dbx-hostname-${index}" class="config-input custom-db-dbx-hostname" data-index="${index}" placeholder="e.g. dbc-a1b2c3d4-e5f6.cloud.databricks.com" value="${cfg.server_hostname || ''}" autocomplete="off">
+            </div>
+          </div>
+          <div class="custom-db-field-row">
+            <div class="custom-db-field wide">
+              <label class="custom-db-field-label" for="custom-db-dbx-path-${index}">HTTP Path:</label>
+              <input type="text" id="custom-db-dbx-path-${index}" class="config-input custom-db-dbx-path" data-index="${index}" placeholder="e.g. /sql/1.0/warehouses/0123456789abcdef" value="${cfg.http_path || ''}" autocomplete="off">
+            </div>
+          </div>
+          <div class="custom-db-field-row">
+            <div class="custom-db-field">
+              <label class="custom-db-field-label" for="custom-db-dbx-catalog-${index}">Catalog: <span class="optional-hint">(optional)</span></label>
+              <input type="text" id="custom-db-dbx-catalog-${index}" class="config-input custom-db-dbx-catalog" data-index="${index}" placeholder="Catalog" value="${cfg.catalog || ''}" autocomplete="off">
+            </div>
+            <div class="custom-db-field">
+              <label class="custom-db-field-label" for="custom-db-dbx-schema-${index}">Schema: <span class="optional-hint">(optional)</span></label>
+              <input type="text" id="custom-db-dbx-schema-${index}" class="config-input custom-db-dbx-schema" data-index="${index}" placeholder="Schema" value="${cfg.schema || ''}" autocomplete="off">
+            </div>
+          </div>
+          <div class="custom-db-field-row">
+            <div class="custom-db-field wide">
+              <label class="custom-db-field-label" for="custom-db-dbx-token-${index}"><a href="https://docs.databricks.com/en/dev-tools/auth/pat.html" target="_blank" rel="noopener noreferrer" title="Personal access tokens (Databricks docs)">Access Token:</a></label>
+              <input type="password" id="custom-db-dbx-token-${index}" class="config-input custom-db-dbx-token" data-index="${index}" placeholder="${db.has_custom_credentials ? 'Token saved - leave blank to keep it, or paste a new one to replace it' : 'Personal access token'}" autocomplete="off">
+            </div>
+          </div>
+          ` : isOracle ? `
+          <div class="custom-db-field-row">
+            <div class="custom-db-field">
+              <label class="custom-db-field-label" for="custom-db-ora-host-${index}">Host:</label>
+              <input type="text" id="custom-db-ora-host-${index}" class="config-input custom-db-ora-host" data-index="${index}" placeholder="e.g. db.example.com" value="${cfg.host || ''}" autocomplete="off">
+            </div>
+            <div class="custom-db-field">
+              <label class="custom-db-field-label" for="custom-db-ora-port-${index}">Port:</label>
+              <input type="text" id="custom-db-ora-port-${index}" class="config-input custom-db-ora-port" data-index="${index}" placeholder="1521" value="${cfg.port || ''}" autocomplete="off">
+            </div>
+          </div>
+          <div class="custom-db-field-row">
+            <div class="custom-db-field">
+              <label class="custom-db-field-label" for="custom-db-ora-service-${index}">Service Name:</label>
+              <input type="text" id="custom-db-ora-service-${index}" class="config-input custom-db-ora-service" data-index="${index}" placeholder="e.g. ORCLPDB1" value="${cfg.service_name || ''}" autocomplete="off">
+            </div>
+            <div class="custom-db-field">
+              <label class="custom-db-field-label" for="custom-db-ora-sid-${index}">SID: <span class="optional-hint">(legacy)</span></label>
+              <input type="text" id="custom-db-ora-sid-${index}" class="config-input custom-db-ora-sid" data-index="${index}" placeholder="SID" value="${cfg.sid || ''}" autocomplete="off">
+            </div>
+            <div class="custom-db-field">
+              <label class="custom-db-field-label" for="custom-db-ora-schema-${index}">Schema: <span class="optional-hint">(optional)</span></label>
+              <input type="text" id="custom-db-ora-schema-${index}" class="config-input custom-db-ora-schema" data-index="${index}" placeholder="Defaults to the connecting user" value="${cfg.schema || ''}" autocomplete="off">
+            </div>
+          </div>
+          <div class="custom-db-field-row">
+            <div class="custom-db-field">
+              <label class="custom-db-field-label" for="custom-db-ora-user-${index}">User:</label>
+              <input type="text" id="custom-db-ora-user-${index}" class="config-input custom-db-ora-user" data-index="${index}" placeholder="Username" value="${cfg.user || ''}" autocomplete="off">
+            </div>
+            <div class="custom-db-field">
+              <label class="custom-db-field-label" for="custom-db-ora-password-${index}">Password:</label>
+              <input type="password" id="custom-db-ora-password-${index}" class="config-input custom-db-ora-password" data-index="${index}" placeholder="${db.has_custom_credentials ? 'Password saved - leave blank to keep it, or type a new one to replace it' : 'Password'}" autocomplete="off">
+            </div>
+          </div>
+          <div class="custom-db-field-row">
+            <div class="custom-db-field wide">
+              <label class="checkbox-option" for="custom-db-ora-ssl-${index}">
+                <input type="checkbox" id="custom-db-ora-ssl-${index}" class="config-input custom-db-ora-ssl" data-index="${index}" ${cfg.ssl ? 'checked' : ''}>
+                <span class="checkbox-label">Use TLS (required for Oracle Cloud)</span>
+              </label>
+            </div>
+          </div>
+          ` : `
+          <div class="custom-db-field-row">
+            <div class="custom-db-field wide">
+              <label class="custom-db-field-label" for="custom-db-url-${index}">URL:</label>
+              <input type="text" id="custom-db-url-${index}" class="config-input custom-db-url-input" data-index="${index}" placeholder="${isMySQL ? 'mysql://user:password@host:3306/dbname' : 'postgresql://user:password@host:5432/dbname'}" value="${maskConnectionUrl(db.url)}" autocomplete="off">
+            </div>
+          </div>
+          `) : ''}
         </div>
       `;
     });
 
-    html += `<button type="button" id="addCustomDbBtn" class="btn btn-secondary" style="align-self: flex-start;">+ Add custom connection</button>`;
+    html += `<button type="button" id="addCustomDbBtn" class="btn btn-secondary custom-db-add-btn">+ Add custom connection</button>`;
 
     container.innerHTML = html;
 
@@ -908,6 +1140,16 @@ document.addEventListener('DOMContentLoaded', async () => {
         const existingName = (customDatabases[index] && customDatabases[index].name) || '';
         customDatabases[index] = makeEmptyCustomDb(select.value);
         customDatabases[index].name = existingName;
+        renderCustomDbRows(activeUrl);
+      });
+    });
+
+    container.querySelectorAll('.custom-db-toggle-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const index = parseInt(btn.dataset.index);
+        const db = customDatabases[index];
+        const currentlyExpanded = db._expanded !== undefined ? db._expanded : !db.connection_key;
+        db._expanded = !currentlyExpanded;
         renderCustomDbRows(activeUrl);
       });
     });
@@ -981,6 +1223,139 @@ document.addEventListener('DOMContentLoaded', async () => {
       });
     });
 
+    container.querySelectorAll('.custom-db-sf-auth-method').forEach(select => {
+      select.addEventListener('change', () => {
+        const index = parseInt(select.dataset.index);
+        const db = customDatabases[index];
+        if (!db.config) db.config = {};
+        db.config.auth_method = select.value;
+        // Switching auth methods shows a different credential field below
+        // (password vs. private key/passphrase) - needs a re-render, same
+        // as the dialect <select> above.
+        renderCustomDbRows(activeUrl);
+      });
+    });
+
+    container.querySelectorAll(
+      '.custom-db-sf-account, .custom-db-sf-database, .custom-db-sf-user, .custom-db-sf-warehouse, '
+      + '.custom-db-sf-schema, .custom-db-sf-role, .custom-db-sf-password, .custom-db-sf-private-key, '
+      + '.custom-db-sf-passphrase'
+    ).forEach(input => {
+      const index = parseInt(input.dataset.index);
+      const radio = container.querySelector(`input[value="custom-${index}"]`);
+      input.addEventListener('focus', () => { if (radio) radio.checked = true; });
+      input.addEventListener('input', () => {
+        if (radio) radio.checked = true;
+        const db = customDatabases[index];
+        if (!db.config) db.config = {};
+        if (input.classList.contains('custom-db-sf-account')) db.config.account = input.value.trim();
+        if (input.classList.contains('custom-db-sf-database')) db.config.database = input.value.trim();
+        if (input.classList.contains('custom-db-sf-user')) db.config.user = input.value.trim();
+        if (input.classList.contains('custom-db-sf-warehouse')) db.config.warehouse = input.value.trim();
+        if (input.classList.contains('custom-db-sf-schema')) db.config.schema = input.value.trim();
+        if (input.classList.contains('custom-db-sf-role')) db.config.role = input.value.trim();
+        if (input.classList.contains('custom-db-sf-password')) db.config.password = input.value;
+        if (input.classList.contains('custom-db-sf-private-key')) db.config.private_key = input.value.trim();
+        if (input.classList.contains('custom-db-sf-passphrase')) db.config.private_key_passphrase = input.value;
+        // Synthetic (non-secret) identifier, kept in sync so radio-selection
+        // matching against activeUrl still works the same way it does for
+        // Postgres/BigQuery rows. Schema is optional on a Snowflake
+        // connection (see backends/snowflake.py) - included only when set,
+        // mirroring config_routes.py's _snowflake_url.
+        db.url = (db.config.account && db.config.database)
+          ? `snowflake://${db.config.account}/${db.config.database}${db.config.schema ? '/' + db.config.schema : ''}`
+          : '';
+        // Same rule as the Postgres/BigQuery inputs above: don't clobber a
+        // name the user already typed themselves.
+        if (!db.name) {
+          db.name = db.config.database || 'Custom Snowflake';
+          const nameInput = container.querySelector(`.custom-db-name-input[data-index="${index}"]`);
+          if (nameInput) nameInput.value = db.name;
+        }
+        if (radio) radio.dataset.dbname = db.name;
+      });
+    });
+
+    container.querySelectorAll(
+      '.custom-db-dbx-hostname, .custom-db-dbx-path, .custom-db-dbx-catalog, '
+      + '.custom-db-dbx-schema, .custom-db-dbx-token'
+    ).forEach(input => {
+      const index = parseInt(input.dataset.index);
+      const radio = container.querySelector(`input[value="custom-${index}"]`);
+      input.addEventListener('focus', () => { if (radio) radio.checked = true; });
+      input.addEventListener('input', () => {
+        if (radio) radio.checked = true;
+        const db = customDatabases[index];
+        if (!db.config) db.config = {};
+        if (input.classList.contains('custom-db-dbx-hostname')) db.config.server_hostname = input.value.trim();
+        if (input.classList.contains('custom-db-dbx-path')) db.config.http_path = input.value.trim();
+        if (input.classList.contains('custom-db-dbx-catalog')) db.config.catalog = input.value.trim();
+        if (input.classList.contains('custom-db-dbx-schema')) db.config.schema = input.value.trim();
+        if (input.classList.contains('custom-db-dbx-token')) db.config.access_token = input.value;
+        // Synthetic (non-secret) identifier, kept in sync so radio-selection
+        // matching against activeUrl still works the same way it does for
+        // Postgres/BigQuery/Snowflake rows.
+        db.url = (db.config.server_hostname && db.config.http_path)
+          ? `databricks://${db.config.server_hostname}${db.config.http_path}`
+          : '';
+        // Same rule as the other dialect inputs above: don't clobber a
+        // name the user already typed themselves.
+        if (!db.name) {
+          db.name = db.config.http_path || 'Custom Databricks';
+          const nameInput = container.querySelector(`.custom-db-name-input[data-index="${index}"]`);
+          if (nameInput) nameInput.value = db.name;
+        }
+        if (radio) radio.dataset.dbname = db.name;
+      });
+    });
+
+    container.querySelectorAll(
+      '.custom-db-ora-host, .custom-db-ora-port, .custom-db-ora-service, .custom-db-ora-sid, '
+      + '.custom-db-ora-user, .custom-db-ora-schema, .custom-db-ora-password, .custom-db-ora-ssl'
+    ).forEach(input => {
+      const index = parseInt(input.dataset.index);
+      const radio = container.querySelector(`input[value="custom-${index}"]`);
+      const isCheckbox = input.type === 'checkbox';
+      // A checkbox has no meaningful "focus to select this row" moment the
+      // way a text field does (it toggles on click, not on typing after
+      // tabbing in) - only wired to 'change', not 'focus', unlike every
+      // other Oracle field below.
+      if (!isCheckbox) {
+        input.addEventListener('focus', () => { if (radio) radio.checked = true; });
+      }
+      input.addEventListener(isCheckbox ? 'change' : 'input', () => {
+        if (radio) radio.checked = true;
+        const db = customDatabases[index];
+        if (!db.config) db.config = {};
+        if (input.classList.contains('custom-db-ora-host')) db.config.host = input.value.trim();
+        if (input.classList.contains('custom-db-ora-port')) db.config.port = input.value.trim();
+        if (input.classList.contains('custom-db-ora-service')) db.config.service_name = input.value.trim();
+        if (input.classList.contains('custom-db-ora-sid')) db.config.sid = input.value.trim();
+        if (input.classList.contains('custom-db-ora-user')) db.config.user = input.value.trim();
+        if (input.classList.contains('custom-db-ora-schema')) db.config.schema = input.value.trim();
+        if (input.classList.contains('custom-db-ora-password')) db.config.password = input.value;
+        if (input.classList.contains('custom-db-ora-ssl')) db.config.ssl = input.checked;
+        // Synthetic (non-secret) identifier, kept in sync so radio-selection
+        // matching against activeUrl still works the same way it does for
+        // Postgres/BigQuery/Snowflake/Databricks rows. Mirrors
+        // config_routes.py's _oracle_url exactly, including the same 1521
+        // default port used when the field is left blank, and service_name
+        // taking precedence over sid when both are somehow filled in.
+        const serviceOrSid = db.config.service_name || db.config.sid;
+        db.url = (db.config.host && serviceOrSid)
+          ? `oracle://${db.config.host}:${db.config.port || 1521}/${serviceOrSid}`
+          : '';
+        // Same rule as the other dialect inputs above: don't clobber a
+        // name the user already typed themselves.
+        if (!db.name) {
+          db.name = serviceOrSid || 'Custom Oracle';
+          const nameInput = container.querySelector(`.custom-db-name-input[data-index="${index}"]`);
+          if (nameInput) nameInput.value = db.name;
+        }
+        if (radio) radio.dataset.dbname = db.name;
+      });
+    });
+
     const addBtn = document.getElementById('addCustomDbBtn');
     if (addBtn) {
       addBtn.addEventListener('click', () => {
@@ -1002,20 +1377,24 @@ document.addEventListener('DOMContentLoaded', async () => {
     const activeUrl = currentDbUrl || ACTIVE_DB_URL || DEFAULT_DB_URL;
     const matchedPresetUrl = getMatchingPresetUrl(activeUrl);
 
-    // Anonymous (Cloud Run, signed-out) users can never be on a custom
-    // connection (server-enforced - see config_routes.py) and are matched
-    // to a preset by index (ACTIVE_PRESET_INDEX), not URL, since they never
-    // receive real preset connection strings (configured_databases is
-    // redacted for them - see fetchBackendConfig()). For signed-in users,
-    // ACTIVE_IS_CUSTOM (the server's record of what was actually picked)
-    // takes priority over the URL match - a saved custom connection can
-    // share its URL with a preset, in which case matchedPresetUrl would be
-    // found either way and URL matching alone can't tell which is active.
-    // Falling back to !matchedPresetUrl covers the ordinary (no collision)
-    // case where a custom connection's URL simply isn't one of the presets.
-    const isCustom = isAnonymousUser ? false : (ACTIVE_IS_CUSTOM || !matchedPresetUrl);
+    // ACTIVE_IS_CUSTOM (the server's record of what was actually picked) is
+    // the primary signal, taking priority over the URL match - a saved
+    // custom connection can share its URL with a preset, in which case
+    // matchedPresetUrl would be found either way and URL matching alone
+    // can't tell which is active. Falling back to !matchedPresetUrl covers
+    // the ordinary (no collision) case where a custom connection's URL
+    // simply isn't one of the presets. Anonymous (Cloud Run, signed-out)
+    // users need ACTIVE_IS_CUSTOM used alone, without that fallback,
+    // though: their admin-configured presets are matched by index
+    // (ACTIVE_PRESET_INDEX), not URL, since preset connection
+    // strings/credentials are still never sent to them (configured_databases
+    // is redacted for them - see fetchBackendConfig()) - so
+    // matchedPresetUrl is never found for an anonymous visitor on a preset
+    // either, and the !matchedPresetUrl fallback would wrongly read that as
+    // "custom" instead of "on a redacted preset".
+    const isCustom = isAnonymousUser ? ACTIVE_IS_CUSTOM : (ACTIVE_IS_CUSTOM || !matchedPresetUrl);
 
-    let html = '';
+    let html = `<div class="radio-group-heading">Pre-configured Database Playgrounds</div>`;
 
     CONFIGURED_DBS.forEach((db, index) => {
       // Anonymous users' preset objects have no "url" (redacted) - fall
@@ -1035,7 +1414,8 @@ document.addEventListener('DOMContentLoaded', async () => {
       `;
     });
 
-    html += `<div id="customDbsContainer" style="display: flex; flex-direction: column; gap: 0.5rem; width: 100%;"></div>`;
+    html += `<div class="radio-group-heading radio-group-heading-custom">Custom Database Connections</div>`;
+    html += `<div id="customDbsContainer" class="custom-dbs-list"></div>`;
 
     radioGroup.innerHTML = html;
 
@@ -1050,6 +1430,24 @@ document.addEventListener('DOMContentLoaded', async () => {
     let dbDataset = null;
     let dbBillingProjectId = null;
     let dbCredentialsJson = null;
+    let dbAccount = null;
+    let dbUser = null;
+    let dbWarehouse = null;
+    let dbDatabase = null;
+    let dbSchema = null;
+    let dbRole = null;
+    let dbPassword = null;
+    let dbPrivateKey = null;
+    let dbPrivateKeyPassphrase = null;
+    let dbServerHostname = null;
+    let dbHttpPath = null;
+    let dbCatalog = null;
+    let dbAccessToken = null;
+    let dbHost = null;
+    let dbPort = null;
+    let dbServiceName = null;
+    let dbSid = null;
+    let dbSsl = null;
     let isCustomOption = false;
     // Set only for anonymous users picking a preset by index (see
     // renderDbRadioButtons()) - the server resolves the real connection
@@ -1069,7 +1467,36 @@ document.addEventListener('DOMContentLoaded', async () => {
       && db.config.project_id && db.config.dataset
       && db.config.billing_project_id
       && (db.config.credentials_json || db.has_custom_credentials);
-    const isCompletePostgres = (db) => db && db.type !== 'bigquery' && db.url && db.url.trim() !== "";
+    // Same idea for Snowflake, minus the billing dimension (Snowflake has
+    // no BigQuery-style separate billing project) but with a credential
+    // that's one of two mutually-exclusive shapes - either counts as
+    // "has a credential", freshly entered or (since neither is ever
+    // redisplayed) already saved server-side.
+    const isCompleteSnowflake = (db) => db && db.type === 'snowflake' && db.config
+      && db.config.account && db.config.user && db.config.warehouse && db.config.database
+      && (db.config.password || db.config.private_key || db.has_custom_credentials);
+    // Same idea for Databricks - no billing dimension, and exactly one
+    // credential shape (an access token) rather than Snowflake's two, but
+    // otherwise the same "freshly entered, or already saved server-side"
+    // rule (see backends/databricks.py's module docstring - PAT-only for
+    // this first pass).
+    const isCompleteDatabricks = (db) => db && db.type === 'databricks' && db.config
+      && db.config.server_hostname && db.config.http_path
+      && (db.config.access_token || db.has_custom_credentials);
+    // Same idea for Oracle - core identifying fields (host, user, and one
+    // of service_name/sid) plus a single credential shape (password),
+    // same "freshly entered, or already saved server-side" rule as every
+    // other structured dialect above (see backends/oracle.py's module
+    // docstring - plain username/password only for this first pass).
+    const isCompleteOracle = (db) => db && db.type === 'oracle' && db.config
+      && db.config.host && db.config.user && (db.config.service_name || db.config.sid)
+      && (db.config.password || db.has_custom_credentials);
+    // Postgres and MySQL are both "simple URL" dialects (see
+    // backends/mysql.py's module docstring) - a single non-blank url is
+    // all either needs to be selectable/saveable. Named generically
+    // (not isCompletePostgres) since it now covers both.
+    const isCompleteSimpleUrlDb = (db) => db && db.type !== 'bigquery' && db.type !== 'snowflake' && db.type !== 'databricks' && db.type !== 'oracle'
+      && db.url && db.url.trim() !== "";
 
     const selectedDbRadio = document.querySelector('input[name="db_connection_option"]:checked');
     if (selectedDbRadio) {
@@ -1077,9 +1504,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         isCustomOption = true;
         const index = parseInt(selectedDbRadio.value.split('-')[1]);
         const selectedDb = customDatabases[index];
-        const chosen = isCompleteBigQuery(selectedDb) || isCompletePostgres(selectedDb)
-          ? selectedDb
-          : customDatabases.find(d => isCompleteBigQuery(d) || isCompletePostgres(d));
+        const isComplete = (d) => isCompleteBigQuery(d) || isCompleteSnowflake(d) || isCompleteDatabricks(d) || isCompleteOracle(d) || isCompleteSimpleUrlDb(d);
+        const chosen = isComplete(selectedDb) ? selectedDb : customDatabases.find(isComplete);
 
         if (isCompleteBigQuery(chosen)) {
           dbType = 'bigquery';
@@ -1093,8 +1519,53 @@ document.addEventListener('DOMContentLoaded', async () => {
           dbCredentialsJson = chosen.config.credentials_json || null;
           dbNameValue = chosen.name || dbDataset;
           dbUrlValue = `bigquery://${dbProjectId}/${dbDataset}`;
-        } else if (isCompletePostgres(chosen)) {
-          dbType = 'postgres';
+        } else if (isCompleteSnowflake(chosen)) {
+          dbType = 'snowflake';
+          dbAccount = chosen.config.account;
+          dbUser = chosen.config.user;
+          dbWarehouse = chosen.config.warehouse;
+          dbDatabase = chosen.config.database;
+          dbSchema = chosen.config.schema || null;
+          dbRole = chosen.config.role || null;
+          // Same "may be blank, server reuses the saved one" rule as
+          // BigQuery's credentials_json above - neither password nor
+          // private_key is ever sent back to redisplay.
+          dbPassword = chosen.config.password || null;
+          dbPrivateKey = chosen.config.private_key || null;
+          dbPrivateKeyPassphrase = chosen.config.private_key_passphrase || null;
+          dbNameValue = chosen.name || dbDatabase;
+          dbUrlValue = `snowflake://${dbAccount}/${dbDatabase}${dbSchema ? '/' + dbSchema : ''}`;
+        } else if (isCompleteDatabricks(chosen)) {
+          dbType = 'databricks';
+          dbServerHostname = chosen.config.server_hostname;
+          dbHttpPath = chosen.config.http_path;
+          dbCatalog = chosen.config.catalog || null;
+          dbSchema = chosen.config.schema || null;
+          // May be blank if the user didn't re-paste a token while just
+          // re-selecting/renaming an already-saved connection - the server
+          // reuses the previously-stored token in that case (it's never
+          // sent back to us to re-display, see get_db_connections).
+          dbAccessToken = chosen.config.access_token || null;
+          dbNameValue = chosen.name || dbHttpPath;
+          dbUrlValue = `databricks://${dbServerHostname}${dbHttpPath}`;
+        } else if (isCompleteOracle(chosen)) {
+          dbType = 'oracle';
+          dbHost = chosen.config.host;
+          dbPort = chosen.config.port || null;
+          dbServiceName = chosen.config.service_name || null;
+          dbSid = chosen.config.sid || null;
+          dbUser = chosen.config.user;
+          dbSchema = chosen.config.schema || null;
+          // May be blank if the user didn't retype a password while just
+          // re-selecting/renaming an already-saved connection - the server
+          // reuses the previously-stored password in that case (it's never
+          // sent back to us to re-display, see get_db_connections).
+          dbPassword = chosen.config.password || null;
+          dbSsl = Boolean(chosen.config.ssl);
+          dbNameValue = chosen.name || dbServiceName || dbSid;
+          dbUrlValue = `oracle://${dbHost}:${dbPort || 1521}/${dbServiceName || dbSid}`;
+        } else if (isCompleteSimpleUrlDb(chosen)) {
+          dbType = chosen.type === 'mysql' ? 'mysql' : 'postgres';
           dbUrlValue = chosen.url;
           dbNameValue = chosen.name;
         } else {
@@ -1125,6 +1596,48 @@ document.addEventListener('DOMContentLoaded', async () => {
           dbDataset = matchedDb.dataset;
           // No credentials_json for admin presets - they authenticate via
           // the app's own service account (ADC), not a per-connection key.
+        } else if (dbType === 'snowflake' && matchedDb) {
+          dbAccount = matchedDb.account;
+          dbUser = matchedDb.user;
+          dbWarehouse = matchedDb.warehouse;
+          dbDatabase = matchedDb.database;
+          dbSchema = matchedDb.schema || null;
+          dbRole = matchedDb.role || null;
+          // Unlike BigQuery presets, a Snowflake preset DOES carry its own
+          // credential right here (CONFIGURED_DBS - see app_config.py's
+          // DATABASE_PRESETS_FILE comment for why Snowflake has no ADC-
+          // style ambient identity to authenticate as instead) - without
+          // resending it, the server would save a credential-less
+          // connection and every subsequent query would fail.
+          dbPassword = matchedDb.password || null;
+          dbPrivateKey = matchedDb.private_key || null;
+          dbPrivateKeyPassphrase = matchedDb.private_key_passphrase || null;
+        } else if (dbType === 'databricks' && matchedDb) {
+          dbServerHostname = matchedDb.server_hostname;
+          dbHttpPath = matchedDb.http_path;
+          dbCatalog = matchedDb.catalog || null;
+          dbSchema = matchedDb.schema || null;
+          // Like Snowflake, a Databricks preset carries its own credential
+          // right here (CONFIGURED_DBS) - Databricks has no ADC-style
+          // ambient identity either (see backends/databricks.py's module
+          // docstring) - without resending it, the server would save a
+          // credential-less connection and every subsequent query would
+          // fail.
+          dbAccessToken = matchedDb.access_token || null;
+        } else if (dbType === 'oracle' && matchedDb) {
+          dbHost = matchedDb.host;
+          dbPort = matchedDb.port || null;
+          dbServiceName = matchedDb.service_name || null;
+          dbSid = matchedDb.sid || null;
+          dbUser = matchedDb.user;
+          dbSchema = matchedDb.schema || null;
+          // Like Databricks, an Oracle preset carries its own credential
+          // right here (CONFIGURED_DBS) - Oracle has no ADC-style ambient
+          // identity either (see backends/oracle.py's module docstring) -
+          // without resending it, the server would save a credential-less
+          // connection and every subsequent query would fail.
+          dbPassword = matchedDb.password || null;
+          dbSsl = Boolean(matchedDb.ssl);
         }
       }
     } else {
@@ -1141,18 +1654,60 @@ document.addEventListener('DOMContentLoaded', async () => {
       database_type: dbType,
       is_custom: isCustomOption,
       custom_databases: customDatabases
-        .filter(d => isCompleteBigQuery(d) || isCompletePostgres(d))
-        .map(d => isCompleteBigQuery(d)
-          ? {
+        .filter(d => isCompleteBigQuery(d) || isCompleteSnowflake(d) || isCompleteDatabricks(d) || isCompleteOracle(d) || isCompleteSimpleUrlDb(d))
+        .map(d => {
+          if (isCompleteBigQuery(d)) {
+            return {
               type: 'bigquery',
               name: d.name,
               project_id: d.config.project_id,
               dataset: d.config.dataset,
               billing_project_id: d.config.billing_project_id,
               credentials_json: d.config.credentials_json || undefined
-            }
-          : { type: 'postgres', name: d.name, url: d.url }
-        ),
+            };
+          }
+          if (isCompleteSnowflake(d)) {
+            return {
+              type: 'snowflake',
+              name: d.name,
+              account: d.config.account,
+              user: d.config.user,
+              warehouse: d.config.warehouse,
+              database: d.config.database,
+              schema: d.config.schema || undefined,
+              role: d.config.role || undefined,
+              password: d.config.password || undefined,
+              private_key: d.config.private_key || undefined,
+              private_key_passphrase: d.config.private_key_passphrase || undefined,
+            };
+          }
+          if (isCompleteDatabricks(d)) {
+            return {
+              type: 'databricks',
+              name: d.name,
+              server_hostname: d.config.server_hostname,
+              http_path: d.config.http_path,
+              catalog: d.config.catalog || undefined,
+              schema: d.config.schema || undefined,
+              access_token: d.config.access_token || undefined,
+            };
+          }
+          if (isCompleteOracle(d)) {
+            return {
+              type: 'oracle',
+              name: d.name,
+              host: d.config.host,
+              port: d.config.port || undefined,
+              service_name: d.config.service_name || undefined,
+              sid: d.config.sid || undefined,
+              user: d.config.user,
+              schema: d.config.schema || undefined,
+              password: d.config.password || undefined,
+              ssl: d.config.ssl || undefined,
+            };
+          }
+          return { type: (d.type === 'mysql' ? 'mysql' : 'postgres'), name: d.name, url: d.url };
+        }),
       auto_sql_execute: autoSqlExecuteValue
     };
     if (presetIndex !== null) {
@@ -1162,6 +1717,31 @@ document.addEventListener('DOMContentLoaded', async () => {
       payload.dataset = dbDataset;
       if (dbBillingProjectId) payload.billing_project_id = dbBillingProjectId;
       if (dbCredentialsJson) payload.credentials_json = dbCredentialsJson;
+    } else if (dbType === 'snowflake') {
+      payload.account = dbAccount;
+      payload.user = dbUser;
+      payload.warehouse = dbWarehouse;
+      payload.database = dbDatabase;
+      if (dbSchema) payload.schema = dbSchema;
+      if (dbRole) payload.role = dbRole;
+      if (dbPassword) payload.password = dbPassword;
+      if (dbPrivateKey) payload.private_key = dbPrivateKey;
+      if (dbPrivateKeyPassphrase) payload.private_key_passphrase = dbPrivateKeyPassphrase;
+    } else if (dbType === 'databricks') {
+      payload.server_hostname = dbServerHostname;
+      payload.http_path = dbHttpPath;
+      if (dbCatalog) payload.catalog = dbCatalog;
+      if (dbSchema) payload.schema = dbSchema;
+      if (dbAccessToken) payload.access_token = dbAccessToken;
+    } else if (dbType === 'oracle') {
+      payload.host = dbHost;
+      if (dbPort) payload.port = dbPort;
+      if (dbServiceName) payload.service_name = dbServiceName;
+      if (dbSid) payload.sid = dbSid;
+      payload.user = dbUser;
+      if (dbSchema) payload.schema = dbSchema;
+      if (dbPassword) payload.password = dbPassword;
+      if (dbSsl) payload.ssl = true;
     } else {
       payload.database_url = dbUrlValue;
     }
@@ -1178,6 +1758,16 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       if (response.ok) {
         const data = await response.json();
+        // Captured BEFORE the ACTIVE_* globals below get overwritten, so
+        // this reflects the connection that was active going into this
+        // save. Compared against the same tuple after the update to detect
+        // an actual connection change (see clearActiveQueryState() below) -
+        // url/is_custom/connection_key/preset_index together are what
+        // uniquely identify "the" active connection (presets: url; custom
+        // connections: connection_key; anonymous preset picks: preset_index,
+        // since url is withheld from them - see "what makes a db connection
+        // unique" discussion).
+        const previousConnectionIdentity = `${ACTIVE_DB_URL}|${ACTIVE_IS_CUSTOM}|${ACTIVE_CUSTOM_CONNECTION_KEY}|${ACTIVE_PRESET_INDEX}`;
         if (data.active_database_url) {
           ACTIVE_DB_URL = data.active_database_url;
         }
@@ -1204,6 +1794,11 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
         if (data.auto_sql_execute !== undefined) {
           autoSqlExecuteEnabled = Boolean(data.auto_sql_execute);
+        }
+
+        const nextConnectionIdentity = `${ACTIVE_DB_URL}|${ACTIVE_IS_CUSTOM}|${ACTIVE_CUSTOM_CONNECTION_KEY}|${ACTIVE_PRESET_INDEX}`;
+        if (nextConnectionIdentity !== previousConnectionIdentity) {
+          clearActiveQueryState();
         }
 
         if (configSaveErrorEl) {
@@ -1331,22 +1926,20 @@ document.addEventListener('DOMContentLoaded', async () => {
       },
       {
         target: configTriggerBadge,
-        title: "You're on a shared demo database",
-        body: "It's read-only-friendly and ready to go. Click this badge anytime to switch databases or connect your own."
+        title: "This is the databse you are connected to",
+        body: "Click this badge to switch to any pre-configured database or connect to your own."
       },
       {
         target: historyBtn,
         title: 'Past queries, saved',
-        body: isAnonymousUser
-          ? 'Once signed in, every translation you run is saved here so you can revisit or reuse it later.'
-          : 'Every translation you run is saved here so you can revisit or reuse it later.'
+        body: 'Every translation you run is saved here so you can revisit or reuse it later.'
       },
       {
         target: authContainer,
-        title: isAnonymousUser ? 'Sign in for the full experience' : "You're signed in",
+        title: isAnonymousUser ? 'Sign in to keep things around' : "You're signed in",
         body: isAnonymousUser
-          ? "Sign in with Google here to unlock custom database connections and saved query history."
-          : 'Manage your account or sign out from here anytime.'
+          ? "Sign in with Google here so your connections and history follow you across browsers and devices."
+          : 'Sign out from here anytime.'
       },
       {
         target: helpBtn,
@@ -1732,12 +2325,6 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   if (historyBtn && historyModal) {
     historyBtn.addEventListener('click', () => {
-      if (isAnonymousUser) {
-        showLoginRequiredModal(
-          'Viewing translation history is available to signed-in users only. Please log in with Google to access this feature.'
-        );
-        return;
-      }
       updateHistoryTurnsSubtitle();
       const purgeTitleEl = document.querySelector('.btn-purge-title');
       if (purgeTitleEl) {

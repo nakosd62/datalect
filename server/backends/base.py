@@ -171,6 +171,19 @@ class Backend(ABC):
     #: against.
     dialect_name = "SQL"
 
+    #: Trivial, always-runnable statement used purely to check "is this
+    #: connection alive" (see execute_routes.py's /api/ping) - needs no
+    #: existing table/dataset and no special permissions, just a live
+    #: connection. "SELECT 1" is valid ANSI SQL and works as-is for every
+    #: backend here except Oracle, which has no SELECT-without-FROM form
+    #: (a bare "SELECT 1" raises ORA-00923: FROM keyword not found where
+    #: expected) - see backends/oracle.py's override. Was previously
+    #: hardcoded client-side in client.js's checkDbStatus(), which is what
+    #: let this Oracle gap slip through undetected: the client can't know
+    #: a dialect's SQL quirks, only the backend that already encodes them
+    #: everywhere else in this file can.
+    liveness_sql = "SELECT 1"
+
     @abstractmethod
     def connect(self, descriptor):
         """Open and return a live connection/client for `descriptor`."""

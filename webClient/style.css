@@ -953,6 +953,43 @@ textarea:focus {
   overflow-y: auto;
 }
 
+/* configModal's form needs its Save button pinned below a scrolling list
+   of DB connections (which can grow arbitrarily tall as custom connections
+   are added) rather than scrolling away with everything else - overrides
+   the generic .modal-body padding/scroll behavior above, scoped to just
+   this one modal via #configForm so every other modal (.modal-body used
+   directly, no split-scroll wrapper markup) keeps its original layout. */
+#configForm.modal-body {
+  padding: 0;
+  gap: 0;
+  overflow: hidden;
+  min-height: 0;
+}
+
+/* The scrolling region - min-height: 0 lets it shrink within modal-card's
+   capped height instead of pushing the footer off-screen; overflow-y:
+   auto is what actually scrolls once content exceeds that shrunk height. */
+#configForm .modal-scroll-content {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+
+/* Stays outside the scrolling region above, so it (and the Save button it
+   holds) is always visible without scrolling. */
+#configForm .modal-footer-fixed {
+  flex-shrink: 0;
+  padding: 1rem 1.25rem 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  border-top: 1px solid var(--bg-card-border);
+}
+
 .help-dialog-body {
   line-height: 1.6;
   color: var(--text-secondary);
@@ -1075,6 +1112,28 @@ textarea:focus {
   padding: 0.6rem 0.8rem;
 }
 
+/* Sub-group headings inside #modalDbRadioGroup ("Pre-configured Database
+   Playgrounds" over the CONFIGURED_DBS presets, "Custom Database
+   Connections" over customDbsContainer) - a plain label, not a button or
+   input, so it's excluded from .radio-group's own flex gap sizing that
+   the radio/custom-connection rows use for click targets. */
+.radio-group-heading {
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+
+/* No border-top of its own here for the "Custom Database Connections"
+   heading, even though it visually starts a new group - #customDbsContainer
+   right below it already draws that exact divider line itself (see
+   .custom-dbs-list:not(:empty) below), so adding one here too would just
+   double it up. */
+.radio-group-heading:not(:first-child) {
+  margin-top: 0.3rem;
+}
+
 .radio-option {
   display: flex;
   align-items: center;
@@ -1114,6 +1173,165 @@ textarea:focus {
   width: 1rem;
   height: 1rem;
   cursor: pointer;
+}
+
+/* ===========================================================================
+   CUSTOM DB CONNECTION CARDS (config modal)
+   Each saved custom connection is enclosed between two horizontal lines
+   (the list's own top border plus each card's bottom border, so adjacent
+   cards share one line rather than doubling up), with its fields laid out
+   one logical row per line instead of everything wrapping together.
+   =========================================================================== */
+.custom-dbs-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.custom-dbs-list:not(:empty) {
+  border-top: 1px solid var(--bg-card-border);
+}
+
+.custom-db-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+  padding: 0.75rem 0;
+  border-bottom: 1px solid var(--bg-card-border);
+}
+
+.custom-db-header-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.custom-db-header-row .custom-db-type-select {
+  flex: 0 0 auto;
+  width: 8.5rem;
+}
+
+.custom-db-header-row .custom-db-name-input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.custom-db-toggle-btn,
+.custom-db-remove-btn {
+  flex: 0 0 auto;
+  padding: 0.15rem 0.6rem;
+  line-height: 1;
+}
+
+.custom-db-toggle-btn {
+  font-size: 0.7rem;
+}
+
+.custom-db-field-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem 1rem;
+  flex-wrap: wrap;
+  padding-left: 1.9rem;
+}
+
+.custom-db-field-row.align-start {
+  align-items: flex-start;
+}
+
+/* A field-row.align-start row (Service Account Key/Private Key - a
+   multi-line textarea) needs its own field(s) top-aligned too, or the
+   label-beside-input change above would vertically center the label next
+   to a 3-row-tall textarea instead of sitting level with its first line. */
+.custom-db-field-row.align-start .custom-db-field {
+  align-items: flex-start;
+}
+
+.custom-db-field-row.align-start .custom-db-field-label {
+  padding-top: 0.3rem;
+}
+
+.custom-db-field {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  min-width: 0;
+}
+
+/* Every field (inside a field-row or the header row alike) is
+   label-beside-input, matching the header row's own Name field - not
+   label-above-input the way grouped fields (e.g. Warehouse / Database /
+   Schema sharing one line) used to render. Deliberately NOT given a
+   min-width (or any other rule that would pad a short label out to match
+   a longer one elsewhere) - fields are not meant to visually align into
+   columns, each label just sits directly next to its own input. */
+.custom-db-field-row .custom-db-field {
+  /* Basis/min-width sized so a 3-field row (e.g. Oracle's Service Name /
+     SID / Schema, Snowflake's Warehouse / Database / Schema) fits on one
+     line at the modal's usual width instead of wrapping its 3rd field
+     down early - flex-grow still expands each field to fill the row's
+     actual leftover space once wrapping is decided, so 2-field rows (e.g.
+     Host / Port) aren't left narrower than before. */
+  flex: 1 1 170px;
+  min-width: 150px;
+  /* Very little space between a label and its input - tighter than the
+     0.4rem every other field/input pairing (header row's Name, etc.)
+     uses. */
+  gap: 0.2rem;
+}
+
+.custom-db-header-row .custom-db-field {
+  flex: 1 1 auto;
+}
+
+.custom-db-field-row .custom-db-field.wide {
+  flex: 1 1 100%;
+}
+
+.custom-db-field-label {
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+
+.custom-db-field-row .custom-db-field-label {
+  white-space: normal;
+  /* Caps how much of the field a label can claim on its own line -
+     without this, an unwrapped long label could eat the field's entire
+     flex-computed width and leave its input squeezed to a sliver. Not an
+     alignment device (no min-width here - see the comment above) - just
+     an overflow guard. */
+  max-width: 8rem;
+}
+
+.custom-db-field-label a {
+  color: inherit;
+  opacity: 0.85;
+  text-decoration: underline dotted;
+}
+
+.custom-db-field-label .optional-hint {
+  display: block;
+  font-size: 0.66rem;
+  opacity: 0.6;
+  font-weight: 400;
+}
+
+.custom-db-field input,
+.custom-db-field select,
+.custom-db-field textarea {
+  flex: 1 1 auto;
+  min-width: 0;
+  width: 100%;
+}
+
+.custom-db-field textarea {
+  resize: vertical;
+}
+
+.custom-db-add-btn {
+  align-self: flex-start;
+  margin-top: 0.5rem;
 }
 
 .results-container {

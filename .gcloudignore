@@ -5,18 +5,15 @@
 # Ignore local virtual environment
 venv/
 
-# Ignore env setting
+# Ignore local env setting
 .env
-
-# Ignore BQ key
-ydyl-bq-test-key.json
+database_presets_local.json
 
 # Ignore utility scripts
 *.sh
 
 # Ignore testing files
 tests/
-pytest.ini
 
 # Ignore utils
 utils/

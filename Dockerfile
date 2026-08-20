@@ -1,6 +1,3 @@
-# Use an official lightweight Python image. 3.9 reached end-of-life (no more
-# security patches) on 2025-10-31 - 3.12 has runway to 2028-10-31. See
-# https://endoflife.ai/python for the full schedule before bumping further.
 FROM python:3.12-slim
 
 # Set working directory
@@ -20,7 +17,13 @@ RUN pip install --no-cache-dir --upgrade pip && \
 COPY ./server ./server
 COPY ./webClient ./webClient
 
-# Copy CRDB certificate 
+# Copy the admin database-presets file (see DATABASE_PRESETS_FILE in
+# app_config.py/README.md) - it's gitignored like env.yaml, so it must
+# exist locally (even as an empty "[]") before building this image, same
+# precondition gcp_deploy.sh already has for env.yaml.
+COPY database_presets_CR.json ./database_presets_CR.json
+
+# Copy CRDB certificate
 # COPY crdb.crt .
 
 # Expose container port (Cloud Run defaults to 8080, but we can configure it)

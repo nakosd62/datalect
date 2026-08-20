@@ -10,7 +10,7 @@ import types as pytypes
 
 import pytest
 
-from helpers import install_fake_bigquery
+from helpers import install_fake_bigquery, write_database_presets_file
 
 
 class FakeGenaiResponse:
@@ -126,13 +126,13 @@ def test_postgres_dialect_intro_used_by_default(app_factory, monkeypatch):
     assert "BigQuery" not in system_instruction
 
 
-def test_bigquery_dialect_intro_used_when_active_connection_is_bigquery(app_factory, monkeypatch):
+def test_bigquery_dialect_intro_used_when_active_connection_is_bigquery(app_factory, tmp_path, monkeypatch):
+    presets_path = write_database_presets_file(tmp_path, [
+        {"type": "bigquery", "name": "BQ", "project_id": "p", "dataset": "d", "billing_project_id": "p"},
+    ])
     env = app_factory(env={
         "GEMINI_PRESET_KEYS": "fake-key-1",
-        "DATABASE_PRESETS": (
-            '[{"type":"bigquery","name":"BQ","project_id":"p","dataset":"d",'
-            '"billing_project_id":"p"}]'
-        ),
+        "DATABASE_PRESETS_FILE": presets_path,
     })
     install_fake_bigquery(monkeypatch)  # so get_database_schema()'s connect() doesn't hit real GCP
     harness = GenaiHarness()
@@ -215,6 +215,51 @@ def test_exhausts_all_retry_attempts_and_returns_500(app_factory, monkeypatch):
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
     assert resp.status_code == 500
     assert len(harness.generate_calls) == env.translate_routes.MAX_GEMINI_ATTEMPTS
+
+
+def test_max_gemini_attempts_defaults_to_5(app_env):
+    assert app_env.translate_routes.MAX_GEMINI_ATTEMPTS == 5
+
+
+def test_gemini_retry_delay_seconds_defaults_to_1(app_env):
+    assert app_env.translate_routes.GEMINI_RETRY_DELAY_SECONDS == 1
+
+
+def test_max_gemini_attempts_env_var_overrides_default(app_factory, monkeypatch):
+    env = app_factory(env={
+        "GEMINI_PRESET_KEYS": "fake-key-1,fake-key-2",
+        "MAX_GEMINI_ATTEMPTS": "2",
+    })
+    assert env.translate_routes.MAX_GEMINI_ATTEMPTS == 2
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    monkeypatch.setattr(env.translate_routes.time, "sleep", lambda *a, **k: None)
+    harness.queue_error(FakeApiError(429))
+    harness.queue_error(FakeApiError(429))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'hi'})
+    assert resp.status_code == 500
+    # Stopped after the configured 2 attempts, not the default 5 - proves
+    # the env var actually drives the retry loop, not just the constant.
+    assert len(harness.generate_calls) == 2
+
+
+def test_gemini_retry_delay_seconds_env_var_is_used_as_sleep_duration(app_factory, monkeypatch):
+    env = app_factory(env={
+        "GEMINI_PRESET_KEYS": "fake-key-1",
+        "GEMINI_RETRY_DELAY_SECONDS": "3.5",
+    })
+    assert env.translate_routes.GEMINI_RETRY_DELAY_SECONDS == 3.5
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    sleep_calls = []
+    monkeypatch.setattr(env.translate_routes.time, "sleep", lambda secs: sleep_calls.append(secs))
+    harness.queue_error(FakeApiError(500))
+    harness.queue_response(FakeGenaiResponse("SELECT 1;"))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'hi'})
+    assert resp.status_code == 200
+    assert sleep_calls == [3.5]
 
 
 def test_sets_session_cookie(app_factory, monkeypatch):

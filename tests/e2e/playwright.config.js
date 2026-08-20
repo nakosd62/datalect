@@ -2,9 +2,10 @@
 //
 // E2E suite for yDyL's web client. Runs against a REAL Flask server (real
 // SqliteStateStore, real /api/config, /api/history, session handling) - the
-// only things mocked are /api/translate and /api/execute, intercepted
-// in-browser via page.route() in each spec, so no real Gemini/BigQuery/
-// Postgres credentials are ever needed to run this suite.
+// only things mocked are /api/translate, /api/execute, and /api/ping,
+// intercepted in-browser via page.route() in each spec (or by fixtures.js's
+// default mocks), so no real Gemini/BigQuery/Postgres credentials are ever
+// needed to run this suite.
 //
 // This config (and package.json/package-lock.json next to it) live under
 // tests/e2e/ rather than the repo root on purpose, to keep the root clean
@@ -83,13 +84,13 @@ module.exports = {
       CRBOT_PORT: String(PORT),
       // Guarantees this server process never loads a real developer .env -
       // see app_config.py's YDYL_SKIP_DOTENV handling. Without this, a
-      // real repo-root .env (real Gemini keys, real DATABASE_PRESETS)
+      // real repo-root .env (real Gemini keys, a real DATABASE_PRESETS_FILE)
       // would silently override every env var set here, since
       // load_dotenv() searches by walking up from app_config.py's own
       // location, not from this process's cwd.
       YDYL_SKIP_DOTENV: '1',
       // Deliberately no GOOGLE_CLIENT_ID / K_SERVICE / GCP_PROJECT_ID /
-      // DATABASE_PRESETS - local-dev defaults (SQLite state, single
+      // DATABASE_PRESETS_FILE - local-dev defaults (SQLite state, single
       // synthetic "Default DB" preset, no auth gating).
     },
     url: `http://127.0.0.1:${PORT}/`,
@@ -97,7 +98,7 @@ module.exports = {
     timeout: 20_000,
     // 'ignore' keeps the Flask dev server's werkzeug access logs and the
     // expected "can't connect to fake test DB" tracebacks (from
-    // checkDbStatus's background /api/execute ping) out of normal test
+    // checkDbStatus's background /api/ping ping) out of normal test
     // output. Playwright still buffers this output internally and prints it
     // if the server fails to start within the timeout above, and it can be
     // re-enabled on demand with `DEBUG=pw:webserver npx playwright test`.

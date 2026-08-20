@@ -21,20 +21,34 @@ from google.auth.transport import requests as google_requests
 
 auth_bp = Blueprint('auth', __name__)
 
-# Identity used for requests on Cloud Run / AUTH_ENABLED deployments that
-# don't carry any verified identity (no Bearer token, no IAP header, no
-# auth cookie). Rather than rejecting these requests outright, they're
-# treated as a distinct "anonymous" user: they get a fully working session
+# Identity prefix used for requests on Cloud Run / AUTH_ENABLED deployments
+# that don't carry any verified identity (no Bearer token, no IAP header,
+# no auth cookie). Rather than rejecting these requests outright, they're
+# treated as an anonymous user: they get a fully working session
 # (translate/execute/default DB all work), but routes that are inherently
 # user-scoped (custom DB connections, translation history) explicitly
-# check for this value and refuse it - see `is_anonymous_user` below.
-ANONYMOUS_USER_ID = "anonymous"
+# check for this prefix and refuse it - see `is_anonymous_user` below.
+#
+# One identity PER BROWSER SESSION (ANONYMOUS_USER_ID_PREFIX + session id -
+# see get_current_user_identity), not a single value every unauthenticated
+# visitor shares. Previously this was one bare constant ("anonymous") used
+# for literally every anonymous request, which meant concurrent anonymous
+# visitors on Cloud Run all read/wrote the exact same state_store row: one
+# visitor picking a different preset DB, or toggling auto-execute, silently
+# changed it for every other anonymous visitor mid-session. Scoping it per
+# session fixes that while keeping the authorization behavior identical -
+# is_anonymous_user() still recognizes every one of these as "not really
+# logged in".
+ANONYMOUS_USER_ID_PREFIX = "anonymous:"
 
 
 def is_anonymous_user(user_identity):
-    """True if `user_identity` represents the shared anonymous identity
-    (i.e. a Cloud Run / AUTH_ENABLED request with no verified login)."""
-    return user_identity == ANONYMOUS_USER_ID
+    """True if `user_identity` represents an anonymous (unauthenticated)
+    identity - i.e. a Cloud Run / AUTH_ENABLED request with no verified
+    login. One such identity exists per browser session now (see
+    ANONYMOUS_USER_ID_PREFIX), so this checks the prefix rather than an
+    exact match against a single shared value."""
+    return bool(user_identity) and user_identity.startswith(ANONYMOUS_USER_ID_PREFIX)
 
 
 def get_or_create_session_id():
@@ -45,11 +59,28 @@ def get_or_create_session_id():
     return session_id
 
 
-def get_current_user_identity():
+def get_current_user_identity(session_id=None):
     """
     Extracts authenticated user identity from Bearer Tokens (verified via Google OAuth),
     GCP Identity-Aware Proxy (IAP) headers, or auth cookies.
-    Falls back to 'global' state key when running locally.
+    Falls back to 'global' state key when running locally, or - when auth
+    is enabled/Cloud Run but the request carries no verified identity - to
+    an anonymous identity scoped to this browser's session (see
+    ANONYMOUS_USER_ID_PREFIX) rather than one shared by every anonymous
+    visitor.
+
+    `session_id`, when the caller has one, should be the SAME value it's
+    using for the crbot_session_id cookie (get_or_create_session_id()'s
+    return value) - resolve it once per request and pass it through here,
+    rather than letting this function derive its own independently.
+    get_or_create_session_id() falls back to a freshly-generated UUID
+    whenever the request carries no session cookie yet, so calling it
+    twice in one request without a cookie present returns two DIFFERENT
+    values - if this function generated its own while the caller sets a
+    different one on the response cookie, a single browser's session state
+    (active DB, auto-execute) would end up split across two different
+    anonymous identities on its very first request. Callers that only need
+    a truthy signal (e.g. the enforce_authentication guard) can omit it.
     """
     # 1. Bearer Token in Authorization Header (Google ID Token)
     auth_header = request.headers.get("Authorization", "")
@@ -83,10 +114,13 @@ def get_current_user_identity():
         return auth_cookie.strip()
 
     # 4. If auth is enabled (Cloud Run), requests carrying no verified
-    # identity are treated as the shared anonymous user rather than being
-    # rejected outright - see ANONYMOUS_USER_ID above.
+    # identity are treated as anonymous rather than being rejected outright
+    # - scoped to this browser's session so concurrent anonymous visitors
+    # don't collide on the same state_store row (see
+    # ANONYMOUS_USER_ID_PREFIX above). Falls back to resolving its own
+    # session_id only if the caller didn't already have one on hand.
     if GOOGLE_CLIENT_ID or IS_CLOUD_RUN:
-        return ANONYMOUS_USER_ID
+        return f"{ANONYMOUS_USER_ID_PREFIX}{session_id or get_or_create_session_id()}"
 
     # 5. Local fallback -> Single 'global' user identity
     return "global"
@@ -143,8 +177,13 @@ def apply_session_cookie(response, session_id):
 # --- Auth Verification Endpoint ---
 @auth_bp.route('/api/auth/me', methods=['GET'])
 def get_current_user_status():
-    user_identity = get_current_user_identity()
+    # session_id resolved BEFORE get_current_user_identity() and passed
+    # into it - see that function's docstring for why the order matters
+    # (an anonymous identity must embed the exact same session_id this
+    # response's cookie carries, or a fresh browser's very first request
+    # would derive two different session ids and split its own state).
     session_id = get_or_create_session_id()
+    user_identity = get_current_user_identity(session_id)
     is_authenticated = bool(
         user_identity and user_identity != session_id and not is_anonymous_user(user_identity)
     )

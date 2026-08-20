@@ -2,19 +2,11 @@
     Welcome to <strong>yDyL</strong> - it helps you talk to your Data in your Language.
     </p>
     
-    <h3>Database Connection</h3>
+    <h3>Database Connections</h3>
     <p>
-    By default, you're connected to a shared playground database, which is read-only even though the
-    application itself can handle DML and DDL. You can connect your own postgres-compliant database by
-    clicking the database badge in the header and entering a connection string.
-    Note: custom connections are user-scoped, so this feature is only available to logged-in users.
-    </p>
-    
-    <h3>User Authentication</h3>
-    <p>
-    To use the full-featured application, sign in with Google. You can also use a restricted version of
-    the app as an anonymous user - some features (custom database connections, translation history) need
-    to be scoped to a specific user to be safe, so they're only available once you're signed in.
+    By default, you're offered a playground database for each supported type of database. 
+    You may select which one to use by clicking the database badge in the header and using the dialog that will pop up. 
+    You may connect your own database using the same pop-up dialog (custom connections are private. i.e. session- or user-scoped).
     </p>
     
     <h3>Natural Language Prompt</h3>
@@ -38,6 +30,12 @@
     will erase past chat history/turns.
     </p>
     
+    <h3>User Authentication</h3>
+    <p>
+    If you log in, you will be able to carry your custom database connections and past translations history with you. 
+    Otherwise, custom database connections and past translation history stays with the browser session where they occurred.
+    </p>
+
     <h3>Application Metadata</h3>
     <p>
     yDyL was built by <a href="mailto:nakosd@gmail.com" target="_blank" rel="noopener noreferrer">nakosd@gmail.com</a> in 2026

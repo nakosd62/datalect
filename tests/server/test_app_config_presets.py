@@ -1,12 +1,17 @@
 """
-app_config.py's DATABASE_PRESETS parsing into CONFIGURED_DBS - covers
-Postgres/BigQuery preset shapes, malformed input handling, and the
-default-fallback/DEFAULT_CONN derivation rules. Each test builds its own
-fresh app instance (via app_factory) since CONFIGURED_DBS is computed once
-at import time from the env.
+app_config.py's DATABASE_PRESETS_FILE parsing into CONFIGURED_DBS - covers
+Postgres/BigQuery/Snowflake preset shapes, malformed input handling,
+missing-file handling, and the default-fallback/DEFAULT_CONN derivation
+rules. Each test builds its own fresh app instance (via app_factory) since
+CONFIGURED_DBS is computed once at import time from the env - and writes
+its own presets file under tmp_path (see helpers.write_database_presets_file
+/ write_database_presets_file_raw) since DATABASE_PRESETS_FILE points at a
+file path rather than holding JSON inline.
 """
 
 import logging
+
+from helpers import write_database_presets_file, write_database_presets_file_raw
 
 
 def test_no_presets_env_falls_back_to_single_default_db(app_factory):
@@ -16,61 +21,109 @@ def test_no_presets_env_falls_back_to_single_default_db(app_factory):
     assert env.app_config.CONFIGURED_DBS[0]["type"] == "postgres"
 
 
-def test_postgres_preset_parsed(app_factory):
-    env = app_factory(env={
-        "DATABASE_PRESETS": '[{"type":"postgres","name":"Shop","url":"postgresql://u:p@h/db"}]',
-    })
+def test_postgres_preset_parsed(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [
+        {"type": "postgres", "name": "Shop", "url": "postgresql://u:p@h/db"},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
     assert len(env.app_config.CONFIGURED_DBS) == 1
     db = env.app_config.CONFIGURED_DBS[0]
     assert db == {"name": "Shop", "type": "postgres", "url": "postgresql://u:p@h/db"}
 
 
-def test_postgres_preset_missing_url_is_skipped(app_factory):
-    env = app_factory(env={
-        "DATABASE_PRESETS": '[{"type":"postgres","name":"Shop"}]',
-    })
+def test_postgres_preset_missing_url_is_skipped(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [{"type": "postgres", "name": "Shop"}])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
     # Skipped entirely -> falls back to the single synthetic default.
     assert len(env.app_config.CONFIGURED_DBS) == 1
     assert env.app_config.CONFIGURED_DBS[0]["name"] == "Default DB"
 
 
-def test_preset_missing_name_is_skipped(app_factory):
-    env = app_factory(env={
-        "DATABASE_PRESETS": '[{"type":"postgres","url":"postgresql://u:p@h/db"}]',
-    })
+def test_mysql_preset_parsed(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [
+        {"type": "mysql", "name": "Sales", "url": "mysql://u:p@h:3306/db"},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    assert len(env.app_config.CONFIGURED_DBS) == 1
+    db = env.app_config.CONFIGURED_DBS[0]
+    assert db == {"name": "Sales", "type": "mysql", "url": "mysql://u:p@h:3306/db"}
+
+
+def test_mysql_preset_missing_url_is_skipped(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [{"type": "mysql", "name": "Sales"}])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    # Skipped entirely -> falls back to the single synthetic default.
     assert len(env.app_config.CONFIGURED_DBS) == 1
     assert env.app_config.CONFIGURED_DBS[0]["name"] == "Default DB"
 
 
-def test_bigquery_preset_with_explicit_billing_project_id(app_factory):
-    env = app_factory(env={
-        "DATABASE_PRESETS": (
-            '[{"type":"bigquery","name":"Trends","project_id":"bigquery-public-data",'
-            '"dataset":"google_trends","billing_project_id":"my-billing-proj"}]'
-        ),
-    })
+def test_mysql_preset_type_is_case_insensitive(app_factory, tmp_path):
+    # "type" is lowercased before dispatch (see app_config.py's presets
+    # loop), so a preset authored with mixed case (e.g. "mySQL", as a
+    # human might naturally type it) still parses instead of being
+    # skipped as an unsupported type.
+    path = write_database_presets_file(tmp_path, [
+        {"type": "mySQL", "name": "Sales", "url": "mysql://u:p@h:3306/db"},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    assert len(env.app_config.CONFIGURED_DBS) == 1
+    assert env.app_config.CONFIGURED_DBS[0]["type"] == "mysql"
+
+
+def test_mysql_preset_with_cloud_sql_unix_socket_url_parsed(app_factory, tmp_path):
+    # Cloud SQL connections carry their socket path in the URL's query
+    # string rather than a real host - see backends/mysql.py's module
+    # docstring - app_config.py's preset parsing doesn't need to know
+    # anything about that (it just stores the url string as-is), but this
+    # locks in that such a URL round-trips through unchanged rather than
+    # being mangled or rejected here.
+    url = "mysql://trial:FooBar@/classicmodels?unix_socket=/cloudsql/proj:us-east1:instance"
+    path = write_database_presets_file(tmp_path, [
+        {"type": "mySQL", "name": "Sales Mgmt (CloudSQL/MySQL)", "url": url},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    db = env.app_config.CONFIGURED_DBS[0]
+    assert db["type"] == "mysql"
+    assert db["url"] == url
+
+
+def test_preset_missing_name_is_skipped(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [
+        {"type": "postgres", "url": "postgresql://u:p@h/db"},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    assert len(env.app_config.CONFIGURED_DBS) == 1
+    assert env.app_config.CONFIGURED_DBS[0]["name"] == "Default DB"
+
+
+def test_bigquery_preset_with_explicit_billing_project_id(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [{
+        "type": "bigquery", "name": "Trends", "project_id": "bigquery-public-data",
+        "dataset": "google_trends", "billing_project_id": "my-billing-proj",
+    }])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
     db = env.app_config.CONFIGURED_DBS[0]
     assert db["type"] == "bigquery"
     assert db["url"] == "bigquery://bigquery-public-data/google_trends"
     assert db["billing_project_id"] == "my-billing-proj"
 
 
-def test_bigquery_preset_missing_project_id_or_dataset_is_skipped(app_factory):
-    env = app_factory(env={
-        "DATABASE_PRESETS": '[{"type":"bigquery","name":"Bad","project_id":"p"}]',
-    })
+def test_bigquery_preset_missing_project_id_or_dataset_is_skipped(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [
+        {"type": "bigquery", "name": "Bad", "project_id": "p"},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
     assert len(env.app_config.CONFIGURED_DBS) == 1
     assert env.app_config.CONFIGURED_DBS[0]["name"] == "Default DB"
 
 
-def test_bigquery_preset_with_no_billing_project_id_falls_back_to_project_id_and_warns(app_factory, caplog):
+def test_bigquery_preset_with_no_billing_project_id_falls_back_to_project_id_and_warns(app_factory, tmp_path, caplog):
+    path = write_database_presets_file(tmp_path, [{
+        "type": "bigquery", "name": "Trends", "project_id": "bigquery-public-data",
+        "dataset": "google_trends",
+    }])
     with caplog.at_level(logging.WARNING, logger="ydyl"):
-        env = app_factory(env={
-            "DATABASE_PRESETS": (
-                '[{"type":"bigquery","name":"Trends","project_id":"bigquery-public-data",'
-                '"dataset":"google_trends"}]'
-            ),
-        })
+        env = app_factory(env={"DATABASE_PRESETS_FILE": path})
     db = env.app_config.CONFIGURED_DBS[0]
     # No env-var fallback exists anymore - falls back to its own
     # project_id, with a warning explaining why that will 403 for data
@@ -86,59 +139,313 @@ def test_no_bigquery_billing_project_id_env_var_exists_anymore(app_factory):
     assert not hasattr(env.app_config, "BIGQUERY_BILLING_PROJECT_ID")
 
 
-def test_unsupported_preset_type_is_skipped(app_factory):
-    env = app_factory(env={
-        "DATABASE_PRESETS": '[{"type":"mysql","name":"Bad","url":"mysql://x"}]',
-    })
+def test_snowflake_preset_with_password_parsed(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [{
+        "type": "snowflake", "name": "Sample", "account": "myorg-myacct", "user": "svc",
+        "warehouse": "COMPUTE_WH", "database": "SNOWFLAKE_SAMPLE_DATA", "schema": "TPCH_SF1",
+        "role": "ACCOUNTADMIN", "password": "hunter2",
+    }])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    assert len(env.app_config.CONFIGURED_DBS) == 1
+    db = env.app_config.CONFIGURED_DBS[0]
+    assert db == {
+        "name": "Sample", "type": "snowflake",
+        "url": "snowflake://myorg-myacct/SNOWFLAKE_SAMPLE_DATA/TPCH_SF1",
+        "account": "myorg-myacct", "user": "svc", "warehouse": "COMPUTE_WH",
+        "database": "SNOWFLAKE_SAMPLE_DATA", "schema": "TPCH_SF1", "role": "ACCOUNTADMIN",
+        "password": "hunter2",
+    }
+
+
+def test_snowflake_preset_with_private_key_parsed(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [{
+        "type": "snowflake", "name": "KP", "account": "acct", "user": "svc",
+        "warehouse": "wh", "database": "db", "private_key": "PEM",
+        "private_key_passphrase": "shh",
+    }])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    db = env.app_config.CONFIGURED_DBS[0]
+    assert db["private_key"] == "PEM"
+    assert db["private_key_passphrase"] == "shh"
+    assert "password" not in db
+
+
+def test_snowflake_preset_omits_optional_schema_and_role_when_blank(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [{
+        "type": "snowflake", "name": "NoSchema", "account": "acct", "user": "svc",
+        "warehouse": "wh", "database": "db", "password": "x",
+    }])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    db = env.app_config.CONFIGURED_DBS[0]
+    assert db["url"] == "snowflake://acct/db"
+    assert "schema" not in db
+    assert "role" not in db
+
+
+def test_snowflake_preset_missing_core_fields_is_skipped(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [
+        {"type": "snowflake", "name": "Bad", "account": "acct", "password": "x"},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
     assert len(env.app_config.CONFIGURED_DBS) == 1
     assert env.app_config.CONFIGURED_DBS[0]["name"] == "Default DB"
 
 
-def test_non_dict_preset_entry_is_skipped(app_factory):
-    env = app_factory(env={"DATABASE_PRESETS": '["just a string", 42]'})
+def test_snowflake_preset_missing_credential_is_skipped(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [{
+        "type": "snowflake", "name": "NoCred", "account": "acct", "user": "svc",
+        "warehouse": "wh", "database": "db",
+    }])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
     assert len(env.app_config.CONFIGURED_DBS) == 1
     assert env.app_config.CONFIGURED_DBS[0]["name"] == "Default DB"
 
 
-def test_malformed_json_is_ignored_entirely(app_factory):
-    env = app_factory(env={"DATABASE_PRESETS": "{not valid json"})
+def test_snowflake_preset_with_both_password_and_private_key_is_skipped(app_factory, tmp_path):
+    # Exactly one credential shape, same rule as the custom-connection path
+    # (state_store.py/config_routes.py) - ambiguous otherwise.
+    path = write_database_presets_file(tmp_path, [{
+        "type": "snowflake", "name": "Ambiguous", "account": "acct", "user": "svc",
+        "warehouse": "wh", "database": "db", "password": "x", "private_key": "y",
+    }])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
     assert len(env.app_config.CONFIGURED_DBS) == 1
     assert env.app_config.CONFIGURED_DBS[0]["name"] == "Default DB"
 
 
-def test_non_array_json_is_ignored_entirely(app_factory):
-    env = app_factory(env={"DATABASE_PRESETS": '{"type":"postgres","name":"x","url":"y"}'})
+def test_databricks_preset_parsed(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [{
+        "type": "databricks", "name": "Sample Lakehouse", "server_hostname": "dbc-a1b2c3d4-e5f6.cloud.databricks.com",
+        "http_path": "/sql/1.0/warehouses/0123456789abcdef", "catalog": "main", "schema": "sales",
+        "access_token": "dapi-secret",
+    }])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    assert len(env.app_config.CONFIGURED_DBS) == 1
+    db = env.app_config.CONFIGURED_DBS[0]
+    assert db == {
+        "name": "Sample Lakehouse", "type": "databricks",
+        "url": "databricks://dbc-a1b2c3d4-e5f6.cloud.databricks.com/sql/1.0/warehouses/0123456789abcdef",
+        "server_hostname": "dbc-a1b2c3d4-e5f6.cloud.databricks.com",
+        "http_path": "/sql/1.0/warehouses/0123456789abcdef",
+        "catalog": "main", "schema": "sales", "access_token": "dapi-secret",
+    }
+
+
+def test_databricks_preset_omits_optional_catalog_and_schema_when_blank(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [{
+        "type": "databricks", "name": "NoCatalog", "server_hostname": "dbc-x.cloud.databricks.com",
+        "http_path": "/sql/1.0/warehouses/abc", "access_token": "tok",
+    }])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    db = env.app_config.CONFIGURED_DBS[0]
+    assert db["url"] == "databricks://dbc-x.cloud.databricks.com/sql/1.0/warehouses/abc"
+    assert "catalog" not in db
+    assert "schema" not in db
+
+
+def test_databricks_preset_missing_core_fields_is_skipped(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [
+        {"type": "databricks", "name": "Bad", "server_hostname": "dbc-x.cloud.databricks.com", "access_token": "tok"},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    assert len(env.app_config.CONFIGURED_DBS) == 1
+    assert env.app_config.CONFIGURED_DBS[0]["name"] == "Default DB"
+
+
+def test_databricks_preset_missing_credential_is_skipped(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [{
+        "type": "databricks", "name": "NoCred", "server_hostname": "dbc-x.cloud.databricks.com",
+        "http_path": "/sql/1.0/warehouses/abc",
+    }])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    assert len(env.app_config.CONFIGURED_DBS) == 1
+    assert env.app_config.CONFIGURED_DBS[0]["name"] == "Default DB"
+
+
+def test_oracle_preset_parsed(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [{
+        "type": "oracle", "name": "Orders (Oracle)", "host": "db.example.com", "port": 1521,
+        "service_name": "ORCLPDB1", "user": "svc_ydyl", "password": "hunter2", "schema": "sales",
+    }])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    assert len(env.app_config.CONFIGURED_DBS) == 1
+    db = env.app_config.CONFIGURED_DBS[0]
+    assert db == {
+        "name": "Orders (Oracle)", "type": "oracle",
+        "url": "oracle://db.example.com:1521/ORCLPDB1",
+        "host": "db.example.com", "port": 1521, "user": "svc_ydyl",
+        "password": "hunter2", "service_name": "ORCLPDB1", "schema": "sales",
+    }
+
+
+def test_oracle_preset_with_sid_parsed(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [{
+        "type": "oracle", "name": "Legacy", "host": "db.example.com", "sid": "XE",
+        "user": "svc", "password": "x",
+    }])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    db = env.app_config.CONFIGURED_DBS[0]
+    assert db["sid"] == "XE"
+    assert "service_name" not in db
+    assert db["url"] == "oracle://db.example.com:1521/XE"
+
+
+def test_oracle_preset_defaults_port_to_1521_when_omitted(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [{
+        "type": "oracle", "name": "NoPort", "host": "db.example.com", "service_name": "ORCLPDB1",
+        "user": "svc", "password": "x",
+    }])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    db = env.app_config.CONFIGURED_DBS[0]
+    assert db["port"] == 1521
+
+
+def test_oracle_preset_omits_optional_schema_when_blank(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [{
+        "type": "oracle", "name": "NoSchema", "host": "db.example.com", "service_name": "ORCLPDB1",
+        "user": "svc", "password": "x",
+    }])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    db = env.app_config.CONFIGURED_DBS[0]
+    assert "schema" not in db
+
+
+def test_oracle_preset_omits_ssl_when_blank(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [{
+        "type": "oracle", "name": "NoSsl", "host": "db.example.com", "service_name": "ORCLPDB1",
+        "user": "svc", "password": "x",
+    }])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    db = env.app_config.CONFIGURED_DBS[0]
+    assert "ssl" not in db
+
+
+def test_oracle_preset_carries_ssl_true_through(app_factory, tmp_path):
+    # Regression coverage for the real-world bug "ssl" fixes - an Oracle
+    # Cloud/Autonomous Database preset needs this threaded through to
+    # connect() as a TLS handshake, or it fails with a confusing
+    # DPY-4011/DPY-6005 "connection reset" against the TLS-only listener
+    # (see backends/oracle.py's module docstring).
+    path = write_database_presets_file(tmp_path, [{
+        "type": "oracle", "name": "ADB", "host": "adb.us-ashburn-1.oraclecloud.com",
+        "port": 1522, "service_name": "myatp_high.adb.oraclecloud.com",
+        "user": "admin", "password": "x", "ssl": True,
+    }])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    db = env.app_config.CONFIGURED_DBS[0]
+    assert db["ssl"] is True
+
+
+def test_oracle_preset_missing_core_fields_is_skipped(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [
+        {"type": "oracle", "name": "Bad", "host": "db.example.com", "password": "x"},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    assert len(env.app_config.CONFIGURED_DBS) == 1
+    assert env.app_config.CONFIGURED_DBS[0]["name"] == "Default DB"
+
+
+def test_oracle_preset_missing_credential_is_skipped(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [{
+        "type": "oracle", "name": "NoCred", "host": "db.example.com", "service_name": "ORCLPDB1",
+        "user": "svc",
+    }])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    assert len(env.app_config.CONFIGURED_DBS) == 1
+    assert env.app_config.CONFIGURED_DBS[0]["name"] == "Default DB"
+
+
+def test_unsupported_preset_type_is_skipped(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [
+        {"type": "oracle", "name": "Bad", "url": "oracle://x"},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    assert len(env.app_config.CONFIGURED_DBS) == 1
+    assert env.app_config.CONFIGURED_DBS[0]["name"] == "Default DB"
+
+
+def test_non_dict_preset_entry_is_skipped(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, ["just a string", 42])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    assert len(env.app_config.CONFIGURED_DBS) == 1
+    assert env.app_config.CONFIGURED_DBS[0]["name"] == "Default DB"
+
+
+def test_malformed_json_is_ignored_entirely(app_factory, tmp_path):
+    path = write_database_presets_file_raw(tmp_path, "{not valid json")
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    assert len(env.app_config.CONFIGURED_DBS) == 1
+    assert env.app_config.CONFIGURED_DBS[0]["name"] == "Default DB"
+
+
+def test_non_array_json_is_ignored_entirely(app_factory, tmp_path):
+    path = write_database_presets_file_raw(
+        tmp_path, '{"type":"postgres","name":"x","url":"y"}',
+    )
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
     assert len(env.app_config.CONFIGURED_DBS) == 1
 
 
-def test_multiple_presets_of_mixed_types(app_factory):
-    env = app_factory(env={
-        "DATABASE_PRESETS": (
-            '[{"type":"postgres","name":"PG","url":"postgresql://u:p@h/db"},'
-            '{"type":"bigquery","name":"BQ","project_id":"p","dataset":"d","billing_project_id":"p"}]'
-        ),
-    })
-    assert len(env.app_config.CONFIGURED_DBS) == 2
+def test_missing_presets_file_is_ignored_entirely_and_logs_an_error(app_factory, tmp_path, caplog):
+    # DATABASE_PRESETS_FILE points somewhere that doesn't exist - e.g. a
+    # typo'd path, or a Cloud Run secret volume that failed to mount.
+    # Should behave exactly like "no presets configured" rather than
+    # crashing app_config.py's module-level import.
+    missing_path = str(tmp_path / "does_not_exist.json")
+    with caplog.at_level(logging.ERROR, logger="ydyl"):
+        env = app_factory(env={"DATABASE_PRESETS_FILE": missing_path})
+    assert len(env.app_config.CONFIGURED_DBS) == 1
+    assert env.app_config.CONFIGURED_DBS[0]["name"] == "Default DB"
+    assert any("DATABASE_PRESETS_FILE" in rec.message for rec in caplog.records)
+
+
+def test_multiple_presets_of_mixed_types(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [
+        {"type": "postgres", "name": "PG", "url": "postgresql://u:p@h/db"},
+        {"type": "mysql", "name": "MySQL DB", "url": "mysql://u:p@h/mysqldb"},
+        {"type": "bigquery", "name": "BQ", "project_id": "p", "dataset": "d", "billing_project_id": "p"},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    assert len(env.app_config.CONFIGURED_DBS) == 3
     types = {db["type"] for db in env.app_config.CONFIGURED_DBS}
-    assert types == {"postgres", "bigquery"}
+    assert types == {"postgres", "mysql", "bigquery"}
 
 
-def test_default_conn_is_first_postgres_preset_even_if_bigquery_listed_first(app_factory):
-    env = app_factory(env={
-        "DATABASE_PRESETS": (
-            '[{"type":"bigquery","name":"BQ","project_id":"p","dataset":"d","billing_project_id":"p"},'
-            '{"type":"postgres","name":"PG","url":"postgresql://u:p@h/pgdb"}]'
-        ),
-    })
+def test_default_conn_is_first_postgres_preset_even_if_bigquery_listed_first(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [
+        {"type": "bigquery", "name": "BQ", "project_id": "p", "dataset": "d", "billing_project_id": "p"},
+        {"type": "postgres", "name": "PG", "url": "postgresql://u:p@h/pgdb"},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
     assert env.app_config.DEFAULT_CONN == "postgresql://u:p@h/pgdb"
 
 
-def test_default_conn_falls_back_to_hardcoded_when_only_bigquery_presets_exist(app_factory):
-    env = app_factory(env={
-        "DATABASE_PRESETS": (
-            '[{"type":"bigquery","name":"BQ","project_id":"p","dataset":"d","billing_project_id":"p"}]'
-        ),
-    })
+def test_default_conn_is_first_postgres_preset_even_if_mysql_listed_first(app_factory, tmp_path):
+    # DEFAULT_CONN/the state-store fallback assume a plain Postgres URL
+    # literal (see app_config.py's comment above _postgres_presets) - a
+    # MySQL preset, even though it's also a simple URL-based dialect, must
+    # not be picked as the default just because it's listed first.
+    path = write_database_presets_file(tmp_path, [
+        {"type": "mysql", "name": "MySQL DB", "url": "mysql://u:p@h/mysqldb"},
+        {"type": "postgres", "name": "PG", "url": "postgresql://u:p@h/pgdb"},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    assert env.app_config.DEFAULT_CONN == "postgresql://u:p@h/pgdb"
+
+
+def test_default_conn_falls_back_to_hardcoded_when_only_bigquery_presets_exist(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [
+        {"type": "bigquery", "name": "BQ", "project_id": "p", "dataset": "d", "billing_project_id": "p"},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    assert env.app_config.DEFAULT_CONN.startswith("postgresql://postgres:password@")
+
+
+def test_default_conn_falls_back_to_hardcoded_when_only_mysql_presets_exist(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [
+        {"type": "mysql", "name": "MySQL DB", "url": "mysql://u:p@h/mysqldb"},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
     assert env.app_config.DEFAULT_CONN.startswith("postgresql://postgres:password@")
 
 

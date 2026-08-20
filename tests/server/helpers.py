@@ -6,7 +6,7 @@ Shared test infrastructure for the backend suite. Not a test file itself
 test_*.py file in this directory imports.
 
 Why this exists: app_config.py has real import-time side effects (builds
-the Flask app, parses DATABASE_PRESETS, tries to connect to Firestore if
+the Flask app, parses DATABASE_PRESETS_FILE, tries to connect to Firestore if
 GCP_PROJECT_ID is set, picks SqliteStateStore vs FirestoreStateStore) and
 every other server module imports shared singletons from it. Different
 tests need different environments (auth on/off, different presets,
@@ -49,11 +49,11 @@ _APP_MODULE_NAMES = [
 # dotenv loading the repo's real .env) never leaks into a test.
 _ENV_VARS_TO_CLEAR = [
     "GCP_PROJECT_ID", "GOOGLE_CLOUD_PROJECT", "GCP_PROJECT", "K_SERVICE",
-    "GOOGLE_CLIENT_ID", "DATABASE_PRESETS", "GEMINI_API_KEY", "GOOGLE_API_KEY",
+    "GOOGLE_CLIENT_ID", "DATABASE_PRESETS_FILE", "GEMINI_API_KEY", "GOOGLE_API_KEY",
     "GEMINI_PRESET_KEYS", "GEMINI_MODEL", "SCHEMA_CACHE_TTL_SECONDS",
     "SCHEMA_MAX_TABLES", "SCHEMA_MAX_TABLE_NAMES_SCANNED",
     "SCHEMA_MAX_SCHEMA_CHARS", "SCHEMA_SHARD_MIN_GROUP_SIZE", "LOG_LEVEL",
-    "CRBOT_HOSTNAME", "CRBOT_PORT",
+    "CRBOT_HOSTNAME", "CRBOT_PORT", "MAX_GEMINI_ATTEMPTS", "GEMINI_RETRY_DELAY_SECONDS",
 ]
 
 
@@ -179,11 +179,33 @@ def login_as(test_client, email):
     test_client.set_cookie("crbot_user_id", email)
 
 
-def database_presets_env(presets):
-    """JSON-encodes a list of preset dicts for the DATABASE_PRESETS env var
-    - just a thin wrapper so test files read declaratively rather than
-    sprinkling json.dumps(...) everywhere."""
-    return json.dumps(presets)
+def write_database_presets_file(tmp_path, presets, filename="database_presets.json"):
+    """Writes `presets` (a list of preset dicts) as JSON to a file under
+    `tmp_path` and returns its absolute path string, ready to hand to
+    app_factory as env={"DATABASE_PRESETS_FILE": ...}. Replaces the old
+    database_presets_env() helper from when presets were a single inline
+    DATABASE_PRESETS env var - now app_config.py reads the JSON from a file
+    instead (see its comment above DATABASE_PRESETS_FILE).
+
+    Pass the SAME tmp_path fixture instance a test's app_factory call will
+    use (pytest caches fixtures per test, so a test function that takes
+    both `app_factory` and `tmp_path` as parameters gets the one shared
+    instance) - fresh_import() chdir's into tmp_path before importing
+    app_config, so a relative filename would resolve too, but returning an
+    absolute path here removes any doubt about that ordering."""
+    path = tmp_path / filename
+    path.write_text(json.dumps(presets), encoding="utf-8")
+    return str(path)
+
+
+def write_database_presets_file_raw(tmp_path, raw_text, filename="database_presets.json"):
+    """Like write_database_presets_file() but writes `raw_text` verbatim
+    instead of JSON-encoding a Python object - for tests that need to feed
+    app_config.py deliberately malformed/non-array file contents (e.g.
+    "{not valid json" or a JSON object instead of an array)."""
+    path = tmp_path / filename
+    path.write_text(raw_text, encoding="utf-8")
+    return str(path)
 
 
 # ---------------------------------------------------------------------------
@@ -460,6 +482,207 @@ class FakePgConnection:
 def make_fake_pg_connection(responses):
     cursor = FakePgCursor(responses)
     return FakePgConnection(cursor), cursor
+
+
+# ---------------------------------------------------------------------------
+# Fake MySQL connection (get_schema()/execute()/identity_label())
+# ---------------------------------------------------------------------------
+# PyMySQL implements the same PEP 249 DB-API cursor shape (execute/
+# description/fetchall/rowcount, cursor as a context manager) psycopg2
+# does, so FakePgCursor above is reused directly here - same approach
+# already used for Snowflake (see the comment above
+# FakeSnowflakeConnectHarness). The one real difference: PyMySQL's
+# Connection.autocommit is a *method* (`connection.autocommit(True)`),
+# not a settable attribute the way psycopg2's/FakePgConnection's is - so
+# this needs its own small connection fake rather than reusing
+# FakePgConnection verbatim, or backends/mysql.py's execute() calling
+# connection.autocommit(True) would raise "'bool' object is not callable"
+# against the Postgres fake.
+
+class FakeMySQLConnection:
+    def __init__(self, cursor):
+        self._cursor = cursor
+        self.autocommit_calls = []
+        self.closed = False
+
+    def cursor(self):
+        return self._cursor
+
+    def autocommit(self, value):
+        self.autocommit_calls.append(value)
+
+    def close(self):
+        self.closed = True
+
+
+def make_fake_mysql_connection(responses):
+    cursor = FakePgCursor(responses)
+    return FakeMySQLConnection(cursor), cursor
+
+
+class FakePyMySQLConnectHarness:
+    def __init__(self):
+        self.calls = []  # list of kwargs dicts, one per connect() call
+
+    def connect(self, **kwargs):
+        self.calls.append(kwargs)
+        return object()  # backend.connect() just returns this straight through
+
+
+def install_fake_pymysql_connect(monkeypatch):
+    """Patches backends.mysql's pymysql.connect with a fake that records
+    its kwargs instead of opening a real connection, and returns the
+    FakePyMySQLConnectHarness controlling it. Must be called *after* the
+    module has been imported (same caveat as install_fake_snowflake_connect
+    above)."""
+    import backends.mysql as mysqlmod
+
+    harness = FakePyMySQLConnectHarness()
+    monkeypatch.setattr(mysqlmod.pymysql, "connect", harness.connect)
+    return harness
+
+
+# ---------------------------------------------------------------------------
+# Fake Snowflake connect()
+# ---------------------------------------------------------------------------
+# backends/snowflake.py's connect() is the one piece of Snowflake-specific
+# logic worth testing directly - deciding password vs key-pair auth and
+# building the connector kwargs accordingly. get_schema()/execute()/
+# identity_label() don't need a separate fake at all: snowflake-connector-
+# python implements the same PEP 249 DB-API cursor shape
+# (execute/description/fetchall/rowcount) psycopg2 does, so those are
+# tested against the very same FakePgCursor/FakePgConnection/
+# make_fake_pg_connection above, driven directly (bypassing connect()
+# entirely) - same approach test_postgres_backend.py already uses.
+
+class FakeSnowflakeConnectHarness:
+    def __init__(self):
+        self.calls = []  # list of kwargs dicts, one per connect() call
+
+    def connect(self, **kwargs):
+        self.calls.append(kwargs)
+        return object()  # backend.connect() just returns this straight through
+
+
+def install_fake_snowflake_connect(monkeypatch):
+    """Patches backends.snowflake's snowflake.connector.connect with a fake
+    that records its kwargs instead of opening a real connection, and
+    returns the FakeSnowflakeConnectHarness controlling it. Must be called
+    *after* the module has been imported (i.e. after fresh_import(), or
+    after a bare `import backends.snowflake`), same caveat as
+    install_fake_bigquery above."""
+    import backends.snowflake as sfmod
+
+    harness = FakeSnowflakeConnectHarness()
+    monkeypatch.setattr(sfmod.snowflake.connector, "connect", harness.connect)
+    return harness
+
+
+# ---------------------------------------------------------------------------
+# Fake Databricks connect()
+# ---------------------------------------------------------------------------
+# backends/databricks.py's connect() is the one piece of Databricks-specific
+# logic worth testing directly - building the connector kwargs (and raising
+# when no access_token is given). get_schema()/execute()/identity_label()
+# don't need a separate fake either: databricks-sql-connector implements the
+# same PEP 249 DB-API cursor shape (execute/description/fetchall/rowcount,
+# cursor as a context manager) psycopg2 does, so those are tested against
+# the very same FakePgCursor/FakePgConnection/make_fake_pg_connection above,
+# driven directly (bypassing connect() entirely) - same approach used for
+# Snowflake/MySQL. The one real wrinkle: the connector's declared paramstyle
+# is "named" (:name, not %s), so get_schema()'s IN (...) queries pass a
+# *dict* of params rather than a list/tuple - FakePgCursor.execute() doesn't
+# care about params' type (it just records whatever it's given), so no
+# separate fake is needed for that either.
+
+class FakeDatabricksConnectHarness:
+    def __init__(self):
+        self.calls = []  # list of kwargs dicts, one per connect() call
+
+    def connect(self, **kwargs):
+        self.calls.append(kwargs)
+        return object()  # backend.connect() just returns this straight through
+
+
+def install_fake_databricks_connect(monkeypatch):
+    """Patches backends.databricks's databricks.sql.connect with a fake that
+    records its kwargs instead of opening a real connection, and returns the
+    FakeDatabricksConnectHarness controlling it. Must be called *after* the
+    module has been imported, same caveat as install_fake_snowflake_connect
+    above."""
+    import backends.databricks as dbxmod
+
+    harness = FakeDatabricksConnectHarness()
+    monkeypatch.setattr(dbxmod.databricks_sql, "connect", harness.connect)
+    return harness
+
+
+# ---------------------------------------------------------------------------
+# Fake Oracle connect()
+# ---------------------------------------------------------------------------
+# backends/oracle.py's connect() is the one piece of Oracle-specific logic
+# worth testing directly - building the connector kwargs (service_name vs
+# sid dispatch, and raising on missing host/user/password/service-or-sid).
+# get_schema()/execute()/identity_label() don't need a separate fake
+# either: python-oracledb implements the same PEP 249 DB-API cursor shape
+# (execute/description/fetchall/rowcount, cursor as a context manager)
+# psycopg2 does, so those are tested against the very same FakePgCursor/
+# FakePgConnection/make_fake_pg_connection above, driven directly
+# (bypassing connect() entirely) - same approach used for Snowflake/MySQL/
+# Databricks. Unlike those, connect() itself can issue a SQL statement
+# (ALTER SESSION SET CURRENT_SCHEMA, when a "schema" descriptor field is
+# given - see _set_current_schema) against the connection it just opened,
+# so this fake's connect() returns a lightweight connection stand-in with
+# its own recording cursor (FakeOracleConnection), not a bare `object()`
+# the way FakeSnowflakeConnectHarness/FakeDatabricksConnectHarness do -
+# tests that care what _set_current_schema actually executed can inspect
+# harness.connections[-1].cursor_calls.
+
+class _FakeOracleCursor:
+    def __init__(self, calls):
+        self._calls = calls
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def execute(self, sql, params=None):
+        self._calls.append((sql, params))
+
+
+class FakeOracleConnection:
+    def __init__(self):
+        self.cursor_calls = []
+
+    def cursor(self):
+        return _FakeOracleCursor(self.cursor_calls)
+
+
+class FakeOracleConnectHarness:
+    def __init__(self):
+        self.calls = []  # list of kwargs dicts, one per connect() call
+        self.connections = []  # the FakeOracleConnection returned by each call
+
+    def connect(self, **kwargs):
+        self.calls.append(kwargs)
+        connection = FakeOracleConnection()
+        self.connections.append(connection)
+        return connection
+
+
+def install_fake_oracle_connect(monkeypatch):
+    """Patches backends.oracle's oracledb.connect with a fake that records
+    its kwargs instead of opening a real connection, and returns the
+    FakeOracleConnectHarness controlling it. Must be called *after* the
+    module has been imported, same caveat as install_fake_snowflake_connect
+    above."""
+    import backends.oracle as oramod
+
+    harness = FakeOracleConnectHarness()
+    monkeypatch.setattr(oramod.oracledb, "connect", harness.connect)
+    return harness
 
 
 # ---------------------------------------------------------------------------

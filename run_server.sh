@@ -24,8 +24,8 @@ fi
 # Install/Update requirements
 if [ -f "requirements.txt" ]; then
     echo "Installing/checking dependencies from requirements.txt..."
-    ./venv/bin/pip install --upgrade pip
-    ./venv/bin/pip install -r requirements.txt
+    ./venv/bin/pip install --upgrade pip > /dev/null
+    ./venv/bin/pip install -r requirements.txt > /dev/null
     if [ $? -ne 0 ]; then
         echo "Error: Failed to install dependencies."
         exit 1
@@ -40,7 +40,8 @@ pkill -9 -f "cloud-sql-proxy" 2>/dev/null
 sleep 2
 
 # Run the Cloud SQL Auth Proxy to access GCP CloudSQL databases
-cloud-sql-proxy grand-cosmos-716:us-east1:trial > cloud-sql-proxy.log 2>&1 &
+cloud-sql-proxy grand-cosmos-716:us-east1:trial > cloudsql-postgres-proxy.log 2>&1 &
+cloud-sql-proxy mysql-506101:us-east1:free-trial-first-project > cloudsql-mysql-proxy.log 2>&1 &
 
 # Start server
 echo "Starting Flask server..."

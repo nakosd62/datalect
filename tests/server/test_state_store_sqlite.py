@@ -170,6 +170,76 @@ def test_two_connections_sharing_url_but_different_credentials_dont_collide(tmp_
     assert len(keys) == 2  # distinct connection_key per row, not overwritten
 
 
+def test_has_custom_credentials_true_for_snowflake_password(tmp_path):
+    store = make_store(tmp_path)
+    store.set_db_connections(
+        "alice", "SF Conn", "snowflake", "snowflake://acc/db/public",
+        db_config={"account": "acc", "user": "u", "warehouse": "wh", "database": "db", "password": "hunter2"},
+    )
+    conns = store.get_db_connections("alice")
+    assert conns[0]["has_custom_credentials"] is True
+    assert "password" not in conns[0]["config"]
+
+
+def test_has_custom_credentials_true_for_snowflake_private_key(tmp_path):
+    store = make_store(tmp_path)
+    store.set_db_connections(
+        "alice", "SF Conn", "snowflake", "snowflake://acc/db/public",
+        db_config={"account": "acc", "user": "u", "warehouse": "wh", "database": "db", "private_key": "PEM"},
+    )
+    conns = store.get_db_connections("alice")
+    assert conns[0]["has_custom_credentials"] is True
+    assert "private_key" not in conns[0]["config"]
+
+
+def test_two_snowflake_connections_sharing_url_but_different_passwords_dont_collide(tmp_path):
+    store = make_store(tmp_path)
+    store.set_db_connections(
+        "alice", None, None, None,
+        custom_databases=[
+            {"name": "Conn A", "type": "snowflake", "url": "snowflake://shared/db/public",
+             "config": {"password": "PASS_A"}},
+            {"name": "Conn B", "type": "snowflake", "url": "snowflake://shared/db/public",
+             "config": {"password": "PASS_B"}},
+        ],
+    )
+    conns = store.get_db_connections("alice")
+    assert len(conns) == 2
+    keys = {c["connection_key"] for c in conns}
+    assert len(keys) == 2
+
+
+def test_switching_snowflake_auth_method_changes_connection_key(tmp_path):
+    # Same name/url, password -> private_key: must be treated as a
+    # genuinely different credential, not silently reuse the old key.
+    from state_store import _credential_value_for_key
+
+    key_no_creds = compute_connection_key(
+        "SF Conn", "snowflake://acc/db/public", _credential_value_for_key({})
+    )
+    key_via_password = compute_connection_key(
+        "SF Conn", "snowflake://acc/db/public", _credential_value_for_key({"password": "hunter2"})
+    )
+    key_via_private_key = compute_connection_key(
+        "SF Conn", "snowflake://acc/db/public", _credential_value_for_key({"private_key": "PEM"})
+    )
+    assert len({key_no_creds, key_via_password, key_via_private_key}) == 3
+
+
+def test_credential_value_for_key_captures_both_private_key_fields():
+    from state_store import _credential_value_for_key
+    base = _credential_value_for_key({"private_key": "PEM"})
+    with_passphrase = _credential_value_for_key({"private_key": "PEM", "private_key_passphrase": "shh"})
+    assert base != with_passphrase  # passphrase alone must still affect the hash
+
+
+def test_credential_value_for_key_is_order_independent_of_dict_insertion(tmp_path):
+    from state_store import _credential_value_for_key
+    a = _credential_value_for_key({"private_key": "PEM", "private_key_passphrase": "shh"})
+    b = _credential_value_for_key({"private_key_passphrase": "shh", "private_key": "PEM"})
+    assert a == b
+
+
 def test_compute_connection_key_differs_by_name_url_and_credentials():
     k1 = compute_connection_key("A", "url1", "cred1")
     k2 = compute_connection_key("B", "url1", "cred1")

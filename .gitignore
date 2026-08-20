@@ -4,7 +4,7 @@ venv/
 # Local state
 state/
 
-# Data exports
+# Data dumps
 utils/data/
 
 # Files containing secrets
@@ -12,14 +12,8 @@ env.yaml
 .env
 crdb.crt
 ydyl-bq-test-key.json
-
-# Python cache
-__pycache__/
-*.pyc
-.pytest_cache/
-
-# macOS system files
-.DS_Store
+database_presets_local.json
+database_presets_CR.json
 
 # Logs
 *.log
@@ -28,9 +22,17 @@ __pycache__/
 *-save*
 *.save*
 
+# Python cache
+__pycache__/
+*.pyc
+.pytest_cache/
+
 # JS/Playwright e2e suite
 node_modules/
 playwright-report/
 test-results/
 tests/e2e/.auth/
 .e2e-runtime/
+
+# macOS system files
+.DS_Store

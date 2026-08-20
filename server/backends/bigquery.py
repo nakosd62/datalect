@@ -16,8 +16,8 @@ contexts: "url" is a synthetic, non-secret identifier (see
 config_routes.py's _bigquery_url) used for UI matching/display, never
 something this backend itself needs to parse. "credentials_json" (a pasted
 service-account key, JSON-encoded) is present only for a user's own custom
-BigQuery connection - admin-configured presets (CONFIGURED_DBS, from
-DATABASE_PRESETS) intentionally carry none, and instead authenticate as the
+BigQuery connection - admin-configured presets (CONFIGURED_DBS, loaded from
+DATABASE_PRESETS_FILE) intentionally carry none, and instead authenticate as the
 app's own ambient identity (Application Default Credentials - the Cloud Run
 service account in production, or whatever
 `gcloud auth application-default login` set up locally).
