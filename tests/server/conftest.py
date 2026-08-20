@@ -12,6 +12,7 @@ import pytest
 from helpers import (
     fresh_import, install_fake_bigquery, install_fake_snowflake_connect,
     install_fake_pymysql_connect, install_fake_databricks_connect, install_fake_oracle_connect,
+    install_fake_redshift_connect,
 )
 
 
@@ -89,3 +90,13 @@ def oracle_harness(monkeypatch):
     bigquery_harness/snowflake_harness/mysql_harness/databricks_harness
     above: call this AFTER app_factory/app_env in your test, not before."""
     return install_fake_oracle_connect(monkeypatch)
+
+
+@pytest.fixture
+def redshift_harness(monkeypatch):
+    """Patches backends.redshift's psycopg2.connect with a fake that
+    records kwargs instead of opening a real connection. Same ordering
+    caveat as bigquery_harness/snowflake_harness/mysql_harness/
+    databricks_harness/oracle_harness above: call this AFTER app_factory/
+    app_env in your test, not before."""
+    return install_fake_redshift_connect(monkeypatch)

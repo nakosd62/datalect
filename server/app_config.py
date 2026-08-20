@@ -136,6 +136,9 @@ DEFAULT_CONN = "postgresql://postgres:password@host:23456/defaultdb?sslmode=veri
 #               "service_name": "..." (or "sid" instead), "user": "...",
 #               "password": "...", "schema": "...", "ssl": false}
 #               ("port"/"schema"/"ssl" optional - see below)
+#   Redshift:   {"type": "redshift", "name": "...", "host": "...", "port": 5439,
+#               "database": "...", "user": "...", "password": "...", "schema": "..."}
+#               ("port"/"schema" optional - see below)
 # Example file contents:
 #   [
 #     {
@@ -177,6 +180,15 @@ DEFAULT_CONN = "postgresql://postgres:password@host:23456/defaultdb?sslmode=veri
 #       "user": "svc_ydyl",
 #       "password": "...",
 #       "ssl": true
+#     },
+#     {
+#       "type": "redshift",
+#       "name": "Warehouse (Redshift)",
+#       "host": "my-cluster.abc123.us-east-1.redshift.amazonaws.com",
+#       "port": 5439,
+#       "database": "dev",
+#       "user": "svc_ydyl",
+#       "password": "..."
 #     }
 #   ]
 # Unlike Postgres presets (a connection string with embedded credentials),
@@ -223,6 +235,19 @@ DEFAULT_CONN = "postgresql://postgres:password@host:23456/defaultdb?sslmode=veri
 # plain-TCP connect() attempt against one fails with a confusing
 # "DPY-4011: the database or network closed the connection" rather than a
 # normal auth error).
+#
+# Redshift presets are the same "no ambient identity" story as Databricks'/
+# Oracle's - a Redshift preset MUST carry its own explicit "password" right
+# here in the file (this first pass is plain username/password only, over
+# TLS - always required, not opt-in the way Oracle's "ssl" flag is - see
+# backends/redshift.py's module docstring; AWS IAM temporary credentials
+# and the Redshift Data API are deferred follow-up, not supported here).
+# "host"/"database"/"user"/"password" are required; "port" defaults to 5439
+# (Redshift's standard port) when omitted; "schema" is optional (omitted =
+# the connecting user's own default search_path - unlike Oracle, Redshift
+# has genuine Postgres-style schemas, so this really is a separate
+# namespace, not a stand-in for a user - see backends/redshift.py's module
+# docstring).
 #
 # No implicit default path: if DATABASE_PRESETS_FILE isn't set, presets are
 # empty (same "no presets configured" fallback as before - see below).
@@ -477,6 +502,39 @@ if raw_db_presets.strip():
                 preset["schema"] = schema
             if entry.get("ssl"):
                 preset["ssl"] = True
+            CONFIGURED_DBS.append(preset)
+
+        elif db_type == "redshift":
+            host = (entry.get("host") or "").strip()
+            database = (entry.get("database") or "").strip()
+            rs_user = (entry.get("user") or "").strip()
+            password = entry.get("password") or ""
+            if not (host and database and rs_user and password):
+                logger.warning(
+                    "Skipping Redshift preset '%s': requires 'host', 'database', 'user', "
+                    "and 'password' - Redshift has no ADC-equivalent ambient identity to "
+                    "fall back to (see backends/redshift.py's module docstring).",
+                    name,
+                )
+                continue
+            port = entry.get("port") or 5439
+            schema = (entry.get("schema") or "").strip()
+            preset = {
+                "name": name,
+                "type": "redshift",
+                # Synthetic identifier, not a credential - mirrors
+                # config_routes.py's _redshift_url (duplicated here rather
+                # than imported, since config_routes.py imports FROM this
+                # module - see the comment above DATABASE_PRESETS_FILE).
+                "url": f"redshift://{host}:{port}/{database}",
+                "host": host,
+                "port": port,
+                "database": database,
+                "user": rs_user,
+                "password": password,
+            }
+            if schema:
+                preset["schema"] = schema
             CONFIGURED_DBS.append(preset)
 
         else:

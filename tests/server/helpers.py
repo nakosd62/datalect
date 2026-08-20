@@ -686,6 +686,81 @@ def install_fake_oracle_connect(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Fake Redshift connect() (config_routes.py's connect()/identity_label()/
+# close() probe, at POST/GET /api/config - not backends/redshift.py's own
+# get_schema()/execute() unit tests, which reuse FakePgConnection/
+# FakePgCursor above directly instead, since RedshiftBackend talks the same
+# psycopg2 DB-API shape backends/postgres.py does)
+# ---------------------------------------------------------------------------
+# Deliberately a real lightweight class, not a bare object() the way
+# FakePyMySQLConnectHarness's connect() returns - RedshiftBackend.connect()
+# sets `connection.autocommit = True` directly (an attribute assignment,
+# not a method call the way PyMySQL's Connection.autocommit is), which a
+# bare object() instance can't support (no __dict__), so this needs its own
+# small class the same way FakeOracleConnection does. No fetchone() on the
+# cursor - same minimal-fake precedent as _FakeOracleCursor: identity_label()
+# calling it against this fake raises, which config_routes.py's GET handler
+# already catches and degrades to "Unknown"/"Unknown" rather than failing
+# the request, and no test here asserts on that value (see
+# test_config_oracle.py's equivalent tests).
+
+class _FakeRedshiftCursor:
+    def __init__(self, calls):
+        self._calls = calls
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def execute(self, sql, params=None):
+        self._calls.append((sql, params))
+
+
+class FakeRedshiftConnection:
+    def __init__(self):
+        self.cursor_calls = []
+        self.autocommit = False
+        self.closed = False
+
+    def cursor(self):
+        return _FakeRedshiftCursor(self.cursor_calls)
+
+    def close(self):
+        self.closed = True
+
+
+class FakeRedshiftConnectHarness:
+    def __init__(self):
+        self.calls = []  # list of kwargs dicts, one per connect() call
+        self.connections = []  # the FakeRedshiftConnection returned by each call
+
+    def connect(self, **kwargs):
+        self.calls.append(kwargs)
+        connection = FakeRedshiftConnection()
+        self.connections.append(connection)
+        return connection
+
+
+def install_fake_redshift_connect(monkeypatch):
+    """Patches backends.redshift's psycopg2.connect with a fake that
+    records its kwargs instead of opening a real connection, and returns
+    the FakeRedshiftConnectHarness controlling it. Must be called *after*
+    the module has been imported, same caveat as install_fake_oracle_connect
+    above. A separate fake from backends.postgres's own `import psycopg2` -
+    patching backends.redshift's module-level reference has no effect on
+    backends.postgres's, even though both ultimately name the same
+    third-party package, since each module holds its own name binding from
+    its own `import psycopg2` statement."""
+    import backends.redshift as rsmod
+
+    harness = FakeRedshiftConnectHarness()
+    monkeypatch.setattr(rsmod.psycopg2, "connect", harness.connect)
+    return harness
+
+
+# ---------------------------------------------------------------------------
 # Fake Firestore client
 # ---------------------------------------------------------------------------
 # A hand-built fake that reproduces real Firestore semantics closely enough

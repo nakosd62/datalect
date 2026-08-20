@@ -102,6 +102,17 @@ it's actually the *user/owner* objects belong to, and querying a different
 one than the connecting user requires an explicit ALTER SESSION SET
 CURRENT_SCHEMA once connected (see backends/oracle.py's module docstring
 for the identifier-validation reasoning behind that).
+
+Redshift is the same "no ADC-equivalent ambient identity, own preset
+credential" shape as Oracle/Databricks - an admin-configured Redshift
+preset carries its own explicit password right in app_config.py's presets
+file, copied across into the session's db_config wherever that preset is
+selected. Unlike Oracle, Redshift's "schema" descriptor field really is a
+separate Postgres-style namespace (not a stand-in for a user) - see
+backends/redshift.py's module docstring. Also unlike Oracle, there's no
+"ssl" descriptor field/opt-in flag: Redshift connections always require
+TLS (see backends/redshift.py's connect()), so it's simply always on
+rather than a per-connection choice.
 """
 
 import json
@@ -158,6 +169,14 @@ def _oracle_url(host, port, service_name_or_sid):
     caller resolved (service_name preferred - see backends/oracle.py's
     connect())."""
     return f"oracle://{host}:{port}/{service_name_or_sid}"
+
+
+def _redshift_url(host, port, database):
+    """Synthetic, non-secret identifier for a Redshift connection - same
+    role _bigquery_url/_snowflake_url/_databricks_url/_oracle_url play
+    (schema-cache key, preset/custom-connection matching, display), but is
+    never a credential."""
+    return f"redshift://{host}:{port}/{database}"
 
 
 def _credential_for_key(config):
@@ -292,6 +311,28 @@ def _resolve_oracle_credentials(user_identity, host, port, service_name_or_sid, 
     return (matches[0].get("config") or {}).get("password")
 
 
+def _resolve_redshift_credentials(user_identity, host, port, database, provided_password, name=None):
+    """Returns the password to persist for a Redshift connection - mirrors
+    _resolve_oracle_credentials' role (letting a user re-select or rename
+    an already-saved connection without re-entering its credential every
+    time it's touched). Same single-credential-shape simplicity as
+    Databricks/Oracle - this first pass is plain username/password only,
+    no IAM temporary credentials - see backends/redshift.py's module
+    docstring."""
+    if provided_password:
+        return provided_password
+    target_url = _redshift_url(host, port, database)
+    existing = state_store.get_db_connections(user_identity, include_credentials=True)
+    matches = [db for db in existing if db.get("type") == "redshift" and db.get("url") == target_url]
+    if not matches:
+        return None
+    if name:
+        named_match = next((db for db in matches if db.get("name") == name), None)
+        if named_match:
+            return (named_match.get("config") or {}).get("password")
+    return (matches[0].get("config") or {}).get("password")
+
+
 _CUSTOM_BIGQUERY_MISSING_FIELDS_ERROR = (
     "Custom BigQuery connections require both a billing project ID and a "
     "service-account key (JSON). This app's own project never pays for a "
@@ -318,6 +359,12 @@ _CUSTOM_ORACLE_MISSING_FIELDS_ERROR = (
     "either a service name or a SID. Oracle has no ambient/shared identity "
     "this app can fall back to - every connection needs its own explicit "
     "credential."
+)
+
+_CUSTOM_REDSHIFT_MISSING_FIELDS_ERROR = (
+    "Custom Redshift connections require a host, a database, a user, and a "
+    "password. Redshift has no ambient/shared identity this app can fall "
+    "back to - every connection needs its own explicit credential."
 )
 
 
@@ -544,6 +591,58 @@ def _parse_incoming_connection(data, user_identity, is_custom):
                 db_config["ssl"] = True
         return db_type, db_url, db_config, None
 
+    if db_type == 'redshift':
+        host = (data.get('host') or '').strip()
+        database = (data.get('database') or '').strip()
+        user = (data.get('user') or '').strip()
+        schema = (data.get('schema') or '').strip()
+        raw_port = data.get('port')
+        # Same "core identifying fields, nothing inferred" threshold every
+        # other structured dialect above uses - a request missing any of
+        # these isn't enough to even identify a connection yet (e.g. a
+        # fresh blank row), not a validation error - see the docstring
+        # above.
+        if not (host and database and user):
+            return db_type, None, {}, None
+        try:
+            port = int(raw_port) if raw_port else 5439
+        except (TypeError, ValueError):
+            port = 5439
+        db_url = _redshift_url(host, port, database)
+        db_config = {"host": host, "port": port, "database": database, "user": user}
+        if schema:
+            db_config["schema"] = schema
+
+        if is_custom:
+            # Same policy as Oracle's/Databricks'/Snowflake's custom
+            # connections: every field explicit, nothing inferred, nothing
+            # falls back to a shared/app identity or to an admin preset's
+            # credential - Redshift has no ADC-equivalent ambient auth mode
+            # to fall back to (see backends/redshift.py's module
+            # docstring).
+            password = _resolve_redshift_credentials(
+                user_identity, host, port, database, data.get('password'),
+                name=data.get('database_name'),
+            )
+            if not password:
+                return db_type, db_url, db_config, _CUSTOM_REDSHIFT_MISSING_FIELDS_ERROR
+            db_config["password"] = password
+        else:
+            # A genuine admin-preset selection (matched by its real fields,
+            # not preset_index - see the anonymous branch in handle_config
+            # for that path). Like an Oracle preset, a Redshift preset DOES
+            # carry its own credential (app_config.py - Redshift has no
+            # ADC-equivalent ambient identity to fall back to), so it must
+            # be copied across here or connect() downstream would raise
+            # "requires a user and password" against an empty db_config.
+            preset_match = next(
+                (db for db in CONFIGURED_DBS if db.get("type") == "redshift" and db.get("url") == db_url),
+                None,
+            )
+            if preset_match and preset_match.get("password"):
+                db_config["password"] = preset_match["password"]
+        return db_type, db_url, db_config, None
+
     if db_type == 'mysql':
         # Same shape as Postgres - a single connection-string URL carries
         # everything (host, credentials, database), so there's no
@@ -731,6 +830,38 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
                 "url": url,
                 "config": config,
             })
+        elif db_type == 'redshift':
+            host = (db.get('host') or '').strip()
+            database = (db.get('database') or '').strip()
+            user = (db.get('user') or '').strip()
+            schema = (db.get('schema') or '').strip()
+            raw_port = db.get('port')
+            if not (host and database and user):
+                continue
+            try:
+                port = int(raw_port) if raw_port else 5439
+            except (TypeError, ValueError):
+                port = 5439
+            url = _redshift_url(host, port, database)
+            password = _resolve_redshift_credentials(
+                user_identity, host, port, database, db.get('password'),
+                name=db.get('name'),
+            )
+            if not password:
+                # Incomplete - not ready to save yet (see docstring above).
+                continue
+            config = {"host": host, "port": port, "database": database, "user": user}
+            if schema:
+                config["schema"] = schema
+            config["password"] = password
+            name = db.get("name") or database or "Custom Redshift"
+            merged.append({
+                "connection_key": compute_connection_key(name, url, password),
+                "name": name,
+                "type": "redshift",
+                "url": url,
+                "config": config,
+            })
         else:
             # Postgres and MySQL both land here - a single connection-
             # string URL carries everything, so there's nothing dialect-
@@ -876,6 +1007,23 @@ def handle_config():
                         new_db_config["password"] = preset["password"]
                     if preset.get("ssl"):
                         new_db_config["ssl"] = True
+                elif new_db_type == 'redshift':
+                    new_db_config = {
+                        "host": preset.get("host", ""),
+                        "port": preset.get("port", 5439),
+                        "database": preset.get("database", ""),
+                        "user": preset.get("user", ""),
+                    }
+                    if preset.get("schema"):
+                        new_db_config["schema"] = preset["schema"]
+                    # Like Oracle, Redshift has no ambient identity to fall
+                    # back to - a preset's password lives right in
+                    # app_config.py's CONFIGURED_DBS entry and must be
+                    # copied across, or connect() downstream raises
+                    # "requires a user and password" against an empty
+                    # config.
+                    if preset.get("password"):
+                        new_db_config["password"] = preset["password"]
 
             if new_db_url or new_auto_sql_execute is not None:
                 state_store.set_session(
@@ -939,6 +1087,8 @@ def handle_config():
                                 new_db_config.get("service_name") or new_db_config.get("sid")
                                 or "Custom Oracle"
                             )
+                        elif new_db_type == 'redshift':
+                            db_name_to_save = new_db_config.get("database") or "Custom Redshift"
                         else:
                             try:
                                 parsed = urlparse(new_db_url)
@@ -1114,17 +1264,26 @@ def handle_config():
         'active_database_account': active_db_config.get("account", "") if active_db_type_out == "snowflake" else "",
         'active_database_warehouse': active_db_config.get("warehouse", "") if active_db_type_out == "snowflake" else "",
         'active_database_snowflake_database': active_db_config.get("database", "") if active_db_type_out == "snowflake" else "",
-        'active_database_schema': active_db_config.get("schema", "") if active_db_type_out in ("snowflake", "databricks", "oracle") else "",
+        'active_database_schema': active_db_config.get("schema", "") if active_db_type_out in ("snowflake", "databricks", "oracle", "redshift") else "",
         'active_database_role': active_db_config.get("role", "") if active_db_type_out == "snowflake" else "",
         'active_database_server_hostname': active_db_config.get("server_hostname", "") if active_db_type_out == "databricks" else "",
         'active_database_http_path': active_db_config.get("http_path", "") if active_db_type_out == "databricks" else "",
         'active_database_catalog': active_db_config.get("catalog", "") if active_db_type_out == "databricks" else "",
-        'active_database_host': active_db_config.get("host", "") if active_db_type_out == "oracle" else "",
-        'active_database_port': active_db_config.get("port", "") if active_db_type_out == "oracle" else "",
+        'active_database_host': active_db_config.get("host", "") if active_db_type_out in ("oracle", "redshift") else "",
+        'active_database_port': active_db_config.get("port", "") if active_db_type_out in ("oracle", "redshift") else "",
         'active_database_service_name': active_db_config.get("service_name", "") if active_db_type_out == "oracle" else "",
         'active_database_sid': active_db_config.get("sid", "") if active_db_type_out == "oracle" else "",
         'active_database_oracle_user': active_db_config.get("user", "") if active_db_type_out == "oracle" else "",
         'active_database_ssl': bool(active_db_config.get("ssl")) if active_db_type_out == "oracle" else False,
+        # Redshift's "host"/"port"/"schema" reuse Oracle's already-generic
+        # field names above (same shape, no need for parallel ones), but
+        # "database" and "user" get their own dialect-specific fields -
+        # Oracle's own "service_name"/"sid"/"oracle_user" don't map cleanly
+        # onto Redshift's plain "database"/"user" (Redshift's "user" isn't
+        # scoped ambiguously the way Oracle's needed its own field name to
+        # avoid colliding with a future generic "active_database_user").
+        'active_database_redshift_database': active_db_config.get("database", "") if active_db_type_out == "redshift" else "",
+        'active_database_redshift_user': active_db_config.get("user", "") if active_db_type_out == "redshift" else "",
         'custom_database_name': user_custom_name or "",
         'custom_database_url': user_custom_url or "",
         'custom_databases': custom_databases or [],

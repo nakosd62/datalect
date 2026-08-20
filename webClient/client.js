@@ -885,12 +885,21 @@ document.addEventListener('DOMContentLoaded', async () => {
         config: { host: '', port: '', service_name: '', sid: '', schema: '', user: '', password: '', ssl: true },
       };
     }
+    if (type === 'redshift') {
+      // No "ssl" field, unlike Oracle's - Redshift connections always
+      // require TLS (see backends/redshift.py's connect()), so there's no
+      // per-connection choice to expose here.
+      return {
+        name: '', type: 'redshift', url: '',
+        config: { host: '', port: '', database: '', schema: '', user: '', password: '' },
+      };
+    }
     // Postgres and MySQL share the same simple shape (a single URL field,
     // no dialect-specific config) - see backends/mysql.py's module
     // docstring - so both fall through here, preserving whichever of the
     // two was actually selected rather than collapsing MySQL into
     // Postgres. Any other/unrecognized value (there shouldn't be one -
-    // the dropdown only ever offers these six types) also lands on
+    // the dropdown only ever offers these seven types) also lands on
     // Postgres, matching this function's original default.
     return { name: '', type: (type === 'mysql' ? 'mysql' : 'postgres'), url: '', config: {} };
   }
@@ -912,6 +921,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       const isMySQL = db.type === 'mysql';
       const isDatabricks = db.type === 'databricks';
       const isOracle = db.type === 'oracle';
+      const isRedshift = db.type === 'redshift';
       const sfAuthMethod = cfg.auth_method || (cfg.private_key ? 'private_key' : 'password');
       // ACTIVE_IS_CUSTOM gates this, not just URL equality - a custom
       // connection's URL can collide with a preset's, and when the active
@@ -952,12 +962,13 @@ document.addEventListener('DOMContentLoaded', async () => {
           <div class="custom-db-header-row">
             <input type="radio" name="db_connection_option" value="custom-${index}" data-dbname="${db.name || ''}" ${isSelected ? 'checked' : ''}>
             <select class="config-input custom-db-type-select" data-index="${index}">
-              <option value="postgres" ${(!isBigQuery && !isSnowflake && !isMySQL && !isDatabricks && !isOracle) ? 'selected' : ''}>PostgreSQL</option>
+              <option value="postgres" ${(!isBigQuery && !isSnowflake && !isMySQL && !isDatabricks && !isOracle && !isRedshift) ? 'selected' : ''}>PostgreSQL</option>
               <option value="mysql" ${isMySQL ? 'selected' : ''}>MySQL</option>
               <option value="bigquery" ${isBigQuery ? 'selected' : ''}>BigQuery</option>
               <option value="snowflake" ${isSnowflake ? 'selected' : ''}>Snowflake</option>
               <option value="databricks" ${isDatabricks ? 'selected' : ''}>Databricks</option>
               <option value="oracle" ${isOracle ? 'selected' : ''}>Oracle</option>
+              <option value="redshift" ${isRedshift ? 'selected' : ''}>Redshift</option>
             </select>
             <div class="custom-db-field">
               <label class="custom-db-field-label" for="custom-db-name-${index}">Name:</label>
@@ -1116,6 +1127,37 @@ document.addEventListener('DOMContentLoaded', async () => {
                 <input type="checkbox" id="custom-db-ora-ssl-${index}" class="config-input custom-db-ora-ssl" data-index="${index}" ${cfg.ssl ? 'checked' : ''}>
                 <span class="checkbox-label">Use TLS (required for Oracle Cloud)</span>
               </label>
+            </div>
+          </div>
+          ` : isRedshift ? `
+          <div class="custom-db-field-row">
+            <div class="custom-db-field">
+              <label class="custom-db-field-label" for="custom-db-rs-host-${index}">Host:</label>
+              <input type="text" id="custom-db-rs-host-${index}" class="config-input custom-db-rs-host" data-index="${index}" placeholder="e.g. my-cluster.abc123.us-east-1.redshift.amazonaws.com" value="${cfg.host || ''}" autocomplete="off">
+            </div>
+            <div class="custom-db-field">
+              <label class="custom-db-field-label" for="custom-db-rs-port-${index}">Port:</label>
+              <input type="text" id="custom-db-rs-port-${index}" class="config-input custom-db-rs-port" data-index="${index}" placeholder="5439" value="${cfg.port || ''}" autocomplete="off">
+            </div>
+          </div>
+          <div class="custom-db-field-row">
+            <div class="custom-db-field">
+              <label class="custom-db-field-label" for="custom-db-rs-database-${index}">Database:</label>
+              <input type="text" id="custom-db-rs-database-${index}" class="config-input custom-db-rs-database" data-index="${index}" placeholder="Database" value="${cfg.database || ''}" autocomplete="off">
+            </div>
+            <div class="custom-db-field">
+              <label class="custom-db-field-label" for="custom-db-rs-schema-${index}">Schema: <span class="optional-hint">(optional)</span></label>
+              <input type="text" id="custom-db-rs-schema-${index}" class="config-input custom-db-rs-schema" data-index="${index}" placeholder="Defaults to the connecting user's search_path" value="${cfg.schema || ''}" autocomplete="off">
+            </div>
+          </div>
+          <div class="custom-db-field-row">
+            <div class="custom-db-field">
+              <label class="custom-db-field-label" for="custom-db-rs-user-${index}">User:</label>
+              <input type="text" id="custom-db-rs-user-${index}" class="config-input custom-db-rs-user" data-index="${index}" placeholder="Username" value="${cfg.user || ''}" autocomplete="off">
+            </div>
+            <div class="custom-db-field">
+              <label class="custom-db-field-label" for="custom-db-rs-password-${index}">Password:</label>
+              <input type="password" id="custom-db-rs-password-${index}" class="config-input custom-db-rs-password" data-index="${index}" placeholder="${db.has_custom_credentials ? 'Password saved - leave blank to keep it, or type a new one to replace it' : 'Password'}" autocomplete="off">
             </div>
           </div>
           ` : `
@@ -1356,6 +1398,42 @@ document.addEventListener('DOMContentLoaded', async () => {
       });
     });
 
+    container.querySelectorAll(
+      '.custom-db-rs-host, .custom-db-rs-port, .custom-db-rs-database, '
+      + '.custom-db-rs-schema, .custom-db-rs-user, .custom-db-rs-password'
+    ).forEach(input => {
+      const index = parseInt(input.dataset.index);
+      const radio = container.querySelector(`input[value="custom-${index}"]`);
+      input.addEventListener('focus', () => { if (radio) radio.checked = true; });
+      input.addEventListener('input', () => {
+        if (radio) radio.checked = true;
+        const db = customDatabases[index];
+        if (!db.config) db.config = {};
+        if (input.classList.contains('custom-db-rs-host')) db.config.host = input.value.trim();
+        if (input.classList.contains('custom-db-rs-port')) db.config.port = input.value.trim();
+        if (input.classList.contains('custom-db-rs-database')) db.config.database = input.value.trim();
+        if (input.classList.contains('custom-db-rs-schema')) db.config.schema = input.value.trim();
+        if (input.classList.contains('custom-db-rs-user')) db.config.user = input.value.trim();
+        if (input.classList.contains('custom-db-rs-password')) db.config.password = input.value;
+        // Synthetic (non-secret) identifier, kept in sync so radio-selection
+        // matching against activeUrl still works the same way it does for
+        // every other structured-descriptor row. Mirrors config_routes.py's
+        // _redshift_url exactly, including the same 5439 default port used
+        // when the field is left blank.
+        db.url = (db.config.host && db.config.database)
+          ? `redshift://${db.config.host}:${db.config.port || 5439}/${db.config.database}`
+          : '';
+        // Same rule as the other dialect inputs above: don't clobber a
+        // name the user already typed themselves.
+        if (!db.name) {
+          db.name = db.config.database || 'Custom Redshift';
+          const nameInput = container.querySelector(`.custom-db-name-input[data-index="${index}"]`);
+          if (nameInput) nameInput.value = db.name;
+        }
+        if (radio) radio.dataset.dbname = db.name;
+      });
+    });
+
     const addBtn = document.getElementById('addCustomDbBtn');
     if (addBtn) {
       addBtn.addEventListener('click', () => {
@@ -1491,11 +1569,19 @@ document.addEventListener('DOMContentLoaded', async () => {
     const isCompleteOracle = (db) => db && db.type === 'oracle' && db.config
       && db.config.host && db.config.user && (db.config.service_name || db.config.sid)
       && (db.config.password || db.has_custom_credentials);
+    // Same idea for Redshift - core identifying fields (host, database,
+    // user) plus a single credential shape (password), same "freshly
+    // entered, or already saved server-side" rule as every other
+    // structured dialect above (see backends/redshift.py's module
+    // docstring - plain username/password only for this first pass).
+    const isCompleteRedshift = (db) => db && db.type === 'redshift' && db.config
+      && db.config.host && db.config.database && db.config.user
+      && (db.config.password || db.has_custom_credentials);
     // Postgres and MySQL are both "simple URL" dialects (see
     // backends/mysql.py's module docstring) - a single non-blank url is
     // all either needs to be selectable/saveable. Named generically
     // (not isCompletePostgres) since it now covers both.
-    const isCompleteSimpleUrlDb = (db) => db && db.type !== 'bigquery' && db.type !== 'snowflake' && db.type !== 'databricks' && db.type !== 'oracle'
+    const isCompleteSimpleUrlDb = (db) => db && db.type !== 'bigquery' && db.type !== 'snowflake' && db.type !== 'databricks' && db.type !== 'oracle' && db.type !== 'redshift'
       && db.url && db.url.trim() !== "";
 
     const selectedDbRadio = document.querySelector('input[name="db_connection_option"]:checked');
@@ -1504,7 +1590,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         isCustomOption = true;
         const index = parseInt(selectedDbRadio.value.split('-')[1]);
         const selectedDb = customDatabases[index];
-        const isComplete = (d) => isCompleteBigQuery(d) || isCompleteSnowflake(d) || isCompleteDatabricks(d) || isCompleteOracle(d) || isCompleteSimpleUrlDb(d);
+        const isComplete = (d) => isCompleteBigQuery(d) || isCompleteSnowflake(d) || isCompleteDatabricks(d) || isCompleteOracle(d) || isCompleteRedshift(d) || isCompleteSimpleUrlDb(d);
         const chosen = isComplete(selectedDb) ? selectedDb : customDatabases.find(isComplete);
 
         if (isCompleteBigQuery(chosen)) {
@@ -1564,6 +1650,20 @@ document.addEventListener('DOMContentLoaded', async () => {
           dbSsl = Boolean(chosen.config.ssl);
           dbNameValue = chosen.name || dbServiceName || dbSid;
           dbUrlValue = `oracle://${dbHost}:${dbPort || 1521}/${dbServiceName || dbSid}`;
+        } else if (isCompleteRedshift(chosen)) {
+          dbType = 'redshift';
+          dbHost = chosen.config.host;
+          dbPort = chosen.config.port || null;
+          dbDatabase = chosen.config.database;
+          dbUser = chosen.config.user;
+          dbSchema = chosen.config.schema || null;
+          // May be blank if the user didn't retype a password while just
+          // re-selecting/renaming an already-saved connection - the server
+          // reuses the previously-stored password in that case (it's never
+          // sent back to us to re-display, see get_db_connections).
+          dbPassword = chosen.config.password || null;
+          dbNameValue = chosen.name || dbDatabase;
+          dbUrlValue = `redshift://${dbHost}:${dbPort || 5439}/${dbDatabase}`;
         } else if (isCompleteSimpleUrlDb(chosen)) {
           dbType = chosen.type === 'mysql' ? 'mysql' : 'postgres';
           dbUrlValue = chosen.url;
@@ -1638,6 +1738,18 @@ document.addEventListener('DOMContentLoaded', async () => {
           // connection and every subsequent query would fail.
           dbPassword = matchedDb.password || null;
           dbSsl = Boolean(matchedDb.ssl);
+        } else if (dbType === 'redshift' && matchedDb) {
+          dbHost = matchedDb.host;
+          dbPort = matchedDb.port || null;
+          dbDatabase = matchedDb.database;
+          dbUser = matchedDb.user;
+          dbSchema = matchedDb.schema || null;
+          // Like Oracle, a Redshift preset carries its own credential right
+          // here (CONFIGURED_DBS) - Redshift has no ADC-style ambient
+          // identity either (see backends/redshift.py's module docstring) -
+          // without resending it, the server would save a credential-less
+          // connection and every subsequent query would fail.
+          dbPassword = matchedDb.password || null;
         }
       }
     } else {
@@ -1654,7 +1766,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       database_type: dbType,
       is_custom: isCustomOption,
       custom_databases: customDatabases
-        .filter(d => isCompleteBigQuery(d) || isCompleteSnowflake(d) || isCompleteDatabricks(d) || isCompleteOracle(d) || isCompleteSimpleUrlDb(d))
+        .filter(d => isCompleteBigQuery(d) || isCompleteSnowflake(d) || isCompleteDatabricks(d) || isCompleteOracle(d) || isCompleteRedshift(d) || isCompleteSimpleUrlDb(d))
         .map(d => {
           if (isCompleteBigQuery(d)) {
             return {
@@ -1706,6 +1818,18 @@ document.addEventListener('DOMContentLoaded', async () => {
               ssl: d.config.ssl || undefined,
             };
           }
+          if (isCompleteRedshift(d)) {
+            return {
+              type: 'redshift',
+              name: d.name,
+              host: d.config.host,
+              port: d.config.port || undefined,
+              database: d.config.database,
+              user: d.config.user,
+              schema: d.config.schema || undefined,
+              password: d.config.password || undefined,
+            };
+          }
           return { type: (d.type === 'mysql' ? 'mysql' : 'postgres'), name: d.name, url: d.url };
         }),
       auto_sql_execute: autoSqlExecuteValue
@@ -1742,6 +1866,13 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (dbSchema) payload.schema = dbSchema;
       if (dbPassword) payload.password = dbPassword;
       if (dbSsl) payload.ssl = true;
+    } else if (dbType === 'redshift') {
+      payload.host = dbHost;
+      if (dbPort) payload.port = dbPort;
+      payload.database = dbDatabase;
+      payload.user = dbUser;
+      if (dbSchema) payload.schema = dbSchema;
+      if (dbPassword) payload.password = dbPassword;
     } else {
       payload.database_url = dbUrlValue;
     }
@@ -1856,9 +1987,9 @@ document.addEventListener('DOMContentLoaded', async () => {
   if (configTriggerBadge && configModal) {
     configTriggerBadge.addEventListener('click', async () => {
       // Anonymous users may open this dialog too - they can switch between
-      // admin-configured presets, just not save a custom connection (the
-      // custom-connection UI itself is hidden for them - see
-      // renderCustomDbRows()).
+      // admin-configured presets AND save their own custom connections
+      // (see isAnonymousUser's comment above and config_routes.py's
+      // handle_config).
       await fetchBackendConfig();
       const configSaveErrorEl = document.getElementById('configSaveError');
       if (configSaveErrorEl) {

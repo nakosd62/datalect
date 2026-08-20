@@ -617,13 +617,13 @@ test.describe('config modal', () => {
     expect(saveBox.y + saveBox.height).toBeLessThanOrEqual(cardBox.y + cardBox.height + 1);
   });
 
-  test('the type dropdown offers PostgreSQL, MySQL, BigQuery, Snowflake, Databricks, and Oracle', async ({ page }) => {
+  test('the type dropdown offers PostgreSQL, MySQL, BigQuery, Snowflake, Databricks, Oracle, and Redshift', async ({ page }) => {
     await gotoApp(page);
     await openConfigModal(page);
     await addCustomDbRow(page);
 
     const options = await page.locator('.custom-db-type-select').last().locator('option').allTextContents();
-    expect(options).toEqual(['PostgreSQL', 'MySQL', 'BigQuery', 'Snowflake', 'Databricks', 'Oracle']);
+    expect(options).toEqual(['PostgreSQL', 'MySQL', 'BigQuery', 'Snowflake', 'Databricks', 'Oracle', 'Redshift']);
   });
 
   test('adding a custom MySQL connection persists it and updates the badge', async ({ page }) => {
@@ -875,5 +875,87 @@ test.describe('config modal', () => {
     await page.locator('.custom-db-type-select').last().selectOption('oracle');
 
     await expect(page.locator('.custom-db-ora-password').last()).toHaveValue('');
+  });
+
+  // Redshift coverage below is deliberately narrow, for the same reason
+  // Snowflake's/Databricks'/Oracle's is (see the comments above those
+  // blocks): posting a complete custom Redshift connection here would make
+  // config_routes.py's post-save identity-check block (backend.connect() -
+  // see handle_config) actually try to reach a fake cluster over the
+  // network from this test run, on a single-threaded, unthreaded dev
+  // server - a slow DNS/connection failure there would block every other
+  // request in this suite. The save-succeeds / credential-never-leaks /
+  // credential-reuse behaviors this would otherwise cover are already
+  // fully exercised, safely, at the Python level against a mocked
+  // connector - see tests/server/test_config_redshift.py. Unlike Oracle,
+  // there's no "Use TLS" checkbox here - Redshift connections always
+  // require TLS (see backends/redshift.py's connect()), so it's simply
+  // always on rather than a per-connection choice.
+  test('custom Redshift row shows Host, Port, Database, Schema, User, and Password fields', async ({ page }) => {
+    await gotoApp(page);
+    await openConfigModal(page);
+
+    await addCustomDbRow(page);
+    await page.locator('.custom-db-type-select').last().selectOption('redshift');
+
+    await expect(page.locator('.custom-db-rs-host').last()).toBeVisible();
+    await expect(page.locator('.custom-db-rs-port').last()).toBeVisible();
+    await expect(page.locator('.custom-db-rs-database').last()).toBeVisible();
+    await expect(page.locator('.custom-db-rs-schema').last()).toBeVisible();
+    await expect(page.locator('.custom-db-rs-user').last()).toBeVisible();
+    await expect(page.locator('.custom-db-rs-password').last()).toBeVisible();
+  });
+
+  test('a Redshift custom row labels each field on its own line: Host/Port, Database/Schema, then User/Password', async ({ page }) => {
+    await gotoApp(page);
+    await openConfigModal(page);
+    await addCustomDbRow(page);
+    await page.locator('.custom-db-type-select').last().selectOption('redshift');
+
+    const card = page.locator('.custom-db-card').last();
+    const fieldRows = card.locator('.custom-db-field-row');
+    await expect(fieldRows).toHaveCount(3);
+    await expect(fieldRows.nth(0).locator('.custom-db-field-label')).toHaveText(['Host:', 'Port:']);
+    await expect(fieldRows.nth(1).locator('.custom-db-field-label')).toHaveText(['Database:', 'Schema: (optional)']);
+    await expect(fieldRows.nth(2).locator('.custom-db-field-label')).toHaveText(['User:', 'Password:']);
+  });
+
+  test('an incomplete custom Redshift row (no database / password) is never submitted', async ({ page }) => {
+    // Same client-side gate as the BigQuery/Snowflake/Databricks/Oracle
+    // cases above (triggerConfigSave's isCompleteRedshift()) - and since
+    // the row never makes it into the request, this never triggers the
+    // real-network-call risk described above either (database_type stays
+    // 'postgres', falling back to the untouched default preset).
+    await gotoApp(page);
+    await openConfigModal(page);
+
+    await addCustomDbRow(page);
+    await page.locator('.custom-db-type-select').last().selectOption('redshift');
+    await page.locator('.custom-db-rs-host').last().fill('cluster.example.com');
+    await page.locator('.custom-db-rs-user').last().fill('alice');
+    // Deliberately leave database and password blank.
+
+    await page.locator('#configSaveBtn').click();
+
+    await expect(page.locator('#configModal')).toHaveClass(/hidden/);
+    await expect(page.locator('#connDbName')).toHaveText('Default DB');
+
+    await openConfigModal(page);
+    await expect(page.locator('.custom-db-rs-host')).toHaveCount(0);
+  });
+
+  test('the Redshift password never round-trips back into the page', async ({ page }) => {
+    // Mirrors the BigQuery service-account-key/Databricks access-token/
+    // Oracle password tests above: a password is a credential, never
+    // redisplayed once saved, same as every other dialect's credential
+    // field(s). The row is never actually submitted here (see the
+    // network-call caution above) - this just pins that the field starts,
+    // and stays, blank rather than ever showing a value.
+    await gotoApp(page);
+    await openConfigModal(page);
+    await addCustomDbRow(page);
+    await page.locator('.custom-db-type-select').last().selectOption('redshift');
+
+    await expect(page.locator('.custom-db-rs-password').last()).toHaveValue('');
   });
 });
