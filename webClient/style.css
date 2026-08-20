@@ -1345,6 +1345,24 @@ textarea:focus {
   overflow: hidden;
 }
 
+.results-retry-status {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.6rem 1rem;
+  background: rgba(245, 158, 11, 0.08);
+  border-bottom: 1px solid rgba(245, 158, 11, 0.3);
+  color: #fbbf24;
+  font-size: 0.85rem;
+}
+
+.results-retry-status .retry-status-icon {
+  display: inline-flex;
+  font-size: 0.95rem;
+  line-height: 1;
+}
+
 .results-tabs-nav {
   flex-shrink: 0;
   display: flex;

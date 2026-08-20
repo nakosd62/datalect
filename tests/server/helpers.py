@@ -179,6 +179,31 @@ def login_as(test_client, email):
     test_client.set_cookie("crbot_user_id", email)
 
 
+def parse_translate_stream(resp):
+    """/api/translate streams newline-delimited JSON (NDJSON) rather than a
+    single JSON body - see translate_routes.py's module docstring: zero or
+    more {"status": "retrying", ...} progress lines, then exactly one
+    terminal {"status": "done", success, sql/error, ...} line carrying the
+    same fields the route used to return as its whole body before
+    streaming existed. resp.get_json() can't be used here - it calls
+    json.loads() on the whole response body, which raises on anything but
+    a single JSON value, and a body with even one retry line already has
+    two.
+
+    Returns (retry_events, final_data): `retry_events` is the list of
+    parsed "retrying" lines in order (empty if no retry occurred),
+    `final_data` is the parsed terminal line (or {} if the body was
+    somehow empty). A request that fails validation before streaming
+    starts (missing prompt/API key) returns a single plain JSON object,
+    not NDJSON - that still parses correctly here as a one-line body whose
+    single line becomes `final_data`, with an empty `retry_events` list."""
+    lines = [ln for ln in resp.get_data(as_text=True).splitlines() if ln.strip()]
+    parsed = [json.loads(ln) for ln in lines]
+    retry_events = [p for p in parsed if p.get("status") == "retrying"]
+    final_data = next((p for p in reversed(parsed) if p.get("status") != "retrying"), parsed[-1] if parsed else {})
+    return retry_events, final_data
+
+
 def write_database_presets_file(tmp_path, presets, filename="database_presets.json"):
     """Writes `presets` (a list of preset dicts) as JSON to a file under
     `tmp_path` and returns its absolute path string, ready to hand to

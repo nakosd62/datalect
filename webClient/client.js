@@ -337,6 +337,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const historyTabStatistics = document.getElementById('historyTabStatistics');
 
   // DOM Elements - Results Table & Tabs
+  const resultsRetryStatus = document.getElementById('resultsRetryStatus');
   const resultsTabsNav = document.getElementById('resultsTabsNav');
   const resultsHeader = document.getElementById('resultsHeader');
   const resultsBody = document.getElementById('resultsBody');
@@ -651,11 +652,96 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function clearResultsDisplay() {
+    hideRetryStatus();
     if (resultsTabsNav) resultsTabsNav.classList.add('hidden');
     if (resultsHeader) resultsHeader.innerHTML = '';
     if (resultsBody) resultsBody.innerHTML = '';
     currentResultsList = [];
     activeResultIndex = 0;
+  }
+
+  // Shown at the top of the results area (above the tabs/table, see
+  // index.html) while /api/translate is working through its one
+  // server-side retry loop (translate_routes.py's stream_translation() -
+  // see the comment above readTranslateStream() below for why this is the
+  // only retry loop left after removing the client-side one that used to
+  // duplicate it). Cleared by clearResultsDisplay() so it never lingers
+  // into a fresh translate/execute call or a connection switch.
+  function showRetryStatus({ attempt, maxAttempts, rotatedKey }) {
+    if (!resultsRetryStatus) return;
+    const keyNote = rotatedKey ? ', switching to a different API key' : '';
+    resultsRetryStatus.innerHTML =
+      `<span class="retry-status-icon animate-spin">⟳</span> ` +
+      `Gemini had a transient error${keyNote} - retrying (attempt ${attempt} of ${maxAttempts})...`;
+    resultsRetryStatus.classList.remove('hidden');
+  }
+
+  function hideRetryStatus() {
+    if (!resultsRetryStatus) return;
+    resultsRetryStatus.classList.add('hidden');
+    resultsRetryStatus.innerHTML = '';
+  }
+
+  // /api/translate streams newline-delimited JSON (see
+  // translate_routes.py's module docstring): zero or more
+  // {"status": "retrying", ...} progress lines emitted live as the
+  // server's one Gemini-call retry loop runs, followed by exactly one
+  // terminal {"status": "done", success, sql/error, ...token usage...}
+  // line - the same shape /api/translate used to return as its whole
+  // body before streaming existed. A request that never reaches that
+  // retry loop at all (missing prompt/API key, a 401 from the auth
+  // guard, or a mocked response in tests - see fixtures.js's
+  // mockTranslate()) isn't streamed - it's still a single plain JSON
+  // object, which this reads exactly the same way: one line, no
+  // "status" field, straight into finalData.
+  async function readTranslateStream(response) {
+    if (!response.body || !response.body.getReader) {
+      // No ReadableStream support (very old browser) - fall back to a
+      // single json() read. No retry-progress display in that case, but
+      // still functionally correct once the whole body has arrived.
+      return response.json();
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let finalData = null;
+
+    const consumeLine = (line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return;
+      let parsed;
+      try {
+        parsed = JSON.parse(trimmed);
+      } catch (err) {
+        console.warn('Failed to parse a line of the /api/translate stream:', trimmed, err);
+        return;
+      }
+      if (parsed.status === 'retrying') {
+        showRetryStatus(parsed);
+      } else {
+        finalData = parsed;
+      }
+    };
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (value) buffer += decoder.decode(value, { stream: true });
+
+      let newlineIndex;
+      while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
+        consumeLine(buffer.slice(0, newlineIndex));
+        buffer = buffer.slice(newlineIndex + 1);
+      }
+
+      if (done) {
+        buffer += decoder.decode();
+        consumeLine(buffer);
+        break;
+      }
+    }
+
+    return finalData || {};
   }
 
   // Wipes everything tied to the connection that was just switched away
@@ -2603,45 +2689,42 @@ document.addEventListener('DOMContentLoaded', async () => {
     // active connection (Postgres or BigQuery, with its full descriptor)
     // from that session. A bare URL override would only be able to
     // express a Postgres connection, silently breaking a BigQuery session.
+    //
+    // Exactly one retry loop for a translation exists in this app, and it
+    // lives server-side (translate_routes.py's per-Gemini-call loop, which
+    // classifies the failure and can rotate API keys - something this
+    // client has no visibility into). This used to also retry the whole
+    // /api/translate request client-side after the server had already
+    // exhausted its own attempts, which just silently repeated the same
+    // exhausted attempt budget on top of the server's, multiplying total
+    // latency on a genuinely-down/exhausted backend with nothing to show
+    // for it. A single request, a single attempt.
     let response = null;
     let data = null;
-    let attempts = 0;
-    const maxAttempts = 5;
-
-    while (attempts < maxAttempts) {
-      attempts++;
-      try {
-        response = await fetch('/api/translate', {
-          method: 'POST',
-          headers: getApiHeaders(),
-          credentials: 'same-origin',
-          body: JSON.stringify({
-            prompt: promptText,
-            history: chatStore.toPayload()
-          })
-        });
-
-        data = await response.json();
-
-        const errMsg = data.error || (response.ok ? '' : `Server returned status ${response.status}`);
-        const errUpper = errMsg.toUpperCase();
-        const isResourceExhausted = errUpper.includes('429 RESOURCE_EXHAUSTED');
-        const isTemporaryFailure = errUpper.includes('503 UNAVAILABLE');
-
-        if ((!response.ok || !data.sql) && (isResourceExhausted || isTemporaryFailure) && attempts < maxAttempts) {
-          await new Promise(resolve => setTimeout(resolve, 2000));
-          continue;
-        }
-        break;
-      } catch (err) {
-        if (attempts >= maxAttempts) {
-          throw err;
-        }
-        await new Promise(resolve => setTimeout(resolve, 2000));
-      }
-    }
 
     try {
+      response = await fetch('/api/translate', {
+        method: 'POST',
+        headers: getApiHeaders(),
+        credentials: 'same-origin',
+        body: JSON.stringify({
+          prompt: promptText,
+          history: chatStore.toPayload()
+        })
+      });
+
+      data = await readTranslateStream(response);
+      hideRetryStatus();
+
+      // A streamed translation failure (every retry exhausted, or a
+      // non-retryable error) comes back as HTTP 200 with success:false in
+      // the terminal line, not a real error status - see
+      // translate_routes.py's module docstring for why. The !data.sql
+      // check below already treats that the same as any other failure, so
+      // no separate handling is needed here; response.ok only still
+      // matters for the auth-guard's real 401 (checked below) and for the
+      // early-validation 400s (missing prompt/API key), which return a
+      // real error status because they're not streamed at all.
       if (response && response.ok && data && data.sql) {
         const trimmedSql = data.sql.trim();
         const isOpenHelp = trimmedSql.toUpperCase().includes('OPEN HELP POPUP');
@@ -2719,6 +2802,11 @@ document.addEventListener('DOMContentLoaded', async () => {
           </tr>`;
       }
     } finally {
+      // Safety net for the network-error path (readTranslateStream()
+      // itself throwing, e.g. the connection dropping mid-stream) - the
+      // explicit hideRetryStatus() call above only runs once the stream
+      // actually finished parsing.
+      hideRetryStatus();
       setButtonsDisabled(false);
     }
   }

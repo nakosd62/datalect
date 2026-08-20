@@ -108,6 +108,41 @@ test.describe('translate + execute', () => {
     await expect.poll(() => currentSql(page)).toBe('');
   });
 
+  // /api/translate normally streams newline-delimited JSON - zero or more
+  // {"status": "retrying", ...} progress lines (rendered live at the top
+  // of the results area - see client.js's showRetryStatus()/
+  // readTranslateStream()) followed by one terminal {"status": "done",
+  // ...} line - rather than the single-object body mockTranslate() above
+  // sends (see translate_routes.py's module docstring). The retry-line
+  // shape itself is covered thoroughly at the Python level (see
+  // tests/server/test_translate_routes.py) and the live-progress timing
+  // isn't reliably observable through Playwright's route.fulfill() (it
+  // delivers a mocked body as one atomic chunk, not staggered over real
+  // time, so the "retrying" line and the terminal line both get parsed in
+  // the same synchronous burst before anything repaints - there's nothing
+  // for a test to catch mid-transition). What IS worth covering here,
+  // and wouldn't be caught by any single-object mock: that
+  // readTranslateStream()'s line-by-line parser still finds and returns
+  // the terminal line correctly when a real retry line precedes it in the
+  // same body, and that the retry banner doesn't linger once the terminal
+  // line has been processed.
+  test('a translate response with a retry line ahead of the terminal line still resolves to the terminal SQL, with no lingering retry banner', async ({ page }) => {
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      const ndjson =
+        JSON.stringify({ status: 'retrying', attempt: 2, maxAttempts: 5, delaySeconds: 1, rotatedKey: false }) + '\n' +
+        JSON.stringify({ status: 'done', success: true, sql: 'SELECT * FROM retried_users;' }) + '\n';
+      await route.fulfill({ status: 200, contentType: 'application/x-ndjson', body: ndjson });
+    });
+    await gotoApp(page);
+
+    await page.locator('#aiPrompt').fill('show me the first 10 users');
+    await page.locator('#aiPrompt').press('Enter');
+
+    await expect.poll(() => normalizedSql(page)).toContain('retried_users');
+    await expect(page.locator('#resultsRetryStatus')).toHaveClass(/hidden/);
+  });
+
   test('directly entering and running SQL bypasses translate entirely', async ({ page }) => {
     await mockExecute(page, {
       results: [{ columns: ['n'], rows: [{ n: 42 }], rowCount: 1 }],

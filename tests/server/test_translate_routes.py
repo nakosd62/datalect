@@ -4,13 +4,32 @@ with a fake that queues canned responses/exceptions - never talks to the
 real Gemini API. types.Content/types.Part/types.GenerateContentConfig are
 left as the real google-genai classes (plain data containers, no network
 calls), so contents/config shape is exercised for real.
+
+/api/translate streams newline-delimited JSON rather than a single JSON
+body (see translate_routes.py's module docstring) - every test below that
+reads the response body uses helpers.parse_translate_stream(resp) instead
+of resp.get_json(), which would raise on any body with more than one JSON
+value in it (i.e. any test where at least one retry actually happened).
+The two early-validation tests (missing API key / empty prompt) are the
+exception: those responses aren't streamed at all - they return before
+translate_query() ever reaches the retry loop - so they keep using
+resp.get_json() directly, same as before this changed.
+
+Also note the status-code trade-off streaming required: a request that
+makes it into the retry loop now always gets HTTP 200 back, whether the
+translation ultimately succeeds or fails - the HTTP status has to be
+fixed before anything streams, so it can't retroactively become a 500
+once a retry line has already gone out. Failure is reported via the
+terminal line's success/error fields instead - see
+test_non_retryable_error_fails_immediately_and_reports_failure_in_body()
+and test_exhausts_all_retry_attempts_and_reports_failure_in_body() below.
 """
 
 import types as pytypes
 
 import pytest
 
-from helpers import install_fake_bigquery, write_database_presets_file
+from helpers import install_fake_bigquery, parse_translate_stream, write_database_presets_file
 
 
 class FakeGenaiResponse:
@@ -92,7 +111,8 @@ def test_success_strips_markdown_fences_and_returns_token_counts(app_factory, mo
 
     resp = env.client.post('/api/translate', json={'prompt': 'Show all users'})
     assert resp.status_code == 200
-    data = resp.get_json()
+    retry_events, data = parse_translate_stream(resp)
+    assert retry_events == []
     assert data['success'] is True
     assert data['sql'] == "SELECT * FROM users;"
     assert data['total_tokens'] == 15
@@ -166,10 +186,20 @@ def test_429_rotates_key_and_succeeds_on_retry(app_factory, monkeypatch):
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
     assert resp.status_code == 200
-    assert resp.get_json()['success'] is True
+    retry_events, data = parse_translate_stream(resp)
+    assert data['success'] is True
     assert len(harness.client_api_keys) == 2
     # The second Client() construction must use a *different* key than the first.
     assert harness.client_api_keys[0] != harness.client_api_keys[1]
+
+    # Exactly one retry event, streamed before the retry itself happened -
+    # see stream_translation()'s comment on why it's yielded before
+    # time.sleep() rather than after.
+    assert len(retry_events) == 1
+    assert retry_events[0]["attempt"] == 2
+    assert retry_events[0]["maxAttempts"] == 5
+    assert retry_events[0]["rotatedKey"] is True
+    assert retry_events[0]["delaySeconds"] == env.translate_routes.GEMINI_RETRY_DELAY_SECONDS
 
 
 def test_server_error_retries_with_same_key(app_factory, monkeypatch):
@@ -182,6 +212,18 @@ def test_server_error_retries_with_same_key(app_factory, monkeypatch):
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
     assert resp.status_code == 200
+    # Consuming the streamed body is what actually drives the generator
+    # through its retry (see stream_translation()/run_wsgi_app's
+    # buffer-then-chain behavior - Werkzeug's test client only executes a
+    # streamed response up to its first yielded line as part of .post()
+    # itself; everything after that first "retrying" line - here, the
+    # actual retry Gemini call - only runs once the body is actually read,
+    # same as get_data()/parse_translate_stream() does below). Assert on
+    # the harness's retry-driven state AFTER parsing, not before.
+    retry_events, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    assert len(retry_events) == 1
+    assert retry_events[0]["rotatedKey"] is False
     # Server-error retries don't rotate keys, and - unlike the 429/rotate
     # path - never reconstruct genai.Client() at all: the same client
     # object is just called again. So exactly one Client() construction,
@@ -190,7 +232,12 @@ def test_server_error_retries_with_same_key(app_factory, monkeypatch):
     assert len(harness.generate_calls) == 2
 
 
-def test_non_retryable_error_fails_immediately_without_retry(app_factory, monkeypatch):
+def test_non_retryable_error_fails_immediately_and_reports_failure_in_body(app_factory, monkeypatch):
+    # Status is 200, not 500 - see this module's docstring on why a
+    # streamed response can't carry a real error status. Nothing here has
+    # actually streamed a retry line (there was none to stream - the
+    # failure is non-retryable), but the HTTP status is decided once, for
+    # every request that reaches the retry loop at all, not per-outcome.
     env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
@@ -198,13 +245,14 @@ def test_non_retryable_error_fails_immediately_without_retry(app_factory, monkey
     harness.queue_error(FakeApiError(400))  # bad request - _classify_gemini_error returns None
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
-    assert resp.status_code == 500
-    data = resp.get_json()
+    assert resp.status_code == 200
+    retry_events, data = parse_translate_stream(resp)
+    assert retry_events == []
     assert data['success'] is False
     assert len(harness.generate_calls) == 1  # no retry attempted
 
 
-def test_exhausts_all_retry_attempts_and_returns_500(app_factory, monkeypatch):
+def test_exhausts_all_retry_attempts_and_reports_failure_in_body(app_factory, monkeypatch):
     env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1,fake-key-2"})
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
@@ -213,7 +261,17 @@ def test_exhausts_all_retry_attempts_and_returns_500(app_factory, monkeypatch):
         harness.queue_error(FakeApiError(429))
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
-    assert resp.status_code == 500
+    assert resp.status_code == 200
+    # Body consumption drives the rest of the retry loop - see the comment
+    # in test_server_error_retries_with_same_key above - so parse first,
+    # then assert on the fully-driven harness state.
+    retry_events, data = parse_translate_stream(resp)
+    assert data['success'] is False
+    assert "error" in data
+    # A retry line is streamed before each of the first MAX-1 attempts'
+    # retries - the MAX-th (final) attempt's failure ends the loop without
+    # one more retry to announce.
+    assert len(retry_events) == env.translate_routes.MAX_GEMINI_ATTEMPTS - 1
     assert len(harness.generate_calls) == env.translate_routes.MAX_GEMINI_ATTEMPTS
 
 
@@ -238,7 +296,9 @@ def test_max_gemini_attempts_env_var_overrides_default(app_factory, monkeypatch)
     harness.queue_error(FakeApiError(429))
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
-    assert resp.status_code == 500
+    assert resp.status_code == 200
+    _, data = parse_translate_stream(resp)
+    assert data['success'] is False
     # Stopped after the configured 2 attempts, not the default 5 - proves
     # the env var actually drives the retry loop, not just the constant.
     assert len(harness.generate_calls) == 2
@@ -259,6 +319,12 @@ def test_gemini_retry_delay_seconds_env_var_is_used_as_sleep_duration(app_factor
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
     assert resp.status_code == 200
+    # Parse (fully drives the retry loop, including the actual sleep()
+    # call - see the comment in test_server_error_retries_with_same_key
+    # above) before checking sleep_calls.
+    retry_events, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    assert retry_events[0]["delaySeconds"] == 3.5
     assert sleep_calls == [3.5]
 
 

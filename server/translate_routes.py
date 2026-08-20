@@ -4,13 +4,22 @@ translate_routes.py
 Natural-language-to-SQL translation via Gemini: API key selection, chat
 history -> Gemini `Content` conversion, the system prompt, and the
 /api/translate route itself.
+
+/api/translate streams its response as newline-delimited JSON (NDJSON)
+rather than a single JSON body, so a client can show live "retrying..."
+feedback while the retry loop below (the single place in this app that
+retries a translation - see MAX_GEMINI_ATTEMPTS/_classify_gemini_error)
+works through a transient Gemini failure, instead of the request just
+appearing to hang. See translate_query()'s stream_translation() for the
+exact line shapes and the HTTP-status-code trade-off streaming requires.
 """
 
+import json
 import random
 import os
 import time
 
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, Response, stream_with_context
 from google import genai
 from google.genai import types
 from google.genai import errors as genai_errors
@@ -249,115 +258,157 @@ def translate_query():
     history = data.get('history', [])[-20:]
     force_schema_refresh = bool(data.get('refresh_schema'))
 
-    try:
-        schema = get_database_schema(conn_str, user_identity, force_refresh=force_schema_refresh)
-        client = genai.Client(api_key=api_key)
-
+    # Everything past this point - the schema fetch, the Gemini retry loop,
+    # and building the final response - is streamed as newline-delimited
+    # JSON (NDJSON) rather than returned as one JSON body, so the client can
+    # show "retrying..." feedback live instead of just hanging for however
+    # long the retry loop below takes (see client.js's readTranslateStream()).
+    # Zero or more progress lines are emitted first:
+    #   {"status": "retrying", "attempt": <next attempt #>, "maxAttempts": N,
+    #    "delaySeconds": <float>, "rotatedKey": <bool>}
+    # ...followed by exactly one terminal line:
+    #   {"status": "done", "success": true, "sql": ..., "input_tokens": ...,
+    #    "output_tokens": ..., "total_tokens": ..., "thinking_tokens": ...,
+    #    "cached_content_tokens": ..., "duration": ...}
+    #   or, on failure (non-retryable, or every retry exhausted):
+    #   {"status": "done", "success": false, "error": "..."}
+    #
+    # IMPORTANT: because the HTTP status code has to be committed before any
+    # of this streams - a chunked response can't retroactively become a 500
+    # once a byte of it has already gone out - every request that makes it
+    # this far now always returns HTTP 200, whether the translation itself
+    # ultimately succeeds or fails. Failure lives in the terminal line's
+    # "success"/"error" fields, not the HTTP status - callers (and tests)
+    # must check that field. This is the one behavior change from before
+    # streaming existed, where a failed translation was a real HTTP 500.
+    # (The two early validation returns above - missing API key, empty
+    # prompt - happen before any of this and keep their real 400 status,
+    # since nothing has streamed yet at that point.)
+    def stream_translation():
+        nonlocal api_key
         try:
-            dialect_name = get_backend(conn_str).dialect_name
-        except Exception:
-            dialect_name = "PostgreSQL"
-        dialect_intro = _DIALECT_PROMPT_INTROS.get(dialect_name, _DEFAULT_DIALECT_PROMPT_INTRO)
+            schema = get_database_schema(conn_str, user_identity, force_refresh=force_schema_refresh)
+            client = genai.Client(api_key=api_key)
 
-        system_instruction = (
-            dialect_intro +
-            "Format the result data to be easily readable. For example, format timestamps as date:hour:min:sec.\n"
-            "Return ONLY the raw SQL code block. Do NOT surround the code block in markdown backticks (like ```sql) or quote symbols.\n"
-            "If you can respond to the prompt succinctly based on your general-purpose training, return your response prepended by the string '*** NO SQL ***'\n"
-            "If the prompt is about this app itself (yDyL) respond as follows: '*** NO SQL *** OPEN HELP POPUP ***'\n"
-            "If you cannot respond at all with reasonable confidence, return '*** NO SQL *** I am not able to respond to your prompt.'\n"
-            "If you run into any error, return '*** NO SQL *** I ran into this error: <the error>'\n"
-        )
-
-        user_message_content = f"Database Schema:\n{schema}\n\nUser Request: {prompt}\n\nSQL Query:"
-
-        contents = build_gemini_history_contents(history)
-        contents.append(
-            types.Content(
-                role="user",
-                parts=[types.Part.from_text(text=user_message_content)]
-            )
-        )
-
-        start_time = time.perf_counter()
-        response = None
-        for attempt in range(1, MAX_GEMINI_ATTEMPTS + 1):
             try:
-                response = client.models.generate_content(
-                    model=gemini_model,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        system_instruction=system_instruction,
-                        temperature=0.1
-                    )
+                dialect_name = get_backend(conn_str).dialect_name
+            except Exception:
+                dialect_name = "PostgreSQL"
+            dialect_intro = _DIALECT_PROMPT_INTROS.get(dialect_name, _DEFAULT_DIALECT_PROMPT_INTRO)
+
+            system_instruction = (
+                dialect_intro +
+                "Format the result data to be easily readable. For example, format timestamps as date:hour:min:sec.\n"
+                "Return ONLY the raw SQL code block. Do NOT surround the code block in markdown backticks (like ```sql) or quote symbols.\n"
+                "If you can respond to the prompt succinctly based on your general-purpose training, return your response prepended by the string '*** NO SQL ***'\n"
+                "If the prompt is about this app itself (yDyL) respond as follows: '*** NO SQL *** OPEN HELP POPUP ***'\n"
+                "If you cannot respond at all with reasonable confidence, return '*** NO SQL *** I am not able to respond to your prompt.'\n"
+                "If you run into any error, return '*** NO SQL *** I ran into this error: <the error>'\n"
+            )
+
+            user_message_content = f"Database Schema:\n{schema}\n\nUser Request: {prompt}\n\nSQL Query:"
+
+            contents = build_gemini_history_contents(history)
+            contents.append(
+                types.Content(
+                    role="user",
+                    parts=[types.Part.from_text(text=user_message_content)]
                 )
-                break
-            except Exception as e:
-                retry_action = _classify_gemini_error(e)
-                if attempt >= MAX_GEMINI_ATTEMPTS or retry_action is None:
-                    raise
+            )
 
-                if retry_action["rotate_key"]:
-                    next_key = pick_gemini_api_key(exclude=tried_gemini_keys)
-                    if next_key != api_key:
-                        api_key = next_key
-                        client = genai.Client(api_key=api_key)
-                    tried_gemini_keys.add(api_key)
-                    logger.warning(
-                        "Gemini call failed (attempt %d/%d), rotating API key and retrying in %ds: %s",
-                        attempt, MAX_GEMINI_ATTEMPTS, retry_action["delay"], e
+            start_time = time.perf_counter()
+            response = None
+            for attempt in range(1, MAX_GEMINI_ATTEMPTS + 1):
+                try:
+                    response = client.models.generate_content(
+                        model=gemini_model,
+                        contents=contents,
+                        config=types.GenerateContentConfig(
+                            system_instruction=system_instruction,
+                            temperature=0.1
+                        )
                     )
-                else:
-                    logger.warning(
-                        "Gemini call failed (attempt %d/%d), retrying in %ds: %s",
-                        attempt, MAX_GEMINI_ATTEMPTS, retry_action["delay"], e
-                    )
+                    break
+                except Exception as e:
+                    retry_action = _classify_gemini_error(e)
+                    if attempt >= MAX_GEMINI_ATTEMPTS or retry_action is None:
+                        raise
 
-                time.sleep(retry_action["delay"])
-                continue
-        end_time = time.perf_counter()
+                    if retry_action["rotate_key"]:
+                        next_key = pick_gemini_api_key(exclude=tried_gemini_keys)
+                        if next_key != api_key:
+                            api_key = next_key
+                            client = genai.Client(api_key=api_key)
+                        tried_gemini_keys.add(api_key)
+                        logger.warning(
+                            "Gemini call failed (attempt %d/%d), rotating API key and retrying in %ds: %s",
+                            attempt, MAX_GEMINI_ATTEMPTS, retry_action["delay"], e
+                        )
+                    else:
+                        logger.warning(
+                            "Gemini call failed (attempt %d/%d), retrying in %ds: %s",
+                            attempt, MAX_GEMINI_ATTEMPTS, retry_action["delay"], e
+                        )
 
-        generated_sql = response.text.strip() if response.text else ""
-        if generated_sql.startswith("```"):
-            lines = generated_sql.splitlines()
-            if lines[0].startswith("```"):
-                lines = lines[1:]
-            if lines and lines[-1].startswith("```"):
-                lines = lines[:-1]
-            generated_sql = "\n".join(lines).strip()
+                    # Told to the client before sleeping, not after, so
+                    # "retrying..." is visible for the full delay instead of
+                    # appearing right as the next attempt actually fires.
+                    yield json.dumps({
+                        "status": "retrying",
+                        "attempt": attempt + 1,
+                        "maxAttempts": MAX_GEMINI_ATTEMPTS,
+                        "delaySeconds": retry_action["delay"],
+                        "rotatedKey": retry_action["rotate_key"],
+                    }) + "\n"
 
-        duration = round(1000 * (end_time - start_time))
-        usage = response.usage_metadata
-        input_tokens = usage.prompt_token_count if usage else 0
-        output_tokens = usage.candidates_token_count if usage else 0
-        total_tokens = usage.total_token_count if usage else 0
-        thinking_tokens = getattr(usage, 'thoughts_token_count', 0) if usage else 0
-        cached_content_tokens = getattr(usage, 'cached_content_token_count', 0) if usage else 0
+                    time.sleep(retry_action["delay"])
+                    continue
+            end_time = time.perf_counter()
 
-        # Anonymous users share a single identity and can't view/purge
-        # their own history via the app (see history_routes.py, still
-        # gated) - but the translation itself is still worth recording
-        # for aggregate usage/cost visibility (e.g. via export_state.py),
-        # so it's logged the same as any other user's, just attributed to
-        # the shared "anonymous" identity rather than a real one.
-        record_translation(user_identity, conn_str, prompt, generated_sql, gemini_model, duration, input_tokens, output_tokens, total_tokens, thinking_tokens, cached_content_tokens)
+            generated_sql = response.text.strip() if response.text else ""
+            if generated_sql.startswith("```"):
+                lines = generated_sql.splitlines()
+                if lines[0].startswith("```"):
+                    lines = lines[1:]
+                if lines and lines[-1].startswith("```"):
+                    lines = lines[:-1]
+                generated_sql = "\n".join(lines).strip()
 
-        resp = jsonify({
-            'success': True,
-            'sql': generated_sql,
-            'input_tokens': input_tokens,
-            'output_tokens': output_tokens,
-            'total_tokens': total_tokens,
-            'thinking_tokens': thinking_tokens,
-            'cached_content_tokens': cached_content_tokens,
-            'duration': duration
-        })
-        return apply_session_cookie(resp, session_id)
+            duration = round(1000 * (end_time - start_time))
+            usage = response.usage_metadata
+            input_tokens = usage.prompt_token_count if usage else 0
+            output_tokens = usage.candidates_token_count if usage else 0
+            total_tokens = usage.total_token_count if usage else 0
+            thinking_tokens = getattr(usage, 'thoughts_token_count', 0) if usage else 0
+            cached_content_tokens = getattr(usage, 'cached_content_token_count', 0) if usage else 0
 
-    except Exception as e:
-        logger.exception("Translation failed")
-        resp = jsonify({
-            'success': False,
-            'error': str(e) or f"{type(e).__name__} occurred during translation."
-        })
-        return apply_session_cookie(resp, session_id), 500
+            # Anonymous users share a single identity and can't view/purge
+            # their own history via the app (see history_routes.py, still
+            # gated) - but the translation itself is still worth recording
+            # for aggregate usage/cost visibility (e.g. via export_state.py),
+            # so it's logged the same as any other user's, just attributed to
+            # the shared "anonymous" identity rather than a real one.
+            record_translation(user_identity, conn_str, prompt, generated_sql, gemini_model, duration, input_tokens, output_tokens, total_tokens, thinking_tokens, cached_content_tokens)
+
+            yield json.dumps({
+                'status': 'done',
+                'success': True,
+                'sql': generated_sql,
+                'input_tokens': input_tokens,
+                'output_tokens': output_tokens,
+                'total_tokens': total_tokens,
+                'thinking_tokens': thinking_tokens,
+                'cached_content_tokens': cached_content_tokens,
+                'duration': duration,
+            }) + "\n"
+
+        except Exception as e:
+            logger.exception("Translation failed")
+            yield json.dumps({
+                'status': 'done',
+                'success': False,
+                'error': str(e) or f"{type(e).__name__} occurred during translation.",
+            }) + "\n"
+
+    resp = Response(stream_with_context(stream_translation()), mimetype='application/x-ndjson')
+    return apply_session_cookie(resp, session_id)
