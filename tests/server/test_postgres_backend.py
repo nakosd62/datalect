@@ -155,17 +155,51 @@ def test_get_schema_scan_query_uses_configured_scan_cap():
 
 # --- cache_key ---------------------------------------------------------------
 
-def test_cache_key_parses_username_and_dbname():
+def test_cache_key_parses_username_host_port_and_dbname():
     backend = PostgresBackend()
     key = backend.cache_key({"url": "postgresql://alice:secret@host:5432/mydb"})
-    assert key == "alice@mydb"
+    assert key == "alice@host:5432/mydb"
     assert "secret" not in key
+
+
+def test_cache_key_differs_across_hosts_with_same_user_and_dbname():
+    # Regression coverage for the real bug this fixes: two entirely
+    # different Postgres servers can easily share both a username and a
+    # database name (e.g. two "demo"/"mydb" presets pointing at two
+    # different customers' instances) - the old host-blind derivation
+    # ("alice@mydb" for both) would collide them onto the same
+    # schema_cache.py entry, silently serving one server's schema back for
+    # the other's /api/translate calls.
+    backend = PostgresBackend()
+    key_a = backend.cache_key({"url": "postgresql://alice:secret@server-a.example.com:5432/mydb"})
+    key_b = backend.cache_key({"url": "postgresql://alice:secret@server-b.example.com:5432/mydb"})
+    assert key_a != key_b
+
+
+def test_cache_key_differs_across_ports_on_the_same_host():
+    # Same failure mode as the cross-host case above, but for two distinct
+    # instances reachable on the same host at different ports (e.g. local
+    # Docker containers each mapped to a different host port).
+    backend = PostgresBackend()
+    key_5432 = backend.cache_key({"url": "postgresql://alice:secret@host:5432/mydb"})
+    key_5433 = backend.cache_key({"url": "postgresql://alice:secret@host:5433/mydb"})
+    assert key_5432 != key_5433
+
+
+def test_cache_key_defaults_port_to_5432_when_omitted():
+    # An omitted port and an explicit ":5432" name the same target - same
+    # default psycopg2/libpq themselves fall back to - so these must
+    # produce the identical key, not two different ones.
+    backend = PostgresBackend()
+    key_explicit = backend.cache_key({"url": "postgresql://alice:secret@host:5432/mydb"})
+    key_omitted = backend.cache_key({"url": "postgresql://alice:secret@host/mydb"})
+    assert key_explicit == key_omitted == "alice@host:5432/mydb"
 
 
 def test_cache_key_strips_query_string_from_dbname():
     backend = PostgresBackend()
     key = backend.cache_key({"url": "postgresql://alice:secret@host:5432/mydb?sslmode=require"})
-    assert key == "alice@mydb"
+    assert key == "alice@host:5432/mydb"
 
 
 def test_cache_key_handles_missing_url():

@@ -40,19 +40,37 @@ class PostgresBackend(Backend):
             connection.close()
 
     def cache_key(self, descriptor):
-        """username@dbname, parsed from the connection URL - never the
-        URL itself, since that carries the password. Same derivation
-        db.py's get_conn_identifier has always used."""
+        """username@host:port/dbname, parsed from the connection URL -
+        never the URL itself, since that carries the password.
+
+        host:port matters just as much as dbname does: two entirely
+        different Postgres servers can easily share both a username and a
+        database name (e.g. two "demo"/"mydb" presets pointing at two
+        different customers' instances) - without the host/port, both
+        would resolve to the same schema_cache.py entry, and whichever
+        server's schema got fetched first would silently be served back
+        for the *other* server's /api/translate calls too, for up to
+        SCHEMA_CACHE_TTL_SECONDS. Username is still included too (not
+        redundant with host:port/dbname): two different users against the
+        exact same database can legitimately see different
+        information_schema results if their grants differ, so a schema
+        fetched as one user must not be served back for another.
+        Port defaults to Postgres's standard 5432 when the URL omits it
+        (e.g. "postgresql://user@host/db") - same default psycopg2/libpq
+        themselves fall back to - so an explicit ":5432" and an omitted
+        port are correctly treated as the same target, not two."""
         url = (descriptor or {}).get("url")
         if not url:
             return "unknown@unknown"
         try:
             parsed = urlparse(url)
             username = parsed.username or "unknown"
+            host = parsed.hostname or "unknown"
+            port = parsed.port or 5432
             dbname = parsed.path.lstrip('/')
             if '?' in dbname:
                 dbname = dbname.split('?')[0]
-            return f"{username}@{dbname or 'unknown'}"
+            return f"{username}@{host}:{port}/{dbname or 'unknown'}"
         except Exception:
             return "unknown@unknown"
 

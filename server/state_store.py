@@ -132,10 +132,14 @@ def compute_connection_key(name, url, credentials_json=None):
 
 class StateStore(ABC):
     """Backend-agnostic persistence for sessions, saved DB connections, and
-    translation history/stats."""
-
-    def __init__(self, default_conn):
-        self.default_conn = default_conn
+    translation history/stats. Deliberately holds no notion of "the default
+    connection" itself (there used to be a default_conn constructor param
+    for exactly that) - a session only ever stores an identity reference
+    (connection_id/is_custom, see get_session's docstring), never a
+    connection's actual details, so there's nothing here that would need a
+    fallback URL to seed a blank row with. db.py's resolve_active_descriptor
+    is what applies DEFAULT_CONN (imported directly from app_config.py) when
+    a session's connection_id is blank."""
 
     @abstractmethod
     def init(self):
@@ -143,39 +147,32 @@ class StateStore(ABC):
 
     @abstractmethod
     def get_session(self, user_id):
-        """Returns {"database_url", "auto_sql_execute", "database_type",
-        "database_config", "is_custom", "custom_connection_key"} for a
-        user/session id. "database_type" defaults to "postgres" for legacy
-        rows that predate multi-dialect support. "database_config" is a
-        dict of dialect-specific fields beyond database_url (e.g.
-        BigQuery's project_id/dataset/credentials_json) - {} for Postgres.
-        "is_custom" (defaults to False for legacy rows) records whether the
-        active connection was selected *as a saved custom connection*
-        rather than a preset - needed because a custom connection's URL can
-        collide with a preset's (see config_routes.py's handle_config), in
-        which case URL equality alone can't tell the two apart.
-        "custom_connection_key" (defaults to "" for legacy rows/presets)
-        is that saved connection's compute_connection_key() value when
-        is_custom is true - needed for the same reason at one level finer:
-        two saved custom connections can themselves collide on URL (e.g.
-        two BigQuery connections on the same project/dataset with different
-        service-account keys - see compute_connection_key's docstring), so
-        URL equality can't tell *which* saved custom connection is active
-        either. Unlike get_db_connections(), this always includes any
-        credentials in database_config, since it's the method db.py uses
-        internally to actually open a connection - callers that expose this
-        data over the API (config_routes.py) must pick out only the fields
-        they intend to return, never forward this dict as-is to a
-        jsonify() call."""
+        """Returns {"auto_sql_execute", "is_custom", "connection_id"} for a
+        user/session id - identity only, never a connection's actual
+        details/credentials (see db.py's resolve_active_descriptor, which
+        resolves those FRESH from CONFIGURED_DBS or get_db_connections()
+        every time something needs to actually connect, rather than trusting
+        anything cached here). "is_custom" (defaults to False for legacy
+        rows) records whether the active connection is a saved custom
+        connection rather than a preset. "connection_id" (defaults to "" -
+        "nothing explicitly selected yet") is, depending on is_custom: a
+        preset's stable CONFIGURED_DBS "id" (see app_config.py's
+        DATABASE_PRESETS_FILE comment) when is_custom is False, or a saved
+        custom connection's compute_connection_key() value when is_custom is
+        True - either way, a single opaque reference resolved fresh at
+        connect time, never a duplicated copy of the connection itself. This
+        also means a removed preset or a deleted custom connection is
+        immediately reflected everywhere (no drift) - see
+        resolve_active_descriptor's "missing" return for how a
+        connection_id that no longer resolves to anything real is handled."""
 
     @abstractmethod
-    def set_session(self, user_id, db_url=None, auto_sql_execute=None, db_type=None,
-                     db_config=None, is_custom=None, custom_connection_key=None):
-        """Persists the active connection (database_url, db_type, db_config,
-        is_custom, custom_connection_key) and/or auto_sql_execute flag for a
-        user/session id. Only the fields passed (not None) are changed - the
-        others are left as-is. Pass custom_connection_key="" (not None) to
-        explicitly clear it, e.g. when switching to a preset - same
+    def set_session(self, user_id, connection_id=None, auto_sql_execute=None, is_custom=None):
+        """Persists the active connection reference (connection_id,
+        is_custom) and/or auto_sql_execute flag for a user/session id. Only
+        the fields passed (not None) are changed - the others are left
+        as-is. Pass connection_id="" (not None) to explicitly clear it, e.g.
+        when switching to a fresh/default connection - same
         not-None-means-"change this" convention is_custom already uses."""
 
     @abstractmethod
@@ -242,8 +239,7 @@ class StateStore(ABC):
 # --------------------------------------------------------------------------
 
 class SqliteStateStore(StateStore):
-    def __init__(self, db_path, default_conn):
-        super().__init__(default_conn)
+    def __init__(self, db_path):
         self.db_path = db_path
 
     def _connect(self):
@@ -278,12 +274,9 @@ class SqliteStateStore(StateStore):
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS sessions (
                         session_id TEXT PRIMARY KEY,
-                        database_url TEXT NOT NULL,
                         auto_sql_execute INTEGER NOT NULL DEFAULT 1,
-                        database_type TEXT NOT NULL DEFAULT 'postgres',
-                        database_config TEXT,
                         is_custom INTEGER NOT NULL DEFAULT 0,
-                        custom_connection_key TEXT NOT NULL DEFAULT '',
+                        connection_id TEXT NOT NULL DEFAULT '',
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     );
                 """)
@@ -295,18 +288,6 @@ class SqliteStateStore(StateStore):
                     cursor.execute(
                         "ALTER TABLE sessions ADD COLUMN auto_sql_execute INTEGER NOT NULL DEFAULT 1;"
                     )
-                # Migration: existing DBs created before multi-dialect support.
-                # database_type defaults to 'postgres' - every row that predates
-                # this column was, by definition, a Postgres connection string.
-                # database_config holds dialect-specific fields beyond
-                # database_url (e.g. BigQuery's project_id/dataset/
-                # credentials_json, JSON-encoded) - NULL/absent for Postgres.
-                if "database_type" not in session_columns:
-                    cursor.execute(
-                        "ALTER TABLE sessions ADD COLUMN database_type TEXT NOT NULL DEFAULT 'postgres';"
-                    )
-                if "database_config" not in session_columns:
-                    cursor.execute("ALTER TABLE sessions ADD COLUMN database_config TEXT;")
                 # Migration: existing DBs created before is_custom existed.
                 # Defaults to 0/False - every legacy row predates the
                 # preset/custom-URL-collision fix, and the safest default is
@@ -316,17 +297,81 @@ class SqliteStateStore(StateStore):
                     cursor.execute(
                         "ALTER TABLE sessions ADD COLUMN is_custom INTEGER NOT NULL DEFAULT 0;"
                     )
-                # Migration: existing DBs created before custom_connection_key
-                # existed. Defaults to '' - matches the "no active custom
-                # connection pinned yet" state get_session()/set_session()
-                # already treat is_custom=False as; config_routes.py falls
-                # back to URL-based matching for any session still carrying
-                # this default (see handle_config), so an existing active
-                # custom connection doesn't just disappear until its next save.
-                if "custom_connection_key" not in session_columns:
-                    cursor.execute(
-                        "ALTER TABLE sessions ADD COLUMN custom_connection_key TEXT NOT NULL DEFAULT '';"
-                    )
+                # Migration: existing DBs created before connection_id existed,
+                # i.e. before a session's active connection was anything more
+                # than a duplicated (database_url, database_type,
+                # database_config) copy of the connection itself - see
+                # get_session's docstring for why that stopped being
+                # acceptable (drift when a preset/custom connection is later
+                # edited or removed, and it kept credentials sitting in this
+                # table redundantly). SQLite can't just ALTER a column away
+                # cleanly here either (dropping database_url/database_type/
+                # database_config/custom_connection_key outright), so this
+                # rebuilds the table under the new schema - same pattern as
+                # the db_connections connection_key migration just below -
+                # backfilling connection_id for each existing row from data
+                # it already has: a legacy is_custom row's own
+                # custom_connection_key IS already exactly the right value
+                # (reused as-is); a legacy preset row's connection_id is
+                # recovered by reverse-matching its stored database_url
+                # against CONFIGURED_DBS's "url" field (the same matching
+                # config_routes.py used to do for the old "active_preset_id"
+                # response field, before presets carried a stable id through
+                # the session itself) - "" (falls back to the default
+                # connection) if nothing matches, e.g. the preset was
+                # renamed/removed since. This is a genuine one-way rebuild,
+                # not just an added column: it's what actually scrubs any
+                # previously-duplicated credentials (a preset's password, a
+                # custom BigQuery key, ...) out of this table rather than
+                # just leaving them sitting in an unread column forever.
+                if "connection_id" not in session_columns:
+                    # Deferred import, not at module level: app_config.py
+                    # imports SqliteStateStore/FirestoreStateStore from this
+                    # module while it's still building CONFIGURED_DBS, so a
+                    # top-level "from app_config import CONFIGURED_DBS" here
+                    # would be a circular import that fails at startup. By
+                    # the time init() actually runs (server.py, after
+                    # app_config.py has fully finished importing), the real,
+                    # fully-populated module is safely importable.
+                    from app_config import CONFIGURED_DBS
+                    cursor.execute("ALTER TABLE sessions RENAME TO sessions_old;")
+                    cursor.execute("""
+                        CREATE TABLE sessions (
+                            session_id TEXT PRIMARY KEY,
+                            auto_sql_execute INTEGER NOT NULL DEFAULT 1,
+                            is_custom INTEGER NOT NULL DEFAULT 0,
+                            connection_id TEXT NOT NULL DEFAULT '',
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        );
+                    """)
+                    cursor.execute("PRAGMA table_info(sessions_old);")
+                    old_columns = {column[1] for column in cursor.fetchall()}
+                    old_has_custom_key = "custom_connection_key" in old_columns
+                    old_has_url = "database_url" in old_columns
+                    select_cols = "session_id, auto_sql_execute, is_custom"
+                    select_cols += ", custom_connection_key" if old_has_custom_key else ", NULL"
+                    select_cols += ", database_url" if old_has_url else ", NULL"
+                    select_cols += ", updated_at" if "updated_at" in old_columns else ", CURRENT_TIMESTAMP"
+                    cursor.execute(f"SELECT {select_cols} FROM sessions_old;")
+                    for (old_session_id, old_auto_exec, old_is_custom,
+                         old_custom_key, old_url, old_updated_at) in cursor.fetchall():
+                        if old_is_custom and old_custom_key:
+                            new_connection_id = old_custom_key
+                        elif not old_is_custom and old_url:
+                            new_connection_id = next(
+                                (db["id"] for db in CONFIGURED_DBS if db.get("url") == old_url), ""
+                            )
+                        else:
+                            new_connection_id = ""
+                        cursor.execute("""
+                            INSERT OR REPLACE INTO sessions
+                                (session_id, auto_sql_execute, is_custom, connection_id, updated_at)
+                            VALUES (?, ?, ?, ?, ?);
+                        """, (
+                            old_session_id, old_auto_exec, old_is_custom,
+                            new_connection_id, old_updated_at,
+                        ))
+                    cursor.execute("DROP TABLE sessions_old;")
 
                 # Drop table if it exists under the old schema (where user_id was
                 # the single primary key) or if the temporary custom_databases
@@ -431,87 +476,64 @@ class SqliteStateStore(StateStore):
             with self._connect() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    "SELECT database_url, auto_sql_execute, database_type, database_config, "
-                    "is_custom, custom_connection_key "
+                    "SELECT auto_sql_execute, is_custom, connection_id "
                     "FROM sessions WHERE session_id = ?",
                     (effective_user,),
                 )
                 row = cursor.fetchone()
                 if row:
                     return {
-                        "database_url": row[0] or self.default_conn,
-                        "auto_sql_execute": bool(row[1]),
-                        "database_type": row[2] or "postgres",
-                        "database_config": _loads_config(row[3]),
-                        "is_custom": bool(row[4]),
-                        "custom_connection_key": row[5] or "",
+                        "auto_sql_execute": bool(row[0]),
+                        "is_custom": bool(row[1]),
+                        "connection_id": row[2] or "",
                     }
         except Exception:
             logger.exception("Error fetching session from SQLite")
         return {
-            "database_url": self.default_conn,
             "auto_sql_execute": DEFAULT_AUTO_SQL_EXECUTE,
-            "database_type": "postgres",
-            "database_config": {},
             "is_custom": False,
-            "custom_connection_key": "",
+            "connection_id": "",
         }
 
-    def set_session(self, user_id, db_url=None, auto_sql_execute=None, db_type=None,
-                     db_config=None, is_custom=None, custom_connection_key=None):
-        if (db_url is None and auto_sql_execute is None and db_type is None
-                and db_config is None and is_custom is None and custom_connection_key is None):
+    def set_session(self, user_id, connection_id=None, auto_sql_execute=None, is_custom=None):
+        if connection_id is None and auto_sql_execute is None and is_custom is None:
             return
         effective_user = _effective_user(user_id)
-        db_config_json = json.dumps(db_config) if db_config is not None else None
         try:
             with self._connect() as conn:
                 cursor = conn.cursor()
                 # Ensure a row exists first (defaults for whichever field
                 # isn't being set), then patch only the field(s) actually
                 # passed in - so e.g. toggling auto_sql_execute alone never
-                # clobbers an already-saved database_url/type/config/
-                # is_custom/custom_connection_key, or vice versa. A brand-new
-                # row that isn't explicitly setting auto_sql_execute here
-                # still gets DEFAULT_AUTO_SQL_EXECUTE (matching the column's
-                # own DEFAULT 1), not False.
+                # clobbers an already-saved connection_id/is_custom, or vice
+                # versa. A brand-new row that isn't explicitly setting
+                # auto_sql_execute here still gets DEFAULT_AUTO_SQL_EXECUTE
+                # (matching the column's own DEFAULT 1), not False.
                 insert_auto_sql_execute = (
                     auto_sql_execute if auto_sql_execute is not None else DEFAULT_AUTO_SQL_EXECUTE
                 )
                 cursor.execute("""
-                    INSERT INTO sessions (session_id, database_url, auto_sql_execute, database_type, database_config, is_custom, custom_connection_key)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO sessions (session_id, auto_sql_execute, is_custom, connection_id)
+                    VALUES (?, ?, ?, ?)
                     ON CONFLICT(session_id) DO NOTHING;
                 """, (
                     effective_user,
-                    db_url or self.default_conn,
                     1 if insert_auto_sql_execute else 0,
-                    db_type or "postgres",
-                    db_config_json,
                     1 if is_custom else 0,
-                    custom_connection_key or "",
+                    connection_id or "",
                 ))
 
                 updates = []
                 params = []
-                if db_url is not None:
-                    updates.append("database_url = ?")
-                    params.append(db_url)
                 if auto_sql_execute is not None:
                     updates.append("auto_sql_execute = ?")
                     params.append(1 if auto_sql_execute else 0)
-                if db_type is not None:
-                    updates.append("database_type = ?")
-                    params.append(db_type)
-                if db_config is not None:
-                    updates.append("database_config = ?")
-                    params.append(db_config_json)
                 if is_custom is not None:
                     updates.append("is_custom = ?")
                     params.append(1 if is_custom else 0)
-                if custom_connection_key is not None:
-                    updates.append("custom_connection_key = ?")
-                    params.append(custom_connection_key)
+                if connection_id is not None:
+                    updates.append("connection_id = ?")
+                    params.append(connection_id)
                 updates.append("updated_at = CURRENT_TIMESTAMP")
                 params.append(effective_user)
                 cursor.execute(
@@ -661,8 +683,7 @@ class SqliteStateStore(StateStore):
 # --------------------------------------------------------------------------
 
 class FirestoreStateStore(StateStore):
-    def __init__(self, client, default_conn):
-        super().__init__(default_conn)
+    def __init__(self, client):
         self.client = client
 
     def init(self):
@@ -670,81 +691,92 @@ class FirestoreStateStore(StateStore):
         pass
 
     def get_session(self, user_id):
+        default_session = {
+            "auto_sql_execute": DEFAULT_AUTO_SQL_EXECUTE,
+            "is_custom": False,
+            "connection_id": "",
+        }
         if not user_id:
-            return {
-                "database_url": self.default_conn,
-                "auto_sql_execute": DEFAULT_AUTO_SQL_EXECUTE,
-                "database_type": "postgres",
-                "database_config": {},
-                "is_custom": False,
-                "custom_connection_key": "",
-            }
+            return default_session
         try:
-            doc = self.client.collection("sessions").document(user_id).get()
+            doc_ref = self.client.collection("sessions").document(user_id)
+            doc = doc_ref.get()
             if doc.exists:
                 data = doc.to_dict() or {}
+                if "connection_id" not in data:
+                    # Lazy migration, on first read after upgrading: this doc
+                    # predates connection_id and still carries the old
+                    # duplicated (database_url, database_type,
+                    # database_config, custom_connection_key) shape (see
+                    # get_session's docstring for why that stopped being
+                    # acceptable). Recover connection_id from data it already
+                    # has - a legacy is_custom doc's own custom_connection_key
+                    # IS already exactly the right value; a legacy preset
+                    # doc's connection_id is recovered by reverse-matching
+                    # its stored database_url against CONFIGURED_DBS's "url"
+                    # field - then write back a cleaned doc that actually
+                    # deletes the old fields (firestore.DELETE_FIELD), not
+                    # just adds connection_id alongside them, so credentials
+                    # (a preset's password, a custom BigQuery key, ...) don't
+                    # linger in this document indefinitely. Deferred import,
+                    # not at module level - see the matching comment in
+                    # SqliteStateStore.init() for why (app_config.py imports
+                    # this module while still building CONFIGURED_DBS).
+                    from app_config import CONFIGURED_DBS
+                    old_is_custom = bool(data.get("is_custom", False))
+                    old_custom_key = data.get("custom_connection_key") or ""
+                    old_url = data.get("database_url") or ""
+                    if old_is_custom and old_custom_key:
+                        connection_id = old_custom_key
+                    elif not old_is_custom and old_url:
+                        connection_id = next(
+                            (db["id"] for db in CONFIGURED_DBS if db.get("url") == old_url), ""
+                        )
+                    else:
+                        connection_id = ""
+                    try:
+                        doc_ref.set({
+                            "is_custom": old_is_custom,
+                            "connection_id": connection_id,
+                            "auto_sql_execute": data.get("auto_sql_execute", DEFAULT_AUTO_SQL_EXECUTE),
+                            "database_url": firestore.DELETE_FIELD,
+                            "database_type": firestore.DELETE_FIELD,
+                            "database_config": firestore.DELETE_FIELD,
+                            "custom_connection_key": firestore.DELETE_FIELD,
+                        }, merge=True)
+                    except Exception:
+                        logger.exception("Error scrubbing legacy session fields in Firestore")
+                    return {
+                        "auto_sql_execute": bool(data.get("auto_sql_execute", DEFAULT_AUTO_SQL_EXECUTE)),
+                        "is_custom": old_is_custom,
+                        "connection_id": connection_id,
+                    }
                 return {
-                    "database_url": data.get("database_url", self.default_conn),
                     "auto_sql_execute": bool(data.get("auto_sql_execute", DEFAULT_AUTO_SQL_EXECUTE)),
-                    "database_type": data.get("database_type") or "postgres",
-                    "database_config": data.get("database_config") or {},
                     "is_custom": bool(data.get("is_custom", False)),
-                    "custom_connection_key": data.get("custom_connection_key") or "",
+                    "connection_id": data.get("connection_id") or "",
                 }
         except Exception:
             logger.exception("Error fetching session from Firestore")
-        return {
-            "database_url": self.default_conn,
-            "auto_sql_execute": DEFAULT_AUTO_SQL_EXECUTE,
-            "database_type": "postgres",
-            "database_config": {},
-            "is_custom": False,
-            "custom_connection_key": "",
-        }
+        return default_session
 
-    def set_session(self, user_id, db_url=None, auto_sql_execute=None, db_type=None,
-                     db_config=None, is_custom=None, custom_connection_key=None):
-        if not user_id or (db_url is None and auto_sql_execute is None and db_type is None
-                           and db_config is None and is_custom is None and custom_connection_key is None):
+    def set_session(self, user_id, connection_id=None, auto_sql_execute=None, is_custom=None):
+        if not user_id or (connection_id is None and auto_sql_execute is None and is_custom is None):
             return
         update_data = {"updated_at": firestore.SERVER_TIMESTAMP}
-        if db_url is not None:
-            update_data["database_url"] = db_url
+        if connection_id is not None:
+            update_data["connection_id"] = connection_id
         if auto_sql_execute is not None:
             update_data["auto_sql_execute"] = bool(auto_sql_execute)
-        if db_type is not None:
-            update_data["database_type"] = db_type
         if is_custom is not None:
             update_data["is_custom"] = bool(is_custom)
-        if custom_connection_key is not None:
-            update_data["custom_connection_key"] = custom_connection_key
-        if db_config is not None:
-            update_data["database_config"] = db_config
         try:
             # merge=list(update_data.keys()) - NOT the boolean merge=True -
             # is what actually gives "patch these top-level fields, leave
-            # the rest of the document alone" semantics here. Firestore's
-            # boolean merge=True performs a *recursive* merge of nested map
-            # fields: a key absent from the new "database_config" (e.g.
-            # billing_project_id, when the new connection doesn't have one)
-            # is left as whatever it was in the OLD document, not cleared -
-            # so switching from a BigQuery connection with a
-            # billing_project_id/credentials_json to one without either
-            # would silently keep serving the previous connection's values.
-            # That's exactly how a customer BigQuery connection into
-            # bigquery-public-data/google_ads once appeared to "start
-            # working" after switching to a different dataset and back -
-            # what actually happened was it inherited a stale
-            # billing_project_id left over from the other dataset, not that
-            # anything was actually fixed. Passing the explicit list of
-            # field paths being written here (a list of strings, not a
-            # bool) tells Firestore to treat each of those fields -
-            # including the whole "database_config" map - as an atomic
-            # replacement, while still leaving any *other* top-level field
-            # (e.g. custom_connection_key, when this call doesn't pass one)
-            # untouched, which is what this method's callers actually rely
-            # on (see set_session's docstring/callers - most calls only
-            # pass a subset of fields).
+            # the rest of the document alone" semantics here (e.g. leaving
+            # connection_id/is_custom untouched on an auto_sql_execute-only
+            # call). See set_session's docstring/callers - most calls only
+            # pass a subset of fields.
             self.client.collection("sessions").document(user_id).set(
                 update_data, merge=list(update_data.keys())
             )

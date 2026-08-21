@@ -164,23 +164,50 @@ def test_get_schema_scan_query_uses_configured_scan_cap():
 
 # --- cache_key -------------------------------------------------------------------
 
-def test_cache_key_parses_user_and_database():
+def test_cache_key_parses_user_host_port_and_database():
     backend = MySQLBackend()
     key = backend.cache_key({"url": "mysql://alice:secret@host:3306/mydb"})
-    assert key == "alice@mydb"
+    assert key == "alice@host:3306/mydb"
     assert "secret" not in key
+
+
+def test_cache_key_differs_across_hosts_with_same_user_and_database():
+    # Regression coverage for the real bug this fixes: two entirely
+    # different MySQL servers can easily share both a username and a
+    # database name - the old host-blind derivation ("alice@mydb" for
+    # both) would collide them onto the same schema_cache.py entry,
+    # silently serving one server's schema back for the other's
+    # /api/translate calls.
+    backend = MySQLBackend()
+    key_a = backend.cache_key({"url": "mysql://alice:secret@server-a.example.com:3306/mydb"})
+    key_b = backend.cache_key({"url": "mysql://alice:secret@server-b.example.com:3306/mydb"})
+    assert key_a != key_b
+
+
+def test_cache_key_differs_across_ports_on_the_same_host():
+    backend = MySQLBackend()
+    key_3306 = backend.cache_key({"url": "mysql://alice:secret@host:3306/mydb"})
+    key_3307 = backend.cache_key({"url": "mysql://alice:secret@host:3307/mydb"})
+    assert key_3306 != key_3307
+
+
+def test_cache_key_defaults_port_to_3306_when_omitted():
+    backend = MySQLBackend()
+    key_explicit = backend.cache_key({"url": "mysql://alice:secret@host:3306/mydb"})
+    key_omitted = backend.cache_key({"url": "mysql://alice:secret@host/mydb"})
+    assert key_explicit == key_omitted == "alice@host:3306/mydb"
 
 
 def test_cache_key_percent_decodes_credentials():
     backend = MySQLBackend()
     key = backend.cache_key({"url": "mysql://ali%40ce:secret@host:3306/mydb"})
-    assert key == "ali@ce@mydb"
+    assert key == "ali@ce@host:3306/mydb"
 
 
 def test_cache_key_strips_query_string_from_database():
     backend = MySQLBackend()
     key = backend.cache_key({"url": "mysql://alice:secret@host:3306/mydb?ssl=true"})
-    assert key == "alice@mydb"
+    assert key == "alice@host:3306/mydb"
 
 
 def test_cache_key_handles_missing_url():
@@ -271,8 +298,25 @@ def test_cache_key_works_for_a_unix_socket_url():
     key = backend.cache_key({
         "url": "mysql://trial:FooBar@/classicmodels?unix_socket=/cloudsql/proj:us-east1:instance",
     })
-    assert key == "trial@classicmodels"
+    assert key == "trial@/cloudsql/proj:us-east1:instance/classicmodels"
     assert "FooBar" not in key
+
+
+def test_cache_key_differs_across_unix_sockets_with_same_user_and_database():
+    # Regression coverage: _parse_mysql_url() defaults "host" to the
+    # meaningless "localhost" for a socket connection (see its own
+    # docstring), so a host:port-based key (even a *correctly* host-aware
+    # one) would still collide two different Cloud SQL instances - only
+    # reachable via two different unix_socket paths - onto the same
+    # "user@localhost:3306/db" key.
+    backend = MySQLBackend()
+    key_a = backend.cache_key({
+        "url": "mysql://trial:FooBar@/classicmodels?unix_socket=/cloudsql/proj:us-east1:instance-a",
+    })
+    key_b = backend.cache_key({
+        "url": "mysql://trial:FooBar@/classicmodels?unix_socket=/cloudsql/proj:us-east1:instance-b",
+    })
+    assert key_a != key_b
 
 
 # --- identity_label ------------------------------------------------------------

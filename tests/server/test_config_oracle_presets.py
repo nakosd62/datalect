@@ -6,10 +6,11 @@ Oracle has no ambient/shared identity to authenticate presets with, so an
 Oracle preset carries its own explicit password right in the presets file -
 and that credential has to be copied into the session's db_config wherever
 a preset gets selected, or every query against it fails with "requires a
-user and password". Two distinct code paths do that copying (see
-config_routes.py's module docstring): the authenticated preset-match
-branch inside _parse_incoming_connection, and the anonymous preset_index
-branch inside handle_config - both are covered here. See
+user and password" - resolved fresh from CONFIGURED_DBS every time (db.py's
+resolve_active_descriptor), never persisted on the session. Both anonymous
+and authenticated users select a preset the same way, by its stable
+"preset_id" (see config_routes.py's unified preset branch in
+handle_config) - covered here for both user types. See
 test_config_oracle.py for the separate custom (user-saved) connection
 flow.
 """
@@ -31,13 +32,10 @@ def test_authenticated_preset_selection_connects_with_presets_password(app_facto
     harness = install_fake_oracle_connect(monkeypatch)
     login_as(env.client, "alice@example.com")
 
-    # Mirrors what client.js's triggerConfigSave() posts for a direct
-    # (non-custom) preset radio selection: the preset's own fields, minus
-    # any credential (never redisplayed to the frontend to resend).
-    resp = env.client.post('/api/config', json={
-        "database_type": "oracle", "host": "db-preset.example.com", "service_name": "ORCLPDB1",
-        "user": "svc_ydyl", "schema": "sales", "database_name": "Orders (Oracle)",
-    })
+    # Mirrors what client.js's triggerConfigSave() posts for a preset radio
+    # selection: just the preset's stable id, same as an anonymous visitor
+    # (see config_routes.py's unified preset branch in handle_config).
+    resp = env.client.post('/api/config', json={"preset_id": "oracle+Orders (Oracle)"})
     assert resp.status_code == 200
 
     env.client.post('/api/execute', json={"sql": "SELECT 1 FROM DUAL;"})
@@ -46,19 +44,20 @@ def test_authenticated_preset_selection_connects_with_presets_password(app_facto
 
 
 def test_preset_credential_never_appears_in_config_response(app_factory, tmp_path, monkeypatch):
-    # Unlike a custom connection (state_store.py's _strip_credentials),
-    # nothing currently strips a preset's own credential out of
-    # CONFIGURED_DBS for an authenticated GET - same status quo pinned by
-    # test_config_databricks_presets.py's equivalent test. Not asserting
-    # this is desirable, just pinning today's actual behavior.
+    # A preset's own credential is redacted out of CONFIGURED_DBS for EVERY
+    # visitor - authenticated or anonymous alike, regardless of environment
+    # (see config_routes.py's handle_config comment on configured_dbs) -
+    # being signed in earns no special access to another admin's secret.
+    # Same status quo as test_config_databricks_presets.py's equivalent test.
     path = write_database_presets_file(tmp_path, _preset_payload())
     env = app_factory(env={"DATABASE_PRESETS_FILE": path})
     login_as(env.client, "alice@example.com")
     data = env.client.get('/api/config').get_json()
-    assert data['configured_databases'][0]['password'] == "preset-password"
+    assert data['configured_databases'][0] == {"id": "oracle+Orders (Oracle)", "name": "Orders (Oracle)", "type": "oracle"}
+    assert "password" not in data['configured_databases'][0]
 
 
-def test_anonymous_preset_index_selection_connects_with_presets_password(app_factory, tmp_path, monkeypatch):
+def test_anonymous_preset_id_selection_connects_with_presets_password(app_factory, tmp_path, monkeypatch):
     path = write_database_presets_file(tmp_path, _preset_payload())
     env = app_factory(env={
         "GOOGLE_CLIENT_ID": "fake.apps.googleusercontent.com",
@@ -66,7 +65,7 @@ def test_anonymous_preset_index_selection_connects_with_presets_password(app_fac
     })
     harness = install_fake_oracle_connect(monkeypatch)
 
-    resp = env.client.post('/api/config', json={"preset_index": 0})
+    resp = env.client.post('/api/config', json={"preset_id": "oracle+Orders (Oracle)"})
     assert resp.status_code == 200
 
     env.client.post('/api/execute', json={"sql": "SELECT 1 FROM DUAL;"})
@@ -96,11 +95,7 @@ def test_authenticated_preset_selection_with_ssl_connects_over_tls(app_factory, 
     harness = install_fake_oracle_connect(monkeypatch)
     login_as(env.client, "alice@example.com")
 
-    resp = env.client.post('/api/config', json={
-        "database_type": "oracle", "host": "adb.us-ashburn-1.oraclecloud.com", "port": 1522,
-        "service_name": "myatp_high.adb.oraclecloud.com", "user": "admin",
-        "database_name": "ADB (Oracle)",
-    })
+    resp = env.client.post('/api/config', json={"preset_id": "oracle+ADB (Oracle)"})
     assert resp.status_code == 200
 
     env.client.post('/api/execute', json={"sql": "SELECT 1 FROM DUAL;"})
@@ -109,7 +104,7 @@ def test_authenticated_preset_selection_with_ssl_connects_over_tls(app_factory, 
     assert call["ssl_server_dn_match"] is True
 
 
-def test_anonymous_preset_index_selection_with_ssl_connects_over_tls(app_factory, tmp_path, monkeypatch):
+def test_anonymous_preset_id_selection_with_ssl_connects_over_tls(app_factory, tmp_path, monkeypatch):
     path = write_database_presets_file(tmp_path, _adb_preset_payload())
     env = app_factory(env={
         "GOOGLE_CLIENT_ID": "fake.apps.googleusercontent.com",
@@ -117,7 +112,7 @@ def test_anonymous_preset_index_selection_with_ssl_connects_over_tls(app_factory
     })
     harness = install_fake_oracle_connect(monkeypatch)
 
-    resp = env.client.post('/api/config', json={"preset_index": 0})
+    resp = env.client.post('/api/config', json={"preset_id": "oracle+ADB (Oracle)"})
     assert resp.status_code == 200
 
     env.client.post('/api/execute', json={"sql": "SELECT 1 FROM DUAL;"})
@@ -136,4 +131,4 @@ def test_anonymous_visitor_never_receives_the_presets_credential(app_factory, tm
     }, mock_firestore=True)
     resp = env.client.get('/api/config')
     assert "preset-password" not in resp.get_data(as_text=True)
-    assert resp.get_json()['configured_databases'] == [{"name": "Orders (Oracle)", "type": "oracle"}]
+    assert resp.get_json()['configured_databases'] == [{"id": "oracle+Orders (Oracle)", "name": "Orders (Oracle)", "type": "oracle"}]

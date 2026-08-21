@@ -114,11 +114,7 @@ def test_cloud_sql_unix_socket_preset_dispatches_with_socket_not_localhost(app_f
     harness = install_fake_pymysql_connect(monkeypatch)
     login_as(env.client, "alice@example.com")
 
-    env.client.post('/api/config', json={
-        "database_type": "mysql",
-        "database_url": "mysql://trial:FooBar@/classicmodels?unix_socket=/cloudsql/proj:us-east1:instance",
-        "database_name": "Sales Mgmt (CloudSQL/MySQL)", "is_custom": False,
-    })
+    env.client.post('/api/config', json={"preset_id": "mysql+Sales Mgmt (CloudSQL/MySQL)"})
     env.client.post('/api/execute', json={"sql": "SELECT 1;"})
     assert len(harness.calls) >= 1
     kwargs = harness.calls[-1]
@@ -146,14 +142,18 @@ def test_mysql_preset_selectable_and_reported_active(app_factory, tmp_path):
     env = app_factory(env={"DATABASE_PRESETS_FILE": path})
     login_as(env.client, "alice@example.com")
 
-    resp = env.client.post('/api/config', json={
-        "database_type": "mysql", "database_url": "mysql://demo:pw@host:3306/sales",
-        "database_name": "Sales (MySQL)", "is_custom": False,
-    })
+    resp = env.client.post('/api/config', json={"preset_id": "mysql+Sales (MySQL)"})
     assert resp.status_code == 200
 
     data = env.client.get('/api/config').get_json()
-    assert data['active_database_type'] == "mysql"
+    # active_database_type is blanked for an active preset (redacted, same
+    # as any other admin preset - see config_routes.py's handle_config);
+    # the type is instead confirmed via configured_databases (below) and
+    # via active_preset_id matching the mysql preset's own stable id, not a
+    # postgres one (the regression this test exists for - see module
+    # docstring).
+    assert data['active_preset_id'] == "mysql+Sales (MySQL)"
+    assert data['active_database_type'] == ""
     assert data['active_is_custom'] is False
     assert data['configured_databases'][0]['type'] == "mysql"
 

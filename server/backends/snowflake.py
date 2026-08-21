@@ -137,7 +137,7 @@ class SnowflakeBackend(Backend):
     def cache_key(self, descriptor):
         """account/database.schema, parsed straight from the descriptor -
         never a credential. Same non-sensitive-identifier role
-        PostgresBackend.cache_key's username@dbname and
+        PostgresBackend.cache_key's username@host:port/dbname and
         BigQueryBackend.cache_key's project.dataset play."""
         descriptor = descriptor or {}
         account = descriptor.get("account") or "unknown"

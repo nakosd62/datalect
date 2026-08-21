@@ -24,7 +24,7 @@ Connections are represented as descriptors: {"type": "postgres", "url":
 "schema": "..."}, or {"type": "oracle", "url": "oracle://<host>:<port>/
 <service_name-or-sid>", "host": "...", "port": 1521, "service_name": "..."
 (or "sid" instead), "user": "...", "password": "...", "schema": "..."} -
-see db.py's session_to_descriptor / backends/base.py's module docstring /
+see db.py's resolve_active_descriptor / backends/base.py's module docstring /
 backends/bigquery.py's, backends/snowflake.py's, backends/databricks.py's,
 and backends/oracle.py's module docstrings for what billing_project_id is
 and why it's not just project_id, for Snowflake's two mutually-exclusive
@@ -56,10 +56,11 @@ silently pays for a preset an admin didn't deliberately configure that way
 (see app_config.py). Snowflake presets are different: Snowflake has no
 ADC-equivalent ambient identity at all, so a Snowflake preset DOES carry
 its own explicit password/private_key right in app_config.py's presets
-file (see that module's DATABASE_PRESETS_FILE comment) - copied across
-into the session's db_config wherever a preset is selected (both the
-authenticated preset-match path in _parse_incoming_connection below and
-the anonymous preset_index path in handle_config). A user's own custom
+file (see that module's DATABASE_PRESETS_FILE comment) - resolved fresh
+from CONFIGURED_DBS by db.py's resolve_active_descriptor every time a
+preset connection is actually used, rather than ever being copied into
+or persisted on the session itself (see db.py's module docstring). A
+user's own custom
 BigQuery connection is held to a stricter rule still: it must ALWAYS
 supply both its own billing_project_id and its own service-account key
 (credentials_json) - _parse_incoming_connection and
@@ -86,16 +87,18 @@ credential - here, a Personal Access Token; see backends/databricks.py's
 module docstring for why OAuth isn't supported yet either) - the one
 difference is Databricks DOES have a preset path, unlike Snowflake: an
 admin-configured Databricks preset carries its own access_token right in
-app_config.py's presets file, copied across into the session's db_config
-wherever that preset is selected, the same way a Snowflake preset's
-password/private_key would be if Snowflake had preset support (it
-doesn't, yet - see app_config.py's DATABASE_PRESETS_FILE comment).
+app_config.py's presets file, resolved fresh from CONFIGURED_DBS whenever
+that preset is actually used (never persisted on the session), the same
+way a Snowflake preset's password/private_key would be if Snowflake had
+preset support (it doesn't, yet - see app_config.py's
+DATABASE_PRESETS_FILE comment).
 
 Oracle is the same "no ADC-equivalent ambient identity, own preset
 credential" shape as Databricks - an admin-configured Oracle preset
 carries its own explicit password right in app_config.py's presets file,
-copied across into the session's db_config wherever that preset is
-selected. Unlike every other structured (non-URL) dialect here, Oracle's
+resolved fresh from CONFIGURED_DBS whenever that preset is actually used
+(never persisted on the session). Unlike every other structured (non-URL)
+dialect here, Oracle's
 "schema" descriptor field isn't a separate namespace within the connected
 database the way BigQuery's dataset/Snowflake's-or-Databricks' schema is -
 it's actually the *user/owner* objects belong to, and querying a different
@@ -106,8 +109,8 @@ for the identifier-validation reasoning behind that).
 Redshift is the same "no ADC-equivalent ambient identity, own preset
 credential" shape as Oracle/Databricks - an admin-configured Redshift
 preset carries its own explicit password right in app_config.py's presets
-file, copied across into the session's db_config wherever that preset is
-selected. Unlike Oracle, Redshift's "schema" descriptor field really is a
+file, resolved fresh from CONFIGURED_DBS whenever that preset is actually
+used (never persisted on the session). Unlike Oracle, Redshift's "schema" descriptor field really is a
 separate Postgres-style namespace (not a stand-in for a user) - see
 backends/redshift.py's module docstring. Also unlike Oracle, there's no
 "ssl" descriptor field/opt-in flag: Redshift connections always require
@@ -121,7 +124,7 @@ from urllib.parse import urlparse
 from flask import Blueprint, request, jsonify
 
 from app_config import (
-    CONFIGURED_DBS, DEFAULT_CONN, PRESET_MODELS,
+    CONFIGURED_DBS, DEFAULT_PRESET_ID, PRESET_MODELS,
     AUTH_ENABLED, IS_CLOUD_RUN, state_store, logger,
 )
 import os
@@ -129,7 +132,7 @@ from auth import (
     get_or_create_session_id, get_current_user_identity, apply_session_cookie,
     is_anonymous_user,
 )
-from db import get_conn_identifier, session_to_descriptor
+from db import get_conn_identifier, resolve_active_descriptor
 from backends import get_backend
 from state_store import compute_connection_key
 import schema_cache
@@ -368,17 +371,22 @@ _CUSTOM_REDSHIFT_MISSING_FIELDS_ERROR = (
 )
 
 
-def _parse_incoming_connection(data, user_identity, is_custom):
+def _parse_incoming_connection(data, user_identity):
     """Builds (db_type, db_url, db_config, error) from a POST body's
-    top-level active-connection fields. db_url is None if the request
-    didn't supply enough to identify a connection of the given type (e.g. a
-    BigQuery selection missing project_id/dataset) - callers treat that the
-    same as "no connection change requested". `error`, when not None, means
-    this connection is invalid and MUST NOT be saved/activated - used for a
-    custom BigQuery connection missing its required billing_project_id
-    and/or credentials_json, or a custom Snowflake connection missing its
-    required account/user/warehouse/database and/or a credential (see
-    module docstring)."""
+    top-level active-connection fields, for a user's own CUSTOM connection
+    only - a preset selection never reaches this function at all anymore
+    (see handle_config's unified `preset_id` branch, which resolves a
+    preset straight from CONFIGURED_DBS and never touches this code path -
+    that's also why there's no `is_custom` parameter here any longer: every
+    call site only ever calls this for a custom connection). db_url is
+    None if the request didn't supply enough to identify a connection of
+    the given type (e.g. a BigQuery selection missing project_id/dataset) -
+    callers treat that the same as "no connection change requested".
+    `error`, when not None, means this connection is invalid and MUST NOT
+    be saved/activated - used for a custom BigQuery connection missing its
+    required billing_project_id and/or credentials_json, or a custom
+    Snowflake connection missing its required account/user/warehouse/
+    database and/or a credential (see module docstring)."""
     db_type = (data.get('database_type') or 'postgres').strip().lower()
 
     if db_type == 'bigquery':
@@ -389,39 +397,23 @@ def _parse_incoming_connection(data, user_identity, is_custom):
         db_url = _bigquery_url(project_id, dataset)
         db_config = {"project_id": project_id, "dataset": dataset}
 
-        if is_custom:
-            # A user's own connection: both fields are required, always
-            # explicit, never inferred from the other or from a preset/app
-            # default - see the module docstring for why. credentials_json
-            # still supports "leave blank to keep the previously-saved key"
-            # (it's the one field that never round-trips back to the
-            # frontend to redisplay); billing_project_id doesn't need that
-            # treatment since it's not a credential and is always shown/
-            # resent as-is by the frontend.
-            credentials_json = _resolve_bigquery_credentials(
-                user_identity, project_id, dataset, data.get('credentials_json'),
-                name=data.get('database_name'),
-            )
-            billing_project_id = (data.get('billing_project_id') or '').strip()
-            if not (credentials_json and billing_project_id):
-                return db_type, db_url, db_config, _CUSTOM_BIGQUERY_MISSING_FIELDS_ERROR
-            db_config["credentials_json"] = credentials_json
-            db_config["billing_project_id"] = billing_project_id
-        else:
-            # A genuine admin-preset selection (matched by its real fields,
-            # not preset_index - see the anonymous branch in handle_config
-            # for that path). Presets are trusted/admin-configured: use
-            # their own explicit billing_project_id (app_config.py) if they
-            # have one; if not, don't invent one here either - the backend
-            # falls back to billing project_id itself, which will 403
-            # loudly if that's data this app doesn't own. There is
-            # deliberately no other fallback (see module docstring).
-            preset_match = next(
-                (db for db in CONFIGURED_DBS if db.get("type") == "bigquery" and db.get("url") == db_url),
-                None,
-            )
-            if preset_match and preset_match.get("billing_project_id"):
-                db_config["billing_project_id"] = preset_match["billing_project_id"]
+        # A user's own connection: both fields are required, always
+        # explicit, never inferred from the other or from a preset/app
+        # default - see the module docstring for why. credentials_json
+        # still supports "leave blank to keep the previously-saved key"
+        # (it's the one field that never round-trips back to the
+        # frontend to redisplay); billing_project_id doesn't need that
+        # treatment since it's not a credential and is always shown/
+        # resent as-is by the frontend.
+        credentials_json = _resolve_bigquery_credentials(
+            user_identity, project_id, dataset, data.get('credentials_json'),
+            name=data.get('database_name'),
+        )
+        billing_project_id = (data.get('billing_project_id') or '').strip()
+        if not (credentials_json and billing_project_id):
+            return db_type, db_url, db_config, _CUSTOM_BIGQUERY_MISSING_FIELDS_ERROR
+        db_config["credentials_json"] = credentials_json
+        db_config["billing_project_id"] = billing_project_id
         return db_type, db_url, db_config, None
 
     if db_type == 'snowflake':
@@ -440,46 +432,25 @@ def _parse_incoming_connection(data, user_identity, is_custom):
         if role:
             db_config["role"] = role
 
-        if is_custom:
-            # Same policy as BigQuery's custom connections: every field
-            # explicit, nothing inferred, nothing falls back to a shared/
-            # app identity or to an admin preset's credential - Snowflake
-            # has no ADC-equivalent ambient auth mode to fall back to even
-            # if it wanted to (see app_config.py's DATABASE_PRESETS_FILE
-            # comment for the admin-preset side of this).
-            password, private_key, private_key_passphrase = _resolve_snowflake_credentials(
-                user_identity, account, database, schema,
-                data.get('password'), data.get('private_key'), data.get('private_key_passphrase'),
-                name=data.get('database_name'),
-            )
-            if not (password or private_key):
-                return db_type, db_url, db_config, _CUSTOM_SNOWFLAKE_MISSING_FIELDS_ERROR
-            if password:
-                db_config["password"] = password
-            else:
-                db_config["private_key"] = private_key
-                if private_key_passphrase:
-                    db_config["private_key_passphrase"] = private_key_passphrase
+        # Same policy as BigQuery's custom connections: every field
+        # explicit, nothing inferred, nothing falls back to a shared/
+        # app identity or to an admin preset's credential - Snowflake
+        # has no ADC-equivalent ambient auth mode to fall back to even
+        # if it wanted to (see app_config.py's DATABASE_PRESETS_FILE
+        # comment for the admin-preset side of this).
+        password, private_key, private_key_passphrase = _resolve_snowflake_credentials(
+            user_identity, account, database, schema,
+            data.get('password'), data.get('private_key'), data.get('private_key_passphrase'),
+            name=data.get('database_name'),
+        )
+        if not (password or private_key):
+            return db_type, db_url, db_config, _CUSTOM_SNOWFLAKE_MISSING_FIELDS_ERROR
+        if password:
+            db_config["password"] = password
         else:
-            # A genuine admin-preset selection (matched by its real fields,
-            # not preset_index - see the anonymous branch in handle_config
-            # for that path). Unlike a BigQuery preset, a Snowflake preset
-            # DOES carry its own credential (app_config.py - Snowflake has
-            # no ADC-equivalent ambient identity to fall back to), so it
-            # must be copied across here or connect() downstream would
-            # raise "requires either 'password' or 'private_key'" against
-            # an empty db_config.
-            preset_match = next(
-                (db for db in CONFIGURED_DBS if db.get("type") == "snowflake" and db.get("url") == db_url),
-                None,
-            )
-            if preset_match:
-                if preset_match.get("password"):
-                    db_config["password"] = preset_match["password"]
-                elif preset_match.get("private_key"):
-                    db_config["private_key"] = preset_match["private_key"]
-                    if preset_match.get("private_key_passphrase"):
-                        db_config["private_key_passphrase"] = preset_match["private_key_passphrase"]
+            db_config["private_key"] = private_key
+            if private_key_passphrase:
+                db_config["private_key_passphrase"] = private_key_passphrase
         return db_type, db_url, db_config, None
 
     if db_type == 'databricks':
@@ -496,34 +467,19 @@ def _parse_incoming_connection(data, user_identity, is_custom):
         if schema:
             db_config["schema"] = schema
 
-        if is_custom:
-            # Same policy as Snowflake's custom connections: every field
-            # explicit, nothing inferred, nothing falls back to a shared/
-            # app identity or to an admin preset's credential - Databricks
-            # has no ADC-equivalent ambient auth mode to fall back to even
-            # if it wanted to (see backends/databricks.py's module
-            # docstring).
-            access_token = _resolve_databricks_credentials(
-                user_identity, server_hostname, http_path, data.get('access_token'),
-                name=data.get('database_name'),
-            )
-            if not access_token:
-                return db_type, db_url, db_config, _CUSTOM_DATABRICKS_MISSING_FIELDS_ERROR
-            db_config["access_token"] = access_token
-        else:
-            # A genuine admin-preset selection (matched by its real fields,
-            # not preset_index - see the anonymous branch in handle_config
-            # for that path). Unlike a BigQuery preset, a Databricks preset
-            # DOES carry its own credential (app_config.py - Databricks has
-            # no ADC-equivalent ambient identity to fall back to), so it
-            # must be copied across here or connect() downstream would
-            # raise "requires an access_token" against an empty db_config.
-            preset_match = next(
-                (db for db in CONFIGURED_DBS if db.get("type") == "databricks" and db.get("url") == db_url),
-                None,
-            )
-            if preset_match and preset_match.get("access_token"):
-                db_config["access_token"] = preset_match["access_token"]
+        # Same policy as Snowflake's custom connections: every field
+        # explicit, nothing inferred, nothing falls back to a shared/
+        # app identity or to an admin preset's credential - Databricks
+        # has no ADC-equivalent ambient auth mode to fall back to even
+        # if it wanted to (see backends/databricks.py's module
+        # docstring).
+        access_token = _resolve_databricks_credentials(
+            user_identity, server_hostname, http_path, data.get('access_token'),
+            name=data.get('database_name'),
+        )
+        if not access_token:
+            return db_type, db_url, db_config, _CUSTOM_DATABRICKS_MISSING_FIELDS_ERROR
+        db_config["access_token"] = access_token
         return db_type, db_url, db_config, None
 
     if db_type == 'oracle':
@@ -560,35 +516,18 @@ def _parse_incoming_connection(data, user_identity, is_custom):
             # threaded through explicitly like every other field here.
             db_config["ssl"] = True
 
-        if is_custom:
-            # Same policy as Snowflake's/Databricks' custom connections:
-            # every field explicit, nothing inferred, nothing falls back to
-            # a shared/app identity or to an admin preset's credential -
-            # Oracle has no ADC-equivalent ambient auth mode to fall back
-            # to (see backends/oracle.py's module docstring).
-            password = _resolve_oracle_credentials(
-                user_identity, host, port, service_name_or_sid, data.get('password'),
-                name=data.get('database_name'),
-            )
-            if not password:
-                return db_type, db_url, db_config, _CUSTOM_ORACLE_MISSING_FIELDS_ERROR
-            db_config["password"] = password
-        else:
-            # A genuine admin-preset selection (matched by its real fields,
-            # not preset_index - see the anonymous branch in handle_config
-            # for that path). Like a Databricks preset, an Oracle preset
-            # DOES carry its own credential (app_config.py - Oracle has no
-            # ADC-equivalent ambient identity to fall back to), so it must
-            # be copied across here or connect() downstream would raise
-            # "requires a user and password" against an empty db_config.
-            preset_match = next(
-                (db for db in CONFIGURED_DBS if db.get("type") == "oracle" and db.get("url") == db_url),
-                None,
-            )
-            if preset_match and preset_match.get("password"):
-                db_config["password"] = preset_match["password"]
-            if preset_match and preset_match.get("ssl"):
-                db_config["ssl"] = True
+        # Same policy as Snowflake's/Databricks' custom connections:
+        # every field explicit, nothing inferred, nothing falls back to
+        # a shared/app identity or to an admin preset's credential -
+        # Oracle has no ADC-equivalent ambient auth mode to fall back
+        # to (see backends/oracle.py's module docstring).
+        password = _resolve_oracle_credentials(
+            user_identity, host, port, service_name_or_sid, data.get('password'),
+            name=data.get('database_name'),
+        )
+        if not password:
+            return db_type, db_url, db_config, _CUSTOM_ORACLE_MISSING_FIELDS_ERROR
+        db_config["password"] = password
         return db_type, db_url, db_config, None
 
     if db_type == 'redshift':
@@ -613,34 +552,19 @@ def _parse_incoming_connection(data, user_identity, is_custom):
         if schema:
             db_config["schema"] = schema
 
-        if is_custom:
-            # Same policy as Oracle's/Databricks'/Snowflake's custom
-            # connections: every field explicit, nothing inferred, nothing
-            # falls back to a shared/app identity or to an admin preset's
-            # credential - Redshift has no ADC-equivalent ambient auth mode
-            # to fall back to (see backends/redshift.py's module
-            # docstring).
-            password = _resolve_redshift_credentials(
-                user_identity, host, port, database, data.get('password'),
-                name=data.get('database_name'),
-            )
-            if not password:
-                return db_type, db_url, db_config, _CUSTOM_REDSHIFT_MISSING_FIELDS_ERROR
-            db_config["password"] = password
-        else:
-            # A genuine admin-preset selection (matched by its real fields,
-            # not preset_index - see the anonymous branch in handle_config
-            # for that path). Like an Oracle preset, a Redshift preset DOES
-            # carry its own credential (app_config.py - Redshift has no
-            # ADC-equivalent ambient identity to fall back to), so it must
-            # be copied across here or connect() downstream would raise
-            # "requires a user and password" against an empty db_config.
-            preset_match = next(
-                (db for db in CONFIGURED_DBS if db.get("type") == "redshift" and db.get("url") == db_url),
-                None,
-            )
-            if preset_match and preset_match.get("password"):
-                db_config["password"] = preset_match["password"]
+        # Same policy as Oracle's/Databricks'/Snowflake's custom
+        # connections: every field explicit, nothing inferred, nothing
+        # falls back to a shared/app identity or to an admin preset's
+        # credential - Redshift has no ADC-equivalent ambient auth mode
+        # to fall back to (see backends/redshift.py's module
+        # docstring).
+        password = _resolve_redshift_credentials(
+            user_identity, host, port, database, data.get('password'),
+            name=data.get('database_name'),
+        )
+        if not password:
+            return db_type, db_url, db_config, _CUSTOM_REDSHIFT_MISSING_FIELDS_ERROR
+        db_config["password"] = password
         return db_type, db_url, db_config, None
 
     if db_type == 'mysql':
@@ -686,7 +610,7 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
     connection_key (see compute_connection_key's docstring in
     state_store.py) is computed here, once, from the exact (name, url,
     credential) this function is about to persist - so it can also be
-    reused as-is for the session's custom_connection_key pointer when this
+    reused as-is for the session's connection_id pointer when this
     same request's active connection is one of these entries (see
     handle_config), instead of that being recomputed separately and
     risking drifting out of sync with what actually got saved."""
@@ -896,8 +820,6 @@ def handle_config():
         user_identity and user_identity != session_id and not is_anonymous_user(user_identity)
     )
 
-    preset_urls = {db["url"] for db in CONFIGURED_DBS}
-
     if request.method == 'POST':
         data = request.get_json() or {}
         new_db_name = data.get('database_name')
@@ -906,135 +828,40 @@ def handle_config():
         if not isinstance(new_auto_sql_execute, bool):
             new_auto_sql_execute = None
 
-        if is_anonymous_user(user_identity) and not is_custom and not data.get('custom_databases'):
-            # Anonymous (Cloud Run, signed-out) users selecting one of the
-            # admin-configured presets never receive that preset's real
-            # connection string (see the redacted configured_databases
-            # below) - the frontend can only ask for "preset #N" by index,
-            # and the actual descriptor is resolved here, server-side, from
-            # CONFIGURED_DBS. Saving/selecting a CUSTOM connection instead
-            # falls through to the generic branch below - unlike admin
-            # presets, a self-supplied custom connection's credentials
-            # aren't a secret from the very user who typed them in, and
-            # every anonymous visitor already gets their own fully
-            # isolated "anonymous:<session_id>" identity at the
-            # state_store layer (see ANONYMOUS_USER_ID_PREFIX in auth.py) -
-            # the same reasoning history_routes.py already applies to
-            # un-gating translation history for anonymous users.
-            new_db_url, new_db_type, new_db_config = None, 'postgres', {}
-            preset_index = data.get('preset_index')
-            if isinstance(preset_index, int) and 0 <= preset_index < len(CONFIGURED_DBS):
-                preset = CONFIGURED_DBS[preset_index]
-                new_db_type = preset.get('type', 'postgres')
-                new_db_url = preset.get('url')
-                if new_db_type == 'bigquery':
-                    new_db_config = {
-                        "project_id": preset.get("project_id", ""),
-                        "dataset": preset.get("dataset", ""),
-                    }
-                    # Presets authenticate via this app's own ambient
-                    # identity (ADC), never a per-user key, so their
-                    # billing project - set explicitly per-preset in
-                    # app_config.py, with no other fallback (see this
-                    # module's docstring) - has to be copied across
-                    # explicitly here - without it, backends/bigquery.py's
-                    # connect() falls back to project_id itself, which is
-                    # exactly the "does not have bigquery.jobs.create
-                    # permission" 403 this was meant to fix whenever a
-                    # preset points at data outside the app's own project
-                    # (e.g. a public dataset).
-                    if preset.get("billing_project_id"):
-                        new_db_config["billing_project_id"] = preset["billing_project_id"]
-                elif new_db_type == 'snowflake':
-                    new_db_config = {
-                        "account": preset.get("account", ""),
-                        "user": preset.get("user", ""),
-                        "warehouse": preset.get("warehouse", ""),
-                        "database": preset.get("database", ""),
-                    }
-                    if preset.get("schema"):
-                        new_db_config["schema"] = preset["schema"]
-                    if preset.get("role"):
-                        new_db_config["role"] = preset["role"]
-                    # Unlike BigQuery's ambient ADC identity, a Snowflake
-                    # preset's credential lives right in app_config.py's
-                    # CONFIGURED_DBS entry (Snowflake has none to fall back
-                    # to - see that module's DATABASE_PRESETS_FILE comment)
-                    # and must be copied across the same way, or
-                    # connect() downstream raises "requires either
-                    # 'password' or 'private_key'" against an empty config.
-                    if preset.get("password"):
-                        new_db_config["password"] = preset["password"]
-                    elif preset.get("private_key"):
-                        new_db_config["private_key"] = preset["private_key"]
-                        if preset.get("private_key_passphrase"):
-                            new_db_config["private_key_passphrase"] = preset["private_key_passphrase"]
-                elif new_db_type == 'databricks':
-                    new_db_config = {
-                        "server_hostname": preset.get("server_hostname", ""),
-                        "http_path": preset.get("http_path", ""),
-                    }
-                    if preset.get("catalog"):
-                        new_db_config["catalog"] = preset["catalog"]
-                    if preset.get("schema"):
-                        new_db_config["schema"] = preset["schema"]
-                    # Like Snowflake, Databricks has no ambient identity to
-                    # fall back to - a preset's access_token lives right in
-                    # app_config.py's CONFIGURED_DBS entry and must be
-                    # copied across, or connect() downstream raises "requires
-                    # an access_token" against an empty config.
-                    if preset.get("access_token"):
-                        new_db_config["access_token"] = preset["access_token"]
-                elif new_db_type == 'oracle':
-                    new_db_config = {
-                        "host": preset.get("host", ""),
-                        "port": preset.get("port", 1521),
-                        "user": preset.get("user", ""),
-                    }
-                    if preset.get("service_name"):
-                        new_db_config["service_name"] = preset["service_name"]
-                    elif preset.get("sid"):
-                        new_db_config["sid"] = preset["sid"]
-                    if preset.get("schema"):
-                        new_db_config["schema"] = preset["schema"]
-                    # Like Databricks, Oracle has no ambient identity to
-                    # fall back to - a preset's password lives right in
-                    # app_config.py's CONFIGURED_DBS entry and must be
-                    # copied across, or connect() downstream raises
-                    # "requires a user and password" against an empty
-                    # config.
-                    if preset.get("password"):
-                        new_db_config["password"] = preset["password"]
-                    if preset.get("ssl"):
-                        new_db_config["ssl"] = True
-                elif new_db_type == 'redshift':
-                    new_db_config = {
-                        "host": preset.get("host", ""),
-                        "port": preset.get("port", 5439),
-                        "database": preset.get("database", ""),
-                        "user": preset.get("user", ""),
-                    }
-                    if preset.get("schema"):
-                        new_db_config["schema"] = preset["schema"]
-                    # Like Oracle, Redshift has no ambient identity to fall
-                    # back to - a preset's password lives right in
-                    # app_config.py's CONFIGURED_DBS entry and must be
-                    # copied across, or connect() downstream raises
-                    # "requires a user and password" against an empty
-                    # config.
-                    if preset.get("password"):
-                        new_db_config["password"] = preset["password"]
+        # The saved custom-connections LIST and "which connection (if any)
+        # is active this request" are independent concerns - a request can
+        # touch one, the other, both, or neither (e.g. renaming a saved
+        # custom connection without switching the active selection away
+        # from a preset). Parsed up front, unconditionally, rather than
+        # nested inside whichever active-connection branch below happens to
+        # apply - `custom_list_saved` (below) tracks whether one of those
+        # branches already folded this into its own state_store call, so
+        # the trailing block at the end doesn't double up on it.
+        merged_custom_databases = _parse_incoming_custom_databases(
+            data.get('custom_databases'), user_identity
+        )
+        custom_list_saved = False
 
-            if new_db_url or new_auto_sql_execute is not None:
-                state_store.set_session(
-                    user_identity, new_db_url, new_auto_sql_execute,
-                    db_type=new_db_type, db_config=new_db_config, is_custom=False,
-                    custom_connection_key="",
-                )
+        preset_id = data.get('preset_id') if not is_custom else None
+        preset = next((db for db in CONFIGURED_DBS if db.get("id") == preset_id), None) if preset_id else None
 
-        else:
+        if preset is not None:
+            # A preset selection - anonymous and signed-in users alike now
+            # identify a preset purely by its stable, non-secret "id" (see
+            # app_config.py's DATABASE_PRESETS_FILE comment), never by
+            # resending its own fields/credentials. Nothing about a
+            # preset's actual connection details ever needs to flow through
+            # this request at all - db.py's resolve_active_descriptor
+            # resolves them fresh from CONFIGURED_DBS every time the
+            # connection is actually used, so the session only ever
+            # remembers the preset's id.
+            state_store.set_session(
+                user_identity, connection_id=preset["id"], is_custom=False,
+                auto_sql_execute=new_auto_sql_execute,
+            )
+        elif is_custom:
             new_db_type, new_db_url, new_db_config, connection_error = _parse_incoming_connection(
-                data, user_identity, is_custom
+                data, user_identity
             )
             if connection_error:
                 # Reject outright, before touching state_store - a
@@ -1045,14 +872,12 @@ def handle_config():
                 resp = jsonify({'success': False, 'error': connection_error})
                 return apply_session_cookie(resp, session_id), 400
 
-            merged_custom_databases = _parse_incoming_custom_databases(
-                data.get('custom_databases'), user_identity
-            )
-
             if new_db_url or new_auto_sql_execute is not None:
                 if new_db_url:
-                    prior_conn_str = state_store.get_session(user_identity)["database_url"]
-                    if new_db_url != prior_conn_str:
+                    prior_descriptor, _prior_missing = resolve_active_descriptor(
+                        state_store.get_session(user_identity), user_identity
+                    )
+                    if new_db_url != prior_descriptor.get("url"):
                         # The DB connection is changing - drop any cached schema
                         # for the connection we're switching to. Without this,
                         # if that connection was cached earlier - e.g. by
@@ -1066,14 +891,14 @@ def handle_config():
 
                 # Resolved once, up front (rather than inside the
                 # save-to-list block below), so the session's "which exact
-                # saved connection is this" pointer (custom_connection_key)
-                # and the actual saved-list row always agree on the same
-                # name - a blank database_name from the frontend falls back
-                # to a derived one, and computing the key before that
-                # fallback ran would silently point at a connection that
-                # was never actually saved under that name.
+                # saved connection is this" pointer (connection_id) and the
+                # actual saved-list row always agree on the same name - a
+                # blank database_name from the frontend falls back to a
+                # derived one, and computing the key before that fallback
+                # ran would silently point at a connection that was never
+                # actually saved under that name.
                 db_name_to_save = None
-                if new_db_url and (is_custom or (new_db_url not in preset_urls)):
+                if new_db_url:
                     db_name_to_save = new_db_name
                     if not db_name_to_save:
                         if new_db_type == 'bigquery':
@@ -1099,19 +924,18 @@ def handle_config():
                             except Exception:
                                 db_name_to_save = "Custom"
 
-                # "" (not None) whenever the active connection isn't a
-                # custom one, so set_session actually clears any
-                # previously-pinned key rather than leaving a stale one
-                # behind from before the user switched to a preset.
+                # "" (not None) whenever no connection was actually
+                # identified this request, so set_session leaves is_custom
+                # true but with a blank connection_id rather than pinning a
+                # stale one.
                 active_connection_key = (
                     compute_connection_key(db_name_to_save, new_db_url, _credential_for_key(new_db_config))
-                    if is_custom and new_db_url else ""
+                    if new_db_url else ""
                 )
 
                 state_store.set_session(
-                    user_identity, new_db_url, new_auto_sql_execute,
-                    db_type=new_db_type, db_config=new_db_config, is_custom=is_custom,
-                    custom_connection_key=active_connection_key,
+                    user_identity, connection_id=active_connection_key, is_custom=True,
+                    auto_sql_execute=new_auto_sql_execute,
                 )
                 if db_name_to_save is not None:
                     state_store.set_db_connections(
@@ -1119,17 +943,50 @@ def handle_config():
                         db_config=new_db_config, custom_databases=merged_custom_databases,
                         connection_key=(active_connection_key or None),
                     )
-            else:
-                state_store.set_session(
-                    user_identity, DEFAULT_CONN, db_type='postgres', db_config={}, is_custom=False,
-                    custom_connection_key="",
-                )
+                    custom_list_saved = True
+        elif new_auto_sql_execute is not None:
+            # Neither a preset nor a custom connection was actively
+            # selected in this request (e.g. only the auto-execute toggle
+            # changed) - leave the active connection exactly as it is.
+            # There's no hardcoded default to reset it to here anymore the
+            # way there used to be: a blank/never-set connection_id already
+            # resolves to the app default on its own - see db.py's
+            # resolve_active_descriptor.
+            state_store.set_session(user_identity, auto_sql_execute=new_auto_sql_execute)
+
+        if not custom_list_saved and merged_custom_databases is not None:
+            state_store.set_db_connections(
+                user_identity, None, None, None, custom_databases=merged_custom_databases
+            )
 
     session_data = state_store.get_session(user_identity)
-    active_conn_str = session_data["database_url"]
-    active_db_type = session_data.get("database_type") or "postgres"
-    active_db_config = session_data.get("database_config") or {}
+    # The FULL descriptor - including any credentials - is resolved fresh,
+    # right now, from CONFIGURED_DBS/db_connections (see db.py's module
+    # docstring); session_data itself holds only the identity reference
+    # (is_custom, connection_id), never a copy of the connection's own
+    # details. `connection_missing` is true when connection_id was set to
+    # something but it no longer resolves to anything real - the preset
+    # was removed/renamed, or the saved custom connection was deleted -
+    # in which case active_descriptor is already the app default, and the
+    # active_connection_missing* fields below tell the frontend so it can
+    # warn the user instead of silently showing the default as if it were
+    # what they'd actually picked.
+    active_descriptor, connection_missing = resolve_active_descriptor(session_data, user_identity)
+    active_conn_str = active_descriptor.get("url")
+    active_db_type = active_descriptor.get("type") or "postgres"
+    active_db_config = {k: v for k, v in active_descriptor.items() if k not in ("type", "url")}
     auto_sql_execute = session_data["auto_sql_execute"]
+
+    active_connection_missing_message = ""
+    if connection_missing:
+        active_connection_missing_message = (
+            "Your previously selected custom connection is no longer available "
+            "(it may have been deleted) - showing the default connection instead."
+            if session_data.get("is_custom") else
+            "Your previously selected database preset is no longer available "
+            "(it may have been removed or renamed) - showing the default "
+            "connection instead."
+        )
 
     # Anonymous (Cloud Run, signed-out) users can now save their own custom
     # connections too (see the POST handling above), and every anonymous
@@ -1146,21 +1003,15 @@ def handle_config():
     # connections can share a URL - e.g. two BigQuery connections on
     # the same project/dataset with different service-account keys;
     # see compute_connection_key's docstring in state_store.py).
-    # session_data's custom_connection_key is the precise pointer set
-    # at save time; only fall back to URL matching for a session saved
-    # before that field existed, so an already-active custom connection
-    # doesn't just appear unselected the first time this loads after
-    # upgrading.
-    active_custom_key = session_data.get("custom_connection_key") or ""
-    active_custom_db = None
-    if active_custom_key:
-        active_custom_db = next(
-            (db for db in custom_databases if db.get("connection_key") == active_custom_key), None
-        )
-    else:
-        active_custom_db = next(
-            (db for db in custom_databases if db.get("url") == active_conn_str), None
-        )
+    # session_data's connection_id (when is_custom) IS that connection's
+    # connection_key directly - no URL-matching fallback needed the way
+    # there used to be for a session saved before that field existed,
+    # since the state_store migration (see state_store.py) backfills
+    # connection_id for every pre-existing session up front.
+    active_custom_key = session_data.get("connection_id") if session_data.get("is_custom") else ""
+    active_custom_db = next(
+        (db for db in custom_databases if db.get("connection_key") == active_custom_key), None
+    ) if active_custom_key else None
     user_custom_name = active_custom_db["name"] if active_custom_db else None
     user_custom_url = active_custom_db["url"] if active_custom_db else None
     active_custom_connection_key = active_custom_db.get("connection_key", "") if active_custom_db else ""
@@ -1172,62 +1023,81 @@ def handle_config():
     # state_store.get_db_connections' has_custom_credentials docstring.
     active_uses_custom_credentials = bool(active_custom_db.get("has_custom_credentials")) if active_custom_db else False
 
-    # Admin-configured presets are redacted to name/type only for anonymous
-    # users UNCONDITIONALLY - CONFIGURED_DBS entries embed the admin's own
+    # Admin-configured presets are always redacted to name/type only, for
+    # EVERY visitor - authenticated or anonymous, on Cloud Run or running
+    # locally, no exception. CONFIGURED_DBS entries embed the admin's own
     # real connection strings and, for dialects with no ambient identity
-    # (Snowflake/Databricks/Oracle), their plaintext credentials too (see
-    # the preset-copying code above), regardless of what the anonymous
-    # visitor's OWN active connection happens to be right now. This is
-    # deliberately independent of active_is_custom_out below - a user's own
-    # custom connection is never a secret from them, but another (admin's)
-    # preset's credentials always are.
-    if IS_CLOUD_RUN and not is_authenticated:
-        configured_dbs = [
-            {"name": db.get("name"), "type": db.get("type", "postgres")}
-            for db in CONFIGURED_DBS
-        ]
-    else:
-        configured_dbs = CONFIGURED_DBS
+    # (Snowflake/Databricks/Oracle/Redshift), their plaintext credentials
+    # too - those were never any individual visitor's own secret to see
+    # just because they happened to sign in (so this doesn't key off
+    # is_authenticated), and they're not tied to the Cloud Run deployment
+    # either (so this doesn't key off IS_CLOUD_RUN anymore, and neither do
+    # the other two redaction spots below - active-connection display and
+    # default_database_url): a presets file checked into the same repo and
+    # run locally carries exactly the same secret as it does on Cloud Run,
+    # and a developer working locally has no more claim to another admin's
+    # preset credential than a Cloud Run visitor does. This is deliberately
+    # independent of active_is_custom_out below - a user's own custom
+    # connection is never a secret from them, but another (admin's)
+    # preset's credentials always are, regardless of who's asking or where
+    # this is running.
+    configured_dbs = [
+        {"id": db.get("id"), "name": db.get("name"), "type": db.get("type", "postgres")}
+        for db in CONFIGURED_DBS
+    ]
 
-    if IS_CLOUD_RUN and not is_authenticated and not session_data.get("is_custom"):
-        # Anonymous users may still open the DB config dialog and switch
-        # between admin-configured presets, but must never see a PRESET's
-        # actual connection string, since that embeds credentials the
-        # admin configured, not the anonymous visitor themselves. The
-        # currently active one is identified by array index
-        # (active_preset_index) rather than by URL, matched here
-        # server-side against the real (never-exposed) active_conn_str -
-        # the frontend never learns the actual string.
+    # Which preset (if any) is active - read straight off session_data's
+    # own connection_id/is_custom, computed once, unconditionally,
+    # regardless of anonymous/authenticated status, since "id" is never a
+    # secret and is always safe to send to the frontend. This is what
+    # actually lets the UI know which radio to check: matching by URL
+    # client-side doesn't work for an anonymous visitor (who never receives
+    # real preset URLs - see configured_dbs above) and matching by array
+    # position doesn't survive the admin reordering/adding/removing presets
+    # in DATABASE_PRESETS_FILE between deployments - "id" has neither
+    # problem. A brand-new session (blank connection_id, not custom) falls
+    # back to DEFAULT_PRESET_ID, matching the app's own default connection
+    # (see app_config.py).
+    if session_data.get("is_custom"):
+        active_preset_id = None
+    else:
+        active_preset_id = session_data.get("connection_id") or DEFAULT_PRESET_ID
+
+    if not session_data.get("is_custom"):
+        # Any visitor - authenticated or anonymous, on Cloud Run or running
+        # locally - may open the DB config dialog and switch between
+        # admin-configured presets, but must never see a PRESET's actual
+        # connection string: that embeds credentials the admin configured,
+        # not something the requesting user supplied themselves, so being
+        # logged in doesn't earn it either, and neither does running the
+        # server on a laptop instead of Cloud Run - active_preset_id above
+        # (safe, opaque) is what lets them know which one is checked
+        # instead, and this branch skips the real connect()/identity_label()
+        # call entirely rather than just hiding its result, so a preset's
+        # host/user identity string never even gets fetched for display.
         # This branch only applies when the active connection IS a preset
-        # (session_data["is_custom"] is false) - when an anonymous user's
-        # active connection is instead their own self-supplied custom one,
-        # the `else` branch below runs for them too, exactly like an
-        # authenticated user, since there's no credential of theirs being
-        # hidden from them (only configured_dbs above stays redacted for
-        # them either way, since that's about OTHER people's presets, not
-        # their own active connection).
-        active_preset_index = next(
-            (i for i, db in enumerate(CONFIGURED_DBS) if db.get("url") == active_conn_str),
-            None,
+        # (session_data["is_custom"] is false) - when the active connection
+        # is instead the visitor's own self-supplied custom one, the `else`
+        # branch below always runs, since there's no credential of theirs
+        # being hidden from them (only configured_dbs above stays redacted
+        # regardless, since that's about OTHER people's presets, not their
+        # own active connection).
+        preset_for_display = (
+            next((db for db in CONFIGURED_DBS if db.get("id") == active_preset_id), None)
+            or (CONFIGURED_DBS[0] if CONFIGURED_DBS else None)
         )
-        active_preset = (
-            CONFIGURED_DBS[active_preset_index] if active_preset_index is not None
-            else (CONFIGURED_DBS[0] if CONFIGURED_DBS else None)
-        )
-        db_name = active_preset["name"] if active_preset else "Database"
+        db_name = preset_for_display["name"] if preset_for_display else "Database"
         username = ""
         active_conn_str_out = ""
         active_db_type_out = ""
         active_is_custom_out = False
     else:
-        active_preset_index = None
         db_name, username = "Unknown", "Unknown"
         backend = None
         conn = None
         try:
-            descriptor = session_to_descriptor(session_data)
-            backend = get_backend(descriptor)
-            conn = backend.connect(descriptor)
+            backend = get_backend(active_descriptor)
+            conn = backend.connect(active_descriptor)
             db_name, username = backend.identity_label(conn)
         except Exception:
             logger.exception("Error fetching connection info")
@@ -1252,8 +1122,15 @@ def handle_config():
         'authenticated': is_authenticated,
         'is_cloud_run': IS_CLOUD_RUN,
         'configured_databases': configured_dbs,
-        'active_preset_index': active_preset_index,
-        'default_database_url': DEFAULT_CONN if (not IS_CLOUD_RUN or is_authenticated) else "",
+        'active_preset_id': active_preset_id,
+        'active_connection_missing': connection_missing,
+        'active_connection_missing_message': active_connection_missing_message,
+        # The real default connection string is never sent to ANY visitor,
+        # anywhere - it's an admin-configured preset's own credential like
+        # any other (see configured_dbs above), not tied to whether this
+        # particular visitor happens to be signed in or to which
+        # environment the server happens to be running in.
+        'default_database_url': "",
         'active_database_url': active_conn_str_out,
         'active_database_type': active_db_type_out,
         'active_is_custom': active_is_custom_out,

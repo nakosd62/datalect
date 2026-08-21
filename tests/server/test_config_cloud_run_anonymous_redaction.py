@@ -1,18 +1,22 @@
 """
-config_routes.py's anonymous-visitor redaction on Cloud Run specifically:
-IS_CLOUD_RUN (K_SERVICE set) is a stricter gate than just "auth is enabled"
+config_routes.py's connection-secrecy redaction on Cloud Run: IS_CLOUD_RUN
+(K_SERVICE set) is a stricter gate than just "auth is enabled"
 (GOOGLE_CLIENT_ID set) - it's the actual Cloud Run detection, and it's what
-config_routes.py's GET response redaction branches key off of (never
-sending an admin preset's real connection string/credentials, or another
-identity's active connection string, to an anonymous visitor). Anonymous
-visitors CAN now save and see their own self-supplied custom connections
-(see the "can_save_and_see_their_own_custom_connection" test below) - that
-redaction was always about admin/other-user secrets, not a blanket "no
-custom connections for anonymous users" rule; see config_routes.py's
-handle_config for the full reasoning. Also covers the flip side of that
-same anonymity: two DIFFERENT anonymous visitors (two browser sessions)
-must not see or affect each other's active DB / auto-execute / custom
-connections either - see auth.py's ANONYMOUS_USER_ID_PREFIX and the
+config_routes.py's GET response redaction branches key off of. On Cloud
+Run, an admin preset's real connection string/credentials - and an active
+preset's real connection identity/default URL - are never sent to ANY
+visitor, authenticated or anonymous alike (see the
+"...gets_same_preset_redaction_as_anonymous"/"...still_gets_full_redaction"
+tests below): a preset's credentials are the admin's secret, not something
+being signed in earns access to. Anonymous visitors CAN save and see their
+own self-supplied custom connections (see the
+"can_save_and_see_their_own_custom_connection" test below) exactly like an
+authenticated user - the redaction is scoped specifically to admin-preset
+secrets, not a blanket "no real functionality for anonymous users" rule;
+see config_routes.py's handle_config for the full reasoning. Also covers
+the flip side of anonymity: two DIFFERENT anonymous visitors (two browser
+sessions) must not see or affect each other's active DB / auto-execute /
+custom connections either - see auth.py's ANONYMOUS_USER_ID_PREFIX and the
 "...dont_collide..." tests below. Requires mock_firestore, since
 IS_CLOUD_RUN=True with no working Firestore client is a hard startup
 RuntimeError by design (see app_config.py's "Halting startup to prevent
@@ -50,7 +54,7 @@ def test_cloud_run_starts_up_successfully_with_mocked_firestore(app_factory, clo
 def test_anonymous_visitor_never_receives_real_preset_connection_strings(app_factory, cloud_run_env):
     env = app_factory(env=cloud_run_env, mock_firestore=True)
     data = env.client.get('/api/config').get_json()
-    assert data['configured_databases'] == [{"name": "Demo", "type": "postgres"}]
+    assert data['configured_databases'] == [{"id": "postgres+Demo", "name": "Demo", "type": "postgres"}]
     for db in data['configured_databases']:
         assert "url" not in db
 
@@ -63,7 +67,7 @@ def test_anonymous_visitor_active_connection_string_is_empty(app_factory, cloud_
     assert data['default_database_url'] == ""
 
 
-def test_anonymous_visitor_selects_preset_by_index_not_url(app_factory, cloud_run_env, tmp_path):
+def test_anonymous_visitor_selects_preset_by_id_not_url(app_factory, cloud_run_env, tmp_path):
     ab_path = write_database_presets_file(tmp_path, [
         {"type": "postgres", "name": "A", "url": "postgresql://real/a"},
         {"type": "postgres", "name": "B", "url": "postgresql://real/b"},
@@ -72,7 +76,7 @@ def test_anonymous_visitor_selects_preset_by_index_not_url(app_factory, cloud_ru
         **cloud_run_env,
         "DATABASE_PRESETS_FILE": ab_path,
     }, mock_firestore=True)
-    resp = env.client.post('/api/config', json={"preset_index": 1})
+    resp = env.client.post('/api/config', json={"preset_id": "postgres+B"})
     assert resp.status_code == 200
     data = env.client.get('/api/config').get_json()
     assert data['database_name'] == "B"
@@ -97,8 +101,8 @@ def test_two_concurrent_anonymous_visitors_dont_collide_on_active_preset(app_fac
     browser_one = env.app_config.app.test_client()
     browser_two = env.app_config.app.test_client()
 
-    resp_one = browser_one.post('/api/config', json={"preset_index": 0})
-    resp_two = browser_two.post('/api/config', json={"preset_index": 1})
+    resp_one = browser_one.post('/api/config', json={"preset_id": "postgres+A"})
+    resp_two = browser_two.post('/api/config', json={"preset_id": "postgres+B"})
     assert resp_one.status_code == 200 and resp_two.status_code == 200
 
     # Each browser must still see ITS OWN selection, not whichever request
@@ -155,7 +159,7 @@ def test_anonymous_visitor_on_a_preset_still_gets_full_redaction_even_with_a_sav
         "database_type": "postgres", "database_url": "postgresql://u:p@h/mydb",
         "database_name": "My DB", "is_custom": True,
     })
-    resp = env.client.post('/api/config', json={"preset_index": 0})
+    resp = env.client.post('/api/config', json={"preset_id": "postgres+Demo"})
     assert resp.status_code == 200
 
     data = env.client.get('/api/config').get_json()
@@ -182,12 +186,40 @@ def test_two_anonymous_visitors_dont_collide_on_custom_connections(app_factory, 
     assert browser_two.get('/api/config').get_json()['custom_databases'] == []
 
 
-def test_authenticated_user_on_cloud_run_gets_real_connection_details(app_factory, cloud_run_env):
+def test_authenticated_user_on_cloud_run_gets_same_preset_redaction_as_anonymous(app_factory, cloud_run_env):
+    # Being signed in earns no special access to an admin preset's own
+    # credentials - Cloud Run redacts these the same for every visitor
+    # (see module docstring). This mirrors
+    # test_anonymous_visitor_never_receives_real_preset_connection_strings /
+    # test_anonymous_visitor_active_connection_string_is_empty above, but
+    # for an authenticated user.
     env = app_factory(env=cloud_run_env, mock_firestore=True)
     login_as(env.client, "alice@example.com")
     data = env.client.get('/api/config').get_json()
     assert data['authenticated'] is True
-    assert data['configured_databases'][0].get("url") == "postgresql://realuser:realpass@realhost/realdb"
+    assert data['configured_databases'] == [{"id": "postgres+Demo", "name": "Demo", "type": "postgres"}]
+    for db in data['configured_databases']:
+        assert "url" not in db
+    assert data['active_database_url'] == ""
+    assert data['active_database_type'] == ""
+    assert data['default_database_url'] == ""
+
+
+def test_authenticated_visitor_selecting_a_preset_still_gets_full_redaction(app_factory, cloud_run_env, tmp_path):
+    # Mirrors test_anonymous_visitor_selects_preset_by_id_not_url above, but
+    # for an authenticated user: selecting a preset by id still never
+    # surfaces its real connection string, signed in or not.
+    ab_path = write_database_presets_file(tmp_path, [
+        {"type": "postgres", "name": "A", "url": "postgresql://real/a"},
+        {"type": "postgres", "name": "B", "url": "postgresql://real/b"},
+    ], filename="ab_presets.json")
+    env = app_factory(env={**cloud_run_env, "DATABASE_PRESETS_FILE": ab_path}, mock_firestore=True)
+    login_as(env.client, "alice@example.com")
+    resp = env.client.post('/api/config', json={"preset_id": "postgres+B"})
+    assert resp.status_code == 200
+    data = env.client.get('/api/config').get_json()
+    assert data['database_name'] == "B"
+    assert data['active_database_url'] == ""  # still never exposed, even signed in
 
 
 def test_authenticated_user_on_cloud_run_can_save_a_custom_connection(app_factory, cloud_run_env):

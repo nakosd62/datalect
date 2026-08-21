@@ -45,30 +45,63 @@ def _to_descriptor(conn_str):
     return {"type": "postgres", "url": conn_str}
 
 
-def session_to_descriptor(session):
-    """Builds a connection descriptor from a state_store session record
-    (see StateStore.get_session) - merges the type-specific
-    database_config fields (e.g. BigQuery's project_id/dataset/
-    credentials_json) on top of the {"type", "url"} base. Public because
-    config_routes.py also needs to resolve a backend for the *active*
-    session connection (for the /api/config "which DB am I connected to"
-    identity check) without going through a fresh resolve_conn_str() call."""
-    descriptor = {
-        "type": session.get("database_type") or "postgres",
-        "url": session.get("database_url"),
-    }
-    descriptor.update(session.get("database_config") or {})
-    return descriptor
+def resolve_active_descriptor(session, user_id):
+    """Builds a connection descriptor FRESH from a state_store session
+    record (see StateStore.get_session) - the session itself holds only an
+    identity reference (is_custom, connection_id), never the connection's
+    actual details/credentials, so this is the one place that identity gets
+    turned into something actually connectable, every time, from the single
+    source of truth: CONFIGURED_DBS (app_config.py) for a preset, or
+    state_store.get_db_connections() for a saved custom connection. Public
+    because config_routes.py also needs to resolve a descriptor for the
+    *active* session connection (for the /api/config "which DB am I
+    connected to" identity check) without going through resolve_conn_str().
+
+    Returns (descriptor, missing). missing=True means connection_id was
+    set to something but it no longer resolves to anything real - the
+    preset was removed/renamed from CONFIGURED_DBS, or the saved custom
+    connection was deleted - in which case descriptor is still a usable
+    one (the app default), so a caller that doesn't care about the
+    distinction (query execution) can just use it as-is; config_routes.py's
+    GET handler is the one caller that surfaces `missing` to the frontend.
+    connection_id == "" (nothing ever explicitly selected - a brand-new
+    session) is NOT "missing" - that's the ordinary/expected state for a
+    first-time visitor, so it silently resolves to the default connection
+    the same way, with missing=False."""
+    connection_id = session.get("connection_id") or ""
+    is_custom = bool(session.get("is_custom"))
+    if not connection_id:
+        return _to_descriptor(DEFAULT_CONN), False
+    if is_custom:
+        for db in state_store.get_db_connections(user_id, include_credentials=True):
+            if db.get("connection_key") == connection_id:
+                descriptor = {"type": db.get("type") or "postgres", "url": db.get("url")}
+                descriptor.update(db.get("config") or {})
+                return descriptor, False
+        return _to_descriptor(DEFAULT_CONN), True
+    for db in CONFIGURED_DBS:
+        if db.get("id") == connection_id:
+            # CONFIGURED_DBS entries already ARE full descriptors plus
+            # "id"/"name" - stripping just those two is all that's needed,
+            # no separate copy/merge step like the custom-connection branch
+            # above (which has to reshape get_db_connections()'s
+            # {"connection_key","name","type","url","config"} response
+            # shape into a flat descriptor).
+            return {k: v for k, v in db.items() if k not in ("id", "name")}, False
+    return _to_descriptor(DEFAULT_CONN), True
 
 
 def resolve_conn_str(conn_str=None, user_id=None):
     """Resolves to a connection descriptor: the explicit conn_str/descriptor
-    if given, else the user's saved session connection (type + config,
-    via session_to_descriptor), else the app default."""
+    if given, else the user's active session connection - resolved fresh via
+    resolve_active_descriptor, discarding whether it was actually found
+    (query execution silently falls back to the app default either way; see
+    that function's docstring) - else the app default."""
     if conn_str:
         return _to_descriptor(conn_str)
     if user_id:
-        return session_to_descriptor(state_store.get_session(user_id))
+        descriptor, _missing = resolve_active_descriptor(state_store.get_session(user_id), user_id)
+        return descriptor
     return _to_descriptor(DEFAULT_CONN)
 
 
@@ -76,7 +109,7 @@ def get_conn_identifier(conn_str):
     """Non-sensitive cache/log identifier for a connection (descriptor or
     legacy raw string) - delegates to the resolved backend's cache_key()
     so each dialect can derive this however makes sense for it (Postgres:
-    user@dbname parsed from the URL; a future BigQuery backend:
+    user@host:port/dbname parsed from the URL; BigQuery:
     project.dataset)."""
     descriptor = _to_descriptor(conn_str)
     if not descriptor:
@@ -92,8 +125,9 @@ def _resolve_database_name(descriptor, user_id):
     translation-history logging: the admin-configured preset name if the
     URL matches one in CONFIGURED_DBS, else the user's own saved custom-
     connection name if it matches one of those, else the backend's
-    non-sensitive cache key (e.g. "user@dbname" for Postgres) as a last
-    resort - never blank, so history rows always show something readable."""
+    non-sensitive cache key (e.g. "user@host:port/dbname" for Postgres) as
+    a last resort - never blank, so history rows always show something
+    readable."""
     url = (descriptor or {}).get("url")
     if url:
         for db in CONFIGURED_DBS:

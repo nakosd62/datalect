@@ -137,15 +137,33 @@ class MySQLBackend(Backend):
             connection.close()
 
     def cache_key(self, descriptor):
-        """username@dbname, parsed from the connection URL - never the URL
-        itself, since that carries the password. Mirrors
-        backends/postgres.py's cache_key() derivation."""
+        """username@host:port/dbname (or username@unix_socket/dbname for a
+        Cloud SQL-style socket connection), parsed from the connection URL -
+        never the URL itself, since that carries the password. Mirrors
+        backends/postgres.py's cache_key() derivation and its reasoning:
+        host/port (or unix_socket) matters just as much as dbname does -
+        two entirely different MySQL servers can easily share both a
+        username and a database name, and without the host in the key both
+        would collide on the same schema_cache.py entry, silently serving
+        one server's schema back for the other's /api/translate calls.
+        Username is still included too: two different users against the
+        exact same database can see different information_schema results
+        if their grants differ.
+
+        unix_socket (not host:port) is used as the target component when
+        present - _parse_mysql_url() defaults "host" to the meaningless
+        "localhost" for a socket connection (see its own docstring), so
+        using host:port here would collide two different Cloud SQL
+        instances (different unix_socket paths) onto the same
+        "user@localhost:3306/db" key just as easily as the original,
+        completely host-blind version of this method did."""
         url = (descriptor or {}).get("url")
         if not url:
             return "unknown@unknown"
         try:
             parts = _parse_mysql_url(url)
-            return f"{parts['user'] or 'unknown'}@{parts['database'] or 'unknown'}"
+            target = parts.get("unix_socket") or f"{parts['host']}:{parts['port']}"
+            return f"{parts['user'] or 'unknown'}@{target}/{parts['database'] or 'unknown'}"
         except Exception:
             return "unknown@unknown"
 

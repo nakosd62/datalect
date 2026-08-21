@@ -1,13 +1,15 @@
 """
 FirestoreStateStore, exercised against helpers.FakeFirestoreClient - an
 in-memory fake that reproduces real Firestore's merge=True (recursive)
-vs. merge=[field, ...] (atomic per-field) semantics closely enough to
-catch the class of bug this file's regression test is named for (see
-FakeFirestoreClient's docstring and state_store.py's FirestoreStateStore.
-set_session comment for the full story).
+vs. merge=[field, ...] (atomic per-field) semantics, and firestore.
+DELETE_FIELD, closely enough to catch the class of bug this file's
+regression tests are named for (see FakeFirestoreClient's docstring and
+state_store.py's FirestoreStateStore.set_session comment for the full
+story).
 """
 
 import sys
+import types
 
 from helpers import SERVER_DIR
 
@@ -20,115 +22,133 @@ from helpers import FakeFirestoreClient
 
 def make_store():
     client = FakeFirestoreClient()
-    store = FirestoreStateStore(client, default_conn="postgresql://default/db")
+    store = FirestoreStateStore(client)
     return store, client
 
 
 # --- sessions --------------------------------------------------------------
+# A session stores only an identity reference (is_custom, connection_id) -
+# never a connection's actual details/credentials (see state_store.py's
+# module/class docstrings and db.py's resolve_active_descriptor, which
+# resolves those fresh every time something needs to actually connect).
 
 def test_get_session_defaults_for_unknown_user():
     store, client = make_store()
     session = store.get_session("alice")
-    assert session["database_url"] == "postgresql://default/db"
     assert session["is_custom"] is False
+    assert session["connection_id"] == ""
+    assert session["auto_sql_execute"] is True
 
 
 def test_get_session_with_no_user_id_returns_defaults_without_touching_client():
     store, client = make_store()
     session = store.get_session(None)
-    assert session["database_url"] == "postgresql://default/db"
+    assert session["connection_id"] == ""
     assert client._collections == {}
 
 
 def test_set_and_get_session_round_trip():
     store, client = make_store()
     store.set_session(
-        "alice", db_url="bigquery://p/d", db_type="bigquery",
-        db_config={"project_id": "p", "dataset": "d"}, is_custom=True,
-        custom_connection_key="key123",
+        "alice", connection_id="key123", is_custom=True, auto_sql_execute=False,
     )
     session = store.get_session("alice")
-    assert session["database_url"] == "bigquery://p/d"
-    assert session["database_type"] == "bigquery"
-    assert session["database_config"] == {"project_id": "p", "dataset": "d"}
+    assert session["connection_id"] == "key123"
     assert session["is_custom"] is True
-    assert session["custom_connection_key"] == "key123"
+    assert session["auto_sql_execute"] is False
 
 
 def test_set_session_with_no_user_id_is_a_no_op():
     store, client = make_store()
-    store.set_session(None, db_url="postgresql://a/b")
+    store.set_session(None, connection_id="abc")
     assert client._collections == {}
 
 
 def test_set_session_leaves_untouched_top_level_fields_alone():
     store, client = make_store()
-    store.set_session("alice", db_url="postgresql://a/b", is_custom=True, custom_connection_key="k1")
+    store.set_session("alice", connection_id="k1", is_custom=True)
     store.set_session("alice", auto_sql_execute=False)  # only this field this time
     session = store.get_session("alice")
-    assert session["database_url"] == "postgresql://a/b"  # untouched
+    assert session["connection_id"] == "k1"  # untouched
     assert session["is_custom"] is True  # untouched
-    assert session["custom_connection_key"] == "k1"  # untouched
     assert session["auto_sql_execute"] is False  # updated
 
 
-def test_merge_fix_regression_switching_bigquery_connections_does_not_leak_stale_billing_project():
-    """
-    This is the exact bug the user reported: after saving a custom
-    BigQuery connection with a billing_project_id/credentials_json, then
-    switching the active connection to a *different* one that has neither
-    (e.g. an admin preset, or a connection missing those fields), the new
-    database_config must NOT still carry the old connection's
-    billing_project_id/credentials_json - which is exactly what a plain
-    `merge=True` .set() call would do (real Firestore's boolean merge
-    recursively merges nested maps, leaving keys absent from the new
-    value as whatever the old document had).
-    """
+# --- lazy migration: legacy sessions predating connection_id ------------------
+
+def test_get_session_lazily_migrates_legacy_custom_connection_doc():
     store, client = make_store()
-
-    store.set_session(
-        "alice", db_url="bigquery://public-data/google_ads", db_type="bigquery",
-        db_config={
-            "project_id": "public-data", "dataset": "google_ads",
-            "credentials_json": "STALE_KEY", "billing_project_id": "stale-billing-project",
-        },
-        is_custom=True, custom_connection_key="conn-a-key",
-    )
-
-    # Switch to a connection with a database_config that does NOT include
-    # credentials_json/billing_project_id at all (e.g. an admin preset).
-    store.set_session(
-        "alice", db_url="bigquery://public-data/google_trends", db_type="bigquery",
-        db_config={"project_id": "public-data", "dataset": "google_trends"},
-        is_custom=False, custom_connection_key="",
-    )
+    # Simulate a pre-migration doc: the full duplicated descriptor shape,
+    # no connection_id field at all yet.
+    client.collection("sessions").document("alice").set({
+        "database_url": "bigquery://p/d",
+        "database_type": "bigquery",
+        "database_config": {"project_id": "p", "dataset": "d", "credentials_json": "STALE_KEY"},
+        "is_custom": True,
+        "custom_connection_key": "custom-key-123",
+        "auto_sql_execute": False,
+    })
 
     session = store.get_session("alice")
-    assert session["database_config"] == {"project_id": "public-data", "dataset": "google_trends"}
-    assert "credentials_json" not in session["database_config"]
-    assert "billing_project_id" not in session["database_config"]
+    assert session["is_custom"] is True
+    assert session["connection_id"] == "custom-key-123"  # reused as-is
+    assert session["auto_sql_execute"] is False
+
+    # The write-back must actually delete the old fields (firestore.
+    # DELETE_FIELD), not just add connection_id alongside them - a
+    # credential (credentials_json here) must not linger in the document.
+    raw = client.collection("sessions").document("alice").get().to_dict()
+    assert "database_url" not in raw
+    assert "database_type" not in raw
+    assert "database_config" not in raw
+    assert "custom_connection_key" not in raw
+    assert raw["connection_id"] == "custom-key-123"
+    assert raw["is_custom"] is True
+
+    # And a second read (now already migrated) is stable/idempotent.
+    session_again = store.get_session("alice")
+    assert session_again["connection_id"] == "custom-key-123"
 
 
-def test_deliberately_broken_boolean_merge_would_have_leaked_the_stale_field():
-    """
-    Sanity-check on the fake itself: proves FakeFirestoreClient's
-    merge=True path really does reproduce the recursive-merge bug (i.e.
-    this fake isn't accidentally "too good" and would pass even a naive,
-    buggy implementation) - directly exercises the client with the OLD,
-    buggy call shape the real bug used.
-    """
-    client = FakeFirestoreClient()
-    doc_ref = client.collection("sessions").document("alice")
-    doc_ref.set({"database_config": {"project_id": "public-data", "dataset": "google_ads",
-                                      "credentials_json": "STALE_KEY", "billing_project_id": "stale-billing-project"}},
-                merge=True)
-    doc_ref.set({"database_config": {"project_id": "public-data", "dataset": "google_trends"}}, merge=True)
+def test_get_session_lazily_migrates_legacy_preset_doc_by_matching_url(monkeypatch):
+    store, client = make_store()
+    client.collection("sessions").document("bob").set({
+        "database_url": "postgresql://preset-match/db",
+        "database_type": "postgres",
+        "is_custom": False,
+        "custom_connection_key": "",
+        "auto_sql_execute": True,
+    })
 
-    data = doc_ref.get().to_dict()
-    # With boolean merge=True, the stale fields DO leak through - this is
-    # exactly the bug, reproduced here to prove the fake is faithful.
-    assert data["database_config"]["credentials_json"] == "STALE_KEY"
-    assert data["database_config"]["billing_project_id"] == "stale-billing-project"
+    fake_app_config = types.ModuleType("app_config")
+    fake_app_config.CONFIGURED_DBS = [
+        {"id": "postgres+Preset Match", "name": "Preset Match", "type": "postgres",
+         "url": "postgresql://preset-match/db"},
+    ]
+    monkeypatch.setitem(sys.modules, "app_config", fake_app_config)
+
+    session = store.get_session("bob")
+    assert session["is_custom"] is False
+    assert session["connection_id"] == "postgres+Preset Match"
+
+
+def test_get_session_lazily_migrates_legacy_preset_doc_with_no_matching_preset(monkeypatch):
+    store, client = make_store()
+    client.collection("sessions").document("carol").set({
+        "database_url": "postgresql://no-longer-configured/db",
+        "database_type": "postgres",
+        "is_custom": False,
+        "custom_connection_key": "",
+        "auto_sql_execute": True,
+    })
+
+    fake_app_config = types.ModuleType("app_config")
+    fake_app_config.CONFIGURED_DBS = []
+    monkeypatch.setitem(sys.modules, "app_config", fake_app_config)
+
+    session = store.get_session("carol")
+    assert session["is_custom"] is False
+    assert session["connection_id"] == ""  # nothing matched -> resolves to app default downstream
 
 
 # --- db_connections ----------------------------------------------------------

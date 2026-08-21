@@ -165,9 +165,11 @@ def test_bigquery_dialect_intro_used_when_active_connection_is_bigquery(app_fact
     # the same way selecting it via /api/config would (identity here is
     # "global": no auth configured in this env, matching
     # _effective_user(None)/get_current_user_identity()'s local fallback).
+    # The preset has no explicit "id" in the fixture above, so it falls
+    # back to "{type}+{name}" (see app_config.py's DATABASE_PRESETS_FILE
+    # comment) - "bigquery+BQ" here.
     env.app_config.state_store.set_session(
-        "global", db_url="bigquery://p/d", db_type="bigquery",
-        db_config={"project_id": "p", "dataset": "d", "billing_project_id": "p"},
+        "global", connection_id="bigquery+BQ", is_custom=False,
     )
 
     env.client.post('/api/translate', json={'prompt': 'hi'})

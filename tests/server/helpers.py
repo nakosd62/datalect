@@ -23,6 +23,8 @@ import sys
 import types
 from datetime import datetime, timedelta, timezone
 
+from google.cloud import firestore
+
 # server/ is not a package (no __init__.py) - it's run as the entrypoint's
 # own directory (`python server/server.py`), so its modules import each
 # other with bare names ("from app_config import app", not
@@ -862,6 +864,17 @@ class _FakeFirestoreDocRef:
         coll = self._store._collections.setdefault(self._collection_name, {})
         existing = coll.get(self._doc_id)
         clean_data = {k: v for k, v in data.items() if k != "updated_at"}
+        # Real Firestore's firestore.DELETE_FIELD sentinel means "remove
+        # this top-level field from the document" rather than "set it to
+        # this value" - used by state_store.py's lazy session migration to
+        # actually scrub old fields (database_url/database_type/
+        # database_config/custom_connection_key) rather than just leaving
+        # them sitting alongside the new connection_id field. Only
+        # meaningful for merge calls (merge=True or a field-path list) -
+        # real Firestore doesn't accept it in a plain overwrite .set()
+        # either, so this fake doesn't need to handle that case.
+        delete_fields = {k for k, v in clean_data.items() if v is firestore.DELETE_FIELD}
+        clean_data = {k: v for k, v in clean_data.items() if v is not firestore.DELETE_FIELD}
 
         if merge is True:
             # Real Firestore boolean-merge semantics: recursively merge
@@ -877,7 +890,10 @@ class _FakeFirestoreDocRef:
                     else:
                         merged[k] = v
                 return merged
-            coll[self._doc_id] = deep_merge(existing, clean_data)
+            merged = deep_merge(existing, clean_data)
+            for field in delete_fields:
+                merged.pop(field, None)
+            coll[self._doc_id] = merged
         elif isinstance(merge, (list, tuple, set)):
             # Field-path merge: each named top-level field is replaced
             # atomically (no recursive merge into it); every other
@@ -886,6 +902,8 @@ class _FakeFirestoreDocRef:
             for field in merge:
                 if field in clean_data:
                     merged[field] = clean_data[field]
+                elif field in delete_fields:
+                    merged.pop(field, None)
             coll[self._doc_id] = merged
         else:
             coll[self._doc_id] = dict(clean_data)

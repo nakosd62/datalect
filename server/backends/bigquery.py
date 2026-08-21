@@ -94,7 +94,7 @@ class BigQueryBackend(Backend):
         """project.dataset, parsed straight from the descriptor - never a
         credential. Same non-sensitive-identifier role db.py's
         get_conn_identifier has always played, mirrored from
-        PostgresBackend.cache_key's username@dbname derivation."""
+        PostgresBackend.cache_key's username@host:port/dbname derivation."""
         project_id = (descriptor or {}).get("project_id") or "unknown"
         dataset = (descriptor or {}).get("dataset") or "unknown"
         return f"{project_id}.{dataset}"

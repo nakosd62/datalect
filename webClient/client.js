@@ -117,13 +117,17 @@ document.addEventListener('DOMContentLoaded', async () => {
   // connection was actually using its own key rather than silently falling
   // back to ADC. Used by updateConnectionDetails() to label the badge.
   let ACTIVE_USES_CUSTOM_CREDENTIALS = false;
-  // Index into CONFIGURED_DBS identifying the active preset, for anonymous
-  // (Cloud Run, signed-out) users only - they never receive real preset
-  // connection strings (see the redacted configured_databases the server
-  // sends them), so URL matching can't tell which preset is active; this
-  // index is the anonymous-safe substitute. null/unused for signed-in users,
-  // who still match presets by URL as before.
-  let ACTIVE_PRESET_INDEX = null;
+  // The active preset's stable, admin-assigned "id" (app_config.py's
+  // DATABASE_PRESETS_FILE "id" field - see its doc-comment there), as
+  // reported by the server's active_preset_id. Unlike the URL/array-index
+  // matching this replaced, "id" is never a secret (safe to send to
+  // anonymous Cloud Run visitors, who never receive a preset's real
+  // connection string - see the redacted configured_databases below) and
+  // survives the admin reordering/adding/removing presets between
+  // deployments - so both anonymous and signed-in users now match presets
+  // by this one field uniformly (see renderDbRadioButtons()). null when the
+  // active connection isn't a preset at all (a custom connection instead).
+  let ACTIVE_PRESET_ID = null;
   let CONFIGURED_DBS = [];
   let currentGoogleClientId = null;
   let googleIdToken = null;
@@ -138,9 +142,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   // isolated) translation history, AND their own custom DB connections -
   // nothing is gated behind sign-in anymore. This flag still matters for
   // the UI, though: an anonymous visitor's admin-configured presets are
-  // matched by index (ACTIVE_PRESET_INDEX) rather than by URL, since
-  // (unlike their own custom connections) preset connection strings/
-  // credentials are still never sent to them - see renderDbRadioButtons().
+  // never sent their real connection strings/credentials (unlike their own
+  // custom connections), so the config modal never shows a preset's URL to
+  // them - see renderDbRadioButtons(), which now matches presets by id
+  // (ACTIVE_PRESET_ID) for anonymous and signed-in users alike.
   let isAnonymousUser = false;
 
   // True once /api/config reports Google Sign-In is configured (auth_enabled
@@ -836,7 +841,15 @@ document.addEventListener('DOMContentLoaded', async () => {
       // hidden from them, so that falls through to the same real-details
       // path an authenticated user gets, below.
       if (badge) badge.style.display = '';
-      if (connDbName) connDbName.textContent = data?.database_name || 'Database';
+      const anonDbLabel = data?.database_name || 'Database';
+      if (connDbName) {
+        connDbName.textContent = data?.active_connection_missing ? `⚠ ${anonDbLabel}` : anonDbLabel;
+      }
+      if (configTriggerBadge) {
+        configTriggerBadge.title = data?.active_connection_missing
+          ? (data.active_connection_missing_message || anonDbLabel)
+          : `Connected to: ${anonDbLabel} (Click to configure)`;
+      }
       document.title = `yDyL`;
       await checkDbStatus();
       return;
@@ -849,15 +862,36 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     if (badge) badge.style.display = '';
 
-    const matchedPreset = CONFIGURED_DBS.find(db => db.url === data.active_database_url);
-    // A custom connection's URL can collide with a preset's, so URL
-    // equality alone can't tell them apart - active_is_custom (the server's
-    // record of which one the user actually picked) breaks the tie. Without
-    // it, a colliding preset match would always win here even when the user
-    // explicitly selected their own custom connection with the same URL.
+    const matchedPreset = CONFIGURED_DBS.find(db => db.id === data.active_preset_id);
+    // Matching by the preset's stable "id" (not URL) also works for
+    // anonymous users, whose CONFIGURED_DBS entries never carry a "url" at
+    // all (see the redacted configured_databases the server sends them). A
+    // custom connection's URL can still collide with a preset's, so
+    // active_is_custom (the server's record of which one the user actually
+    // picked) breaks the tie - without it, a colliding preset match would
+    // always win here even when the user explicitly selected their own
+    // custom connection with the same URL.
     const dbDisplayName = data.active_is_custom
       ? (data.custom_database_name || data.database_name || "Database")
       : (matchedPreset?.name || data.database_name || "Database");
+
+    // A previously-selected preset/custom connection that's since been
+    // removed or renamed still resolves to a real (default) connection -
+    // see db.py's resolve_active_descriptor - but the badge should say so
+    // rather than silently showing the default as if it were what the
+    // user actually picked (see config_routes.py's
+    // active_connection_missing/_message).
+    if (data.active_connection_missing) {
+      if (configTriggerBadge) {
+        configTriggerBadge.title = data.active_connection_missing_message || `Connected to: ${dbDisplayName} (Click to configure)`;
+      }
+      if (connDbName) {
+        connDbName.textContent = `⚠ ${dbDisplayName}`;
+      }
+      document.title = `yDyL`;
+      await checkDbStatus();
+      return;
+    }
 
     if (configTriggerBadge) {
       configTriggerBadge.title = `Connected to: ${dbDisplayName} (Click to configure)`;
@@ -870,12 +904,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     document.title = `yDyL`;
 
     await checkDbStatus();
-  }
-
-  function getMatchingPresetUrl(targetUrl) {
-    if (!targetUrl || !CONFIGURED_DBS || CONFIGURED_DBS.length === 0) return null;
-    const found = CONFIGURED_DBS.find(db => db.url === targetUrl);
-    return found ? found.url : null;
   }
 
   // ===========================================================================
@@ -926,7 +954,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       ACTIVE_IS_CUSTOM = Boolean(data.active_is_custom);
       ACTIVE_CUSTOM_CONNECTION_KEY = data.active_custom_connection_key || "";
       ACTIVE_USES_CUSTOM_CREDENTIALS = Boolean(data.active_uses_custom_credentials);
-      ACTIVE_PRESET_INDEX = typeof data.active_preset_index === 'number' ? data.active_preset_index : null;
+      ACTIVE_PRESET_ID = data.active_preset_id ?? null;
 
       renderDbRadioButtons();
       loadConfigIntoUI();
@@ -1539,37 +1567,29 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (!radioGroup) return;
 
     const activeUrl = currentDbUrl || ACTIVE_DB_URL || DEFAULT_DB_URL;
-    const matchedPresetUrl = getMatchingPresetUrl(activeUrl);
 
     // ACTIVE_IS_CUSTOM (the server's record of what was actually picked) is
-    // the primary signal, taking priority over the URL match - a saved
-    // custom connection can share its URL with a preset, in which case
-    // matchedPresetUrl would be found either way and URL matching alone
-    // can't tell which is active. Falling back to !matchedPresetUrl covers
-    // the ordinary (no collision) case where a custom connection's URL
-    // simply isn't one of the presets. Anonymous (Cloud Run, signed-out)
-    // users need ACTIVE_IS_CUSTOM used alone, without that fallback,
-    // though: their admin-configured presets are matched by index
-    // (ACTIVE_PRESET_INDEX), not URL, since preset connection
-    // strings/credentials are still never sent to them (configured_databases
-    // is redacted for them - see fetchBackendConfig()) - so
-    // matchedPresetUrl is never found for an anonymous visitor on a preset
-    // either, and the !matchedPresetUrl fallback would wrongly read that as
-    // "custom" instead of "on a redacted preset".
-    const isCustom = isAnonymousUser ? ACTIVE_IS_CUSTOM : (ACTIVE_IS_CUSTOM || !matchedPresetUrl);
+    // the primary signal, taking priority over the id match - a saved
+    // custom connection can share its URL with a preset, in which case a
+    // preset's id would still be "active" (config_routes.py's active_preset
+    // is computed by URL, independent of is_custom), and matching would
+    // wrongly pick the preset radio instead of the custom one. This one
+    // rule now works identically for anonymous and signed-in users, since
+    // ACTIVE_PRESET_ID (unlike the URL it replaced) is never a secret and is
+    // sent to every visitor regardless of auth state - see fetchBackendConfig().
+    const isCustom = ACTIVE_IS_CUSTOM;
 
     let html = `<div class="radio-group-heading">Pre-configured Database Playgrounds</div>`;
 
-    CONFIGURED_DBS.forEach((db, index) => {
-      // Anonymous users' preset objects have no "url" (redacted) - fall
-      // back to an index-based value, mirroring the "custom-N" pattern
-      // used for custom rows, and resolved server-side via preset_index.
-      const value = db.url || `preset-${index}`;
-      const isSelected = !isCustom && (
-        isAnonymousUser
-          ? ACTIVE_PRESET_INDEX === index
-          : Boolean(matchedPresetUrl && db.url === matchedPresetUrl)
-      );
+    CONFIGURED_DBS.forEach((db) => {
+      // Encodes the preset's stable id (never a secret, unlike the real
+      // URL) rather than the URL itself or its array position - the id
+      // survives the admin reordering/adding/removing presets between
+      // deployments and works identically whether or not this visitor's
+      // CONFIGURED_DBS entries are redacted (see fetchBackendConfig()).
+      // Resolved server-side via payload.preset_id (see triggerConfigSave()).
+      const value = `preset:${db.id}`;
+      const isSelected = !isCustom && db.id === ACTIVE_PRESET_ID;
       html += `
         <label class="radio-option">
           <input type="radio" name="db_connection_option" value="${value}" data-dbname="${db.name}" ${isSelected ? 'checked' : ''}>
@@ -1613,10 +1633,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     let dbSid = null;
     let dbSsl = null;
     let isCustomOption = false;
-    // Set only for anonymous users picking a preset by index (see
+    // Set only for anonymous users picking a preset by its stable id (see
     // renderDbRadioButtons()) - the server resolves the real connection
-    // from this index itself, since anonymous users never receive one.
-    let presetIndex = null;
+    // from this id itself, since anonymous users never receive one. Signed-
+    // in users' preset selections are still matched by their real field
+    // values in _parse_incoming_connection (see its own comments), not by
+    // id, so this stays null for them even though the radio value now
+    // encodes an id for both user types.
+    let presetId = null;
 
     // A custom BigQuery connection is only "complete"/selectable/saveable
     // once it has BOTH its own billing project ID and its own key - either
@@ -1763,80 +1787,26 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         customDbName = dbNameValue;
         customDbUrl = dbUrlValue;
-      } else if (selectedDbRadio.value.startsWith('preset-')) {
-        // Anonymous path: this preset's real URL was withheld from us
-        // (see fetchBackendConfig()'s redacted configured_databases), so
-        // we can only tell the server which index was picked and let it
-        // resolve the actual connection itself.
-        presetIndex = parseInt(selectedDbRadio.value.split('-')[1], 10);
-        const matchedDb = CONFIGURED_DBS[presetIndex];
+      } else if (selectedDbRadio.value.startsWith('preset:')) {
+        // Both anonymous and signed-in users select a preset purely by its
+        // stable, non-secret id (see renderDbRadioButtons()) - never by
+        // resending its own fields, let alone its credentials. The server
+        // resolves the preset's actual connection details fresh from
+        // CONFIGURED_DBS every time it's actually used (see db.py's
+        // resolve_active_descriptor) and never persists them on the
+        // session, so there's nothing else to send here regardless of
+        // whether this visitor is signed in - matchedDb is only a
+        // name+type+id skeleton for an anonymous user (see
+        // fetchBackendConfig()'s redacted configured_databases) but the
+        // full preset descriptor for a signed-in one, since presets aren't
+        // redacted for them; either way, only its id and name are used
+        // below (dbType/dbNameValue are display-only for this payload -
+        // the server ignores them for a preset selection).
+        const matchedPresetId = selectedDbRadio.value.slice('preset:'.length);
+        const matchedDb = CONFIGURED_DBS.find(db => db.id === matchedPresetId);
         dbType = (matchedDb && matchedDb.type) || 'postgres';
         dbNameValue = matchedDb ? matchedDb.name : "Preset DB";
-      } else {
-        dbUrlValue = selectedDbRadio.value;
-        const matchedDb = CONFIGURED_DBS.find(db => db.url === dbUrlValue);
-        dbType = (matchedDb && matchedDb.type) || 'postgres';
-        dbNameValue = matchedDb ? matchedDb.name : "Preset DB";
-        if (dbType === 'bigquery' && matchedDb) {
-          dbProjectId = matchedDb.project_id;
-          dbDataset = matchedDb.dataset;
-          // No credentials_json for admin presets - they authenticate via
-          // the app's own service account (ADC), not a per-connection key.
-        } else if (dbType === 'snowflake' && matchedDb) {
-          dbAccount = matchedDb.account;
-          dbUser = matchedDb.user;
-          dbWarehouse = matchedDb.warehouse;
-          dbDatabase = matchedDb.database;
-          dbSchema = matchedDb.schema || null;
-          dbRole = matchedDb.role || null;
-          // Unlike BigQuery presets, a Snowflake preset DOES carry its own
-          // credential right here (CONFIGURED_DBS - see app_config.py's
-          // DATABASE_PRESETS_FILE comment for why Snowflake has no ADC-
-          // style ambient identity to authenticate as instead) - without
-          // resending it, the server would save a credential-less
-          // connection and every subsequent query would fail.
-          dbPassword = matchedDb.password || null;
-          dbPrivateKey = matchedDb.private_key || null;
-          dbPrivateKeyPassphrase = matchedDb.private_key_passphrase || null;
-        } else if (dbType === 'databricks' && matchedDb) {
-          dbServerHostname = matchedDb.server_hostname;
-          dbHttpPath = matchedDb.http_path;
-          dbCatalog = matchedDb.catalog || null;
-          dbSchema = matchedDb.schema || null;
-          // Like Snowflake, a Databricks preset carries its own credential
-          // right here (CONFIGURED_DBS) - Databricks has no ADC-style
-          // ambient identity either (see backends/databricks.py's module
-          // docstring) - without resending it, the server would save a
-          // credential-less connection and every subsequent query would
-          // fail.
-          dbAccessToken = matchedDb.access_token || null;
-        } else if (dbType === 'oracle' && matchedDb) {
-          dbHost = matchedDb.host;
-          dbPort = matchedDb.port || null;
-          dbServiceName = matchedDb.service_name || null;
-          dbSid = matchedDb.sid || null;
-          dbUser = matchedDb.user;
-          dbSchema = matchedDb.schema || null;
-          // Like Databricks, an Oracle preset carries its own credential
-          // right here (CONFIGURED_DBS) - Oracle has no ADC-style ambient
-          // identity either (see backends/oracle.py's module docstring) -
-          // without resending it, the server would save a credential-less
-          // connection and every subsequent query would fail.
-          dbPassword = matchedDb.password || null;
-          dbSsl = Boolean(matchedDb.ssl);
-        } else if (dbType === 'redshift' && matchedDb) {
-          dbHost = matchedDb.host;
-          dbPort = matchedDb.port || null;
-          dbDatabase = matchedDb.database;
-          dbUser = matchedDb.user;
-          dbSchema = matchedDb.schema || null;
-          // Like Oracle, a Redshift preset carries its own credential right
-          // here (CONFIGURED_DBS) - Redshift has no ADC-style ambient
-          // identity either (see backends/redshift.py's module docstring) -
-          // without resending it, the server would save a credential-less
-          // connection and every subsequent query would fail.
-          dbPassword = matchedDb.password || null;
-        }
+        presetId = matchedPresetId;
       }
     } else {
       dbUrlValue = DEFAULT_DB_URL;
@@ -1920,8 +1890,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         }),
       auto_sql_execute: autoSqlExecuteValue
     };
-    if (presetIndex !== null) {
-      payload.preset_index = presetIndex;
+    if (presetId !== null) {
+      payload.preset_id = presetId;
     } else if (dbType === 'bigquery') {
       payload.project_id = dbProjectId;
       payload.dataset = dbDataset;
@@ -1979,12 +1949,12 @@ document.addEventListener('DOMContentLoaded', async () => {
         // this reflects the connection that was active going into this
         // save. Compared against the same tuple after the update to detect
         // an actual connection change (see clearActiveQueryState() below) -
-        // url/is_custom/connection_key/preset_index together are what
-        // uniquely identify "the" active connection (presets: url; custom
-        // connections: connection_key; anonymous preset picks: preset_index,
-        // since url is withheld from them - see "what makes a db connection
-        // unique" discussion).
-        const previousConnectionIdentity = `${ACTIVE_DB_URL}|${ACTIVE_IS_CUSTOM}|${ACTIVE_CUSTOM_CONNECTION_KEY}|${ACTIVE_PRESET_INDEX}`;
+        // url/is_custom/connection_key/preset_id together are what uniquely
+        // identify "the" active connection (custom connections:
+        // connection_key; presets: preset_id, which now works the same way
+        // for anonymous and signed-in users alike - see "what makes a db
+        // connection unique" discussion).
+        const previousConnectionIdentity = `${ACTIVE_DB_URL}|${ACTIVE_IS_CUSTOM}|${ACTIVE_CUSTOM_CONNECTION_KEY}|${ACTIVE_PRESET_ID}`;
         if (data.active_database_url) {
           ACTIVE_DB_URL = data.active_database_url;
         }
@@ -1997,8 +1967,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (data.active_uses_custom_credentials !== undefined) {
           ACTIVE_USES_CUSTOM_CREDENTIALS = Boolean(data.active_uses_custom_credentials);
         }
-        if (data.active_preset_index !== undefined) {
-          ACTIVE_PRESET_INDEX = typeof data.active_preset_index === 'number' ? data.active_preset_index : null;
+        if (data.active_preset_id !== undefined) {
+          ACTIVE_PRESET_ID = data.active_preset_id ?? null;
         }
         if (data.custom_database_name !== undefined) {
           customDbName = data.custom_database_name;
@@ -2013,7 +1983,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           autoSqlExecuteEnabled = Boolean(data.auto_sql_execute);
         }
 
-        const nextConnectionIdentity = `${ACTIVE_DB_URL}|${ACTIVE_IS_CUSTOM}|${ACTIVE_CUSTOM_CONNECTION_KEY}|${ACTIVE_PRESET_INDEX}`;
+        const nextConnectionIdentity = `${ACTIVE_DB_URL}|${ACTIVE_IS_CUSTOM}|${ACTIVE_CUSTOM_CONNECTION_KEY}|${ACTIVE_PRESET_ID}`;
         if (nextConnectionIdentity !== previousConnectionIdentity) {
           clearActiveQueryState();
         }

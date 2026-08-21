@@ -30,10 +30,10 @@ def test_authenticated_preset_selection_bills_against_presets_billing_project(ap
     harness = install_fake_bigquery(monkeypatch)
     login_as(env.client, "alice@example.com")
 
-    resp = env.client.post('/api/config', json={
-        "database_type": "bigquery", "project_id": "bigquery-public-data",
-        "dataset": "usa_names", "database_name": "Public Data",
-    })
+    # Preset selected by its stable id, same as an anonymous visitor would -
+    # both user types now identify a preset purely by id, never by resending
+    # its own fields (see config_routes.py's unified preset branch).
+    resp = env.client.post('/api/config', json={"preset_id": "bigquery+Public Data"})
     assert resp.status_code == 200
 
     env.client.post('/api/execute', json={"sql": "SELECT 1;"})
@@ -51,7 +51,7 @@ def test_anonymous_preset_selection_bills_against_presets_billing_project(app_fa
     })
     harness = install_fake_bigquery(monkeypatch)
 
-    resp = env.client.post('/api/config', json={"preset_index": 0})
+    resp = env.client.post('/api/config', json={"preset_id": "bigquery+Public Data"})
     assert resp.status_code == 200
 
     env.client.post('/api/execute', json={"sql": "SELECT 1;"})
@@ -68,10 +68,7 @@ def test_preset_without_billing_project_id_falls_back_to_its_own_project_and_sti
     env = app_factory(env={"DATABASE_PRESETS_FILE": path})
     harness = install_fake_bigquery(monkeypatch)
     login_as(env.client, "alice@example.com")
-    env.client.post('/api/config', json={
-        "database_type": "bigquery", "project_id": "bigquery-public-data",
-        "dataset": "usa_names", "database_name": "No Billing",
-    })
+    env.client.post('/api/config', json={"preset_id": "bigquery+No Billing"})
     env.client.post('/api/execute', json={"sql": "SELECT 1;"})
     assert harness.client_calls[-1]["project"] == "bigquery-public-data"
 
@@ -150,27 +147,18 @@ def test_custom_connection_never_borrows_a_matching_presets_billing_project(app_
 
 
 # --- _parse_incoming_connection / _parse_incoming_custom_databases, direct ----
-
-def test_parse_incoming_connection_preset_uses_matching_preset_billing_project(app_factory, tmp_path):
-    path = write_database_presets_file(tmp_path, [{
-        "type": "bigquery", "name": "Trends", "project_id": "bigquery-public-data",
-        "dataset": "google_trends", "billing_project_id": "preset-billing-proj",
-    }])
-    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
-    db_type, db_url, db_config, error = env.config_routes._parse_incoming_connection(
-        {"database_type": "bigquery", "project_id": "bigquery-public-data", "dataset": "google_trends"},
-        "alice@example.com", False,
-    )
-    assert error is None
-    assert db_config["billing_project_id"] == "preset-billing-proj"
-
+# _parse_incoming_connection is custom-connection-only now - a preset
+# selection never reaches it at all (see config_routes.py's module
+# docstring and its unified preset_id branch in handle_config); the
+# preset-billing-project behavior above is covered end to end by the
+# /api/config + /api/execute tests, not a direct call into this function.
 
 def test_parse_incoming_connection_incomplete_bigquery_fields_returns_no_url_no_error(app_env):
     # Missing project_id/dataset entirely = "no connection change
     # requested", not an error - distinct from the custom-BigQuery
     # missing-billing/key case, which IS an error.
     db_type, db_url, db_config, error = app_env.config_routes._parse_incoming_connection(
-        {"database_type": "bigquery"}, "alice@example.com", True,
+        {"database_type": "bigquery"}, "alice@example.com",
     )
     assert db_url is None
     assert error is None

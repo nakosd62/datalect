@@ -16,79 +16,75 @@ from state_store import SqliteStateStore, compute_connection_key
 
 
 def make_store(tmp_path):
-    store = SqliteStateStore(str(tmp_path / "state.db"), default_conn="postgresql://default/db")
+    store = SqliteStateStore(str(tmp_path / "state.db"))
     store.init()
     return store
 
 
 # --- sessions ------------------------------------------------------------------
+# A session stores only an identity reference (is_custom, connection_id) -
+# never a connection's actual details/credentials (see state_store.py's
+# module/class docstrings and db.py's resolve_active_descriptor, which
+# resolves those fresh every time something needs to actually connect).
 
 def test_get_session_defaults_when_no_row_exists(tmp_path):
     store = make_store(tmp_path)
     session = store.get_session("alice")
-    assert session["database_url"] == "postgresql://default/db"
     assert session["auto_sql_execute"] is True
-    assert session["database_type"] == "postgres"
-    assert session["database_config"] == {}
     assert session["is_custom"] is False
-    assert session["custom_connection_key"] == ""
+    assert session["connection_id"] == ""
 
 
 def test_set_and_get_session_round_trips_all_fields(tmp_path):
     store = make_store(tmp_path)
     store.set_session(
-        "alice", db_url="bigquery://p/d", auto_sql_execute=False, db_type="bigquery",
-        db_config={"project_id": "p", "dataset": "d"}, is_custom=True,
-        custom_connection_key="abc123",
+        "alice", connection_id="abc123", auto_sql_execute=False, is_custom=True,
     )
     session = store.get_session("alice")
-    assert session["database_url"] == "bigquery://p/d"
+    assert session["connection_id"] == "abc123"
     assert session["auto_sql_execute"] is False
-    assert session["database_type"] == "bigquery"
-    assert session["database_config"] == {"project_id": "p", "dataset": "d"}
     assert session["is_custom"] is True
-    assert session["custom_connection_key"] == "abc123"
 
 
 def test_set_session_only_updates_passed_fields(tmp_path):
     store = make_store(tmp_path)
-    store.set_session("alice", db_url="postgresql://a/b", auto_sql_execute=True)
+    store.set_session("alice", connection_id="preset+Default DB", auto_sql_execute=True)
     store.set_session("alice", auto_sql_execute=False)  # only toggling this
     session = store.get_session("alice")
-    assert session["database_url"] == "postgresql://a/b"  # untouched
+    assert session["connection_id"] == "preset+Default DB"  # untouched
     assert session["auto_sql_execute"] is False
 
 
 def test_set_session_with_all_none_is_a_no_op(tmp_path):
     store = make_store(tmp_path)
-    store.set_session("alice", db_url="postgresql://a/b")
+    store.set_session("alice", connection_id="preset+Default DB")
     store.set_session("alice")  # nothing passed
     session = store.get_session("alice")
-    assert session["database_url"] == "postgresql://a/b"
+    assert session["connection_id"] == "preset+Default DB"
 
 
-def test_set_session_can_explicitly_clear_custom_connection_key(tmp_path):
+def test_set_session_can_explicitly_clear_connection_id(tmp_path):
     store = make_store(tmp_path)
-    store.set_session("alice", db_url="bigquery://p/d", is_custom=True, custom_connection_key="abc123")
-    store.set_session("alice", db_url="postgresql://a/b", is_custom=False, custom_connection_key="")
+    store.set_session("alice", connection_id="abc123", is_custom=True)
+    store.set_session("alice", connection_id="", is_custom=False)
     session = store.get_session("alice")
-    assert session["custom_connection_key"] == ""
+    assert session["connection_id"] == ""
     assert session["is_custom"] is False
 
 
 def test_sessions_are_isolated_per_user(tmp_path):
     store = make_store(tmp_path)
-    store.set_session("alice", db_url="postgresql://alice-db")
-    store.set_session("bob", db_url="postgresql://bob-db")
-    assert store.get_session("alice")["database_url"] == "postgresql://alice-db"
-    assert store.get_session("bob")["database_url"] == "postgresql://bob-db"
+    store.set_session("alice", connection_id="alice-conn")
+    store.set_session("bob", connection_id="bob-conn")
+    assert store.get_session("alice")["connection_id"] == "alice-conn"
+    assert store.get_session("bob")["connection_id"] == "bob-conn"
 
 
 def test_none_user_id_bucketed_under_global(tmp_path):
     store = make_store(tmp_path)
-    store.set_session(None, db_url="postgresql://global-db")
-    assert store.get_session(None)["database_url"] == "postgresql://global-db"
-    assert store.get_session("global")["database_url"] == "postgresql://global-db"
+    store.set_session(None, connection_id="global-conn")
+    assert store.get_session(None)["connection_id"] == "global-conn"
+    assert store.get_session("global")["connection_id"] == "global-conn"
 
 
 # --- db_connections (saved custom connections) --------------------------------
@@ -322,7 +318,7 @@ def test_init_migrates_pre_connection_key_db_connections_table(tmp_path):
     conn.commit()
     conn.close()
 
-    store = SqliteStateStore(db_path, default_conn="postgresql://default/db")
+    store = SqliteStateStore(db_path)
     store.init()  # must not raise, and must preserve the legacy row
 
     conns = store.get_db_connections("alice")
@@ -331,9 +327,119 @@ def test_init_migrates_pre_connection_key_db_connections_table(tmp_path):
     assert conns[0]["connection_key"]  # backfilled, non-empty
 
 
+def test_init_migrates_pre_connection_id_sessions_table_for_custom_row(tmp_path):
+    db_path = str(tmp_path / "state.db")
+    # Simulate a pre-migration DB: sessions storing a full duplicated
+    # descriptor (database_url/database_type/database_config/
+    # custom_connection_key) rather than just an identity reference - see
+    # state_store.py's init() migration comment for why this got scrubbed.
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        CREATE TABLE sessions (
+            session_id TEXT PRIMARY KEY,
+            database_url TEXT,
+            database_type TEXT,
+            database_config TEXT,
+            auto_sql_execute INTEGER NOT NULL DEFAULT 1,
+            is_custom INTEGER NOT NULL DEFAULT 0,
+            custom_connection_key TEXT NOT NULL DEFAULT '',
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    conn.execute(
+        "INSERT INTO sessions (session_id, database_url, database_type, database_config, "
+        "auto_sql_execute, is_custom, custom_connection_key) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("alice", "bigquery://p/d", "bigquery", '{"project_id": "p", "dataset": "d"}', 0, 1, "custom-key-123"),
+    )
+    conn.commit()
+    conn.close()
+
+    store = SqliteStateStore(db_path)
+    store.init()  # must not raise, and must preserve/scrub the legacy row
+
+    session = store.get_session("alice")
+    assert session["is_custom"] is True
+    assert session["connection_id"] == "custom-key-123"  # reused as-is
+    assert session["auto_sql_execute"] is False
+
+    # The old descriptor columns must actually be gone (a hard rebuild, not
+    # just an added column) - no lingering credentials in an unread column.
+    with store._connect() as check_conn:
+        cursor = check_conn.cursor()
+        cursor.execute("PRAGMA table_info(sessions);")
+        cols = {c[1] for c in cursor.fetchall()}
+    assert cols == {"session_id", "auto_sql_execute", "is_custom", "connection_id", "updated_at"}
+
+
+def test_init_migrates_pre_connection_id_sessions_table_for_preset_row(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "state.db")
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        CREATE TABLE sessions (
+            session_id TEXT PRIMARY KEY,
+            database_url TEXT,
+            database_type TEXT,
+            database_config TEXT,
+            auto_sql_execute INTEGER NOT NULL DEFAULT 1,
+            is_custom INTEGER NOT NULL DEFAULT 0,
+            custom_connection_key TEXT NOT NULL DEFAULT '',
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    conn.execute(
+        "INSERT INTO sessions (session_id, database_url, database_type, database_config, "
+        "auto_sql_execute, is_custom, custom_connection_key) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("bob", "postgresql://preset-match/db", "postgres", None, 1, 0, ""),
+    )
+    conn.execute(
+        "INSERT INTO sessions (session_id, database_url, database_type, database_config, "
+        "auto_sql_execute, is_custom, custom_connection_key) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("carol", "postgresql://no-longer-configured/db", "postgres", None, 1, 0, ""),
+    )
+    conn.commit()
+    conn.close()
+
+    # The migration's "from app_config import CONFIGURED_DBS" is a local
+    # import (see state_store.py's init() comment on why - app_config.py
+    # itself imports this module while still building CONFIGURED_DBS, so a
+    # top-level import here would be circular). Rather than importing the
+    # real app_config module (which this file's own docstring says to
+    # avoid - these tests exercise SqliteStateStore with no Flask/app_config
+    # involvement), inject a minimal fake module under that name so the
+    # local import resolves to it instead.
+    import types
+    fake_app_config = types.ModuleType("app_config")
+    fake_app_config.CONFIGURED_DBS = [
+        {"id": "postgres+Preset Match", "name": "Preset Match", "type": "postgres",
+         "url": "postgresql://preset-match/db"},
+    ]
+    monkeypatch.setitem(sys.modules, "app_config", fake_app_config)
+
+    store = SqliteStateStore(db_path)
+    store.init()
+
+    # bob's old database_url matches a configured preset by url -> backfilled
+    # to that preset's stable id.
+    bob_session = store.get_session("bob")
+    assert bob_session["is_custom"] is False
+    assert bob_session["connection_id"] == "postgres+Preset Match"
+
+    # carol's old database_url doesn't match anything currently configured
+    # (the preset it once pointed at is gone) -> blank connection_id, which
+    # resolves to the app default going forward (see db.py's
+    # resolve_active_descriptor) rather than raising or guessing.
+    carol_session = store.get_session("carol")
+    assert carol_session["is_custom"] is False
+    assert carol_session["connection_id"] == ""
+
+
 def test_init_is_idempotent(tmp_path):
     store = make_store(tmp_path)
     store.set_db_connections("alice", "Conn", "postgres", "postgresql://a/b")
+    store.set_session("alice", connection_id="some-id", is_custom=True)
     store.init()  # calling init() again must not lose data or error
     conns = store.get_db_connections("alice")
     assert len(conns) == 1
+    session = store.get_session("alice")
+    assert session["connection_id"] == "some-id"
+    assert session["is_custom"] is True

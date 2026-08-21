@@ -1145,7 +1145,16 @@ textarea:focus {
   white-space: nowrap;
 }
 
-.radio-option input[type="radio"] {
+/* Also applies to the radio inside .custom-db-header-row (each custom
+   connection card's own selector radio, right below the preset list in
+   #modalDbRadioGroup - see renderCustomDbRows()) - that one isn't wrapped
+   in a .radio-option label the way a preset's is (its row has a type
+   select/name input/toggle/remove button alongside it, not just a label),
+   so without this it rendered as a bare, unstyled native browser radio -
+   a different size/color than every preset's right above it, even though
+   both are options in the same db_connection_option radio group. */
+.radio-option input[type="radio"],
+.custom-db-header-row input[type="radio"] {
   accent-color: var(--primary);
   width: 1rem;
   height: 1rem;

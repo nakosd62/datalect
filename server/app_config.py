@@ -120,8 +120,27 @@ DEFAULT_CONN = "postgresql://postgres:password@host:23456/defaultdb?sslmode=veri
 # deployment tooling) - unreadable and unreviewable once there were more
 # than one or two presets. A file has no such restriction: write it
 # multi-line, indented, with real JSON formatting, and just point
-# DATABASE_PRESETS_FILE at its path. Every object needs "type" and "name";
-# the rest of the shape is dialect-specific:
+# DATABASE_PRESETS_FILE at its path. Every object needs "type" and "name",
+# and should also carry an "id" - a short, admin-chosen string, unique
+# across this file, that never changes for that preset's lifetime (e.g.
+# "ecommerce-prod", not a UUID - it's never sent to an anonymous visitor
+# either, so there's no reason to make it opaque). This is what a session
+# actually pins its active preset to (see config_routes.py's handle_config)
+# - unlike matching by "url" (ambiguous once a custom connection can share
+# a preset's URL) or by position in this file (silently wrong the moment
+# a preset is reordered or removed), "id" is a stable identity an admin
+# controls directly. "id" is optional only for backward compatibility -
+# a preset missing it falls back to "{type}+{name}" (e.g. "postgres+Demo
+# DB"), which still moves with the preset if the file gets reordered
+# (unlike a position-based fallback), but breaks the moment "name" or
+# "type" is edited - so this is still just a migration aid, not a
+# substitute for adding a real explicit "id" to every preset here as soon
+# as convenient. Two presets sharing the same "id" is a config error: the
+# later one is skipped entirely (logged as a warning), exactly like any
+# other malformed preset below (missing "name"/"url"/credential) - it never
+# ends up in CONFIGURED_DBS at all, rather than loading anyway and quietly
+# activating the WRONG connection whenever its (collided) radio is clicked.
+# The rest of each object's shape is dialect-specific:
 #   Postgres:  {"type": "postgres", "name": "...", "url": "postgresql://..."}
 #   MySQL:     {"type": "mysql", "name": "...", "url": "mysql://..."}
 #   BigQuery:  {"type": "bigquery", "name": "...", "project_id": "...", "dataset": "..."}
@@ -286,6 +305,8 @@ if raw_db_presets.strip():
         )
         parsed_presets = []
 
+    _seen_preset_ids = set()
+
     for entry in parsed_presets:
         if not isinstance(entry, dict):
             logger.warning("Skipping database preset entry that is not a JSON object: %r", entry)
@@ -297,12 +318,41 @@ if raw_db_presets.strip():
             logger.warning("Skipping database preset entry with no 'name': %r", entry)
             continue
 
+        # See the DATABASE_PRESETS_FILE comment above for what "id" is and
+        # why it exists - a preset missing it falls back to "{type}+{name}"
+        # rather than its position in this file, so it survives the file
+        # being reordered (though not a later rename of "name"/"type"
+        # itself); this is purely a migration aid, not the recommended
+        # long-term state for any preset here. Never collides with a saved
+        # custom connection's own identity (state_store.py's
+        # compute_connection_key(), a sha256 hex digest) - those live in a
+        # completely separate lookup (a different DB table, keyed by
+        # (user_id, connection_key)), never compared against CONFIGURED_DBS
+        # ids anywhere in this codebase.
+        preset_id = (entry.get("id") or "").strip() or f"{db_type}+{name}"
+        if preset_id in _seen_preset_ids:
+            # Same treatment as every other malformed preset in this loop
+            # (missing "name"/"url"/credential, below) - skipped entirely,
+            # never added to CONFIGURED_DBS. Loading it anyway would mean
+            # its config-modal radio silently activates whichever earlier
+            # preset actually owns this id when clicked, which is worse
+            # than just not offering it at all.
+            logger.warning(
+                "Skipping database preset '%s' (type=%s): its id %r collides with "
+                "an earlier preset's - each preset needs a unique id (see the "
+                "DATABASE_PRESETS_FILE comment above). Add an explicit \"id\" to "
+                "one of them to fix this.",
+                name, db_type, preset_id,
+            )
+            continue
+        _seen_preset_ids.add(preset_id)
+
         if db_type == "postgres":
             url = (entry.get("url") or "").strip()
             if not url:
                 logger.warning("Skipping Postgres preset '%s': missing 'url'.", name)
                 continue
-            CONFIGURED_DBS.append({"name": name, "type": "postgres", "url": url})
+            CONFIGURED_DBS.append({"id": preset_id, "name": name, "type": "postgres", "url": url})
 
         elif db_type == "mysql":
             # Same shape as a Postgres preset - a single connection-string
@@ -314,7 +364,7 @@ if raw_db_presets.strip():
             if not url:
                 logger.warning("Skipping MySQL preset '%s': missing 'url'.", name)
                 continue
-            CONFIGURED_DBS.append({"name": name, "type": "mysql", "url": url})
+            CONFIGURED_DBS.append({"id": preset_id, "name": name, "type": "mysql", "url": url})
 
         elif db_type == "bigquery":
             project_id = (entry.get("project_id") or "").strip()
@@ -355,6 +405,7 @@ if raw_db_presets.strip():
                 )
                 billing_project_id = project_id
             CONFIGURED_DBS.append({
+                "id": preset_id,
                 "name": name,
                 "type": "bigquery",
                 # Synthetic identifier, not a credential - used for UI matching/
@@ -402,6 +453,7 @@ if raw_db_presets.strip():
                 )
                 continue
             preset = {
+                "id": preset_id,
                 "name": name,
                 "type": "snowflake",
                 # Synthetic identifier, not a credential - mirrors
@@ -442,6 +494,7 @@ if raw_db_presets.strip():
             catalog = (entry.get("catalog") or "").strip()
             schema = (entry.get("schema") or "").strip()
             preset = {
+                "id": preset_id,
                 "name": name,
                 "type": "databricks",
                 # Synthetic identifier, not a credential - mirrors
@@ -477,6 +530,7 @@ if raw_db_presets.strip():
             port = entry.get("port") or 1521
             schema = (entry.get("schema") or "").strip()
             preset = {
+                "id": preset_id,
                 "name": name,
                 "type": "oracle",
                 # Synthetic identifier, not a credential - mirrors
@@ -520,6 +574,7 @@ if raw_db_presets.strip():
             port = entry.get("port") or 5439
             schema = (entry.get("schema") or "").strip()
             preset = {
+                "id": preset_id,
                 "name": name,
                 "type": "redshift",
                 # Synthetic identifier, not a credential - mirrors
@@ -543,17 +598,30 @@ if raw_db_presets.strip():
 
 # Ensure at least one default fallback exists
 if not CONFIGURED_DBS:
-    CONFIGURED_DBS = [{"name": "Default DB", "type": "postgres", "url": DEFAULT_CONN}]
+    CONFIGURED_DBS = [{"id": "postgres+Default DB", "name": "Default DB", "type": "postgres", "url": DEFAULT_CONN}]
 
-# First *Postgres* preset is the default fallback connection - state_store's
-# "no session row yet" fallback and this module's own DEFAULT_CONN both
-# assume a plain Postgres URL, so this must stay Postgres-typed even if a
-# BigQuery preset happens to be listed first in CONFIGURED_DBS. Falls back
-# to the original env-derived DEFAULT_CONN if no Postgres preset exists at
-# all (e.g. a deployment configured with only BigQuery presets).
+# First *Postgres* preset is the default fallback connection - db.py's
+# resolve_active_descriptor (a blank/unresolvable session connection_id)
+# and this module's own DEFAULT_CONN both assume a plain Postgres URL, so
+# this must stay Postgres-typed even if a BigQuery preset happens to be
+# listed first in CONFIGURED_DBS. Falls back to the original env-derived
+# DEFAULT_CONN if no Postgres preset exists at all (e.g. a deployment
+# configured with only BigQuery presets).
 _postgres_presets = [db for db in CONFIGURED_DBS if db.get("type") == "postgres"]
 if _postgres_presets:
     DEFAULT_CONN = _postgres_presets[0]["url"]
+
+# The preset "id" (see this file's DATABASE_PRESETS_FILE comment) that
+# DEFAULT_CONN above actually came from, or None if no Postgres preset
+# exists (DEFAULT_CONN is then the hardcoded fallback string, which never
+# matches any preset in CONFIGURED_DBS at all). This is what lets a brand-
+# new session (connection_id == "", nothing ever explicitly selected)
+# report the SAME preset as "active" in the config modal that its
+# connection actually resolves to - see db.py's resolve_active_descriptor
+# and config_routes.py's handle_config, both of which fall back to this
+# id, not to a bare "nothing selected" null, whenever connection_id is
+# blank.
+DEFAULT_PRESET_ID = _postgres_presets[0]["id"] if _postgres_presets else None
 
 # --- Model Configuration -----------------------------------------------------
 DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
@@ -566,6 +634,6 @@ TRANSLATION_STATS_DB_PATH = "state/ydyl_state.db"
 
 # --- State Store: Firestore on Cloud Run, SQLite locally ---------------------
 if firestore_client:
-    state_store = FirestoreStateStore(firestore_client, DEFAULT_CONN)
+    state_store = FirestoreStateStore(firestore_client)
 else:
-    state_store = SqliteStateStore(TRANSLATION_STATS_DB_PATH, DEFAULT_CONN)
+    state_store = SqliteStateStore(TRANSLATION_STATS_DB_PATH)

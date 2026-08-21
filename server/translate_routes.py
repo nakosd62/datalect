@@ -419,12 +419,12 @@ def translate_query():
             thinking_tokens = getattr(usage, 'thoughts_token_count', 0) if usage else 0
             cached_content_tokens = getattr(usage, 'cached_content_token_count', 0) if usage else 0
 
-            # Anonymous users share a single identity and can't view/purge
-            # their own history via the app (see history_routes.py, still
-            # gated) - but the translation itself is still worth recording
-            # for aggregate usage/cost visibility (e.g. via export_state.py),
-            # so it's logged the same as any other user's, just attributed to
-            # the shared "anonymous" identity rather than a real one.
+            # Anonymous visitors share a single per-session identity
+            # (anonymous:<session_id>) rather than a real signed-in one, but
+            # the translation is recorded the same way regardless - both for
+            # aggregate usage/cost visibility (e.g. via export_state.py) and
+            # because anonymous visitors can view/purge their own history via
+            # the app same as anyone else (see history_routes.py).
             record_translation(user_identity, conn_str, prompt, generated_sql, gemini_model, duration, input_tokens, output_tokens, total_tokens, thinking_tokens, cached_content_tokens)
 
             yield json.dumps({

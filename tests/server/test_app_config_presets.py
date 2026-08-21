@@ -28,7 +28,7 @@ def test_postgres_preset_parsed(app_factory, tmp_path):
     env = app_factory(env={"DATABASE_PRESETS_FILE": path})
     assert len(env.app_config.CONFIGURED_DBS) == 1
     db = env.app_config.CONFIGURED_DBS[0]
-    assert db == {"name": "Shop", "type": "postgres", "url": "postgresql://u:p@h/db"}
+    assert db == {"id": "postgres+Shop", "name": "Shop", "type": "postgres", "url": "postgresql://u:p@h/db"}
 
 
 def test_postgres_preset_missing_url_is_skipped(app_factory, tmp_path):
@@ -46,7 +46,7 @@ def test_mysql_preset_parsed(app_factory, tmp_path):
     env = app_factory(env={"DATABASE_PRESETS_FILE": path})
     assert len(env.app_config.CONFIGURED_DBS) == 1
     db = env.app_config.CONFIGURED_DBS[0]
-    assert db == {"name": "Sales", "type": "mysql", "url": "mysql://u:p@h:3306/db"}
+    assert db == {"id": "mysql+Sales", "name": "Sales", "type": "mysql", "url": "mysql://u:p@h:3306/db"}
 
 
 def test_mysql_preset_missing_url_is_skipped(app_factory, tmp_path):
@@ -149,7 +149,7 @@ def test_snowflake_preset_with_password_parsed(app_factory, tmp_path):
     assert len(env.app_config.CONFIGURED_DBS) == 1
     db = env.app_config.CONFIGURED_DBS[0]
     assert db == {
-        "name": "Sample", "type": "snowflake",
+        "id": "snowflake+Sample", "name": "Sample", "type": "snowflake",
         "url": "snowflake://myorg-myacct/SNOWFLAKE_SAMPLE_DATA/TPCH_SF1",
         "account": "myorg-myacct", "user": "svc", "warehouse": "COMPUTE_WH",
         "database": "SNOWFLAKE_SAMPLE_DATA", "schema": "TPCH_SF1", "role": "ACCOUNTADMIN",
@@ -223,7 +223,7 @@ def test_databricks_preset_parsed(app_factory, tmp_path):
     assert len(env.app_config.CONFIGURED_DBS) == 1
     db = env.app_config.CONFIGURED_DBS[0]
     assert db == {
-        "name": "Sample Lakehouse", "type": "databricks",
+        "id": "databricks+Sample Lakehouse", "name": "Sample Lakehouse", "type": "databricks",
         "url": "databricks://dbc-a1b2c3d4-e5f6.cloud.databricks.com/sql/1.0/warehouses/0123456789abcdef",
         "server_hostname": "dbc-a1b2c3d4-e5f6.cloud.databricks.com",
         "http_path": "/sql/1.0/warehouses/0123456789abcdef",
@@ -271,7 +271,7 @@ def test_oracle_preset_parsed(app_factory, tmp_path):
     assert len(env.app_config.CONFIGURED_DBS) == 1
     db = env.app_config.CONFIGURED_DBS[0]
     assert db == {
-        "name": "Orders (Oracle)", "type": "oracle",
+        "id": "oracle+Orders (Oracle)", "name": "Orders (Oracle)", "type": "oracle",
         "url": "oracle://db.example.com:1521/ORCLPDB1",
         "host": "db.example.com", "port": 1521, "user": "svc_ydyl",
         "password": "hunter2", "service_name": "ORCLPDB1", "schema": "sales",
@@ -409,6 +409,126 @@ def test_multiple_presets_of_mixed_types(app_factory, tmp_path):
     assert len(env.app_config.CONFIGURED_DBS) == 3
     types = {db["type"] for db in env.app_config.CONFIGURED_DBS}
     assert types == {"postgres", "mysql", "bigquery"}
+
+
+# --- preset "id" ---------------------------------------------------------
+# Slice A of the connection-identity redesign: presets get a stable,
+# admin-chosen "id" (see the DATABASE_PRESETS_FILE comment) rather than
+# being identified by URL (ambiguous once a custom connection can share
+# one) or by position in this file (silently wrong the moment a preset is
+# reordered/removed/added).
+
+def test_explicit_preset_id_is_used_as_is(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [
+        {"id": "ecommerce-prod", "type": "postgres", "name": "Shop", "url": "postgresql://u:p@h/db"},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    assert env.app_config.CONFIGURED_DBS[0]["id"] == "ecommerce-prod"
+
+
+def test_preset_id_works_uniformly_across_every_dialect(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [
+        {"id": "pg-1", "type": "postgres", "name": "PG", "url": "postgresql://u:p@h/pgdb"},
+        {"id": "mysql-1", "type": "mysql", "name": "MySQL", "url": "mysql://u:p@h/mysqldb"},
+        {"id": "bq-1", "type": "bigquery", "name": "BQ", "project_id": "p", "dataset": "d", "billing_project_id": "p"},
+        {
+            "id": "sf-1", "type": "snowflake", "name": "SF", "account": "acc", "user": "u",
+            "warehouse": "wh", "database": "db", "password": "hunter2",
+        },
+        {
+            "id": "dbx-1", "type": "databricks", "name": "DBX", "server_hostname": "host",
+            "http_path": "/path", "access_token": "tok",
+        },
+        {
+            "id": "ora-1", "type": "oracle", "name": "ORA", "host": "h", "service_name": "svc",
+            "user": "u", "password": "p",
+        },
+        {
+            "id": "rs-1", "type": "redshift", "name": "RS", "host": "h", "database": "db",
+            "user": "u", "password": "p",
+        },
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    ids = {db["type"]: db["id"] for db in env.app_config.CONFIGURED_DBS}
+    assert ids == {
+        "postgres": "pg-1", "mysql": "mysql-1", "bigquery": "bq-1", "snowflake": "sf-1",
+        "databricks": "dbx-1", "oracle": "ora-1", "redshift": "rs-1",
+    }
+
+
+def test_preset_missing_id_falls_back_to_type_and_name(app_factory, tmp_path):
+    # Migration aid, not the recommended long-term state (see the
+    # DATABASE_PRESETS_FILE comment) - a preset saved before "id" existed,
+    # or one an admin hasn't gotten to yet, still gets a usable identity
+    # rather than breaking outright.
+    path = write_database_presets_file(tmp_path, [
+        {"type": "postgres", "name": "First", "url": "postgresql://u:p@h/db1"},
+        {"type": "postgres", "name": "Second", "url": "postgresql://u:p@h/db2"},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    assert [db["id"] for db in env.app_config.CONFIGURED_DBS] == ["postgres+First", "postgres+Second"]
+
+
+def test_preset_id_fallback_survives_reordering_and_earlier_entries_being_skipped(app_factory, tmp_path):
+    # Unlike a position-based fallback, "{type}+{name}" doesn't shift when
+    # an earlier entry in the file is skipped (e.g. missing "url") or when
+    # presets are reordered - it depends only on this preset's own type and
+    # name, never on where it happens to sit in the file.
+    path = write_database_presets_file(tmp_path, [
+        {"type": "postgres", "name": "Bad"},  # missing "url" - skipped
+        {"type": "postgres", "name": "Good", "url": "postgresql://u:p@h/db"},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    assert len(env.app_config.CONFIGURED_DBS) == 1
+    assert env.app_config.CONFIGURED_DBS[0]["id"] == "postgres+Good"
+
+
+def test_blank_explicit_id_falls_back_to_type_and_name(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [
+        {"id": "   ", "type": "postgres", "name": "Shop", "url": "postgresql://u:p@h/db"},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    assert env.app_config.CONFIGURED_DBS[0]["id"] == "postgres+Shop"
+
+
+def test_duplicate_preset_id_is_skipped_like_any_other_malformed_preset(app_factory, tmp_path, caplog):
+    # A duplicate id gets the same treatment as every other malformed
+    # preset in this loop (missing "name"/"url"/credential) - skipped
+    # entirely, never loaded - rather than loading anyway and leaving a
+    # config-modal radio around that silently activates the WRONG
+    # connection (the first preset with that id) whenever it's clicked.
+    path = write_database_presets_file(tmp_path, [
+        {"id": "dup", "type": "postgres", "name": "First", "url": "postgresql://u:p@h/db1"},
+        {"id": "dup", "type": "postgres", "name": "Second", "url": "postgresql://u:p@h/db2"},
+    ])
+    with caplog.at_level(logging.WARNING, logger="ydyl"):
+        env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    assert len(env.app_config.CONFIGURED_DBS) == 1
+    assert env.app_config.CONFIGURED_DBS[0]["name"] == "First"
+    assert any("Skipping database preset 'Second'" in rec.message for rec in caplog.records)
+
+
+def test_duplicate_preset_id_from_two_colliding_fallback_ids_is_also_skipped(app_factory, tmp_path, caplog):
+    # The fallback id ("{type}+{name}") can collide too, e.g. two presets
+    # of the same type that an admin happened to give the same name - same
+    # skip-the-later-one behavior as an explicit duplicate "id".
+    path = write_database_presets_file(tmp_path, [
+        {"type": "postgres", "name": "Demo", "url": "postgresql://u:p@h/db1"},
+        {"type": "postgres", "name": "Demo", "url": "postgresql://u:p@h/db2"},
+    ])
+    with caplog.at_level(logging.WARNING, logger="ydyl"):
+        env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    assert len(env.app_config.CONFIGURED_DBS) == 1
+    assert env.app_config.CONFIGURED_DBS[0]["url"] == "postgresql://u:p@h/db1"
+    assert any("Skipping database preset 'Demo'" in rec.message for rec in caplog.records)
+
+
+def test_default_fallback_db_has_an_id(app_factory):
+    # The synthetic "Default DB" used when no presets file is configured at
+    # all must still carry an id - every other code path that reads
+    # CONFIGURED_DBS can assume "id" is always present.
+    env = app_factory(env={})
+    assert env.app_config.CONFIGURED_DBS[0]["id"] == "postgres+Default DB"
 
 
 def test_default_conn_is_first_postgres_preset_even_if_bigquery_listed_first(app_factory, tmp_path):
