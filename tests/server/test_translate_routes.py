@@ -176,11 +176,27 @@ def test_bigquery_dialect_intro_used_when_active_connection_is_bigquery(app_fact
     assert "_TABLE_SUFFIX" in system_instruction
 
 
-def test_429_rotates_key_and_succeeds_on_retry(app_factory, monkeypatch):
-    env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1,fake-key-2"})
+def test_429_rotates_key_and_retries_immediately_with_no_delay(app_factory, monkeypatch):
+    # A 429 (per-key rate limit/capacity exhausted) rotates to a different
+    # key and retries right away - no GEMINI_RETRY_DELAY_SECONDS wait, since
+    # the next attempt already isn't subject to whatever limit the failed
+    # key just hit. See _classify_gemini_error's comment for why this
+    # differs from the 5xx/same-key case (test_server_error_retries_with_
+    # same_key/test_gemini_retry_delay_seconds_env_var_is_used_as_sleep_
+    # duration below), which DOES wait.
+    env = app_factory(env={
+        "GEMINI_PRESET_KEYS": "fake-key-1,fake-key-2",
+        # A conspicuously large, non-default delay - if this leaked into
+        # the 429 path at all (even a stray non-zero value), the request
+        # would visibly hang for 3.5s if the sleep() patch below weren't
+        # in place, or sleep_calls would show it. Set high enough that any
+        # regression back to using it would be unmistakable.
+        "GEMINI_RETRY_DELAY_SECONDS": "3.5",
+    })
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    monkeypatch.setattr(env.translate_routes.time, "sleep", lambda *a, **k: None)
+    sleep_calls = []
+    monkeypatch.setattr(env.translate_routes.time, "sleep", lambda secs: sleep_calls.append(secs))
     harness.queue_error(FakeApiError(429))
     harness.queue_response(FakeGenaiResponse("SELECT 1;"))
 
@@ -199,7 +215,11 @@ def test_429_rotates_key_and_succeeds_on_retry(app_factory, monkeypatch):
     assert retry_events[0]["attempt"] == 2
     assert retry_events[0]["maxAttempts"] == 5
     assert retry_events[0]["rotatedKey"] is True
-    assert retry_events[0]["delaySeconds"] == env.translate_routes.GEMINI_RETRY_DELAY_SECONDS
+    assert retry_events[0]["delaySeconds"] == 0
+    # time.sleep() isn't called at all for a delay=0 retry (see
+    # stream_translation()'s "if retry_action["delay"]:" guard) - not just
+    # called with 0.
+    assert sleep_calls == []
 
 
 def test_server_error_retries_with_same_key(app_factory, monkeypatch):

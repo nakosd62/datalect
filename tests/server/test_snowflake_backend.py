@@ -26,6 +26,7 @@ if SERVER_DIR not in sys.path:
     sys.path.insert(0, SERVER_DIR)
 
 from backends.snowflake import SnowflakeBackend
+from backends.base import DB_CONNECT_TIMEOUT_SECONDS
 from helpers import install_fake_snowflake_connect, make_fake_pg_connection
 
 
@@ -55,6 +56,11 @@ def test_connect_password_auth_passes_password_no_authenticator_override(monkeyp
     assert call["password"] == "hunter2"
     assert "authenticator" not in call
     assert "private_key" not in call
+    # See backends/base.py's DB_CONNECT_TIMEOUT_SECONDS docstring - bounds
+    # only the connect/authenticate phase; network_timeout (which would
+    # also cap query execution) is deliberately left unset.
+    assert call["login_timeout"] == DB_CONNECT_TIMEOUT_SECONDS
+    assert "network_timeout" not in call
 
 
 def test_connect_key_pair_auth_sets_jwt_authenticator(monkeypatch):

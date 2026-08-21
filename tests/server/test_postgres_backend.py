@@ -18,7 +18,8 @@ if SERVER_DIR not in sys.path:
     sys.path.insert(0, SERVER_DIR)
 
 from backends.postgres import PostgresBackend
-from helpers import make_fake_pg_connection
+from backends.base import DB_CONNECT_TIMEOUT_SECONDS
+from helpers import make_fake_pg_connection, install_fake_postgres_connect
 
 
 def _schema_responses(table_names, columns_rows, constraints=(), indexes=(), views=(), grants=(), triggers=()):
@@ -31,6 +32,23 @@ def _schema_responses(table_names, columns_rows, constraints=(), indexes=(), vie
         (list(grants), None, -1),
         (list(triggers), None, -1),
     ]
+
+
+# --- connect(): DSN + connect_timeout ---------------------------------------
+# Regression coverage for the failure mode surfaced by live Redshift
+# Serverless troubleshooting: connect() used to pass no timeout at all, so a
+# wrong/unreachable host would hang for however long the OS's own TCP
+# connect timeout happens to be (effectively unbounded), rather than failing
+# fast - see backends/base.py's DB_CONNECT_TIMEOUT_SECONDS docstring.
+
+def test_connect_passes_url_as_dsn_and_sets_connect_timeout(monkeypatch):
+    harness = install_fake_postgres_connect(monkeypatch)
+    backend = PostgresBackend()
+    backend.connect({"type": "postgres", "url": "postgresql://alice:secret@host:5432/mydb"})
+    assert len(harness.calls) == 1
+    dsn, kwargs = harness.calls[0]
+    assert dsn == "postgresql://alice:secret@host:5432/mydb"
+    assert kwargs["connect_timeout"] == DB_CONNECT_TIMEOUT_SECONDS
 
 
 def test_get_schema_returns_none_when_no_tables():

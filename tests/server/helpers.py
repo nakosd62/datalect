@@ -510,6 +510,44 @@ def make_fake_pg_connection(responses):
 
 
 # ---------------------------------------------------------------------------
+# Fake Postgres connect() (backends/postgres.py's own connect(), as opposed
+# to the make_fake_pg_connection() fake above, which drives get_schema()/
+# execute()/identity_label() directly and bypasses connect() entirely)
+# ---------------------------------------------------------------------------
+# Unlike every structured-descriptor dialect's connect() (Redshift/Oracle/
+# Snowflake/Databricks/MySQL, all called as pure **kwargs), psycopg2.connect()
+# for a plain Postgres URL is called as connect(dsn, **kwargs) - one
+# positional DSN string plus keyword args (see backends/postgres.py's
+# connect()) - so this fake records both instead of just a kwargs dict.
+
+class FakePostgresConnectHarness:
+    def __init__(self):
+        self.calls = []  # list of (dsn, kwargs) tuples, one per connect() call
+
+    def connect(self, dsn, **kwargs):
+        self.calls.append((dsn, kwargs))
+        return object()  # backend.connect() just returns this straight through
+
+
+def install_fake_postgres_connect(monkeypatch):
+    """Patches backends.postgres's psycopg2.connect with a fake that
+    records the DSN and kwargs it was called with instead of opening a real
+    connection, and returns the FakePostgresConnectHarness controlling it.
+    Must be called *after* the module has been imported, same caveat as
+    install_fake_oracle_connect above. A separate fake from
+    backends.redshift's own `import psycopg2` - patching backends.postgres's
+    module-level reference has no effect on backends.redshift's, even
+    though both ultimately name the same third-party package, since each
+    module holds its own name binding from its own `import psycopg2`
+    statement (see install_fake_redshift_connect's own docstring)."""
+    import backends.postgres as pgmod
+
+    harness = FakePostgresConnectHarness()
+    monkeypatch.setattr(pgmod.psycopg2, "connect", harness.connect)
+    return harness
+
+
+# ---------------------------------------------------------------------------
 # Fake MySQL connection (get_schema()/execute()/identity_label())
 # ---------------------------------------------------------------------------
 # PyMySQL implements the same PEP 249 DB-API cursor shape (execute/

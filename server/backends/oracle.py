@@ -114,6 +114,7 @@ import sqlparse
 
 from .base import (
     Backend, SCHEMA_MAX_TABLE_NAMES_SCANNED, SCHEMA_MAX_TABLES,
+    DB_CONNECT_TIMEOUT_SECONDS,
     group_date_sharded_tables, cap_kept_tables, cap_schema_text,
 )
 
@@ -198,7 +199,14 @@ class OracleBackend(Backend):
         if not (user and password):
             raise ValueError("Oracle connection requires a user and password - one was missing.")
 
-        kwargs = {"host": host, "port": port, "user": user, "password": password}
+        # tcp_connect_timeout bounds only the initial TCP connect phase,
+        # never query execution afterwards - see backends/base.py's
+        # DB_CONNECT_TIMEOUT_SECONDS docstring for why a wrong/unreachable
+        # host needs to fail fast here rather than hanging indefinitely.
+        kwargs = {
+            "host": host, "port": port, "user": user, "password": password,
+            "tcp_connect_timeout": float(DB_CONNECT_TIMEOUT_SECONDS),
+        }
         if service_name:
             kwargs["service_name"] = service_name
         else:

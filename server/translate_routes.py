@@ -102,14 +102,24 @@ _DIALECT_PROMPT_INTROS = {
 }
 _DEFAULT_DIALECT_PROMPT_INTRO = _DIALECT_PROMPT_INTROS["PostgreSQL"]
 
-# Transient Gemini failures (rate limiting, or the server-side hiccups it
-# occasionally throws as a plain "500 INTERNAL") are worth a few automatic
-# retries - the same request usually succeeds a couple seconds later.
-# Anything else (bad request, invalid model, auth failure, etc.) will just
-# fail the same way again, so it's raised immediately instead. Both knobs
-# are configurable via env vars (e.g. to tune retry behavior for a noisier
-# Gemini rollout without a code change) - same int()/float()-on-getenv
-# pattern as SCHEMA_CACHE_TTL_SECONDS in schema_cache.py.
+# Two retryable Gemini failure kinds, each worth a few automatic retries -
+# the same request usually gets through shortly after. Anything else (bad
+# request, invalid model, auth failure, etc.) will just fail the same way
+# again, so it's raised immediately instead.
+#
+# GEMINI_RETRY_DELAY_SECONDS applies ONLY to a 5xx/transient server-side
+# hiccup - the same key is reused, and the failure is about Gemini's own
+# backend momentarily struggling, not about anything the client did, so a
+# brief pause before hitting the exact same thing again gives it a moment
+# to clear. A 429 (per-key rate limit/capacity exhausted) is a different
+# story: the next attempt uses a DIFFERENT key (see _classify_gemini_error's
+# rotate_key), which isn't subject to whatever limit the failed key just
+# hit, so there's nothing to wait out - that retry fires immediately, with
+# no delay (see _classify_gemini_error below).
+#
+# Both knobs are configurable via env vars (e.g. to tune retry behavior for
+# a noisier Gemini rollout without a code change) - same int()/float()-on-
+# getenv pattern as SCHEMA_CACHE_TTL_SECONDS in schema_cache.py.
 MAX_GEMINI_ATTEMPTS = int(os.environ.get("MAX_GEMINI_ATTEMPTS", 5))
 GEMINI_RETRY_DELAY_SECONDS = float(os.environ.get("GEMINI_RETRY_DELAY_SECONDS", 1))
 
@@ -155,12 +165,22 @@ def _gemini_error_code(exc):
 # Retry policy, keyed by failure type. This is the single place to add
 # retry behavior for a new kind of Gemini failure as it comes up - each
 # classifier below just needs to return a dict describing how to retry:
-#   - delay (float): seconds to sleep before the next attempt
+#   - delay (float): seconds to sleep before the next attempt. Only ever
+#     non-zero for a failure that's NOT key-related (see rotate_key below) -
+#     waiting only makes sense when the next attempt is otherwise identical
+#     to the one that just failed (same key, same everything), giving
+#     whatever went wrong a moment to clear. When the next attempt already
+#     differs (a different key), there's nothing to wait out.
 #   - rotate_key (bool): pick a different configured API key for the next
 #     attempt rather than reusing the one that just failed. Used for
-#     capacity/rate-limit errors, where the same key would likely just
-#     fail the same way again; transient server-side errors aren't
-#     key-related, so they retry with the same key.
+#     capacity/rate-limit errors: the failed key is (at least momentarily)
+#     out of capacity, but a different configured key almost certainly
+#     isn't, so that retry fires immediately (delay=0) rather than sitting
+#     idle waiting out a limit a different key was never subject to.
+#     Transient server-side errors aren't key-related at all, so they
+#     retry with the same key instead - and since nothing changed about
+#     the request, they DO wait out GEMINI_RETRY_DELAY_SECONDS first, on
+#     the theory the same problem needs a moment to pass.
 # Returning None means "don't retry this - raise immediately" (e.g. bad
 # request, invalid model, auth failure - these fail the same way every
 # time, so retrying wastes the attempt budget).
@@ -172,13 +192,21 @@ def _classify_gemini_error(exc):
 
     # 429 - per-key rate limit / capacity exhausted. Rotate to a
     # different configured key so the next attempt isn't just hitting
-    # the same limit again.
+    # the same limit again - and since that next attempt uses a key that
+    # was never subject to the limit that just failed, there's nothing to
+    # wait out: it retries immediately (delay=0), not after
+    # GEMINI_RETRY_DELAY_SECONDS (that delay is reserved for the 5xx case
+    # below, where the same key retries against the same problem).
     if code == 429:
-        return {"rotate_key": True, "delay": GEMINI_RETRY_DELAY_SECONDS}
+        return {"rotate_key": True, "delay": 0}
 
     # 5xx - transient, server-side hiccup (e.g. the plain "500 INTERNAL"
     # Gemini occasionally throws) unrelated to which key was used, so the
-    # same key is fine to retry with.
+    # same key is fine to retry with. Unlike the 429 case above, the next
+    # attempt is otherwise identical to the one that just failed, so this
+    # one DOES wait out GEMINI_RETRY_DELAY_SECONDS first, giving the
+    # transient condition a moment to actually pass before trying the
+    # exact same thing again.
     is_server_error = (isinstance(code, int) and 500 <= code < 600) or isinstance(exc, genai_errors.ServerError)
     if is_server_error:
         return {"rotate_key": False, "delay": GEMINI_RETRY_DELAY_SECONDS}
@@ -340,9 +368,13 @@ def translate_query():
                             api_key = next_key
                             client = genai.Client(api_key=api_key)
                         tried_gemini_keys.add(api_key)
+                        # No "in %ds" here - a key-rotation retry always
+                        # fires immediately (see _classify_gemini_error's
+                        # comment for why waiting doesn't make sense when
+                        # the next attempt already uses a different key).
                         logger.warning(
-                            "Gemini call failed (attempt %d/%d), rotating API key and retrying in %ds: %s",
-                            attempt, MAX_GEMINI_ATTEMPTS, retry_action["delay"], e
+                            "Gemini call failed (attempt %d/%d), rotating API key and retrying immediately: %s",
+                            attempt, MAX_GEMINI_ATTEMPTS, e
                         )
                     else:
                         logger.warning(
@@ -361,7 +393,12 @@ def translate_query():
                         "rotatedKey": retry_action["rotate_key"],
                     }) + "\n"
 
-                    time.sleep(retry_action["delay"])
+                    # Skip the sleep entirely rather than call time.sleep(0) -
+                    # a key-rotation retry's delay is always 0 (see
+                    # _classify_gemini_error), and this makes "no delay"
+                    # mean no sleep call at all, not a zero-length one.
+                    if retry_action["delay"]:
+                        time.sleep(retry_action["delay"])
                     continue
             end_time = time.perf_counter()
 

@@ -99,6 +99,21 @@ class DatabricksBackend(Backend):
                 "Databricks connection requires an access_token - none was provided."
             )
 
+        # No connect-only timeout kwarg here, unlike every other network-
+        # dialing backend (see backends/base.py's DB_CONNECT_TIMEOUT_SECONDS
+        # docstring) - deliberately, not an oversight. This connector's only
+        # relevant knob (undocumented "_socket_timeout") bounds socket send/
+        # recv/connect for the connection's *entire* lifetime, not just the
+        # initial handshake, so setting it here would also cap how long any
+        # query run over this same connection is allowed to take. Capping a
+        # bad preset's *connect* attempt isn't worth silently truncating a
+        # legitimate long-running query on a *working* Databricks connection
+        # - a wrong/unreachable Databricks preset still fails eventually via
+        # the connector's own (much longer) internal timeouts, and every
+        # caller of connect() already wraps it in try/except and degrades
+        # gracefully (see execute_routes.py's ping()/config_routes.py's
+        # handle_config()), so the failure mode is "that one preset is slow
+        # to report broken," not "the whole app hangs."
         kwargs = {"server_hostname": server_hostname, "http_path": http_path, "access_token": access_token}
         if catalog:
             kwargs["catalog"] = catalog

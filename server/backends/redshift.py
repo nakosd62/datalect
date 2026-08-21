@@ -93,6 +93,7 @@ import sqlparse
 
 from .base import (
     Backend, SCHEMA_MAX_TABLE_NAMES_SCANNED, SCHEMA_MAX_TABLES,
+    DB_CONNECT_TIMEOUT_SECONDS,
     group_date_sharded_tables, cap_kept_tables, cap_schema_text,
 )
 
@@ -123,10 +124,14 @@ class RedshiftBackend(Backend):
 
         # sslmode="require" is always passed, not an opt-in flag - see the
         # module docstring above for why Redshift gets no Oracle-style
-        # opt-out.
+        # opt-out. connect_timeout bounds only TCP/handshake setup, never
+        # query execution afterwards - see backends/base.py's
+        # DB_CONNECT_TIMEOUT_SECONDS docstring (this is the exact dialect/
+        # failure mode - a Redshift Serverless workgroup with a closed
+        # security group or bad DNS record - that motivated adding it).
         connection = psycopg2.connect(
             host=host, port=port, dbname=database, user=user, password=password,
-            sslmode="require",
+            sslmode="require", connect_timeout=DB_CONNECT_TIMEOUT_SECONDS,
         )
         # Set once up front (rather than only inside execute() the way
         # Postgres/Oracle do it) so the SET search_path statement right

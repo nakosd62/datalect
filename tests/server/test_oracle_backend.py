@@ -32,6 +32,7 @@ if SERVER_DIR not in sys.path:
     sys.path.insert(0, SERVER_DIR)
 
 from backends.oracle import OracleBackend, _set_current_schema, _IDENTIFIER_RE
+from backends.base import DB_CONNECT_TIMEOUT_SECONDS
 from helpers import install_fake_oracle_connect, make_fake_pg_connection
 
 
@@ -77,6 +78,9 @@ def test_connect_passes_service_name_and_core_kwargs(monkeypatch):
     assert call["user"] == "alice"
     assert call["password"] == "hunter2"
     assert "sid" not in call
+    # See backends/base.py's DB_CONNECT_TIMEOUT_SECONDS docstring - a wrong/
+    # unreachable host must fail fast rather than hang indefinitely.
+    assert call["tcp_connect_timeout"] == float(DB_CONNECT_TIMEOUT_SECONDS)
 
 
 def test_connect_uses_sid_when_service_name_not_given(monkeypatch):

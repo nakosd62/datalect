@@ -22,6 +22,7 @@ if SERVER_DIR not in sys.path:
     sys.path.insert(0, SERVER_DIR)
 
 from backends.mysql import MySQLBackend
+from backends.base import DB_CONNECT_TIMEOUT_SECONDS
 from helpers import make_fake_mysql_connection, install_fake_pymysql_connect
 
 
@@ -202,6 +203,10 @@ def test_connect_parses_url_into_pymysql_kwargs(monkeypatch):
     assert kwargs["user"] == "alice"
     assert kwargs["password"] == "secret"
     assert kwargs["database"] == "mydb"
+    # See backends/base.py's DB_CONNECT_TIMEOUT_SECONDS docstring - tied to
+    # the same shared knob every other dialect uses, rather than left to
+    # PyMySQL's own (coincidentally identical) built-in default.
+    assert kwargs["connect_timeout"] == DB_CONNECT_TIMEOUT_SECONDS
 
 
 def test_connect_percent_decodes_username_and_password(monkeypatch):

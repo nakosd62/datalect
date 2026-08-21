@@ -32,6 +32,7 @@ if SERVER_DIR not in sys.path:
     sys.path.insert(0, SERVER_DIR)
 
 from backends.redshift import RedshiftBackend
+from backends.base import DB_CONNECT_TIMEOUT_SECONDS
 from helpers import install_fake_redshift_connect, make_fake_pg_connection
 
 
@@ -79,6 +80,10 @@ def test_connect_passes_core_kwargs_and_requires_sslmode(monkeypatch):
     # Always required, never opt-in (unlike Oracle's "ssl" descriptor flag) -
     # see the module docstring.
     assert call["sslmode"] == "require"
+    # See backends/base.py's DB_CONNECT_TIMEOUT_SECONDS docstring - a wrong/
+    # unreachable Redshift host (bad DNS record, closed security group) must
+    # fail fast rather than hang indefinitely.
+    assert call["connect_timeout"] == DB_CONNECT_TIMEOUT_SECONDS
 
 
 def test_connect_defaults_port_to_5439_when_omitted(monkeypatch):

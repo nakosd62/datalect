@@ -54,6 +54,7 @@ import sqlparse
 
 from .base import (
     Backend, SCHEMA_MAX_TABLE_NAMES_SCANNED, SCHEMA_MAX_TABLES,
+    DB_CONNECT_TIMEOUT_SECONDS,
     group_date_sharded_tables, cap_kept_tables, cap_schema_text,
 )
 
@@ -92,6 +93,13 @@ class SnowflakeBackend(Backend):
             "user": user,
             "warehouse": warehouse,
             "database": database,
+            # login_timeout bounds only the connect/authenticate phase,
+            # never query execution afterwards (that's network_timeout,
+            # deliberately left unset here) - see backends/base.py's
+            # DB_CONNECT_TIMEOUT_SECONDS docstring for why a wrong/
+            # unreachable account needs to fail fast here rather than
+            # hanging indefinitely.
+            "login_timeout": DB_CONNECT_TIMEOUT_SECONDS,
         }
         if schema:
             kwargs["schema"] = schema

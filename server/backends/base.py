@@ -60,6 +60,46 @@ SCHEMA_MAX_TABLE_NAMES_SCANNED = int(os.environ.get("SCHEMA_MAX_TABLE_NAMES_SCAN
 # view definitions, more table entries than fit even after the caps above).
 SCHEMA_MAX_CHARS = int(os.environ.get("SCHEMA_MAX_SCHEMA_CHARS", 100_000))
 
+# --- Connect-time timeout ----------------------------------------------------
+# Bounds how long connect() may block dialing/handshaking out to a real
+# network host - Postgres, MySQL, Redshift, Oracle, and Snowflake all thread
+# this through to their respective driver's own connect-phase timeout kwarg
+# (see each backend's connect()). Without it, a wrong/unreachable host in an
+# admin-configured preset (bad hostname, closed security group, blackholed
+# route - exactly the DNS-resolution/connection-timeout failures worked
+# through live against a real Redshift Serverless workgroup) doesn't fail
+# fast: it hangs for however long the OS's own TCP connect timeout happens
+# to be, which is unbounded in practice (a silently-dropped SYN can hang for
+# minutes). Every place that calls a backend's connect() - /api/config's
+# identity probe, /api/ping's liveness check, /api/execute, /api/translate's
+# schema fetch - already wraps it in try/except and degrades gracefully
+# (see execute_routes.py's ping()/config_routes.py's handle_config()), so
+# once connect() itself is bounded, one bad preset's connection attempts
+# fail in DB_CONNECT_TIMEOUT_SECONDS instead of hanging indefinitely.
+#
+# That said, this alone only bounds *how long* one bad preset's connection
+# attempt can block - it doesn't change *what else* is blocked meanwhile.
+# Werkzeug's dev server (what server.py actually runs, in production too -
+# see the Dockerfile's CMD) handles one request at a time unless told
+# otherwise, so a single slow connect() - even a bounded one - still stalls
+# every other user's unrelated request for that whole window. See
+# server.py's threaded=True for the other half of this fix: bounding the
+# *duration* of a bad connection here, and bounding its *blast radius* there.
+#
+# Deliberately one shared, env-configurable knob rather than a per-dialect
+# env var - the failure mode is identical regardless of which dialect a
+# preset happens to be. Scoped to connection establishment only: every kwarg
+# it's passed as below (psycopg2's/pymysql's connect_timeout, oracledb's
+# tcp_connect_timeout, Snowflake's login_timeout) is documented by its own
+# driver as bounding only the initial connect/handshake phase, never query
+# execution afterwards - a slow-but-legitimate query against an already-open
+# connection is unaffected. Databricks is the one dialect this doesn't cover
+# (see backends/databricks.py's connect() for why its driver has no
+# equivalent connect-only knob to hook into) and BigQuery doesn't need it
+# (bigquery.Client() construction doesn't dial out synchronously the way a
+# real TCP connect() does).
+DB_CONNECT_TIMEOUT_SECONDS = int(os.environ.get("DB_CONNECT_TIMEOUT_SECONDS", 10))
+
 # Minimum number of same-prefix, date-suffixed tables before they're treated
 # as a date-shard family and collapsed into one schema entry (see
 # group_date_sharded_tables). A table that just happens to end in a

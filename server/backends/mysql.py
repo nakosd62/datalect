@@ -63,6 +63,7 @@ import sqlparse
 
 from .base import (
     Backend, SCHEMA_MAX_TABLE_NAMES_SCANNED, SCHEMA_MAX_TABLES,
+    DB_CONNECT_TIMEOUT_SECONDS,
     group_date_sharded_tables, cap_kept_tables, cap_schema_text,
 )
 
@@ -105,6 +106,13 @@ class MySQLBackend(Backend):
         kwargs = {
             "user": parts["user"], "password": parts["password"], "database": parts["database"],
             "autocommit": False,
+            # connect_timeout bounds only TCP/handshake setup, never query
+            # execution afterwards - see backends/base.py's
+            # DB_CONNECT_TIMEOUT_SECONDS docstring. PyMySQL already defaults
+            # this to 10 on its own, but set it explicitly here so it's tied
+            # to the same single, admin-adjustable knob every other dialect
+            # uses rather than to a value that happens to coincide with it.
+            "connect_timeout": DB_CONNECT_TIMEOUT_SECONDS,
         }
         if parts["unix_socket"]:
             # Unix-socket connections (Cloud SQL) have no real TCP host at

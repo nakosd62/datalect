@@ -43,4 +43,19 @@ if __name__ == '__main__':
     hostname = os.environ.get("CRBOT_HOSTNAME", "0.0.0.0")
     port = int(os.environ.get("CRBOT_PORT", 3000))
     state_store.init()
-    app.run(host=hostname, port=port, debug=False, use_reloader=False)
+    # threaded=True: without it, Werkzeug's dev server (what this actually
+    # is, in production too - see the Dockerfile's CMD) handles one request
+    # at a time. A single slow/unreachable admin-configured database preset
+    # - even with backends/base.py's DB_CONNECT_TIMEOUT_SECONDS now bounding
+    # how long its connect() calls can hang - would otherwise stall every
+    # other user's completely unrelated request for that whole window,
+    # since nothing else can be serviced while the one worker is blocked.
+    # Verified safe to flip on: every process-wide mutable global this app
+    # has (schema_cache.py's _cache) is already guarded by its own
+    # threading.Lock(), and state_store.py's SqliteStateStore opens a fresh
+    # sqlite3 connection per operation rather than sharing one across
+    # threads, so nothing here relied on single-threaded execution to begin
+    # with. See backends/base.py's DB_CONNECT_TIMEOUT_SECONDS docstring for
+    # the other half of this fix (bounding *how long* a bad connection can
+    # block) - this half bounds *what else* is blocked meanwhile.
+    app.run(host=hostname, port=port, debug=False, use_reloader=False, threaded=True)

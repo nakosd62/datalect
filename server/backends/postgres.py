@@ -16,6 +16,7 @@ import sqlparse
 
 from .base import (
     Backend, SCHEMA_MAX_TABLE_NAMES_SCANNED, SCHEMA_MAX_TABLES,
+    DB_CONNECT_TIMEOUT_SECONDS,
     group_date_sharded_tables, cap_kept_tables, cap_schema_text,
 )
 
@@ -24,7 +25,15 @@ class PostgresBackend(Backend):
     dialect_name = "PostgreSQL"
 
     def connect(self, descriptor):
-        return psycopg2.connect(descriptor["url"])
+        # connect_timeout bounds only TCP/handshake setup (libpq's own
+        # definition of the parameter), never query execution afterwards -
+        # see backends/base.py's DB_CONNECT_TIMEOUT_SECONDS docstring for why
+        # a wrong/unreachable host needs to fail fast here rather than
+        # hanging on the OS's own (effectively unbounded) TCP connect
+        # timeout. Passed as a kwarg alongside the DSN string rather than
+        # appended to the URL itself - psycopg2 lets both coexist, and a
+        # kwarg here always wins over anything already in descriptor["url"].
+        return psycopg2.connect(descriptor["url"], connect_timeout=DB_CONNECT_TIMEOUT_SECONDS)
 
     def close(self, connection):
         if connection:
