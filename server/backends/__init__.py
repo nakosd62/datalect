@@ -17,6 +17,7 @@ from .mysql import MySQLBackend
 from .databricks import DatabricksBackend
 from .oracle import OracleBackend
 from .redshift import RedshiftBackend
+from .mssql import MssqlBackend
 
 _BACKENDS = {
     "postgres": PostgresBackend(),
@@ -26,6 +27,7 @@ _BACKENDS = {
     "databricks": DatabricksBackend(),
     "oracle": OracleBackend(),
     "redshift": RedshiftBackend(),
+    "mssql": MssqlBackend(),
 }
 
 

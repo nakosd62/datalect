@@ -1008,6 +1008,17 @@ document.addEventListener('DOMContentLoaded', async () => {
         config: { host: '', port: '', database: '', schema: '', user: '', password: '' },
       };
     }
+    if (type === 'mssql') {
+      // "encrypt" defaults to true (same opt-out-not-opt-in rationale as
+      // Oracle's "ssl" above) - most real SQL Server deployments, and
+      // Azure SQL Database in particular, require encryption outright, so
+      // a connection that leaves it unset would simply fail to connect at
+      // all (see backends/mssql.py's module docstring).
+      return {
+        name: '', type: 'mssql', url: '',
+        config: { host: '', port: '', database: '', schema: '', user: '', password: '', encrypt: true },
+      };
+    }
     // Postgres and MySQL share the same simple shape (a single URL field,
     // no dialect-specific config) - see backends/mysql.py's module
     // docstring - so both fall through here, preserving whichever of the
@@ -1036,6 +1047,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       const isDatabricks = db.type === 'databricks';
       const isOracle = db.type === 'oracle';
       const isRedshift = db.type === 'redshift';
+      const isSqlServer = db.type === 'mssql';
       const sfAuthMethod = cfg.auth_method || (cfg.private_key ? 'private_key' : 'password');
       // ACTIVE_IS_CUSTOM gates this, not just URL equality - a custom
       // connection's URL can collide with a preset's, and when the active
@@ -1076,13 +1088,14 @@ document.addEventListener('DOMContentLoaded', async () => {
           <div class="custom-db-header-row">
             <input type="radio" name="db_connection_option" value="custom-${index}" data-dbname="${db.name || ''}" ${isSelected ? 'checked' : ''}>
             <select class="config-input custom-db-type-select" data-index="${index}">
-              <option value="postgres" ${(!isBigQuery && !isSnowflake && !isMySQL && !isDatabricks && !isOracle && !isRedshift) ? 'selected' : ''}>PostgreSQL</option>
+              <option value="postgres" ${(!isBigQuery && !isSnowflake && !isMySQL && !isDatabricks && !isOracle && !isRedshift && !isSqlServer) ? 'selected' : ''}>PostgreSQL</option>
               <option value="mysql" ${isMySQL ? 'selected' : ''}>MySQL</option>
               <option value="bigquery" ${isBigQuery ? 'selected' : ''}>BigQuery</option>
               <option value="snowflake" ${isSnowflake ? 'selected' : ''}>Snowflake</option>
               <option value="databricks" ${isDatabricks ? 'selected' : ''}>Databricks</option>
               <option value="oracle" ${isOracle ? 'selected' : ''}>Oracle</option>
               <option value="redshift" ${isRedshift ? 'selected' : ''}>Redshift</option>
+              <option value="mssql" ${isSqlServer ? 'selected' : ''}>SQL Server</option>
             </select>
             <div class="custom-db-field">
               <label class="custom-db-field-label" for="custom-db-name-${index}">Name:</label>
@@ -1272,6 +1285,45 @@ document.addEventListener('DOMContentLoaded', async () => {
             <div class="custom-db-field">
               <label class="custom-db-field-label" for="custom-db-rs-password-${index}">Password:</label>
               <input type="password" id="custom-db-rs-password-${index}" class="config-input custom-db-rs-password" data-index="${index}" placeholder="${db.has_custom_credentials ? 'Password saved - leave blank to keep it, or type a new one to replace it' : 'Password'}" autocomplete="off">
+            </div>
+          </div>
+          ` : isSqlServer ? `
+          <div class="custom-db-field-row">
+            <div class="custom-db-field">
+              <label class="custom-db-field-label" for="custom-db-ms-host-${index}">Host:</label>
+              <input type="text" id="custom-db-ms-host-${index}" class="config-input custom-db-ms-host" data-index="${index}" placeholder="e.g. my-server.database.windows.net" value="${cfg.host || ''}" autocomplete="off">
+            </div>
+            <div class="custom-db-field">
+              <label class="custom-db-field-label" for="custom-db-ms-port-${index}">Port:</label>
+              <input type="text" id="custom-db-ms-port-${index}" class="config-input custom-db-ms-port" data-index="${index}" placeholder="1433" value="${cfg.port || ''}" autocomplete="off">
+            </div>
+          </div>
+          <div class="custom-db-field-row">
+            <div class="custom-db-field">
+              <label class="custom-db-field-label" for="custom-db-ms-database-${index}">Database:</label>
+              <input type="text" id="custom-db-ms-database-${index}" class="config-input custom-db-ms-database" data-index="${index}" placeholder="Database" value="${cfg.database || ''}" autocomplete="off">
+            </div>
+            <div class="custom-db-field">
+              <label class="custom-db-field-label" for="custom-db-ms-schema-${index}">Schema: <span class="optional-hint">(optional)</span></label>
+              <input type="text" id="custom-db-ms-schema-${index}" class="config-input custom-db-ms-schema" data-index="${index}" placeholder="Defaults to dbo" value="${cfg.schema || ''}" autocomplete="off">
+            </div>
+          </div>
+          <div class="custom-db-field-row">
+            <div class="custom-db-field">
+              <label class="custom-db-field-label" for="custom-db-ms-user-${index}">User:</label>
+              <input type="text" id="custom-db-ms-user-${index}" class="config-input custom-db-ms-user" data-index="${index}" placeholder="Username" value="${cfg.user || ''}" autocomplete="off">
+            </div>
+            <div class="custom-db-field">
+              <label class="custom-db-field-label" for="custom-db-ms-password-${index}">Password:</label>
+              <input type="password" id="custom-db-ms-password-${index}" class="config-input custom-db-ms-password" data-index="${index}" placeholder="${db.has_custom_credentials ? 'Password saved - leave blank to keep it, or type a new one to replace it' : 'Password'}" autocomplete="off">
+            </div>
+          </div>
+          <div class="custom-db-field-row">
+            <div class="custom-db-field wide">
+              <label class="checkbox-option" for="custom-db-ms-encrypt-${index}">
+                <input type="checkbox" id="custom-db-ms-encrypt-${index}" class="config-input custom-db-ms-encrypt" data-index="${index}" ${cfg.encrypt !== false ? 'checked' : ''}>
+                <span class="checkbox-label">Encrypt Connection (required for Azure SQL Database)</span>
+              </label>
             </div>
           </div>
           ` : `
@@ -1548,6 +1600,48 @@ document.addEventListener('DOMContentLoaded', async () => {
       });
     });
 
+    container.querySelectorAll(
+      '.custom-db-ms-host, .custom-db-ms-port, .custom-db-ms-database, '
+      + '.custom-db-ms-schema, .custom-db-ms-user, .custom-db-ms-password, .custom-db-ms-encrypt'
+    ).forEach(input => {
+      const index = parseInt(input.dataset.index);
+      const radio = container.querySelector(`input[value="custom-${index}"]`);
+      const isCheckbox = input.type === 'checkbox';
+      // Same "no focus-to-select moment" reasoning as Oracle's ssl checkbox
+      // above - only wired to 'change', not 'focus'.
+      if (!isCheckbox) {
+        input.addEventListener('focus', () => { if (radio) radio.checked = true; });
+      }
+      input.addEventListener(isCheckbox ? 'change' : 'input', () => {
+        if (radio) radio.checked = true;
+        const db = customDatabases[index];
+        if (!db.config) db.config = {};
+        if (input.classList.contains('custom-db-ms-host')) db.config.host = input.value.trim();
+        if (input.classList.contains('custom-db-ms-port')) db.config.port = input.value.trim();
+        if (input.classList.contains('custom-db-ms-database')) db.config.database = input.value.trim();
+        if (input.classList.contains('custom-db-ms-schema')) db.config.schema = input.value.trim();
+        if (input.classList.contains('custom-db-ms-user')) db.config.user = input.value.trim();
+        if (input.classList.contains('custom-db-ms-password')) db.config.password = input.value;
+        if (input.classList.contains('custom-db-ms-encrypt')) db.config.encrypt = input.checked;
+        // Synthetic (non-secret) identifier, kept in sync so radio-selection
+        // matching against activeUrl still works the same way it does for
+        // every other structured-descriptor row. Mirrors config_routes.py's
+        // _mssql_url exactly, including the same 1433 default port used
+        // when the field is left blank.
+        db.url = (db.config.host && db.config.database)
+          ? `mssql://${db.config.host}:${db.config.port || 1433}/${db.config.database}`
+          : '';
+        // Same rule as the other dialect inputs above: don't clobber a
+        // name the user already typed themselves.
+        if (!db.name) {
+          db.name = db.config.database || 'Custom SQL Server';
+          const nameInput = container.querySelector(`.custom-db-name-input[data-index="${index}"]`);
+          if (nameInput) nameInput.value = db.name;
+        }
+        if (radio) radio.dataset.dbname = db.name;
+      });
+    });
+
     const addBtn = document.getElementById('addCustomDbBtn');
     if (addBtn) {
       addBtn.addEventListener('click', () => {
@@ -1632,6 +1726,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     let dbServiceName = null;
     let dbSid = null;
     let dbSsl = null;
+    let dbEncrypt = null;
     let isCustomOption = false;
     // Set only for anonymous users picking a preset by its stable id (see
     // renderDbRadioButtons()) - the server resolves the real connection
@@ -1687,11 +1782,21 @@ document.addEventListener('DOMContentLoaded', async () => {
     const isCompleteRedshift = (db) => db && db.type === 'redshift' && db.config
       && db.config.host && db.config.database && db.config.user
       && (db.config.password || db.has_custom_credentials);
+    // Same idea for SQL Server - core identifying fields (host, database,
+    // user) plus a single credential shape (password), same "freshly
+    // entered, or already saved server-side" rule as every other
+    // structured dialect above (see backends/mssql.py's module docstring -
+    // plain SQL Login username/password only for this first pass).
+    // "encrypt" isn't part of completeness - it has its own always-present
+    // default (true) at the backend layer, so it's never a blocking field.
+    const isCompleteMssql = (db) => db && db.type === 'mssql' && db.config
+      && db.config.host && db.config.database && db.config.user
+      && (db.config.password || db.has_custom_credentials);
     // Postgres and MySQL are both "simple URL" dialects (see
     // backends/mysql.py's module docstring) - a single non-blank url is
     // all either needs to be selectable/saveable. Named generically
     // (not isCompletePostgres) since it now covers both.
-    const isCompleteSimpleUrlDb = (db) => db && db.type !== 'bigquery' && db.type !== 'snowflake' && db.type !== 'databricks' && db.type !== 'oracle' && db.type !== 'redshift'
+    const isCompleteSimpleUrlDb = (db) => db && db.type !== 'bigquery' && db.type !== 'snowflake' && db.type !== 'databricks' && db.type !== 'oracle' && db.type !== 'redshift' && db.type !== 'mssql'
       && db.url && db.url.trim() !== "";
 
     const selectedDbRadio = document.querySelector('input[name="db_connection_option"]:checked');
@@ -1700,7 +1805,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         isCustomOption = true;
         const index = parseInt(selectedDbRadio.value.split('-')[1]);
         const selectedDb = customDatabases[index];
-        const isComplete = (d) => isCompleteBigQuery(d) || isCompleteSnowflake(d) || isCompleteDatabricks(d) || isCompleteOracle(d) || isCompleteRedshift(d) || isCompleteSimpleUrlDb(d);
+        const isComplete = (d) => isCompleteBigQuery(d) || isCompleteSnowflake(d) || isCompleteDatabricks(d) || isCompleteOracle(d) || isCompleteRedshift(d) || isCompleteMssql(d) || isCompleteSimpleUrlDb(d);
         const chosen = isComplete(selectedDb) ? selectedDb : customDatabases.find(isComplete);
 
         if (isCompleteBigQuery(chosen)) {
@@ -1774,6 +1879,25 @@ document.addEventListener('DOMContentLoaded', async () => {
           dbPassword = chosen.config.password || null;
           dbNameValue = chosen.name || dbDatabase;
           dbUrlValue = `redshift://${dbHost}:${dbPort || 5439}/${dbDatabase}`;
+        } else if (isCompleteMssql(chosen)) {
+          dbType = 'mssql';
+          dbHost = chosen.config.host;
+          dbPort = chosen.config.port || null;
+          dbDatabase = chosen.config.database;
+          dbUser = chosen.config.user;
+          dbSchema = chosen.config.schema || null;
+          // May be blank if the user didn't retype a password while just
+          // re-selecting/renaming an already-saved connection - the server
+          // reuses the previously-stored password in that case (it's never
+          // sent back to us to re-display, see get_db_connections).
+          dbPassword = chosen.config.password || null;
+          // Unlike dbSsl above, absence here means "on" (see
+          // backends/mssql.py's module docstring) - so this reads as
+          // "explicitly false" vs. "anything else (including undefined)",
+          // not truthy vs. falsy.
+          dbEncrypt = chosen.config.encrypt !== false;
+          dbNameValue = chosen.name || dbDatabase;
+          dbUrlValue = `mssql://${dbHost}:${dbPort || 1433}/${dbDatabase}`;
         } else if (isCompleteSimpleUrlDb(chosen)) {
           dbType = chosen.type === 'mysql' ? 'mysql' : 'postgres';
           dbUrlValue = chosen.url;
@@ -1822,7 +1946,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       database_type: dbType,
       is_custom: isCustomOption,
       custom_databases: customDatabases
-        .filter(d => isCompleteBigQuery(d) || isCompleteSnowflake(d) || isCompleteDatabricks(d) || isCompleteOracle(d) || isCompleteRedshift(d) || isCompleteSimpleUrlDb(d))
+        .filter(d => isCompleteBigQuery(d) || isCompleteSnowflake(d) || isCompleteDatabricks(d) || isCompleteOracle(d) || isCompleteRedshift(d) || isCompleteMssql(d) || isCompleteSimpleUrlDb(d))
         .map(d => {
           if (isCompleteBigQuery(d)) {
             return {
@@ -1886,6 +2010,26 @@ document.addEventListener('DOMContentLoaded', async () => {
               password: d.config.password || undefined,
             };
           }
+          if (isCompleteMssql(d)) {
+            return {
+              type: 'mssql',
+              name: d.name,
+              host: d.config.host,
+              port: d.config.port || undefined,
+              database: d.config.database,
+              user: d.config.user,
+              schema: d.config.schema || undefined,
+              password: d.config.password || undefined,
+              // Unlike every other optional field above (omitted via
+              // "|| undefined" when blank), "encrypt" is always sent
+              // explicitly as true/false - it's a meaningful boolean where
+              // an explicit false and an absent value are different things
+              // (see backends/mssql.py's module docstring: connect()
+              // itself defaults to True only when the key is missing
+              // entirely) - so this must never collapse to undefined.
+              encrypt: d.config.encrypt !== false,
+            };
+          }
           return { type: (d.type === 'mysql' ? 'mysql' : 'postgres'), name: d.name, url: d.url };
         }),
       auto_sql_execute: autoSqlExecuteValue
@@ -1929,6 +2073,17 @@ document.addEventListener('DOMContentLoaded', async () => {
       payload.user = dbUser;
       if (dbSchema) payload.schema = dbSchema;
       if (dbPassword) payload.password = dbPassword;
+    } else if (dbType === 'mssql') {
+      payload.host = dbHost;
+      if (dbPort) payload.port = dbPort;
+      payload.database = dbDatabase;
+      payload.user = dbUser;
+      if (dbSchema) payload.schema = dbSchema;
+      if (dbPassword) payload.password = dbPassword;
+      // Always explicit, never conditional like dbSsl above - see the
+      // customDatabases.map() branch's comment for why "encrypt" can't be
+      // safely omitted the way every other optional field here is.
+      payload.encrypt = dbEncrypt !== false;
     } else {
       payload.database_url = dbUrlValue;
     }

@@ -21,25 +21,33 @@ Connections are represented as descriptors: {"type": "postgres", "url":
 "private_key_passphrase" instead of "password"), {"type": "databricks",
 "url": "databricks://<server_hostname><http_path>", "server_hostname":
 "...", "http_path": "...", "access_token": "...", "catalog": "...",
-"schema": "..."}, or {"type": "oracle", "url": "oracle://<host>:<port>/
+"schema": "..."}, {"type": "oracle", "url": "oracle://<host>:<port>/
 <service_name-or-sid>", "host": "...", "port": 1521, "service_name": "..."
-(or "sid" instead), "user": "...", "password": "...", "schema": "..."} -
-see db.py's resolve_active_descriptor / backends/base.py's module docstring /
-backends/bigquery.py's, backends/snowflake.py's, backends/databricks.py's,
-and backends/oracle.py's module docstrings for what billing_project_id is
+(or "sid" instead), "user": "...", "password": "...", "schema": "..."},
+{"type": "redshift", "url": "redshift://<host>:<port>/<database>",
+"host": "...", "port": 5439, "database": "...", "user": "...",
+"password": "...", "schema": "..."}, or {"type": "mssql", "url":
+"mssql://<host>:<port>/<database>", "host": "...", "port": 1433,
+"database": "...", "user": "...", "password": "...", "schema": "...",
+"encrypt": true} - see db.py's resolve_active_descriptor / backends/base.py's
+module docstring / backends/bigquery.py's, backends/snowflake.py's,
+backends/databricks.py's, backends/oracle.py's, backends/redshift.py's, and
+backends/mssql.py's module docstrings for what billing_project_id is
 and why it's not just project_id, for Snowflake's two mutually-exclusive
-auth methods, and for why Databricks/Oracle (like Snowflake) only support
-one explicit credential shape (a Personal Access Token for Databricks,
-plain username/password for Oracle - no wallet/mTLS yet) rather than any
-ambient identity. credentials_json (BigQuery), password/private_key/
-private_key_passphrase (Snowflake), access_token (Databricks), and
-password (Oracle - the same field name Postgres's URL-embedded password
-plays, but standalone here since Oracle has no single connection-string
-url of its own) are the fields that must never round-trip back to the
+auth methods, and for why Databricks/Oracle/Redshift/SQL Server (like
+Snowflake) only support one explicit credential shape (a Personal Access
+Token for Databricks, plain username/password for the other three - no
+wallet/mTLS/IAM-temp-credentials yet) rather than any ambient identity.
+credentials_json (BigQuery), password/private_key/private_key_passphrase
+(Snowflake), access_token (Databricks), and password (Oracle/Redshift/SQL
+Server - the same field name Postgres's URL-embedded password plays, but
+standalone here since none of the three have a single connection-string
+url of their own) are the fields that must never round-trip back to the
 frontend once saved (see state_store.get_db_connections' include_credentials
 param and its _CREDENTIAL_CONFIG_FIELDS); _resolve_bigquery_credentials/
 _resolve_snowflake_credentials/_resolve_databricks_credentials/
-_resolve_oracle_credentials below are what let a user re-select or rename
+_resolve_oracle_credentials/_resolve_redshift_credentials/
+_resolve_mssql_credentials below are what let a user re-select or rename
 a saved connection, or just switch back to it, without re-entering its
 credential every time. billing_project_id is NOT a credential (it's just a
 project id string) and always round-trips to the frontend as-is - see
@@ -116,6 +124,22 @@ backends/redshift.py's module docstring. Also unlike Oracle, there's no
 "ssl" descriptor field/opt-in flag: Redshift connections always require
 TLS (see backends/redshift.py's connect()), so it's simply always on
 rather than a per-connection choice.
+
+SQL Server ("mssql") is the same "no ADC-equivalent ambient identity, own
+preset credential" shape as Oracle/Databricks/Redshift - an admin-
+configured SQL Server preset carries its own explicit password right in
+app_config.py's presets file, resolved fresh from CONFIGURED_DBS whenever
+that preset is actually used (never persisted on the session). Like
+Redshift's, its "schema" descriptor field is a real separate namespace
+(SQL Server's default is "dbo") rather than a stand-in for a user the way
+Oracle's is - but unlike Oracle's ALTER SESSION or Redshift's SET
+search_path, there's no session-level statement backends/mssql.py's
+connect() can issue to apply it (see that module's docstring), so it's
+merely carried through to the backend rather than acted on here. Like
+Oracle's "ssl", SQL Server has its own opt-in "encrypt" descriptor field
+(bool) - defaulting to on when absent, since Azure SQL Database requires
+encryption and simply fails outright without it, a stricter default than
+Oracle's own "off unless requested."
 """
 
 import json
@@ -182,18 +206,27 @@ def _redshift_url(host, port, database):
     return f"redshift://{host}:{port}/{database}"
 
 
+def _mssql_url(host, port, database):
+    """Synthetic, non-secret identifier for a SQL Server connection - same
+    role _bigquery_url/_snowflake_url/_databricks_url/_oracle_url/
+    _redshift_url play (schema-cache key, preset/custom-connection
+    matching, display), but is never a credential."""
+    return f"mssql://{host}:{port}/{database}"
+
+
 def _credential_for_key(config):
     """Whichever single credential value `config` carries - BigQuery's
     credentials_json, Snowflake's password/private_key, Databricks'
-    access_token, or Oracle's password - for folding into
-    compute_connection_key()'s hash at the one call site (below, in
-    handle_config) that has to work generically across every connection
-    type rather than inside a type-specific branch that already knows
-    which field it means. Mutually exclusive by connection type (a
+    access_token, or Oracle's/Redshift's/SQL Server's password - for
+    folding into compute_connection_key()'s hash at the one call site
+    (below, in handle_config) that has to work generically across every
+    connection type rather than inside a type-specific branch that already
+    knows which field it means. Mutually exclusive by connection type (a
     Postgres/BigQuery config never has "password"/"private_key"/
     "access_token" set, and so on - note Postgres/MySQL's own URL-embedded
-    password never lands in `config` at all, only Oracle's standalone
-    "password" field does, so there's no collision there either), so a
+    password never lands in `config` at all, only Oracle's/Redshift's/SQL
+    Server's standalone "password" field does, so there's no collision
+    there either), so a
     plain OR-chain is correct without needing to dispatch on db_type - if a
     future backend adds its own credential field, add it here too (and to
     state_store.py's _CREDENTIAL_CONFIG_FIELDS, which is what actually
@@ -336,6 +369,28 @@ def _resolve_redshift_credentials(user_identity, host, port, database, provided_
     return (matches[0].get("config") or {}).get("password")
 
 
+def _resolve_mssql_credentials(user_identity, host, port, database, provided_password, name=None):
+    """Returns the password to persist for a SQL Server connection -
+    mirrors _resolve_redshift_credentials' role (letting a user re-select
+    or rename an already-saved connection without re-entering its
+    credential every time it's touched). Same single-credential-shape
+    simplicity as Databricks/Oracle/Redshift - this first pass is plain
+    SQL Login (username/password) only, no Windows/Azure AD auth - see
+    backends/mssql.py's module docstring."""
+    if provided_password:
+        return provided_password
+    target_url = _mssql_url(host, port, database)
+    existing = state_store.get_db_connections(user_identity, include_credentials=True)
+    matches = [db for db in existing if db.get("type") == "mssql" and db.get("url") == target_url]
+    if not matches:
+        return None
+    if name:
+        named_match = next((db for db in matches if db.get("name") == name), None)
+        if named_match:
+            return (named_match.get("config") or {}).get("password")
+    return (matches[0].get("config") or {}).get("password")
+
+
 _CUSTOM_BIGQUERY_MISSING_FIELDS_ERROR = (
     "Custom BigQuery connections require both a billing project ID and a "
     "service-account key (JSON). This app's own project never pays for a "
@@ -368,6 +423,12 @@ _CUSTOM_REDSHIFT_MISSING_FIELDS_ERROR = (
     "Custom Redshift connections require a host, a database, a user, and a "
     "password. Redshift has no ambient/shared identity this app can fall "
     "back to - every connection needs its own explicit credential."
+)
+
+_CUSTOM_MSSQL_MISSING_FIELDS_ERROR = (
+    "Custom SQL Server connections require a host, a database, a user, and "
+    "a password. SQL Server has no ambient/shared identity this app can "
+    "fall back to - every connection needs its own explicit credential."
 )
 
 
@@ -564,6 +625,53 @@ def _parse_incoming_connection(data, user_identity):
         )
         if not password:
             return db_type, db_url, db_config, _CUSTOM_REDSHIFT_MISSING_FIELDS_ERROR
+        db_config["password"] = password
+        return db_type, db_url, db_config, None
+
+    if db_type == 'mssql':
+        host = (data.get('host') or '').strip()
+        database = (data.get('database') or '').strip()
+        user = (data.get('user') or '').strip()
+        schema = (data.get('schema') or '').strip()
+        raw_port = data.get('port')
+        use_encrypt = data.get('encrypt')
+        # Same "core identifying fields, nothing inferred" threshold every
+        # other structured dialect above uses - a request missing any of
+        # these isn't enough to even identify a connection yet (e.g. a
+        # fresh blank row), not a validation error - see the docstring
+        # above.
+        if not (host and database and user):
+            return db_type, None, {}, None
+        try:
+            port = int(raw_port) if raw_port else 1433
+        except (TypeError, ValueError):
+            port = 1433
+        db_url = _mssql_url(host, port, database)
+        db_config = {"host": host, "port": port, "database": database, "user": user}
+        if schema:
+            db_config["schema"] = schema
+        if use_encrypt is not None:
+            # Unlike every other optional field here, "encrypt" is a
+            # meaningful boolean where an explicit False and an absent
+            # value are different things (see backends/mssql.py's module
+            # docstring - connect() itself defaults to True when this key
+            # is missing from the descriptor entirely) - so this only adds
+            # the key when the request actually specified one, rather than
+            # defaulting it here too, letting the backend's own default
+            # be the single place that default lives.
+            db_config["encrypt"] = bool(use_encrypt)
+
+        # Same policy as Oracle's/Databricks'/Snowflake's/Redshift's custom
+        # connections: every field explicit, nothing inferred, nothing
+        # falls back to a shared/app identity or to an admin preset's
+        # credential - SQL Server has no ADC-equivalent ambient auth mode
+        # to fall back to (see backends/mssql.py's module docstring).
+        password = _resolve_mssql_credentials(
+            user_identity, host, port, database, data.get('password'),
+            name=data.get('database_name'),
+        )
+        if not password:
+            return db_type, db_url, db_config, _CUSTOM_MSSQL_MISSING_FIELDS_ERROR
         db_config["password"] = password
         return db_type, db_url, db_config, None
 
@@ -786,6 +894,41 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
                 "url": url,
                 "config": config,
             })
+        elif db_type == 'mssql':
+            host = (db.get('host') or '').strip()
+            database = (db.get('database') or '').strip()
+            user = (db.get('user') or '').strip()
+            schema = (db.get('schema') or '').strip()
+            raw_port = db.get('port')
+            use_encrypt = db.get('encrypt')
+            if not (host and database and user):
+                continue
+            try:
+                port = int(raw_port) if raw_port else 1433
+            except (TypeError, ValueError):
+                port = 1433
+            url = _mssql_url(host, port, database)
+            password = _resolve_mssql_credentials(
+                user_identity, host, port, database, db.get('password'),
+                name=db.get('name'),
+            )
+            if not password:
+                # Incomplete - not ready to save yet (see docstring above).
+                continue
+            config = {"host": host, "port": port, "database": database, "user": user}
+            if schema:
+                config["schema"] = schema
+            if use_encrypt is not None:
+                config["encrypt"] = bool(use_encrypt)
+            config["password"] = password
+            name = db.get("name") or database or "Custom SQL Server"
+            merged.append({
+                "connection_key": compute_connection_key(name, url, password),
+                "name": name,
+                "type": "mssql",
+                "url": url,
+                "config": config,
+            })
         else:
             # Postgres and MySQL both land here - a single connection-
             # string URL carries everything, so there's nothing dialect-
@@ -914,6 +1057,8 @@ def handle_config():
                             )
                         elif new_db_type == 'redshift':
                             db_name_to_save = new_db_config.get("database") or "Custom Redshift"
+                        elif new_db_type == 'mssql':
+                            db_name_to_save = new_db_config.get("database") or "Custom SQL Server"
                         else:
                             try:
                                 parsed = urlparse(new_db_url)
@@ -1141,13 +1286,13 @@ def handle_config():
         'active_database_account': active_db_config.get("account", "") if active_db_type_out == "snowflake" else "",
         'active_database_warehouse': active_db_config.get("warehouse", "") if active_db_type_out == "snowflake" else "",
         'active_database_snowflake_database': active_db_config.get("database", "") if active_db_type_out == "snowflake" else "",
-        'active_database_schema': active_db_config.get("schema", "") if active_db_type_out in ("snowflake", "databricks", "oracle", "redshift") else "",
+        'active_database_schema': active_db_config.get("schema", "") if active_db_type_out in ("snowflake", "databricks", "oracle", "redshift", "mssql") else "",
         'active_database_role': active_db_config.get("role", "") if active_db_type_out == "snowflake" else "",
         'active_database_server_hostname': active_db_config.get("server_hostname", "") if active_db_type_out == "databricks" else "",
         'active_database_http_path': active_db_config.get("http_path", "") if active_db_type_out == "databricks" else "",
         'active_database_catalog': active_db_config.get("catalog", "") if active_db_type_out == "databricks" else "",
-        'active_database_host': active_db_config.get("host", "") if active_db_type_out in ("oracle", "redshift") else "",
-        'active_database_port': active_db_config.get("port", "") if active_db_type_out in ("oracle", "redshift") else "",
+        'active_database_host': active_db_config.get("host", "") if active_db_type_out in ("oracle", "redshift", "mssql") else "",
+        'active_database_port': active_db_config.get("port", "") if active_db_type_out in ("oracle", "redshift", "mssql") else "",
         'active_database_service_name': active_db_config.get("service_name", "") if active_db_type_out == "oracle" else "",
         'active_database_sid': active_db_config.get("sid", "") if active_db_type_out == "oracle" else "",
         'active_database_oracle_user': active_db_config.get("user", "") if active_db_type_out == "oracle" else "",
@@ -1161,6 +1306,14 @@ def handle_config():
         # avoid colliding with a future generic "active_database_user").
         'active_database_redshift_database': active_db_config.get("database", "") if active_db_type_out == "redshift" else "",
         'active_database_redshift_user': active_db_config.get("user", "") if active_db_type_out == "redshift" else "",
+        # SQL Server's "host"/"port"/"schema" also reuse the generic fields
+        # above; "database"/"user" get their own fields for the same reason
+        # Redshift's do, and "encrypt" gets its own boolean field mirroring
+        # Oracle's "ssl" one (a different field name, not reused, since
+        # they're independent booleans on independent dialects).
+        'active_database_mssql_database': active_db_config.get("database", "") if active_db_type_out == "mssql" else "",
+        'active_database_mssql_user': active_db_config.get("user", "") if active_db_type_out == "mssql" else "",
+        'active_database_mssql_encrypt': bool(active_db_config.get("encrypt")) if active_db_type_out == "mssql" else False,
         'custom_database_name': user_custom_name or "",
         'custom_database_url': user_custom_url or "",
         'custom_databases': custom_databases or [],

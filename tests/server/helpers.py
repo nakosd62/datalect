@@ -826,6 +826,72 @@ def install_fake_redshift_connect(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Fake SQL Server (pytds-shaped) connection/cursor
+# ---------------------------------------------------------------------------
+# pytds implements the same PEP 249 DB-API cursor shape (execute/
+# description/fetchall/rowcount, cursor as a context manager) psycopg2
+# does, so FakePgCursor above is reused directly for get_schema()/execute()/
+# identity_label() tests - same approach already used for Snowflake/MySQL
+# (see the comments above FakeSnowflakeConnectHarness/FakeMySQLConnection).
+# Unlike Oracle's/Redshift's connection fakes, no autocommit attribute
+# assignment support is needed here - backends/mssql.py's connect() passes
+# autocommit as a pytds connect()-time kwarg rather than setting it as a
+# post-connect attribute (see that module's docstring), so execute() never
+# touches connection.autocommit at all. What this fake DOES need to support
+# that FakePgConnection doesn't: an arbitrary `mssql_schema` attribute,
+# since backends/mssql.py's connect() stashes the descriptor's "schema"
+# value directly on the connection object for get_schema() to read back
+# (there's no session-level "SET schema"-equivalent statement to bake it
+# into the session context the way Oracle's/Redshift's connect() do - see
+# that module's docstring) - a plain class with a real __dict__ (not a
+# bare object()) supports this with no special handling needed.
+
+class FakeMssqlConnection:
+    def __init__(self, cursor=None):
+        self._cursor = cursor
+        self.closed = False
+        self.mssql_schema = None
+
+    def cursor(self):
+        return self._cursor
+
+    def close(self):
+        self.closed = True
+
+
+def make_fake_mssql_connection(responses, schema=None):
+    cursor = FakePgCursor(responses)
+    connection = FakeMssqlConnection(cursor)
+    connection.mssql_schema = schema
+    return connection, cursor
+
+
+class FakeMssqlConnectHarness:
+    def __init__(self):
+        self.calls = []  # list of kwargs dicts, one per connect() call
+        self.connections = []  # the FakeMssqlConnection returned by each call
+
+    def connect(self, **kwargs):
+        self.calls.append(kwargs)
+        connection = FakeMssqlConnection()
+        self.connections.append(connection)
+        return connection
+
+
+def install_fake_mssql_connect(monkeypatch):
+    """Patches backends.mssql's pytds.connect with a fake that records its
+    kwargs instead of opening a real connection, and returns the
+    FakeMssqlConnectHarness controlling it. Must be called *after* the
+    module has been imported, same caveat as install_fake_oracle_connect
+    above."""
+    import backends.mssql as msmod
+
+    harness = FakeMssqlConnectHarness()
+    monkeypatch.setattr(msmod.pytds, "connect", harness.connect)
+    return harness
+
+
+# ---------------------------------------------------------------------------
 # Fake Firestore client
 # ---------------------------------------------------------------------------
 # A hand-built fake that reproduces real Firestore semantics closely enough

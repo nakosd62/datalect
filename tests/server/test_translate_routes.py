@@ -29,7 +29,7 @@ import types as pytypes
 
 import pytest
 
-from helpers import install_fake_bigquery, parse_translate_stream, write_database_presets_file
+from helpers import install_fake_bigquery, install_fake_mssql_connect, parse_translate_stream, write_database_presets_file
 
 
 class FakeGenaiResponse:
@@ -176,6 +176,33 @@ def test_bigquery_dialect_intro_used_when_active_connection_is_bigquery(app_fact
     system_instruction = harness.generate_calls[0]["config"].system_instruction
     assert "BigQuery Standard SQL" in system_instruction
     assert "_TABLE_SUFFIX" in system_instruction
+
+
+def test_mssql_dialect_intro_used_when_active_connection_is_mssql(app_factory, tmp_path, monkeypatch):
+    presets_path = write_database_presets_file(tmp_path, [
+        {"type": "mssql", "name": "MS", "host": "h", "database": "d", "user": "u", "password": "p"},
+    ])
+    env = app_factory(env={
+        "GEMINI_PRESET_KEYS": "fake-key-1",
+        "DATABASE_PRESETS_FILE": presets_path,
+    })
+    install_fake_mssql_connect(monkeypatch)  # so get_database_schema()'s connect() doesn't hit a real server
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(FakeGenaiResponse("SELECT 1;"))
+
+    # Same "make the preset the active session connection" approach as the
+    # BigQuery test above - "mssql+MS" is the {type}+{name} fallback id
+    # (see app_config.py's DATABASE_PRESETS_FILE comment).
+    env.app_config.state_store.set_session(
+        "global", connection_id="mssql+MS", is_custom=False,
+    )
+
+    env.client.post('/api/translate', json={'prompt': 'hi'})
+    system_instruction = harness.generate_calls[0]["config"].system_instruction
+    assert "Microsoft SQL Server" in system_instruction
+    assert "SELECT TOP" in system_instruction
+    assert "GO statement" in system_instruction
 
 
 def test_429_rotates_key_and_retries_immediately_with_no_delay(app_factory, monkeypatch):

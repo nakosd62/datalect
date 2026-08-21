@@ -158,6 +158,10 @@ DEFAULT_CONN = "postgresql://postgres:password@host:23456/defaultdb?sslmode=veri
 #   Redshift:   {"type": "redshift", "name": "...", "host": "...", "port": 5439,
 #               "database": "...", "user": "...", "password": "...", "schema": "..."}
 #               ("port"/"schema" optional - see below)
+#   SQL Server: {"type": "mssql", "name": "...", "host": "...", "port": 1433,
+#               "database": "...", "user": "...", "password": "...", "schema": "...",
+#               "encrypt": true}
+#               ("port"/"schema"/"encrypt" optional - see below)
 # Example file contents:
 #   [
 #     {
@@ -208,6 +212,16 @@ DEFAULT_CONN = "postgresql://postgres:password@host:23456/defaultdb?sslmode=veri
 #       "database": "dev",
 #       "user": "svc_ydyl",
 #       "password": "..."
+#     },
+#     {
+#       "type": "mssql",
+#       "name": "Orders (SQL Server)",
+#       "host": "my-server.database.windows.net",
+#       "port": 1433,
+#       "database": "orders",
+#       "user": "svc_ydyl",
+#       "password": "...",
+#       "encrypt": true
 #     }
 #   ]
 # Unlike Postgres presets (a connection string with embedded credentials),
@@ -267,6 +281,21 @@ DEFAULT_CONN = "postgresql://postgres:password@host:23456/defaultdb?sslmode=veri
 # has genuine Postgres-style schemas, so this really is a separate
 # namespace, not a stand-in for a user - see backends/redshift.py's module
 # docstring).
+#
+# SQL Server presets are the same "no ambient identity" story again - an
+# mssql preset MUST carry its own explicit "password" right here in the file
+# (this first pass is plain SQL Login username/password only, not Windows/AD/
+# Azure AD auth - see backends/mssql.py's module docstring). "host"/
+# "database"/"user"/"password" are required; "port" defaults to 1433 (SQL
+# Server's standard port) when omitted; "schema" is optional (omitted = the
+# connecting login's own default schema, commonly "dbo" - see
+# backends/mssql.py's module docstring for why the schema is applied by
+# scoping every introspection query rather than by a session-level SET, the
+# way Oracle's/Redshift's schema is). "encrypt" is optional, defaulting to
+# true when omitted (mirrors Oracle's "ssl" flag, but opposite default - most
+# real SQL Server deployments, and Azure SQL Database in particular, require
+# encryption outright - see backends/mssql.py's module docstring for the
+# "cafile"/certifi mechanics and its self-signed-CA limitation).
 #
 # No implicit default path: if DATABASE_PRESETS_FILE isn't set, presets are
 # empty (same "no presets configured" fallback as before - see below).
@@ -590,6 +619,47 @@ if raw_db_presets.strip():
             }
             if schema:
                 preset["schema"] = schema
+            CONFIGURED_DBS.append(preset)
+
+        elif db_type == "mssql":
+            host = (entry.get("host") or "").strip()
+            database = (entry.get("database") or "").strip()
+            ms_user = (entry.get("user") or "").strip()
+            password = entry.get("password") or ""
+            if not (host and database and ms_user and password):
+                logger.warning(
+                    "Skipping SQL Server preset '%s': requires 'host', 'database', 'user', "
+                    "and 'password' - SQL Server has no ADC-equivalent ambient identity to "
+                    "fall back to (see backends/mssql.py's module docstring).",
+                    name,
+                )
+                continue
+            port = entry.get("port") or 1433
+            schema = (entry.get("schema") or "").strip()
+            preset = {
+                "id": preset_id,
+                "name": name,
+                "type": "mssql",
+                # Synthetic identifier, not a credential - mirrors
+                # config_routes.py's _mssql_url (duplicated here rather
+                # than imported, since config_routes.py imports FROM this
+                # module - see the comment above DATABASE_PRESETS_FILE).
+                "url": f"mssql://{host}:{port}/{database}",
+                "host": host,
+                "port": port,
+                "database": database,
+                "user": ms_user,
+                "password": password,
+            }
+            if schema:
+                preset["schema"] = schema
+            # "encrypt" defaults to True inside backends/mssql.py's connect()
+            # when the key is absent entirely - so only set it here when the
+            # preset entry actually specifies a value, letting an explicit
+            # "encrypt": false opt out without this layer inventing its own
+            # separate default (mirrors config_routes.py's parsing branch).
+            if "encrypt" in entry:
+                preset["encrypt"] = bool(entry.get("encrypt"))
             CONFIGURED_DBS.append(preset)
 
         else:

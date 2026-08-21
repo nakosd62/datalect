@@ -10,5 +10,9 @@ snowflake-connector-python
 PyMySQL
 databricks-sql-connector
 oracledb
+python-tds
+pyOpenSSL
+cryptography
+certifi
 pandas
 python-dotenv

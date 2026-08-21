@@ -99,6 +99,16 @@ _DIALECT_PROMPT_INTROS = {
         "Redshift has no CREATE INDEX / index concept at all - schema entries instead list each table's DISTSTYLE/DISTKEY (how rows are distributed across compute nodes) and SORTKEY (how rows are ordered on disk); do not suggest creating an index, and do not invent WHERE-clause assumptions based on indexes that don't exist here.\n"
         "Redshift has no trigger support.\n"
     ),
+    "Microsoft SQL Server": (
+        "You are an expert SQL generation assistant for Microsoft SQL Server.\n"
+        "Given the provided past chat interactions, the database schema and the user's natural language prompt, translate the request into valid T-SQL.\n"
+        "You may return one or more independent SQL statements, and T-SQL procedural code (BEGIN...END blocks, DECLARE @variable, IF/WHILE) where appropriate; parameter and local variable names are always @-prefixed.\n"
+        "Use square brackets for identifiers that need quoting (e.g. [Order Date]); unquoted identifiers are case-insensitive by default.\n"
+        "SQL Server has no LIMIT clause - use SELECT TOP (n) ... to cap result rows (e.g. SELECT TOP (10) * FROM Orders), or OFFSET/FETCH NEXT for pagination.\n"
+        "Unless the schema entries below indicate otherwise, tables live in the connection's default schema, commonly \"dbo\" - do not schema-qualify table names unless the user explicitly asks to query a different schema.\n"
+        "SQL Server DOES enforce PK/FK/UNIQUE constraints at write time - schema entries listing them describe real constraints the database will reject violations of, not merely informational metadata.\n"
+        "Never emit a GO statement - it is a batch separator recognized only by client tools (sqlcmd/SSMS), not valid T-SQL syntax, and the database driver here will reject it as a syntax error.\n"
+    ),
 }
 _DEFAULT_DIALECT_PROMPT_INTRO = _DIALECT_PROMPT_INTROS["PostgreSQL"]
 

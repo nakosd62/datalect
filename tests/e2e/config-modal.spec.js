@@ -617,13 +617,13 @@ test.describe('config modal', () => {
     expect(saveBox.y + saveBox.height).toBeLessThanOrEqual(cardBox.y + cardBox.height + 1);
   });
 
-  test('the type dropdown offers PostgreSQL, MySQL, BigQuery, Snowflake, Databricks, Oracle, and Redshift', async ({ page }) => {
+  test('the type dropdown offers PostgreSQL, MySQL, BigQuery, Snowflake, Databricks, Oracle, Redshift, and SQL Server', async ({ page }) => {
     await gotoApp(page);
     await openConfigModal(page);
     await addCustomDbRow(page);
 
     const options = await page.locator('.custom-db-type-select').last().locator('option').allTextContents();
-    expect(options).toEqual(['PostgreSQL', 'MySQL', 'BigQuery', 'Snowflake', 'Databricks', 'Oracle', 'Redshift']);
+    expect(options).toEqual(['PostgreSQL', 'MySQL', 'BigQuery', 'Snowflake', 'Databricks', 'Oracle', 'Redshift', 'SQL Server']);
   });
 
   test('adding a custom MySQL connection persists it and updates the badge', async ({ page }) => {
@@ -957,5 +957,103 @@ test.describe('config modal', () => {
     await page.locator('.custom-db-type-select').last().selectOption('redshift');
 
     await expect(page.locator('.custom-db-rs-password').last()).toHaveValue('');
+  });
+
+  // SQL Server coverage below is deliberately narrow, for the same reason
+  // Snowflake's/Databricks'/Oracle's/Redshift's is (see the comments above
+  // those blocks): posting a complete custom SQL Server connection here
+  // would make config_routes.py's post-save identity-check block
+  // (backend.connect() - see handle_config) actually try to reach a fake
+  // server over the network from this test run, on a single-threaded,
+  // unthreaded dev server - a slow DNS/connection failure there would
+  // block every other request in this suite. The save-succeeds/
+  // credential-never-leaks/credential-reuse behaviors this would
+  // otherwise cover are already fully exercised, safely, at the Python
+  // level against a mocked connector - see tests/server/test_config_mssql.py.
+  // Like Oracle's "Use TLS" checkbox (and unlike Redshift's always-on
+  // TLS), SQL Server's "Encrypt Connection" is a per-connection opt-in/out
+  // checkbox - but it defaults checked ON, not off, matching connect()'s
+  // own absent-defaults-to-True behavior (see backends/mssql.py's module
+  // docstring).
+  test('custom SQL Server row shows Host, Port, Database, Schema, User, Password, and Encrypt Connection fields', async ({ page }) => {
+    await gotoApp(page);
+    await openConfigModal(page);
+
+    await addCustomDbRow(page);
+    await page.locator('.custom-db-type-select').last().selectOption('mssql');
+
+    await expect(page.locator('.custom-db-ms-host').last()).toBeVisible();
+    await expect(page.locator('.custom-db-ms-port').last()).toBeVisible();
+    await expect(page.locator('.custom-db-ms-database').last()).toBeVisible();
+    await expect(page.locator('.custom-db-ms-schema').last()).toBeVisible();
+    await expect(page.locator('.custom-db-ms-user').last()).toBeVisible();
+    await expect(page.locator('.custom-db-ms-password').last()).toBeVisible();
+    await expect(page.locator('.custom-db-ms-encrypt').last()).toBeVisible();
+  });
+
+  test('a SQL Server custom row labels each field on its own line: Host/Port, Database/Schema, User/Password, then Encrypt Connection', async ({ page }) => {
+    await gotoApp(page);
+    await openConfigModal(page);
+    await addCustomDbRow(page);
+    await page.locator('.custom-db-type-select').last().selectOption('mssql');
+
+    const card = page.locator('.custom-db-card').last();
+    const fieldRows = card.locator('.custom-db-field-row');
+    await expect(fieldRows).toHaveCount(4);
+    await expect(fieldRows.nth(0).locator('.custom-db-field-label')).toHaveText(['Host:', 'Port:']);
+    await expect(fieldRows.nth(1).locator('.custom-db-field-label')).toHaveText(['Database:', 'Schema: (optional)']);
+    await expect(fieldRows.nth(2).locator('.custom-db-field-label')).toHaveText(['User:', 'Password:']);
+    await expect(fieldRows.nth(3)).toContainText('Encrypt Connection (required for Azure SQL Database)');
+  });
+
+  test('the SQL Server "Encrypt Connection" checkbox starts checked (by default) and toggles off on click', async ({ page }) => {
+    await gotoApp(page);
+    await openConfigModal(page);
+    await addCustomDbRow(page);
+    await page.locator('.custom-db-type-select').last().selectOption('mssql');
+
+    const encryptCheckbox = page.locator('.custom-db-ms-encrypt').last();
+    await expect(encryptCheckbox).toBeChecked();
+    await encryptCheckbox.click();
+    await expect(encryptCheckbox).not.toBeChecked();
+  });
+
+  test('an incomplete custom SQL Server row (no database / password) is never submitted', async ({ page }) => {
+    // Same client-side gate as the BigQuery/Snowflake/Databricks/Oracle/
+    // Redshift cases above (triggerConfigSave's isCompleteMssql()) - and
+    // since the row never makes it into the request, this never triggers
+    // the real-network-call risk described above either (database_type
+    // stays 'postgres', falling back to the untouched default preset).
+    await gotoApp(page);
+    await openConfigModal(page);
+
+    await addCustomDbRow(page);
+    await page.locator('.custom-db-type-select').last().selectOption('mssql');
+    await page.locator('.custom-db-ms-host').last().fill('server.example.com');
+    await page.locator('.custom-db-ms-user').last().fill('alice');
+    // Deliberately leave database and password blank.
+
+    await page.locator('#configSaveBtn').click();
+
+    await expect(page.locator('#configModal')).toHaveClass(/hidden/);
+    await expect(page.locator('#connDbName')).toHaveText('Default DB');
+
+    await openConfigModal(page);
+    await expect(page.locator('.custom-db-ms-host')).toHaveCount(0);
+  });
+
+  test('the SQL Server password never round-trips back into the page', async ({ page }) => {
+    // Mirrors the BigQuery service-account-key/Databricks access-token/
+    // Oracle-Redshift password tests above: a password is a credential,
+    // never redisplayed once saved, same as every other dialect's
+    // credential field(s). The row is never actually submitted here (see
+    // the network-call caution above) - this just pins that the field
+    // starts, and stays, blank rather than ever showing a value.
+    await gotoApp(page);
+    await openConfigModal(page);
+    await addCustomDbRow(page);
+    await page.locator('.custom-db-type-select').last().selectOption('mssql');
+
+    await expect(page.locator('.custom-db-ms-password').last()).toHaveValue('');
   });
 });
