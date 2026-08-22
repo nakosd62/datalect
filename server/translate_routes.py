@@ -112,6 +112,7 @@ _DIALECT_PROMPT_INTROS = {
     ),
     "Google Visualization API Query Language": (
         "You are an expert SQL generation assistant for Google's Visualization API Query Language - the query language behind a spreadsheet's own =QUERY() formula.\n"
+        "Given the provided past chat interactions, the database schema and the user's natural language prompt, translate the request into valid Gogle Visualization API Query Language.\n"
         "This is NOT standard SQL: it has NO FROM clause at all - the data source (the spreadsheet tab) is always implicit, so NEVER write FROM anything, not even the tab's name.\n"
         "There are no JOINs, no subqueries, and no CASE/COALESCE/CAST - this grammar simply doesn't have them; do not attempt to work around their absence with unsupported syntax.\n"
         "Reference columns ONLY by the spreadsheet letter shown in the schema (A, B, C, ...) - never by header/label text, even though the schema also shows each column's label for readability.\n"
