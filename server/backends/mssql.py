@@ -40,6 +40,23 @@ adaptation of Oracle's/Redshift's "optional namespace override" pattern to
 a dialect that genuinely has no session-level equivalent, not a missed
 step.
 
+Because nothing changes at the session level, an unqualified table
+reference in generated SQL resolves against the connecting login's own
+default schema, not this descriptor's "schema" override - if those two
+differ (the common reason to set "schema" explicitly in the first place),
+an unqualified query silently targets the wrong place and fails with
+"Invalid object name" - the generated SQL never knew which schema it
+actually needed to land in. get_schema() below therefore renders every
+table/view name schema-qualified (e.g. "reporting.customers") whenever an
+explicit override is configured, so a query built from this schema text
+carries the right
+qualification by construction rather than depending on
+translate_routes.py's dialect prompt to explain the rule correctly (see
+that file's _DIALECT_PROMPT_INTROS entry for this dialect). Left
+unqualified when no override is configured, since in that case an
+unqualified reference already resolves correctly, into the same default
+schema this introspection itself just queried via SCHEMA_NAME().
+
 This first pass is deliberately narrow, mirroring how every other
 non-ambient-identity dialect's (Snowflake/Databricks/Oracle/Redshift) own
 first pass was narrowed too:
@@ -303,6 +320,20 @@ class MssqlBackend(Backend):
             if not all_table_names:
                 return None
 
+            # Every table/view name rendered below gets this prefix when an
+            # explicit "schema" override was configured - see the module
+            # docstring for why: unqualified names generated from this
+            # schema text would otherwise silently resolve into the
+            # connecting login's own default schema at execution time, not
+            # this override, since T-SQL has no session-level mechanism (the
+            # way Postgres's search_path/Oracle's ALTER SESSION SET
+            # CURRENT_SCHEMA have) to make that resolution automatic. Left
+            # empty when no override is configured - an unqualified
+            # reference already resolves correctly in that case, into the
+            # same default schema this introspection itself just queried
+            # via SCHEMA_NAME(), so qualifying would add nothing but noise.
+            schema_prefix = f"{connection.mssql_schema}." if connection.mssql_schema else ""
+
             kept_names, shard_groups = group_date_sharded_tables(all_table_names)
             kept_names, shard_groups, omitted_count = cap_kept_tables(kept_names, shard_groups)
             # No native wildcard-table query mechanism (unlike BigQuery), so
@@ -347,14 +378,14 @@ class MssqlBackend(Backend):
                 if table_name in shard_by_representative:
                     prefix, members = shard_by_representative[table_name]
                     heading = (
-                        f"Table family: {prefix}_<date> ({len(members)} date-sharded tables, "
-                        f"e.g. {members[0]} .. {members[-1]}; identical columns in every "
+                        f"Table family: {schema_prefix}{prefix}_<date> ({len(members)} date-sharded tables, "
+                        f"e.g. {schema_prefix}{members[0]} .. {schema_prefix}{members[-1]}; identical columns in every "
                         f"member - substitute the exact table name for whichever date is "
                         f"meant, following this same naming pattern; never query "
-                        f"'{prefix}_<date>' literally)"
+                        f"'{schema_prefix}{prefix}_<date>' literally)"
                     )
                 else:
-                    heading = f"Table: {table_name}"
+                    heading = f"Table: {schema_prefix}{table_name}"
                 schema_parts.append(heading + "\n" + "\n".join(col_defs))
 
             if omitted_count:
@@ -403,11 +434,11 @@ class MssqlBackend(Backend):
                     lines = []
                     for tbl, c_name, c_type, col, f_tbl, f_col in constraints:
                         if c_type == 'FOREIGN KEY' and f_tbl:
-                            lines.append(f"  [{tbl}] {c_name} ({c_type}): {col} -> {f_tbl}({f_col})")
+                            lines.append(f"  [{schema_prefix}{tbl}] {c_name} ({c_type}): {col} -> {schema_prefix}{f_tbl}({f_col})")
                         elif col:
-                            lines.append(f"  [{tbl}] {c_name} ({c_type}): {col}")
+                            lines.append(f"  [{schema_prefix}{tbl}] {c_name} ({c_type}): {col}")
                         else:
-                            lines.append(f"  [{tbl}] {c_name} ({c_type})")
+                            lines.append(f"  [{schema_prefix}{tbl}] {c_name} ({c_type})")
                     schema_parts.append(
                         "Constraints (enforced at write time):\n" + "\n".join(lines)
                     )
@@ -426,7 +457,7 @@ class MssqlBackend(Backend):
                 """, (connection.mssql_schema,))
                 views = cursor.fetchall()
                 if views:
-                    view_lines = [f"  View {v[0]}: {(v[1] or '').strip()}" for v in views]
+                    view_lines = [f"  View {schema_prefix}{v[0]}: {(v[1] or '').strip()}" for v in views]
                     schema_parts.append("Views:\n" + "\n".join(view_lines))
             except Exception:
                 pass

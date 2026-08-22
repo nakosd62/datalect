@@ -429,6 +429,79 @@ def test_get_schema_uses_explicit_schema_when_given():
     assert table_names_params[-1] == "reporting"
 
 
+# --- get_schema(): schema-qualified names when an override is configured ---
+# Regression coverage for a real-world bug this fixes: T-SQL has no
+# session-level statement to change a session's default schema (see
+# backends/mssql.py's module docstring), so an unqualified table/view name
+# in generated SQL always resolves against the connecting login's own
+# default schema, never this connection's configured "schema" override.
+# Whenever those two differ - the whole reason to set "schema" explicitly -
+# unqualified SQL silently targets the wrong place and fails with "Invalid
+# object name". get_schema() addresses this by rendering every table/view
+# name schema-qualified so Gemini reuses the exact qualified form shown,
+# rather than needing to reason about which schema an unqualified name
+# would land in.
+
+def test_get_schema_qualifies_plain_table_heading_when_schema_configured():
+    conn, cursor = make_fake_mssql_connection(_schema_responses(
+        table_names=["customers"],
+        columns_rows=[("customers", "id", "int", "NO", None)],
+    ), schema="reporting")
+    backend = MssqlBackend()
+    schema = backend.get_schema(conn)
+    assert "Table: reporting.customers" in schema
+    assert "Table: customers" not in schema
+
+
+def test_get_schema_leaves_table_heading_unqualified_when_no_schema_configured():
+    # No override configured - an unqualified reference already resolves
+    # correctly (into the same default schema this introspection itself
+    # just queried via SCHEMA_NAME()), so qualifying would add nothing.
+    conn, cursor = make_fake_mssql_connection(_schema_responses(
+        table_names=["customers"],
+        columns_rows=[("customers", "id", "int", "NO", None)],
+    ), schema=None)
+    backend = MssqlBackend()
+    schema = backend.get_schema(conn)
+    assert "Table: customers" in schema
+
+
+def test_get_schema_qualifies_date_sharded_family_heading_when_schema_configured():
+    members = [f"events_2024010{i}" for i in range(1, 6)]
+    conn, cursor = make_fake_mssql_connection(_schema_responses(
+        table_names=members,
+        columns_rows=[(members[-1], "id", "int", "NO", None)],
+    ), schema="reporting")
+    backend = MssqlBackend()
+    schema = backend.get_schema(conn)
+    assert "Table family: reporting.events_<date>" in schema
+    assert "e.g. reporting.events_20240101 .. reporting.events_20240105" in schema
+
+
+def test_get_schema_qualifies_constraint_table_names_when_schema_configured():
+    conn, cursor = make_fake_mssql_connection(_schema_responses(
+        table_names=["orders"],
+        columns_rows=[("orders", "customer_id", "int", "NO", None)],
+        constraints=[("orders", "fk_customer", "FOREIGN KEY", "customer_id", "customers", "id")],
+    ), schema="reporting")
+    backend = MssqlBackend()
+    schema = backend.get_schema(conn)
+    assert "[reporting.orders]" in schema
+    assert "reporting.customer_id -> reporting.customers(id)" not in schema  # sanity: only table names qualified, not columns
+    assert "customer_id -> reporting.customers(id)" in schema
+
+
+def test_get_schema_qualifies_view_name_when_schema_configured():
+    conn, cursor = make_fake_mssql_connection(_schema_responses(
+        table_names=["customers"],
+        columns_rows=[("customers", "id", "int", "NO", None)],
+        views=[("customer_orders", "SELECT * FROM orders JOIN customers ...")],
+    ), schema="reporting")
+    backend = MssqlBackend()
+    schema = backend.get_schema(conn)
+    assert "View reporting.customer_orders:" in schema
+
+
 def test_get_schema_table_name_query_uses_top_not_limit():
     conn, cursor = make_fake_mssql_connection(_schema_responses(
         table_names=["t1"],

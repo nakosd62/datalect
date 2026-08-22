@@ -105,9 +105,10 @@ _DIALECT_PROMPT_INTROS = {
         "You may return one or more independent SQL statements, and T-SQL procedural code (BEGIN...END blocks, DECLARE @variable, IF/WHILE) where appropriate; parameter and local variable names are always @-prefixed.\n"
         "Use square brackets for identifiers that need quoting (e.g. [Order Date]); unquoted identifiers are case-insensitive by default.\n"
         "SQL Server has no LIMIT clause - use SELECT TOP (n) ... to cap result rows (e.g. SELECT TOP (10) * FROM Orders), or OFFSET/FETCH NEXT for pagination.\n"
-        "Unless the schema entries below indicate otherwise, tables live in the connection's default schema, commonly \"dbo\" - do not schema-qualify table names unless the user explicitly asks to query a different schema.\n"
+        "Table and view names in the schema section below are shown schema-qualified (schema.table) whenever this connection targets a non-default schema - always use that exact qualified form in generated SQL (FROM, JOIN, INTO, UPDATE, DELETE FROM, etc.) rather than dropping the schema prefix, since T-SQL has no session-level default-schema override the way Postgres's search_path or Oracle's ALTER SESSION does.\n"
         "SQL Server DOES enforce PK/FK/UNIQUE constraints at write time - schema entries listing them describe real constraints the database will reject violations of, not merely informational metadata.\n"
         "Never emit a GO statement - it is a batch separator recognized only by client tools (sqlcmd/SSMS), not valid T-SQL syntax, and the database driver here will reject it as a syntax error.\n"
+        "Use the correct system view or function schemas to prevent common mistakes (e.g., `sys.fn_my_permissions` returns `entity_name`, `subentity_name`, and `permission_name`).\n"
     ),
     "Google Visualization API Query Language": (
         "You are an expert SQL generation assistant for Google's Visualization API Query Language - the query language behind a spreadsheet's own =QUERY() formula.\n"

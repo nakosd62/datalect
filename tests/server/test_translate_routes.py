@@ -203,6 +203,15 @@ def test_mssql_dialect_intro_used_when_active_connection_is_mssql(app_factory, t
     assert "Microsoft SQL Server" in system_instruction
     assert "SELECT TOP" in system_instruction
     assert "GO statement" in system_instruction
+    # Regression guard: this dialect has no session-level default-schema
+    # override (see backends/mssql.py's module docstring), so the prompt
+    # must tell Gemini to always reuse the schema-qualified names shown in
+    # the schema section - the previous wording ("do not schema-qualify...")
+    # was actively wrong whenever a connection's configured schema differs
+    # from the connecting login's own default schema, and produced
+    # unqualified SQL that failed with "Invalid object name".
+    assert "schema-qualified" in system_instruction
+    assert "do not schema-qualify" not in system_instruction.lower()
 
 
 def test_429_rotates_key_and_retries_immediately_with_no_delay(app_factory, monkeypatch):
