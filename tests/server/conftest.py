@@ -12,7 +12,7 @@ import pytest
 from helpers import (
     fresh_import, install_fake_bigquery, install_fake_snowflake_connect,
     install_fake_pymysql_connect, install_fake_databricks_connect, install_fake_oracle_connect,
-    install_fake_redshift_connect, install_fake_mssql_connect,
+    install_fake_redshift_connect, install_fake_mssql_connect, install_fake_sheets_requests,
 )
 
 
@@ -110,3 +110,17 @@ def mssql_harness(monkeypatch):
     oracle_harness/redshift_harness above: call this AFTER app_factory/
     app_env in your test, not before."""
     return install_fake_mssql_connect(monkeypatch)
+
+
+@pytest.fixture
+def sheets_harness(monkeypatch):
+    """Patches backends.sheets's module-level `requests` reference with a
+    fake .get that records calls and returns queued canned gviz responses,
+    instead of making a real HTTP request. Same ordering caveat as
+    bigquery_harness/.../mssql_harness above: call this AFTER app_factory/
+    app_env in your test, not before. Unlike every harness above, this one
+    starts with an EMPTY response queue - queue_table()/queue_error()/
+    queue_response() on the returned harness before triggering any call
+    that reaches _fetch() (identity_label()/get_schema()/execute()), since
+    there's no live connection object here to default the response from."""
+    return install_fake_sheets_requests(monkeypatch)

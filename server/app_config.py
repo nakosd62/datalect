@@ -21,6 +21,7 @@ from flask_cors import CORS
 from google.cloud import firestore
 
 from state_store import SqliteStateStore, FirestoreStateStore
+from sheets_util import extract_spreadsheet_id
 
 from dotenv import load_dotenv
 
@@ -162,6 +163,9 @@ DEFAULT_CONN = "postgresql://postgres:password@host:23456/defaultdb?sslmode=veri
 #               "database": "...", "user": "...", "password": "...", "schema": "...",
 #               "encrypt": true}
 #               ("port"/"schema"/"encrypt" optional - see below)
+#   Google Sheets: {"type": "sheets", "name": "...", "spreadsheet_url": "..."
+#               (or "spreadsheet_id" instead), "tab_name": "...",
+#               "credentials_json": "..." (optional - see below)}
 # Example file contents:
 #   [
 #     {
@@ -222,6 +226,12 @@ DEFAULT_CONN = "postgresql://postgres:password@host:23456/defaultdb?sslmode=veri
 #       "user": "svc_ydyl",
 #       "password": "...",
 #       "encrypt": true
+#     },
+#     {
+#       "type": "sheets",
+#       "name": "Team Roster (Sheet)",
+#       "spreadsheet_url": "https://docs.google.com/spreadsheets/d/1AbCdEf.../edit",
+#       "tab_name": "Roster"
 #     }
 #   ]
 # Unlike Postgres presets (a connection string with embedded credentials),
@@ -296,6 +306,35 @@ DEFAULT_CONN = "postgresql://postgres:password@host:23456/defaultdb?sslmode=veri
 # real SQL Server deployments, and Azure SQL Database in particular, require
 # encryption outright - see backends/mssql.py's module docstring for the
 # "cafile"/certifi mechanics and its self-signed-CA limitation).
+#
+# Google Sheets presets are architecturally different from every dialect
+# above: by default there's no credential at all - a "sheets" preset with
+# no "credentials_json" reaches only a spreadsheet genuinely shared as
+# "Anyone with the link can view" (or published to the web), since this
+# app has no Google identity of its own to act on anyone's behalf (see
+# backends/sheets.py's module docstring). An entry MAY optionally carry
+# its own "credentials_json" (a pasted service-account key, pasted here in
+# full just like a Snowflake preset already carries its own "password") to
+# reach a PRIVATE spreadsheet explicitly shared with that service
+# account's email - passed through verbatim below, no resolver needed
+# since presets aren't user-editable/re-saved through the app the way
+# custom connections are.
+#
+# There IS one ambient identity available, though, unlike every dialect
+# above (which either always or never have one): SHEETS_SERVICE_ACCOUNT_CREDENTIALS_FILE,
+# a single service-account key configured once for the whole app, used as
+# a fallback by ANY Sheets connection (preset or custom) that doesn't
+# supply its own "credentials_json" - see backends/sheets.py's module
+# docstring for the full mechanism. That fallback is resolved entirely
+# inside backend.connect(), not here, so a preset entry with no
+# "credentials_json" of its own may still reach a private spreadsheet in
+# practice if that env var is set - this file doesn't need to know either
+# way for its own parsing to be correct.
+#
+# "spreadsheet_url" (a full pasted Sheets URL) or "spreadsheet_id" (the
+# bare id) and "tab_name" are required - the tab is selected by its
+# display name, not a numeric index, so renaming a tab in the spreadsheet
+# breaks a preset pointed at the old name.
 #
 # No implicit default path: if DATABASE_PRESETS_FILE isn't set, presets are
 # empty (same "no presets configured" fallback as before - see below).
@@ -661,6 +700,56 @@ if raw_db_presets.strip():
             if "encrypt" in entry:
                 preset["encrypt"] = bool(entry.get("encrypt"))
             CONFIGURED_DBS.append(preset)
+
+        elif db_type == "sheets":
+            spreadsheet_url_or_id = (
+                entry.get("spreadsheet_url") or entry.get("spreadsheet_id") or ""
+            ).strip()
+            tab_name = (entry.get("tab_name") or "").strip()
+            if not (spreadsheet_url_or_id and tab_name):
+                logger.warning(
+                    "Skipping Google Sheets preset '%s': requires 'spreadsheet_url' "
+                    "(or 'spreadsheet_id') and 'tab_name' - and the sheet must be "
+                    "shared as \"Anyone with the link can view\", since this app has "
+                    "no Google identity of its own (see backends/sheets.py's module "
+                    "docstring).",
+                    name,
+                )
+                continue
+            spreadsheet_id = extract_spreadsheet_id(spreadsheet_url_or_id)
+            if not spreadsheet_id:
+                logger.warning(
+                    "Skipping Google Sheets preset '%s': couldn't parse a spreadsheet "
+                    "id out of 'spreadsheet_url'/'spreadsheet_id'.",
+                    name,
+                )
+                continue
+            sheets_preset = {
+                "id": preset_id,
+                "name": name,
+                "type": "sheets",
+                # Synthetic identifier, not a credential - mirrors
+                # config_routes.py's _sheets_url (duplicated here rather
+                # than imported, since config_routes.py imports FROM this
+                # module - see the comment above DATABASE_PRESETS_FILE).
+                # extract_spreadsheet_id itself IS imported (from
+                # sheets_util, not backends.sheets) since it's not a
+                # one-liner worth tripling - see sheets_util.py's docstring
+                # for why it lives in its own dependency-free module rather
+                # than in backends/sheets.py.
+                "url": f"sheets://{spreadsheet_id}/{tab_name}",
+                "spreadsheet_id": spreadsheet_id,
+                "tab_name": tab_name,
+            }
+            # Optional - present only for a preset the admin explicitly
+            # wants pointed at a private spreadsheet (see the comment above
+            # DATABASE_PRESETS_FILE). Pasted in verbatim, same as a
+            # Snowflake preset's own "password" field above - no resolver
+            # needed since presets aren't user-editable/re-saved.
+            credentials_json = (entry.get("credentials_json") or "").strip()
+            if credentials_json:
+                sheets_preset["credentials_json"] = credentials_json
+            CONFIGURED_DBS.append(sheets_preset)
 
         else:
             logger.warning("Skipping database preset '%s': unsupported type %r.", name, db_type)

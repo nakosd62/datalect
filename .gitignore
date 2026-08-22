@@ -12,8 +12,9 @@ env.yaml
 .env
 crdb.crt
 ydyl-bq-test-key.json
-database_presets_local.json
-database_presets_CR.json
+presets_local.json
+presets_CR.json
+grand-cosmos-716-730fa5353a45.json
 
 # Logs
 *.log

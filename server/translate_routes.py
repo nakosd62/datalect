@@ -109,6 +109,16 @@ _DIALECT_PROMPT_INTROS = {
         "SQL Server DOES enforce PK/FK/UNIQUE constraints at write time - schema entries listing them describe real constraints the database will reject violations of, not merely informational metadata.\n"
         "Never emit a GO statement - it is a batch separator recognized only by client tools (sqlcmd/SSMS), not valid T-SQL syntax, and the database driver here will reject it as a syntax error.\n"
     ),
+    "Google Visualization API Query Language": (
+        "You are an expert SQL generation assistant for Google's Visualization API Query Language - the query language behind a spreadsheet's own =QUERY() formula.\n"
+        "This is NOT standard SQL: it has NO FROM clause at all - the data source (the spreadsheet tab) is always implicit, so NEVER write FROM anything, not even the tab's name.\n"
+        "There are no JOINs, no subqueries, and no CASE/COALESCE/CAST - this grammar simply doesn't have them; do not attempt to work around their absence with unsupported syntax.\n"
+        "Reference columns ONLY by the spreadsheet letter shown in the schema (A, B, C, ...) - never by header/label text, even though the schema also shows each column's label for readability.\n"
+        "Supported clauses: select, where, group by, pivot, order by, limit, offset, label, format, options.\n"
+        "Supported functions: year(), month(), day(), quarter(), dayOfWeek(), hour(), minute(), second(), millisecond(), dateDiff(), toDate(), now(), upper(), lower(), plus the aggregates sum(), avg(), count(), min(), max() (valid only alongside group by). Do not invent clauses or functions outside this list.\n"
+        "String literals use single quotes.\n"
+        "Return EXACTLY ONE query - this dialect has no multi-statement/batch concept, so never return multiple semicolon-separated statements, and do not end the query with a trailing semicolon.\n"
+    ),
 }
 _DEFAULT_DIALECT_PROMPT_INTRO = _DIALECT_PROMPT_INTROS["PostgreSQL"]
 
@@ -363,7 +373,23 @@ def translate_query():
                         contents=contents,
                         config=types.GenerateContentConfig(
                             system_instruction=system_instruction,
-                            temperature=0.1
+                            temperature=0.1,
+                            # This app never passes `tools=` to Gemini - there's no
+                            # function-calling in play here, just a single
+                            # translate-this-prompt-to-SQL request per call. The
+                            # google-genai SDK's "automatic function calling" (AFC)
+                            # machinery defaults to "on" regardless of whether any
+                            # tools are configured, and logs a one-time warning
+                            # ("Direct use of AFC in Models.generate_content is not
+                            # recommended...") suggesting the Chat.send_message API
+                            # instead - which doesn't fit here since this app already
+                            # manages its own conversation history explicitly (see
+                            # build_gemini_history_contents above) rather than
+                            # delegating that to an SDK-managed Chat object.
+                            # Disabling AFC costs nothing functionally (there is no
+                            # function-calling behavior to lose) and silences that
+                            # warning at the source instead of just living with it.
+                            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
                         )
                     )
                     break

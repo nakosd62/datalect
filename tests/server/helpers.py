@@ -892,6 +892,116 @@ def install_fake_mssql_connect(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Fake Google Sheets ("gviz") HTTP layer
+# ---------------------------------------------------------------------------
+# Unlike every other backend above, backends/sheets.py talks to a real DB-API
+# driver at all - there's no connect()-returning-a-live-object shape to fake
+# here. Instead it issues one requests.get() per query against Google's gviz
+# endpoint, so this fake patches backends.sheets's module-level `requests`
+# reference with a fake `.get` that records each call's url/params/timeout
+# and returns a queued canned HTTP response (status_code + text) built to
+# look exactly like gviz's real JSONP-wrapped JSON body - confirmed live
+# against the real endpoint during this feature's design (see
+# backends/sheets.py's module docstring), not guessed at.
+
+def make_gviz_table_json(cols, rows, wrapped=True):
+    """Builds gviz response text for a successful query. `cols` is a list of
+    {"label", "type"} dicts (matching gviz's own per-column shape); `rows`
+    is a list of lists of raw cell values - a plain value becomes {"v":
+    value}, and a (v, f) tuple becomes {"v": v, "f": f} (the "formatted
+    string" gviz attaches to date/datetime/timeofday cells - see
+    backends/sheets.py's f-vs-v handling). `wrapped=True` (the default)
+    produces the real JSONP-callback-wrapped form
+    (`google.visualization.Query.setResponse({...});`); `wrapped=False`
+    produces bare JSON - both forms are handled defensively by
+    backends.sheets._parse_gviz_response, and both are exercised across
+    this file's tests since which one `tqx=out:json` actually returns
+    wasn't pinned down to just one ahead of time."""
+    def _cell(value):
+        if isinstance(value, tuple):
+            v, f = value
+            return {"v": v, "f": f}
+        if value is None:
+            return None
+        return {"v": value}
+
+    body = {
+        "version": "0.6", "reqId": "0", "status": "ok",
+        "table": {
+            "cols": list(cols),
+            "rows": [{"c": [_cell(v) for v in row]} for row in rows],
+        },
+    }
+    text = json.dumps(body)
+    if wrapped:
+        return f"google.visualization.Query.setResponse({text});"
+    return text
+
+
+def make_gviz_error_json(detailed_message, wrapped=True):
+    """Builds gviz response text for a semantically-bad query (e.g. a
+    nonexistent column) - HTTP 200 with a status:"error" body, exactly as
+    confirmed live against the real endpoint (see backends/sheets.py's
+    module docstring) - NOT an HTTP error status."""
+    body = {
+        "version": "0.6", "reqId": "0", "status": "error",
+        "errors": [{"reason": "invalid_query", "message": "INVALID_QUERY", "detailed_message": detailed_message}],
+    }
+    text = json.dumps(body)
+    if wrapped:
+        return f"google.visualization.Query.setResponse({text});"
+    return text
+
+
+class FakeSheetsResponse:
+    def __init__(self, status_code=200, text=""):
+        self.status_code = status_code
+        self.text = text
+
+
+class FakeSheetsRequestsHarness:
+    """Records every requests.get() call (url/params/timeout) and returns
+    queued canned responses in order - queue_response() appends one;
+    calling .get() with an empty queue raises, so every test is explicit
+    about what each call should return rather than silently reusing a
+    stale default."""
+
+    def __init__(self):
+        self.calls = []
+        self._queue = []
+
+    def queue_response(self, status_code=200, text=""):
+        self._queue.append(FakeSheetsResponse(status_code=status_code, text=text))
+
+    def queue_table(self, cols, rows, wrapped=True):
+        self.queue_response(status_code=200, text=make_gviz_table_json(cols, rows, wrapped=wrapped))
+
+    def queue_error(self, detailed_message, wrapped=True):
+        self.queue_response(status_code=200, text=make_gviz_error_json(detailed_message, wrapped=wrapped))
+
+    def get(self, url, params=None, timeout=None, headers=None):
+        self.calls.append({"url": url, "params": params, "timeout": timeout, "headers": headers})
+        if not self._queue:
+            raise AssertionError(
+                "FakeSheetsRequestsHarness.get() called with an empty response "
+                "queue - call queue_response()/queue_table()/queue_error() first."
+            )
+        return self._queue.pop(0)
+
+
+def install_fake_sheets_requests(monkeypatch):
+    """Patches backends.sheets's module-level `requests` reference so its
+    .get is the fake above, and returns the FakeSheetsRequestsHarness
+    controlling it. Must be called *after* the module has been imported,
+    same ordering caveat as install_fake_oracle_connect/etc. above."""
+    import backends.sheets as shmod
+
+    harness = FakeSheetsRequestsHarness()
+    monkeypatch.setattr(shmod.requests, "get", harness.get)
+    return harness
+
+
+# ---------------------------------------------------------------------------
 # Fake Firestore client
 # ---------------------------------------------------------------------------
 # A hand-built fake that reproduces real Firestore semantics closely enough

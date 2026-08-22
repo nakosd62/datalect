@@ -7,7 +7,7 @@ venv/
 
 # Ignore local env setting
 .env
-database_presets_local.json
+presets_local.json
 
 # Ignore utility scripts
 *.sh

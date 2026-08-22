@@ -26,10 +26,12 @@ Connections are represented as descriptors: {"type": "postgres", "url":
 (or "sid" instead), "user": "...", "password": "...", "schema": "..."},
 {"type": "redshift", "url": "redshift://<host>:<port>/<database>",
 "host": "...", "port": 5439, "database": "...", "user": "...",
-"password": "...", "schema": "..."}, or {"type": "mssql", "url":
+"password": "...", "schema": "..."}, {"type": "mssql", "url":
 "mssql://<host>:<port>/<database>", "host": "...", "port": 1433,
 "database": "...", "user": "...", "password": "...", "schema": "...",
-"encrypt": true} - see db.py's resolve_active_descriptor / backends/base.py's
+"encrypt": true}, or {"type": "sheets", "url":
+"sheets://<spreadsheet_id>/<tab_name>", "spreadsheet_id": "...",
+"tab_name": "...", "credentials_json": "..." (optional)} - see db.py's resolve_active_descriptor / backends/base.py's
 module docstring / backends/bigquery.py's, backends/snowflake.py's,
 backends/databricks.py's, backends/oracle.py's, backends/redshift.py's, and
 backends/mssql.py's module docstrings for what billing_project_id is
@@ -38,18 +40,19 @@ auth methods, and for why Databricks/Oracle/Redshift/SQL Server (like
 Snowflake) only support one explicit credential shape (a Personal Access
 Token for Databricks, plain username/password for the other three - no
 wallet/mTLS/IAM-temp-credentials yet) rather than any ambient identity.
-credentials_json (BigQuery), password/private_key/private_key_passphrase
-(Snowflake), access_token (Databricks), and password (Oracle/Redshift/SQL
-Server - the same field name Postgres's URL-embedded password plays, but
-standalone here since none of the three have a single connection-string
-url of their own) are the fields that must never round-trip back to the
-frontend once saved (see state_store.get_db_connections' include_credentials
-param and its _CREDENTIAL_CONFIG_FIELDS); _resolve_bigquery_credentials/
+credentials_json (BigQuery, and optionally Sheets - see below), password/
+private_key/private_key_passphrase (Snowflake), access_token (Databricks),
+and password (Oracle/Redshift/SQL Server - the same field name Postgres's
+URL-embedded password plays, but standalone here since none of the three
+have a single connection-string url of their own) are the fields that must
+never round-trip back to the frontend once saved (see
+state_store.get_db_connections' include_credentials param and its
+_CREDENTIAL_CONFIG_FIELDS); _resolve_bigquery_credentials/
 _resolve_snowflake_credentials/_resolve_databricks_credentials/
 _resolve_oracle_credentials/_resolve_redshift_credentials/
-_resolve_mssql_credentials below are what let a user re-select or rename
-a saved connection, or just switch back to it, without re-entering its
-credential every time. billing_project_id is NOT a credential (it's just a
+_resolve_mssql_credentials/_resolve_sheets_credentials below are what let a
+user re-select or rename a saved connection, or just switch back to it,
+without re-entering its credential every time. billing_project_id is NOT a credential (it's just a
 project id string) and always round-trips to the frontend as-is - see
 get_db_connections' _strip_credentials, which only strips the fields in
 _CREDENTIAL_CONFIG_FIELDS.
@@ -140,6 +143,35 @@ Oracle's "ssl", SQL Server has its own opt-in "encrypt" descriptor field
 (bool) - defaulting to on when absent, since Azure SQL Database requires
 encryption and simply fails outright without it, a stricter default than
 Oracle's own "off unless requested."
+
+Google Sheets ("sheets") is credential-OPTIONAL, unlike every other
+dialect above (which are either always credentialed or never are): a
+spreadsheet genuinely shared as "Anyone with the link can view" needs
+nothing, since this app has no Google identity of its own to act on a
+signed-in user's behalf (see auth.py - only ID tokens are ever verified,
+never an OAuth access token). But a connection MAY also carry an optional
+credentials_json (a pasted service-account key, same field/shape as
+BigQuery's) for reaching a PRIVATE spreadsheet the sheet's owner has
+explicitly shared with that service account's email - see
+backends/sheets.py's module docstring for the full credential model and a
+flagged caveat about this mechanism's verification status. Because of
+that, _parse_incoming_connection's and _parse_incoming_custom_databases'
+sheets branches still follow the unconditional-success shape Postgres/
+MySQL's URL-based branches use (a missing credential is never an error -
+most Sheets connections legitimately have none), but they now ALSO call
+_resolve_sheets_credentials (mirroring _resolve_bigquery_credentials'
+fresh-wins-else-fall-back-to-saved shape) to fold in an optional
+credentials_json when one is provided or already saved.
+
+Separately, a Sheets connection (preset OR custom) that has no
+credentials_json at all - explicit or saved - can still reach a private
+sheet via a single, app-wide ambient service-account key
+(SHEETS_SERVICE_ACCOUNT_CREDENTIALS_FILE - see backends/sheets.py's module
+docstring). That fallback is resolved entirely inside backend.connect(),
+never here and never persisted in any saved config, so nothing in this
+file needs to know it exists to work correctly - it's mentioned here only
+so a reader isn't left wondering how a credential-less-looking descriptor
+still reaches a private sheet in practice.
 """
 
 import json
@@ -159,6 +191,7 @@ from auth import (
 from db import get_conn_identifier, resolve_active_descriptor
 from backends import get_backend
 from state_store import compute_connection_key
+from sheets_util import extract_spreadsheet_id
 import schema_cache
 
 config_bp = Blueprint('config', __name__)
@@ -212,6 +245,38 @@ def _mssql_url(host, port, database):
     _redshift_url play (schema-cache key, preset/custom-connection
     matching, display), but is never a credential."""
     return f"mssql://{host}:{port}/{database}"
+
+
+def _sheets_url(spreadsheet_id, tab_name):
+    """Synthetic, non-secret identifier for a Google Sheets connection -
+    same role _bigquery_url/_oracle_url/etc. play (schema-cache key,
+    preset/custom-connection matching, display), but is never a credential
+    itself - see backends/sheets.py's module docstring for the (optional)
+    credentials_json this dialect can separately carry."""
+    return f"sheets://{spreadsheet_id}/{tab_name}"
+
+
+def _resolve_sheets_credentials(user_identity, spreadsheet_id, tab_name, provided_credentials_json, name=None):
+    """Returns the credentials_json to persist for a Sheets connection, or
+    None. Mirrors _resolve_bigquery_credentials' fresh-wins-else-fall-back-
+    to-saved shape, purely so re-selecting/renaming an already-saved
+    private-sheet connection doesn't look like "credential removed" and
+    silently drop it. UNLIKE _resolve_bigquery_credentials, a None return
+    here is NOT an error anywhere it's called - most Sheets connections are
+    legitimately credential-less (a public sheet), and that must stay the
+    normal, zero-friction case."""
+    if provided_credentials_json:
+        return provided_credentials_json
+    target_url = _sheets_url(spreadsheet_id, tab_name)
+    existing = state_store.get_db_connections(user_identity, include_credentials=True)
+    matches = [db for db in existing if db.get("type") == "sheets" and db.get("url") == target_url]
+    if not matches:
+        return None
+    if name:
+        named_match = next((db for db in matches if db.get("name") == name), None)
+        if named_match:
+            return (named_match.get("config") or {}).get("credentials_json")
+    return (matches[0].get("config") or {}).get("credentials_json")
 
 
 def _credential_for_key(config):
@@ -675,6 +740,35 @@ def _parse_incoming_connection(data, user_identity):
         db_config["password"] = password
         return db_type, db_url, db_config, None
 
+    if db_type == 'sheets':
+        spreadsheet_url_or_id = (data.get('spreadsheet_url') or '').strip()
+        tab_name = (data.get('tab_name') or '').strip()
+        # Same "core identifying fields, nothing inferred" threshold every
+        # other structured dialect above uses - a request missing either
+        # field isn't enough to even identify a connection yet (e.g. a
+        # fresh blank row), not a validation error - see the docstring
+        # above.
+        if not (spreadsheet_url_or_id and tab_name):
+            return db_type, None, {}, None
+        spreadsheet_id = extract_spreadsheet_id(spreadsheet_url_or_id)
+        if not spreadsheet_id:
+            return db_type, None, {}, None
+        db_url = _sheets_url(spreadsheet_id, tab_name)
+        db_config = {"spreadsheet_id": spreadsheet_id, "tab_name": tab_name}
+        # Optional, unlike every other credentialed dialect above: a
+        # missing credential here is the normal public-sheet case, not an
+        # error - see backends/sheets.py's module docstring. Unconditional
+        # error=None regardless, same as the MySQL/default-Postgres branch
+        # below, NOT the Oracle/Redshift/Snowflake/Databricks/mssql
+        # "resolve or error" shape above.
+        credentials_json = _resolve_sheets_credentials(
+            user_identity, spreadsheet_id, tab_name, data.get('credentials_json'),
+            name=data.get('database_name'),
+        )
+        if credentials_json:
+            db_config["credentials_json"] = credentials_json
+        return db_type, db_url, db_config, None
+
     if db_type == 'mysql':
         # Same shape as Postgres - a single connection-string URL carries
         # everything (host, credentials, database), so there's no
@@ -929,6 +1023,38 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
                 "url": url,
                 "config": config,
             })
+        elif db_type == 'sheets':
+            spreadsheet_url_or_id = (db.get('spreadsheet_url') or '').strip()
+            tab_name = (db.get('tab_name') or '').strip()
+            if not (spreadsheet_url_or_id and tab_name):
+                # Incomplete - not ready to save yet (see docstring above).
+                continue
+            spreadsheet_id = extract_spreadsheet_id(spreadsheet_url_or_id)
+            if not spreadsheet_id:
+                continue
+            url = _sheets_url(spreadsheet_id, tab_name)
+            name = db.get("name") or tab_name or "Custom Sheet"
+            credentials_json = _resolve_sheets_credentials(
+                user_identity, spreadsheet_id, tab_name, db.get('credentials_json'),
+                name=name,
+            )
+            config = {"spreadsheet_id": spreadsheet_id, "tab_name": tab_name}
+            if credentials_json:
+                config["credentials_json"] = credentials_json
+            # credentials_json folded into the key (may be None) - unlike
+            # the unconditional None this used to pass unconditionally,
+            # two connections that differ only by credential (same
+            # spreadsheet/tab, different service-account key) now get
+            # distinct connection_keys instead of colliding and silently
+            # overwriting each other - same reasoning as the password-
+            # folding calls above.
+            merged.append({
+                "connection_key": compute_connection_key(name, url, credentials_json),
+                "name": name,
+                "type": "sheets",
+                "url": url,
+                "config": config,
+            })
         else:
             # Postgres and MySQL both land here - a single connection-
             # string URL carries everything, so there's nothing dialect-
@@ -1059,6 +1185,8 @@ def handle_config():
                             db_name_to_save = new_db_config.get("database") or "Custom Redshift"
                         elif new_db_type == 'mssql':
                             db_name_to_save = new_db_config.get("database") or "Custom SQL Server"
+                        elif new_db_type == 'sheets':
+                            db_name_to_save = new_db_config.get("tab_name") or "Custom Sheet"
                         else:
                             try:
                                 parsed = urlparse(new_db_url)
@@ -1314,6 +1442,11 @@ def handle_config():
         'active_database_mssql_database': active_db_config.get("database", "") if active_db_type_out == "mssql" else "",
         'active_database_mssql_user': active_db_config.get("user", "") if active_db_type_out == "mssql" else "",
         'active_database_mssql_encrypt': bool(active_db_config.get("encrypt")) if active_db_type_out == "mssql" else False,
+        # Sheets has no host/port/database/user/schema concept at all -
+        # nothing here fits any of the generic fields above, so both of
+        # its fields get their own dedicated names.
+        'active_database_sheets_spreadsheet_id': active_db_config.get("spreadsheet_id", "") if active_db_type_out == "sheets" else "",
+        'active_database_sheets_tab_name': active_db_config.get("tab_name", "") if active_db_type_out == "sheets" else "",
         'custom_database_name': user_custom_name or "",
         'custom_database_url': user_custom_url or "",
         'custom_databases': custom_databases or [],

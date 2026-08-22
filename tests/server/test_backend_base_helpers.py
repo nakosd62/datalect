@@ -28,10 +28,15 @@ def test_backend_base_class_defaults_liveness_sql_to_select_1():
     assert Backend.liveness_sql == "SELECT 1"
 
 
-def test_every_registered_backend_except_oracle_uses_the_ansi_select_1_default():
+def test_every_registered_backend_except_oracle_and_sheets_uses_the_ansi_select_1_default():
+    # Sheets is the second exclusion here (see backends/sheets.py): the
+    # GViz query language has no bare "SELECT 1" form either - it has no
+    # SELECT/FROM concept at all, just a SELECT clause against an implicit
+    # data source, so its liveness_sql is "select * limit 1" instead - a
+    # deliberate override, same status as Oracle's.
     from backends import _BACKENDS
     for name, backend_cls in _BACKENDS.items():
-        if name == "oracle":
+        if name in ("oracle", "sheets"):
             continue
         assert backend_cls.liveness_sql == "SELECT 1", (
             f"{name} backend overrides liveness_sql unexpectedly - if that's "

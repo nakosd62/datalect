@@ -617,13 +617,13 @@ test.describe('config modal', () => {
     expect(saveBox.y + saveBox.height).toBeLessThanOrEqual(cardBox.y + cardBox.height + 1);
   });
 
-  test('the type dropdown offers PostgreSQL, MySQL, BigQuery, Snowflake, Databricks, Oracle, Redshift, and SQL Server', async ({ page }) => {
+  test('the type dropdown offers PostgreSQL, MySQL, BigQuery, Snowflake, Databricks, Oracle, Redshift, SQL Server, and Google Sheets', async ({ page }) => {
     await gotoApp(page);
     await openConfigModal(page);
     await addCustomDbRow(page);
 
     const options = await page.locator('.custom-db-type-select').last().locator('option').allTextContents();
-    expect(options).toEqual(['PostgreSQL', 'MySQL', 'BigQuery', 'Snowflake', 'Databricks', 'Oracle', 'Redshift', 'SQL Server']);
+    expect(options).toEqual(['PostgreSQL', 'MySQL', 'BigQuery', 'Snowflake', 'Databricks', 'Oracle', 'Redshift', 'SQL Server', 'Google Sheets']);
   });
 
   test('adding a custom MySQL connection persists it and updates the badge', async ({ page }) => {
@@ -1055,5 +1055,89 @@ test.describe('config modal', () => {
     await page.locator('.custom-db-type-select').last().selectOption('mssql');
 
     await expect(page.locator('.custom-db-ms-password').last()).toHaveValue('');
+  });
+
+  // Google Sheets coverage below is deliberately narrow, for the same
+  // network-call-safety reason as the SQL Server/Redshift/Oracle/
+  // Databricks/Snowflake blocks above - identity_label() (called during
+  // config_routes.py's post-save identity check) performs a real HTTP GET
+  // against Google's gviz endpoint for this dialect (see
+  // backends/sheets.py's module docstring), so a complete row is never
+  // actually submitted here. That save-succeeds/round-trips-the-right-
+  // fields behavior is already fully exercised, safely, at the Python
+  // level against a fake HTTP layer - see tests/server/test_config_sheets.py.
+  // Unlike every other dialect's own block above, the credential field here
+  // (Service Account Key) is OPTIONAL, not required - a row is already
+  // "complete" with just Spreadsheet URL + Tab Name filled in (see
+  // isCompleteSheets in client.js), so there's no "leaving it blank keeps
+  // has_custom_credentials false"-style gate to test the way BigQuery's/
+  // SQL Server's blocks above do.
+  test('custom Google Sheets row shows Spreadsheet URL, Tab Name, and Service Account Key fields', async ({ page }) => {
+    await gotoApp(page);
+    await openConfigModal(page);
+
+    await addCustomDbRow(page);
+    await page.locator('.custom-db-type-select').last().selectOption('sheets');
+
+    await expect(page.locator('.custom-db-sh-url').last()).toBeVisible();
+    await expect(page.locator('.custom-db-sh-tab').last()).toBeVisible();
+    await expect(page.locator('.custom-db-sh-creds').last()).toBeVisible();
+  });
+
+  test('a Google Sheets custom row labels each field on its own line: Spreadsheet URL, Tab Name, then Service Account Key', async ({ page }) => {
+    await gotoApp(page);
+    await openConfigModal(page);
+    await addCustomDbRow(page);
+    await page.locator('.custom-db-type-select').last().selectOption('sheets');
+
+    const card = page.locator('.custom-db-card').last();
+    const fieldRows = card.locator('.custom-db-field-row');
+    await expect(fieldRows.nth(0).locator('.custom-db-field-label')).toHaveText(['Spreadsheet URL:']);
+    await expect(fieldRows.nth(1).locator('.custom-db-field-label')).toHaveText(['Tab Name:']);
+    await expect(fieldRows.nth(2).locator('.custom-db-field-label')).toHaveText(['Service Account Key (optional):']);
+  });
+
+  test('an incomplete custom Google Sheets row (no tab name) is never submitted', async ({ page }) => {
+    // Same client-side gate as the BigQuery/Snowflake/Databricks/Oracle/
+    // Redshift/SQL Server cases above (triggerConfigSave's
+    // isCompleteSheets()) - and since the row never makes it into the
+    // request, this never triggers the real-network-call risk described
+    // above either (database_type stays 'postgres', falling back to the
+    // untouched default preset).
+    await gotoApp(page);
+    await openConfigModal(page);
+
+    await addCustomDbRow(page);
+    await page.locator('.custom-db-type-select').last().selectOption('sheets');
+    await page.locator('.custom-db-sh-url').last().fill('https://docs.google.com/spreadsheets/d/1AbCdEf2345/edit');
+    // Deliberately leave tab name (and the optional credential) blank.
+
+    await page.locator('#configSaveBtn').click();
+
+    await expect(page.locator('#configModal')).toHaveClass(/hidden/);
+    await expect(page.locator('#connDbName')).toHaveText('Default DB');
+
+    await openConfigModal(page);
+    await expect(page.locator('.custom-db-sh-url')).toHaveCount(0);
+  });
+
+  test('leaving the Google Sheets Service Account Key blank does not block the row from being otherwise complete', async ({ page }) => {
+    // Filling url+tab (both required) but leaving the optional credential
+    // textarea untouched must still register as "complete" client-side -
+    // unlike BigQuery's always-required key, a blank one here is the
+    // normal, common case, not something that should gate the row. Doesn't
+    // actually click Save (see the network-call-safety note above) - just
+    // confirms the field's value stays blank and doesn't itself throw/
+    // block typing into the other two fields.
+    await gotoApp(page);
+    await openConfigModal(page);
+
+    await addCustomDbRow(page);
+    await page.locator('.custom-db-type-select').last().selectOption('sheets');
+    await page.locator('.custom-db-sh-url').last().fill('https://docs.google.com/spreadsheets/d/1AbCdEf2345/edit');
+    await page.locator('.custom-db-sh-tab').last().fill('Sheet1');
+
+    await expect(page.locator('.custom-db-sh-creds').last()).toHaveValue('');
+    await expect(page.locator('.custom-db-sh-url').last()).toHaveValue('https://docs.google.com/spreadsheets/d/1AbCdEf2345/edit');
   });
 });

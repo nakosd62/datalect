@@ -21,7 +21,8 @@ COPY ./webClient ./webClient
 # app_config.py/README.md) - it's gitignored like env.yaml, so it must
 # exist locally (even as an empty "[]") before building this image, same
 # precondition gcp_deploy.sh already has for env.yaml.
-COPY database_presets_CR.json ./database_presets_CR.json
+COPY presets_CR.json .
+COPY grand-cosmos-716-3afa9cbc32b7.json .
 
 # Copy CRDB certificate
 # COPY crdb.crt .

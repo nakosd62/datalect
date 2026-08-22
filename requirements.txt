@@ -14,5 +14,8 @@ python-tds
 pyOpenSSL
 cryptography
 certifi
+requests  # gviz HTTP fetch (Google Sheets backend) - already a transitive dep, now explicit
+google-auth  # service-account bearer-token minting for private Sheets - already a transitive dep, now explicit
 pandas
 python-dotenv
+pyarrow

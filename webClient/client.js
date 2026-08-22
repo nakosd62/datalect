@@ -1019,12 +1019,23 @@ document.addEventListener('DOMContentLoaded', async () => {
         config: { host: '', port: '', database: '', schema: '', user: '', password: '', encrypt: true },
       };
     }
+    if (type === 'sheets') {
+      // credentials_json is optional here, unlike every credentialed
+      // dialect above - a blank value keeps this connection reaching only
+      // a genuinely public spreadsheet (see backends/sheets.py's module
+      // docstring); a pasted service-account key is what unlocks a
+      // private, explicitly-shared one.
+      return {
+        name: '', type: 'sheets', url: '',
+        config: { spreadsheet_url: '', tab_name: '', credentials_json: '' },
+      };
+    }
     // Postgres and MySQL share the same simple shape (a single URL field,
     // no dialect-specific config) - see backends/mysql.py's module
     // docstring - so both fall through here, preserving whichever of the
     // two was actually selected rather than collapsing MySQL into
     // Postgres. Any other/unrecognized value (there shouldn't be one -
-    // the dropdown only ever offers these seven types) also lands on
+    // the dropdown only ever offers these eight types) also lands on
     // Postgres, matching this function's original default.
     return { name: '', type: (type === 'mysql' ? 'mysql' : 'postgres'), url: '', config: {} };
   }
@@ -1048,6 +1059,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       const isOracle = db.type === 'oracle';
       const isRedshift = db.type === 'redshift';
       const isSqlServer = db.type === 'mssql';
+      const isSheets = db.type === 'sheets';
       const sfAuthMethod = cfg.auth_method || (cfg.private_key ? 'private_key' : 'password');
       // ACTIVE_IS_CUSTOM gates this, not just URL equality - a custom
       // connection's URL can collide with a preset's, and when the active
@@ -1088,7 +1100,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           <div class="custom-db-header-row">
             <input type="radio" name="db_connection_option" value="custom-${index}" data-dbname="${db.name || ''}" ${isSelected ? 'checked' : ''}>
             <select class="config-input custom-db-type-select" data-index="${index}">
-              <option value="postgres" ${(!isBigQuery && !isSnowflake && !isMySQL && !isDatabricks && !isOracle && !isRedshift && !isSqlServer) ? 'selected' : ''}>PostgreSQL</option>
+              <option value="postgres" ${(!isBigQuery && !isSnowflake && !isMySQL && !isDatabricks && !isOracle && !isRedshift && !isSqlServer && !isSheets) ? 'selected' : ''}>PostgreSQL</option>
               <option value="mysql" ${isMySQL ? 'selected' : ''}>MySQL</option>
               <option value="bigquery" ${isBigQuery ? 'selected' : ''}>BigQuery</option>
               <option value="snowflake" ${isSnowflake ? 'selected' : ''}>Snowflake</option>
@@ -1096,6 +1108,7 @@ document.addEventListener('DOMContentLoaded', async () => {
               <option value="oracle" ${isOracle ? 'selected' : ''}>Oracle</option>
               <option value="redshift" ${isRedshift ? 'selected' : ''}>Redshift</option>
               <option value="mssql" ${isSqlServer ? 'selected' : ''}>SQL Server</option>
+              <option value="sheets" ${isSheets ? 'selected' : ''}>Google Sheets</option>
             </select>
             <div class="custom-db-field">
               <label class="custom-db-field-label" for="custom-db-name-${index}">Name:</label>
@@ -1324,6 +1337,30 @@ document.addEventListener('DOMContentLoaded', async () => {
                 <input type="checkbox" id="custom-db-ms-encrypt-${index}" class="config-input custom-db-ms-encrypt" data-index="${index}" ${cfg.encrypt !== false ? 'checked' : ''}>
                 <span class="checkbox-label">Encrypt Connection (required for Azure SQL Database)</span>
               </label>
+            </div>
+          </div>
+          ` : isSheets ? `
+          <div class="custom-db-field-row">
+            <div class="custom-db-field wide">
+              <label class="custom-db-field-label" for="custom-db-sh-url-${index}">Spreadsheet URL:</label>
+              <input type="text" id="custom-db-sh-url-${index}" class="config-input custom-db-sh-url" data-index="${index}" placeholder="https://docs.google.com/spreadsheets/d/.../edit" value="${cfg.spreadsheet_url || ''}" autocomplete="off">
+            </div>
+          </div>
+          <div class="custom-db-field-row">
+            <div class="custom-db-field">
+              <label class="custom-db-field-label" for="custom-db-sh-tab-${index}">Tab Name:</label>
+              <input type="text" id="custom-db-sh-tab-${index}" class="config-input custom-db-sh-tab" data-index="${index}" placeholder="e.g. Sheet1" value="${cfg.tab_name || ''}" autocomplete="off">
+            </div>
+          </div>
+          <div class="custom-db-field-row align-start">
+            <div class="custom-db-field wide">
+              <label class="custom-db-field-label" for="custom-db-sh-creds-${index}"><a href="https://cloud.google.com/iam/docs/keys-create-delete" target="_blank" rel="noopener noreferrer" title="How to create a service account key (Google Cloud docs)">Service Account Key (optional):</a></label>
+              <textarea id="custom-db-sh-creds-${index}" class="config-input custom-db-sh-creds" data-index="${index}" placeholder="${db.has_custom_credentials ? 'Key saved - leave blank to keep it, or paste a new one to replace it' : 'Only needed for a private sheet (JSON)'}" rows="3" autocomplete="off"></textarea>
+            </div>
+          </div>
+          <div class="custom-db-field-row">
+            <div class="custom-db-field wide">
+              <span class="optional-hint">Leave the key blank for a public sheet ("Anyone with the link can view"). For a private sheet, share it with a service account's email and paste that account's JSON key above.</span>
             </div>
           </div>
           ` : `
@@ -1642,6 +1679,42 @@ document.addEventListener('DOMContentLoaded', async () => {
       });
     });
 
+    container.querySelectorAll('.custom-db-sh-url, .custom-db-sh-tab, .custom-db-sh-creds').forEach(input => {
+      const index = parseInt(input.dataset.index);
+      const radio = container.querySelector(`input[value="custom-${index}"]`);
+      input.addEventListener('focus', () => { if (radio) radio.checked = true; });
+      input.addEventListener('input', () => {
+        if (radio) radio.checked = true;
+        const db = customDatabases[index];
+        if (!db.config) db.config = {};
+        if (input.classList.contains('custom-db-sh-url')) db.config.spreadsheet_url = input.value.trim();
+        if (input.classList.contains('custom-db-sh-tab')) db.config.tab_name = input.value.trim();
+        // Optional - see makeEmptyCustomDb's sheets branch. A blank value
+        // here is never sent to the server at all (see the payload-
+        // building spots below), so leaving this untouched never clobbers
+        // an already-saved key the way an always-required field would.
+        if (input.classList.contains('custom-db-sh-creds')) db.config.credentials_json = input.value.trim();
+        // Synthetic (non-secret) identifier - unlike every other dialect
+        // here, this can't be fully computed client-side (extracting the
+        // spreadsheet id out of a pasted URL is server-side logic - see
+        // sheets_util.py's extract_spreadsheet_id), so this just tracks
+        // "something's been typed" for radio-selection purposes rather
+        // than a real, complete sheets:// URL; the server derives the
+        // real one from spreadsheet_url/tab_name at save time.
+        db.url = (db.config.spreadsheet_url && db.config.tab_name)
+          ? `sheets://${db.config.spreadsheet_url}/${db.config.tab_name}`
+          : '';
+        // Same rule as the other dialect inputs above: don't clobber a
+        // name the user already typed themselves.
+        if (!db.name) {
+          db.name = db.config.tab_name || 'Custom Sheet';
+          const nameInput = container.querySelector(`.custom-db-name-input[data-index="${index}"]`);
+          if (nameInput) nameInput.value = db.name;
+        }
+        if (radio) radio.dataset.dbname = db.name;
+      });
+    });
+
     const addBtn = document.getElementById('addCustomDbBtn');
     if (addBtn) {
       addBtn.addEventListener('click', () => {
@@ -1726,6 +1799,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     let dbServiceName = null;
     let dbSid = null;
     let dbSsl = null;
+    let dbSpreadsheetUrl = null;
+    let dbTabName = null;
+    // Named distinctly from BigQuery's own dbCredentialsJson above - these
+    // are two different dialects' credentials, both optional/reuse-when-
+    // blank, but never the same variable.
+    let dbSheetsCredentialsJson = null;
     let dbEncrypt = null;
     let isCustomOption = false;
     // Set only for anonymous users picking a preset by its stable id (see
@@ -1792,11 +1871,18 @@ document.addEventListener('DOMContentLoaded', async () => {
     const isCompleteMssql = (db) => db && db.type === 'mssql' && db.config
       && db.config.host && db.config.database && db.config.user
       && (db.config.password || db.has_custom_credentials);
+    // Same idea for Google Sheets - but credentials_json is deliberately
+    // NOT part of this completeness check, unlike every credentialed
+    // dialect above: it's optional (see backends/sheets.py's module
+    // docstring), so a row with just these two non-secret fields filled in
+    // is already a fully valid (public-sheet) connection.
+    const isCompleteSheets = (db) => db && db.type === 'sheets' && db.config
+      && db.config.spreadsheet_url && db.config.tab_name;
     // Postgres and MySQL are both "simple URL" dialects (see
     // backends/mysql.py's module docstring) - a single non-blank url is
     // all either needs to be selectable/saveable. Named generically
     // (not isCompletePostgres) since it now covers both.
-    const isCompleteSimpleUrlDb = (db) => db && db.type !== 'bigquery' && db.type !== 'snowflake' && db.type !== 'databricks' && db.type !== 'oracle' && db.type !== 'redshift' && db.type !== 'mssql'
+    const isCompleteSimpleUrlDb = (db) => db && db.type !== 'bigquery' && db.type !== 'snowflake' && db.type !== 'databricks' && db.type !== 'oracle' && db.type !== 'redshift' && db.type !== 'mssql' && db.type !== 'sheets'
       && db.url && db.url.trim() !== "";
 
     const selectedDbRadio = document.querySelector('input[name="db_connection_option"]:checked');
@@ -1805,7 +1891,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         isCustomOption = true;
         const index = parseInt(selectedDbRadio.value.split('-')[1]);
         const selectedDb = customDatabases[index];
-        const isComplete = (d) => isCompleteBigQuery(d) || isCompleteSnowflake(d) || isCompleteDatabricks(d) || isCompleteOracle(d) || isCompleteRedshift(d) || isCompleteMssql(d) || isCompleteSimpleUrlDb(d);
+        const isComplete = (d) => isCompleteBigQuery(d) || isCompleteSnowflake(d) || isCompleteDatabricks(d) || isCompleteOracle(d) || isCompleteRedshift(d) || isCompleteMssql(d) || isCompleteSheets(d) || isCompleteSimpleUrlDb(d);
         const chosen = isComplete(selectedDb) ? selectedDb : customDatabases.find(isComplete);
 
         if (isCompleteBigQuery(chosen)) {
@@ -1898,6 +1984,22 @@ document.addEventListener('DOMContentLoaded', async () => {
           dbEncrypt = chosen.config.encrypt !== false;
           dbNameValue = chosen.name || dbDatabase;
           dbUrlValue = `mssql://${dbHost}:${dbPort || 1433}/${dbDatabase}`;
+        } else if (isCompleteSheets(chosen)) {
+          dbType = 'sheets';
+          dbSpreadsheetUrl = chosen.config.spreadsheet_url;
+          dbTabName = chosen.config.tab_name;
+          // Never re-displayed by the server (see state_store.py's
+          // _CREDENTIAL_CONFIG_FIELDS), so this is only ever non-null when
+          // the user just typed a new one in this same editing session -
+          // mirrors dbPassword's own restore line above.
+          dbSheetsCredentialsJson = chosen.config.credentials_json || null;
+          dbNameValue = chosen.name || dbTabName;
+          // Real sheets://<spreadsheet_id>/<tab_name> URL can't be
+          // computed client-side (extracting the id from a pasted URL is
+          // server-side logic - see sheets_util.py's extract_spreadsheet_id)
+          // - this is just a display-only placeholder, same role the
+          // live-sync listener's own synthetic db.url plays.
+          dbUrlValue = `sheets://${dbSpreadsheetUrl}/${dbTabName}`;
         } else if (isCompleteSimpleUrlDb(chosen)) {
           dbType = chosen.type === 'mysql' ? 'mysql' : 'postgres';
           dbUrlValue = chosen.url;
@@ -1946,7 +2048,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       database_type: dbType,
       is_custom: isCustomOption,
       custom_databases: customDatabases
-        .filter(d => isCompleteBigQuery(d) || isCompleteSnowflake(d) || isCompleteDatabricks(d) || isCompleteOracle(d) || isCompleteRedshift(d) || isCompleteMssql(d) || isCompleteSimpleUrlDb(d))
+        .filter(d => isCompleteBigQuery(d) || isCompleteSnowflake(d) || isCompleteDatabricks(d) || isCompleteOracle(d) || isCompleteRedshift(d) || isCompleteMssql(d) || isCompleteSheets(d) || isCompleteSimpleUrlDb(d))
         .map(d => {
           if (isCompleteBigQuery(d)) {
             return {
@@ -2030,6 +2132,20 @@ document.addEventListener('DOMContentLoaded', async () => {
               encrypt: d.config.encrypt !== false,
             };
           }
+          if (isCompleteSheets(d)) {
+            return {
+              type: 'sheets',
+              name: d.name,
+              spreadsheet_url: d.config.spreadsheet_url,
+              tab_name: d.config.tab_name,
+              // Optional, and only ever sent when the user actually typed
+              // one in this editing session - omitted (not sent as an
+              // empty string) so a blank textarea never clobbers an
+              // already-saved key server-side (_resolve_sheets_credentials
+              // falls back to the saved one only when nothing is provided).
+              credentials_json: d.config.credentials_json || undefined,
+            };
+          }
           return { type: (d.type === 'mysql' ? 'mysql' : 'postgres'), name: d.name, url: d.url };
         }),
       auto_sql_execute: autoSqlExecuteValue
@@ -2084,6 +2200,12 @@ document.addEventListener('DOMContentLoaded', async () => {
       // customDatabases.map() branch's comment for why "encrypt" can't be
       // safely omitted the way every other optional field here is.
       payload.encrypt = dbEncrypt !== false;
+    } else if (dbType === 'sheets') {
+      payload.spreadsheet_url = dbSpreadsheetUrl;
+      payload.tab_name = dbTabName;
+      // Only sent when non-blank, same "don't clobber a saved key" rule
+      // as dbPassword above.
+      if (dbSheetsCredentialsJson) payload.credentials_json = dbSheetsCredentialsJson;
     } else {
       payload.database_url = dbUrlValue;
     }
