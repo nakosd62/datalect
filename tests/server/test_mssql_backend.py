@@ -35,13 +35,15 @@ import sys
 from decimal import Decimal
 from datetime import date
 
+import pytest
+
 from helpers import SERVER_DIR
 
 if SERVER_DIR not in sys.path:
     sys.path.insert(0, SERVER_DIR)
 
 from backends.mssql import MssqlBackend
-from backends.base import DB_CONNECT_TIMEOUT_SECONDS
+from backends.base import DB_CONNECT_TIMEOUT_SECONDS, SqlExecutionError
 from helpers import install_fake_mssql_connect, make_fake_mssql_connection
 
 
@@ -569,6 +571,24 @@ def test_execute_multiple_statements_returns_one_result_per_statement():
     assert results[1]["rows"] == [{"id": 1}]
 
 
+def test_execute_mid_script_failure_raises_sql_execution_error_with_partial_results():
+    """Regression guard for the multi-statement "one tab per statement,
+    including the failed one" UI feature - see SqlExecutionError's
+    docstring in backends/base.py."""
+    responses = [([], None, 1), RuntimeError("Incorrect syntax near 'bad'")]
+    conn, cursor = make_fake_mssql_connection(responses)
+    backend = MssqlBackend()
+    with pytest.raises(SqlExecutionError) as exc_info:
+        backend.execute(conn, "UPDATE t SET x=1; SELEC bad syntax; SELECT 1;")
+
+    err = exc_info.value
+    assert len(err.results) == 1
+    assert err.failed_statement == "SELEC bad syntax"
+    assert err.statement_index == 1
+    assert err.total_statements == 3
+    assert "Incorrect syntax near 'bad'" in str(err)
+
+
 # --- pytds/pyOpenSSL compatibility shim (TLS hostname validation) -----------
 # pytds's own pytds.tls.validate_host calls pyOpenSSL's X509.get_extension(),
 # which was removed in pyOpenSSL 26.2.0 (confirmed directly against the
@@ -601,8 +621,8 @@ def _self_signed_cert(common_name, san_dns_names=()):
         x509.CertificateBuilder()
         .subject_name(name).issuer_name(name).public_key(key.public_key())
         .serial_number(x509.random_serial_number())
-        .not_valid_before(datetime.datetime.utcnow())
-        .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=1))
+        .not_valid_before(datetime.datetime.now(datetime.timezone.utc))
+        .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1))
     )
     if san_dns_names:
         builder = builder.add_extension(

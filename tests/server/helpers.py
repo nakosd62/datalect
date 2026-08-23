@@ -55,7 +55,14 @@ _ENV_VARS_TO_CLEAR = [
     "GEMINI_PRESET_KEYS", "GEMINI_MODEL", "SCHEMA_CACHE_TTL_SECONDS",
     "SCHEMA_MAX_TABLES", "SCHEMA_MAX_TABLE_NAMES_SCANNED",
     "SCHEMA_MAX_SCHEMA_CHARS", "SCHEMA_SHARD_MIN_GROUP_SIZE", "LOG_LEVEL",
-    "CRBOT_HOSTNAME", "CRBOT_PORT", "MAX_GEMINI_ATTEMPTS", "GEMINI_RETRY_DELAY_SECONDS",
+    "CRBOT_HOSTNAME", "CRBOT_PORT", "MAX_TRANSLATION_ATTEMPTS", "TRANSLATION_RETRY_DELAY_SECONDS",
+    "HISTORY_RESULT_MAX_ROWS", "HISTORY_MAX_TURNS",
+    # Claude/Anthropic provider path (translate_routes.py's LLM_PROVIDER
+    # switch) - cleared for the same reason as the Gemini vars above: a
+    # developer's real shell (or CI) plausibly has ANTHROPIC_API_KEY set
+    # (e.g. for using Claude Code itself), which would otherwise leak into
+    # any test that doesn't explicitly pass its own `env`.
+    "LLM_PROVIDER", "CLAUDE_PRESET_KEYS", "ANTHROPIC_API_KEY", "CLAUDE_MODEL",
 ]
 
 
@@ -463,7 +470,14 @@ class FakePgCursor:
         get_schema()'s queries (never read), or a list of 1-tuples/objects
         whose [0] is the column name for execute()'s DML/SELECT queries
         (mirrors psycopg2's cursor.description shape - execute_routes.py's
-        row-shaping only ever reads desc[0])."""
+        row-shaping only ever reads desc[0]).
+
+        An entry may also just be a bare Exception instance instead of a
+        3-tuple - execute() raises it directly rather than treating it as
+        a response, simulating a statement partway through a multi-
+        statement script failing (e.g. a syntax error on statement 2 of
+        3). This is what backends/base.py's SqlExecutionError wraps - see
+        each backend test file's test_execute_*_statement_failure test."""
         self._responses = list(responses)
         self.calls = []
         self.description = None
@@ -479,9 +493,12 @@ class FakePgCursor:
     def execute(self, sql, params=None):
         self.calls.append((sql, params))
         if self._responses:
-            rows, description, rowcount = self._responses.pop(0)
+            item = self._responses.pop(0)
         else:
-            rows, description, rowcount = [], None, -1
+            item = ([], None, -1)
+        if isinstance(item, Exception):
+            raise item
+        rows, description, rowcount = item
         self._rows = rows
         self.description = description
         self.rowcount = rowcount if rowcount is not None else -1

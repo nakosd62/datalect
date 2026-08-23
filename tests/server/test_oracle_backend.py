@@ -26,13 +26,15 @@ import sys
 from decimal import Decimal
 from datetime import date
 
+import pytest
+
 from helpers import SERVER_DIR
 
 if SERVER_DIR not in sys.path:
     sys.path.insert(0, SERVER_DIR)
 
 from backends.oracle import OracleBackend, _set_current_schema, _IDENTIFIER_RE
-from backends.base import DB_CONNECT_TIMEOUT_SECONDS
+from backends.base import DB_CONNECT_TIMEOUT_SECONDS, SqlExecutionError
 from helpers import install_fake_oracle_connect, make_fake_pg_connection
 
 
@@ -519,3 +521,21 @@ def test_execute_multiple_statements_returns_one_result_per_statement():
     results = backend.execute(conn, "UPDATE t SET x=1; SELECT id FROM t;")
     assert len(results) == 2
     assert results[1]["rows"] == [{"id": 1}]
+
+
+def test_execute_mid_script_failure_raises_sql_execution_error_with_partial_results():
+    """Regression guard for the multi-statement "one tab per statement,
+    including the failed one" UI feature - see SqlExecutionError's
+    docstring in backends/base.py."""
+    responses = [([], None, 1), RuntimeError("ORA-00933: SQL command not properly ended")]
+    conn, cursor = make_fake_pg_connection(responses)
+    backend = OracleBackend()
+    with pytest.raises(SqlExecutionError) as exc_info:
+        backend.execute(conn, "UPDATE t SET x=1; SELEC bad syntax; SELECT 1;")
+
+    err = exc_info.value
+    assert len(err.results) == 1
+    assert err.failed_statement == "SELEC bad syntax"
+    assert err.statement_index == 1
+    assert err.total_statements == 3
+    assert "ORA-00933" in str(err)

@@ -1451,6 +1451,25 @@ textarea:focus {
   z-index: 3;
 }
 
+/* A tab for a statement that failed (see client.js's
+   renderResultsWithFailedStatement()) - colored distinctly from every
+   other tab state above so it draws the eye immediately, whether or not
+   it's the currently-active tab. */
+.result-tab-btn--error {
+  color: var(--danger);
+}
+
+.result-tab-btn--error:hover:not(.active) {
+  background-color: var(--danger-glow);
+  color: var(--danger-hover);
+}
+
+.result-tab-btn--error.active {
+  background-color: #0f172a;
+  color: var(--danger);
+  box-shadow: inset 0 -2px 0 var(--danger);
+}
+
 .results-table-wrapper {
   flex: 1;
   min-height: 0;
@@ -2092,6 +2111,21 @@ textarea:focus {
 .status-dot.error {
   background-color: var(--danger);
   box-shadow: 0 0 6px var(--danger);
+}
+
+/* Shown the instant a liveness check (checkDbStatus()/api/ping) starts,
+   for however long it takes to actually resolve - the check itself now
+   runs in the background rather than blocking the config modal's open/
+   Save flow (see client.js), so this is the only visual cue that a check
+   is in flight rather than the dot just sitting on a stale prior state. */
+.status-dot.checking {
+  background-color: var(--text-muted);
+  animation: status-dot-checking-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes status-dot-checking-pulse {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 1; }
 }
 
 .response-cell {

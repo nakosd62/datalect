@@ -199,6 +199,46 @@ def cap_schema_text(text, max_chars=SCHEMA_MAX_CHARS):
     )
 
 
+class SqlExecutionError(Exception):
+    """Raised by Backend.execute() when one statement in a multi-statement
+    script fails partway through - e.g. statement 2 of 4 has a syntax
+    error. Every SQL-capable backend's execute() runs statements in a
+    single ordered loop (see e.g. backends/postgres.py) and used to just
+    let the driver's raw exception propagate straight out of that loop,
+    silently discarding every result dict already collected for the
+    statements that succeeded before the failure - execute_routes.py had
+    no way to report them, and the UI had no way to show them.
+
+    Wrapping the failure in this instead preserves that partial state so
+    execute_routes.py can build a response with one entry per ATTEMPTED
+    statement (successes + the failure), letting the client render one
+    results tab per statement - the same tabbed UI as the all-succeeded
+    case - with the failed statement's tab flagged, instead of a single
+    opaque "Execution Error" that loses track of what did or didn't run.
+    Statements after the failure are never attempted at all (correct
+    behavior - a script shouldn't keep running after an error), so there's
+    nothing to report for those; only `results` (before) + the failed
+    statement itself are ever available here.
+    """
+    def __init__(self, message, results, failed_statement, statement_index, total_statements):
+        super().__init__(message)
+        #: list of {"statement", "columns", "rows", "rowCount"} dicts for
+        #: every statement that completed successfully BEFORE the failure,
+        #: in order - the same shape execute() always returns on success.
+        self.results = results
+        #: raw (semicolon-stripped) SQL text of the statement that failed.
+        self.failed_statement = failed_statement
+        #: 0-based position of the failed statement among every statement
+        #: in the script - always equal to len(results), since backends
+        #: stop at the first failure, but kept explicit for clarity at the
+        #: call site rather than making execute_routes.py re-derive it.
+        self.statement_index = statement_index
+        #: how many statements sqlparse split the script into in total -
+        #: lets the client/caller say "statement 2 of 4 failed" even
+        #: though statements 3-4 were never attempted.
+        self.total_statements = total_statements
+
+
 class Backend(ABC):
     """One implementation per supported SQL dialect/database product."""
 
@@ -247,9 +287,15 @@ class Backend(ABC):
         """Run one or more statements in `sql_text` and return a list of
         {"statement", "columns", "rows", "rowCount"} dicts, one per
         statement - the same shape execute_routes.py has always returned
-        to the frontend. Let exceptions propagate; execute_routes.py is
-        responsible for catching them and surfacing the raw error message
-        to the client (see the docstring at the top of that file)."""
+        to the frontend. If a statement partway through fails, raise
+        SqlExecutionError (see its docstring above) instead of letting the
+        raw driver exception propagate directly, so the statements that
+        succeeded before it aren't silently lost. A failure on the very
+        first statement, or a backend with no multi-statement concept
+        (e.g. sheets.py), MAY still just let the original exception
+        propagate - execute_routes.py handles both: SqlExecutionError gets
+        the richer partial-results response, anything else falls back to
+        the plain {"success": false, "error": ...} shape it's always had."""
 
     @abstractmethod
     def identity_label(self, connection):

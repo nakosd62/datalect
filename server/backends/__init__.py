@@ -9,7 +9,7 @@ Databricks later means adding one line here (and one new backend file),
 not touching any route or db.py dispatch logic.
 """
 
-from .base import Backend
+from .base import Backend, SqlExecutionError
 from .postgres import PostgresBackend
 from .bigquery import BigQueryBackend
 from .snowflake import SnowflakeBackend
@@ -45,4 +45,4 @@ def get_backend(descriptor):
     return backend
 
 
-__all__ = ["Backend", "get_backend"]
+__all__ = ["Backend", "get_backend", "SqlExecutionError"]

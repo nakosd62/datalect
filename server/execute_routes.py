@@ -13,6 +13,24 @@ talking to psycopg2, a BigQuery job client, or anything else. Its own job
 is just: resolve the connection, time the call, shape the HTTP response,
 and translate any backend exception into the existing error JSON shape.
 
+A multi-statement script (semicolon-separated) that fails partway through
+raises backends.SqlExecutionError instead of a bare exception (see that
+class's docstring) - this route builds a richer failure response for that
+case specifically, so the client can render every ATTEMPTED statement
+(the ones that succeeded, plus the one that failed) as its own tab, the
+same tabbed UI as an all-succeeded response, rather than one opaque error
+that loses track of what did or didn't run:
+  {"success": false, "error": "<failing statement's raw DB error>",
+   "results": [...succeeded-statement dicts, in order...],
+   "failedStatement": "<raw SQL text of the statement that failed>",
+   "failedIndex": <0-based position among all statements>,
+   "totalStatements": <how many statements the script was split into>,
+   "executionTimeMs": ...}
+Any other exception (connect() failure, a single-statement script's own
+error, a backend with no multi-statement concept) keeps the original flat
+shape: {"success": false, "error": ..., "executionTimeMs": ...} - no
+"results"/"failedStatement" keys at all.
+
 Also owns /api/ping, a separate lightweight liveness check for the status
 dot (see that route's own docstring for why it isn't just /api/execute
 with a hardcoded query string).
@@ -25,7 +43,7 @@ from flask import Blueprint, request, jsonify
 from app_config import logger
 from auth import get_or_create_session_id, get_current_user_identity, apply_session_cookie
 from db import resolve_conn_str
-from backends import get_backend
+from backends import get_backend, SqlExecutionError
 
 execute_bp = Blueprint('execute', __name__)
 
@@ -66,6 +84,28 @@ def execute_query():
         })
         return apply_session_cookie(resp, session_id)
 
+    except SqlExecutionError as e:
+        # A multi-statement script failed partway through - e.results holds
+        # every statement that succeeded BEFORE the failure (see that
+        # class's docstring in backends/base.py and this module's own
+        # docstring for the resulting response shape). Same "log server-
+        # side, return the raw message" posture as the plain-Exception
+        # branch below, just with the extra positional detail attached.
+        execution_time_ms = round((time.time() - start_time) * 1000, 2)
+        logger.warning(
+            "SQL execution error for user=%s (statement %d/%d): %s",
+            user_identity, e.statement_index + 1, e.total_statements, e
+        )
+        resp = jsonify({
+            'success': False,
+            'error': str(e),
+            'results': e.results,
+            'failedStatement': e.failed_statement,
+            'failedIndex': e.statement_index,
+            'totalStatements': e.total_statements,
+            'executionTimeMs': execution_time_ms
+        })
+        return apply_session_cookie(resp, session_id), 400
     except Exception as e:
         execution_time_ms = round((time.time() - start_time) * 1000, 2)
         # Note: unlike the other handlers in this codebase, we intentionally

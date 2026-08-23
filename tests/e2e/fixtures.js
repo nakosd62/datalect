@@ -167,15 +167,30 @@ async function mockTranslate(page, { sql, error, status } = {}) {
 /** Intercept POST /api/execute at the browser network layer. Pass either
  * `results` (an array of {columns, rows, rowCount} - the shape
  * renderMultiTurnResults() expects) for success, or `error`+`status` for a
- * failure - mirrors execute_routes.py's real response shapes. */
-async function mockExecute(page, { results, error, status } = {}) {
+ * failure - mirrors execute_routes.py's real response shapes.
+ *
+ * For a multi-statement script that fails PARTWAY through (the
+ * SqlExecutionError path - see execute_routes.py's module docstring),
+ * also pass `failedStatement` alongside `error`, plus `results` (the
+ * statements that succeeded BEFORE the failure) and optionally
+ * `failedIndex`/`totalStatements` - mirrors that route's richer failure
+ * shape so a spec can exercise client.js's renderResultsWithFailedStatement()
+ * tabbed rendering instead of the flat single-error block. */
+async function mockExecute(page, { results, error, status, failedStatement, failedIndex, totalStatements } = {}) {
   await page.route('**/api/execute', async (route) => {
     if (route.request().method() !== 'POST') return route.fallback();
     if (error !== undefined) {
+      const body = { success: false, error };
+      if (failedStatement !== undefined) {
+        body.results = results || [];
+        body.failedStatement = failedStatement;
+        body.failedIndex = failedIndex !== undefined ? failedIndex : (results || []).length;
+        body.totalStatements = totalStatements !== undefined ? totalStatements : body.failedIndex + 1;
+      }
       await route.fulfill({
         status: status || 400,
         contentType: 'application/json',
-        body: JSON.stringify({ success: false, error }),
+        body: JSON.stringify(body),
       });
     } else {
       await route.fulfill({

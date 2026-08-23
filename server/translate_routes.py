@@ -8,8 +8,8 @@ history -> Gemini `Content` conversion, the system prompt, and the
 /api/translate streams its response as newline-delimited JSON (NDJSON)
 rather than a single JSON body, so a client can show live "retrying..."
 feedback while the retry loop below (the single place in this app that
-retries a translation - see MAX_GEMINI_ATTEMPTS/_classify_gemini_error)
-works through a transient Gemini failure, instead of the request just
+retries a translation - see MAX_TRANSLATION_ATTEMPTS/_classify_gemini_error)
+works through a transient LLM failure, instead of the request just
 appearing to hang. See translate_query()'s stream_translation() for the
 exact line shapes and the HTTP-status-code trade-off streaming requires.
 """
@@ -23,6 +23,7 @@ from flask import Blueprint, request, jsonify, Response, stream_with_context
 from google import genai
 from google.genai import types
 from google.genai import errors as genai_errors
+import anthropic
 
 # from app_config import DEFAULT_MODEL, logger, log_and_generalize_error
 from app_config import DEFAULT_MODEL, logger
@@ -32,6 +33,20 @@ from db import resolve_conn_str, get_database_schema, record_translation
 from backends import get_backend
 
 translate_bp = Blueprint('translate', __name__)
+
+# Which LLM backend /api/translate uses. Set LLM_PROVIDER=claude in the
+# environment to switch this whole route over to Claude; anything else
+# (including unset, the default) keeps the original Gemini path exactly as
+# it was before. No other code path in this file branches on this except
+# stream_translation() and the setup right before it.
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "gemini").strip().lower()
+
+# claude-sonnet-5 is a solid default for NL-to-SQL: strong structured-output
+# reasoning at a much lower cost than the top-tier model. Override per
+# request the same way gemini_model already can (data['claude_model'] /
+# data['model']), or via this env var for a fleet-wide default change with
+# no code edit.
+DEFAULT_CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5")
 
 # Per-dialect opening lines for the system instruction below - the rest of
 # the instruction (output format, NO SQL sentinels, etc.) is identical
@@ -124,26 +139,66 @@ _DIALECT_PROMPT_INTROS = {
 }
 _DEFAULT_DIALECT_PROMPT_INTRO = _DIALECT_PROMPT_INTROS["PostgreSQL"]
 
-# Two retryable Gemini failure kinds, each worth a few automatic retries -
-# the same request usually gets through shortly after. Anything else (bad
-# request, invalid model, auth failure, etc.) will just fail the same way
-# again, so it's raised immediately instead.
+# Past-turn query results embedded back into the prompt as chat history were
+# previously uncapped (max_rows=len(rws) - i.e. "show all of them"). A wide
+# result set from even one earlier turn, multiplied across up to 20 retained
+# history turns, is exactly what can blow a prompt out to millions of
+# tokens - this is what tripped Claude's 1M-token request limit. This caps
+# how many rows of a PAST turn's results get serialized back into the LLM
+# prompt; it has no effect on what the current turn's results show in the
+# UI. Override via env var if 50 is too aggressive/lenient for your data.
+HISTORY_RESULT_MAX_ROWS = int(os.environ.get("HISTORY_RESULT_MAX_ROWS", 50))
+
+# How many conversational turns of history are sent back to the LLM. A
+# "turn" here is a user message + the model's reply to it - 2 entries in
+# the history list per turn - so the default of 10 turns keeps the last 20
+# entries, same as the previous hardcoded -20 slice. Configurable since a
+# large schema/result-heavy app may need this lower to stay under a
+# provider's token limit (see HISTORY_RESULT_MAX_ROWS above for the other
+# lever on that same problem).
+HISTORY_MAX_TURNS = int(os.environ.get("HISTORY_MAX_TURNS", 10))
+
+# There are two, INDEPENDENT retry mechanisms below, each with its own
+# budget - they used to share one counter (MAX_GEMINI_ATTEMPTS), which
+# quietly conflated two unrelated things now that both Gemini and Claude
+# are supported. Keep them straight:
 #
-# GEMINI_RETRY_DELAY_SECONDS applies ONLY to a 5xx/transient server-side
-# hiccup - the same key is reused, and the failure is about Gemini's own
-# backend momentarily struggling, not about anything the client did, so a
-# brief pause before hitting the exact same thing again gives it a moment
-# to clear. A 429 (per-key rate limit/capacity exhausted) is a different
-# story: the next attempt uses a DIFFERENT key (see _classify_gemini_error's
-# rotate_key), which isn't subject to whatever limit the failed key just
-# hit, so there's nothing to wait out - that retry fires immediately, with
-# no delay (see _classify_gemini_error below).
+# 1. Transient-error retries (MAX_TRANSLATION_ATTEMPTS /
+#    TRANSLATION_RETRY_DELAY_SECONDS below) - a provider's own backend is
+#    momentarily struggling (a 5xx, a dropped connection), unrelated to
+#    which API key was used. The SAME key is reused, after a
+#    TRANSLATION_RETRY_DELAY_SECONDS pause to give the problem a moment to
+#    clear. This bucket is shared by BOTH providers - see
+#    _classify_gemini_error/_classify_claude_error - and bounded by
+#    MAX_TRANSLATION_ATTEMPTS total calls (initial call + retries).
 #
-# Both knobs are configurable via env vars (e.g. to tune retry behavior for
-# a noisier Gemini rollout without a code change) - same int()/float()-on-
-# getenv pattern as SCHEMA_CACHE_TTL_SECONDS in schema_cache.py.
-MAX_GEMINI_ATTEMPTS = int(os.environ.get("MAX_GEMINI_ATTEMPTS", 5))
-GEMINI_RETRY_DELAY_SECONDS = float(os.environ.get("GEMINI_RETRY_DELAY_SECONDS", 1))
+# 2. Gemini's own key-rotation retry (see _classify_gemini_error's 429
+#    case) - a per-key rate limit/capacity exhaustion, where the fix is
+#    simply "use a different configured key", not "wait". This is a
+#    Gemini-specific hack: it only exists because this app supports
+#    configuring a POOL of Gemini keys (GEMINI_PRESET_KEYS) to rotate
+#    through, a pattern Claude isn't assumed to have (see
+#    _classify_claude_error's docstring). Its retry fires immediately (no
+#    delay - the next key was never subject to the limit that just hit),
+#    and its OWN budget is simply "one attempt per configured key" - i.e.
+#    it keeps going until every key in GEMINI_PRESET_KEYS has been tried
+#    once (see the retry loop below), a count that has nothing to do with
+#    MAX_TRANSLATION_ATTEMPTS and isn't a separate env var of its own.
+#
+# Anything that isn't one of these two retryable kinds (bad request,
+# invalid model, auth failure, etc.) just fails the same way every time,
+# so it's raised immediately instead of wasting a retry on it.
+#
+# MAX_TRANSLATION_ATTEMPTS/TRANSLATION_RETRY_DELAY_SECONDS are configurable
+# via env vars (e.g. to tune retry behavior for a noisier rollout without a
+# code change) - same int()/float()-on-getenv pattern as
+# SCHEMA_CACHE_TTL_SECONDS in schema_cache.py. Formerly named
+# MAX_GEMINI_ATTEMPTS/GEMINI_RETRY_DELAY_SECONDS - renamed now that they
+# govern both providers' transient-error retries, not just Gemini's; there's
+# no back-compat alias, so an existing deployment setting the old names
+# needs updating.
+MAX_TRANSLATION_ATTEMPTS = int(os.environ.get("MAX_TRANSLATION_ATTEMPTS", 5))
+TRANSLATION_RETRY_DELAY_SECONDS = float(os.environ.get("TRANSLATION_RETRY_DELAY_SECONDS", 1))
 
 
 def get_gemini_api_keys():
@@ -173,6 +228,65 @@ def pick_gemini_api_key(exclude=None):
     return random.choice(keys)
 
 
+def get_claude_api_keys():
+    """Collect Claude API keys. Supports an optional comma-separated
+    CLAUDE_PRESET_KEYS env var (same pool pattern as GEMINI_PRESET_KEYS,
+    for load-balancing across several paid keys); falls back to the single
+    standard ANTHROPIC_API_KEY var if that's not set, which is the normal
+    case for one paid account."""
+    preset_keys_env = os.environ.get("CLAUDE_PRESET_KEYS", "")
+    keys = [k.strip() for k in preset_keys_env.split(",") if k.strip()]
+    if keys:
+        return keys
+    single = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    return [single] if single else []
+
+
+def pick_claude_api_key(exclude=None):
+    """Same selection logic as pick_gemini_api_key: random choice, avoiding
+    already-tried keys in `exclude` where a fresh alternative exists. With
+    only one configured key (the common case) this just returns it."""
+    keys = get_claude_api_keys()
+    if not keys:
+        return None
+    if exclude:
+        remaining = [k for k in keys if k not in exclude]
+        if remaining:
+            return random.choice(remaining)
+    return random.choice(keys)
+
+
+def _classify_claude_error(exc):
+    """Decide whether/how to retry a failed Claude call. Unlike Gemini (see
+    _classify_gemini_error below), Claude never rotates keys here: the
+    key-pool-rotation retry is a Gemini-specific hack for an app that's
+    known to configure a POOL of Gemini keys (GEMINI_PRESET_KEYS) to spread
+    load/rate-limits across - Claude isn't assumed to have that, so ALL of
+    its retryable failures - including rate limits and "overloaded" - just
+    wait and retry with the same key, same as a transient Gemini 5xx would:
+      - RateLimitError (429), a 529 "overloaded" APIStatusError, any other
+        5xx APIStatusError, or a connection-level APIConnectionError: retry
+        with the same key after TRANSLATION_RETRY_DELAY_SECONDS.
+      - Anything else (bad request, auth failure, invalid model): not
+        retried, same as Gemini.
+    """
+    if isinstance(exc, anthropic.RateLimitError):
+        return {"rotate_key": False, "delay": TRANSLATION_RETRY_DELAY_SECONDS}
+
+    if isinstance(exc, anthropic.APIStatusError):
+        code = getattr(exc, "status_code", None)
+        if code == 529:  # Claude-specific "overloaded, try again" status
+            return {"rotate_key": False, "delay": TRANSLATION_RETRY_DELAY_SECONDS}
+        if isinstance(code, int) and 500 <= code < 600:
+            return {"rotate_key": False, "delay": TRANSLATION_RETRY_DELAY_SECONDS}
+        return None
+
+    if isinstance(exc, anthropic.APIConnectionError):
+        return {"rotate_key": False, "delay": TRANSLATION_RETRY_DELAY_SECONDS}
+
+    return None
+
+
 def _gemini_error_code(exc):
     """Best-effort extraction of the HTTP-style status code the google-genai
     SDK attaches to APIError subclasses. Different SDK versions have used
@@ -187,22 +301,28 @@ def _gemini_error_code(exc):
 # Retry policy, keyed by failure type. This is the single place to add
 # retry behavior for a new kind of Gemini failure as it comes up - each
 # classifier below just needs to return a dict describing how to retry:
-#   - delay (float): seconds to sleep before the next attempt. Only ever
-#     non-zero for a failure that's NOT key-related (see rotate_key below) -
-#     waiting only makes sense when the next attempt is otherwise identical
-#     to the one that just failed (same key, same everything), giving
-#     whatever went wrong a moment to clear. When the next attempt already
-#     differs (a different key), there's nothing to wait out.
-#   - rotate_key (bool): pick a different configured API key for the next
-#     attempt rather than reusing the one that just failed. Used for
-#     capacity/rate-limit errors: the failed key is (at least momentarily)
-#     out of capacity, but a different configured key almost certainly
-#     isn't, so that retry fires immediately (delay=0) rather than sitting
-#     idle waiting out a limit a different key was never subject to.
-#     Transient server-side errors aren't key-related at all, so they
-#     retry with the same key instead - and since nothing changed about
-#     the request, they DO wait out GEMINI_RETRY_DELAY_SECONDS first, on
-#     the theory the same problem needs a moment to pass.
+#   - delay (float): seconds to sleep before the next attempt, drawn from
+#     the shared TRANSLATION_RETRY_DELAY_SECONDS budget (see the comment
+#     above MAX_TRANSLATION_ATTEMPTS). Only ever non-zero for a failure
+#     that's NOT key-related (see rotate_key below) - waiting only makes
+#     sense when the next attempt is otherwise identical to the one that
+#     just failed (same key, same everything), giving whatever went wrong
+#     a moment to clear. When the next attempt already differs (a
+#     different key), there's nothing to wait out.
+#   - rotate_key (bool): pick a different configured Gemini API key for the
+#     next attempt rather than reusing the one that just failed, drawing
+#     from the SEPARATE, Gemini-only key-rotation budget (one attempt per
+#     configured GEMINI_PRESET_KEYS entry - see the retry loop in
+#     stream_translation()). Used for capacity/rate-limit errors: the
+#     failed key is (at least momentarily) out of capacity, but a
+#     different configured key almost certainly isn't, so that retry fires
+#     immediately (delay=0) rather than sitting idle waiting out a limit a
+#     different key was never subject to. This is Gemini's ONLY - see
+#     _classify_claude_error, which never sets this. Transient server-side
+#     errors aren't key-related at all, so they retry with the same key
+#     instead - and since nothing changed about the request, they DO wait
+#     out TRANSLATION_RETRY_DELAY_SECONDS first, on the theory the same
+#     problem needs a moment to pass.
 # Returning None means "don't retry this - raise immediately" (e.g. bad
 # request, invalid model, auth failure - these fail the same way every
 # time, so retrying wastes the attempt budget).
@@ -217,8 +337,11 @@ def _classify_gemini_error(exc):
     # the same limit again - and since that next attempt uses a key that
     # was never subject to the limit that just failed, there's nothing to
     # wait out: it retries immediately (delay=0), not after
-    # GEMINI_RETRY_DELAY_SECONDS (that delay is reserved for the 5xx case
-    # below, where the same key retries against the same problem).
+    # TRANSLATION_RETRY_DELAY_SECONDS (that delay is reserved for the 5xx
+    # case below, where the same key retries against the same problem).
+    # This rotate_key retry draws from its own budget - one attempt per
+    # configured Gemini key - entirely independent of
+    # MAX_TRANSLATION_ATTEMPTS (see stream_translation()'s retry loop).
     if code == 429:
         return {"rotate_key": True, "delay": 0}
 
@@ -226,12 +349,12 @@ def _classify_gemini_error(exc):
     # Gemini occasionally throws) unrelated to which key was used, so the
     # same key is fine to retry with. Unlike the 429 case above, the next
     # attempt is otherwise identical to the one that just failed, so this
-    # one DOES wait out GEMINI_RETRY_DELAY_SECONDS first, giving the
+    # one DOES wait out TRANSLATION_RETRY_DELAY_SECONDS first, giving the
     # transient condition a moment to actually pass before trying the
     # exact same thing again.
     is_server_error = (isinstance(code, int) and 500 <= code < 600) or isinstance(exc, genai_errors.ServerError)
     if is_server_error:
-        return {"rotate_key": False, "delay": GEMINI_RETRY_DELAY_SECONDS}
+        return {"rotate_key": False, "delay": TRANSLATION_RETRY_DELAY_SECONDS}
 
     return None
 
@@ -269,8 +392,9 @@ def build_gemini_history_contents(history):
                 cols = res.get('columns') or []
                 rws = res.get('rows') or []
                 row_count = res.get('rowCount', len(rws))
-                header = f"[Query Result {i + 1} - {row_count} row(s) total, showing {len(rws)}]"
-                result_blocks.append(header + "\n" + format_results_table_text(cols, rws, max_rows=len(rws)))
+                shown_rows = min(len(rws), HISTORY_RESULT_MAX_ROWS)
+                header = f"[Query Result {i + 1} - {row_count} row(s) total, showing {shown_rows}]"
+                result_blocks.append(header + "\n" + format_results_table_text(cols, rws, max_rows=HISTORY_RESULT_MAX_ROWS))
             combined_text = combined_text + "\n\n" + "\n\n".join(result_blocks)
 
         contents.append(
@@ -282,17 +406,155 @@ def build_gemini_history_contents(history):
     return contents
 
 
+def build_claude_history_messages(history):
+    """Same purpose as build_gemini_history_contents above, targeting
+    Claude's message shape instead: a plain list of {"role", "content"}
+    dicts. Gemini's "model" role becomes Claude's "assistant"; "user" is
+    unchanged. The results-appending logic is identical to the Gemini
+    version - only the returned container shape differs."""
+    messages = []
+    for msg in history:
+        role = msg.get("role")
+        text = msg.get("text")
+        if not (role and text):
+            continue
+
+        combined_text = text
+        hist_results = msg.get("results")
+        if hist_results:
+            result_blocks = []
+            for i, res in enumerate(hist_results):
+                cols = res.get('columns') or []
+                rws = res.get('rows') or []
+                row_count = res.get('rowCount', len(rws))
+                shown_rows = min(len(rws), HISTORY_RESULT_MAX_ROWS)
+                header = f"[Query Result {i + 1} - {row_count} row(s) total, showing {shown_rows}]"
+                result_blocks.append(header + "\n" + format_results_table_text(cols, rws, max_rows=HISTORY_RESULT_MAX_ROWS))
+            combined_text = combined_text + "\n\n" + "\n\n".join(result_blocks)
+
+        messages.append({
+            "role": "assistant" if role == "model" else role,
+            "content": combined_text,
+        })
+    return messages
+
+
+def _call_gemini(client, model, contents, system_instruction):
+    """One Gemini generate_content call. Returns (text, usage_dict) - the
+    usage_dict shape is shared with _call_claude below so the retry loop
+    and the response-building code in stream_translation() don't need to
+    know which provider actually ran.
+
+    No explicit caching setup here, unlike _call_claude below: Gemini 2.5+
+    models cache matching prefixes automatically ("implicit caching") with
+    no opt-in call or config field required - Google's own docs are
+    explicit that "there is nothing you need to do" beyond what
+    stream_translation() already does structurally (putting the large,
+    stable schema/history content ahead of the ever-changing new prompt).
+    Cache hits are reported back via usage_metadata.cached_content_token_count,
+    surfaced below the same way a real cache read is for Claude."""
+    response = client.models.generate_content(
+        model=model,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=system_instruction,
+            temperature=0.1,
+            # See the long comment on automatic_function_calling further
+            # down in the original file history - unchanged from before.
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+        )
+    )
+    text = response.text.strip() if response.text else ""
+    usage = response.usage_metadata
+    return text, {
+        "input_tokens": usage.prompt_token_count if usage else 0,
+        "output_tokens": usage.candidates_token_count if usage else 0,
+        "total_tokens": usage.total_token_count if usage else 0,
+        "thinking_tokens": getattr(usage, 'thoughts_token_count', 0) if usage else 0,
+        "cached_content_tokens": getattr(usage, 'cached_content_token_count', 0) if usage else 0,
+    }
+
+
+def _mark_claude_cache_boundary(message):
+    """Converts a plain {"role", "content": <str>} message (the shape
+    build_claude_history_messages()/translate_query() build) into
+    Anthropic's content-block form, with an ephemeral cache_control marker
+    on that block. Claude has no automatic/implicit caching the way Gemini
+    2.5+ does (see _call_gemini's docstring and this module's docstring) -
+    a block only ever gets cached if explicitly marked like this. Marking
+    it here means everything up to and including this message - system
+    prompt, schema, and all history through this point - becomes a
+    candidate cached prefix; see translate_query()'s comment on why the
+    last already-accumulated history turn (not the ever-changing new
+    prompt at the end) is the right message to mark."""
+    message["content"] = [{
+        "type": "text",
+        "text": message["content"],
+        "cache_control": {"type": "ephemeral"},
+    }]
+
+
+def _call_claude(client, model, messages, system_instruction):
+    """One Claude messages.create call. Returns (text, usage_dict) in the
+    same shape _call_gemini returns above.
+
+    No `temperature` here on purpose: Claude Opus 4.7 and later (which
+    includes the claude-sonnet-5 default) reject sampling parameters
+    (temperature/top_p/top_k) outright rather than just ignoring them -
+    Anthropic deprecated them for these newer models. This app wants
+    low-variance SQL generation anyway, and these models are tuned for
+    that by default without needing temperature pinned to near-0.
+
+    The system prompt (dialect_intro + the fixed formatting rules) is sent
+    as its own cache_control-marked block - it's identical on every call
+    for a given dialect, so caching it benefits every session using that
+    dialect, not just one conversation. Below Anthropic's per-model
+    minimum cacheable size (1024 tokens for Sonnet, more for Haiku) this
+    marker is simply a no-op - no error, the content just isn't written to
+    the cache - so marking it unconditionally is always safe."""
+    response = client.messages.create(
+        model=model,
+        max_tokens=4096,
+        system=[{
+            "type": "text",
+            "text": system_instruction,
+            "cache_control": {"type": "ephemeral"},
+        }],
+        messages=messages,
+    )
+    text = "".join(block.text for block in response.content if block.type == "text").strip()
+    usage = response.usage
+    return text, {
+        "input_tokens": usage.input_tokens if usage else 0,
+        "output_tokens": usage.output_tokens if usage else 0,
+        "total_tokens": (usage.input_tokens + usage.output_tokens) if usage else 0,
+        # This app doesn't use extended thinking on the Claude path, so
+        # this is always 0 - reported anyway so record_translation() and
+        # the NDJSON payload don't need a provider-specific case for it.
+        "thinking_tokens": 0,
+        # Tokens actually served from cache on THIS call (a cache miss/
+        # write reports 0 here even though cache_creation_input_tokens is
+        # nonzero) - same semantics as Gemini's cached_content_token_count
+        # above, hence the shared field name.
+        "cached_content_tokens": getattr(usage, 'cache_read_input_tokens', 0) if usage else 0,
+    }
+
+
 @translate_bp.route('/api/translate', methods=['POST'])
 def translate_query():
     data = request.get_json() or {}
 
-    gemini_model = data.get('gemini_model') or data.get('model') or DEFAULT_MODEL
-    tried_gemini_keys = set()
-    api_key = pick_gemini_api_key()
-
-    if not api_key:
-        return jsonify({'error': 'Gemini API key is not configured.'}), 400
-    tried_gemini_keys.add(api_key)
+    if LLM_PROVIDER == "claude":
+        llm_model = data.get('claude_model') or data.get('model') or DEFAULT_CLAUDE_MODEL
+        api_key = pick_claude_api_key()
+        if not api_key:
+            return jsonify({'error': 'Claude API key is not configured.'}), 400
+    else:
+        llm_model = data.get('gemini_model') or data.get('model') or DEFAULT_MODEL
+        api_key = pick_gemini_api_key()
+        if not api_key:
+            return jsonify({'error': 'Gemini API key is not configured.'}), 400
+    tried_llm_keys = {api_key}
 
     prompt = data.get('prompt', '').strip()
     if not prompt:
@@ -305,7 +567,7 @@ def translate_query():
     user_identity = get_current_user_identity(session_id)
     conn_str = resolve_conn_str(data.get('database_url'), user_identity)
 
-    history = data.get('history', [])[-20:]
+    history = data.get('history', [])[-(HISTORY_MAX_TURNS * 2):]
     force_schema_refresh = bool(data.get('refresh_schema'))
 
     # Everything past this point - the schema fetch, the Gemini retry loop,
@@ -338,7 +600,10 @@ def translate_query():
         nonlocal api_key
         try:
             schema = get_database_schema(conn_str, user_identity, force_refresh=force_schema_refresh)
-            client = genai.Client(api_key=api_key)
+            if LLM_PROVIDER == "claude":
+                client = anthropic.Anthropic(api_key=api_key)
+            else:
+                client = genai.Client(api_key=api_key)
 
             try:
                 dialect_name = get_backend(conn_str).dialect_name
@@ -351,96 +616,152 @@ def translate_query():
                 "Format the result data to be easily readable. For example, format timestamps as date:hour:min:sec.\n"
                 "Return ONLY the raw SQL code block. Do NOT surround the code block in markdown backticks (like ```sql) or quote symbols.\n"
                 "If you can respond to the prompt succinctly based on your general-purpose training, return your response prepended by the string '*** NO SQL ***'\n"
-                "If the prompt is about this app itself (yDyL) respond as follows: '*** NO SQL *** OPEN HELP POPUP ***'\n"
+                "If the prompt is about the data available in the database that is currently configured, return your response based on your knowledge of the schema and include an ER diagram using ascii art. Prepend the string '*** NO SQL ***' to your response\n"
+                "If the prompt is about this app itself, respond as follows: '*** NO SQL *** OPEN HELP POPUP ***'\n"
                 "If you cannot respond at all with reasonable confidence, return '*** NO SQL *** I am not able to respond to your prompt.'\n"
                 "If you run into any error, return '*** NO SQL *** I ran into this error: <the error>'\n"
             )
 
-            user_message_content = f"Database Schema:\n{schema}\n\nUser Request: {prompt}\n\nSQL Query:"
+            # Sequencing matters here for prompt-caching purposes: the schema
+            # is large and identical across every call in a given session
+            # (barring a schema refresh), so it belongs as far to the front
+            # of the input as possible - ahead of history, and ahead of the
+            # ever-different new prompt. It can't be its own leading
+            # message, though: Claude's Messages API rejects two consecutive
+            # same-role messages ("roles must alternate between user and
+            # assistant"), and history already starts with a "user" turn, so
+            # a standalone schema-only user message in front of it would
+            # violate that. Instead it's prepended onto whichever message
+            # actually comes first - history's oldest turn when there is
+            # history, or the new prompt itself on a conversation's very
+            # first call. Either way the final order is system prompt ->
+            # schema -> history -> new prompt, and from the second call in a
+            # conversation onward, that first message (schema + the oldest
+            # turn's unchanged text) is byte-identical across calls - the
+            # ever-growing, cacheable prefix Claude's cache_control marker
+            # below (and Gemini's automatic implicit caching) relies on.
+            schema_block = f"Database Schema:\n{schema}\n\n"
+            new_prompt_content = f"User Request: {prompt}\n\nSQL Query:"
 
-            contents = build_gemini_history_contents(history)
-            contents.append(
-                types.Content(
-                    role="user",
-                    parts=[types.Part.from_text(text=user_message_content)]
+            if LLM_PROVIDER == "claude":
+                llm_input = build_claude_history_messages(history)
+                if llm_input:
+                    llm_input[0]["content"] = schema_block + llm_input[0]["content"]
+                    # Marks the end of the accumulated (stable) prefix -
+                    # everything from the system prompt through this
+                    # message is a caching candidate; only the new prompt
+                    # appended below is left unmarked, since it's the one
+                    # part guaranteed to differ every call. See
+                    # _mark_claude_cache_boundary's docstring.
+                    _mark_claude_cache_boundary(llm_input[-1])
+                else:
+                    new_prompt_content = schema_block + new_prompt_content
+                llm_input.append({"role": "user", "content": new_prompt_content})
+            else:
+                llm_input = build_gemini_history_contents(history)
+                if llm_input:
+                    first_part = llm_input[0].parts[0]
+                    first_part.text = schema_block + first_part.text
+                else:
+                    new_prompt_content = schema_block + new_prompt_content
+                llm_input.append(
+                    types.Content(
+                        role="user",
+                        parts=[types.Part.from_text(text=new_prompt_content)]
+                    )
                 )
-            )
+
+            # Gemini's key-rotation retries (see _classify_gemini_error's
+            # 429 case) get their own budget, sized to how many keys are
+            # actually configured - NOT to MAX_TRANSLATION_ATTEMPTS. Only
+            # Gemini ever sets rotate_key=True (Claude's classifier never
+            # does - see _classify_claude_error's docstring), so this is
+            # irrelevant when LLM_PROVIDER=="claude". tried_llm_keys already
+            # starts as {api_key} (set above, before this generator runs),
+            # so it's the natural running total of distinct keys tried.
+            gemini_key_pool_size = len(get_gemini_api_keys())
 
             start_time = time.perf_counter()
-            response = None
-            for attempt in range(1, MAX_GEMINI_ATTEMPTS + 1):
+            generated_sql = ""
+            usage_info = {}
+            # transient_attempt tracks the SHARED, both-providers budget for
+            # same-key/after-a-delay retries (MAX_TRANSLATION_ATTEMPTS) -
+            # it's advanced only by the "else" (non-rotate) branch below.
+            # The Gemini-only key-rotation budget above is tracked
+            # separately via tried_llm_keys/gemini_key_pool_size, so a run
+            # of 429s doesn't eat into this counter at all, and vice versa.
+            transient_attempt = 1
+            while True:
                 try:
-                    response = client.models.generate_content(
-                        model=gemini_model,
-                        contents=contents,
-                        config=types.GenerateContentConfig(
-                            system_instruction=system_instruction,
-                            temperature=0.1,
-                            # This app never passes `tools=` to Gemini - there's no
-                            # function-calling in play here, just a single
-                            # translate-this-prompt-to-SQL request per call. The
-                            # google-genai SDK's "automatic function calling" (AFC)
-                            # machinery defaults to "on" regardless of whether any
-                            # tools are configured, and logs a one-time warning
-                            # ("Direct use of AFC in Models.generate_content is not
-                            # recommended...") suggesting the Chat.send_message API
-                            # instead - which doesn't fit here since this app already
-                            # manages its own conversation history explicitly (see
-                            # build_gemini_history_contents above) rather than
-                            # delegating that to an SDK-managed Chat object.
-                            # Disabling AFC costs nothing functionally (there is no
-                            # function-calling behavior to lose) and silences that
-                            # warning at the source instead of just living with it.
-                            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-                        )
-                    )
+                    if LLM_PROVIDER == "claude":
+                        generated_sql, usage_info = _call_claude(client, llm_model, llm_input, system_instruction)
+                    else:
+                        generated_sql, usage_info = _call_gemini(client, llm_model, llm_input, system_instruction)
                     break
                 except Exception as e:
-                    retry_action = _classify_gemini_error(e)
-                    if attempt >= MAX_GEMINI_ATTEMPTS or retry_action is None:
+                    retry_action = (
+                        _classify_claude_error(e) if LLM_PROVIDER == "claude"
+                        else _classify_gemini_error(e)
+                    )
+                    if retry_action is None:
                         raise
 
                     if retry_action["rotate_key"]:
-                        next_key = pick_gemini_api_key(exclude=tried_gemini_keys)
+                        # Gemini-only budget: one attempt per configured
+                        # key. Checked BEFORE picking the next key (rather
+                        # than relying on pick_gemini_api_key's own
+                        # fallback-to-full-pool behavior) so exhaustion is
+                        # decided here, not masked by that fallback.
+                        if len(tried_llm_keys) >= gemini_key_pool_size:
+                            raise
+                        next_key = pick_gemini_api_key(exclude=tried_llm_keys)
                         if next_key != api_key:
                             api_key = next_key
                             client = genai.Client(api_key=api_key)
-                        tried_gemini_keys.add(api_key)
+                        tried_llm_keys.add(api_key)
                         # No "in %ds" here - a key-rotation retry always
                         # fires immediately (see _classify_gemini_error's
                         # comment for why waiting doesn't make sense when
                         # the next attempt already uses a different key).
                         logger.warning(
-                            "Gemini call failed (attempt %d/%d), rotating API key and retrying immediately: %s",
-                            attempt, MAX_GEMINI_ATTEMPTS, e
+                            "%s call failed (%d/%d configured keys tried), rotating API key and retrying immediately: %s",
+                            LLM_PROVIDER, len(tried_llm_keys), gemini_key_pool_size, e
                         )
-                    else:
-                        logger.warning(
-                            "Gemini call failed (attempt %d/%d), retrying in %ds: %s",
-                            attempt, MAX_GEMINI_ATTEMPTS, retry_action["delay"], e
-                        )
+                        # Told to the client before continuing, so
+                        # "retrying..." is visible even though there's no
+                        # delay to speak of.
+                        yield json.dumps({
+                            "status": "retrying",
+                            "attempt": len(tried_llm_keys),
+                            "maxAttempts": gemini_key_pool_size,
+                            "delaySeconds": 0,
+                            "rotatedKey": True,
+                        }) + "\n"
+                        continue
 
+                    # Shared transient-error budget (both providers).
+                    if transient_attempt >= MAX_TRANSLATION_ATTEMPTS:
+                        raise
+                    logger.warning(
+                        "%s call failed (attempt %d/%d), retrying in %ds: %s",
+                        LLM_PROVIDER, transient_attempt, MAX_TRANSLATION_ATTEMPTS, retry_action["delay"], e
+                    )
                     # Told to the client before sleeping, not after, so
                     # "retrying..." is visible for the full delay instead of
                     # appearing right as the next attempt actually fires.
                     yield json.dumps({
                         "status": "retrying",
-                        "attempt": attempt + 1,
-                        "maxAttempts": MAX_GEMINI_ATTEMPTS,
+                        "attempt": transient_attempt + 1,
+                        "maxAttempts": MAX_TRANSLATION_ATTEMPTS,
                         "delaySeconds": retry_action["delay"],
-                        "rotatedKey": retry_action["rotate_key"],
+                        "rotatedKey": False,
                     }) + "\n"
-
-                    # Skip the sleep entirely rather than call time.sleep(0) -
-                    # a key-rotation retry's delay is always 0 (see
-                    # _classify_gemini_error), and this makes "no delay"
-                    # mean no sleep call at all, not a zero-length one.
+                    transient_attempt += 1
                     if retry_action["delay"]:
                         time.sleep(retry_action["delay"])
                     continue
             end_time = time.perf_counter()
 
-            generated_sql = response.text.strip() if response.text else ""
             if generated_sql.startswith("```"):
                 lines = generated_sql.splitlines()
                 if lines[0].startswith("```"):
@@ -450,12 +771,11 @@ def translate_query():
                 generated_sql = "\n".join(lines).strip()
 
             duration = round(1000 * (end_time - start_time))
-            usage = response.usage_metadata
-            input_tokens = usage.prompt_token_count if usage else 0
-            output_tokens = usage.candidates_token_count if usage else 0
-            total_tokens = usage.total_token_count if usage else 0
-            thinking_tokens = getattr(usage, 'thoughts_token_count', 0) if usage else 0
-            cached_content_tokens = getattr(usage, 'cached_content_token_count', 0) if usage else 0
+            input_tokens = usage_info.get("input_tokens", 0)
+            output_tokens = usage_info.get("output_tokens", 0)
+            total_tokens = usage_info.get("total_tokens", 0)
+            thinking_tokens = usage_info.get("thinking_tokens", 0)
+            cached_content_tokens = usage_info.get("cached_content_tokens", 0)
 
             # Anonymous visitors share a single per-session identity
             # (anonymous:<session_id>) rather than a real signed-in one, but
@@ -463,7 +783,7 @@ def translate_query():
             # aggregate usage/cost visibility (e.g. via export_state.py) and
             # because anonymous visitors can view/purge their own history via
             # the app same as anyone else (see history_routes.py).
-            record_translation(user_identity, conn_str, prompt, generated_sql, gemini_model, duration, input_tokens, output_tokens, total_tokens, thinking_tokens, cached_content_tokens)
+            record_translation(user_identity, conn_str, prompt, generated_sql, llm_model, duration, input_tokens, output_tokens, total_tokens, thinking_tokens, cached_content_tokens)
 
             yield json.dumps({
                 'status': 'done',

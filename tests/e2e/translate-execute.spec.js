@@ -97,6 +97,53 @@ test.describe('translate + execute', () => {
     await expect(page.locator('#resultsBody')).toContainText('does not exist');
   });
 
+  test('a multi-statement script that fails partway through shows one tab per attempted statement, with the failed one flagged', async ({ page }) => {
+    // Mirrors execute_routes.py's SqlExecutionError-shaped response: the
+    // first of three statements succeeded, the second failed, and the
+    // third was never attempted (correct behavior - the script stops at
+    // the first failure) - see backends/base.py's SqlExecutionError
+    // docstring and this app's fixtures.js mockExecute() jsdoc.
+    await mockTranslate(page, { sql: 'UPDATE users SET x=1; SELEC bad syntax; SELECT 1;' });
+    await mockExecute(page, {
+      results: [{ columns: null, rows: null, rowCount: 3, statement: 'UPDATE users SET x=1' }],
+      error: 'syntax error at or near "SELEC"',
+      failedStatement: 'SELEC bad syntax',
+      failedIndex: 1,
+      totalStatements: 3,
+    });
+    await gotoApp(page);
+
+    await page.locator('#aiPrompt').fill('do three things, the second one is bad');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect.poll(() => normalizedSql(page)).toContain('SELEC');
+
+    await page.locator('#runBtn').click();
+
+    // Two tabs total - one per ATTEMPTED statement (the succeeded one +
+    // the failed one) - never a third for the statement that was never
+    // run. Scoped to #resultsTabsNav specifically: the unrelated History
+    // modal's own internal tab switcher (#tabBtnTranslations/
+    // #tabBtnStatistics in index.html) reuses the same .result-tab-btn
+    // class name, so an unscoped page-wide locator would overcount.
+    const tabs = page.locator('#resultsTabsNav .result-tab-btn');
+    await expect(tabs).toHaveCount(2);
+
+    // Defaults to showing the failure immediately, not the first
+    // (successful) tab - see renderResultsWithFailedStatement()'s comment
+    // on why.
+    await expect(tabs.nth(1)).toHaveClass(/result-tab-btn--error/);
+    await expect(tabs.nth(1)).toHaveClass(/active/);
+    await expect(tabs.nth(0)).not.toHaveClass(/result-tab-btn--error/);
+    await expect(page.locator('#resultsBody')).toContainText('Execution Error');
+    await expect(page.locator('#resultsBody')).toContainText('syntax error at or near "SELEC"');
+
+    // Clicking back to the first (successful) tab shows its own results,
+    // not the error - the two tabs' content is genuinely independent.
+    await tabs.nth(0).click();
+    await expect(page.locator('#resultsBody')).not.toContainText('Execution Error');
+    await expect(tabs.nth(0)).toHaveClass(/active/);
+  });
+
   test('a conversational (no-SQL) reply is rendered as text, not a query', async ({ page }) => {
     await mockTranslate(page, { sql: '*** NO SQL *** I can only answer questions about your data.' });
     await gotoApp(page);

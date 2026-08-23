@@ -184,11 +184,11 @@ sensible default.
 | Variable | Default | Purpose |
 |---|---|---|
 | `GEMINI_API_KEY` / `GOOGLE_API_KEY` | — | A single Gemini API key. Either name works. |
-| `GEMINI_PRESET_KEYS` | — | Comma-separated list of additional Gemini API keys. The app picks one at random per request and, on a rate-limit (429) error, automatically retries with a different key from the pool. See [`translate_routes.py`](./server/translate_routes.py) for the full retry policy. |
+| `GEMINI_PRESET_KEYS` | — | Comma-separated list of additional Gemini API keys. The app picks one at random per request and, on a rate-limit (429) error, automatically retries with a different key from the pool — immediately, with no delay, for up to one attempt per configured key (this budget is independent of `MAX_TRANSLATION_ATTEMPTS` below and is a Gemini-only mechanism; it does not apply when `LLM_PROVIDER=claude`). See [`translate_routes.py`](./server/translate_routes.py) for the full retry policy. |
 | `GEMINI_MODEL` | `gemini-2.5-flash` | Default model used for translation. |
 | `GEMINI_PRESET_MODELS` | `gemini-2.5-flash,gemini-2.5-pro` | Comma-separated list of models offered in the UI. `GEMINI_MODEL` is auto-added if missing. |
-| `MAX_GEMINI_ATTEMPTS` | `5` | Max attempts (initial call + retries) for a single Gemini request before giving up. Only rate-limit/server-error failures are retried — see [`translate_routes.py`](./server/translate_routes.py). |
-| `GEMINI_RETRY_DELAY_SECONDS` | `1` | Seconds to wait between retry attempts. |
+| `MAX_TRANSLATION_ATTEMPTS` | `5` | Max attempts (initial call + retries) for a single translation request before giving up, for transient (rate-limit/server-error/connection) failures. Shared by both Gemini and Claude — see [`translate_routes.py`](./server/translate_routes.py). (Formerly `MAX_GEMINI_ATTEMPTS`.) |
+| `TRANSLATION_RETRY_DELAY_SECONDS` | `1` | Seconds to wait between transient-error retry attempts. Shared by both providers. (Formerly `GEMINI_RETRY_DELAY_SECONDS`.) |
 
 At least one of `GEMINI_API_KEY`, `GOOGLE_API_KEY`, or
 `GEMINI_PRESET_KEYS` must be set, or `/api/translate` returns a 400

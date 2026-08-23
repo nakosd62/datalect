@@ -4,6 +4,22 @@ directly with a fake Backend so these tests exercise only this route's own
 logic (empty-SQL validation, response shaping, the intentional raw-error-
 message-on-failure behavior) rather than a specific dialect's backend -
 those are covered in test_postgres_backend.py/test_bigquery_backend.py.
+
+The SqlExecutionError-specific tests below cover this route's OWN handling
+of that exception (catching it ahead of the plain-Exception branch,
+shaping the richer partial-results response) - the backends' own raising
+of it on a mid-script failure is covered per-dialect in each
+test_*_backend.py file instead (e.g. test_postgres_backend.py's
+test_execute_mid_script_failure_raises_sql_execution_error_with_partial_
+results).
+
+Those tests build their SqlExecutionError instance off app_env.execute_
+routes.SqlExecutionError (the class object the fresh-imported module under
+test actually holds - see helpers.fresh_import()'s module-reimport
+mechanics) rather than a top-level `from backends.base import
+SqlExecutionError`, which would bind a DIFFERENT class object each test
+gets a fresh reimport, silently failing execute_routes.py's `except
+SqlExecutionError` isinstance check.
 """
 
 import pytest
@@ -104,6 +120,59 @@ def test_execute_failure_returns_raw_error_message(app_env, monkeypatch):
     data = resp.get_json()
     assert data['success'] is False
     assert data['error'] == 'column "foo" does not exist'
+    # A plain (non-SqlExecutionError) failure keeps the original flat
+    # shape - no partial-results keys at all, since there's no positional
+    # detail to report (see test_execute_mid_script_failure_below for the
+    # richer shape a SqlExecutionError produces instead).
+    assert 'results' not in data
+    assert 'failedStatement' not in data
+
+
+def test_execute_mid_script_failure_returns_partial_results_and_failed_statement_info(app_env, monkeypatch):
+    """Core regression guard for the "one tab per statement, including the
+    failed one" UI feature: when the backend raises SqlExecutionError (a
+    statement partway through a multi-statement script failed), the route
+    must surface the successful statements' results plus which statement
+    failed - not just a flat error that loses that detail."""
+    succeeded = [{"statement": "UPDATE t SET x=1", "columns": None, "rows": None, "rowCount": 3}]
+    exc = app_env.execute_routes.SqlExecutionError(
+        'syntax error at or near "SELEC"',
+        results=succeeded,
+        failed_statement="SELEC bad syntax",
+        statement_index=1,
+        total_statements=3,
+    )
+    fake = _FakeBackend(raise_exc=exc)
+    _patch_backend(monkeypatch, app_env, fake)
+    resp = app_env.client.post(
+        '/api/execute',
+        json={'sql': 'UPDATE t SET x=1; SELEC bad syntax; SELECT 1;'}
+    )
+    assert resp.status_code == 400
+    data = resp.get_json()
+    assert data['success'] is False
+    assert data['error'] == 'syntax error at or near "SELEC"'
+    assert data['results'] == succeeded
+    assert data['failedStatement'] == "SELEC bad syntax"
+    assert data['failedIndex'] == 1
+    assert data['totalStatements'] == 3
+    assert 'executionTimeMs' in data
+
+
+def test_execute_mid_script_failure_with_no_prior_successes_still_includes_empty_results(app_env, monkeypatch):
+    """The very first statement failing is still a SqlExecutionError (just
+    with an empty `results` list) - the response shape stays consistent
+    rather than falling back to the flat shape only in this one case."""
+    exc = app_env.execute_routes.SqlExecutionError(
+        "syntax error", results=[], failed_statement="SELEC bad", statement_index=0, total_statements=2,
+    )
+    fake = _FakeBackend(raise_exc=exc)
+    _patch_backend(monkeypatch, app_env, fake)
+    resp = app_env.client.post('/api/execute', json={'sql': 'SELEC bad; SELECT 1;'})
+    data = resp.get_json()
+    assert data['results'] == []
+    assert data['failedIndex'] == 0
+    assert data['totalStatements'] == 2
 
 
 def test_execute_connect_failure_also_returns_400_with_raw_message(app_env, monkeypatch):

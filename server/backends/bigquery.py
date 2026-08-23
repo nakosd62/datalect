@@ -48,7 +48,7 @@ from google.oauth2 import service_account
 import sqlparse
 
 from .base import (
-    Backend, SCHEMA_MAX_TABLE_NAMES_SCANNED, SCHEMA_MAX_TABLES,
+    Backend, SqlExecutionError, SCHEMA_MAX_TABLE_NAMES_SCANNED, SCHEMA_MAX_TABLES,
     group_date_sharded_tables, cap_kept_tables, cap_schema_text,
 )
 
@@ -280,38 +280,44 @@ class BigQueryBackend(Backend):
             if not stmt_clean:
                 continue
 
-            query_job = self._run(connection, stmt_clean)
-            result = query_job.result()
+            try:
+                query_job = self._run(connection, stmt_clean)
+                result = query_job.result()
 
-            columns = None
-            rows = None
+                columns = None
+                rows = None
 
-            if result.schema:
-                columns = [field.name for field in result.schema]
-                rows = []
-                for row in result:
-                    row_dict = {}
-                    for col in columns:
-                        val = row[col]
-                        if hasattr(val, 'isoformat'):
-                            val = val.isoformat()
-                        elif isinstance(val, decimal.Decimal):
-                            val = float(val)
-                        elif isinstance(val, bytes):
-                            val = val.decode('utf-8', errors='replace')
-                        row_dict[col] = val
-                    rows.append(row_dict)
-                count = len(rows)
-            else:
-                # DML (INSERT/UPDATE/DELETE/MERGE) or DDL - no result rows.
-                affected = getattr(query_job, 'num_dml_affected_rows', None)
-                count = affected if affected is not None else 0
+                if result.schema:
+                    columns = [field.name for field in result.schema]
+                    rows = []
+                    for row in result:
+                        row_dict = {}
+                        for col in columns:
+                            val = row[col]
+                            if hasattr(val, 'isoformat'):
+                                val = val.isoformat()
+                            elif isinstance(val, decimal.Decimal):
+                                val = float(val)
+                            elif isinstance(val, bytes):
+                                val = val.decode('utf-8', errors='replace')
+                            row_dict[col] = val
+                        rows.append(row_dict)
+                    count = len(rows)
+                else:
+                    # DML (INSERT/UPDATE/DELETE/MERGE) or DDL - no result rows.
+                    affected = getattr(query_job, 'num_dml_affected_rows', None)
+                    count = affected if affected is not None else 0
 
-            results.append({
-                'statement': stmt_clean,
-                'columns': columns,
-                'rows': rows,
-                'rowCount': count,
-            })
+                results.append({
+                    'statement': stmt_clean,
+                    'columns': columns,
+                    'rows': rows,
+                    'rowCount': count,
+                })
+            except Exception as e:
+                # Don't let a mid-script failure silently drop every
+                # result already collected in `results` - see
+                # SqlExecutionError's docstring in backends/base.py.
+                raise SqlExecutionError(str(e), results, stmt_clean, len(results), len(statements)) from e
 
         return results

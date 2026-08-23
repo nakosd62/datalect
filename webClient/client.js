@@ -25,7 +25,15 @@ document.addEventListener('DOMContentLoaded', async () => {
   // places) means the turn cap, the "always push in pairs" rule, and the
   // undo/redo bookkeeping only need to be correct in one place.
   function createChatHistoryStore(maxTurns) {
-    const maxEntries = maxTurns * 2;
+    // Not a const: the real cap is the server's HISTORY_MAX_TURNS env var
+    // (see setMaxTurns() below), which isn't known yet at this synchronous
+    // creation point - fetchBackendConfig() hasn't made its first request
+    // yet. maxTurns here is just a same-as-server-default fallback so the
+    // store is usable immediately; setMaxTurns() reconciles it with the
+    // real value as soon as /api/config's response is in, and again on
+    // every subsequent fetchBackendConfig() call, so this can never drift
+    // from what /api/translate actually replays to the LLM.
+    let maxEntries = maxTurns * 2;
     let history = [];
     let future = [];
     let pending = null; // { entry, sql } - see setPending()
@@ -38,6 +46,21 @@ document.addEventListener('DOMContentLoaded', async () => {
         history.push(modelEntry);
         history = history.slice(-maxEntries);
         future = [];
+      },
+      // Applies a new turn cap (from /api/config's history_max_turns) and
+      // immediately re-trims `history` if it's now over the new, smaller
+      // limit - rather than waiting for the next pushTurn() to notice.
+      // Trimming from the front (oldest turns) matches pushTurn()'s own
+      // -maxEntries slice. `future` (the redo stack) is left alone: it's
+      // turns the user already stepped back past, not part of what's
+      // currently sent to the LLM, so it isn't bound by this cap.
+      setMaxTurns(turns) {
+        const n = Number(turns);
+        if (!Number.isFinite(n) || n <= 0) return; // ignore a missing/invalid value - keep the current cap
+        maxEntries = Math.floor(n) * 2;
+        if (history.length > maxEntries) {
+          history = history.slice(-maxEntries);
+        }
       },
       // Marks a chatHistory entry as "SQL generated, awaiting first
       // execution" so executeSql() can fill in its results in place instead
@@ -85,8 +108,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     };
   }
 
-  const MAX_HISTORY_TURNS = 10;
-  const chatStore = createChatHistoryStore(MAX_HISTORY_TURNS);
+  // Same default as the server's HISTORY_MAX_TURNS (translate_routes.py) -
+  // just a fallback until the first fetchBackendConfig() call reconciles
+  // it via chatStore.setMaxTurns(), see createChatHistoryStore() above.
+  const FALLBACK_HISTORY_TURNS = 10;
+  const chatStore = createChatHistoryStore(FALLBACK_HISTORY_TURNS);
 
   let DEFAULT_DB_URL = "";
   let ACTIVE_DB_URL = "";
@@ -674,10 +700,18 @@ document.addEventListener('DOMContentLoaded', async () => {
   // into a fresh translate/execute call or a connection switch.
   function showRetryStatus({ attempt, maxAttempts, rotatedKey }) {
     if (!resultsRetryStatus) return;
+    // Provider-neutral wording: this banner now covers both providers'
+    // shared transient-error retries (translate_routes.py's
+    // MAX_TRANSLATION_ATTEMPTS/TRANSLATION_RETRY_DELAY_SECONDS) as well as
+    // Gemini's own key-rotation retries (rotatedKey: true) - the latter is
+    // Gemini-exclusive (see _classify_claude_error's docstring), so
+    // "switching to a different API key" is only ever shown for Gemini in
+    // practice, but the message itself no longer hardcodes "Gemini" since
+    // a plain transient retry can happen for either provider.
     const keyNote = rotatedKey ? ', switching to a different API key' : '';
     resultsRetryStatus.innerHTML =
       `<span class="retry-status-icon animate-spin">⟳</span> ` +
-      `Gemini had a transient error${keyNote} - retrying (attempt ${attempt} of ${maxAttempts})...`;
+      `Translation hit a transient error${keyNote} - retrying (attempt ${attempt} of ${maxAttempts})...`;
     resultsRetryStatus.classList.remove('hidden');
   }
 
@@ -792,8 +826,25 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
+  // Fires the real liveness check (a genuine connect() + query against
+  // whatever database is active - see /api/ping's own docstring) and
+  // updates the header dot whenever it resolves. Deliberately called
+  // WITHOUT awaiting it from every call site below (updateConnectionDetails())
+  // - a slow/unreachable connection used to make the config modal's open
+  // and Save actions hang for however long /api/ping took (up to
+  // DB_CONNECT_TIMEOUT_SECONDS, ~10s by default, per statement), since
+  // those flows used to `await` this before letting the modal become
+  // visible/closing it. Now the modal opens/closes immediately and this
+  // keeps running in the background, updating the dot in place once it's
+  // done - same end result, just never blocking the UI on it.
   async function checkDbStatus() {
     if (!connDbDot) return;
+
+    // Immediate feedback that a (re)check is now in flight, rather than
+    // leaving the previous connected/disconnected state up for however
+    // long this background check takes - see the "checking" style's own
+    // comment in style.css.
+    connDbDot.className = 'status-dot checking';
 
     try {
       // /api/ping (not /api/execute with a hardcoded query string) - no
@@ -851,7 +902,10 @@ document.addEventListener('DOMContentLoaded', async () => {
           : `Connected to: ${anonDbLabel} (Click to configure)`;
       }
       document.title = `yDyL`;
-      await checkDbStatus();
+      // Deliberately not awaited - see checkDbStatus()'s own comment on
+      // why this must never block the modal open/Save flow that calls
+      // into this function.
+      checkDbStatus();
       return;
     }
 
@@ -889,7 +943,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         connDbName.textContent = `⚠ ${dbDisplayName}`;
       }
       document.title = `yDyL`;
-      await checkDbStatus();
+      // Deliberately not awaited - see checkDbStatus()'s own comment on
+      // why this must never block the modal open/Save flow that calls
+      // into this function.
+      checkDbStatus();
       return;
     }
 
@@ -903,7 +960,10 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     document.title = `yDyL`;
 
-    await checkDbStatus();
+    // Deliberately not awaited - see checkDbStatus()'s own comment on why
+    // this must never block the modal open/Save flow that calls into
+    // this function.
+    checkDbStatus();
   }
 
   // ===========================================================================
@@ -940,6 +1000,12 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (data.auto_sql_execute !== undefined) {
         autoSqlExecuteEnabled = Boolean(data.auto_sql_execute);
       }
+
+      // Keeps the turn-navigation cap in lockstep with HISTORY_MAX_TURNS,
+      // the same env var /api/translate uses to decide how many past
+      // turns actually reach the LLM (see createChatHistoryStore's
+      // setMaxTurns() for why this can't just be a hardcoded constant).
+      chatStore.setMaxTurns(data.history_max_turns);
 
       if (data.auth_enabled && data.google_client_id) {
         googleAuthEnabled = true;
@@ -2819,6 +2885,27 @@ document.addEventListener('DOMContentLoaded', async () => {
     resultsHeader.innerHTML = '';
     resultsBody.innerHTML = '';
 
+    // A synthetic "this statement failed" tab entry (see
+    // renderResultsWithFailedStatement() below) - same error markup
+    // executeSql() has always shown for a single-statement failure, just
+    // scoped to one tab's content instead of replacing the whole results
+    // area, so it sits alongside the other (successful) statements' tabs.
+    if (result && result.isError) {
+      resultsBody.innerHTML = `
+        <tr>
+          <td class="error-cell">
+            <div class="error-container">
+              <span class="error-icon">⚠️</span>
+              <div class="error-details">
+                <strong>Execution Error</strong>
+                <p>${result.error || 'An error occurred during SQL execution.'}</p>
+              </div>
+            </div>
+          </td>
+        </tr>`;
+      return;
+    }
+
     if (!result || (!result.columns && !result.rows)) {
       resultsBody.innerHTML = `<tr><td class="text-center text-muted py-8">Statement executed successfully. No dataset returned.</td></tr>`;
       return;
@@ -2863,16 +2950,25 @@ document.addEventListener('DOMContentLoaded', async () => {
     resultsTabsNav.classList.remove('hidden');
     currentResultsList.forEach((res, idx) => {
       const btn = document.createElement('button');
-      btn.className = `result-tab-btn ${idx === activeResultIndex ? 'active' : ''}`;
+      const isError = !!res.isError;
+      btn.className = `result-tab-btn ${idx === activeResultIndex ? 'active' : ''} ${isError ? 'result-tab-btn--error' : ''}`.trim();
 
       const sqlText = res.query || res.sql || res.statement || '';
       if (sqlText) {
         btn.setAttribute('title', sqlText);
       }
 
-      const count = res.rowCount !== undefined ? res.rowCount : (res.rows ? res.rows.length : 0);
-      const rowLabel = count === 1 ? '1 row' : `${count} rows`;
-      btn.textContent = `Query ${idx + 1} (${rowLabel})`;
+      if (isError) {
+        // Colored differently (via the result-tab-btn--error class) so a
+        // failed statement in an otherwise-successful multi-statement
+        // script draws the eye immediately, instead of looking like just
+        // another results tab.
+        btn.textContent = `Query ${idx + 1} (Error)`;
+      } else {
+        const count = res.rowCount !== undefined ? res.rowCount : (res.rows ? res.rows.length : 0);
+        const rowLabel = count === 1 ? '1 row' : `${count} rows`;
+        btn.textContent = `Query ${idx + 1} (${rowLabel})`;
+      }
 
       btn.addEventListener('click', () => {
         activeResultIndex = idx;
@@ -2896,7 +2992,34 @@ document.addEventListener('DOMContentLoaded', async () => {
     buildResultsTabsNav();
     renderTableResult(currentResultsList[activeResultIndex]);
   }
-  
+
+  // A multi-statement script (semicolon-separated) that fails partway
+  // through gets the SAME tabbed treatment as one that fully succeeds
+  // (renderMultiTurnResults above), rather than one opaque error that
+  // throws away which statements ran and what they returned. `data` is
+  // /api/execute's SqlExecutionError-shaped failure response (see
+  // execute_routes.py's module docstring): `data.results` holds every
+  // statement that succeeded BEFORE the failure, and `data.failedStatement`/
+  // `data.error` describe the one that didn't - there's no tab for
+  // whatever came after it, since the script correctly never got there.
+  function renderResultsWithFailedStatement(data) {
+    const succeeded = Array.isArray(data.results) ? data.results : [];
+    const failedEntry = {
+      statement: data.failedStatement || '',
+      isError: true,
+      error: data.error || 'An error occurred during SQL execution.',
+    };
+    currentResultsList = [...succeeded, failedEntry];
+    // Jump straight to the failed statement's tab rather than defaulting
+    // to the first one (renderMultiTurnResults's success-case behavior) -
+    // it's what the user needs to see first, not something they should
+    // have to go looking for.
+    activeResultIndex = currentResultsList.length - 1;
+
+    buildResultsTabsNav();
+    renderTableResult(currentResultsList[activeResultIndex]);
+  }
+
   function renderNoSqlResponse(rawText) {
     const cleanText = (rawText || '').replace(/^\*\*\*\s*NO\s*SQL\s*\*\*\*\s*/i, '').trim() || rawText || '';
 
@@ -3129,10 +3252,21 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         if (connDbDot) connDbDot.className = 'status-dot connected';
       } else {
-        const errMsg = response.status === 401 
+        const errMsg = response.status === 401
           ? "Authentication required. Please click 'Sign in with Google' in the top-right corner to log in."
           : (data.error || "An error occurred during SQL execution.");
-        if (resultsBody) {
+
+        // A multi-statement script that failed partway through carries
+        // `results` (the statements that succeeded before the failure) and
+        // `failedStatement` (see execute_routes.py's module docstring) -
+        // render those as tabs, same as the success case, with the failed
+        // one flagged, instead of one generic error that loses track of
+        // what did or didn't run. A response with neither key (e.g. a
+        // connect() failure, or a single-statement script with nothing to
+        // report alongside it) falls back to the original flat block.
+        if (Array.isArray(data.results) || data.failedStatement !== undefined) {
+          renderResultsWithFailedStatement({ ...data, error: errMsg });
+        } else if (resultsBody) {
           resultsBody.innerHTML = `
             <tr>
               <td class="error-cell">

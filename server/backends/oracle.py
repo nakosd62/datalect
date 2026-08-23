@@ -113,7 +113,7 @@ import oracledb
 import sqlparse
 
 from .base import (
-    Backend, SCHEMA_MAX_TABLE_NAMES_SCANNED, SCHEMA_MAX_TABLES,
+    Backend, SqlExecutionError, SCHEMA_MAX_TABLE_NAMES_SCANNED, SCHEMA_MAX_TABLES,
     DB_CONNECT_TIMEOUT_SECONDS,
     group_date_sharded_tables, cap_kept_tables, cap_schema_text,
 )
@@ -441,38 +441,44 @@ class OracleBackend(Backend):
                 if not stmt_clean:
                     continue
 
-                cursor.execute(stmt_clean)
-                row_count = cursor.rowcount
+                try:
+                    cursor.execute(stmt_clean)
+                    row_count = cursor.rowcount
 
-                columns = None
-                rows = None
+                    columns = None
+                    rows = None
 
-                if cursor.description:
-                    columns = [desc[0] for desc in cursor.description]
-                    rows = []
-                    for r in cursor.fetchall():
-                        row_dict = {}
-                        for idx, col in enumerate(columns):
-                            val = r[idx]
-                            if hasattr(val, 'isoformat'):
-                                val = val.isoformat()
-                            elif hasattr(val, 'to_eng_string'):
-                                val = float(val)
-                            elif isinstance(val, bytes):
-                                val = val.decode('utf-8', errors='replace')
-                            elif type(val).__name__ == 'Decimal':
-                                val = float(val)
-                            row_dict[col] = val
-                        rows.append(row_dict)
-                    count = len(rows)
-                else:
-                    count = row_count if row_count >= 0 else 0
+                    if cursor.description:
+                        columns = [desc[0] for desc in cursor.description]
+                        rows = []
+                        for r in cursor.fetchall():
+                            row_dict = {}
+                            for idx, col in enumerate(columns):
+                                val = r[idx]
+                                if hasattr(val, 'isoformat'):
+                                    val = val.isoformat()
+                                elif hasattr(val, 'to_eng_string'):
+                                    val = float(val)
+                                elif isinstance(val, bytes):
+                                    val = val.decode('utf-8', errors='replace')
+                                elif type(val).__name__ == 'Decimal':
+                                    val = float(val)
+                                row_dict[col] = val
+                            rows.append(row_dict)
+                        count = len(rows)
+                    else:
+                        count = row_count if row_count >= 0 else 0
 
-                results.append({
-                    'statement': stmt_clean,
-                    'columns': columns,
-                    'rows': rows,
-                    'rowCount': count
-                })
+                    results.append({
+                        'statement': stmt_clean,
+                        'columns': columns,
+                        'rows': rows,
+                        'rowCount': count
+                    })
+                except Exception as e:
+                    # Don't let a mid-script failure silently drop every
+                    # result already collected in `results` - see
+                    # SqlExecutionError's docstring in backends/base.py.
+                    raise SqlExecutionError(str(e), results, stmt_clean, len(results), len(statements)) from e
 
         return results

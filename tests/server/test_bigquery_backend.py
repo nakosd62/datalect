@@ -8,12 +8,15 @@ import sys
 from decimal import Decimal
 from datetime import date
 
+import pytest
+
 from helpers import SERVER_DIR
 
 if SERVER_DIR not in sys.path:
     sys.path.insert(0, SERVER_DIR)
 
 from backends.bigquery import BigQueryBackend
+from backends.base import SqlExecutionError
 from helpers import (
     install_fake_bigquery, schema_query_handler, make_service_account_key_json,
     FakeBQQueryJob,
@@ -252,3 +255,30 @@ def test_execute_multiple_statements(monkeypatch):
     results = backend.execute(conn, "UPDATE t SET x=1; SELECT id FROM t;")
     assert len(results) == 2
     assert results[1]["rows"] == [{"id": 1}]
+
+
+def test_execute_mid_script_failure_raises_sql_execution_error_with_partial_results(monkeypatch):
+    """Regression guard for the multi-statement "one tab per statement,
+    including the failed one" UI feature - see SqlExecutionError's
+    docstring in backends/base.py."""
+    backend, harness = _bq(monkeypatch)
+    calls = {"n": 0}
+
+    def handler(sql, jc):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return FakeBQQueryJob(rows=[], columns=[], num_dml_affected_rows=1)
+        raise RuntimeError("Syntax error: Unexpected keyword SELEC")
+
+    harness.set_handler(handler)
+    conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
+    with pytest.raises(SqlExecutionError) as exc_info:
+        backend.execute(conn, "UPDATE t SET x=1; SELEC bad syntax; SELECT 1;")
+
+    err = exc_info.value
+    assert len(err.results) == 1
+    assert err.results[0]["rowCount"] == 1
+    assert err.failed_statement == "SELEC bad syntax"
+    assert err.statement_index == 1
+    assert err.total_statements == 3
+    assert "Syntax error" in str(err)

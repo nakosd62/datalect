@@ -12,13 +12,15 @@ import sys
 from decimal import Decimal
 from datetime import date
 
+import pytest
+
 from helpers import SERVER_DIR
 
 if SERVER_DIR not in sys.path:
     sys.path.insert(0, SERVER_DIR)
 
 from backends.postgres import PostgresBackend
-from backends.base import DB_CONNECT_TIMEOUT_SECONDS
+from backends.base import DB_CONNECT_TIMEOUT_SECONDS, SqlExecutionError
 from helpers import make_fake_pg_connection, install_fake_postgres_connect
 
 
@@ -276,6 +278,30 @@ def test_execute_converts_decimal_datetime_and_bytes():
     assert isinstance(out_row["price"], float)
     assert out_row["d"] == "2024-01-15"
     assert out_row["data"] == "raw-bytes"
+
+
+def test_execute_mid_script_failure_raises_sql_execution_error_with_partial_results():
+    """Regression guard for the multi-statement "one tab per statement,
+    including the failed one" UI feature: a failure on statement 2 of 3
+    must not silently discard statement 1's already-collected result -
+    see SqlExecutionError's docstring in backends/base.py."""
+    responses = [
+        ([], None, 1),  # statement 1 succeeds
+        RuntimeError('syntax error at or near "SELEC"'),  # statement 2 fails
+    ]
+    conn, cursor = make_fake_pg_connection(responses)
+    backend = PostgresBackend()
+    with pytest.raises(SqlExecutionError) as exc_info:
+        backend.execute(conn, "UPDATE users SET x=1; SELEC bad syntax; SELECT 1;")
+
+    err = exc_info.value
+    assert len(err.results) == 1
+    assert err.results[0]["statement"] == "UPDATE users SET x=1"
+    assert err.results[0]["rowCount"] == 1
+    assert err.failed_statement == "SELEC bad syntax"
+    assert err.statement_index == 1
+    assert err.total_statements == 3
+    assert 'syntax error at or near "SELEC"' in str(err)
 
 
 def test_execute_ignores_blank_statements_between_semicolons():

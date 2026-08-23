@@ -1140,4 +1140,69 @@ test.describe('config modal', () => {
     await expect(page.locator('.custom-db-sh-creds').last()).toHaveValue('');
     await expect(page.locator('.custom-db-sh-url').last()).toHaveValue('https://docs.google.com/spreadsheets/d/1AbCdEf2345/edit');
   });
+
+  // Regression coverage for the modal-sluggishness fix: client.js's
+  // checkDbStatus() (the real /api/ping liveness check driving the header
+  // dot) used to be `await`ed by updateConnectionDetails() - called from
+  // both the modal-open handler and triggerConfigSave() - so a slow/
+  // unreachable connection made the modal hang open/closed for however
+  // long /api/ping took. It's now fired without awaiting it, so the modal
+  // opens/closes immediately and the dot updates whenever the check
+  // actually finishes. These install a deliberately slow /api/ping (well
+  // past any reasonable UI-blocking threshold) AFTER the initial page
+  // load's own ping (mocked instantly by the `test` fixture's default) to
+  // isolate what's being tested here from gotoApp()'s own wait on that
+  // first ping.
+  test('opening the config modal does not block on a slow liveness check', async ({ page }) => {
+    await gotoApp(page);
+
+    let resolvePing;
+    const pingStarted = new Promise((resolve) => { resolvePing = resolve; });
+    await page.route('**/api/ping', async (route) => {
+      if (route.request().method() !== 'GET') return route.fallback();
+      resolvePing();
+      await new Promise((r) => setTimeout(r, 3000));
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ success: true }) });
+    });
+
+    const start = Date.now();
+    await page.locator('#configTriggerBadge').click();
+    await expect(page.locator('#configModal')).not.toHaveClass(/hidden/);
+    const elapsedMs = Date.now() - start;
+
+    // The modal became visible well before the 3s slow ping could have
+    // resolved - proves the open isn't gated on it.
+    expect(elapsedMs).toBeLessThan(2000);
+
+    // The slow ping is genuinely in flight (not skipped) - the dot should
+    // be showing the "checking" state, not a stale connected/disconnected
+    // one, until it resolves.
+    await pingStarted;
+    await expect(page.locator('#connDbDot')).toHaveClass(/checking/);
+
+    // Once the slow ping actually completes, the dot updates in place.
+    await expect(page.locator('#connDbDot')).toHaveClass(/connected/, { timeout: 5000 });
+  });
+
+  test('saving the config does not block on a slow liveness check', async ({ page }) => {
+    await gotoApp(page);
+    await openConfigModal(page);
+
+    await page.route('**/api/ping', async (route) => {
+      if (route.request().method() !== 'GET') return route.fallback();
+      await new Promise((r) => setTimeout(r, 3000));
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ success: true }) });
+    });
+
+    await page.locator('#modalDbRadioGroup input[type="radio"]').first().check();
+
+    const start = Date.now();
+    await page.locator('#configSaveBtn').click();
+    await expect(page.locator('#configModal')).toHaveClass(/hidden/);
+    const elapsedMs = Date.now() - start;
+
+    // The modal closed well before the 3s slow ping could have resolved -
+    // proves Save isn't gated on it either.
+    expect(elapsedMs).toBeLessThan(2000);
+  });
 });

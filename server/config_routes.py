@@ -181,7 +181,7 @@ from flask import Blueprint, request, jsonify
 
 from app_config import (
     CONFIGURED_DBS, DEFAULT_PRESET_ID, PRESET_MODELS,
-    AUTH_ENABLED, IS_CLOUD_RUN, state_store, logger,
+    AUTH_ENABLED, IS_CLOUD_RUN, state_store,
 )
 import os
 from auth import (
@@ -189,10 +189,17 @@ from auth import (
     is_anonymous_user,
 )
 from db import get_conn_identifier, resolve_active_descriptor
-from backends import get_backend
 from state_store import compute_connection_key
 from sheets_util import extract_spreadsheet_id
 import schema_cache
+# Read-only reuse of translate_routes.py's HISTORY_MAX_TURNS - the client
+# needs the same number that already governs how many past turns
+# /api/translate replays to the LLM (see that module's comment on it), so
+# its own turn-navigation cap (chatStore in client.js) can match it exactly
+# instead of carrying an independent, easy-to-drift hardcoded constant. No
+# circular import risk: translate_routes.py doesn't import config_routes.py
+# (or anything that transitively does).
+from translate_routes import HISTORY_MAX_TURNS
 
 config_bp = Blueprint('config', __name__)
 
@@ -1365,18 +1372,24 @@ def handle_config():
         active_db_type_out = ""
         active_is_custom_out = False
     else:
-        db_name, username = "Unknown", "Unknown"
-        backend = None
-        conn = None
-        try:
-            backend = get_backend(active_descriptor)
-            conn = backend.connect(active_descriptor)
-            db_name, username = backend.identity_label(conn)
-        except Exception:
-            logger.exception("Error fetching connection info")
-        finally:
-            if conn and backend:
-                backend.close(conn)
+        # A custom (user-supplied) connection's display name in the UI is
+        # always the name the user gave it when they saved it - sent below
+        # as 'custom_database_name' (see user_custom_name above) - which
+        # client.js's updateConnectionDetails() prefers over 'database_name'
+        # and never actually falls through to it in practice. This branch
+        # used to also do a real backend.connect() + identity_label() call
+        # here purely to populate that 'database_name'/'username' fallback
+        # with the live DB name and connected user - a real network round
+        # trip to the target database on every single GET/POST /api/config,
+        # including on every config-modal open and Save, for a value
+        # nothing in the UI ends up displaying. Removed entirely per the
+        # user's request - db_name now just reuses the already-known custom
+        # name (no connection needed) and username is left blank, since
+        # nothing reads it. identity_label() itself is untouched on every
+        # Backend subclass in case it's wanted again later - this was its
+        # only caller anywhere in the server.
+        db_name = user_custom_name or "Custom"
+        username = ""
         active_conn_str_out = active_conn_str
         active_db_type_out = active_db_type
         # Whether the active connection was explicitly selected as a saved
@@ -1453,6 +1466,11 @@ def handle_config():
         'gemini_preset_keys': PRESET_MODELS,
         'models': PRESET_MODELS,
         'auto_sql_execute': auto_sql_execute,
+        # So the client's own turn-navigation cap (chatStore in client.js)
+        # can match the number of turns /api/translate actually replays to
+        # the LLM, rather than carrying an independent hardcoded constant
+        # that silently drifts if this env var is ever changed.
+        'history_max_turns': HISTORY_MAX_TURNS,
         'database_name': db_name,
         'username': username
     })
