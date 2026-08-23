@@ -132,6 +132,7 @@ _DIALECT_PROMPT_INTROS = {
         "There are no JOINs, no subqueries, and no CASE/COALESCE/CAST - this grammar simply doesn't have them; do not attempt to work around their absence with unsupported syntax.\n"
         "Reference columns ONLY by the spreadsheet letter shown in the schema (A, B, C, ...) - never by header/label text, even though the schema also shows each column's label for readability.\n"
         "Supported clauses: select, where, group by, pivot, order by, limit, offset, label, format, options.\n"
+        "When you use the GROUP BY clause you must include an aggregation even if the user did not request that. In that case include a COUNT of the same column you GROUP BY.\n"
         "Supported functions: year(), month(), day(), quarter(), dayOfWeek(), hour(), minute(), second(), millisecond(), dateDiff(), toDate(), now(), upper(), lower(), plus the aggregates sum(), avg(), count(), min(), max() (valid only alongside group by). Do not invent clauses or functions outside this list.\n"
         "String literals use single quotes.\n"
         "Return EXACTLY ONE query - this dialect has no multi-statement/batch concept, so never return multiple semicolon-separated statements, and do not end the query with a trailing semicolon.\n"
@@ -466,12 +467,22 @@ def _call_gemini(client, model, contents, system_instruction):
     )
     text = response.text.strip() if response.text else ""
     usage = response.usage_metadata
+    cached_content_tokens = getattr(usage, 'cached_content_token_count', 0) if usage else 0
+    # Logged at INFO (this app's default LOG_LEVEL) so cache behavior can be
+    # confirmed directly from the server's own logs rather than relying on
+    # a provider console's dashboard - see the matching log in _call_claude
+    # below for why this was added (both are the concrete way to verify a
+    # cache hit actually happened on a given call, immediately, per-call).
+    logger.info(
+        "Gemini call cache stats: cached_content_tokens=%s prompt_tokens=%s",
+        cached_content_tokens, usage.prompt_token_count if usage else 0,
+    )
     return text, {
         "input_tokens": usage.prompt_token_count if usage else 0,
         "output_tokens": usage.candidates_token_count if usage else 0,
         "total_tokens": usage.total_token_count if usage else 0,
         "thinking_tokens": getattr(usage, 'thoughts_token_count', 0) if usage else 0,
-        "cached_content_tokens": getattr(usage, 'cached_content_token_count', 0) if usage else 0,
+        "cached_content_tokens": cached_content_tokens,
     }
 
 
@@ -524,6 +535,23 @@ def _call_claude(client, model, messages, system_instruction):
     )
     text = "".join(block.text for block in response.content if block.type == "text").strip()
     usage = response.usage
+    cache_read_tokens = getattr(usage, 'cache_read_input_tokens', 0) if usage else 0
+    cache_creation_tokens = getattr(usage, 'cache_creation_input_tokens', 0) if usage else 0
+    # Logged at INFO (this app's default LOG_LEVEL) rather than only
+    # exposed via the Anthropic Console's own usage dashboard - that
+    # dashboard aggregates across the whole workspace/account with its own
+    # refresh delay, so it can't tell you whether THIS call actually hit
+    # the cache. Both numbers are logged (not just the read count carried
+    # in cached_content_tokens below): cache_creation_input_tokens > 0 on a
+    # call means this call WROTE a new cache entry (a miss that primes the
+    # next one), while cache_read_input_tokens > 0 means it actually reused
+    # one written by an earlier call - seeing only the former for a while
+    # after a change like this one is expected and fine, it's the latter
+    # ever becoming nonzero that confirms reuse is really happening.
+    logger.info(
+        "Claude call cache stats: cache_creation_input_tokens=%s cache_read_input_tokens=%s input_tokens=%s",
+        cache_creation_tokens, cache_read_tokens, usage.input_tokens if usage else 0,
+    )
     return text, {
         "input_tokens": usage.input_tokens if usage else 0,
         "output_tokens": usage.output_tokens if usage else 0,
@@ -534,9 +562,9 @@ def _call_claude(client, model, messages, system_instruction):
         "thinking_tokens": 0,
         # Tokens actually served from cache on THIS call (a cache miss/
         # write reports 0 here even though cache_creation_input_tokens is
-        # nonzero) - same semantics as Gemini's cached_content_token_count
-        # above, hence the shared field name.
-        "cached_content_tokens": getattr(usage, 'cache_read_input_tokens', 0) if usage else 0,
+        # nonzero, logged above) - same semantics as Gemini's
+        # cached_content_token_count above, hence the shared field name.
+        "cached_content_tokens": cache_read_tokens,
     }
 
 
@@ -615,11 +643,14 @@ def translate_query():
                 dialect_intro +
                 "Format the result data to be easily readable. For example, format timestamps as date:hour:min:sec.\n"
                 "Return ONLY the raw SQL code block. Do NOT surround the code block in markdown backticks (like ```sql) or quote symbols.\n"
+                "If asked to documnet the SQL command, add comments at the top of the query using standard SQL convenstion for how to mark comments.\n"
                 "If you can respond to the prompt succinctly based on your general-purpose training, return your response prepended by the string '*** NO SQL ***'\n"
                 "If the prompt is about the data available in the database that is currently configured, return your response based on your knowledge of the schema and include an ER diagram using ascii art. Prepend the string '*** NO SQL ***' to your response\n"
-                "If the prompt is about this app itself, respond as follows: '*** NO SQL *** OPEN HELP POPUP ***'\n"
+                "If the prompt is about this app itself, respond as follows: '*** NO SQL *** OPEN HELP POPUP ***'.\n"
                 "If you cannot respond at all with reasonable confidence, return '*** NO SQL *** I am not able to respond to your prompt.'\n"
-                "If you run into any error, return '*** NO SQL *** I ran into this error: <the error>'\n"
+                "If you run into any error, return '*** NO SQL *** I ran into this error: <the error>'.\n"
+                "If you want to respond partly with a SQL command and partly with free text, enclose the free text as follows 'SELECT <your free-text response in quotes> as RESPONSE;'.\n"
+                "If a user asks you who you are or what model you are using, hide this behind a generic response.\n"
             )
 
             # Sequencing matters here for prompt-caching purposes: the schema
@@ -635,11 +666,7 @@ def translate_query():
             # actually comes first - history's oldest turn when there is
             # history, or the new prompt itself on a conversation's very
             # first call. Either way the final order is system prompt ->
-            # schema -> history -> new prompt, and from the second call in a
-            # conversation onward, that first message (schema + the oldest
-            # turn's unchanged text) is byte-identical across calls - the
-            # ever-growing, cacheable prefix Claude's cache_control marker
-            # below (and Gemini's automatic implicit caching) relies on.
+            # schema -> history -> new prompt.
             schema_block = f"Database Schema:\n{schema}\n\n"
             new_prompt_content = f"User Request: {prompt}\n\nSQL Query:"
 
@@ -651,12 +678,45 @@ def translate_query():
                     # everything from the system prompt through this
                     # message is a caching candidate; only the new prompt
                     # appended below is left unmarked, since it's the one
-                    # part guaranteed to differ every call. See
+                    # part guaranteed to differ every call. From the second
+                    # call in a conversation onward, that first message
+                    # (schema + the oldest turn's unchanged text) is
+                    # byte-identical across calls - the ever-growing,
+                    # cacheable prefix this relies on. See
                     # _mark_claude_cache_boundary's docstring.
                     _mark_claude_cache_boundary(llm_input[-1])
+                    llm_input.append({"role": "user", "content": new_prompt_content})
                 else:
-                    new_prompt_content = schema_block + new_prompt_content
-                llm_input.append({"role": "user", "content": new_prompt_content})
+                    # A conversation's very first call - there's no history
+                    # turn to prepend the schema onto and mark, but the
+                    # schema itself is still identical across EVERY first
+                    # call against this DB (this user's next fresh
+                    # conversation, or a different user's, as long as it
+                    # lands within the cache's TTL) - by far the single
+                    # biggest, most repeated, most worth-caching block this
+                    # app ever sends, so it shouldn't go out unmarked just
+                    # because there's no prior turn yet. Concatenating it
+                    # onto new_prompt_content into one plain string (as a
+                    # previous version of this code did) and marking THAT
+                    # would be wrong - the marker would cover the
+                    # ever-different question too, so the exact bytes would
+                    # never repeat and the block would never actually hit.
+                    # Splitting into two content blocks on the same message
+                    # keeps schema_block as its own marked, reusable prefix
+                    # and leaves new_prompt_content unmarked, exactly
+                    # mirroring what _mark_claude_cache_boundary does for
+                    # the has-history case above, just one call earlier.
+                    llm_input.append({
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": schema_block,
+                                "cache_control": {"type": "ephemeral"},
+                            },
+                            {"type": "text", "text": new_prompt_content},
+                        ],
+                    })
             else:
                 llm_input = build_gemini_history_contents(history)
                 if llm_input:

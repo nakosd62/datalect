@@ -937,10 +937,11 @@ def test_claude_schema_precedes_history_and_is_not_glued_to_the_new_prompt(app_f
 
 def test_claude_schema_attaches_to_new_prompt_when_there_is_no_history(app_factory, monkeypatch):
     """With no prior history the new prompt IS the first (and only)
-    message, so it carries the schema directly - the same net text this
-    app has always sent for a conversation's first turn, just now built
-    via the same schema_block prepending logic rather than a separate
-    code path."""
+    message, so it carries the schema directly - but as two separate
+    content blocks (schema, then the new prompt), not one concatenated
+    string, so the schema half can be independently cache_control-marked
+    (see the dedicated cache-control tests below) even on a conversation's
+    very first call."""
     env = app_factory(env={"LLM_PROVIDER": "claude", "ANTHROPIC_API_KEY": "fake-key-1"})
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
@@ -950,19 +951,24 @@ def test_claude_schema_attaches_to_new_prompt_when_there_is_no_history(app_facto
 
     messages = harness.create_calls[0]["messages"]
     assert len(messages) == 1
-    assert messages[0]["content"] == (
-        "Database Schema:\nNo schema description available.\n\n"
-        "User Request: show users\n\nSQL Query:"
-    )
+    content = messages[0]["content"]
+    assert isinstance(content, list) and len(content) == 2
+    assert content[0]["text"] == "Database Schema:\nNo schema description available.\n\n"
+    assert content[1]["text"] == "User Request: show users\n\nSQL Query:"
 
 
 # --- Claude prompt caching (cache_control) ---
 # Claude has no automatic/implicit caching the way Gemini 2.5+ does (see
 # _call_gemini's docstring) - a block is only ever cached if explicitly
 # marked with cache_control. These tests pin down where those markers
-# land: the system prompt always, and the last already-accumulated
-# history turn when there is one - never the new prompt itself, which is
-# guaranteed to differ every call and would gain nothing from caching.
+# land: the system prompt always; the schema block always too, whether
+# that's prepended to the last already-accumulated history turn (when
+# there is history) or split into its own content block on a
+# conversation's very first call (when there isn't) - see
+# translate_query()'s comment on why concatenating the schema onto the
+# ever-changing new prompt and marking THAT would defeat the point. The
+# new prompt itself is never marked, in either case - it's guaranteed to
+# differ every call and would gain nothing from caching.
 
 
 def test_claude_system_prompt_is_cache_control_marked(app_factory, monkeypatch):
@@ -1003,11 +1009,15 @@ def test_claude_cache_control_marks_last_history_turn_not_the_new_prompt(app_fac
     assert messages[3]["content"][0]["cache_control"] == {"type": "ephemeral"}
 
 
-def test_claude_no_cache_control_boundary_when_there_is_no_history(app_factory, monkeypatch):
-    """With no history, the sole message is the new prompt itself (schema
-    attached, per the ordering tests above) - it's still guaranteed to
-    differ every call (it ends in the ever-changing prompt text), so
-    nothing here is marked for caching."""
+def test_claude_schema_block_is_cache_control_marked_even_with_no_history(app_factory, monkeypatch):
+    """With no history, the sole message still splits into two content
+    blocks (see test_claude_schema_attaches_to_new_prompt_when_there_is_no_history
+    above): the schema block IS cache_control-marked here - it's the
+    single largest, most-repeated-across-conversations block this app
+    sends, so it shouldn't have to wait for a second call to start being
+    cacheable. The new-prompt block right after it is left unmarked, since
+    it ends in the ever-changing prompt text and would gain nothing from
+    caching."""
     env = app_factory(env={"LLM_PROVIDER": "claude", "ANTHROPIC_API_KEY": "fake-key-1"})
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
@@ -1017,7 +1027,10 @@ def test_claude_no_cache_control_boundary_when_there_is_no_history(app_factory, 
 
     messages = harness.create_calls[0]["messages"]
     assert len(messages) == 1
-    assert isinstance(messages[0]["content"], str)  # not block form - never marked
+    content = messages[0]["content"]
+    assert isinstance(content, list) and len(content) == 2
+    assert content[0]["cache_control"] == {"type": "ephemeral"}
+    assert "cache_control" not in content[1]
 
 
 def test_claude_reports_cache_read_tokens_via_cached_content_tokens(app_factory, monkeypatch):
