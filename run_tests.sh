@@ -17,6 +17,11 @@ echo " BACKEND TESTING "
 echo "-----------------"
 ./venv/bin/python -m pytest tests/server/
 
+echo "----------------------------"
+echo " UTILITY TESTING (utils/)   "
+echo "----------------------------"
+./venv/bin/python -m pytest tests/utils/
+
 
 echo "--------------------------"
 echo " E2E TESTING (Playwright) "

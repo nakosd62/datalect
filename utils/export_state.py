@@ -52,6 +52,30 @@ def normalize_datetime_columns(df):
     return df
 
 
+def sort_columns_alphabetically(df):
+    """
+    Returns df with its columns reordered alphabetically by name, so every
+    exported CSV's column layout is fully deterministic across separate
+    runs - regardless of source, and with no exceptions for "well-known"
+    columns like doc_id/_source.
+
+    This matters most for Datastore/Firestore: pd.DataFrame(list_of_dicts)
+    (see fetch_datastore) takes its column order from whichever row it
+    processes first, then appends any new keys later rows introduce - and
+    neither a Datastore entity's own property order (dict(entity) just
+    reflects however the client library happened to deserialize that
+    document's fields, not a documented stable ordering) nor its query row
+    order (query.fetch() here has no explicit .order()) is guaranteed
+    stable between two separate export runs, even against unchanged
+    underlying data. SQLite's `SELECT *` column order is already stable
+    (schema-defined), so this is a no-op there in practice - but it's
+    applied uniformly anyway (fetch_sqlite, fetch_datastore, and the
+    unioned output in export_union all call this) so there's a single,
+    simple, always-true rule rather than "stable except when it isn't."
+    """
+    return df[sorted(df.columns)]
+
+
 # ==========================================
 # Datastore Fetch/Export Handlers
 # ==========================================
@@ -106,9 +130,7 @@ def fetch_datastore(target_table, namespace=None):
                 records.append(data)
 
             df = pd.DataFrame(records)
-            if "doc_id" in df.columns:
-                cols = ["doc_id"] + [c for c in df.columns if c != "doc_id"]
-                df = df[cols]
+            df = sort_columns_alphabetically(df)
 
             results[kind.lower()] = normalize_datetime_columns(df)
 
@@ -172,6 +194,7 @@ def fetch_sqlite(db_path, target_table):
                 df = pd.read_sql_query(f'SELECT * FROM "{table_name}"', conn)
                 if df.empty:
                     continue
+                df = sort_columns_alphabetically(df)
                 results[table_name.lower()] = normalize_datetime_columns(df)
             except Exception as e:
                 print(f"[SQLite Error] Failed to export table '{table_name}': {e}")
@@ -228,7 +251,17 @@ def export_union(target_table, output_dir, db_path, namespace=None):
             df.insert(0, "_source", "sqlite")
             frames.append(df)
 
+        # Individual frames are already alphabetically sorted (both
+        # fetch_datastore and fetch_sqlite apply sort_columns_alphabetically
+        # themselves), but pd.concat(sort=False) takes the FIRST frame's
+        # column order as its base and only appends the other frame's
+        # columns that aren't already present - so a column unique to
+        # sqlite_data would land after every datastore_data column instead
+        # of in true alphabetical position. Re-sorting the combined result
+        # is what actually guarantees one global alphabetical order for the
+        # union output, regardless of which store contributed which column.
         combined = pd.concat(frames, ignore_index=True, sort=False)
+        combined = sort_columns_alphabetically(combined)
 
         filename = os.path.join(output_dir, f"{name}.csv")
         combined.to_csv(filename, index=False)
