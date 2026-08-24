@@ -2456,8 +2456,8 @@ document.addEventListener('DOMContentLoaded', async () => {
       },
       {
         target: configTriggerBadge,
-        title: "This is the databse you are connected to",
-        body: "Click this badge to switch to any pre-configured database or connect to your own."
+        title: "This is the database you are connected to",
+        body: "Click this badge to switch to any pre-configured database or connect to your own. The colored dot on the left signifies the connection status."
       },
       {
         target: historyBtn,
