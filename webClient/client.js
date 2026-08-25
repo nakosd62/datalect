@@ -251,6 +251,29 @@ document.addEventListener('DOMContentLoaded', async () => {
   //    (login-required modal, help modal fetch/open logic - full onboarding
   //    wiring for the help button lives further down, in section 6)
   // ===========================================================================
+
+  // Every modal (#configModal, #helpModal, #historyModal, #confirmModal,
+  // #loginRequiredModal) shares the exact same .modal-overlay z-index (see
+  // style.css) - fine when only one is ever open at a time, but two CAN
+  // legitimately be open together now (e.g. the "See Help & Documentation"
+  // link inside the DB connection dialog opens #helpModal without closing
+  // #configModal first). With z-index tied, stacking falls back to DOM
+  // order, which has nothing to do with which modal the user actually
+  // opened most recently - #configModal happens to sit later in
+  // index.html than #helpModal, so it always won and visually buried Help
+  // behind it. bringModalToFront() fixes that generally, for any modal
+  // opened on top of any other: each call hands out a fresh, strictly
+  // increasing inline z-index, so whichever modal was shown/clicked-into
+  // last is always the one on top - call it right alongside every
+  // `<modal>.classList.remove('hidden')` in this file. Starts one above
+  // .modal-overlay's own 1000 and stays far below .tour-overlay's 2000,
+  // even after many opens in one session.
+  let nextModalZIndex = 1001;
+  function bringModalToFront(modalEl) {
+    if (!modalEl) return;
+    modalEl.style.zIndex = String(nextModalZIndex++);
+  }
+
   // DOM Elements - Primary Controls
   const aiPrompt = document.getElementById('aiPrompt');
   const sqlQueryTextarea = document.getElementById('sqlQuery');
@@ -285,6 +308,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (!loginRequiredModal) return;
     if (loginRequiredModalText) loginRequiredModalText.textContent = message;
     loginRequiredModal.classList.remove('hidden');
+    bringModalToFront(loginRequiredModal);
   }
 
   function closeLoginRequiredModal() {
@@ -341,6 +365,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   function openHelpModal() {
     if (!helpModal) return;
     helpModal.classList.remove('hidden');
+    bringModalToFront(helpModal);
     updateRestoreQuickPromptsVisibility();
     if (!helpModalBody) return;
     loadHelpContent()
@@ -1138,11 +1163,18 @@ document.addEventListener('DOMContentLoaded', async () => {
       // project/dataset with different service-account keys), so URL
       // matching alone can't tell which specific one is active. Falls back
       // to URL matching only when ACTIVE_CUSTOM_CONNECTION_KEY is blank -
-      // a session saved before that field existed.
-      const isSelected = ACTIVE_IS_CUSTOM && Boolean(db.url) && (
+      // a session saved before that field existed. The old unconditional
+      // `Boolean(db.url) &&` guard is gone: BigQuery/Snowflake/Databricks/
+      // Oracle/Redshift/SQL Server/Sheets rows never carry a real db.url
+      // any more (the server only ever sends "" for those - see
+      // config_routes.py's module docstring), so requiring it here would
+      // make those 7 types permanently unselectable. It's still applied,
+      // just moved into the URL-fallback branch below, where it actually
+      // belongs (Postgres/MySQL, the two types the fallback branch is for).
+      const isSelected = ACTIVE_IS_CUSTOM && (
         ACTIVE_CUSTOM_CONNECTION_KEY
           ? db.connection_key === ACTIVE_CUSTOM_CONNECTION_KEY
-          : activeUrl === db.url
+          : Boolean(db.url) && activeUrl === db.url
       );
 
       // A connection_key is only ever present on a row that came back from
@@ -1436,6 +1468,12 @@ document.addEventListener('DOMContentLoaded', async () => {
               <input type="text" id="custom-db-url-${index}" class="config-input custom-db-url-input" data-index="${index}" placeholder="${isMySQL ? 'mysql://user:password@host:3306/dbname' : 'postgresql://user:password@host:5432/dbname'}" value="${maskConnectionUrl(db.url)}" autocomplete="off">
             </div>
           </div>
+          <div class="custom-db-field-row align-start">
+            <div class="custom-db-field wide">
+              <label class="custom-db-field-label" for="custom-db-cacert-${index}">CA Certificate: <span class="optional-hint">(optional - only needed if your URL sets sslmode=verify-ca or verify-full; ignored for a unix_socket connection)</span></label>
+              <textarea id="custom-db-cacert-${index}" class="config-input custom-db-cacert" data-index="${index}" placeholder="Paste a PEM-encoded CA certificate here to verify the server (not needed for sslmode=require)" rows="3" autocomplete="off">${cfg.ca_cert_pem || ''}</textarea>
+            </div>
+          </div>
           `) : ''}
         </div>
       `;
@@ -1505,6 +1543,22 @@ document.addEventListener('DOMContentLoaded', async () => {
       });
     });
 
+    container.querySelectorAll('.custom-db-cacert').forEach(input => {
+      const index = parseInt(input.dataset.index);
+      const radio = container.querySelector(`input[value="custom-${index}"]`);
+      input.addEventListener('focus', () => { if (radio) radio.checked = true; });
+      input.addEventListener('input', () => {
+        if (radio) radio.checked = true;
+        if (!customDatabases[index].config) customDatabases[index].config = {};
+        // Not a secret (see backends/postgres.py's/backends/mysql.py's
+        // module docstrings), so unlike every credential textarea below
+        // there's no masking/"leave blank to keep it" convention - a
+        // blank value here really does mean "no CA cert", clearing
+        // whatever was saved before.
+        customDatabases[index].config.ca_cert_pem = input.value.trim();
+      });
+    });
+
     container.querySelectorAll('.custom-db-bq-project, .custom-db-bq-dataset, .custom-db-bq-billing, .custom-db-bq-creds').forEach(input => {
       const index = parseInt(input.dataset.index);
       const radio = container.querySelector(`input[value="custom-${index}"]`);
@@ -1517,12 +1571,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (input.classList.contains('custom-db-bq-dataset')) db.config.dataset = input.value.trim();
         if (input.classList.contains('custom-db-bq-billing')) db.config.billing_project_id = input.value.trim();
         if (input.classList.contains('custom-db-bq-creds')) db.config.credentials_json = input.value.trim();
-        // Synthetic (non-secret) identifier, kept in sync so radio-selection
-        // matching against activeUrl still works the same way it does for
-        // Postgres rows.
-        db.url = (db.config.project_id && db.config.dataset)
-          ? `bigquery://${db.config.project_id}/${db.config.dataset}`
-          : '';
+        // No db.url here any more - BigQuery has no real url of its own
+        // (see config_routes.py's module docstring); radio-selection now
+        // matches by connection_key instead (see isSelected above).
         // Same rule as the Postgres URL input above: don't clobber a name
         // the user already typed themselves.
         if (!db.name) {
@@ -1568,14 +1619,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (input.classList.contains('custom-db-sf-password')) db.config.password = input.value;
         if (input.classList.contains('custom-db-sf-private-key')) db.config.private_key = input.value.trim();
         if (input.classList.contains('custom-db-sf-passphrase')) db.config.private_key_passphrase = input.value;
-        // Synthetic (non-secret) identifier, kept in sync so radio-selection
-        // matching against activeUrl still works the same way it does for
-        // Postgres/BigQuery rows. Schema is optional on a Snowflake
-        // connection (see backends/snowflake.py) - included only when set,
-        // mirroring config_routes.py's _snowflake_url.
-        db.url = (db.config.account && db.config.database)
-          ? `snowflake://${db.config.account}/${db.config.database}${db.config.schema ? '/' + db.config.schema : ''}`
-          : '';
+        // No db.url here any more - Snowflake has no real url of its own
+        // (see config_routes.py's module docstring); radio-selection now
+        // matches by connection_key instead (see isSelected above).
         // Same rule as the Postgres/BigQuery inputs above: don't clobber a
         // name the user already typed themselves.
         if (!db.name) {
@@ -1603,12 +1649,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (input.classList.contains('custom-db-dbx-catalog')) db.config.catalog = input.value.trim();
         if (input.classList.contains('custom-db-dbx-schema')) db.config.schema = input.value.trim();
         if (input.classList.contains('custom-db-dbx-token')) db.config.access_token = input.value;
-        // Synthetic (non-secret) identifier, kept in sync so radio-selection
-        // matching against activeUrl still works the same way it does for
-        // Postgres/BigQuery/Snowflake rows.
-        db.url = (db.config.server_hostname && db.config.http_path)
-          ? `databricks://${db.config.server_hostname}${db.config.http_path}`
-          : '';
+        // No db.url here any more - Databricks has no real url of its own
+        // (see config_routes.py's module docstring); radio-selection now
+        // matches by connection_key instead (see isSelected above).
         // Same rule as the other dialect inputs above: don't clobber a
         // name the user already typed themselves.
         if (!db.name) {
@@ -1646,16 +1689,12 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (input.classList.contains('custom-db-ora-schema')) db.config.schema = input.value.trim();
         if (input.classList.contains('custom-db-ora-password')) db.config.password = input.value;
         if (input.classList.contains('custom-db-ora-ssl')) db.config.ssl = input.checked;
-        // Synthetic (non-secret) identifier, kept in sync so radio-selection
-        // matching against activeUrl still works the same way it does for
-        // Postgres/BigQuery/Snowflake/Databricks rows. Mirrors
-        // config_routes.py's _oracle_url exactly, including the same 1521
-        // default port used when the field is left blank, and service_name
-        // taking precedence over sid when both are somehow filled in.
+        // No db.url here any more - Oracle has no real url of its own (see
+        // config_routes.py's module docstring); radio-selection now
+        // matches by connection_key instead (see isSelected above).
+        // service_name takes precedence over sid when both are somehow
+        // filled in, same as config_routes.py's _oracle_identity.
         const serviceOrSid = db.config.service_name || db.config.sid;
-        db.url = (db.config.host && serviceOrSid)
-          ? `oracle://${db.config.host}:${db.config.port || 1521}/${serviceOrSid}`
-          : '';
         // Same rule as the other dialect inputs above: don't clobber a
         // name the user already typed themselves.
         if (!db.name) {
@@ -1684,14 +1723,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (input.classList.contains('custom-db-rs-schema')) db.config.schema = input.value.trim();
         if (input.classList.contains('custom-db-rs-user')) db.config.user = input.value.trim();
         if (input.classList.contains('custom-db-rs-password')) db.config.password = input.value;
-        // Synthetic (non-secret) identifier, kept in sync so radio-selection
-        // matching against activeUrl still works the same way it does for
-        // every other structured-descriptor row. Mirrors config_routes.py's
-        // _redshift_url exactly, including the same 5439 default port used
-        // when the field is left blank.
-        db.url = (db.config.host && db.config.database)
-          ? `redshift://${db.config.host}:${db.config.port || 5439}/${db.config.database}`
-          : '';
+        // No db.url here any more - Redshift has no real url of its own
+        // (see config_routes.py's module docstring); radio-selection now
+        // matches by connection_key instead (see isSelected above).
         // Same rule as the other dialect inputs above: don't clobber a
         // name the user already typed themselves.
         if (!db.name) {
@@ -1726,14 +1760,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (input.classList.contains('custom-db-ms-user')) db.config.user = input.value.trim();
         if (input.classList.contains('custom-db-ms-password')) db.config.password = input.value;
         if (input.classList.contains('custom-db-ms-encrypt')) db.config.encrypt = input.checked;
-        // Synthetic (non-secret) identifier, kept in sync so radio-selection
-        // matching against activeUrl still works the same way it does for
-        // every other structured-descriptor row. Mirrors config_routes.py's
-        // _mssql_url exactly, including the same 1433 default port used
-        // when the field is left blank.
-        db.url = (db.config.host && db.config.database)
-          ? `mssql://${db.config.host}:${db.config.port || 1433}/${db.config.database}`
-          : '';
+        // No db.url here any more - SQL Server has no real url of its own
+        // (see config_routes.py's module docstring); radio-selection now
+        // matches by connection_key instead (see isSelected above).
         // Same rule as the other dialect inputs above: don't clobber a
         // name the user already typed themselves.
         if (!db.name) {
@@ -1760,16 +1789,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         // building spots below), so leaving this untouched never clobbers
         // an already-saved key the way an always-required field would.
         if (input.classList.contains('custom-db-sh-creds')) db.config.credentials_json = input.value.trim();
-        // Synthetic (non-secret) identifier - unlike every other dialect
-        // here, this can't be fully computed client-side (extracting the
-        // spreadsheet id out of a pasted URL is server-side logic - see
-        // sheets_util.py's extract_spreadsheet_id), so this just tracks
-        // "something's been typed" for radio-selection purposes rather
-        // than a real, complete sheets:// URL; the server derives the
-        // real one from spreadsheet_url/tab_name at save time.
-        db.url = (db.config.spreadsheet_url && db.config.tab_name)
-          ? `sheets://${db.config.spreadsheet_url}/${db.config.tab_name}`
-          : '';
+        // No db.url here any more - Sheets has no real url of its own (see
+        // config_routes.py's module docstring); radio-selection now
+        // matches by connection_key instead (see isSelected above).
         // Same rule as the other dialect inputs above: don't clobber a
         // name the user already typed themselves.
         if (!db.name) {
@@ -1814,7 +1836,24 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     let html = `<div class="radio-group-heading">Pre-configured Database Playgrounds</div>`;
 
+    // Two visual columns, purely a layout grouping (no change to what's
+    // selectable or how - db_connection_option/preset:<id> works exactly
+    // the same either way): the 4 "simple credential" dialects that speak
+    // a single connection-string/user+password (Postgres, MySQL, Oracle,
+    // SQL Server) on the left, the other 5 structured/cloud dialects
+    // (BigQuery, Snowflake, Databricks, Redshift, Google Sheets) on the
+    // right. LEFT_COLUMN_TYPES is exhaustive over every dialect this app
+    // supports today (see this file's isComplete*/config_routes.py's
+    // module docstring for the full list) - a future new dialect type not
+    // in either set falls into the right column by default, below.
+    const LEFT_COLUMN_TYPES = new Set(['postgres', 'mysql', 'oracle', 'mssql']);
+    const leftPresets = [];
+    const rightPresets = [];
     CONFIGURED_DBS.forEach((db) => {
+      (LEFT_COLUMN_TYPES.has(db.type) ? leftPresets : rightPresets).push(db);
+    });
+
+    const renderPresetOption = (db) => {
       // Encodes the preset's stable id (never a secret, unlike the real
       // URL) rather than the URL itself or its array position - the id
       // survives the admin reordering/adding/removing presets between
@@ -1823,20 +1862,47 @@ document.addEventListener('DOMContentLoaded', async () => {
       // Resolved server-side via payload.preset_id (see triggerConfigSave()).
       const value = `preset:${db.id}`;
       const isSelected = !isCustom && db.id === ACTIVE_PRESET_ID;
-      html += `
+      return `
         <label class="radio-option">
           <input type="radio" name="db_connection_option" value="${value}" data-dbname="${db.name}" ${isSelected ? 'checked' : ''}>
           <span class="radio-label">${db.name}</span>
         </label>
       `;
-    });
+    };
+
+    html += `
+      <div class="preset-columns">
+        <div class="preset-column">${leftPresets.map(renderPresetOption).join('')}</div>
+        <div class="preset-column">${rightPresets.map(renderPresetOption).join('')}</div>
+      </div>
+    `;
 
     html += `<div class="radio-group-heading radio-group-heading-custom">Custom Database Connections</div>`;
+    // Short reassurance, not a full explanation - see help.html's "Database
+    // Connections"/"User Authentication" sections (opened via the link
+    // below) for the actual detail: encryption at rest, and exactly what
+    // "your own session" vs. "your account" scoping means.
+    html += `
+      <p class="custom-db-security-note">
+        Your custom connections are private and secure (<a href="#" id="customDbSecurityNoteHelpLink">see Documentation</a>).
+      </p>
+    `;
     html += `<div id="customDbsContainer" class="custom-dbs-list"></div>`;
 
     radioGroup.innerHTML = html;
 
     renderCustomDbRows(activeUrl);
+
+    // Re-wired on every render, not just once at startup - the link above
+    // is recreated from scratch each time renderDbRadioButtons() rebuilds
+    // radioGroup.innerHTML, same as customDbsContainer's own inputs below.
+    const securityNoteHelpLink = document.getElementById('customDbSecurityNoteHelpLink');
+    if (securityNoteHelpLink) {
+      securityNoteHelpLink.addEventListener('click', (e) => {
+        e.preventDefault();
+        openHelpModal();
+      });
+    }
   }
 
   async function triggerConfigSave({ closeModal = false } = {}) {
@@ -1867,6 +1933,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     let dbSsl = null;
     let dbSpreadsheetUrl = null;
     let dbTabName = null;
+    // Postgres-only (see backends/postgres.py's module docstring) - not a
+    // credential, so unlike dbPassword/dbCredentialsJson above this never
+    // needs a "may be blank, server reuses the saved one" fallback; a
+    // blank value really does mean "no CA cert supplied this time".
+    let dbCaCertPem = null;
     // Named distinctly from BigQuery's own dbCredentialsJson above - these
     // are two different dialects' credentials, both optional/reuse-when-
     // blank, but never the same variable.
@@ -1971,7 +2042,10 @@ document.addEventListener('DOMContentLoaded', async () => {
           // never sent back to us to re-display, see get_db_connections).
           dbCredentialsJson = chosen.config.credentials_json || null;
           dbNameValue = chosen.name || dbDataset;
-          dbUrlValue = `bigquery://${dbProjectId}/${dbDataset}`;
+          // No dbUrlValue here - BigQuery has no real url of its own, and
+          // the server never reads payload.database_url for this type
+          // (see config_routes.py's module docstring / _parse_incoming_
+          // connection), so there's nothing meaningful to send.
         } else if (isCompleteSnowflake(chosen)) {
           dbType = 'snowflake';
           dbAccount = chosen.config.account;
@@ -1987,7 +2061,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           dbPrivateKey = chosen.config.private_key || null;
           dbPrivateKeyPassphrase = chosen.config.private_key_passphrase || null;
           dbNameValue = chosen.name || dbDatabase;
-          dbUrlValue = `snowflake://${dbAccount}/${dbDatabase}${dbSchema ? '/' + dbSchema : ''}`;
+          // No dbUrlValue here - see the BigQuery branch's comment above.
         } else if (isCompleteDatabricks(chosen)) {
           dbType = 'databricks';
           dbServerHostname = chosen.config.server_hostname;
@@ -2000,7 +2074,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           // sent back to us to re-display, see get_db_connections).
           dbAccessToken = chosen.config.access_token || null;
           dbNameValue = chosen.name || dbHttpPath;
-          dbUrlValue = `databricks://${dbServerHostname}${dbHttpPath}`;
+          // No dbUrlValue here - see the BigQuery branch's comment above.
         } else if (isCompleteOracle(chosen)) {
           dbType = 'oracle';
           dbHost = chosen.config.host;
@@ -2016,7 +2090,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           dbPassword = chosen.config.password || null;
           dbSsl = Boolean(chosen.config.ssl);
           dbNameValue = chosen.name || dbServiceName || dbSid;
-          dbUrlValue = `oracle://${dbHost}:${dbPort || 1521}/${dbServiceName || dbSid}`;
+          // No dbUrlValue here - see the BigQuery branch's comment above.
         } else if (isCompleteRedshift(chosen)) {
           dbType = 'redshift';
           dbHost = chosen.config.host;
@@ -2030,7 +2104,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           // sent back to us to re-display, see get_db_connections).
           dbPassword = chosen.config.password || null;
           dbNameValue = chosen.name || dbDatabase;
-          dbUrlValue = `redshift://${dbHost}:${dbPort || 5439}/${dbDatabase}`;
+          // No dbUrlValue here - see the BigQuery branch's comment above.
         } else if (isCompleteMssql(chosen)) {
           dbType = 'mssql';
           dbHost = chosen.config.host;
@@ -2049,7 +2123,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           // not truthy vs. falsy.
           dbEncrypt = chosen.config.encrypt !== false;
           dbNameValue = chosen.name || dbDatabase;
-          dbUrlValue = `mssql://${dbHost}:${dbPort || 1433}/${dbDatabase}`;
+          // No dbUrlValue here - see the BigQuery branch's comment above.
         } else if (isCompleteSheets(chosen)) {
           dbType = 'sheets';
           dbSpreadsheetUrl = chosen.config.spreadsheet_url;
@@ -2060,16 +2134,15 @@ document.addEventListener('DOMContentLoaded', async () => {
           // mirrors dbPassword's own restore line above.
           dbSheetsCredentialsJson = chosen.config.credentials_json || null;
           dbNameValue = chosen.name || dbTabName;
-          // Real sheets://<spreadsheet_id>/<tab_name> URL can't be
-          // computed client-side (extracting the id from a pasted URL is
-          // server-side logic - see sheets_util.py's extract_spreadsheet_id)
-          // - this is just a display-only placeholder, same role the
-          // live-sync listener's own synthetic db.url plays.
-          dbUrlValue = `sheets://${dbSpreadsheetUrl}/${dbTabName}`;
+          // No dbUrlValue here - see the BigQuery branch's comment above.
         } else if (isCompleteSimpleUrlDb(chosen)) {
           dbType = chosen.type === 'mysql' ? 'mysql' : 'postgres';
           dbUrlValue = chosen.url;
           dbNameValue = chosen.name;
+          // Both simple-URL dialects support ca_cert_pem (see
+          // backends/postgres.py's and backends/mysql.py's module
+          // docstrings).
+          dbCaCertPem = (chosen.config && chosen.config.ca_cert_pem) || null;
         } else {
           dbType = 'postgres';
           dbUrlValue = DEFAULT_DB_URL;
@@ -2212,7 +2285,17 @@ document.addEventListener('DOMContentLoaded', async () => {
               credentials_json: d.config.credentials_json || undefined,
             };
           }
-          return { type: (d.type === 'mysql' ? 'mysql' : 'postgres'), name: d.name, url: d.url };
+          const simpleUrlType = d.type === 'mysql' ? 'mysql' : 'postgres';
+          const simpleUrlOut = { type: simpleUrlType, name: d.name, url: d.url };
+          // Shared by both simple-URL dialects (see backends/postgres.py's
+          // and backends/mysql.py's module docstrings) - not a credential,
+          // so it's just carried through as-is like BigQuery's
+          // billing_project_id, not resolved via a "leave blank to keep
+          // the saved one" helper the way passwords are.
+          if (d.config && d.config.ca_cert_pem) {
+            simpleUrlOut.ca_cert_pem = d.config.ca_cert_pem;
+          }
+          return simpleUrlOut;
         }),
       auto_sql_execute: autoSqlExecuteValue
     };
@@ -2274,6 +2357,9 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (dbSheetsCredentialsJson) payload.credentials_json = dbSheetsCredentialsJson;
     } else {
       payload.database_url = dbUrlValue;
+      // Both simple-URL dialects support ca_cert_pem (see
+      // backends/postgres.py's and backends/mysql.py's module docstrings).
+      if (dbCaCertPem) payload.ca_cert_pem = dbCaCertPem;
     }
 
     const configSaveErrorEl = document.getElementById('configSaveError');
@@ -2396,6 +2482,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         configSaveErrorEl.textContent = '';
       }
       configModal.classList.remove('hidden');
+      bringModalToFront(configModal);
     });
   }
 
@@ -2456,8 +2543,8 @@ document.addEventListener('DOMContentLoaded', async () => {
       },
       {
         target: configTriggerBadge,
-        title: "This is the database you are connected to",
-        body: "Click this badge to switch to any pre-configured database or connect to your own. The colored dot on the left signifies the connection status."
+        title: "This is the databse you are connected to",
+        body: "Click this badge to switch to any pre-configured database or connect to your own."
       },
       {
         target: historyBtn,
@@ -2743,6 +2830,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       textEl.textContent = message;
       modal.classList.remove('hidden');
+      bringModalToFront(modal);
 
       let cleanedUp = false;
       const cleanup = (result) => {
@@ -2861,6 +2949,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         purgeTitleEl.textContent = '(...)';
       }
       historyModal.classList.remove('hidden');
+      bringModalToFront(historyModal);
       loadHistoryData();
     });
   }

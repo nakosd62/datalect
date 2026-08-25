@@ -12,6 +12,8 @@ backends.mysql's pymysql.connect() and records the kwargs it was called
 with - mirroring how backends/snowflake.py's connect() dispatch is tested.
 """
 
+import os
+import ssl
 import sys
 from decimal import Decimal
 from datetime import date
@@ -25,7 +27,9 @@ if SERVER_DIR not in sys.path:
 
 from backends.mysql import MySQLBackend
 from backends.base import DB_CONNECT_TIMEOUT_SECONDS, SqlExecutionError
-from helpers import make_fake_mysql_connection, install_fake_pymysql_connect
+from helpers import (
+    make_fake_mysql_connection, install_fake_pymysql_connect, make_self_signed_ca_cert_pem,
+)
 
 
 def _schema_responses(table_names, columns_rows, constraints=(), indexes=(), views=(), grants=(), triggers=()):
@@ -293,6 +297,150 @@ def test_connect_omits_unix_socket_kwarg_for_an_ordinary_tcp_url(monkeypatch):
     backend.connect({"type": "mysql", "url": "mysql://alice:secret@dbhost:3306/mydb"})
     assert "unix_socket" not in harness.calls[0]
     assert harness.calls[0]["host"] == "dbhost"
+
+
+# --- connect(): sslmode / ca_cert_pem ---------------------------------------
+# Coverage for the "verify-ca"/"verify-full" CA-certificate support added to
+# connect() - mirrors backends/postgres.py's equivalent tests, adapted for
+# PyMySQL's very different TLS API (an ssl.SSLContext object, not a
+# filesystem-path kwarg libpq parses itself - see module docstring).
+
+def test_connect_with_no_sslmode_adds_no_ssl_kwarg_at_all(monkeypatch):
+    """Regression guard: a descriptor with no sslmode in the URL at all
+    (the overwhelming common case, and every existing connection prior to
+    this feature) must produce byte-identical connect() behavior - no
+    "ssl" kwarg, nothing extra. See module docstring for why this does NOT
+    mean "no TLS ever" - PyMySQL's own default (no ssl_* kwargs) already
+    opportunistically attempts TLS - this test just confirms connect()
+    itself isn't adding anything on top of that default."""
+    import backends.mysql as mysqlmod
+    harness = install_fake_pymysql_connect(monkeypatch)
+    backend = mysqlmod.MySQLBackend()
+    backend.connect({"type": "mysql", "url": "mysql://alice:secret@dbhost:3306/mydb"})
+    assert "ssl" not in harness.calls[0]
+
+
+def test_connect_sslmode_disable_adds_no_ssl_kwarg(monkeypatch):
+    import backends.mysql as mysqlmod
+    harness = install_fake_pymysql_connect(monkeypatch)
+    backend = mysqlmod.MySQLBackend()
+    backend.connect({"type": "mysql", "url": "mysql://alice:secret@dbhost:3306/mydb?sslmode=disable"})
+    assert "ssl" not in harness.calls[0]
+
+
+def test_connect_sslmode_require_encrypts_without_verifying(monkeypatch):
+    import backends.mysql as mysqlmod
+    harness = install_fake_pymysql_connect(monkeypatch)
+    backend = mysqlmod.MySQLBackend()
+    backend.connect({"type": "mysql", "url": "mysql://alice:secret@dbhost:3306/mydb?sslmode=require"})
+    ctx = harness.calls[0]["ssl"]
+    assert isinstance(ctx, ssl.SSLContext)
+    assert ctx.check_hostname is False
+    assert ctx.verify_mode == ssl.CERT_NONE
+
+
+def test_connect_sslmode_require_needs_no_ca_cert(monkeypatch):
+    # require is encrypt-only - no ca_cert_pem needed or used, unlike
+    # verify-ca/verify-full below.
+    import backends.mysql as mysqlmod
+    harness = install_fake_pymysql_connect(monkeypatch)
+    backend = mysqlmod.MySQLBackend()
+    backend.connect({
+        "type": "mysql",
+        "url": "mysql://alice:secret@dbhost:3306/mydb?sslmode=require",
+    })
+    assert isinstance(harness.calls[0]["ssl"], ssl.SSLContext)
+
+
+def test_connect_sslmode_verify_ca_checks_cert_but_not_hostname(monkeypatch):
+    import backends.mysql as mysqlmod
+    harness = install_fake_pymysql_connect(monkeypatch)
+    backend = mysqlmod.MySQLBackend()
+    backend.connect({
+        "type": "mysql",
+        "url": "mysql://alice:secret@dbhost:3306/mydb?sslmode=verify-ca",
+        "ca_cert_pem": make_self_signed_ca_cert_pem(),
+    })
+    ctx = harness.calls[0]["ssl"]
+    assert isinstance(ctx, ssl.SSLContext)
+    assert ctx.verify_mode == ssl.CERT_REQUIRED
+    assert ctx.check_hostname is False
+
+
+def test_connect_sslmode_verify_full_checks_cert_and_hostname(monkeypatch):
+    import backends.mysql as mysqlmod
+    harness = install_fake_pymysql_connect(monkeypatch)
+    backend = mysqlmod.MySQLBackend()
+    backend.connect({
+        "type": "mysql",
+        "url": "mysql://alice:secret@dbhost:3306/mydb?sslmode=verify-full",
+        "ca_cert_pem": make_self_signed_ca_cert_pem(),
+    })
+    ctx = harness.calls[0]["ssl"]
+    assert isinstance(ctx, ssl.SSLContext)
+    assert ctx.verify_mode == ssl.CERT_REQUIRED
+    assert ctx.check_hostname is True
+
+
+def test_connect_verify_full_without_ca_cert_falls_back_to_system_trust_store(monkeypatch):
+    # No ca_cert_pem supplied at all - must not raise, and must still turn
+    # on cert+hostname verification (against whatever this machine's own
+    # system trust store contains), same as backends/postgres.py's
+    # verify-full-with-no-sslrootcert behavior.
+    import backends.mysql as mysqlmod
+    harness = install_fake_pymysql_connect(monkeypatch)
+    backend = mysqlmod.MySQLBackend()
+    backend.connect({
+        "type": "mysql",
+        "url": "mysql://alice:secret@dbhost:3306/mydb?sslmode=verify-full",
+    })
+    ctx = harness.calls[0]["ssl"]
+    assert ctx.verify_mode == ssl.CERT_REQUIRED
+    assert ctx.check_hostname is True
+
+
+def test_connect_ca_cert_pem_tempfile_is_deleted_after_connect(monkeypatch):
+    """The tempfile connect() writes ca_cert_pem to must not linger on disk
+    once connect() has returned - only needed for SSLContext construction,
+    not for the life of the connection."""
+    import backends.mysql as mysqlmod
+
+    written_paths = []
+    real_materialize = mysqlmod.materialize_ca_cert_tempfile
+
+    def _spy(pem_text):
+        path = real_materialize(pem_text)
+        written_paths.append(path)
+        return path
+
+    monkeypatch.setattr(mysqlmod, "materialize_ca_cert_tempfile", _spy)
+    install_fake_pymysql_connect(monkeypatch)
+    backend = mysqlmod.MySQLBackend()
+    backend.connect({
+        "type": "mysql",
+        "url": "mysql://alice:secret@dbhost:3306/mydb?sslmode=verify-full",
+        "ca_cert_pem": make_self_signed_ca_cert_pem(),
+    })
+    assert len(written_paths) == 1
+    assert not os.path.exists(written_paths[0])
+
+
+def test_connect_unix_socket_ignores_sslmode_entirely(monkeypatch):
+    """TLS is a TCP-only concept in the MySQL wire protocol (same as
+    Postgres - see module docstring): a unix_socket connection must never
+    get an "ssl" kwarg at all, even if sslmode is also present in the same
+    URL (a user combining the two doesn't silently get half-applied TLS
+    settings)."""
+    import backends.mysql as mysqlmod
+    harness = install_fake_pymysql_connect(monkeypatch)
+    backend = mysqlmod.MySQLBackend()
+    backend.connect({
+        "type": "mysql",
+        "url": "mysql://trial:FooBar@/classicmodels?unix_socket=/cloudsql/proj:us-east1:instance&sslmode=verify-full",
+        "ca_cert_pem": make_self_signed_ca_cert_pem(),
+    })
+    assert harness.calls[0]["unix_socket"] == "/cloudsql/proj:us-east1:instance"
+    assert "ssl" not in harness.calls[0]
 
 
 def test_cache_key_works_for_a_unix_socket_url():

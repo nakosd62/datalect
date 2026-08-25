@@ -25,7 +25,7 @@ ephemeral SQLite fallback").
 
 import pytest
 
-from helpers import login_as, write_database_presets_file
+from helpers import login_as, write_database_presets_file, FAKE_DB_CONFIG_ENCRYPTION_KEY
 
 
 @pytest.fixture
@@ -33,12 +33,18 @@ def cloud_run_env(tmp_path):
     """The common Cloud Run env every test below starts from - a single
     "Demo" Postgres preset written to its own file under tmp_path (each
     test gets a fresh tmp_path, so a fresh file), since DATABASE_PRESETS_FILE
-    points at a path rather than holding the JSON inline."""
+    points at a path rather than holding the JSON inline. DB_CONFIG_ENCRYPTION_KEY
+    is required here (not just optional) - without it, app_config.py's
+    startup guard raises RuntimeError for Cloud Run (see state_store.py's
+    encryption-at-rest comment); these tests aren't about that mechanism
+    itself, so a fixed shared key is enough (see FAKE_DB_CONFIG_ENCRYPTION_KEY's
+    docstring)."""
     path = write_database_presets_file(tmp_path, [
         {"type": "postgres", "name": "Demo", "url": "postgresql://realuser:realpass@realhost/realdb"},
     ])
     return {
         "K_SERVICE": "ydyl-service",
+        "DB_CONFIG_ENCRYPTION_KEY": FAKE_DB_CONFIG_ENCRYPTION_KEY,
         "GOOGLE_CLIENT_ID": "fake.apps.googleusercontent.com",
         "GCP_PROJECT_ID": "fake-project",
         "DATABASE_PRESETS_FILE": path,

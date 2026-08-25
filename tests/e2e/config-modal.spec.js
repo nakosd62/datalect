@@ -80,19 +80,108 @@ test.describe('config modal', () => {
       'Pre-configured Database Playgrounds', 'Custom Database Connections',
     ]);
 
-    // Not just present - actually in this order: every preset option comes
-    // before the "Custom Database Connections" heading, which itself comes
-    // before customDbsContainer (the add button/custom rows).
+    // Not just present - actually in this order: the two-column preset
+    // block comes before the "Custom Database Connections" heading, which
+    // itself comes before customDbsContainer (the add button/custom rows).
+    // Presets themselves aren't direct children of #modalDbRadioGroup any
+    // more (see the .preset-columns/.preset-column wrapper in
+    // renderDbRadioButtons()) - the column split below covers that layer.
     const children = await radioGroup.evaluate(el =>
       [...el.children].map(c => c.className)
     );
     const presetHeadingIdx = children.indexOf('radio-group-heading');
-    const firstPresetIdx = children.indexOf('radio-option');
+    const presetColumnsIdx = children.indexOf('preset-columns');
     const customHeadingIdx = children.findIndex(c => c.includes('radio-group-heading-custom'));
     const customContainerIdx = children.indexOf('custom-dbs-list');
-    expect(presetHeadingIdx).toBeLessThan(firstPresetIdx);
-    expect(firstPresetIdx).toBeLessThan(customHeadingIdx);
+    expect(presetHeadingIdx).toBeLessThan(presetColumnsIdx);
+    expect(presetColumnsIdx).toBeLessThan(customHeadingIdx);
     expect(customHeadingIdx).toBeLessThan(customContainerIdx);
+
+    await expect(radioGroup.locator('.preset-columns .radio-option').first()).toBeVisible();
+  });
+
+  test('preset playgrounds split into two columns by dialect', async ({ page }) => {
+    // Left column: the 4 "simple credential" dialects (single connection
+    // string or plain user/password) - Postgres, MySQL, Oracle, SQL
+    // Server. Right column: the other 5 structured/cloud dialects -
+    // BigQuery, Snowflake, Databricks, Redshift, Google Sheets. Mirrors
+    // LEFT_COLUMN_TYPES in renderDbRadioButtons() (client.js).
+    const configuredDatabases = [
+      { id: 'p-pg', name: 'PG Playground', type: 'postgres' },
+      { id: 'p-my', name: 'MySQL Playground', type: 'mysql' },
+      { id: 'p-ora', name: 'Oracle Playground', type: 'oracle' },
+      { id: 'p-ms', name: 'SQL Server Playground', type: 'mssql' },
+      { id: 'p-bq', name: 'BigQuery Playground', type: 'bigquery' },
+      { id: 'p-sf', name: 'Snowflake Playground', type: 'snowflake' },
+      { id: 'p-db', name: 'Databricks Playground', type: 'databricks' },
+      { id: 'p-rs', name: 'Redshift Playground', type: 'redshift' },
+      { id: 'p-sh', name: 'Sheets Playground', type: 'sheets' },
+    ];
+    await page.route('**/api/config', async (route) => {
+      if (route.request().method() !== 'GET') return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          auth_enabled: false,
+          session_id: 'e2e-session',
+          user_id: 'global',
+          authenticated: false,
+          is_cloud_run: false,
+          configured_databases: configuredDatabases,
+          active_preset_id: 'p-pg',
+          default_database_url: '',
+          active_database_url: '',
+          active_database_type: 'postgres',
+          active_is_custom: false,
+          active_custom_connection_key: '',
+          active_uses_custom_credentials: false,
+          database_name: 'PG Playground',
+          custom_database_name: '',
+          custom_database_url: '',
+          custom_databases: [],
+          auto_sql_execute: false,
+        }),
+      });
+    });
+
+    await gotoApp(page);
+    await openConfigModal(page);
+
+    const columns = page.locator('.preset-column');
+    await expect(columns).toHaveCount(2);
+    await expect(columns.nth(0).locator('.radio-label')).toHaveText([
+      'PG Playground', 'MySQL Playground', 'Oracle Playground', 'SQL Server Playground',
+    ]);
+    await expect(columns.nth(1).locator('.radio-label')).toHaveText([
+      'BigQuery Playground', 'Snowflake Playground', 'Databricks Playground',
+      'Redshift Playground', 'Sheets Playground',
+    ]);
+  });
+
+  test('custom connections heading has a security note that opens the Help modal', async ({ page }) => {
+    await gotoApp(page);
+    await openConfigModal(page);
+
+    const note = page.locator('.custom-db-security-note');
+    await expect(note).toBeVisible();
+    await expect(note).toContainText('private and secure');
+
+    await note.locator('#customDbSecurityNoteHelpLink').click();
+    await expect(page.locator('#helpModal')).not.toHaveClass(/hidden/);
+    await expect(page.locator('#helpModalBody')).toContainText('encrypted at rest');
+
+    // Both modals are left open here (the link doesn't close #configModal
+    // first) - the regression this guards: every modal shares the same
+    // .modal-overlay z-index (see style.css), so without
+    // bringModalToFront() (client.js), #helpModal would render BEHIND
+    // #configModal (later in index.html's DOM order) and be invisible
+    // until #configModal was closed.
+    const [configZ, helpZ] = await Promise.all([
+      page.locator('#configModal').evaluate(el => parseInt(getComputedStyle(el).zIndex, 10)),
+      page.locator('#helpModal').evaluate(el => parseInt(getComputedStyle(el).zIndex, 10)),
+    ]);
+    expect(helpZ).toBeGreaterThan(configZ);
   });
 
   test('an anonymous Cloud Run visitor sees both the presets and custom-connections headings', async ({ page }) => {
@@ -405,7 +494,13 @@ test.describe('config modal', () => {
 
     const card = page.locator('.custom-db-card').last();
     await expect(card.locator('.custom-db-header-row label.custom-db-field-label')).toHaveText('Name:');
-    await expect(card.locator('.custom-db-field-row label.custom-db-field-label')).toHaveText('URL:');
+    // A default (URL-based) Postgres row renders TWO .custom-db-field-row
+    // divs - URL, then a separate CA Certificate row below it - so the
+    // unscoped locator here used to match both labels and fail Playwright's
+    // strict mode. .first() pins this to the URL row specifically, which is
+    // always the one rendered first (see client.js's custom-db-url-${index}
+    // markup, immediately followed by custom-db-cacert-${index}).
+    await expect(card.locator('.custom-db-field-row label.custom-db-field-label').first()).toHaveText('URL:');
   });
 
   test('a newly-added custom connection row starts expanded, showing its detail fields right away', async ({ page }) => {
@@ -661,7 +756,10 @@ test.describe('config modal', () => {
 
     const card = page.locator('.custom-db-card').last();
     await expect(card.locator('.custom-db-header-row label.custom-db-field-label')).toHaveText('Name:');
-    await expect(card.locator('.custom-db-field-row label.custom-db-field-label')).toHaveText('URL:');
+    // Same strict-mode fix as the Postgres version of this test above: a
+    // default (URL-based) MySQL row also renders a separate CA Certificate
+    // row after the URL row, so this must be pinned to the URL row (first).
+    await expect(card.locator('.custom-db-field-row label.custom-db-field-label').first()).toHaveText('URL:');
     await expect(card.locator('.custom-db-url-input')).toHaveAttribute('placeholder', /^mysql:\/\//);
   });
 

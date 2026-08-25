@@ -26,6 +26,7 @@ COPY grand-cosmos-716-3afa9cbc32b7.json .
 
 # Copy CRDB certificate
 # COPY crdb.crt .
+COPY cloudsql-ca.pem .
 
 # Expose container port (Cloud Run defaults to 8080, but we can configure it)
 EXPOSE 3000

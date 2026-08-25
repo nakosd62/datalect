@@ -265,6 +265,25 @@ path for Snowflake — see `config_routes.py`'s module docstring.
 See [Authentication model](#authentication-model) for the full picture,
 including how identity is resolved and what anonymous users can/can't do.
 
+### Encryption at rest
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `DB_CONFIG_ENCRYPTION_KEY` | — | Encrypts every saved connection's `database_config` (passwords, service-account keys, private keys, CA certificates, ...) before it's written to SQLite/Firestore, and decrypts it transparently on read. A [Fernet](https://cryptography.io/en/latest/fernet/) key — generate one with `python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`. **Required on Cloud Run** — like `K_SERVICE`/Firestore below, the app refuses to start without a valid one there; optional locally, where an unset/invalid key just means `database_config` is stored unencrypted, same as today. |
+
+The whole `database_config` value is encrypted as one blob rather than
+picking individual "sensitive" fields — a field added to any backend's
+config later is automatically covered, with nothing to remember to add to
+an allowlist. A row saved before this was configured (or under a
+previously-configured key) keeps reading correctly with no migration
+step: decryption is tried first and silently falls back to the
+row's original plain representation on any failure. Losing the key means
+losing access to every already-saved connection's credentials (there's
+no recovery path by design — that's what "encrypted" means); rotating it
+means previously-saved connections need to be re-saved to pick up the new
+key. See [`state_store.py`](./server/state_store.py)'s "Encryption at
+rest for database_config" comment for the full design.
+
 ### GCP / Cloud Run
 
 | Variable | Default | Purpose |
@@ -327,8 +346,15 @@ Minimum environment for a Cloud Run deployment (built from the
 
 ```bash
 gcloud run deploy ydyl \
-  --set-env-vars GEMINI_API_KEY=...,GOOGLE_CLIENT_ID=...,GCP_PROJECT_ID=your-project,CRBOT_PORT=8080
+  --set-env-vars GEMINI_API_KEY=...,GOOGLE_CLIENT_ID=...,GCP_PROJECT_ID=your-project,CRBOT_PORT=8080,DB_CONFIG_ENCRYPTION_KEY=...
 ```
+
+`DB_CONFIG_ENCRYPTION_KEY` isn't optional here the way `GOOGLE_CLIENT_ID`
+is — see [Encryption at rest](#encryption-at-rest) above; the app halts
+at startup without a valid one. Prefer passing it via `--set-secrets`
+from [Secret Manager](https://cloud.google.com/secret-manager) rather
+than `--set-env-vars` for a real deployment, the same way you'd handle
+any other production secret.
 
 See [`gcp_deploy.sh`](./gcp_deploy.sh) and [`env.yaml`](./env.yaml) for
 this repo's own version of the above.
@@ -412,6 +438,10 @@ Either way, translation history is recorded against a non-sensitive
 `username@dbname` identifier (see `get_conn_identifier` in
 [`db.py`](./server/db.py)) — raw connection strings, including credentials,
 are never written to the history table.
+
+Every saved connection's `database_config` is encrypted at rest before
+either backend ever writes it — see [Encryption at
+rest](#encryption-at-rest) above.
 
 ---
 

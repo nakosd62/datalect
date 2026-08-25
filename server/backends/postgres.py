@@ -7,24 +7,60 @@ This is a direct extraction of logic that used to live inline in db.py
 the queries and behavior are unchanged, just moved behind the Backend
 interface (see backends/base.py) so the route/dispatch layer no longer
 needs to know it's talking to psycopg2 specifically.
+
+TLS/server-certificate verification ("sslmode", "verify-full", etc.) is
+deliberately NOT forced or defaulted here - unlike backends/redshift.py's
+unconditional sslmode="require", a user typing their own "?sslmode=..."
+query parameter into the connection URL already reaches libpq untouched
+(psycopg2.connect() forwards the whole DSN string as-is), so nothing needs
+to change for sslmode alone. The one piece that DOES need help from this
+module is "verify-ca"/"verify-full": those modes need a CA certificate to
+validate the server's certificate against, and libpq's "sslrootcert"
+parameter is a filesystem path - not something a user pasting a connection
+string into a web form can supply directly unless they also happen to
+have filesystem access to wherever this app is actually running. See
+"ca_cert_pem" below for how that gap is closed.
 """
 
-from urllib.parse import urlparse
+import os
+from urllib.parse import urlparse, parse_qs
 
 import psycopg2
 import sqlparse
 
 from .base import (
     Backend, SqlExecutionError, SCHEMA_MAX_TABLE_NAMES_SCANNED, SCHEMA_MAX_TABLES,
-    DB_CONNECT_TIMEOUT_SECONDS,
+    DB_CONNECT_TIMEOUT_SECONDS, materialize_ca_cert_tempfile,
     group_date_sharded_tables, cap_kept_tables, cap_schema_text,
 )
+
+
+def _url_already_specifies_sslrootcert(url):
+    """True if `url` already carries its own "?sslrootcert=..." (or the
+    connection is otherwise unparseable, in which case this errs toward
+    "yes" - i.e. leave descriptor["ca_cert_pem"] unused rather than risk
+    fighting a URL this function couldn't even parse). A self-hoster who
+    already has a CA cert file sitting on the same machine this app runs
+    on can point sslrootcert at that path directly in the URL exactly as
+    before - that path always wins over descriptor["ca_cert_pem"], never
+    the other way around, so this module never silently overrides a
+    connection string the user already fully specified themselves."""
+    if not url:
+        return False
+    try:
+        return bool(parse_qs(urlparse(url).query).get("sslrootcert"))
+    except Exception:
+        return True
 
 
 class PostgresBackend(Backend):
     dialect_name = "PostgreSQL"
 
     def connect(self, descriptor):
+        descriptor = descriptor or {}
+        url = descriptor.get("url")
+        ca_cert_pem = descriptor.get("ca_cert_pem")
+
         # connect_timeout bounds only TCP/handshake setup (libpq's own
         # definition of the parameter), never query execution afterwards -
         # see backends/base.py's DB_CONNECT_TIMEOUT_SECONDS docstring for why
@@ -33,10 +69,45 @@ class PostgresBackend(Backend):
         # timeout. Passed as a kwarg alongside the DSN string rather than
         # appended to the URL itself - psycopg2 lets both coexist, and a
         # kwarg here always wins over anything already in descriptor["url"].
-        return psycopg2.connect(descriptor["url"], connect_timeout=DB_CONNECT_TIMEOUT_SECONDS)
+        kwargs = {"connect_timeout": DB_CONNECT_TIMEOUT_SECONDS}
+
+        # ca_cert_pem is only ever used when the URL doesn't already name
+        # its own sslrootcert - see _url_already_specifies_sslrootcert's
+        # docstring for why a self-hoster's own explicit choice always
+        # wins. sslmode itself is never touched here regardless (see
+        # module docstring) - the user's own "?sslmode=verify-full" (or
+        # any other value) in the URL is what actually turns verification
+        # on; this only supplies the CA cert that mode then needs.
+        temp_ca_path = None
+        if ca_cert_pem and not _url_already_specifies_sslrootcert(url):
+            temp_ca_path = materialize_ca_cert_tempfile(ca_cert_pem)
+            kwargs["sslrootcert"] = temp_ca_path
+
+        try:
+            return psycopg2.connect(url, **kwargs)
+        finally:
+            # Only needed for the handshake inside psycopg2.connect() above
+            # - libpq doesn't keep the file open/re-read it for the life of
+            # the connection - so it's safe (and best practice, since this
+            # is derived from user-pasted PEM text) to remove it right
+            # away rather than leaving it on disk for any longer than the
+            # single connect() call needs it.
+            if temp_ca_path:
+                try:
+                    os.remove(temp_ca_path)
+                except OSError:
+                    pass
 
     def close(self, connection):
-        if connection:
+        # hasattr-guarded like backends/mysql.py's, backends/bigquery.py's,
+        # and backends/snowflake.py's close() (not just `if connection:`,
+        # which this used to be) - config_routes.py's /api/config handler
+        # calls this unconditionally in a finally block, including in
+        # tests that patch connect() with a lightweight stand-in object
+        # that has no close() of its own (see
+        # helpers.install_fake_postgres_connect and mysql.py's own close()
+        # docstring for the original reasoning this mirrors).
+        if connection is not None and hasattr(connection, "close"):
             connection.close()
 
     def cache_key(self, descriptor):

@@ -8,6 +8,7 @@ exact order PostgresBackend.get_schema() issues them:
   5. views         6. grants    7. triggers
 """
 
+import os
 import sys
 from decimal import Decimal
 from datetime import date
@@ -51,6 +52,92 @@ def test_connect_passes_url_as_dsn_and_sets_connect_timeout(monkeypatch):
     dsn, kwargs = harness.calls[0]
     assert dsn == "postgresql://alice:secret@host:5432/mydb"
     assert kwargs["connect_timeout"] == DB_CONNECT_TIMEOUT_SECONDS
+
+
+# --- connect(): ca_cert_pem -> sslrootcert ----------------------------------
+# Coverage for the "verify-ca"/"verify-full" CA-certificate support added to
+# connect() - see backends/postgres.py's module docstring. sslmode itself is
+# never touched by connect() (the user's own "?sslmode=..." in the URL is
+# what actually turns verification on) - these tests only cover the
+# ca_cert_pem -> sslrootcert tempfile plumbing.
+
+def test_connect_with_no_ca_cert_pem_behaves_exactly_as_before(monkeypatch):
+    """Regression guard: a descriptor with no ca_cert_pem at all (the
+    overwhelming common case, and every existing connection prior to this
+    feature) must produce byte-identical connect() behavior - no
+    "sslrootcert" kwarg, nothing extra."""
+    harness = install_fake_postgres_connect(monkeypatch)
+    backend = PostgresBackend()
+    backend.connect({"type": "postgres", "url": "postgresql://alice:secret@host:5432/mydb"})
+    dsn, kwargs = harness.calls[0]
+    assert "sslrootcert" not in kwargs
+    assert harness.sslrootcert_contents[0] is None
+
+
+def test_connect_with_ca_cert_pem_writes_it_to_sslrootcert(monkeypatch):
+    harness = install_fake_postgres_connect(monkeypatch)
+    backend = PostgresBackend()
+    ca_cert_pem = "-----BEGIN CERTIFICATE-----\nFAKEFAKEFAKE\n-----END CERTIFICATE-----\n"
+    backend.connect({
+        "type": "postgres",
+        "url": "postgresql://alice:secret@host:5432/mydb",
+        "ca_cert_pem": ca_cert_pem,
+    })
+    dsn, kwargs = harness.calls[0]
+    assert dsn == "postgresql://alice:secret@host:5432/mydb"
+    assert "sslrootcert" in kwargs
+    # The exact PEM text the caller supplied must have reached the file
+    # connect() pointed sslrootcert at - captured by the fake at call time
+    # (see FakePostgresConnectHarness's docstring for why it can't be read
+    # back from disk afterward).
+    assert harness.sslrootcert_contents[0] == ca_cert_pem
+
+
+def test_connect_ca_cert_pem_tempfile_is_deleted_after_connect(monkeypatch):
+    """The tempfile connect() writes ca_cert_pem to must not linger on disk
+    once connect() has returned - it's derived from user-pasted PEM text
+    and is only ever needed for the handshake inside psycopg2.connect()
+    itself (see backends/postgres.py's connect() comments)."""
+    harness = install_fake_postgres_connect(monkeypatch)
+    backend = PostgresBackend()
+    backend.connect({
+        "type": "postgres",
+        "url": "postgresql://alice:secret@host:5432/mydb",
+        "ca_cert_pem": "-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n",
+    })
+    _, kwargs = harness.calls[0]
+    assert not os.path.exists(kwargs["sslrootcert"])
+
+
+def test_connect_ca_cert_pem_ignored_when_url_already_specifies_sslrootcert(monkeypatch):
+    """A self-hoster who already points sslrootcert at a file on their own
+    machine (see backends/postgres.py's _url_already_specifies_sslrootcert
+    docstring) must never have that silently overridden by a separately
+    stored ca_cert_pem - their own explicit URL always wins."""
+    harness = install_fake_postgres_connect(monkeypatch)
+    backend = PostgresBackend()
+    backend.connect({
+        "type": "postgres",
+        "url": "postgresql://alice:secret@host:5432/mydb?sslmode=verify-full&sslrootcert=/etc/ydyl/ca.pem",
+        "ca_cert_pem": "-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n",
+    })
+    dsn, kwargs = harness.calls[0]
+    # connect() must not have injected its own sslrootcert kwarg at all -
+    # psycopg2/libpq resolves it from the URL's own query string instead.
+    assert "sslrootcert" not in kwargs
+    assert dsn == "postgresql://alice:secret@host:5432/mydb?sslmode=verify-full&sslrootcert=/etc/ydyl/ca.pem"
+
+
+def test_connect_with_no_descriptor_url_still_works(monkeypatch):
+    """connect({}) (or connect(None)) must not raise just because
+    ca_cert_pem support now reads descriptor.get("url") up front instead of
+    only ever using descriptor["url"] positionally."""
+    harness = install_fake_postgres_connect(monkeypatch)
+    backend = PostgresBackend()
+    backend.connect({})
+    dsn, kwargs = harness.calls[0]
+    assert dsn is None
+    assert "sslrootcert" not in kwargs
 
 
 def test_get_schema_returns_none_when_no_tables():

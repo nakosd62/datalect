@@ -23,6 +23,7 @@ import sys
 import types
 from datetime import datetime, timedelta, timezone
 
+from cryptography.fernet import Fernet
 from google.cloud import firestore
 
 # server/ is not a package (no __init__.py) - it's run as the entrypoint's
@@ -63,7 +64,29 @@ _ENV_VARS_TO_CLEAR = [
     # (e.g. for using Claude Code itself), which would otherwise leak into
     # any test that doesn't explicitly pass its own `env`.
     "LLM_PROVIDER", "CLAUDE_PRESET_KEYS", "ANTHROPIC_API_KEY", "CLAUDE_MODEL",
+    # state_store.py's database_config encryption-at-rest key (see its
+    # module docstring section) - cleared for the same reason as every
+    # other secret-shaped var above: a developer's real shell/.env
+    # plausibly has this set for their own local Cloud Run testing.
+    "DB_CONFIG_ENCRYPTION_KEY",
 ]
+
+# A syntactically valid (but obviously throwaway, fixed/shared) Fernet
+# key - for tests that need SOME valid DB_CONFIG_ENCRYPTION_KEY to satisfy
+# app_config.py's Cloud Run startup guard (see its "Startup / Module Scope
+# Guard" section) but aren't testing the encryption mechanism itself, so
+# a fresh key per call would just be unnecessary noise. Tests that DO care
+# about the encryption mechanism (e.g. "data encrypted under key A can't
+# be read back under key B") should call make_fernet_key() below instead
+# to get a fresh, distinct key.
+FAKE_DB_CONFIG_ENCRYPTION_KEY = Fernet.generate_key().decode()
+
+
+def make_fernet_key():
+    """Returns a fresh, valid Fernet key string - see
+    FAKE_DB_CONFIG_ENCRYPTION_KEY's docstring above for when to use that
+    fixed constant instead of this."""
+    return Fernet.generate_key().decode()
 
 
 def fresh_import(monkeypatch, tmp_path, env=None, register_blueprints=True, mock_firestore=False):
@@ -281,6 +304,49 @@ def make_service_account_key(project_id="fake-project", client_email=None):
 
 def make_service_account_key_json(project_id="fake-project", client_email=None):
     return json.dumps(make_service_account_key(project_id, client_email))
+
+
+# ---------------------------------------------------------------------------
+# Fake CA certificate (Postgres/MySQL ca_cert_pem)
+# ---------------------------------------------------------------------------
+
+def make_self_signed_ca_cert_pem(common_name="ydyl-test-ca"):
+    """Returns a syntactically-real (but obviously throwaway) self-signed
+    CA certificate as a PEM string - unlike Postgres's connect()-level
+    tests (backends.postgres's psycopg2.connect() is faked, so it never
+    actually parses ca_cert_pem's content at all), backends.mysql's
+    connect() constructs a real ssl.SSLContext via
+    ssl.create_default_context(cafile=...) itself, BEFORE ever reaching
+    the (faked) pymysql.connect() call - Python's real ssl module parses
+    and validates that file's PEM content immediately, eagerly, at
+    SSLContext-construction time, so a hand-typed placeholder string like
+    "-----BEGIN CERTIFICATE-----\\nFAKE\\n-----END CERTIFICATE-----" fails
+    with `ssl.SSLError: [X509] PEM lib` well before pymysql.connect() is
+    ever reached. This generates a fresh throwaway keypair + self-signed
+    cert per call (cheap enough for tests; never reused, never a real CA)
+    so that code path has something it can actually load."""
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
+    now = datetime.datetime(2024, 1, 1)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now + datetime.timedelta(days=3650))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    return cert.public_bytes(serialization.Encoding.PEM).decode("utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -542,9 +608,23 @@ def make_fake_pg_connection(responses):
 class FakePostgresConnectHarness:
     def __init__(self):
         self.calls = []  # list of (dsn, kwargs) tuples, one per connect() call
+        # Snapshotted here, not read by the test afterward, because
+        # backends.postgres.connect()'s ca_cert_pem support deletes the
+        # sslrootcert tempfile in a `finally` immediately after this fake
+        # returns - by the time a test gets control back, the path in
+        # kwargs["sslrootcert"] no longer exists on disk. One entry per
+        # connect() call, in the same order as self.calls; None when that
+        # call's kwargs had no "sslrootcert" at all.
+        self.sslrootcert_contents = []
 
     def connect(self, dsn, **kwargs):
         self.calls.append((dsn, kwargs))
+        sslrootcert_path = kwargs.get("sslrootcert")
+        if sslrootcert_path:
+            with open(sslrootcert_path, "r") as f:
+                self.sslrootcert_contents.append(f.read())
+        else:
+            self.sslrootcert_contents.append(None)
         return object()  # backend.connect() just returns this straight through
 
 

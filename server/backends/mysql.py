@@ -54,8 +54,36 @@ assuming they're identical:
 NOTE for reviewers: like backends/snowflake.py, this has been exercised
 against the fake DB-API harness in tests/server/helpers.py, not a real
 MySQL server yet - treat the SQL here as a solid first draft.
+
+TLS ("sslmode", a CA certificate to verify against) works differently here
+than in backends/postgres.py, because of that same "connect() parses the
+URL itself" fact above: psycopg2.connect() forwards a whole DSN string to
+libpq, which parses "?sslmode=..."/"?sslrootcert=..." itself - but this
+module already hand-parses the URL's query string and only recognizes
+specific keys (see _parse_mysql_url), so "sslmode" needs to be explicitly
+added to that whitelist rather than "just working" the way it does for
+Postgres. See _parse_mysql_url's and connect()'s own comments for the
+recognized "sslmode" values (deliberately reusing Postgres's own
+disable/require/verify-ca/verify-full vocabulary, even though MySQL's own
+client tools spell these differently, so a user moving between the two
+dialects in this app doesn't need to learn two vocabularies for the same
+idea) and how each maps onto PyMySQL's ssl_* parameters.
+
+Worth correcting here for anyone who read this module's connect() before
+this comment existed: PyMySQL does NOT leave a connection fully
+unencrypted by default the way this docstring used to imply - with no
+ssl_* arguments at all (sslmode absent/"disable", the byte-identical-to-
+before case), PyMySQL still opportunistically attempts TLS if the server
+offers it and silently falls back to plaintext if not (its own comment
+calls this "PREFERRED mode") - the same "prefer" default psycopg2/libpq
+uses for Postgres when nothing is specified. "require"/"verify-ca"/
+"verify-full" below are about turning that opportunistic, unverified
+default into something enforced and/or actually checked - not about
+turning encryption on from a fully-off state.
 """
 
+import os
+import ssl
 from urllib.parse import urlparse, unquote, parse_qs
 
 import pymysql
@@ -63,14 +91,14 @@ import sqlparse
 
 from .base import (
     Backend, SqlExecutionError, SCHEMA_MAX_TABLE_NAMES_SCANNED, SCHEMA_MAX_TABLES,
-    DB_CONNECT_TIMEOUT_SECONDS,
+    DB_CONNECT_TIMEOUT_SECONDS, materialize_ca_cert_tempfile,
     group_date_sharded_tables, cap_kept_tables, cap_schema_text,
 )
 
 
 def _parse_mysql_url(url):
-    """{"host", "port", "user", "password", "database", "unix_socket"}
-    from a mysql://... URL. urlparse does not percent-decode
+    """{"host", "port", "user", "password", "database", "unix_socket",
+    "sslmode"} from a mysql://... URL. urlparse does not percent-decode
     .username/.password (unlike psycopg2's own DSN parser), so both are
     explicitly unquote()'d here - without this, a password containing an
     encoded special character (e.g. %40 for '@') would be sent to the
@@ -78,16 +106,18 @@ def _parse_mysql_url(url):
 
     "unix_socket" is pulled from the query string (see module docstring -
     the Cloud SQL connection pattern) and is None when absent, i.e. an
-    ordinary TCP connection. A query string can carry other keys too
-    (sslmode, charset, ...) - only unix_socket is recognized today; anything
-    else is silently ignored rather than erroring, same as an unrecognized
-    field would be for any other dialect's config."""
+    ordinary TCP connection. "sslmode" is the other recognized key (see
+    connect() for what each value does) - a query string can carry other
+    keys too (charset, ...); anything besides these two is silently
+    ignored rather than erroring, same as an unrecognized field would be
+    for any other dialect's config."""
     parsed = urlparse(url)
     database = parsed.path.lstrip('/')
     if '?' in database:
         database = database.split('?')[0]
     query = parse_qs(parsed.query)
     unix_socket = (query.get('unix_socket') or [None])[0]
+    sslmode = (query.get('sslmode') or [None])[0]
     return {
         "host": parsed.hostname or "localhost",
         "port": parsed.port or 3306,
@@ -95,6 +125,7 @@ def _parse_mysql_url(url):
         "password": unquote(parsed.password) if parsed.password else "",
         "database": database or None,
         "unix_socket": unix_socket,
+        "sslmode": sslmode,
     }
 
 
@@ -102,7 +133,8 @@ class MySQLBackend(Backend):
     dialect_name = "MySQL"
 
     def connect(self, descriptor):
-        parts = _parse_mysql_url((descriptor or {}).get("url") or "")
+        descriptor = descriptor or {}
+        parts = _parse_mysql_url(descriptor.get("url") or "")
         kwargs = {
             "user": parts["user"], "password": parts["password"], "database": parts["database"],
             "autocommit": False,
@@ -118,12 +150,83 @@ class MySQLBackend(Backend):
             # Unix-socket connections (Cloud SQL) have no real TCP host at
             # all - host/port are omitted entirely rather than sent
             # alongside unix_socket, so there's no ambiguity about which
-            # one PyMySQL actually uses.
+            # one PyMySQL actually uses. TLS is a TCP-only concept in the
+            # MySQL wire protocol too (same as Postgres - see
+            # backends/postgres.py's docstring for the Postgres side of
+            # this), so sslmode is meaningless for a unix_socket connection
+            # and is intentionally never even inspected in this branch.
             kwargs["unix_socket"] = parts["unix_socket"]
-        else:
-            kwargs["host"] = parts["host"]
-            kwargs["port"] = parts["port"]
-        return pymysql.connect(**kwargs)
+            return pymysql.connect(**kwargs)
+
+        kwargs["host"] = parts["host"]
+        kwargs["port"] = parts["port"]
+
+        # sslmode is never forced or defaulted here, same policy as
+        # backends/postgres.py's sslmode: "disable" (or the key simply
+        # absent from the URL, the overwhelmingly common case and the one
+        # that must behave byte-identically to before this feature
+        # existed) means "don't add anything - let PyMySQL's own built-in
+        # opportunistic-TLS-with-silent-fallback default apply" (see module
+        # docstring for why that's already the behavior with zero ssl_*
+        # kwargs at all, not "always plaintext").
+        #
+        # "require"/"verify-ca"/"verify-full" all build our own
+        # ssl.SSLContext by hand and hand it to PyMySQL via the "ssl"
+        # kwarg, rather than using PyMySQL's own ssl_ca/ssl_verify_cert/
+        # ssl_verify_identity kwargs directly - PyMySQL special-cases an
+        # ssl.SSLContext instance as "use this exactly as given" (see
+        # Connection._create_ssl_ctx), which sidesteps PyMySQL's own
+        # somewhat surprising interaction between those individual kwargs
+        # (e.g. supplying ssl_ca alone, with ssl_verify_cert/
+        # ssl_verify_identity left unset, does NOT turn on verification at
+        # all - it silently maps to CERT_NONE) in favor of us stating
+        # exactly what we mean for each mode.
+        sslmode = (parts.get("sslmode") or "").strip().lower()
+        ca_cert_pem = descriptor.get("ca_cert_pem")
+        temp_ca_path = None
+        try:
+            if sslmode == "require":
+                # Encrypt, but don't check the server's certificate at all
+                # - same meaning as Postgres's sslmode=require. No CA cert
+                # is used or needed for this mode.
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                kwargs["ssl"] = ctx
+            elif sslmode in ("verify-ca", "verify-full"):
+                # cafile passed straight to create_default_context() (not
+                # added afterward via load_verify_locations()) so that,
+                # when a CA cert IS supplied, ONLY that CA is trusted -
+                # not also this machine's system CA store - mirroring
+                # libpq's own sslrootcert semantics (see
+                # backends/postgres.py's connect()). Without a CA cert,
+                # this falls back to the system trust store, same as
+                # Postgres does when verify-full is requested with no
+                # sslrootcert at all.
+                if ca_cert_pem:
+                    temp_ca_path = materialize_ca_cert_tempfile(ca_cert_pem)
+                    ctx = ssl.create_default_context(cafile=temp_ca_path)
+                else:
+                    ctx = ssl.create_default_context()
+                ctx.check_hostname = (sslmode == "verify-full")
+                ctx.verify_mode = ssl.CERT_REQUIRED
+                kwargs["ssl"] = ctx
+            # Any other value (missing, "disable", or an unrecognized typo)
+            # intentionally adds nothing at all - see the comment above.
+
+            return pymysql.connect(**kwargs)
+        finally:
+            # Only needed for the handshake inside pymysql.connect() above
+            # - same reasoning as backends/postgres.py's own tempfile
+            # cleanup: safe (and best practice, since this is derived from
+            # user-pasted PEM text) to remove it immediately rather than
+            # leaving it on disk any longer than this one connect() call
+            # needs it.
+            if temp_ca_path:
+                try:
+                    os.remove(temp_ca_path)
+                except OSError:
+                    pass
 
     def close(self, connection):
         # hasattr-guarded like backends/bigquery.py's and

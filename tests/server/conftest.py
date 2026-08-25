@@ -13,6 +13,7 @@ from helpers import (
     fresh_import, install_fake_bigquery, install_fake_snowflake_connect,
     install_fake_pymysql_connect, install_fake_databricks_connect, install_fake_oracle_connect,
     install_fake_redshift_connect, install_fake_mssql_connect, install_fake_sheets_requests,
+    install_fake_postgres_connect,
 )
 
 
@@ -63,6 +64,16 @@ def snowflake_harness(monkeypatch):
     ordering caveat as bigquery_harness above: call this AFTER
     app_factory/app_env in your test, not before."""
     return install_fake_snowflake_connect(monkeypatch)
+
+
+@pytest.fixture
+def postgres_harness(monkeypatch):
+    """Patches backends.postgres's psycopg2.connect with a fake that
+    records the DSN and kwargs it was called with instead of opening a
+    real connection. Same ordering caveat as bigquery_harness/
+    snowflake_harness/mysql_harness above: call this AFTER app_factory/
+    app_env in your test, not before."""
+    return install_fake_postgres_connect(monkeypatch)
 
 
 @pytest.fixture

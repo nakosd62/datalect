@@ -15,6 +15,7 @@ ydyl-bq-test-key.json
 presets_local.json
 presets_CR.json
 grand-cosmos-716-*.json
+cloudsql-ca.pem
 
 # Logs
 *.log

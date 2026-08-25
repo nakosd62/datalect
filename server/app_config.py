@@ -20,7 +20,7 @@ from flask import Flask
 from flask_cors import CORS
 from google.cloud import firestore
 
-from state_store import SqliteStateStore, FirestoreStateStore
+from state_store import SqliteStateStore, FirestoreStateStore, is_db_config_encryption_configured
 from sheets_util import extract_spreadsheet_id
 
 from dotenv import load_dotenv
@@ -101,6 +101,27 @@ if IS_CLOUD_RUN and not firestore_client:
         f"CRITICAL: Service running on Cloud Run (K_SERVICE={os.environ.get('K_SERVICE')}), "
         f"but Firestore client failed to initialize (GCP_PROJECT_ID={GCP_PROJECT_ID}). "
         "Halting startup to prevent ephemeral SQLite fallback."
+    )
+
+# Saved connections (database_config - passwords, service-account keys,
+# private keys, CA certificates, ...) are encrypted at rest using a key
+# read from DB_CONFIG_ENCRYPTION_KEY (see state_store.py's encryption-at-
+# rest comment for the full design). Locally, an unset/invalid key just
+# means database_config is stored unencrypted - convenient for zero-config
+# dev, same posture as GOOGLE_CLIENT_ID being unset. On Cloud Run, where
+# real users' real credentials are actually at stake, that same silent
+# fallback would be a genuine security regression nobody would notice
+# until it mattered - so, same as the Firestore guard just above, this
+# halts startup rather than allowing it.
+if IS_CLOUD_RUN and not is_db_config_encryption_configured():
+    raise RuntimeError(
+        f"CRITICAL: Service running on Cloud Run (K_SERVICE={os.environ.get('K_SERVICE')}), "
+        "but DB_CONFIG_ENCRYPTION_KEY is not set to a valid Fernet key. Saved connection "
+        "details (passwords, service-account keys, private keys, CA certificates, ...) "
+        "would be stored in plaintext in Firestore. Halting startup rather than silently "
+        "storing credentials unencrypted. Generate a key with: "
+        'python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())" '
+        "and set it as DB_CONFIG_ENCRYPTION_KEY."
     )
 
 # --- Flask app ---------------------------------------------------------------
@@ -524,10 +545,14 @@ if raw_db_presets.strip():
                 "id": preset_id,
                 "name": name,
                 "type": "snowflake",
-                # Synthetic identifier, not a credential - mirrors
-                # config_routes.py's _snowflake_url (duplicated here rather
-                # than imported, since config_routes.py imports FROM this
-                # module - see the comment above DATABASE_PRESETS_FILE).
+                # Synthetic, display-only identifier for this preset - unlike
+                # config_routes.py's CUSTOM-connection _snowflake_identity (which is
+                # purely internal and never stored as a url any more - see
+                # that module's docstring), an admin-configured preset like this
+                # one is out of scope for that change and still carries its own
+                # synthetic url, built independently here rather than imported
+                # (config_routes.py imports FROM this module - see the comment
+                # above DATABASE_PRESETS_FILE).
                 "url": f"snowflake://{account}/{database}" + (f"/{schema}" if schema else ""),
                 "account": account,
                 "user": sf_user,
@@ -565,10 +590,14 @@ if raw_db_presets.strip():
                 "id": preset_id,
                 "name": name,
                 "type": "databricks",
-                # Synthetic identifier, not a credential - mirrors
-                # config_routes.py's _databricks_url (duplicated here rather
-                # than imported, since config_routes.py imports FROM this
-                # module - see the comment above DATABASE_PRESETS_FILE).
+                # Synthetic, display-only identifier for this preset - unlike
+                # config_routes.py's CUSTOM-connection _databricks_identity (which is
+                # purely internal and never stored as a url any more - see
+                # that module's docstring), an admin-configured preset like this
+                # one is out of scope for that change and still carries its own
+                # synthetic url, built independently here rather than imported
+                # (config_routes.py imports FROM this module - see the comment
+                # above DATABASE_PRESETS_FILE).
                 "url": f"databricks://{server_hostname}{http_path}",
                 "server_hostname": server_hostname,
                 "http_path": http_path,
@@ -601,10 +630,14 @@ if raw_db_presets.strip():
                 "id": preset_id,
                 "name": name,
                 "type": "oracle",
-                # Synthetic identifier, not a credential - mirrors
-                # config_routes.py's _oracle_url (duplicated here rather
-                # than imported, since config_routes.py imports FROM this
-                # module - see the comment above DATABASE_PRESETS_FILE).
+                # Synthetic, display-only identifier for this preset - unlike
+                # config_routes.py's CUSTOM-connection _oracle_identity (which is
+                # purely internal and never stored as a url any more - see
+                # that module's docstring), an admin-configured preset like this
+                # one is out of scope for that change and still carries its own
+                # synthetic url, built independently here rather than imported
+                # (config_routes.py imports FROM this module - see the comment
+                # above DATABASE_PRESETS_FILE).
                 "url": f"oracle://{host}:{port}/{service_name or sid}",
                 "host": host,
                 "port": port,
@@ -645,10 +678,14 @@ if raw_db_presets.strip():
                 "id": preset_id,
                 "name": name,
                 "type": "redshift",
-                # Synthetic identifier, not a credential - mirrors
-                # config_routes.py's _redshift_url (duplicated here rather
-                # than imported, since config_routes.py imports FROM this
-                # module - see the comment above DATABASE_PRESETS_FILE).
+                # Synthetic, display-only identifier for this preset - unlike
+                # config_routes.py's CUSTOM-connection _redshift_identity (which is
+                # purely internal and never stored as a url any more - see
+                # that module's docstring), an admin-configured preset like this
+                # one is out of scope for that change and still carries its own
+                # synthetic url, built independently here rather than imported
+                # (config_routes.py imports FROM this module - see the comment
+                # above DATABASE_PRESETS_FILE).
                 "url": f"redshift://{host}:{port}/{database}",
                 "host": host,
                 "port": port,
@@ -679,10 +716,14 @@ if raw_db_presets.strip():
                 "id": preset_id,
                 "name": name,
                 "type": "mssql",
-                # Synthetic identifier, not a credential - mirrors
-                # config_routes.py's _mssql_url (duplicated here rather
-                # than imported, since config_routes.py imports FROM this
-                # module - see the comment above DATABASE_PRESETS_FILE).
+                # Synthetic, display-only identifier for this preset - unlike
+                # config_routes.py's CUSTOM-connection _mssql_identity (which is
+                # purely internal and never stored as a url any more - see
+                # that module's docstring), an admin-configured preset like this
+                # one is out of scope for that change and still carries its own
+                # synthetic url, built independently here rather than imported
+                # (config_routes.py imports FROM this module - see the comment
+                # above DATABASE_PRESETS_FILE).
                 "url": f"mssql://{host}:{port}/{database}",
                 "host": host,
                 "port": port,
@@ -728,10 +769,14 @@ if raw_db_presets.strip():
                 "id": preset_id,
                 "name": name,
                 "type": "sheets",
-                # Synthetic identifier, not a credential - mirrors
-                # config_routes.py's _sheets_url (duplicated here rather
-                # than imported, since config_routes.py imports FROM this
-                # module - see the comment above DATABASE_PRESETS_FILE).
+                # Synthetic, display-only identifier for this preset - unlike
+                # config_routes.py's CUSTOM-connection _sheets_identity (which is
+                # purely internal and never stored as a url any more - see
+                # that module's docstring), an admin-configured preset like this
+                # one is out of scope for that change and still carries its own
+                # synthetic url, built independently here rather than imported
+                # (config_routes.py imports FROM this module - see the comment
+                # above DATABASE_PRESETS_FILE).
                 # extract_spreadsheet_id itself IS imported (from
                 # sheets_util, not backends.sheets) since it's not a
                 # one-liner worth tripling - see sheets_util.py's docstring

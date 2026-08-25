@@ -29,6 +29,7 @@ actually needs it.
 
 import os
 import re
+import tempfile
 from abc import ABC, abstractmethod
 
 # --- Schema-introspection size limits ---------------------------------------
@@ -197,6 +198,37 @@ def cap_schema_text(text, max_chars=SCHEMA_MAX_CHARS):
         + "reduce SCHEMA_MAX_CHARS/SCHEMA_MAX_TABLES scope on this "
         + "connection's dataset, to see more of it.]"
     )
+
+
+def materialize_ca_cert_tempfile(ca_cert_pem):
+    """Writes `ca_cert_pem` (PEM text, pasted by a user through the config
+    modal and stored verbatim in database_config - see config_routes.py's
+    module docstring and state_store.py's _CREDENTIAL_CONFIG_FIELDS, which
+    deliberately does NOT include this field since a CA certificate is
+    public information, not a secret) to a fresh, uniquely-named temp file
+    and returns its path. Shared by backends/postgres.py (libpq's
+    "sslrootcert") and backends/mysql.py (an ssl.SSLContext's cafile) -
+    both dialects' underlying driver only accepts a CA cert as a
+    filesystem path, never inline PEM content, so this is the one place
+    that gap gets bridged for either of them.
+
+    A fresh tempfile.mkstemp() call per connect() (not a shared/cached
+    path) matters: connect() can run concurrently for different users or
+    different connections (schema-cache refreshes, concurrent /api/execute
+    calls, ...), and a shared path would let one connection's CA cert
+    clobber another's mid-handshake. The caller is responsible for
+    deleting the path this returns once the underlying driver's connect
+    call has returned (success or failure) - see backends/postgres.py's
+    and backends/mysql.py's connect() for the delete-in-a-finally
+    pattern."""
+    fd, path = tempfile.mkstemp(suffix=".pem", prefix="ydyl_ca_")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(ca_cert_pem)
+    except Exception:
+        os.remove(path)
+        raise
+    return path
 
 
 class SqlExecutionError(Exception):

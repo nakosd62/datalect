@@ -18,7 +18,11 @@ MySQL custom connection in the same request doesn't collapse either one
 into the other.
 """
 
-from helpers import login_as, write_database_presets_file, install_fake_pymysql_connect
+import ssl
+
+from helpers import (
+    login_as, write_database_presets_file, install_fake_pymysql_connect, make_self_signed_ca_cert_pem,
+)
 
 
 def test_custom_mysql_connection_persists_with_correct_type(app_env):
@@ -97,6 +101,30 @@ def test_mysql_connection_actually_dispatches_to_mysql_backend(app_env, mysql_ha
     assert kwargs["user"] == "alice"
     assert kwargs["password"] == "secret"
     assert kwargs["database"] == "salesdb"
+
+
+def test_connect_dispatches_sslmode_and_ca_cert_pem_through_to_mysql_backend(app_env, mysql_harness):
+    # The real end-to-end check: not just that config_routes.py stores
+    # ca_cert_pem, but that it - along with the URL's own sslmode - reaches
+    # backends.mysql.MySQLBackend.connect() as a real ssl.SSLContext on a
+    # real /api/execute call. See test_mysql_backend.py for connect()-level
+    # unit coverage of the sslmode->SSLContext mapping, and
+    # test_config_postgres_ca_cert.py for the equivalent Postgres test.
+    login_as(app_env.client, "alice@example.com")
+    ca_cert_pem = make_self_signed_ca_cert_pem()
+    app_env.client.post('/api/config', json={
+        "database_type": "mysql",
+        "database_url": "mysql://alice:secret@dbhost:3306/salesdb?sslmode=verify-full",
+        "database_name": "MySQL Conn", "is_custom": True, "ca_cert_pem": ca_cert_pem,
+    })
+    app_env.client.post('/api/execute', json={"sql": "SELECT 1;"})
+    # >=1 rather than an exact count - see the comment on the test above
+    # this one for why.
+    assert len(mysql_harness.calls) >= 1
+    ctx = mysql_harness.calls[-1].get("ssl")
+    assert isinstance(ctx, ssl.SSLContext)
+    assert ctx.verify_mode == ssl.CERT_REQUIRED
+    assert ctx.check_hostname is True
 
 
 def test_cloud_sql_unix_socket_preset_dispatches_with_socket_not_localhost(app_factory, tmp_path, monkeypatch):

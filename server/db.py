@@ -127,19 +127,40 @@ def _resolve_database_name(descriptor, user_id):
     connection name if it matches one of those, else the backend's
     non-sensitive cache key (e.g. "user@host:port/dbname" for Postgres) as
     a last resort - never blank, so history rows always show something
-    readable."""
-    url = (descriptor or {}).get("url")
+    readable.
+
+    Postgres/MySQL custom connections still match by url, same as always
+    - it's their real, distinguishing DSN. BigQuery/Snowflake/Databricks/
+    Oracle/Redshift/MSSQL/Sheets custom connections have no real url of
+    their own (config_routes.py's module docstring), so url is always
+    None for those now; they're matched by comparing the descriptor's own
+    config fields (the same ones resolve_active_descriptor merged onto it
+    from the saved row in the first place) against each saved row's
+    config instead. include_credentials=True on that lookup is required
+    for this comparison, not just an option - resolve_active_descriptor
+    built `descriptor` with credentials merged in, so a stripped
+    (credential-free) config from get_db_connections() would never equal
+    it."""
+    descriptor = descriptor or {}
+    url = descriptor.get("url")
     if url:
         for db in CONFIGURED_DBS:
             if db.get("url") == url:
                 return db["name"]
-        if user_id:
-            try:
-                for db in state_store.get_db_connections(user_id):
+    if user_id:
+        try:
+            db_type = descriptor.get("type")
+            own_config = {k: v for k, v in descriptor.items() if k not in ("type", "url")}
+            for db in state_store.get_db_connections(user_id, include_credentials=True):
+                if db.get("type") != db_type:
+                    continue
+                if url:
                     if db.get("url") == url:
                         return db.get("name") or "Custom"
-            except Exception:
-                logger.exception("Error resolving custom database name for translation history")
+                elif (db.get("config") or {}) == own_config:
+                    return db.get("name") or "Custom"
+        except Exception:
+            logger.exception("Error resolving custom database name for translation history")
     return get_conn_identifier(descriptor)
 
 

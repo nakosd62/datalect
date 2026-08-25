@@ -23,6 +23,7 @@ import os
 import sqlite3
 from abc import ABC, abstractmethod
 
+from cryptography.fernet import Fernet
 from google.cloud import firestore
 
 # Reuses the same logger name/config server.py sets up (root logger stays
@@ -30,6 +31,110 @@ from google.cloud import firestore
 # If this module is ever imported standalone without server.py's config
 # having run, it still works - it just falls back to logging defaults.
 logger = logging.getLogger("ydyl")
+
+
+# --- Encryption at rest for database_config ---------------------------------
+#
+# database_config (see below) can carry a saved connection's password, a
+# BigQuery service-account key, a Snowflake private key, a Postgres/MySQL
+# CA certificate, and so on. Rather than maintaining a field-by-field
+# allowlist of "these specific keys are sensitive, encrypt just those"
+# (easy to miss a newly-added field one day - see _CREDENTIAL_CONFIG_FIELDS
+# above, a similar-looking allowlist but for a completely different
+# purpose: API-response redaction, not storage), the WHOLE database_config
+# dict is encrypted as one opaque blob before it's ever written to SQLite
+# or Firestore, and decrypted transparently on read. A field added to any
+# backend's config in the future is automatically covered without anyone
+# needing to remember to add it to a list here.
+#
+# The key itself is never stored alongside the data it protects - it's
+# read from DB_CONFIG_ENCRYPTION_KEY_ENV_VAR (a Fernet key: AES-128-CBC +
+# HMAC-SHA256, from the `cryptography` package, already a production
+# dependency - see requirements.txt), the same way GOOGLE_CLIENT_ID/
+# GEMINI_API_KEY/etc are already read from the environment
+# (app_config.py) - via a real secret manager (e.g. Cloud Run's Secret
+# Manager integration) in production, a plain .env locally. See
+# app_config.py's "Startup / Module Scope Guard" section for what happens
+# when this is missing/invalid on Cloud Run specifically.
+#
+# Backward compatibility for rows written before this existed (or written
+# while no/an invalid key was configured) needs no separate migration
+# step: decryption is attempted first, and ANY failure (no cipher
+# configured, wrong/rotated key, or the value was never encrypted to
+# begin with) falls back to treating the stored value as the plain,
+# unencrypted representation this module always used before - see
+# _loads_config (SQLite's TEXT column - always a string either way) and
+# _decrypt_firestore_config (Firestore's field - a native map before this
+# existed, a string once a valid key is configured) below. A legacy row
+# is transparently re-encrypted the next time it's saved, not proactively
+# rewritten by this module.
+DB_CONFIG_ENCRYPTION_KEY_ENV_VAR = "DB_CONFIG_ENCRYPTION_KEY"
+
+
+def _load_cipher():
+    """Returns a fresh Fernet cipher built from the CURRENT
+    DB_CONFIG_ENCRYPTION_KEY_ENV_VAR value, or None if it's unset or not a
+    valid Fernet key. Deliberately re-reads the env var and reconstructs
+    the Fernet object on every call rather than caching it once at import
+    time - the actual cost of doing so is negligible (base64-decoding a
+    32-byte key; no KDF involved), and this way a changed env var takes
+    effect on the very next call with no special re-import/restart step
+    needed to pick it up. A None result means database_config is stored
+    as plain JSON text / a native Firestore map, exactly as it was before
+    this feature existed - this function itself stays permissive so
+    purely-local dev keeps working with zero configuration, same as
+    GOOGLE_CLIENT_ID being unset today; app_config.py's startup guard is
+    what turns "no valid key" into a hard failure specifically on Cloud
+    Run."""
+    raw_key = os.environ.get(DB_CONFIG_ENCRYPTION_KEY_ENV_VAR, "").strip()
+    if not raw_key:
+        return None
+    try:
+        return Fernet(raw_key.encode("utf-8"))
+    except Exception:
+        logger.error(
+            "%s is set but is not a valid Fernet key - database_config will be "
+            "stored UNENCRYPTED until this is fixed. Generate a valid key with: "
+            'python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"',
+            DB_CONFIG_ENCRYPTION_KEY_ENV_VAR,
+        )
+        return None
+
+
+def is_db_config_encryption_configured():
+    """Whether a valid encryption key is configured right now - used by
+    app_config.py's startup guard to decide whether to halt startup on
+    Cloud Run (see this module's encryption-at-rest comment above)."""
+    return _load_cipher() is not None
+
+
+def _encrypt_config_to_text(config):
+    """The value to actually persist for a database_config dict in
+    SQLite's TEXT column: Fernet-encrypted JSON when a cipher is
+    configured, or the same plain JSON text this stored before encryption
+    at rest existed when it isn't (see _load_cipher) - either way, a str,
+    matching the column's type. Firestore's write path
+    (_config_value_to_store below) has its own wrapper, since a Firestore
+    field isn't limited to text the way a SQLite column is."""
+    raw = json.dumps(config or {})
+    cipher = _load_cipher()
+    if cipher is None:
+        return raw
+    return cipher.encrypt(raw.encode("utf-8")).decode("utf-8")
+
+
+def _config_value_to_store(config):
+    """The value to actually persist for a database_config field in
+    Firestore. Contrast _encrypt_config_to_text just above, which always
+    returns a str for SQLite's TEXT column - Firestore has no such
+    constraint, so when no cipher is configured this keeps writing the
+    native map Firestore always wrote for this field before encryption at
+    rest existed, rather than a JSON-text string it would then have to be
+    told apart from by type on read (see _decrypt_firestore_config)."""
+    cipher = _load_cipher()
+    if cipher is None:
+        return config or {}
+    return _encrypt_config_to_text(config)
 
 
 def _effective_user(user_id):
@@ -61,16 +166,55 @@ _CREDENTIAL_CONFIG_FIELDS = {"credentials_json", "password", "private_key", "pri
 
 
 def _loads_config(raw_json):
-    """Best-effort JSON decode for a stored database_config value. Never
-    raises - a corrupt/legacy value just degrades to an empty config
-    rather than breaking session/connection loading entirely."""
+    """Best-effort decode for a stored database_config value: SQLite's
+    TEXT column value directly, or (via _decrypt_firestore_config)
+    Firestore's field value once that's already been confirmed to be a
+    str there. Tries Fernet-decryption first when a cipher is configured
+    (see _load_cipher above), then falls through to parsing the result as
+    plain JSON regardless of whether decryption ran at all - that's what
+    makes a legacy plaintext row (written before encryption at rest
+    existed, or while no/a different key was configured) keep reading
+    correctly under a newly-configured key, with no separate migration
+    step required. Never raises - a corrupt/foreign value just degrades
+    to an empty config rather than breaking session/connection loading
+    entirely."""
     if not raw_json:
         return {}
+    cipher = _load_cipher()
+    if cipher is not None:
+        try:
+            raw_json = cipher.decrypt(raw_json.encode("utf-8")).decode("utf-8")
+        except Exception:
+            # Not (or no longer) valid ciphertext under this key - fall
+            # through and try it as plain JSON below instead of treating
+            # this as an error; see this function's docstring.
+            pass
     try:
         return json.loads(raw_json) or {}
     except Exception:
         logger.warning("Failed to parse stored database_config JSON; ignoring it.")
         return {}
+
+
+def _decrypt_firestore_config(value):
+    """Inverse of _config_value_to_store for a database_config field
+    already read back from Firestore. A dict means it was written as a
+    native map - either before encryption at rest existed, or while no
+    cipher was configured at write time - and is returned as-is. A str
+    means it was written as Fernet-encrypted text (_config_value_to_store
+    only ever produces a str when a cipher IS configured), so it's run
+    through _loads_config's decrypt-then-fall-back-to-plain-JSON logic -
+    note a plain JSON *string* is not a representation Firestore itself
+    ever wrote for this field, so falling all the way through to that
+    branch here means either a value encrypted under a different/
+    no-longer-configured key, or genuinely foreign data; either way it
+    degrades to {} rather than raising, same as everywhere else in this
+    module."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        return _loads_config(value)
+    return {}
 
 
 def _strip_credentials(config):
@@ -392,7 +536,7 @@ class SqliteStateStore(StateStore):
                         user_id TEXT,
                         connection_key TEXT NOT NULL DEFAULT '',
                         database_name TEXT NOT NULL,
-                        database_url TEXT NOT NULL,
+                        database_url TEXT,
                         database_type TEXT NOT NULL DEFAULT 'postgres',
                         database_config TEXT,
                         PRIMARY KEY (user_id, connection_key)
@@ -449,6 +593,44 @@ class SqliteStateStore(StateStore):
                                 (user_id, connection_key, database_name, database_url, database_type, database_config)
                             VALUES (?, ?, ?, ?, ?, ?);
                         """, (old_user_id, old_key, old_name, old_url, old_type, old_config_raw))
+                    cursor.execute("DROP TABLE db_connections_old;")
+
+                # Migration: existing DBs created before BigQuery/Snowflake/
+                # Databricks/Oracle/Redshift/MSSQL/Sheets custom connections
+                # stopped carrying a synthetic, made-up database_url (see
+                # config_routes.py's module docstring - those 7 dialects
+                # have no real url of their own, so there's nothing genuine
+                # to store here for them any more). NOT NULL made sense back
+                # when every row had *something* to put there; now it'd
+                # force storing an empty string standing in for "no url",
+                # which is exactly the fake value this change is trying to
+                # stop persisting. SQLite can't relax a column's NOT NULL in
+                # place, so this is the same rebuild-and-copy pattern as the
+                # connection_key migration just above - existing rows
+                # (including any old synthetic url for the 7 dialects) are
+                # carried over completely as-is; nothing is backfilled to
+                # NULL retroactively, since re-saving each connection
+                # through /api/config is what actually clears it.
+                cursor.execute("PRAGMA table_info(db_connections);")
+                if any(col[1] == "database_url" and col[3] for col in cursor.fetchall()):
+                    cursor.execute("ALTER TABLE db_connections RENAME TO db_connections_old;")
+                    cursor.execute("""
+                        CREATE TABLE db_connections (
+                            user_id TEXT,
+                            connection_key TEXT NOT NULL DEFAULT '',
+                            database_name TEXT NOT NULL,
+                            database_url TEXT,
+                            database_type TEXT NOT NULL DEFAULT 'postgres',
+                            database_config TEXT,
+                            PRIMARY KEY (user_id, connection_key)
+                        );
+                    """)
+                    cursor.execute("""
+                        INSERT INTO db_connections
+                            (user_id, connection_key, database_name, database_url, database_type, database_config)
+                        SELECT user_id, connection_key, database_name, database_url, database_type, database_config
+                        FROM db_connections_old;
+                    """)
                     cursor.execute("DROP TABLE db_connections_old;")
 
                 cursor.execute("PRAGMA table_info(translations);")
@@ -587,12 +769,27 @@ class SqliteStateStore(StateStore):
                         t = db.get("type") or "postgres"
                         cfg = db.get("config") or {}
                         key = db.get("connection_key") or compute_connection_key(n, u, _credential_value_for_key(cfg))
-                        if u:
+                        # Gated on name, not url: BigQuery/Snowflake/
+                        # Databricks/Oracle/Redshift/MSSQL/Sheets rows have
+                        # no real url of their own any more (always "" -
+                        # see config_routes.py's module docstring) and are
+                        # still real, complete rows that must be persisted.
+                        # This function's only caller
+                        # (_parse_incoming_custom_databases) already drops
+                        # genuinely incomplete rows before they ever get
+                        # here and always supplies a name, so gating on it
+                        # here is just a last-resort guard against a
+                        # malformed row, not the load-bearing completeness
+                        # check url used to be.
+                        if n:
                             cursor.execute("""
                                 INSERT OR REPLACE INTO db_connections
                                     (user_id, connection_key, database_name, database_url, database_type, database_config)
                                 VALUES (?, ?, ?, ?, ?, ?);
-                            """, (effective_user, key, n or "Custom", u, t, json.dumps(cfg) if cfg else None))
+                            """, (
+                            effective_user, key, n or "Custom", u, t,
+                            _encrypt_config_to_text(cfg) if cfg else None,
+                        ))
                     conn.commit()
             except Exception:
                 logger.exception("Error replacing custom connections in SQLite")
@@ -608,7 +805,7 @@ class SqliteStateStore(StateStore):
                     VALUES (?, ?, ?, ?, ?, ?);
                 """, (
                     effective_user, key, db_name, db_url, db_type or "postgres",
-                    json.dumps(db_config) if db_config else None,
+                    _encrypt_config_to_text(db_config) if db_config else None,
                 ))
                 conn.commit()
         except Exception:
@@ -792,8 +989,17 @@ class FirestoreStateStore(StateStore):
             docs = self.client.collection("db_connections").where("user_id", "==", effective_user).stream()
             for doc in docs:
                 data = doc.to_dict()
-                if data and data.get("database_url"):
-                    config = dict(data.get("database_config") or {})
+                # Gated on database_name, not database_url: BigQuery/
+                # Snowflake/Databricks/Oracle/Redshift/MSSQL/Sheets rows
+                # always have "" for database_url now (no real url of
+                # their own - see config_routes.py's module docstring),
+                # but are still real, complete rows that must be returned.
+                # database_name is set on every row this class's
+                # set_db_connections ever writes, so it's an equally
+                # reliable "is this a real doc, not something malformed or
+                # mid-write" guard, without excluding those 7 dialects.
+                if data and data.get("database_name"):
+                    config = _decrypt_firestore_config(data.get("database_config"))
                     has_custom_credentials = _has_any_credential(config)
                     if not include_credentials:
                         config = _strip_credentials(config)
@@ -804,7 +1010,13 @@ class FirestoreStateStore(StateStore):
                         "connection_key": data.get("connection_key") or "",
                         "name": data.get("database_name", "Custom"),
                         "type": data.get("database_type") or "postgres",
-                        "url": data.get("database_url", ""),
+                        # None (not "") when there's no real url - see
+                        # config_routes.py's module docstring for which 7
+                        # dialects that's always true for. data.get(...)
+                        # already returns None on its own when the field is
+                        # absent/null, so this default only matters for an
+                        # old doc written before "" stopped being stored.
+                        "url": data.get("database_url") or None,
                         "config": config,
                         "has_custom_credentials": has_custom_credentials,
                     })
@@ -827,7 +1039,9 @@ class FirestoreStateStore(StateStore):
                     t = db.get("type") or "postgres"
                     cfg = db.get("config") or {}
                     key = db.get("connection_key") or compute_connection_key(n, u, _credential_value_for_key(cfg))
-                    if u:
+                    # Gated on name, not url - see the matching SQLite
+                    # comment above for why.
+                    if n:
                         doc_id = f"{effective_user}_{key}"
                         self.client.collection("db_connections").document(doc_id).set({
                             "user_id": effective_user,
@@ -835,7 +1049,7 @@ class FirestoreStateStore(StateStore):
                             "database_name": n or "Custom",
                             "database_type": t,
                             "database_url": u,
-                            "database_config": cfg,
+                            "database_config": _config_value_to_store(cfg),
                             "updated_at": firestore.SERVER_TIMESTAMP,
                         })
             except Exception:
@@ -851,7 +1065,7 @@ class FirestoreStateStore(StateStore):
                 "database_name": db_name,
                 "database_type": db_type or "postgres",
                 "database_url": db_url,
-                "database_config": db_config or {},
+                "database_config": _config_value_to_store(db_config),
                 "updated_at": firestore.SERVER_TIMESTAMP,
             })
         except Exception:

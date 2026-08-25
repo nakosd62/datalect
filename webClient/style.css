@@ -1134,6 +1134,51 @@ textarea:focus {
   margin-top: 0.3rem;
 }
 
+/* Extra breathing room specifically above "Custom Database Connections" -
+   more than a plain sub-group heading gets from the rule just above, since
+   this one visually starts a whole new section (custom connections), not
+   just another sub-group under the same one. Same specificity as that
+   rule (two classes each) - declared after it so this wins the tie on
+   source order, rather than relying on a specificity difference. */
+.radio-group-heading.radio-group-heading-custom {
+  margin-top: 1.1rem;
+}
+
+/* Two-column layout for the preset radio options (see renderDbRadioButtons()
+   in client.js) - purely visual grouping, wraps in the same .radio-group
+   flow as everything else. min-width: 0 lets each column's own content
+   (radio-option's flex row) shrink below its natural width instead of
+   overflowing/forcing the modal wider when a preset name is long. */
+.preset-columns {
+  display: flex;
+  gap: 1rem;
+}
+
+.preset-column {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  flex: 1;
+  min-width: 0;
+}
+
+/* Short reassurance line under the "Custom Database Connections" heading
+   (see renderDbRadioButtons() in client.js) - deliberately smaller/quieter
+   than .radio-group-heading itself, since it's a one-liner pointing at
+   help.html for the real explanation, not a heading of its own. */
+.custom-db-security-note {
+  font-size: 0.72rem;
+  line-height: 1.35;
+  color: var(--text-muted);
+  margin: -0.1rem 0 0.15rem;
+}
+
+.custom-db-security-note a {
+  color: inherit;
+  opacity: 0.85;
+  text-decoration: underline dotted;
+}
+
 .radio-option {
   display: flex;
   align-items: center;

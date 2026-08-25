@@ -1,15 +1,21 @@
     <p>
-    Welcome to <strong>your Data your Language</strong> - it helps you talk to your Data in your Language 
-    and does not allow the Database to get in between and complicate the interaction.
+    Welcome to <strong>yDyL</strong> - it helps you talk to your Data in your Language.
     </p>
     
     <h3>Database Connections</h3>
     <p>
-    By default, you're offered a playground database for each supported type of database. 
-    You may select which one to use by clicking the database badge in the header and using the dialog that will pop up. 
+    By default, you're offered a playground database for each supported type of database.
+    You may select which one to use by clicking the database badge in the header and using the dialog that will pop up.
     You may connect your own database using the same pop-up dialog (custom connections are private. i.e. session- or user-scoped).
     </p>
-    
+    <p>
+    Your custom connections are kept private and secure. If you do not log in, your custom connections are 
+    scoped to your current browser session only - nobody else can see or use them. If you log in, your connections 
+    are scoped to your account instead, so they follow you across sessions and devices, but are still never visible 
+    to any other user. Sensitive fields - passwords, service-account keys, private keys, access tokens - are encrypted 
+    at rest in the App's state database, and are never sent back to your browser once saved. 
+    </p>
+
     <h3>Natural Language Prompt</h3>
     <p>
     Type your query or instruction into the top text box in plain English or any other language.
@@ -25,7 +31,7 @@
     
     <h3>Multi-turn Conversations</h3>
     <p>
-    The application remembers your last <strong>5 turns</strong>. Each turn contains the prompt, the SQL
+    The application remembers your last <strong>10 turns</strong>. Each turn contains the prompt, the SQL
     it generated, and the results that came back from the database. Use the <strong>&#9664; / &#9654;</strong>
     arrows in the NL prompt text box to step back and forward through previous turns. Reloading the app
     will erase past chat history/turns.
@@ -39,7 +45,7 @@
 
     <h3>Application Metadata</h3>
     <p>
-    <strong>your Data your Language</strong> was built by <a href="mailto:nakosd@gmail.com" target="_blank" rel="noopener noreferrer">nakosd@gmail.com</a>
-    and its source code is available on <a href="https://github.com/nakosd62/ydyl" target="_blank" rel="noopener noreferrer">GitHub</a>.
+    yDyL was built by <a href="mailto:nakosd@gmail.com" target="_blank" rel="noopener noreferrer">nakosd@gmail.com</a> in 2026
+    and its source is available on <a href="https://github.com/nakosd62/ydyl" target="_blank" rel="noopener noreferrer">GitHub</a>.
     If you have comments or questions, please send them along.
     </p>

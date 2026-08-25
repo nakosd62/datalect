@@ -133,6 +133,95 @@ def test_include_credentials_true_returns_the_actual_key(tmp_path):
     assert conns[0]["config"]["credentials_json"] == "SECRET_KEY_BLOB"
 
 
+def test_single_connection_with_no_real_url_stores_and_returns_none_not_blank(tmp_path):
+    # Mirrors how config_routes.py now saves a custom BigQuery/Snowflake/
+    # Databricks/Oracle/Redshift/MSSQL/Sheets connection - those 7 dialects
+    # have no real url of their own, so db_url is None, not "" (see that
+    # module's docstring). database_url's column is nullable specifically
+    # so this doesn't have to fake an empty string instead.
+    store = make_store(tmp_path)
+    store.set_db_connections(
+        "alice", "BQ Conn", "bigquery", None,
+        db_config={"project_id": "p", "dataset": "d"},
+    )
+    conns = store.get_db_connections("alice")
+    assert len(conns) == 1
+    assert conns[0]["url"] is None
+
+
+def test_custom_databases_list_form_with_no_real_url_stores_and_returns_none_not_blank(tmp_path):
+    store = make_store(tmp_path)
+    store.set_db_connections(
+        "alice", None, None, None,
+        custom_databases=[
+            {"name": "BQ Conn", "type": "bigquery", "url": None,
+             "config": {"project_id": "p", "dataset": "d"}},
+        ],
+    )
+    conns = store.get_db_connections("alice")
+    assert len(conns) == 1
+    assert conns[0]["url"] is None
+
+
+def test_legacy_not_null_database_url_column_is_migrated_to_nullable(tmp_path):
+    # Simulates a database file created before database_url stopped being
+    # NOT NULL (i.e. before BigQuery/Snowflake/etc. custom connections
+    # stopped needing a fake "" placeholder there - see the migration's own
+    # comment in state_store.py's init()). A fresh install never hits this
+    # path (CREATE TABLE IF NOT EXISTS already creates the column nullable
+    # today) - only an existing, pre-upgrade database file does, so this
+    # test builds that legacy schema by hand rather than through the store.
+    db_path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("""
+        CREATE TABLE db_connections (
+            user_id TEXT,
+            connection_key TEXT NOT NULL DEFAULT '',
+            database_name TEXT NOT NULL,
+            database_url TEXT NOT NULL,
+            database_type TEXT NOT NULL DEFAULT 'postgres',
+            database_config TEXT,
+            PRIMARY KEY (user_id, connection_key)
+        );
+    """)
+    conn.execute(
+        "INSERT INTO db_connections (user_id, connection_key, database_name, database_url, database_type) "
+        "VALUES ('alice', 'k1', 'My PG', 'postgresql://u:p@h/db', 'postgres')"
+    )
+    # A pre-existing row from before this change - the old "" placeholder
+    # a structured-dialect connection used to be saved with. Migrating the
+    # column to nullable doesn't retroactively touch this value; only
+    # re-saving it through set_db_connections would.
+    conn.execute(
+        "INSERT INTO db_connections (user_id, connection_key, database_name, database_url, database_type) "
+        "VALUES ('alice', 'k2', 'My BQ', '', 'bigquery')"
+    )
+    conn.commit()
+    conn.close()
+
+    store = SqliteStateStore(str(db_path))
+    store.init()  # must not raise, and must actually relax the constraint
+
+    conn = sqlite3.connect(str(db_path))
+    cols = conn.execute("PRAGMA table_info(db_connections);").fetchall()
+    conn.close()
+    notnull = next(c[3] for c in cols if c[1] == "database_url")
+    assert notnull == 0
+
+    conns = store.get_db_connections("alice")
+    urls_by_name = {c["name"]: c["url"] for c in conns}
+    assert urls_by_name["My PG"] == "postgresql://u:p@h/db"
+    assert urls_by_name["My BQ"] == ""  # preserved as-is, not retroactively changed
+
+    # And a fresh save through the store now goes through None, not "".
+    store.set_db_connections(
+        "alice", "My BQ", "bigquery", None, db_config={"project_id": "p", "dataset": "d"},
+        connection_key="k2",
+    )
+    refreshed = {c["name"]: c["url"] for c in store.get_db_connections("alice")}
+    assert refreshed["My BQ"] is None
+
+
 def test_replace_custom_databases_list_via_custom_databases_param(tmp_path):
     store = make_store(tmp_path)
     store.set_db_connections("alice", "Old Conn", "postgres", "postgresql://old/db")

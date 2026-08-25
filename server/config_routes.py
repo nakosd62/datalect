@@ -10,28 +10,38 @@ frontend may pass per-request to /api/translate, but which is not tied to
 or persisted on the session.
 
 Connections are represented as descriptors: {"type": "postgres", "url":
-"..."} (MySQL is identical in shape, just {"type": "mysql", "url":
-"mysql://..."} - see backends/mysql.py's module docstring), {"type":
-"bigquery", "url": "bigquery://<project>/<dataset>",
-"project_id": "...", "dataset": "...", "credentials_json": "...",
-"billing_project_id": "..."}, {"type": "snowflake", "url":
-"snowflake://<account>/<database>[/<schema>]", "account": "...",
-"user": "...", "warehouse": "...", "database": "...", "schema": "...",
-"role": "...", "password": "..."} (or "private_key"/
-"private_key_passphrase" instead of "password"), {"type": "databricks",
-"url": "databricks://<server_hostname><http_path>", "server_hostname":
-"...", "http_path": "...", "access_token": "...", "catalog": "...",
-"schema": "..."}, {"type": "oracle", "url": "oracle://<host>:<port>/
-<service_name-or-sid>", "host": "...", "port": 1521, "service_name": "..."
-(or "sid" instead), "user": "...", "password": "...", "schema": "..."},
-{"type": "redshift", "url": "redshift://<host>:<port>/<database>",
-"host": "...", "port": 5439, "database": "...", "user": "...",
-"password": "...", "schema": "..."}, {"type": "mssql", "url":
-"mssql://<host>:<port>/<database>", "host": "...", "port": 1433,
-"database": "...", "user": "...", "password": "...", "schema": "...",
-"encrypt": true}, or {"type": "sheets", "url":
-"sheets://<spreadsheet_id>/<tab_name>", "spreadsheet_id": "...",
-"tab_name": "...", "credentials_json": "..." (optional)} - see db.py's resolve_active_descriptor / backends/base.py's
+"...", "ca_cert_pem": "..."} (MySQL is identical in shape, ca_cert_pem
+included - {"type": "mysql", "url": "mysql://...", "ca_cert_pem": "..."} -
+see backends/mysql.py's module docstring), {"type":
+"bigquery", "url": None, "project_id": "...", "dataset": "...",
+"credentials_json": "...", "billing_project_id": "..."}, {"type":
+"snowflake", "url": None, "account": "...", "user": "...", "warehouse":
+"...", "database": "...", "schema": "...", "role": "...", "password":
+"..."} (or "private_key"/"private_key_passphrase" instead of
+"password"), {"type": "databricks", "url": None, "server_hostname": "...",
+"http_path": "...", "access_token": "...", "catalog": "...", "schema":
+"..."}, {"type": "oracle", "url": None, "host": "...", "port": 1521,
+"service_name": "..." (or "sid" instead), "user": "...", "password":
+"...", "schema": "..."}, {"type": "redshift", "url": None, "host": "...",
+"port": 5439, "database": "...", "user": "...", "password": "...",
+"schema": "..."}, {"type": "mssql", "url": None, "host": "...", "port":
+1433, "database": "...", "user": "...", "password": "...", "schema":
+"...", "encrypt": true}, or {"type": "sheets", "url": None,
+"spreadsheet_id": "...", "tab_name": "...", "credentials_json": "..."
+(optional)}. Postgres/MySQL are the only two dialects with a real,
+driver-parsed url of their own; for the other 7, "url" is always None for
+a CUSTOM connection - genuinely absent, not just blank, all the way down
+to the state_store row (this module builds a purely internal,
+never-stored, never-returned identity string instead for hashing/matching
+purposes - see the _xxx_identity functions and compute_connection_key's
+call sites below) - though it may still be a non-blank, synthetic,
+informational string for an admin-configured preset (CONFIGURED_DBS,
+built independently in app_config.py, out of scope for this
+distinction). The GET /api/config response still always sends
+'active_database_url'/'custom_database_url' as a string (coalescing None
+to "" right at that boundary) - only the internal representation and
+storage are None now, not the wire format signed-in/anonymous clients
+already depend on. See db.py's resolve_active_descriptor / backends/base.py's
 module docstring / backends/bigquery.py's, backends/snowflake.py's,
 backends/databricks.py's, backends/oracle.py's, backends/redshift.py's, and
 backends/mssql.py's module docstrings for what billing_project_id is
@@ -55,7 +65,14 @@ user re-select or rename a saved connection, or just switch back to it,
 without re-entering its credential every time. billing_project_id is NOT a credential (it's just a
 project id string) and always round-trips to the frontend as-is - see
 get_db_connections' _strip_credentials, which only strips the fields in
-_CREDENTIAL_CONFIG_FIELDS.
+_CREDENTIAL_CONFIG_FIELDS. Postgres's and MySQL's optional ca_cert_pem is
+the same way - it's a CA certificate (PEM text), used to populate libpq's
+"sslrootcert" (Postgres) or an ssl.SSLContext's trusted CA (MySQL) for a
+"sslmode=verify-ca"/"verify-full" connection (see backends/postgres.py's
+and backends/mysql.py's module docstrings), and a CA certificate is
+public information, not a secret, so it's likewise never stripped and
+always round-trips as-is, unlike password/credentials_json/private_key/
+access_token above.
 
 Billing policy, by design: admin-configured BigQuery presets (CONFIGURED_DBS,
 loaded from DATABASE_PRESETS_FILE in app_config.py) authenticate via this app's
@@ -203,64 +220,77 @@ from translate_routes import HISTORY_MAX_TURNS
 
 config_bp = Blueprint('config', __name__)
 
-
-def _bigquery_url(project_id, dataset):
-    """Synthetic, non-secret identifier for a BigQuery connection - plays
-    the same role a Postgres DSN does elsewhere (schema-cache key, preset/
-    custom-connection matching, display), but is never a credential."""
-    return f"bigquery://{project_id}/{dataset}"
-
-
-def _snowflake_url(account, database, schema):
-    """Synthetic, non-secret identifier for a Snowflake connection - same
-    role _bigquery_url plays. Schema is optional on a Snowflake connection
-    (omitted = the account's own default schema - see
-    backends/snowflake.py's module docstring), so it's only appended when
-    given, rather than embedding an empty trailing segment."""
-    base = f"snowflake://{account}/{database}"
-    return f"{base}/{schema}" if schema else base
+# These 7 dialects have no real url of their own - what used to be stored
+# as "url" for a CUSTOM connection of one of these types was always a
+# synthetic, concatenated string built purely for display/identity
+# purposes (see the _xxx_identity functions below), never something a
+# backend's connect() actually parsed. Postgres/MySQL are deliberately
+# absent from this set: their url is the real, user-typed DSN their
+# backend's connect() genuinely parses, so it's still stored as-is.
+_STRUCTURED_DIALECTS_WITHOUT_A_REAL_URL = frozenset({
+    "bigquery", "snowflake", "databricks", "oracle", "redshift", "mssql", "sheets",
+})
 
 
-def _databricks_url(server_hostname, http_path):
-    """Synthetic, non-secret identifier for a Databricks connection - same
-    role _bigquery_url/_snowflake_url play (schema-cache key, preset/
-    custom-connection matching, display), but is never a credential."""
-    return f"databricks://{server_hostname}{http_path}"
+def _bigquery_identity(project_id, dataset):
+    """Stable, non-secret string identifying a BigQuery CUSTOM connection -
+    used only as compute_connection_key()'s hash input and to recognize an
+    already-saved connection when a request re-edits it without
+    re-pasting its credential (see _resolve_bigquery_credentials below).
+    Deliberately NOT a "url" - it's never stored, never returned to the
+    frontend, and never a real connection string the backend uses to
+    connect (backends/bigquery.py's connect() never reads a "url" field
+    at all - only Postgres/MySQL have a real, user-typed connection-string
+    url; see this module's docstring). A prior version of this function
+    built a synthetic "bigquery://project/dataset"-shaped string that WAS
+    stored/returned as a "database_url" field - removed because it wasn't
+    a real url, was duplicated near-identically in app_config.py's preset
+    loader and client.js, and gave the impression a custom connection's
+    identity was somehow url-based when it was always really just these
+    two fields."""
+    return f"{project_id}\x00{dataset}"
 
 
-def _oracle_url(host, port, service_name_or_sid):
-    """Synthetic, non-secret identifier for an Oracle connection - same
-    role _bigquery_url/_snowflake_url/_databricks_url play (schema-cache
-    key, preset/custom-connection matching, display), but is never a
-    credential. `service_name_or_sid` is whichever of service_name/sid the
-    caller resolved (service_name preferred - see backends/oracle.py's
-    connect())."""
-    return f"oracle://{host}:{port}/{service_name_or_sid}"
+def _snowflake_identity(account, database, schema):
+    """Same role _bigquery_identity plays, for Snowflake. Schema is
+    optional on a Snowflake connection (omitted = the account's own
+    default schema - see backends/snowflake.py's module docstring), so
+    it's folded in either way (present or blank) rather than varying the
+    number of \\x00-separated parts."""
+    return f"{account}\x00{database}\x00{schema or ''}"
 
 
-def _redshift_url(host, port, database):
-    """Synthetic, non-secret identifier for a Redshift connection - same
-    role _bigquery_url/_snowflake_url/_databricks_url/_oracle_url play
-    (schema-cache key, preset/custom-connection matching, display), but is
-    never a credential."""
-    return f"redshift://{host}:{port}/{database}"
+def _databricks_identity(server_hostname, http_path):
+    """Same role _bigquery_identity/_snowflake_identity play, for
+    Databricks."""
+    return f"{server_hostname}\x00{http_path}"
 
 
-def _mssql_url(host, port, database):
-    """Synthetic, non-secret identifier for a SQL Server connection - same
-    role _bigquery_url/_snowflake_url/_databricks_url/_oracle_url/
-    _redshift_url play (schema-cache key, preset/custom-connection
-    matching, display), but is never a credential."""
-    return f"mssql://{host}:{port}/{database}"
+def _oracle_identity(host, port, service_name_or_sid):
+    """Same role _bigquery_identity/_snowflake_identity/_databricks_identity
+    play, for Oracle. `service_name_or_sid` is whichever of
+    service_name/sid the caller resolved (service_name preferred - see
+    backends/oracle.py's connect())."""
+    return f"{host}\x00{port}\x00{service_name_or_sid}"
 
 
-def _sheets_url(spreadsheet_id, tab_name):
-    """Synthetic, non-secret identifier for a Google Sheets connection -
-    same role _bigquery_url/_oracle_url/etc. play (schema-cache key,
-    preset/custom-connection matching, display), but is never a credential
-    itself - see backends/sheets.py's module docstring for the (optional)
+def _redshift_identity(host, port, database):
+    """Same role _bigquery_identity/_snowflake_identity/_databricks_identity/
+    _oracle_identity play, for Redshift."""
+    return f"{host}\x00{port}\x00{database}"
+
+
+def _mssql_identity(host, port, database):
+    """Same role _bigquery_identity/_snowflake_identity/_databricks_identity/
+    _oracle_identity/_redshift_identity play, for SQL Server."""
+    return f"{host}\x00{port}\x00{database}"
+
+
+def _sheets_identity(spreadsheet_id, tab_name):
+    """Same role _bigquery_identity/_oracle_identity/etc. play, for Google
+    Sheets - see backends/sheets.py's module docstring for the (optional)
     credentials_json this dialect can separately carry."""
-    return f"sheets://{spreadsheet_id}/{tab_name}"
+    return f"{spreadsheet_id}\x00{tab_name}"
 
 
 def _resolve_sheets_credentials(user_identity, spreadsheet_id, tab_name, provided_credentials_json, name=None):
@@ -274,9 +304,12 @@ def _resolve_sheets_credentials(user_identity, spreadsheet_id, tab_name, provide
     normal, zero-friction case."""
     if provided_credentials_json:
         return provided_credentials_json
-    target_url = _sheets_url(spreadsheet_id, tab_name)
     existing = state_store.get_db_connections(user_identity, include_credentials=True)
-    matches = [db for db in existing if db.get("type") == "sheets" and db.get("url") == target_url]
+    matches = [
+        db for db in existing if db.get("type") == "sheets"
+        and (db.get("config") or {}).get("spreadsheet_id") == spreadsheet_id
+        and (db.get("config") or {}).get("tab_name") == tab_name
+    ]
     if not matches:
         return None
     if name:
@@ -328,9 +361,12 @@ def _resolve_bigquery_credentials(user_identity, project_id, dataset, provided_c
     still correct whenever there's genuinely only one)."""
     if provided_credentials_json:
         return provided_credentials_json
-    target_url = _bigquery_url(project_id, dataset)
     existing = state_store.get_db_connections(user_identity, include_credentials=True)
-    matches = [db for db in existing if db.get("type") == "bigquery" and db.get("url") == target_url]
+    matches = [
+        db for db in existing if db.get("type") == "bigquery"
+        and (db.get("config") or {}).get("project_id") == project_id
+        and (db.get("config") or {}).get("dataset") == dataset
+    ]
     if not matches:
         return None
     if name:
@@ -362,9 +398,13 @@ def _resolve_snowflake_credentials(user_identity, account, database, schema, pro
     if provided_private_key:
         return None, provided_private_key, provided_private_key_passphrase or None
 
-    target_url = _snowflake_url(account, database, schema)
     existing = state_store.get_db_connections(user_identity, include_credentials=True)
-    matches = [db for db in existing if db.get("type") == "snowflake" and db.get("url") == target_url]
+    matches = [
+        db for db in existing if db.get("type") == "snowflake"
+        and (db.get("config") or {}).get("account") == account
+        and (db.get("config") or {}).get("database") == database
+        and (db.get("config") or {}).get("schema") == (schema or None)
+    ]
     if not matches:
         return None, None, None
     match = None
@@ -386,9 +426,12 @@ def _resolve_databricks_credentials(user_identity, server_hostname, http_path, p
     backends/databricks.py's module docstring."""
     if provided_access_token:
         return provided_access_token
-    target_url = _databricks_url(server_hostname, http_path)
     existing = state_store.get_db_connections(user_identity, include_credentials=True)
-    matches = [db for db in existing if db.get("type") == "databricks" and db.get("url") == target_url]
+    matches = [
+        db for db in existing if db.get("type") == "databricks"
+        and (db.get("config") or {}).get("server_hostname") == server_hostname
+        and (db.get("config") or {}).get("http_path") == http_path
+    ]
     if not matches:
         return None
     if name:
@@ -407,9 +450,16 @@ def _resolve_oracle_credentials(user_identity, host, port, service_name_or_sid, 
     wallet/mTLS - see backends/oracle.py's module docstring."""
     if provided_password:
         return provided_password
-    target_url = _oracle_url(host, port, service_name_or_sid)
     existing = state_store.get_db_connections(user_identity, include_credentials=True)
-    matches = [db for db in existing if db.get("type") == "oracle" and db.get("url") == target_url]
+    matches = [
+        db for db in existing if db.get("type") == "oracle"
+        and (db.get("config") or {}).get("host") == host
+        and (db.get("config") or {}).get("port") == port
+        and (
+            (db.get("config") or {}).get("service_name") == service_name_or_sid
+            or (db.get("config") or {}).get("sid") == service_name_or_sid
+        )
+    ]
     if not matches:
         return None
     if name:
@@ -429,9 +479,13 @@ def _resolve_redshift_credentials(user_identity, host, port, database, provided_
     docstring."""
     if provided_password:
         return provided_password
-    target_url = _redshift_url(host, port, database)
     existing = state_store.get_db_connections(user_identity, include_credentials=True)
-    matches = [db for db in existing if db.get("type") == "redshift" and db.get("url") == target_url]
+    matches = [
+        db for db in existing if db.get("type") == "redshift"
+        and (db.get("config") or {}).get("host") == host
+        and (db.get("config") or {}).get("port") == port
+        and (db.get("config") or {}).get("database") == database
+    ]
     if not matches:
         return None
     if name:
@@ -451,9 +505,13 @@ def _resolve_mssql_credentials(user_identity, host, port, database, provided_pas
     backends/mssql.py's module docstring."""
     if provided_password:
         return provided_password
-    target_url = _mssql_url(host, port, database)
     existing = state_store.get_db_connections(user_identity, include_credentials=True)
-    matches = [db for db in existing if db.get("type") == "mssql" and db.get("url") == target_url]
+    matches = [
+        db for db in existing if db.get("type") == "mssql"
+        and (db.get("config") or {}).get("host") == host
+        and (db.get("config") or {}).get("port") == port
+        and (db.get("config") or {}).get("database") == database
+    ]
     if not matches:
         return None
     if name:
@@ -514,12 +572,20 @@ def _parse_incoming_connection(data, user_identity):
     call site only ever calls this for a custom connection). db_url is
     None if the request didn't supply enough to identify a connection of
     the given type (e.g. a BigQuery selection missing project_id/dataset) -
-    callers treat that the same as "no connection change requested".
-    `error`, when not None, means this connection is invalid and MUST NOT
-    be saved/activated - used for a custom BigQuery connection missing its
-    required billing_project_id and/or credentials_json, or a custom
-    Snowflake connection missing its required account/user/warehouse/
-    database and/or a credential (see module docstring)."""
+    callers treat that the same as "no connection change requested". For
+    the 7 structured (non-"simple URL") dialects, a non-None db_url is a
+    stable identity string (built by _bigquery_identity/etc. above) used
+    ONLY as compute_connection_key()'s hash input in handle_config below -
+    it is NEVER a real url and handle_config blanks it to None before this
+    value is persisted or returned to the frontend (those dialects have no
+    real connection-string url at all - see this module's docstring).
+    Only Postgres/MySQL's db_url is a real, user-typed url that's actually
+    stored/returned as-is. `error`, when not None, means this connection
+    is invalid and MUST NOT be saved/activated - used for a custom
+    BigQuery connection missing its required billing_project_id and/or
+    credentials_json, or a custom Snowflake connection missing its
+    required account/user/warehouse/database and/or a credential (see
+    module docstring)."""
     db_type = (data.get('database_type') or 'postgres').strip().lower()
 
     if db_type == 'bigquery':
@@ -527,7 +593,7 @@ def _parse_incoming_connection(data, user_identity):
         dataset = (data.get('dataset') or '').strip()
         if not (project_id and dataset):
             return db_type, None, {}, None
-        db_url = _bigquery_url(project_id, dataset)
+        db_url = _bigquery_identity(project_id, dataset)
         db_config = {"project_id": project_id, "dataset": dataset}
 
         # A user's own connection: both fields are required, always
@@ -558,7 +624,7 @@ def _parse_incoming_connection(data, user_identity):
         role = (data.get('role') or '').strip()
         if not (account and user and warehouse and database):
             return db_type, None, {}, None
-        db_url = _snowflake_url(account, database, schema)
+        db_url = _snowflake_identity(account, database, schema)
         db_config = {"account": account, "user": user, "warehouse": warehouse, "database": database}
         if schema:
             db_config["schema"] = schema
@@ -593,7 +659,7 @@ def _parse_incoming_connection(data, user_identity):
         schema = (data.get('schema') or '').strip()
         if not (server_hostname and http_path):
             return db_type, None, {}, None
-        db_url = _databricks_url(server_hostname, http_path)
+        db_url = _databricks_identity(server_hostname, http_path)
         db_config = {"server_hostname": server_hostname, "http_path": http_path}
         if catalog:
             db_config["catalog"] = catalog
@@ -635,7 +701,7 @@ def _parse_incoming_connection(data, user_identity):
         except (TypeError, ValueError):
             port = 1521
         service_name_or_sid = service_name or sid
-        db_url = _oracle_url(host, port, service_name_or_sid)
+        db_url = _oracle_identity(host, port, service_name_or_sid)
         db_config = {"host": host, "port": port, "user": user}
         if service_name:
             db_config["service_name"] = service_name
@@ -680,7 +746,7 @@ def _parse_incoming_connection(data, user_identity):
             port = int(raw_port) if raw_port else 5439
         except (TypeError, ValueError):
             port = 5439
-        db_url = _redshift_url(host, port, database)
+        db_url = _redshift_identity(host, port, database)
         db_config = {"host": host, "port": port, "database": database, "user": user}
         if schema:
             db_config["schema"] = schema
@@ -718,7 +784,7 @@ def _parse_incoming_connection(data, user_identity):
             port = int(raw_port) if raw_port else 1433
         except (TypeError, ValueError):
             port = 1433
-        db_url = _mssql_url(host, port, database)
+        db_url = _mssql_identity(host, port, database)
         db_config = {"host": host, "port": port, "database": database, "user": user}
         if schema:
             db_config["schema"] = schema
@@ -760,7 +826,7 @@ def _parse_incoming_connection(data, user_identity):
         spreadsheet_id = extract_spreadsheet_id(spreadsheet_url_or_id)
         if not spreadsheet_id:
             return db_type, None, {}, None
-        db_url = _sheets_url(spreadsheet_id, tab_name)
+        db_url = _sheets_identity(spreadsheet_id, tab_name)
         db_config = {"spreadsheet_id": spreadsheet_id, "tab_name": tab_name}
         # Optional, unlike every other credentialed dialect above: a
         # missing credential here is the normal public-sheet case, not an
@@ -778,19 +844,34 @@ def _parse_incoming_connection(data, user_identity):
 
     if db_type == 'mysql':
         # Same shape as Postgres - a single connection-string URL carries
-        # everything (host, credentials, database), so there's no
-        # dialect-specific config dict to build and no preset-credential
+        # everything (host, credentials, database), so there's no other
+        # dialect-specific config to build and no preset-credential
         # copy-over needed (unlike BigQuery/Snowflake) - a MySQL preset's
         # URL already contains its own credentials, same as a Postgres
         # preset's does. See backends/mysql.py's module docstring.
-        return db_type, data.get('database_url'), {}, None
+        #
+        # ca_cert_pem is the one optional field both this dialect and
+        # Postgres share (see backends/mysql.py's and backends/postgres.py's
+        # module docstrings) - not a credential, so unlike password/
+        # credentials_json above there's no "leave blank to keep the saved
+        # one" resolver needed: it's either present in this request or it
+        # isn't, same treatment as Oracle's "schema" or Redshift's "schema".
+        db_config = {}
+        ca_cert_pem = (data.get('ca_cert_pem') or '').strip()
+        if ca_cert_pem:
+            db_config["ca_cert_pem"] = ca_cert_pem
+        return db_type, data.get('database_url'), db_config, None
 
     # Default / explicit postgres - also the fallback for any unrecognized
     # db_type value, same as before this module supported more than one
     # simple-URL dialect (predates multi-dialect support entirely - see
     # backends/__init__.py's get_backend() docstring for the equivalent
     # default at the dispatch layer).
-    return 'postgres', data.get('database_url'), {}, None
+    db_config = {}
+    ca_cert_pem = (data.get('ca_cert_pem') or '').strip()
+    if ca_cert_pem:
+        db_config["ca_cert_pem"] = ca_cert_pem
+    return 'postgres', data.get('database_url'), db_config, None
 
 
 def _parse_incoming_custom_databases(custom_databases_in, user_identity):
@@ -834,7 +915,7 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
             dataset = (db.get('dataset') or '').strip()
             if not (project_id and dataset):
                 continue
-            url = _bigquery_url(project_id, dataset)
+            identity = _bigquery_identity(project_id, dataset)
             credentials_json = _resolve_bigquery_credentials(
                 user_identity, project_id, dataset, db.get('credentials_json'),
                 name=db.get('name'),
@@ -851,10 +932,14 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
             }
             name = db.get("name") or dataset or "Custom BigQuery"
             merged.append({
-                "connection_key": compute_connection_key(name, url, credentials_json),
+                "connection_key": compute_connection_key(name, identity, credentials_json),
                 "name": name,
                 "type": "bigquery",
-                "url": url,
+                # None, not "" - BigQuery has no real url of its own (see
+                # this module's docstring and _bigquery_identity above).
+                # Still present as a key, for shape-parity with Postgres/
+                # MySQL rows, which do carry a real one.
+                "url": None,
                 "config": config,
             })
         elif db_type == 'snowflake':
@@ -866,7 +951,7 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
             role = (db.get('role') or '').strip()
             if not (account and user and warehouse and database):
                 continue
-            url = _snowflake_url(account, database, schema)
+            identity = _snowflake_identity(account, database, schema)
             password, private_key, private_key_passphrase = _resolve_snowflake_credentials(
                 user_identity, account, database, schema,
                 db.get('password'), db.get('private_key'), db.get('private_key_passphrase'),
@@ -888,10 +973,10 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
                     config["private_key_passphrase"] = private_key_passphrase
             name = db.get("name") or database or "Custom Snowflake"
             merged.append({
-                "connection_key": compute_connection_key(name, url, password or private_key),
+                "connection_key": compute_connection_key(name, identity, password or private_key),
                 "name": name,
                 "type": "snowflake",
-                "url": url,
+                "url": None,  # None, not "" - see _snowflake_identity above (and this module's docstring).
                 "config": config,
             })
         elif db_type == 'databricks':
@@ -901,7 +986,7 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
             schema = (db.get('schema') or '').strip()
             if not (server_hostname and http_path):
                 continue
-            url = _databricks_url(server_hostname, http_path)
+            identity = _databricks_identity(server_hostname, http_path)
             access_token = _resolve_databricks_credentials(
                 user_identity, server_hostname, http_path, db.get('access_token'),
                 name=db.get('name'),
@@ -916,10 +1001,10 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
                 config["schema"] = schema
             name = db.get("name") or http_path or "Custom Databricks"
             merged.append({
-                "connection_key": compute_connection_key(name, url, access_token),
+                "connection_key": compute_connection_key(name, identity, access_token),
                 "name": name,
                 "type": "databricks",
-                "url": url,
+                "url": None,  # None, not "" - see _databricks_identity above (and this module's docstring).
                 "config": config,
             })
         elif db_type == 'oracle':
@@ -937,7 +1022,7 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
             except (TypeError, ValueError):
                 port = 1521
             service_name_or_sid = service_name or sid
-            url = _oracle_url(host, port, service_name_or_sid)
+            identity = _oracle_identity(host, port, service_name_or_sid)
             password = _resolve_oracle_credentials(
                 user_identity, host, port, service_name_or_sid, db.get('password'),
                 name=db.get('name'),
@@ -957,10 +1042,10 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
             config["password"] = password
             name = db.get("name") or service_name_or_sid or "Custom Oracle"
             merged.append({
-                "connection_key": compute_connection_key(name, url, password),
+                "connection_key": compute_connection_key(name, identity, password),
                 "name": name,
                 "type": "oracle",
-                "url": url,
+                "url": None,  # None, not "" - see _oracle_identity above (and this module's docstring).
                 "config": config,
             })
         elif db_type == 'redshift':
@@ -975,7 +1060,7 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
                 port = int(raw_port) if raw_port else 5439
             except (TypeError, ValueError):
                 port = 5439
-            url = _redshift_url(host, port, database)
+            identity = _redshift_identity(host, port, database)
             password = _resolve_redshift_credentials(
                 user_identity, host, port, database, db.get('password'),
                 name=db.get('name'),
@@ -989,10 +1074,10 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
             config["password"] = password
             name = db.get("name") or database or "Custom Redshift"
             merged.append({
-                "connection_key": compute_connection_key(name, url, password),
+                "connection_key": compute_connection_key(name, identity, password),
                 "name": name,
                 "type": "redshift",
-                "url": url,
+                "url": None,  # None, not "" - see _redshift_identity above (and this module's docstring).
                 "config": config,
             })
         elif db_type == 'mssql':
@@ -1008,7 +1093,7 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
                 port = int(raw_port) if raw_port else 1433
             except (TypeError, ValueError):
                 port = 1433
-            url = _mssql_url(host, port, database)
+            identity = _mssql_identity(host, port, database)
             password = _resolve_mssql_credentials(
                 user_identity, host, port, database, db.get('password'),
                 name=db.get('name'),
@@ -1024,10 +1109,10 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
             config["password"] = password
             name = db.get("name") or database or "Custom SQL Server"
             merged.append({
-                "connection_key": compute_connection_key(name, url, password),
+                "connection_key": compute_connection_key(name, identity, password),
                 "name": name,
                 "type": "mssql",
-                "url": url,
+                "url": None,  # None, not "" - see _mssql_identity above (and this module's docstring).
                 "config": config,
             })
         elif db_type == 'sheets':
@@ -1039,7 +1124,7 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
             spreadsheet_id = extract_spreadsheet_id(spreadsheet_url_or_id)
             if not spreadsheet_id:
                 continue
-            url = _sheets_url(spreadsheet_id, tab_name)
+            identity = _sheets_identity(spreadsheet_id, tab_name)
             name = db.get("name") or tab_name or "Custom Sheet"
             credentials_json = _resolve_sheets_credentials(
                 user_identity, spreadsheet_id, tab_name, db.get('credentials_json'),
@@ -1056,10 +1141,10 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
             # overwriting each other - same reasoning as the password-
             # folding calls above.
             merged.append({
-                "connection_key": compute_connection_key(name, url, credentials_json),
+                "connection_key": compute_connection_key(name, identity, credentials_json),
                 "name": name,
                 "type": "sheets",
-                "url": url,
+                "url": None,  # None, not "" - see _sheets_identity above (and this module's docstring).
                 "config": config,
             })
         else:
@@ -1074,12 +1159,23 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
             if not url:
                 continue
             name = db.get("name") or "Custom"
+            resolved_type = db_type if db_type == "mysql" else "postgres"
+            # ca_cert_pem is shared by both dialects (see
+            # backends/postgres.py's and backends/mysql.py's module
+            # docstrings) - not a credential, so it's simply carried
+            # through as-is, never folded into connection_key (unlike a
+            # real credential, it doesn't need to distinguish two
+            # otherwise-identical connections from each other).
+            config = {}
+            ca_cert_pem = (db.get('ca_cert_pem') or '').strip()
+            if ca_cert_pem:
+                config["ca_cert_pem"] = ca_cert_pem
             merged.append({
                 "connection_key": compute_connection_key(name, url, None),
                 "name": name,
-                "type": db_type if db_type == "mysql" else "postgres",
+                "type": resolved_type,
                 "url": url,
-                "config": {},
+                "config": config,
             })
     return merged
 
@@ -1148,12 +1244,26 @@ def handle_config():
                 resp = jsonify({'success': False, 'error': connection_error})
                 return apply_session_cookie(resp, session_id), 400
 
+            # new_db_url, for the 7 structured dialects, is really just
+            # _parse_incoming_connection's internal identity string (see
+            # its docstring) - never a real url, and never what actually
+            # gets persisted/returned as one. new_db_url_to_persist is that
+            # real, storage/response-facing value: Postgres/MySQL's actual
+            # url unchanged, None for everything else (those backends never
+            # had a real url to begin with - see this module's docstring).
+            # None, not "" - state_store.py's database_url column/field is
+            # nullable specifically so this doesn't need to fake one.
+            new_db_url_to_persist = (
+                None if new_db_type in _STRUCTURED_DIALECTS_WITHOUT_A_REAL_URL else new_db_url
+            )
+
             if new_db_url or new_auto_sql_execute is not None:
                 if new_db_url:
                     prior_descriptor, _prior_missing = resolve_active_descriptor(
                         state_store.get_session(user_identity), user_identity
                     )
-                    if new_db_url != prior_descriptor.get("url"):
+                    prior_config = {k: v for k, v in prior_descriptor.items() if k not in ("type", "url")}
+                    if new_db_url != prior_descriptor.get("url") or new_db_config != prior_config:
                         # The DB connection is changing - drop any cached schema
                         # for the connection we're switching to. Without this,
                         # if that connection was cached earlier - e.g. by
@@ -1161,8 +1271,15 @@ def handle_config():
                         # the schema changed - /api/translate would keep
                         # serving that stale schema for up to
                         # SCHEMA_CACHE_TTL_SECONDS after the switch.
+                        # Comparing new_db_config too (not just url), unlike
+                        # before, is what makes this also fire for the 7
+                        # structured dialects (whose real distinguishing
+                        # fields live in config, not a url - see above) and
+                        # incidentally now also catches a Postgres/MySQL
+                        # ca_cert_pem-only change, which url comparison alone
+                        # would have missed.
                         schema_cache.invalidate(get_conn_identifier(
-                            {"type": new_db_type, "url": new_db_url, **new_db_config}
+                            {"type": new_db_type, "url": new_db_url_to_persist, **new_db_config}
                         ))
 
                 # Resolved once, up front (rather than inside the
@@ -1218,8 +1335,14 @@ def handle_config():
                     auto_sql_execute=new_auto_sql_execute,
                 )
                 if db_name_to_save is not None:
+                    # new_db_url_to_persist, not new_db_url: for the 7
+                    # structured dialects new_db_url is only an internal
+                    # identity string (already spent, above, on the cache
+                    # check and active_connection_key) and was never a real
+                    # url - persisting it would resurrect exactly the
+                    # synthetic/concatenated field this refactor removes.
                     state_store.set_db_connections(
-                        user_identity, db_name_to_save, new_db_type, new_db_url,
+                        user_identity, db_name_to_save, new_db_type, new_db_url_to_persist,
                         db_config=new_db_config, custom_databases=merged_custom_databases,
                         connection_key=(active_connection_key or None),
                     )
@@ -1390,7 +1513,12 @@ def handle_config():
         # only caller anywhere in the server.
         db_name = user_custom_name or "Custom"
         username = ""
-        active_conn_str_out = active_conn_str
+        # active_conn_str is None for a structured-dialect (BigQuery/etc.)
+        # custom connection - coalesced to "" here, at the response
+        # boundary, so 'active_database_url' below stays the string every
+        # existing client (and test) already expects; only the internal
+        # representation/storage is None now, not the wire format.
+        active_conn_str_out = active_conn_str or ""
         active_db_type_out = active_db_type
         # Whether the active connection was explicitly selected as a saved
         # custom connection, as opposed to a preset - lets the frontend break
