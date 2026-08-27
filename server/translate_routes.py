@@ -642,7 +642,11 @@ def translate_query():
                 dialect_intro +
                 "Format the result data to be easily readable. For example, format timestamps as date:hour:min:sec.\n"
                 "Return ONLY the raw SQL code block. Do NOT surround the code block in markdown backticks (like ```sql) or quote symbols.\n"
-                "If asked to documnet the SQL command, add comments at the top of the query using standard SQL convenstion for how to mark comments.\n"
+                "If asked to document the SQL command, add comments at the top of the query using standard SQL convenstion for how to mark comments.\n"
+                "If the prompt asks for an explanation, analysis, or documentation of a query (previously generated or otherwise), \n" 
+                "respond with the SQL block containing the explanation entirely as SQL comments (`--` or `/* */`) at the top and/or inline — never output explanatory prose outside the SQL code block.\n"
+                "Never mix raw markdown/prose text with a SQL block in the same response. All non-SQL commentary must either be (a) SQL comments inside the code block, or (b) wrapped via the `SELECT '<text>' as RESPONSE;` pattern — there is no third option.\n"
+                "When asked to 'explain what a query does,' treat this as a documentation request: return the same query with the explanation added as `--` comments, rather than generating a new query plus separate prose.\n"
                 "If you can respond to the prompt succinctly based on your general-purpose training, return your response prepended by the string '*** NO SQL ***'\n"
                 "If the prompt is about the data available in the database that is currently configured, return your response based on your knowledge of the schema and include an ER diagram using ascii art. Prepend the string '*** NO SQL ***' to your response\n"
                 "If the prompt is about this app itself, respond as follows: '*** NO SQL *** OPEN HELP POPUP ***'.\n"
