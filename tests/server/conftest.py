@@ -13,7 +13,7 @@ from helpers import (
     fresh_import, install_fake_bigquery, install_fake_snowflake_connect,
     install_fake_pymysql_connect, install_fake_databricks_connect, install_fake_oracle_connect,
     install_fake_redshift_connect, install_fake_mssql_connect, install_fake_sheets_requests,
-    install_fake_postgres_connect,
+    install_fake_postgres_connect, install_fake_pyodbc_connect,
 )
 
 
@@ -83,6 +83,16 @@ def mysql_harness(monkeypatch):
     bigquery_harness/snowflake_harness above: call this AFTER
     app_factory/app_env in your test, not before."""
     return install_fake_pymysql_connect(monkeypatch)
+
+
+@pytest.fixture
+def mongodb_sql_harness(monkeypatch):
+    """Patches backends.mongodb_sql's pyodbc.connect with a fake that
+    records the connection string + kwargs instead of opening a real ODBC
+    connection. Same ordering caveat as bigquery_harness/snowflake_harness/
+    mysql_harness above: call this AFTER app_factory/app_env in your test,
+    not before."""
+    return install_fake_pyodbc_connect(monkeypatch)
 
 
 @pytest.fixture

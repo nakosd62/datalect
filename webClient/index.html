@@ -96,6 +96,13 @@
             </svg>
           </div>
 
+          <div id="modelTriggerBadge" class="status-badge connected clickable-badge" title="Model Info (Click to configure)">
+            <span id="modelBadgeName" class="conn-badge-text"></span>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="conn-badge-icon">
+              <path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"></path>
+            </svg>
+          </div>
+
           <button id="helpBtn" class="help-btn" title="Help">
             <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M15 14c.2-1 .7-1.7 1.5-2.5 1-.9 1.5-2.2 1.5-3.5A6 6 0 0 0 6 8c0 1 .2 2.2 1.5 3.5.7.7 1.3 1.5 1.5 2.5"></path>
@@ -296,6 +303,29 @@
           <div id="configSaveError" class="config-error-message" style="display: none; color: #e05d5d; font-size: 0.85rem;"></div>
           <div class="modal-actions" style="display: flex; gap: 0.5rem; justify-content: flex-end; align-items: center;">
             <button type="button" id="configSaveBtn" class="btn btn-primary">Save Changes</button>
+          </div>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div id="modelModal" class="modal-overlay hidden">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h2 class="modal-title">Model Selection</h2>
+        <button id="modelModalCloseBtn" class="modal-close-btn" type="button">&times;</button>
+      </div>
+      <form id="modelForm" class="modal-body" onsubmit="event.preventDefault();">
+        <div class="modal-scroll-content">
+          <div class="config-section">
+            <span class="config-label">Translation Model</span>
+            <div class="radio-group" id="modalModelRadioGroup"></div>
+          </div>
+        </div>
+        <div class="modal-footer-fixed">
+          <div id="modelSaveError" class="config-error-message" style="display: none; color: #e05d5d; font-size: 0.85rem;"></div>
+          <div class="modal-actions" style="display: flex; gap: 0.5rem; justify-content: flex-end; align-items: center;">
+            <button type="button" id="modelSaveBtn" class="btn btn-primary">Save Changes</button>
           </div>
         </div>
       </form>

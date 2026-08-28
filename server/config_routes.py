@@ -2,12 +2,18 @@
 config_routes.py
 
 The /api/config endpoint: reads/writes the current session's active
-database (dialect-aware - Postgres, MySQL, BigQuery, or Snowflake) and its
-"Automatic SQL Execution" preference, and reports back everything the
-frontend needs to render its DB/session UI - including the server-
-configured list of available Gemini models (PRESET_MODELS), which the
-frontend may pass per-request to /api/translate, but which is not tied to
-or persisted on the session.
+database (dialect-aware - Postgres, MySQL, BigQuery, or Snowflake), its
+"Automatic SQL Execution" preference, and its LLM provider/model
+selection, and reports back everything the frontend needs to render its
+DB/session/model UI. Unlike this module's original design (every LLM
+provider's preset model list used to be a server-configured, Gemini-only
+value the frontend could pass per-request to /api/translate but never
+persisted anywhere), the active llm_provider/llm_model IS now persisted on
+the session - see state_store.py's get_session/set_session and
+translate_routes.py's list_llm_providers_info() - exactly the same
+persistence model the active database connection already uses, so a
+user's model choice survives page reloads and follows them the same way
+their DB connection does.
 
 Connections are represented as descriptors: {"type": "postgres", "url":
 "...", "ca_cert_pem": "..."} (MySQL is identical in shape, ca_cert_pem
@@ -26,18 +32,28 @@ see backends/mysql.py's module docstring), {"type":
 "port": 5439, "database": "...", "user": "...", "password": "...",
 "schema": "..."}, {"type": "mssql", "url": None, "host": "...", "port":
 1433, "database": "...", "user": "...", "password": "...", "schema":
-"...", "encrypt": true}, or {"type": "sheets", "url": None,
+"...", "encrypt": true}, {"type": "sheets", "url": None,
 "spreadsheet_id": "...", "tab_name": "...", "credentials_json": "..."
-(optional)}. Postgres/MySQL are the only two dialects with a real,
-driver-parsed url of their own; for the other 7, "url" is always None for
-a CUSTOM connection - genuinely absent, not just blank, all the way down
-to the state_store row (this module builds a purely internal,
-never-stored, never-returned identity string instead for hashing/matching
-purposes - see the _xxx_identity functions and compute_connection_key's
-call sites below) - though it may still be a non-blank, synthetic,
-informational string for an admin-configured preset (CONFIGURED_DBS,
-built independently in app_config.py, out of scope for this
-distinction). The GET /api/config response still always sends
+(optional)}, or {"type": "MongoDB", "url": "mongodb://...", "database":
+"...", "user": "...", "password": "..."}. Postgres/MySQL/MongoDB Atlas
+SQL are the only three dialects with a real, driver-parsed url of their
+own; for the other 7, "url" is always None for a CUSTOM connection -
+genuinely absent, not just blank, all the way down to the state_store row
+(this module builds a purely internal, never-stored, never-returned
+identity string instead for hashing/matching purposes - see the
+_xxx_identity functions and compute_connection_key's call sites below) -
+though it may still be a non-blank, synthetic, informational string for an
+admin-configured preset (CONFIGURED_DBS, built independently in
+app_config.py, out of scope for this distinction). MongoDB is a hybrid of
+the two patterns: its "url" is real and stored/returned as-is (like
+Postgres/MySQL - no separate identity function needed, see the mongodb
+branches below), but it ALSO carries database/user/password as separate
+config fields (like the other 7) rather than packing them into the url
+string - see backends/mongodb_sql.py's module docstring for why (that
+dialect's actual ODBC connection string needs a "Driver={...}" clause and
+a "Uri=" key name neither of which are this app's concern to ask a user
+for; the backend's connect() reassembles all of it). The GET /api/config
+response still always sends
 'active_database_url'/'custom_database_url' as a string (coalescing None
 to "" right at that boundary) - only the internal representation and
 storage are None now, not the wire format signed-in/anonymous clients
@@ -50,17 +66,22 @@ auth methods, and for why Databricks/Oracle/Redshift/SQL Server (like
 Snowflake) only support one explicit credential shape (a Personal Access
 Token for Databricks, plain username/password for the other three - no
 wallet/mTLS/IAM-temp-credentials yet) rather than any ambient identity.
+MongoDB Atlas SQL is the same plain-username/password shape too, with
+just as little ambient-identity fallback available - see backends/
+mongodb_sql.py's module docstring.
 credentials_json (BigQuery, and optionally Sheets - see below), password/
 private_key/private_key_passphrase (Snowflake), access_token (Databricks),
-and password (Oracle/Redshift/SQL Server - the same field name Postgres's
-URL-embedded password plays, but standalone here since none of the three
-have a single connection-string url of their own) are the fields that must
+and password (Oracle/Redshift/SQL Server/MongoDB Atlas SQL - the same
+field name Postgres's URL-embedded password plays, but standalone here
+since none of these four pack their password into their url the way
+Postgres/MySQL do) are the fields that must
 never round-trip back to the frontend once saved (see
 state_store.get_db_connections' include_credentials param and its
 _CREDENTIAL_CONFIG_FIELDS); _resolve_bigquery_credentials/
 _resolve_snowflake_credentials/_resolve_databricks_credentials/
 _resolve_oracle_credentials/_resolve_redshift_credentials/
-_resolve_mssql_credentials/_resolve_sheets_credentials below are what let a
+_resolve_mssql_credentials/_resolve_sheets_credentials/
+_resolve_mongodb_sql_credentials below are what let a
 user re-select or rename a saved connection, or just switch back to it,
 without re-entering its credential every time. billing_project_id is NOT a credential (it's just a
 project id string) and always round-trips to the frontend as-is - see
@@ -192,12 +213,13 @@ still reaches a private sheet in practice.
 """
 
 import json
+import re
 from urllib.parse import urlparse
 
 from flask import Blueprint, request, jsonify
 
 from app_config import (
-    CONFIGURED_DBS, DEFAULT_PRESET_ID, PRESET_MODELS,
+    CONFIGURED_DBS, DEFAULT_PRESET_ID,
     AUTH_ENABLED, IS_CLOUD_RUN, state_store,
 )
 import os
@@ -216,7 +238,9 @@ import schema_cache
 # instead of carrying an independent, easy-to-drift hardcoded constant. No
 # circular import risk: translate_routes.py doesn't import config_routes.py
 # (or anything that transitively does).
-from translate_routes import HISTORY_MAX_TURNS
+from translate_routes import (
+    HISTORY_MAX_TURNS, get_llm_provider, list_llm_providers_info,
+)
 
 config_bp = Blueprint('config', __name__)
 
@@ -495,6 +519,39 @@ def _resolve_redshift_credentials(user_identity, host, port, database, provided_
     return (matches[0].get("config") or {}).get("password")
 
 
+def _resolve_mongodb_sql_credentials(user_identity, url, database, provided_password, name=None):
+    """Returns the password to persist for a MongoDB Atlas SQL connection -
+    mirrors _resolve_redshift_credentials'/_resolve_mssql_credentials' role
+    (letting a user re-select or rename an already-saved connection without
+    re-entering its credential every time it's touched). Matches on "url"
+    directly (not `(db.get("config") or {}).get("url")`) - unlike Oracle/
+    Redshift/SQL Server, MongoDB's "url" is a real, top-level field (see
+    this module's docstring), not something folded into an internal
+    identity string, so matching reads it the same way Postgres/MySQL's
+    own url-based matching effectively would if they needed this function
+    at all (they don't - their url already carries the credential, so
+    there's nothing to separately resolve). "user" deliberately isn't part
+    of the match, same omission Oracle/Redshift/SQL Server's matching
+    above already makes - name+url+password together (see
+    compute_connection_key) are what actually disambiguate two saved
+    connections in the rare case two share a url/database."""
+    if provided_password:
+        return provided_password
+    existing = state_store.get_db_connections(user_identity, include_credentials=True)
+    matches = [
+        db for db in existing if db.get("type") == "MongoDB"
+        and db.get("url") == url
+        and (db.get("config") or {}).get("database") == database
+    ]
+    if not matches:
+        return None
+    if name:
+        named_match = next((db for db in matches if db.get("name") == name), None)
+        if named_match:
+            return (named_match.get("config") or {}).get("password")
+    return (matches[0].get("config") or {}).get("password")
+
+
 def _resolve_mssql_credentials(user_identity, host, port, database, provided_password, name=None):
     """Returns the password to persist for a SQL Server connection -
     mirrors _resolve_redshift_credentials' role (letting a user re-select
@@ -559,6 +616,13 @@ _CUSTOM_MSSQL_MISSING_FIELDS_ERROR = (
     "Custom SQL Server connections require a host, a database, a user, and "
     "a password. SQL Server has no ambient/shared identity this app can "
     "fall back to - every connection needs its own explicit credential."
+)
+
+_CUSTOM_MONGODB_SQL_MISSING_FIELDS_ERROR = (
+    "Custom MongoDB Atlas SQL connections require a URI, a database, a "
+    "user, and a password. MongoDB Atlas SQL has no ambient/shared "
+    "identity this app can fall back to - every connection needs its own "
+    "explicit credential."
 )
 
 
@@ -841,6 +905,49 @@ def _parse_incoming_connection(data, user_identity):
         if credentials_json:
             db_config["credentials_json"] = credentials_json
         return db_type, db_url, db_config, None
+
+    if db_type == 'mongodb':
+        # Unlike Postgres/MySQL, MongoDB's "url" only carries the bare
+        # mongodb:// URI - database/user/password are separate structured
+        # fields, same shape as Redshift's/SQL Server's above (see this
+        # module's docstring). There's no ca_cert_pem-style optional field
+        # either: TLS trust for MongoDB Atlas SQL is expressed inside the
+        # URI itself (a "?ssl=true" query param), never as a separately
+        # pasted CA certificate. See backends/mongodb_sql.py's module
+        # docstring for the full shape and why this dialect is read-only.
+        url = (data.get('database_url') or '').strip()
+        database = (data.get('database') or '').strip()
+        user = (data.get('user') or '').strip()
+        # Same "core identifying fields, nothing inferred" threshold every
+        # other structured dialect above uses - a request missing any of
+        # these isn't enough to even identify a connection yet (e.g. a
+        # fresh blank row), not a validation error - see the docstring
+        # above.
+        if not (url and database and user):
+            return db_type, None, {}, None
+        db_config = {"database": database, "user": user}
+
+        # Same policy as Oracle's/Redshift's/SQL Server's custom
+        # connections: every field explicit, nothing inferred, nothing
+        # falls back to a shared/app identity or to an admin preset's
+        # credential - MongoDB Atlas SQL has no ADC-equivalent ambient
+        # auth mode to fall back to (see backends/mongodb_sql.py's module
+        # docstring).
+        password = _resolve_mongodb_sql_credentials(
+            user_identity, url, database, data.get('password'),
+            name=data.get('database_name'),
+        )
+        if not password:
+            return 'MongoDB', url, db_config, _CUSTOM_MONGODB_SQL_MISSING_FIELDS_ERROR
+        db_config["password"] = password
+        # Returns the literal "MongoDB" (not the lowercased db_type just
+        # compared above) so the stored/exposed type always matches
+        # backends/__init__.py's _BACKENDS dict key exactly. Returns the
+        # real url (not None, and not an internal-only identity string) -
+        # MongoDB is NOT in _STRUCTURED_DIALECTS_WITHOUT_A_REAL_URL, so
+        # this IS what gets persisted/returned as "url" (see this module's
+        # docstring).
+        return 'MongoDB', url, db_config, None
 
     if db_type == 'mysql':
         # Same shape as Postgres - a single connection-string URL carries
@@ -1147,19 +1254,51 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
                 "url": None,  # None, not "" - see _sheets_identity above (and this module's docstring).
                 "config": config,
             })
+        elif db_type == 'mongodb':
+            # Unlike Postgres/MySQL just below, MongoDB's "url" only
+            # carries the bare mongodb:// URI - database/user/password are
+            # separate structured fields, same shape as Redshift's/SQL
+            # Server's above (see this module's docstring and backends/
+            # mongodb_sql.py's).
+            url = (db.get('url') or '').strip()
+            database = (db.get('database') or '').strip()
+            user = (db.get('user') or '').strip()
+            if not (url and database and user):
+                continue
+            password = _resolve_mongodb_sql_credentials(
+                user_identity, url, database, db.get('password'),
+                name=db.get('name'),
+            )
+            if not password:
+                # Incomplete - not ready to save yet (see docstring above).
+                continue
+            config = {"database": database, "user": user, "password": password}
+            name = db.get("name") or database or "Custom MongoDB"
+            merged.append({
+                # password folded directly into the key (not via url,
+                # which carries no credential of its own for this
+                # dialect - see _resolve_mongodb_sql_credentials above),
+                # same as Redshift's/SQL Server's calls above.
+                "connection_key": compute_connection_key(name, url, password),
+                "name": name,
+                "type": "MongoDB",
+                "url": url,
+                "config": config,
+            })
         else:
-            # Postgres and MySQL both land here - a single connection-
-            # string URL carries everything, so there's nothing dialect-
-            # specific to normalize beyond preserving whichever of the two
-            # was actually selected (db_type), rather than relabeling a
-            # MySQL row as Postgres the way this used to unconditionally
-            # do (see _parse_incoming_connection's matching fix, and
+            # Postgres and MySQL land here - each is a single
+            # connection-string "url" that carries everything (including
+            # its own credential), so there's nothing dialect-specific to
+            # normalize beyond preserving whichever was actually selected
+            # (db_type), rather than relabeling a non-Postgres row as
+            # Postgres the way this used to unconditionally do (see
+            # _parse_incoming_connection's matching fix, and
             # backends/mysql.py's module docstring).
             url = (db.get("url") or "").strip()
             if not url:
                 continue
             name = db.get("name") or "Custom"
-            resolved_type = db_type if db_type == "mysql" else "postgres"
+            resolved_type = "mysql" if db_type == "mysql" else "postgres"
             # ca_cert_pem is shared by both dialects (see
             # backends/postgres.py's and backends/mysql.py's module
             # docstrings) - not a credential, so it's simply carried
@@ -1200,6 +1339,26 @@ def handle_config():
         if not isinstance(new_auto_sql_execute, bool):
             new_auto_sql_execute = None
 
+        # LLM provider/model selection - an independent concern from the
+        # database connection fields above/below (same "a request can touch
+        # one, the other, both, or neither" reasoning as auto_sql_execute),
+        # so it's parsed up front and threaded into every set_session() call
+        # below rather than living in its own branch. Both silently ignored
+        # (left as None -> "don't change this") unless they resolve to an
+        # actually-registered provider/one of that provider's actual preset
+        # models - a bad/stale request here should never persist garbage
+        # that then breaks every subsequent /api/translate call for this
+        # session.
+        new_llm_provider = data.get('llm_provider')
+        new_llm_model = data.get('llm_model')
+        if isinstance(new_llm_provider, str) and new_llm_provider in (p["name"] for p in list_llm_providers_info()):
+            provider_for_validation = get_llm_provider(new_llm_provider)
+            if not (isinstance(new_llm_model, str) and new_llm_model in provider_for_validation.preset_models):
+                new_llm_model = None
+        else:
+            new_llm_provider = None
+            new_llm_model = None
+
         # The saved custom-connections LIST and "which connection (if any)
         # is active this request" are independent concerns - a request can
         # touch one, the other, both, or neither (e.g. renaming a saved
@@ -1230,6 +1389,7 @@ def handle_config():
             state_store.set_session(
                 user_identity, connection_id=preset["id"], is_custom=False,
                 auto_sql_execute=new_auto_sql_execute,
+                llm_provider=new_llm_provider, llm_model=new_llm_model,
             )
         elif is_custom:
             new_db_type, new_db_url, new_db_config, connection_error = _parse_incoming_connection(
@@ -1311,6 +1471,18 @@ def handle_config():
                             db_name_to_save = new_db_config.get("database") or "Custom SQL Server"
                         elif new_db_type == 'sheets':
                             db_name_to_save = new_db_config.get("tab_name") or "Custom Sheet"
+                        elif new_db_type == 'MongoDB':
+                            # new_db_config.get("database") directly, same
+                            # as Redshift's/SQL Server's branches above -
+                            # database is now a real structured field, not
+                            # something regex-scraped out of a packed
+                            # url/identity string (see backends/
+                            # mongodb_sql.py's and this module's
+                            # docstrings). new_db_type is already the
+                            # canonical "MongoDB" here (not lowercased) -
+                            # see _parse_incoming_connection's mongodb
+                            # branch, which is where this value came from.
+                            db_name_to_save = new_db_config.get("database") or "Custom MongoDB"
                         else:
                             try:
                                 parsed = urlparse(new_db_url)
@@ -1333,6 +1505,7 @@ def handle_config():
                 state_store.set_session(
                     user_identity, connection_id=active_connection_key, is_custom=True,
                     auto_sql_execute=new_auto_sql_execute,
+                    llm_provider=new_llm_provider, llm_model=new_llm_model,
                 )
                 if db_name_to_save is not None:
                     # new_db_url_to_persist, not new_db_url: for the 7
@@ -1347,15 +1520,20 @@ def handle_config():
                         connection_key=(active_connection_key or None),
                     )
                     custom_list_saved = True
-        elif new_auto_sql_execute is not None:
+        elif new_auto_sql_execute is not None or new_llm_provider is not None or new_llm_model is not None:
             # Neither a preset nor a custom connection was actively
             # selected in this request (e.g. only the auto-execute toggle
-            # changed) - leave the active connection exactly as it is.
-            # There's no hardcoded default to reset it to here anymore the
-            # way there used to be: a blank/never-set connection_id already
-            # resolves to the app default on its own - see db.py's
-            # resolve_active_descriptor.
-            state_store.set_session(user_identity, auto_sql_execute=new_auto_sql_execute)
+            # changed, or - the model-selection modal's own save, which
+            # never sends preset_id/is_custom at all - only llm_provider/
+            # llm_model changed) - leave the active connection exactly as
+            # it is. There's no hardcoded default to reset it to here
+            # anymore the way there used to be: a blank/never-set
+            # connection_id already resolves to the app default on its own
+            # - see db.py's resolve_active_descriptor.
+            state_store.set_session(
+                user_identity, auto_sql_execute=new_auto_sql_execute,
+                llm_provider=new_llm_provider, llm_model=new_llm_model,
+            )
 
         if not custom_list_saved and merged_custom_databases is not None:
             state_store.set_db_connections(
@@ -1379,6 +1557,14 @@ def handle_config():
     active_db_type = active_descriptor.get("type") or "postgres"
     active_db_config = {k: v for k, v in active_descriptor.items() if k not in ("type", "url")}
     auto_sql_execute = session_data["auto_sql_execute"]
+
+    # A blank/never-set session field falls back to get_llm_provider()'s own
+    # hardcoded default (Google), exactly like translate_query()'s own
+    # resolution (see that function's comment) - the badge/modal always
+    # shows the model that would actually be used, never a raw blank.
+    active_llm_provider_obj = get_llm_provider(session_data.get("llm_provider"))
+    active_llm_provider = active_llm_provider_obj.name
+    active_llm_model = session_data.get("llm_model") or active_llm_provider_obj.default_model
 
     active_connection_missing_message = ""
     if connection_missing:
@@ -1588,11 +1774,23 @@ def handle_config():
         # its fields get their own dedicated names.
         'active_database_sheets_spreadsheet_id': active_db_config.get("spreadsheet_id", "") if active_db_type_out == "sheets" else "",
         'active_database_sheets_tab_name': active_db_config.get("tab_name", "") if active_db_type_out == "sheets" else "",
+        # MongoDB's "url" already round-trips generically via
+        # active_database_url above (it's a real field for this dialect,
+        # unlike Redshift's/SQL Server's - see this module's docstring) -
+        # only database/user need their own dedicated fields here, same
+        # reasoning as Redshift's/SQL Server's own database/user fields.
+        'active_database_mongodb_database': active_db_config.get("database", "") if active_db_type_out == "MongoDB" else "",
+        'active_database_mongodb_user': active_db_config.get("user", "") if active_db_type_out == "MongoDB" else "",
         'custom_database_name': user_custom_name or "",
         'custom_database_url': user_custom_url or "",
         'custom_databases': custom_databases or [],
-        'gemini_preset_keys': PRESET_MODELS,
-        'models': PRESET_MODELS,
+        # Organized by provider (see list_llm_providers_info()'s docstring)
+        # so the model-selection modal can render one radio-button section
+        # per provider without the client needing its own hardcoded notion
+        # of which models belong to which provider.
+        'llm_providers': list_llm_providers_info(),
+        'active_llm_provider': active_llm_provider,
+        'active_llm_model': active_llm_model,
         'auto_sql_execute': auto_sql_execute,
         # So the client's own turn-navigation cap (chatStore in client.js)
         # can match the number of turns /api/translate actually replays to

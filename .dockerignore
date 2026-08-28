@@ -17,6 +17,8 @@ README.md
 # Ignre local env files containing secrets
 .env
 presets_local.json
+atlas-credentials.env
+
 
 # Ignore local state
 state/

@@ -101,16 +101,17 @@ test.describe('config modal', () => {
   });
 
   test('preset playgrounds split into two columns by dialect', async ({ page }) => {
-    // Left column: the 4 "simple credential" dialects (single connection
+    // Left column: the 5 "simple credential" dialects (single connection
     // string or plain user/password) - Postgres, MySQL, Oracle, SQL
-    // Server. Right column: the other 5 structured/cloud dialects -
-    // BigQuery, Snowflake, Databricks, Redshift, Google Sheets. Mirrors
-    // LEFT_COLUMN_TYPES in renderDbRadioButtons() (client.js).
+    // Server, MongoDB Atlas SQL. Right column: the other 5 structured/cloud
+    // dialects - BigQuery, Snowflake, Databricks, Redshift, Google Sheets.
+    // Mirrors LEFT_COLUMN_TYPES in renderDbRadioButtons() (client.js).
     const configuredDatabases = [
       { id: 'p-pg', name: 'PG Playground', type: 'postgres' },
       { id: 'p-my', name: 'MySQL Playground', type: 'mysql' },
       { id: 'p-ora', name: 'Oracle Playground', type: 'oracle' },
       { id: 'p-ms', name: 'SQL Server Playground', type: 'mssql' },
+      { id: 'p-mo', name: 'Mongo Playground', type: 'MongoDB' },
       { id: 'p-bq', name: 'BigQuery Playground', type: 'bigquery' },
       { id: 'p-sf', name: 'Snowflake Playground', type: 'snowflake' },
       { id: 'p-db', name: 'Databricks Playground', type: 'databricks' },
@@ -152,6 +153,7 @@ test.describe('config modal', () => {
     await expect(columns).toHaveCount(2);
     await expect(columns.nth(0).locator('.radio-label')).toHaveText([
       'PG Playground', 'MySQL Playground', 'Oracle Playground', 'SQL Server Playground',
+      'Mongo Playground',
     ]);
     await expect(columns.nth(1).locator('.radio-label')).toHaveText([
       'BigQuery Playground', 'Snowflake Playground', 'Databricks Playground',
@@ -712,13 +714,13 @@ test.describe('config modal', () => {
     expect(saveBox.y + saveBox.height).toBeLessThanOrEqual(cardBox.y + cardBox.height + 1);
   });
 
-  test('the type dropdown offers PostgreSQL, MySQL, BigQuery, Snowflake, Databricks, Oracle, Redshift, SQL Server, and Google Sheets', async ({ page }) => {
+  test('the type dropdown offers PostgreSQL, MySQL, BigQuery, Snowflake, Databricks, Oracle, Redshift, SQL Server, Google Sheets, and MongoDB', async ({ page }) => {
     await gotoApp(page);
     await openConfigModal(page);
     await addCustomDbRow(page);
 
     const options = await page.locator('.custom-db-type-select').last().locator('option').allTextContents();
-    expect(options).toEqual(['PostgreSQL', 'MySQL', 'BigQuery', 'Snowflake', 'Databricks', 'Oracle', 'Redshift', 'SQL Server', 'Google Sheets']);
+    expect(options).toEqual(['PostgreSQL', 'MySQL', 'BigQuery', 'Snowflake', 'Databricks', 'Oracle', 'Redshift', 'SQL Server', 'Google Sheets', 'MongoDB']);
   });
 
   test('adding a custom MySQL connection persists it and updates the badge', async ({ page }) => {
@@ -1237,6 +1239,84 @@ test.describe('config modal', () => {
 
     await expect(page.locator('.custom-db-sh-creds').last()).toHaveValue('');
     await expect(page.locator('.custom-db-sh-url').last()).toHaveValue('https://docs.google.com/spreadsheets/d/1AbCdEf2345/edit');
+  });
+
+  // MongoDB Atlas SQL coverage below is deliberately narrow, for the same
+  // network-call-safety reason as the SQL Server/Redshift/Oracle/
+  // Databricks/Snowflake blocks above - connect() (called during
+  // config_routes.py's post-save identity check) opens a real ODBC/TCP
+  // connection to the Atlas host for this dialect (see backends/
+  // mongodb_sql.py's module docstring), so a complete row is never
+  // actually submitted here. That save-succeeds/round-trips-the-right-
+  // fields behavior is already fully exercised, safely, at the Python
+  // level against a mocked pyodbc.connect - see
+  // tests/server/test_config_mongodb_sql.py. Unlike every other structured
+  // dialect above, this one has a real "url" field (the bare mongodb://
+  // deployment URI) ALONGSIDE database/user/password, rather than no url
+  // at all - see this dialect's isCompleteMongo() in client.js.
+  test('custom MongoDB row shows URI, Database, User, and Password fields', async ({ page }) => {
+    await gotoApp(page);
+    await openConfigModal(page);
+
+    await addCustomDbRow(page);
+    await page.locator('.custom-db-type-select').last().selectOption('MongoDB');
+
+    await expect(page.locator('.custom-db-mongo-uri').last()).toBeVisible();
+    await expect(page.locator('.custom-db-mongo-database').last()).toBeVisible();
+    await expect(page.locator('.custom-db-mongo-user').last()).toBeVisible();
+    await expect(page.locator('.custom-db-mongo-password').last()).toBeVisible();
+  });
+
+  test('a MongoDB custom row labels each field on its own line: URI, then Database/User, then Password', async ({ page }) => {
+    await gotoApp(page);
+    await openConfigModal(page);
+    await addCustomDbRow(page);
+    await page.locator('.custom-db-type-select').last().selectOption('MongoDB');
+
+    const card = page.locator('.custom-db-card').last();
+    const fieldRows = card.locator('.custom-db-field-row');
+    await expect(fieldRows.nth(0).locator('.custom-db-field-label')).toHaveText(['URI:']);
+    await expect(fieldRows.nth(1).locator('.custom-db-field-label')).toHaveText(['Database:', 'User:']);
+    await expect(fieldRows.nth(2).locator('.custom-db-field-label')).toHaveText(['Password:']);
+  });
+
+  test('an incomplete custom MongoDB row (no database / password) is never submitted', async ({ page }) => {
+    // Same client-side gate as every other structured dialect above
+    // (triggerConfigSave's isCompleteMongo()) - and since the row never
+    // makes it into the request, this never triggers the real-network-
+    // call risk described above either (database_type stays 'postgres',
+    // falling back to the untouched default preset).
+    await gotoApp(page);
+    await openConfigModal(page);
+
+    await addCustomDbRow(page);
+    await page.locator('.custom-db-type-select').last().selectOption('MongoDB');
+    await page.locator('.custom-db-mongo-uri').last().fill('mongodb://atlas-sql-abc.mongodb.net/?ssl=true');
+    await page.locator('.custom-db-mongo-user').last().fill('alice');
+    // Deliberately leave database and password blank.
+
+    await page.locator('#configSaveBtn').click();
+
+    await expect(page.locator('#configModal')).toHaveClass(/hidden/);
+    await expect(page.locator('#connDbName')).toHaveText('Default DB');
+
+    await openConfigModal(page);
+    await expect(page.locator('.custom-db-mongo-uri')).toHaveCount(0);
+  });
+
+  test('the MongoDB password never round-trips back into the page', async ({ page }) => {
+    // Mirrors the BigQuery service-account-key/Databricks access-token/
+    // Oracle-Redshift-SQL Server password tests above: a password is a
+    // credential, never redisplayed once saved, same as every other
+    // dialect's credential field(s). The row is never actually submitted
+    // here (see the network-call caution above) - this just pins that the
+    // field starts, and stays, blank rather than ever showing a value.
+    await gotoApp(page);
+    await openConfigModal(page);
+    await addCustomDbRow(page);
+    await page.locator('.custom-db-type-select').last().selectOption('MongoDB');
+
+    await expect(page.locator('.custom-db-mongo-password').last()).toHaveValue('');
   });
 
   // Regression coverage for the modal-sluggishness fix: client.js's

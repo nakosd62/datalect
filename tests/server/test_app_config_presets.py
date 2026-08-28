@@ -11,6 +11,8 @@ file path rather than holding JSON inline.
 
 import logging
 
+import pytest
+
 from helpers import write_database_presets_file, write_database_presets_file_raw
 
 
@@ -85,6 +87,66 @@ def test_mysql_preset_with_cloud_sql_unix_socket_url_parsed(app_factory, tmp_pat
     db = env.app_config.CONFIGURED_DBS[0]
     assert db["type"] == "mysql"
     assert db["url"] == url
+
+
+def test_mongodb_sql_preset_parsed(app_factory, tmp_path):
+    # No "Driver={...}" clause and no leading "Uri=" key name in "url" -
+    # neither is something a preset author supplies anymore; backends/
+    # mongodb_sql.py's connect() injects both itself (see that module's
+    # docstring). "url" is just the bare mongodb:// deployment URI;
+    # database/user/password are separate fields, same shape as Redshift's/
+    # SQL Server's own presets.
+    uri = "mongodb://atlas-sql-abc.mongodb.net/?ssl=true&authSource=admin"
+    path = write_database_presets_file(tmp_path, [
+        {"type": "MongoDB", "name": "Analytics", "url": uri,
+         "database": "mydb", "user": "u", "password": "p"},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    assert len(env.app_config.CONFIGURED_DBS) == 1
+    db = env.app_config.CONFIGURED_DBS[0]
+    # Auto-derived id is "{lowercased type}+{name}" ("mongodb+..."), but the
+    # stored "type" itself is the canonical "MongoDB" - see this dialect's
+    # branch in app_config.py's preset-loading loop for why those two
+    # deliberately differ in case.
+    assert db == {
+        "id": "mongodb+Analytics", "name": "Analytics", "type": "MongoDB",
+        "url": uri, "database": "mydb", "user": "u", "password": "p",
+    }
+
+
+def test_mongodb_sql_preset_missing_url_is_skipped(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [
+        {"type": "MongoDB", "name": "Analytics", "database": "mydb", "user": "u", "password": "p"},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    # Skipped entirely -> falls back to the single synthetic default.
+    assert len(env.app_config.CONFIGURED_DBS) == 1
+    assert env.app_config.CONFIGURED_DBS[0]["name"] == "Default DB"
+
+
+@pytest.mark.parametrize("missing_field", ["database", "user", "password"])
+def test_mongodb_sql_preset_missing_any_required_field_is_skipped(app_factory, tmp_path, missing_field):
+    # Same as a missing url above - url/database/user/password are all
+    # required; missing any one of them (not just url) must skip the
+    # preset rather than loading a connection that can never actually
+    # authenticate.
+    fields = {"type": "MongoDB", "name": "Analytics",
+               "url": "mongodb://h/?ssl=true", "database": "mydb", "user": "u", "password": "p"}
+    del fields[missing_field]
+    path = write_database_presets_file(tmp_path, [fields])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    assert len(env.app_config.CONFIGURED_DBS) == 1
+    assert env.app_config.CONFIGURED_DBS[0]["name"] == "Default DB"
+
+
+def test_mongodb_sql_preset_type_is_case_insensitive(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [
+        {"type": "MONGODB", "name": "Analytics", "url": "mongodb://h/?ssl=true",
+         "database": "d", "user": "u", "password": "p"},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    assert len(env.app_config.CONFIGURED_DBS) == 1
+    assert env.app_config.CONFIGURED_DBS[0]["type"] == "MongoDB"
 
 
 def test_preset_missing_name_is_skipped(app_factory, tmp_path):
@@ -567,17 +629,6 @@ def test_default_conn_falls_back_to_hardcoded_when_only_mysql_presets_exist(app_
     ])
     env = app_factory(env={"DATABASE_PRESETS_FILE": path})
     assert env.app_config.DEFAULT_CONN.startswith("postgresql://postgres:password@")
-
-
-def test_gemini_model_defaults_and_preset_models_include_it(app_factory):
-    env = app_factory(env={})
-    assert env.app_config.DEFAULT_MODEL == "gemini-2.5-flash"
-    assert env.app_config.DEFAULT_MODEL in env.app_config.PRESET_MODELS
-
-
-def test_custom_gemini_model_gets_added_to_preset_models(app_factory):
-    env = app_factory(env={"GEMINI_MODEL": "gemini-custom-model"})
-    assert env.app_config.PRESET_MODELS[0] == "gemini-custom-model"
 
 
 def test_local_dev_uses_sqlite_state_store_by_default(app_factory):

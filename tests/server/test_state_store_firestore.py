@@ -64,6 +64,37 @@ def test_set_session_with_no_user_id_is_a_no_op():
     assert client._collections == {}
 
 
+# --- llm_provider / llm_model (model-selection UI) --------------------------
+# Same "" -> "nothing explicitly selected yet" convention connection_id
+# already uses - see get_session's docstring in state_store.py.
+
+def test_get_session_defaults_llm_fields_to_blank():
+    store, client = make_store()
+    session = store.get_session("alice")
+    assert session["llm_provider"] == ""
+    assert session["llm_model"] == ""
+
+
+def test_set_and_get_session_round_trips_llm_fields():
+    store, client = make_store()
+    store.set_session("alice", llm_provider="openai", llm_model="gpt-5.6-luna")
+    session = store.get_session("alice")
+    assert session["llm_provider"] == "openai"
+    assert session["llm_model"] == "gpt-5.6-luna"
+    assert session["connection_id"] == ""  # untouched
+
+
+def test_set_session_llm_fields_do_not_clobber_connection_fields():
+    store, client = make_store()
+    store.set_session("alice", connection_id="k1", is_custom=True)
+    store.set_session("alice", llm_provider="anthropic", llm_model="claude-sonnet-5")
+    session = store.get_session("alice")
+    assert session["connection_id"] == "k1"  # untouched
+    assert session["is_custom"] is True  # untouched
+    assert session["llm_provider"] == "anthropic"
+    assert session["llm_model"] == "claude-sonnet-5"
+
+
 def test_set_session_leaves_untouched_top_level_fields_alone():
     store, client = make_store()
     store.set_session("alice", connection_id="k1", is_custom=True)

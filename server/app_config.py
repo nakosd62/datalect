@@ -187,6 +187,23 @@ DEFAULT_CONN = "postgresql://postgres:password@host:23456/defaultdb?sslmode=veri
 #   Google Sheets: {"type": "sheets", "name": "...", "spreadsheet_url": "..."
 #               (or "spreadsheet_id" instead), "tab_name": "...",
 #               "credentials_json": "..." (optional - see below)}
+#   MongoDB Atlas SQL: {"type": "MongoDB" (case-insensitive on input; the
+#               "type" this app then stores/exposes is always the exact
+#               "MongoDB" spelling below, same as every other type here
+#               canonicalizes to its own fixed spelling), "name": "...",
+#               "url": "mongodb://...", "database": "...", "user": "...",
+#               "password": "..."} ("url"/"database"/"user"/"password" all
+#               required - see below). Unlike Oracle/Redshift/SQL Server
+#               above, "url" here IS a real, driver-parsed value (a bare
+#               mongodb:// URI, same as Postgres/MySQL's own "url") - it's
+#               just that database/user/password are separate fields
+#               instead of being packed into that same string (see
+#               backends/mongodb_sql.py's module docstring for why: this
+#               dialect's actual ODBC connection string also needs a fixed
+#               "Driver={...}" clause and a "Uri=" key name neither of
+#               which are this file's concern - connect() injects both).
+#               This dialect is also read-only (SELECT-only - no write
+#               statements exist for it).
 # Example file contents:
 #   [
 #     {
@@ -454,6 +471,48 @@ if raw_db_presets.strip():
                 logger.warning("Skipping MySQL preset '%s': missing 'url'.", name)
                 continue
             CONFIGURED_DBS.append({"id": preset_id, "name": name, "type": "mysql", "url": url})
+
+        elif db_type == "mongodb":
+            # Structured fields (see backends/mongodb_sql.py's module
+            # docstring and this file's shape comment above): "url" is a
+            # clean, real mongodb:// URI - unlike Oracle's/Redshift's
+            # synthetic display-only "url" below, this one IS what gets
+            # used as-is elsewhere (backends/mongodb_sql.py's connect()
+            # injects the fixed Driver= clause and the Uri= key name, not
+            # this file), same as Postgres/MySQL's real url. "database"/
+            # "user"/"password" are ordinary required fields, same shape
+            # as Redshift's - MongoDB Atlas SQL has no ADC-equivalent
+            # ambient identity to fall back to either.
+            url = (entry.get("url") or "").strip()
+            database = (entry.get("database") or "").strip()
+            mongo_user = (entry.get("user") or "").strip()
+            password = entry.get("password") or ""
+            if not (url and database and mongo_user and password):
+                logger.warning(
+                    "Skipping MongoDB Atlas SQL preset '%s': requires 'url', 'database', "
+                    "'user', and 'password' - MongoDB Atlas SQL has no ADC-equivalent "
+                    "ambient identity to fall back to (see backends/mongodb_sql.py's "
+                    "module docstring).",
+                    name,
+                )
+                continue
+            # Stored/exposed "type" is the literal "MongoDB" (matching
+            # backends/__init__.py's _BACKENDS dict key exactly, case-
+            # sensitively) even though the comparison just above is against
+            # the lowercased db_type - same "canonicalize on the way out,
+            # case-insensitive on the way in" pattern this whole loop
+            # already applies to every other dialect, just more visible
+            # here since "MongoDB" (unlike "mysql"/"postgres"/etc.) isn't
+            # already all-lowercase.
+            CONFIGURED_DBS.append({
+                "id": preset_id,
+                "name": name,
+                "type": "MongoDB",
+                "url": url,
+                "database": database,
+                "user": mongo_user,
+                "password": password,
+            })
 
         elif db_type == "bigquery":
             project_id = (entry.get("project_id") or "").strip()
@@ -827,11 +886,18 @@ if _postgres_presets:
 # blank.
 DEFAULT_PRESET_ID = _postgres_presets[0]["id"] if _postgres_presets else None
 
-# --- Model Configuration -----------------------------------------------------
-DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-PRESET_MODELS = ["gemini-2.5-flash", "gemini-2.5-pro"]
-if DEFAULT_MODEL not in PRESET_MODELS:
-    PRESET_MODELS.insert(0, DEFAULT_MODEL)
+# Model configuration for all three LLM providers (Google included) lives
+# in translate_routes.py now, not here - each provider's own single
+# *_MODELS env var (GOOGLE_MODELS/ANTHROPIC_MODELS/OPENAI_MODELS) doubles as
+# both its default model (first entry) and the full list the
+# model-selection modal offers (see LlmProvider.default_model/
+# preset_models and list_llm_providers_info() in that module). This used
+# to be a Gemini-only DEFAULT_MODEL/PRESET_MODELS pair here - Gemini being
+# the original/only provider before the multi-provider refactor - with
+# PRESET_MODELS hardcoded and never actually read from any env var despite
+# older docs claiming it was, and never wired into anything the client
+# used. Moved for symmetry with Claude/OpenAI's own model config, which
+# always lived in translate_routes.py.
 
 # --- State DB file in local mode ---------------------------------------------
 TRANSLATION_STATS_DB_PATH = "state/ydyl_state.db"

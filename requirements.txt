@@ -3,6 +3,7 @@ psycopg2-binary==2.9.9
 flask-cors==4.0.1
 google-genai>=1.0.0
 anthropic>=0.40.0
+openai>=1.66.0  # 1.66.0 is the first release with the Responses API (client.responses.create) - see translate_routes.py's _call_openai
 sqlparse>=0.5.0
 google-cloud-firestore
 google-cloud-datastore
@@ -20,3 +21,4 @@ google-auth  # service-account bearer-token minting for private Sheets - already
 pandas
 python-dotenv
 pyarrow
+pyodbc  # backends/mongodb_sql.py - MongoDB Atlas SQL Interface is ODBC/JDBC-only, no pure-Python driver exists; requires unixODBC + MongoDB's own ODBC driver at the OS level (see Dockerfile)

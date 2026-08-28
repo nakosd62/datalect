@@ -291,33 +291,48 @@ class StateStore(ABC):
 
     @abstractmethod
     def get_session(self, user_id):
-        """Returns {"auto_sql_execute", "is_custom", "connection_id"} for a
-        user/session id - identity only, never a connection's actual
-        details/credentials (see db.py's resolve_active_descriptor, which
-        resolves those FRESH from CONFIGURED_DBS or get_db_connections()
-        every time something needs to actually connect, rather than trusting
-        anything cached here). "is_custom" (defaults to False for legacy
-        rows) records whether the active connection is a saved custom
-        connection rather than a preset. "connection_id" (defaults to "" -
-        "nothing explicitly selected yet") is, depending on is_custom: a
-        preset's stable CONFIGURED_DBS "id" (see app_config.py's
-        DATABASE_PRESETS_FILE comment) when is_custom is False, or a saved
-        custom connection's compute_connection_key() value when is_custom is
-        True - either way, a single opaque reference resolved fresh at
-        connect time, never a duplicated copy of the connection itself. This
-        also means a removed preset or a deleted custom connection is
-        immediately reflected everywhere (no drift) - see
-        resolve_active_descriptor's "missing" return for how a
-        connection_id that no longer resolves to anything real is handled."""
+        """Returns {"auto_sql_execute", "is_custom", "connection_id",
+        "llm_provider", "llm_model"} for a user/session id - identity only,
+        never a connection's actual details/credentials (see db.py's
+        resolve_active_descriptor, which resolves those FRESH from
+        CONFIGURED_DBS or get_db_connections() every time something needs
+        to actually connect, rather than trusting anything cached here).
+        "is_custom" (defaults to False for legacy rows) records whether the
+        active connection is a saved custom connection rather than a
+        preset. "connection_id" (defaults to "" - "nothing explicitly
+        selected yet") is, depending on is_custom: a preset's stable
+        CONFIGURED_DBS "id" (see app_config.py's DATABASE_PRESETS_FILE
+        comment) when is_custom is False, or a saved custom connection's
+        compute_connection_key() value when is_custom is True - either way,
+        a single opaque reference resolved fresh at connect time, never a
+        duplicated copy of the connection itself. This also means a removed
+        preset or a deleted custom connection is immediately reflected
+        everywhere (no drift) - see resolve_active_descriptor's "missing"
+        return for how a connection_id that no longer resolves to anything
+        real is handled.
+
+        "llm_provider"/"llm_model" (both default to "" - "nothing
+        explicitly selected yet", same convention as connection_id above,
+        not auto_sql_execute's baked-in-default one) are the user's saved
+        model-selection choice (see translate_routes.py's LlmProvider/
+        get_llm_provider). A blank value means "use this app's one
+        hardcoded default (Google/gemini-3.7-flash)" - resolved at the
+        point of use (translate_query() calls get_llm_provider(''), whose
+        own fallback IS that hardcoded default - see its docstring), not
+        baked into a default here, since unlike auto_sql_execute's
+        True/False there's no single hardcoded stand-in value that would
+        stay correct if that hardcoded default ever changed."""
 
     @abstractmethod
-    def set_session(self, user_id, connection_id=None, auto_sql_execute=None, is_custom=None):
+    def set_session(self, user_id, connection_id=None, auto_sql_execute=None, is_custom=None,
+                     llm_provider=None, llm_model=None):
         """Persists the active connection reference (connection_id,
-        is_custom) and/or auto_sql_execute flag for a user/session id. Only
-        the fields passed (not None) are changed - the others are left
-        as-is. Pass connection_id="" (not None) to explicitly clear it, e.g.
-        when switching to a fresh/default connection - same
-        not-None-means-"change this" convention is_custom already uses."""
+        is_custom), auto_sql_execute flag, and/or llm_provider/llm_model
+        selection for a user/session id. Only the fields passed (not None)
+        are changed - the others are left as-is. Pass connection_id=""
+        (not None) to explicitly clear it, e.g. when switching to a
+        fresh/default connection - same not-None-means-"change this"
+        convention is_custom/llm_provider/llm_model already use."""
 
     @abstractmethod
     def get_db_connections(self, user_id, include_credentials=False):
@@ -421,6 +436,8 @@ class SqliteStateStore(StateStore):
                         auto_sql_execute INTEGER NOT NULL DEFAULT 1,
                         is_custom INTEGER NOT NULL DEFAULT 0,
                         connection_id TEXT NOT NULL DEFAULT '',
+                        llm_provider TEXT NOT NULL DEFAULT '',
+                        llm_model TEXT NOT NULL DEFAULT '',
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     );
                 """)
@@ -431,6 +448,22 @@ class SqliteStateStore(StateStore):
                 if "auto_sql_execute" not in session_columns:
                     cursor.execute(
                         "ALTER TABLE sessions ADD COLUMN auto_sql_execute INTEGER NOT NULL DEFAULT 1;"
+                    )
+                # Migration: existing DBs created before llm_provider/llm_model
+                # existed. Both default to '' ("nothing explicitly selected
+                # yet", same convention connection_id already uses below) -
+                # every pre-existing row predates per-user model selection, and
+                # get_session()/translate_query() already treat a blank value
+                # as "fall back to the env-configured default", so a plain
+                # ALTER (no data backfill needed, unlike connection_id's own
+                # migration further down) is sufficient here.
+                if "llm_provider" not in session_columns:
+                    cursor.execute(
+                        "ALTER TABLE sessions ADD COLUMN llm_provider TEXT NOT NULL DEFAULT '';"
+                    )
+                if "llm_model" not in session_columns:
+                    cursor.execute(
+                        "ALTER TABLE sessions ADD COLUMN llm_model TEXT NOT NULL DEFAULT '';"
                     )
                 # Migration: existing DBs created before is_custom existed.
                 # Defaults to 0/False - every legacy row predates the
@@ -485,6 +518,8 @@ class SqliteStateStore(StateStore):
                             auto_sql_execute INTEGER NOT NULL DEFAULT 1,
                             is_custom INTEGER NOT NULL DEFAULT 0,
                             connection_id TEXT NOT NULL DEFAULT '',
+                            llm_provider TEXT NOT NULL DEFAULT '',
+                            llm_model TEXT NOT NULL DEFAULT '',
                             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                         );
                     """)
@@ -492,13 +527,26 @@ class SqliteStateStore(StateStore):
                     old_columns = {column[1] for column in cursor.fetchall()}
                     old_has_custom_key = "custom_connection_key" in old_columns
                     old_has_url = "database_url" in old_columns
+                    # llm_provider/llm_model are always present on sessions_old
+                    # by this point (the migration guards above already ALTER
+                    # them onto "sessions" before this rebuild ever runs) -
+                    # selected defensively via old_columns anyway, matching
+                    # custom_connection_key/database_url's own
+                    # already-established defensive pattern just above, in
+                    # case this rebuild path is ever reordered ahead of those
+                    # guards in the future.
+                    old_has_llm_provider = "llm_provider" in old_columns
+                    old_has_llm_model = "llm_model" in old_columns
                     select_cols = "session_id, auto_sql_execute, is_custom"
                     select_cols += ", custom_connection_key" if old_has_custom_key else ", NULL"
                     select_cols += ", database_url" if old_has_url else ", NULL"
+                    select_cols += ", llm_provider" if old_has_llm_provider else ", ''"
+                    select_cols += ", llm_model" if old_has_llm_model else ", ''"
                     select_cols += ", updated_at" if "updated_at" in old_columns else ", CURRENT_TIMESTAMP"
                     cursor.execute(f"SELECT {select_cols} FROM sessions_old;")
                     for (old_session_id, old_auto_exec, old_is_custom,
-                         old_custom_key, old_url, old_updated_at) in cursor.fetchall():
+                         old_custom_key, old_url, old_llm_provider, old_llm_model,
+                         old_updated_at) in cursor.fetchall():
                         if old_is_custom and old_custom_key:
                             new_connection_id = old_custom_key
                         elif not old_is_custom and old_url:
@@ -509,11 +557,13 @@ class SqliteStateStore(StateStore):
                             new_connection_id = ""
                         cursor.execute("""
                             INSERT OR REPLACE INTO sessions
-                                (session_id, auto_sql_execute, is_custom, connection_id, updated_at)
-                            VALUES (?, ?, ?, ?, ?);
+                                (session_id, auto_sql_execute, is_custom, connection_id,
+                                 llm_provider, llm_model, updated_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?);
                         """, (
                             old_session_id, old_auto_exec, old_is_custom,
-                            new_connection_id, old_updated_at,
+                            new_connection_id, old_llm_provider or '', old_llm_model or '',
+                            old_updated_at,
                         ))
                     cursor.execute("DROP TABLE sessions_old;")
 
@@ -658,7 +708,7 @@ class SqliteStateStore(StateStore):
             with self._connect() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    "SELECT auto_sql_execute, is_custom, connection_id "
+                    "SELECT auto_sql_execute, is_custom, connection_id, llm_provider, llm_model "
                     "FROM sessions WHERE session_id = ?",
                     (effective_user,),
                 )
@@ -668,6 +718,8 @@ class SqliteStateStore(StateStore):
                         "auto_sql_execute": bool(row[0]),
                         "is_custom": bool(row[1]),
                         "connection_id": row[2] or "",
+                        "llm_provider": row[3] or "",
+                        "llm_model": row[4] or "",
                     }
         except Exception:
             logger.exception("Error fetching session from SQLite")
@@ -675,10 +727,14 @@ class SqliteStateStore(StateStore):
             "auto_sql_execute": DEFAULT_AUTO_SQL_EXECUTE,
             "is_custom": False,
             "connection_id": "",
+            "llm_provider": "",
+            "llm_model": "",
         }
 
-    def set_session(self, user_id, connection_id=None, auto_sql_execute=None, is_custom=None):
-        if connection_id is None and auto_sql_execute is None and is_custom is None:
+    def set_session(self, user_id, connection_id=None, auto_sql_execute=None, is_custom=None,
+                     llm_provider=None, llm_model=None):
+        if (connection_id is None and auto_sql_execute is None and is_custom is None
+                and llm_provider is None and llm_model is None):
             return
         effective_user = _effective_user(user_id)
         try:
@@ -695,14 +751,17 @@ class SqliteStateStore(StateStore):
                     auto_sql_execute if auto_sql_execute is not None else DEFAULT_AUTO_SQL_EXECUTE
                 )
                 cursor.execute("""
-                    INSERT INTO sessions (session_id, auto_sql_execute, is_custom, connection_id)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO sessions
+                        (session_id, auto_sql_execute, is_custom, connection_id, llm_provider, llm_model)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     ON CONFLICT(session_id) DO NOTHING;
                 """, (
                     effective_user,
                     1 if insert_auto_sql_execute else 0,
                     1 if is_custom else 0,
                     connection_id or "",
+                    llm_provider or "",
+                    llm_model or "",
                 ))
 
                 updates = []
@@ -716,6 +775,12 @@ class SqliteStateStore(StateStore):
                 if connection_id is not None:
                     updates.append("connection_id = ?")
                     params.append(connection_id)
+                if llm_provider is not None:
+                    updates.append("llm_provider = ?")
+                    params.append(llm_provider)
+                if llm_model is not None:
+                    updates.append("llm_model = ?")
+                    params.append(llm_model)
                 updates.append("updated_at = CURRENT_TIMESTAMP")
                 params.append(effective_user)
                 cursor.execute(
@@ -892,6 +957,8 @@ class FirestoreStateStore(StateStore):
             "auto_sql_execute": DEFAULT_AUTO_SQL_EXECUTE,
             "is_custom": False,
             "connection_id": "",
+            "llm_provider": "",
+            "llm_model": "",
         }
         if not user_id:
             return default_session
@@ -947,18 +1014,24 @@ class FirestoreStateStore(StateStore):
                         "auto_sql_execute": bool(data.get("auto_sql_execute", DEFAULT_AUTO_SQL_EXECUTE)),
                         "is_custom": old_is_custom,
                         "connection_id": connection_id,
+                        "llm_provider": data.get("llm_provider") or "",
+                        "llm_model": data.get("llm_model") or "",
                     }
                 return {
                     "auto_sql_execute": bool(data.get("auto_sql_execute", DEFAULT_AUTO_SQL_EXECUTE)),
                     "is_custom": bool(data.get("is_custom", False)),
                     "connection_id": data.get("connection_id") or "",
+                    "llm_provider": data.get("llm_provider") or "",
+                    "llm_model": data.get("llm_model") or "",
                 }
         except Exception:
             logger.exception("Error fetching session from Firestore")
         return default_session
 
-    def set_session(self, user_id, connection_id=None, auto_sql_execute=None, is_custom=None):
-        if not user_id or (connection_id is None and auto_sql_execute is None and is_custom is None):
+    def set_session(self, user_id, connection_id=None, auto_sql_execute=None, is_custom=None,
+                     llm_provider=None, llm_model=None):
+        if not user_id or (connection_id is None and auto_sql_execute is None and is_custom is None
+                            and llm_provider is None and llm_model is None):
             return
         update_data = {"updated_at": firestore.SERVER_TIMESTAMP}
         if connection_id is not None:
@@ -967,6 +1040,10 @@ class FirestoreStateStore(StateStore):
             update_data["auto_sql_execute"] = bool(auto_sql_execute)
         if is_custom is not None:
             update_data["is_custom"] = bool(is_custom)
+        if llm_provider is not None:
+            update_data["llm_provider"] = llm_provider
+        if llm_model is not None:
+            update_data["llm_model"] = llm_model
         try:
             # merge=list(update_data.keys()) - NOT the boolean merge=True -
             # is what actually gives "patch these top-level fields, leave

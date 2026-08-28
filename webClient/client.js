@@ -155,6 +155,14 @@ document.addEventListener('DOMContentLoaded', async () => {
   // active connection isn't a preset at all (a custom connection instead).
   let ACTIVE_PRESET_ID = null;
   let CONFIGURED_DBS = [];
+  // Model-selection state (see fetchBackendConfig()/updateModelBadge()/
+  // renderModelRadioButtons()) - mirrors CONFIGURED_DBS/ACTIVE_DB_URL's own
+  // "fetched once per /api/config round-trip, read by the badge and the
+  // modal's render function" pattern. LLM_PROVIDERS is the GET response's
+  // 'llm_providers' list verbatim: [{name, preset_models, default_model}, ...].
+  let LLM_PROVIDERS = [];
+  let ACTIVE_LLM_PROVIDER = "";
+  let ACTIVE_LLM_MODEL = "";
   let currentGoogleClientId = null;
   let googleIdToken = null;
   let customDbUrl = "";
@@ -293,6 +301,14 @@ document.addEventListener('DOMContentLoaded', async () => {
   const autoSqlExecuteCheckbox = document.getElementById('autoSqlExecuteCheckbox');
   const connDbName = document.getElementById('connDbName');
   const connDbDot = document.getElementById('connDbDot');
+
+  // DOM Elements - Model Selection Modal & Badge (mirrors the DB connection
+  // badge/modal pair above - see updateModelBadge()/renderModelRadioButtons()).
+  const modelModal = document.getElementById('modelModal');
+  const modelTriggerBadge = document.getElementById('modelTriggerBadge');
+  const modelModalCloseBtn = document.getElementById('modelModalCloseBtn');
+  const modelSaveBtn = document.getElementById('modelSaveBtn');
+  const modelBadgeName = document.getElementById('modelBadgeName');
 
   // DOM Elements - Login Required Modal. Not currently triggered by
   // anything: translation history and saving a custom DB connection were
@@ -991,6 +1007,21 @@ document.addEventListener('DOMContentLoaded', async () => {
     checkDbStatus();
   }
 
+  function updateModelBadge() {
+    if (!modelBadgeName) return;
+    // ACTIVE_LLM_MODEL alone (not "provider/model") - the provider is
+    // implied by which model is showing, and the modal (grouped by
+    // provider heading) is where that grouping actually matters; the badge
+    // itself just needs to answer "what model am I using right now" at a
+    // glance, same one-value-only spirit as the DB badge's connDbName.
+    modelBadgeName.textContent = ACTIVE_LLM_MODEL || "Model";
+    if (modelTriggerBadge) {
+      modelTriggerBadge.title = ACTIVE_LLM_MODEL
+        ? `Using model: ${ACTIVE_LLM_MODEL} (Click to configure)`
+        : 'Model Info (Click to configure)';
+    }
+  }
+
   // ===========================================================================
   // 5. BACKEND CONFIG SYNC + DATABASE CONNECTION CONFIG MODAL
   //    (fetch /api/config, render preset/custom DB radio options, save
@@ -1047,10 +1078,15 @@ document.addEventListener('DOMContentLoaded', async () => {
       ACTIVE_USES_CUSTOM_CREDENTIALS = Boolean(data.active_uses_custom_credentials);
       ACTIVE_PRESET_ID = data.active_preset_id ?? null;
 
+      LLM_PROVIDERS = data.llm_providers || [];
+      ACTIVE_LLM_PROVIDER = data.active_llm_provider || "";
+      ACTIVE_LLM_MODEL = data.active_llm_model || "";
+
       renderDbRadioButtons();
       loadConfigIntoUI();
-      
+
       await updateConnectionDetails(data);
+      updateModelBadge();
     } catch (err) {
       console.error("Failed to fetch backend configuration:", err);
       if (connDbDot) connDbDot.className = 'status-dot disconnected';
@@ -1121,14 +1157,29 @@ document.addEventListener('DOMContentLoaded', async () => {
         config: { spreadsheet_url: '', tab_name: '', credentials_json: '' },
       };
     }
+    if (type === 'MongoDB') {
+      // Unlike Postgres/MySQL just below, MongoDB has a real url (the
+      // bare mongodb:// URI) PLUS separate structured config fields - see
+      // backends/mongodb_sql.py's and config_routes.py's module
+      // docstrings for why it's a hybrid of the two shapes.
+      return {
+        name: '', type: 'MongoDB', url: '',
+        config: { database: '', user: '', password: '' },
+      };
+    }
     // Postgres and MySQL share the same simple shape (a single URL field,
     // no dialect-specific config) - see backends/mysql.py's module
-    // docstring - so both fall through here, preserving whichever of the
-    // two was actually selected rather than collapsing MySQL into
-    // Postgres. Any other/unrecognized value (there shouldn't be one -
-    // the dropdown only ever offers these eight types) also lands on
-    // Postgres, matching this function's original default.
-    return { name: '', type: (type === 'mysql' ? 'mysql' : 'postgres'), url: '', config: {} };
+    // docstring - so both fall through here, preserving whichever was
+    // actually selected rather than collapsing MySQL into Postgres. Any
+    // other/unrecognized value (there shouldn't be one - the dropdown
+    // only ever offers these nine types) also lands on Postgres, matching
+    // this function's original default.
+    return {
+      name: '',
+      type: (type === 'mysql') ? type : 'postgres',
+      url: '',
+      config: {},
+    };
   }
 
   // Renders every entry in `customDatabases` (including in-progress blank
@@ -1151,6 +1202,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       const isRedshift = db.type === 'redshift';
       const isSqlServer = db.type === 'mssql';
       const isSheets = db.type === 'sheets';
+      const isMongoSql = db.type === 'MongoDB';
       const sfAuthMethod = cfg.auth_method || (cfg.private_key ? 'private_key' : 'password');
       // ACTIVE_IS_CUSTOM gates this, not just URL equality - a custom
       // connection's URL can collide with a preset's, and when the active
@@ -1198,7 +1250,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           <div class="custom-db-header-row">
             <input type="radio" name="db_connection_option" value="custom-${index}" data-dbname="${db.name || ''}" ${isSelected ? 'checked' : ''}>
             <select class="config-input custom-db-type-select" data-index="${index}">
-              <option value="postgres" ${(!isBigQuery && !isSnowflake && !isMySQL && !isDatabricks && !isOracle && !isRedshift && !isSqlServer && !isSheets) ? 'selected' : ''}>PostgreSQL</option>
+              <option value="postgres" ${(!isBigQuery && !isSnowflake && !isMySQL && !isDatabricks && !isOracle && !isRedshift && !isSqlServer && !isSheets && !isMongoSql) ? 'selected' : ''}>PostgreSQL</option>
               <option value="mysql" ${isMySQL ? 'selected' : ''}>MySQL</option>
               <option value="bigquery" ${isBigQuery ? 'selected' : ''}>BigQuery</option>
               <option value="snowflake" ${isSnowflake ? 'selected' : ''}>Snowflake</option>
@@ -1207,6 +1259,7 @@ document.addEventListener('DOMContentLoaded', async () => {
               <option value="redshift" ${isRedshift ? 'selected' : ''}>Redshift</option>
               <option value="mssql" ${isSqlServer ? 'selected' : ''}>SQL Server</option>
               <option value="sheets" ${isSheets ? 'selected' : ''}>Google Sheets</option>
+              <option value="MongoDB" ${isMongoSql ? 'selected' : ''}>MongoDB</option>
             </select>
             <div class="custom-db-field">
               <label class="custom-db-field-label" for="custom-db-name-${index}">Name:</label>
@@ -1461,6 +1514,34 @@ document.addEventListener('DOMContentLoaded', async () => {
               <span class="optional-hint">Leave the key blank for a public sheet ("Anyone with the link can view"). For a private sheet, share it with a service account's email and paste that account's JSON key above.</span>
             </div>
           </div>
+          ` : isMongoSql ? `
+          <div class="custom-db-field-row">
+            <div class="custom-db-field wide">
+              <label class="custom-db-field-label" for="custom-db-mongo-uri-${index}">URI:</label>
+              <input type="text" id="custom-db-mongo-uri-${index}" class="config-input custom-db-mongo-uri" data-index="${index}" placeholder="mongodb://atlas-sql-xxxxx.a.query.mongodb.net/?ssl=true&authSource=admin" value="${db.url || ''}" autocomplete="off">
+            </div>
+          </div>
+          <div class="custom-db-field-row">
+            <div class="custom-db-field">
+              <label class="custom-db-field-label" for="custom-db-mongo-database-${index}">Database:</label>
+              <input type="text" id="custom-db-mongo-database-${index}" class="config-input custom-db-mongo-database" data-index="${index}" placeholder="Database" value="${cfg.database || ''}" autocomplete="off">
+            </div>
+            <div class="custom-db-field">
+              <label class="custom-db-field-label" for="custom-db-mongo-user-${index}">User:</label>
+              <input type="text" id="custom-db-mongo-user-${index}" class="config-input custom-db-mongo-user" data-index="${index}" placeholder="Username" value="${cfg.user || ''}" autocomplete="off">
+            </div>
+          </div>
+          <div class="custom-db-field-row">
+            <div class="custom-db-field wide">
+              <label class="custom-db-field-label" for="custom-db-mongo-password-${index}">Password:</label>
+              <input type="password" id="custom-db-mongo-password-${index}" class="config-input custom-db-mongo-password" data-index="${index}" placeholder="${db.has_custom_credentials ? 'Password saved - leave blank to keep it, or type a new one to replace it' : 'Password'}" autocomplete="off">
+            </div>
+          </div>
+          <div class="custom-db-field-row">
+            <div class="custom-db-field wide">
+              <span class="optional-hint custom-db-mongo-hint">Get these values from the ODBC connection string Atlas gave you when enabling the SQL Interface on your cluster. Note: the interface supports one read operations.</span>
+            </div>
+          </div>
           ` : `
           <div class="custom-db-field-row">
             <div class="custom-db-field wide">
@@ -1528,8 +1609,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       input.addEventListener('focus', () => { if (radio) radio.checked = true; });
       input.addEventListener('input', () => {
         if (radio) radio.checked = true;
-        const val = input.value.trim();
-        const unmaskedUrl = unmaskConnectionUrl(val, customDatabases[index].url);
+        const unmaskedUrl = unmaskConnectionUrl(input.value.trim(), customDatabases[index].url);
         customDatabases[index].url = unmaskedUrl;
         // Only auto-fill the name from the URL while the user hasn't typed
         // one of their own in the name field above - an explicit name must
@@ -1540,6 +1620,44 @@ document.addEventListener('DOMContentLoaded', async () => {
           if (nameInput) nameInput.value = customDatabases[index].name;
         }
         if (radio) radio.dataset.dbname = customDatabases[index].name;
+      });
+    });
+
+    container.querySelectorAll('.custom-db-mongo-uri').forEach(input => {
+      const index = parseInt(input.dataset.index);
+      const radio = container.querySelector(`input[value="custom-${index}"]`);
+      input.addEventListener('focus', () => { if (radio) radio.checked = true; });
+      input.addEventListener('input', () => {
+        if (radio) radio.checked = true;
+        // Unlike Postgres/MySQL's url, Mongo's uri never carries a
+        // credential any more (see backends/mongodb_sql.py's module
+        // docstring) - no masking/unmasking needed, this is just an
+        // ordinary text field.
+        customDatabases[index].url = input.value.trim();
+      });
+    });
+
+    container.querySelectorAll(
+      '.custom-db-mongo-database, .custom-db-mongo-user, .custom-db-mongo-password'
+    ).forEach(input => {
+      const index = parseInt(input.dataset.index);
+      const radio = container.querySelector(`input[value="custom-${index}"]`);
+      input.addEventListener('focus', () => { if (radio) radio.checked = true; });
+      input.addEventListener('input', () => {
+        if (radio) radio.checked = true;
+        const db = customDatabases[index];
+        if (!db.config) db.config = {};
+        if (input.classList.contains('custom-db-mongo-database')) db.config.database = input.value.trim();
+        if (input.classList.contains('custom-db-mongo-user')) db.config.user = input.value.trim();
+        if (input.classList.contains('custom-db-mongo-password')) db.config.password = input.value;
+        // Same rule as every other structured dialect below: don't
+        // clobber a name the user already typed themselves.
+        if (!db.name) {
+          db.name = db.config.database || 'Custom MongoDB';
+          const nameInput = container.querySelector(`.custom-db-name-input[data-index="${index}"]`);
+          if (nameInput) nameInput.value = db.name;
+        }
+        if (radio) radio.dataset.dbname = db.name;
       });
     });
 
@@ -1846,7 +1964,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     // supports today (see this file's isComplete*/config_routes.py's
     // module docstring for the full list) - a future new dialect type not
     // in either set falls into the right column by default, below.
-    const LEFT_COLUMN_TYPES = new Set(['postgres', 'mysql', 'oracle', 'mssql']);
+    // MongoDB Atlas SQL added to the left ("simple credential") column
+    // too - like Postgres/MySQL/Oracle/SQL Server, it's a single-server
+    // connection a user types in directly, not a structured/cloud
+    // dialect - see backends/mongodb_sql.py. (It does have its own
+    // database/user/password fields like Oracle/SQL Server do, just no
+    // separate identity/display-url concept.)
+    const LEFT_COLUMN_TYPES = new Set(['postgres', 'mysql', 'oracle', 'mssql', 'MongoDB']);
     const leftPresets = [];
     const rightPresets = [];
     CONFIGURED_DBS.forEach((db) => {
@@ -1903,6 +2027,123 @@ document.addEventListener('DOMContentLoaded', async () => {
         openHelpModal();
       });
     }
+  }
+
+  // ===========================================================================
+  // MODEL SELECTION MODAL (fetch already covered by fetchBackendConfig() -
+  // see LLM_PROVIDERS/ACTIVE_LLM_PROVIDER/ACTIVE_LLM_MODEL - this section
+  // just renders/saves the radio list, mirroring renderDbRadioButtons()/
+  // triggerConfigSave() above but scoped to model selection only, since a
+  // model choice is otherwise fully independent of the DB connection form.)
+  // ===========================================================================
+
+  // Display-only company names for the modal's radio-group headings.
+  // provider.name IS "google"/"anthropic"/"openai" server-side now (see
+  // translate_routes.py's _LLM_PROVIDERS) - this map exists only because
+  // naively title-casing that string would render OpenAI's heading as
+  // "Openai" instead of "OpenAI"; Google/Anthropic would already come out
+  // right without it, but spelling all three out here is clearer than a
+  // one-off special case for just the exception.
+  const LLM_PROVIDER_DISPLAY_NAMES = {
+    google: "Google",
+    anthropic: "Anthropic",
+    openai: "OpenAI",
+  };
+
+  function renderModelRadioButtons() {
+    const radioGroup = document.getElementById('modalModelRadioGroup');
+    if (!radioGroup) return;
+
+    // One radio-group-heading + column of radio-options per provider (see
+    // renderDbRadioButtons() for the same heading/radio-option markup this
+    // reuses verbatim via the shared .radio-group/.radio-option/
+    // .radio-group-heading CSS classes) - "organized by llm_provider", as
+    // requested, without needing any new CSS.
+    // Provider/model names are server-configured (env vars an admin sets),
+    // never raw end-user input - same trust level renderDbRadioButtons()
+    // already extends to db.name above, so this interpolates them
+    // unescaped too, consistent with that existing convention.
+    let html = '';
+    LLM_PROVIDERS.forEach((provider) => {
+      const providerLabel = LLM_PROVIDER_DISPLAY_NAMES[provider.name] ||
+        (provider.name.charAt(0).toUpperCase() + provider.name.slice(1));
+      html += `<div class="radio-group-heading">${providerLabel}</div>`;
+      html += (provider.preset_models || []).map((model) => {
+        const value = `${provider.name}::${model}`;
+        const isSelected = provider.name === ACTIVE_LLM_PROVIDER && model === ACTIVE_LLM_MODEL;
+        return `
+          <label class="radio-option">
+            <input type="radio" name="llm_model_option" value="${value}" ${isSelected ? 'checked' : ''}>
+            <span class="radio-label">${model}</span>
+          </label>
+        `;
+      }).join('');
+    });
+
+    radioGroup.innerHTML = html;
+  }
+
+  function closeModelModal() {
+    if (modelModal) modelModal.classList.add('hidden');
+  }
+
+  async function saveModelSelection() {
+    const modelSaveErrorEl = document.getElementById('modelSaveError');
+    if (modelSaveErrorEl) {
+      modelSaveErrorEl.style.display = 'none';
+      modelSaveErrorEl.textContent = '';
+    }
+
+    const checked = document.querySelector('input[name="llm_model_option"]:checked');
+    if (!checked) {
+      closeModelModal();
+      return;
+    }
+    const separatorIndex = checked.value.indexOf('::');
+    const llmProvider = checked.value.slice(0, separatorIndex);
+    const llmModel = checked.value.slice(separatorIndex + 2);
+
+    try {
+      const response = await fetch('/api/config', {
+        method: 'POST',
+        headers: getApiHeaders(),
+        credentials: 'same-origin',
+        body: JSON.stringify({ llm_provider: llmProvider, llm_model: llmModel }),
+      });
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(errData.error || 'Failed to save model selection.');
+      }
+      await fetchBackendConfig();
+      closeModelModal();
+    } catch (err) {
+      if (modelSaveErrorEl) {
+        modelSaveErrorEl.textContent = err.message || 'Failed to save model selection.';
+        modelSaveErrorEl.style.display = 'block';
+      }
+    }
+  }
+
+  if (modelTriggerBadge && modelModal) {
+    modelTriggerBadge.addEventListener('click', async () => {
+      await fetchBackendConfig();
+      renderModelRadioButtons();
+      const modelSaveErrorEl = document.getElementById('modelSaveError');
+      if (modelSaveErrorEl) {
+        modelSaveErrorEl.style.display = 'none';
+        modelSaveErrorEl.textContent = '';
+      }
+      modelModal.classList.remove('hidden');
+      bringModalToFront(modelModal);
+    });
+  }
+
+  if (modelModalCloseBtn) {
+    modelModalCloseBtn.addEventListener('click', closeModelModal);
+  }
+
+  if (modelSaveBtn) {
+    modelSaveBtn.addEventListener('click', saveModelSelection);
   }
 
   async function triggerConfigSave({ closeModal = false } = {}) {
@@ -2018,9 +2259,21 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Postgres and MySQL are both "simple URL" dialects (see
     // backends/mysql.py's module docstring) - a single non-blank url is
     // all either needs to be selectable/saveable. Named generically
-    // (not isCompletePostgres) since it now covers both.
-    const isCompleteSimpleUrlDb = (db) => db && db.type !== 'bigquery' && db.type !== 'snowflake' && db.type !== 'databricks' && db.type !== 'oracle' && db.type !== 'redshift' && db.type !== 'mssql' && db.type !== 'sheets'
+    // (not isCompletePostgres) since it now covers both. MongoDB is
+    // explicitly excluded here (unlike before this dialect had its own
+    // database/user/password fields) and gets its own isCompleteMongo
+    // check below instead, since a bare url alone is no longer enough
+    // for it.
+    const isCompleteSimpleUrlDb = (db) => db && db.type !== 'bigquery' && db.type !== 'snowflake' && db.type !== 'databricks' && db.type !== 'oracle' && db.type !== 'redshift' && db.type !== 'mssql' && db.type !== 'sheets' && db.type !== 'MongoDB'
       && db.url && db.url.trim() !== "";
+    // MongoDB Atlas SQL is a hybrid: a real url (like Postgres/MySQL)
+    // PLUS separate structured config fields (like every dialect above)
+    // - see backends/mongodb_sql.py's and config_routes.py's module
+    // docstrings. Same "freshly entered, or already saved server-side"
+    // credential rule as the rest.
+    const isCompleteMongo = (db) => db && db.type === 'MongoDB' && db.url && db.url.trim() !== ""
+      && db.config && db.config.database && db.config.user
+      && (db.config.password || db.has_custom_credentials);
 
     const selectedDbRadio = document.querySelector('input[name="db_connection_option"]:checked');
     if (selectedDbRadio) {
@@ -2028,7 +2281,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         isCustomOption = true;
         const index = parseInt(selectedDbRadio.value.split('-')[1]);
         const selectedDb = customDatabases[index];
-        const isComplete = (d) => isCompleteBigQuery(d) || isCompleteSnowflake(d) || isCompleteDatabricks(d) || isCompleteOracle(d) || isCompleteRedshift(d) || isCompleteMssql(d) || isCompleteSheets(d) || isCompleteSimpleUrlDb(d);
+        const isComplete = (d) => isCompleteBigQuery(d) || isCompleteSnowflake(d) || isCompleteDatabricks(d) || isCompleteOracle(d) || isCompleteRedshift(d) || isCompleteMssql(d) || isCompleteSheets(d) || isCompleteMongo(d) || isCompleteSimpleUrlDb(d);
         const chosen = isComplete(selectedDb) ? selectedDb : customDatabases.find(isComplete);
 
         if (isCompleteBigQuery(chosen)) {
@@ -2135,13 +2388,23 @@ document.addEventListener('DOMContentLoaded', async () => {
           dbSheetsCredentialsJson = chosen.config.credentials_json || null;
           dbNameValue = chosen.name || dbTabName;
           // No dbUrlValue here - see the BigQuery branch's comment above.
+        } else if (isCompleteMongo(chosen)) {
+          dbType = 'MongoDB';
+          dbUrlValue = chosen.url;
+          dbDatabase = chosen.config.database;
+          dbUser = chosen.config.user;
+          // May be blank if the user didn't retype a password while just
+          // re-selecting/renaming an already-saved connection - the server
+          // reuses the previously-stored password in that case (it's never
+          // sent back to us to re-display, see get_db_connections).
+          dbPassword = chosen.config.password || null;
+          dbNameValue = chosen.name || dbDatabase;
         } else if (isCompleteSimpleUrlDb(chosen)) {
           dbType = chosen.type === 'mysql' ? 'mysql' : 'postgres';
           dbUrlValue = chosen.url;
           dbNameValue = chosen.name;
-          // Both simple-URL dialects support ca_cert_pem (see
-          // backends/postgres.py's and backends/mysql.py's module
-          // docstrings).
+          // Postgres/MySQL support ca_cert_pem (see backends/postgres.py's
+          // and backends/mysql.py's module docstrings).
           dbCaCertPem = (chosen.config && chosen.config.ca_cert_pem) || null;
         } else {
           dbType = 'postgres';
@@ -2187,7 +2450,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       database_type: dbType,
       is_custom: isCustomOption,
       custom_databases: customDatabases
-        .filter(d => isCompleteBigQuery(d) || isCompleteSnowflake(d) || isCompleteDatabricks(d) || isCompleteOracle(d) || isCompleteRedshift(d) || isCompleteMssql(d) || isCompleteSheets(d) || isCompleteSimpleUrlDb(d))
+        .filter(d => isCompleteBigQuery(d) || isCompleteSnowflake(d) || isCompleteDatabricks(d) || isCompleteOracle(d) || isCompleteRedshift(d) || isCompleteMssql(d) || isCompleteSheets(d) || isCompleteMongo(d) || isCompleteSimpleUrlDb(d))
         .map(d => {
           if (isCompleteBigQuery(d)) {
             return {
@@ -2285,11 +2548,21 @@ document.addEventListener('DOMContentLoaded', async () => {
               credentials_json: d.config.credentials_json || undefined,
             };
           }
+          if (isCompleteMongo(d)) {
+            return {
+              type: 'MongoDB',
+              name: d.name,
+              url: d.url,
+              database: d.config.database,
+              user: d.config.user,
+              password: d.config.password || undefined,
+            };
+          }
           const simpleUrlType = d.type === 'mysql' ? 'mysql' : 'postgres';
           const simpleUrlOut = { type: simpleUrlType, name: d.name, url: d.url };
-          // Shared by both simple-URL dialects (see backends/postgres.py's
-          // and backends/mysql.py's module docstrings) - not a credential,
-          // so it's just carried through as-is like BigQuery's
+          // Shared by Postgres/MySQL (see backends/postgres.py's and
+          // backends/mysql.py's module docstrings) - not a credential, so
+          // it's just carried through as-is like BigQuery's
           // billing_project_id, not resolved via a "leave blank to keep
           // the saved one" helper the way passwords are.
           if (d.config && d.config.ca_cert_pem) {
@@ -2355,6 +2628,16 @@ document.addEventListener('DOMContentLoaded', async () => {
       // Only sent when non-blank, same "don't clobber a saved key" rule
       // as dbPassword above.
       if (dbSheetsCredentialsJson) payload.credentials_json = dbSheetsCredentialsJson;
+    } else if (dbType === 'MongoDB') {
+      // Unlike every other structured dialect above, MongoDB also has a
+      // real url (see backends/mongodb_sql.py's module docstring) - sent
+      // as database_url like Postgres/MySQL, alongside the three
+      // structured fields matching config_routes.py's
+      // _parse_incoming_connection mongo branch.
+      payload.database_url = dbUrlValue;
+      payload.database = dbDatabase;
+      payload.user = dbUser;
+      if (dbPassword) payload.password = dbPassword;
     } else {
       payload.database_url = dbUrlValue;
       // Both simple-URL dialects support ca_cert_pem (see
@@ -2545,6 +2828,11 @@ document.addEventListener('DOMContentLoaded', async () => {
         target: configTriggerBadge,
         title: "This is the databse you are connected to",
         body: "Click this badge to switch to any pre-configured database or connect to your own."
+      },
+      {
+        target: modelTriggerBadge,
+        title: "This is the AI model translating your questions",
+        body: "Click this badge to switch between the available models, grouped by provider (Google, Anthropic, OpenAI)."
       },
       {
         target: historyBtn,

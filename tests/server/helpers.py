@@ -53,17 +53,22 @@ _APP_MODULE_NAMES = [
 _ENV_VARS_TO_CLEAR = [
     "GCP_PROJECT_ID", "GOOGLE_CLOUD_PROJECT", "GCP_PROJECT", "K_SERVICE",
     "GOOGLE_CLIENT_ID", "DATABASE_PRESETS_FILE", "GEMINI_API_KEY", "GOOGLE_API_KEY",
-    "GEMINI_PRESET_KEYS", "GEMINI_MODEL", "SCHEMA_CACHE_TTL_SECONDS",
+    "GEMINI_PRESET_KEYS", "GOOGLE_MODELS", "SCHEMA_CACHE_TTL_SECONDS",
     "SCHEMA_MAX_TABLES", "SCHEMA_MAX_TABLE_NAMES_SCANNED",
     "SCHEMA_MAX_SCHEMA_CHARS", "SCHEMA_SHARD_MIN_GROUP_SIZE", "LOG_LEVEL",
     "CRBOT_HOSTNAME", "CRBOT_PORT", "MAX_TRANSLATION_ATTEMPTS", "TRANSLATION_RETRY_DELAY_SECONDS",
     "HISTORY_RESULT_MAX_ROWS", "HISTORY_MAX_TURNS",
-    # Claude/Anthropic provider path (translate_routes.py's LLM_PROVIDER
-    # switch) - cleared for the same reason as the Gemini vars above: a
-    # developer's real shell (or CI) plausibly has ANTHROPIC_API_KEY set
-    # (e.g. for using Claude Code itself), which would otherwise leak into
-    # any test that doesn't explicitly pass its own `env`.
-    "LLM_PROVIDER", "CLAUDE_PRESET_KEYS", "ANTHROPIC_API_KEY", "CLAUDE_MODEL",
+    # Anthropic (Claude) provider path (translate_routes.py's
+    # AnthropicProvider - note there's no LLM_PROVIDER env var anymore to
+    # select it; see helpers.select_llm_provider()) - cleared for the same
+    # reason as the Google vars above: a developer's real shell (or CI)
+    # plausibly has ANTHROPIC_API_KEY set (e.g. for using Claude Code
+    # itself), which would otherwise leak into any test that doesn't
+    # explicitly pass its own `env`.
+    "CLAUDE_PRESET_KEYS", "ANTHROPIC_API_KEY", "ANTHROPIC_MODELS",
+    # OpenAI provider path (translate_routes.py's OpenAiProvider) - cleared
+    # for the same reason as the Google/Anthropic vars above.
+    "OPENAI_API_KEY", "OPENAI_PRESET_KEYS", "OPENAI_MODELS",
     # state_store.py's database_config encryption-at-rest key (see its
     # module docstring section) - cleared for the same reason as every
     # other secret-shaped var above: a developer's real shell/.env
@@ -209,6 +214,24 @@ def login_as(test_client, email):
     individual request (it gets silently dropped) - this is the one
     reliable way to set a cookie for `client.get()`/`client.post()` calls."""
     test_client.set_cookie("crbot_user_id", email)
+
+
+def select_llm_provider(env, provider_name):
+    """Pre-seeds the local-dev "global" identity's saved llm_provider
+    choice, so a test can exercise a specific LLM provider's /api/translate
+    code path without a per-fleet LLM_PROVIDER env var - there isn't one
+    anymore (see translate_routes.py's module docstring): a fresh session
+    with nothing saved now falls back to the one hardcoded default,
+    Google/gemini-3.7-flash, rather than an env-configurable provider.
+
+    Call this AFTER app_factory() (it needs `env.app_config.state_store`,
+    initialized by fresh_import()) and BEFORE the first /api/translate
+    request that should see this provider. Every test that uses this helper
+    runs in the default local-dev environment (no GOOGLE_CLIENT_ID/
+    IS_CLOUD_RUN), where get_current_user_identity() resolves to the
+    constant "global" for every request regardless of cookies - so unlike
+    login_as() above, there's no cookie/session-id plumbing needed here."""
+    env.app_config.state_store.set_session("global", llm_provider=provider_name)
 
 
 def parse_translate_stream(resp):
@@ -701,6 +724,36 @@ def install_fake_pymysql_connect(monkeypatch):
 
     harness = FakePyMySQLConnectHarness()
     monkeypatch.setattr(mysqlmod.pymysql, "connect", harness.connect)
+    return harness
+
+
+# ---------------------------------------------------------------------------
+# Fake pyodbc connect() (backends/mongodb_sql.py)
+# ---------------------------------------------------------------------------
+# Unlike every fake above, pyodbc.connect()'s first arg is positional (the
+# connection string), not all-kwargs like pymysql's - recorded separately as
+# "url" rather than folded into the kwargs dict, so a test can assert on it
+# by name the same way it would any other captured field.
+
+class FakePyodbcConnectHarness:
+    def __init__(self):
+        self.calls = []  # list of {"url": ..., **kwargs} dicts, one per connect() call
+
+    def connect(self, url, **kwargs):
+        self.calls.append({"url": url, **kwargs})
+        return object()  # backend.connect() just returns this straight through
+
+
+def install_fake_pyodbc_connect(monkeypatch):
+    """Patches backends.mongodb_sql's pyodbc.connect with a fake that
+    records the connection string + kwargs instead of opening a real ODBC
+    connection, and returns the FakePyodbcConnectHarness controlling it.
+    Must be called *after* the module has been imported (same caveat as
+    install_fake_snowflake_connect above)."""
+    import backends.mongodb_sql as mongo_sql_mod
+
+    harness = FakePyodbcConnectHarness()
+    monkeypatch.setattr(mongo_sql_mod.pyodbc, "connect", harness.connect)
     return harness
 
 

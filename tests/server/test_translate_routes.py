@@ -5,8 +5,9 @@ real Gemini API. types.Content/types.Part/types.GenerateContentConfig are
 left as the real google-genai classes (plain data containers, no network
 calls), so contents/config shape is exercised for real.
 
-The Claude/Anthropic provider path (LLM_PROVIDER=claude - see that section
-further down) is covered the same way: ClaudeHarness patches
+The Anthropic (Claude) provider path (selected by saving llm_provider=
+"anthropic" on the test session - see helpers.select_llm_provider() and
+that section further down) is covered the same way: ClaudeHarness patches
 translate_routes.anthropic.Anthropic with a fake that queues canned
 responses/exceptions, never talking to the real Claude API either. Its
 Fake*Error classes subclass the real anthropic exception types directly
@@ -14,6 +15,31 @@ Fake*Error classes subclass the real anthropic exception types directly
 _classify_claude_error does real isinstance() checks against those types -
 unlike Gemini's plain .code-duck-typing via FakeApiError above, a stand-in
 that merely looked similar wouldn't satisfy those checks.
+
+The OpenAI provider path (selected the same way - see that section further
+down, after Anthropic's) follows the exact same pattern once more:
+OpenAiHarness patches translate_routes.openai.OpenAI with a fake whose
+.responses.create(...) queues canned responses/exceptions - this app's
+OpenAI integration is built on the Responses API, not the older Chat
+Completions API (see translate_routes.py's _call_openai docstring). Its
+Fake*Error classes likewise subclass the real openai exception types
+(openai.RateLimitError/InternalServerError/APIConnectionError/
+BadRequestError) for the same isinstance()-check reason.
+
+None of the three providers' dispatch goes through hand-rolled
+if/elif branches anymore - translate_query()/stream_translation() call
+methods on an LlmProvider object (get_llm_provider(session_data.get(
+'llm_provider')) - see that function's and the LlmProvider class's
+docstrings in translate_routes.py; there's no separate LLM_PROVIDER env
+var anymore - a fresh session with nothing saved falls back to the one
+hardcoded default, Google/gemini-3.7-flash). The tests below don't test
+that class directly except in a small dedicated section near the end;
+they exercise it the same way they always exercised the old if/elif
+branches - through /api/translate with the session's saved llm_provider
+set via helpers.select_llm_provider() (a thin wrapper around
+state_store.set_session() - see that helper's docstring) - since that's
+what actually matters and it's what would break if the dispatch ever
+picked the wrong provider.
 
 /api/translate streams newline-delimited JSON rather than a single JSON
 body (see translate_routes.py's module docstring) - every test below that
@@ -38,9 +64,13 @@ and test_exhausts_all_retry_attempts_and_reports_failure_in_body() below.
 import types as pytypes
 
 import anthropic
+import openai
 import pytest
 
-from helpers import install_fake_bigquery, install_fake_mssql_connect, parse_translate_stream, write_database_presets_file
+from helpers import (
+    install_fake_bigquery, install_fake_mssql_connect, parse_translate_stream,
+    write_database_presets_file, login_as, select_llm_provider,
+)
 
 
 class FakeGenaiResponse:
@@ -104,7 +134,7 @@ class FakeApiError(Exception):
 def test_missing_api_key_returns_400(app_env):
     resp = app_env.client.post('/api/translate', json={'prompt': 'show users'})
     assert resp.status_code == 400
-    assert "Gemini API key is not configured." in resp.get_json()['error']
+    assert "Google API key is not configured." in resp.get_json()['error']
 
 
 def test_empty_prompt_returns_400(app_factory):
@@ -600,7 +630,8 @@ def test_history_result_truncation_reaches_the_real_gemini_call(app_factory, mon
 
 
 def test_history_result_truncation_reaches_the_real_claude_call(app_factory, monkeypatch):
-    env = app_factory(env={"LLM_PROVIDER": "claude", "ANTHROPIC_API_KEY": "fake-key-1", "HISTORY_RESULT_MAX_ROWS": "2"})
+    env = app_factory(env={"ANTHROPIC_API_KEY": "fake-key-1", "HISTORY_RESULT_MAX_ROWS": "2"})
+    select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
     harness.queue_response(FakeClaudeResponse("SELECT 2;"))
@@ -656,7 +687,8 @@ def test_history_sent_to_gemini_is_capped_to_history_max_turns(app_factory, monk
 
 
 def test_history_sent_to_claude_is_capped_to_history_max_turns(app_factory, monkeypatch):
-    env = app_factory(env={"LLM_PROVIDER": "claude", "ANTHROPIC_API_KEY": "fake-key-1", "HISTORY_MAX_TURNS": "2"})
+    env = app_factory(env={"ANTHROPIC_API_KEY": "fake-key-1", "HISTORY_MAX_TURNS": "2"})
+    select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
     harness.queue_response(FakeClaudeResponse("SELECT 4;"))
@@ -696,11 +728,13 @@ def test_config_exposes_history_max_turns_env_override(app_factory):
     assert data['history_max_turns'] == 3
 
 
-# --- Claude provider path (LLM_PROVIDER=claude) ---
+# --- Anthropic (Claude) provider path (llm_provider="anthropic") ---
 # translate_query() branches to _call_claude/_classify_claude_error/
 # build_claude_history_messages/pick_claude_api_key instead of their Gemini
-# counterparts whenever LLM_PROVIDER=claude - see translate_routes.py's
-# module-level LLM_PROVIDER comment. Everything upstream of that branch
+# counterparts whenever the session's saved llm_provider is "anthropic" -
+# see helpers.select_llm_provider() and translate_routes.py's
+# ClaudeProvider/_LLM_PROVIDERS (registered under the "anthropic" label -
+# the class itself keeps its SDK-derived name). Everything upstream of that branch
 # (dialect intro selection, schema fetch, NDJSON streaming shape, markdown
 # fence stripping) is shared code already covered by the Gemini tests above,
 # so the tests below focus on what's actually different: API key selection/
@@ -786,14 +820,16 @@ class FakeClaudeConnectionError(anthropic.APIConnectionError):
 
 
 def test_claude_missing_api_key_returns_400(app_factory):
-    env = app_factory(env={"LLM_PROVIDER": "claude"})
+    env = app_factory(env={})
+    select_llm_provider(env, "anthropic")
     resp = env.client.post('/api/translate', json={'prompt': 'show users'})
     assert resp.status_code == 400
-    assert "Claude API key is not configured." in resp.get_json()['error']
+    assert "Anthropic API key is not configured." in resp.get_json()['error']
 
 
 def test_claude_success_strips_markdown_fences_and_returns_token_counts(app_factory, monkeypatch):
-    env = app_factory(env={"LLM_PROVIDER": "claude", "ANTHROPIC_API_KEY": "fake-key-1"})
+    env = app_factory(env={"ANTHROPIC_API_KEY": "fake-key-1"})
+    select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
     harness.queue_response(FakeClaudeResponse("```sql\nSELECT * FROM users;\n```", input_tokens=20, output_tokens=8))
@@ -815,11 +851,16 @@ def test_claude_success_strips_markdown_fences_and_returns_token_counts(app_fact
 
 
 def test_claude_success_records_translation_history(app_factory, monkeypatch):
-    env = app_factory(env={"LLM_PROVIDER": "claude", "ANTHROPIC_API_KEY": "fake-key-1"})
+    env = app_factory(env={"ANTHROPIC_API_KEY": "fake-key-1"})
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
     harness.queue_response(FakeClaudeResponse("SELECT 1;"))
 
+    # Not select_llm_provider(env, ...) here - that seeds the "global"
+    # identity, but this test's request resolves to "alice@example.com" via
+    # the cookie below, so the provider choice has to be seeded on THAT
+    # identity instead for it to actually take effect.
+    env.app_config.state_store.set_session("alice@example.com", llm_provider="anthropic")
     env.client.set_cookie("crbot_user_id", "alice@example.com")
     env.client.post('/api/translate', json={'prompt': 'give me one'})
 
@@ -834,7 +875,8 @@ def test_claude_no_temperature_param_is_ever_passed(app_factory, monkeypatch):
     FakeMessages.create()'s signature above has no temperature parameter at
     all, so passing one would raise TypeError rather than silently
     accepting it - proving the real call site never does."""
-    env = app_factory(env={"LLM_PROVIDER": "claude", "ANTHROPIC_API_KEY": "fake-key-1"})
+    env = app_factory(env={"ANTHROPIC_API_KEY": "fake-key-1"})
+    select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
     harness.queue_response(FakeClaudeResponse("SELECT 1;"))
@@ -855,10 +897,10 @@ def test_claude_dialect_intro_reaches_the_system_param(app_factory, tmp_path, mo
         {"type": "mssql", "name": "MS", "host": "h", "database": "d", "user": "u", "password": "p"},
     ])
     env = app_factory(env={
-        "LLM_PROVIDER": "claude",
         "ANTHROPIC_API_KEY": "fake-key-1",
         "DATABASE_PRESETS_FILE": presets_path,
     })
+    select_llm_provider(env, "anthropic")
     install_fake_mssql_connect(monkeypatch)
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
@@ -883,7 +925,8 @@ def test_claude_history_uses_assistant_role_and_appends_results(app_factory, mon
     build_gemini_history_contents() does for the Gemini path. (Schema
     placement and cache_control marking on messages[0]/messages[-2] are
     covered by the dedicated tests below.)"""
-    env = app_factory(env={"LLM_PROVIDER": "claude", "ANTHROPIC_API_KEY": "fake-key-1"})
+    env = app_factory(env={"ANTHROPIC_API_KEY": "fake-key-1"})
+    select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
     harness.queue_response(FakeClaudeResponse("SELECT 2;"))
@@ -916,7 +959,8 @@ def test_claude_schema_precedes_history_and_is_not_glued_to_the_new_prompt(app_f
     message rather than glued onto the ever-changing new prompt - that's
     what makes it a stable, repeatable prefix Claude's cache_control
     marker (see the dedicated tests below) relies on."""
-    env = app_factory(env={"LLM_PROVIDER": "claude", "ANTHROPIC_API_KEY": "fake-key-1"})
+    env = app_factory(env={"ANTHROPIC_API_KEY": "fake-key-1"})
+    select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
     harness.queue_response(FakeClaudeResponse("SELECT 2;"))
@@ -942,7 +986,8 @@ def test_claude_schema_attaches_to_new_prompt_when_there_is_no_history(app_facto
     string, so the schema half can be independently cache_control-marked
     (see the dedicated cache-control tests below) even on a conversation's
     very first call."""
-    env = app_factory(env={"LLM_PROVIDER": "claude", "ANTHROPIC_API_KEY": "fake-key-1"})
+    env = app_factory(env={"ANTHROPIC_API_KEY": "fake-key-1"})
+    select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
     harness.queue_response(FakeClaudeResponse("SELECT 1;"))
@@ -972,7 +1017,8 @@ def test_claude_schema_attaches_to_new_prompt_when_there_is_no_history(app_facto
 
 
 def test_claude_system_prompt_is_cache_control_marked(app_factory, monkeypatch):
-    env = app_factory(env={"LLM_PROVIDER": "claude", "ANTHROPIC_API_KEY": "fake-key-1"})
+    env = app_factory(env={"ANTHROPIC_API_KEY": "fake-key-1"})
+    select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
     harness.queue_response(FakeClaudeResponse("SELECT 1;"))
@@ -986,7 +1032,8 @@ def test_claude_system_prompt_is_cache_control_marked(app_factory, monkeypatch):
 
 
 def test_claude_cache_control_marks_last_history_turn_not_the_new_prompt(app_factory, monkeypatch):
-    env = app_factory(env={"LLM_PROVIDER": "claude", "ANTHROPIC_API_KEY": "fake-key-1"})
+    env = app_factory(env={"ANTHROPIC_API_KEY": "fake-key-1"})
+    select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
     harness.queue_response(FakeClaudeResponse("SELECT 3;"))
@@ -1018,7 +1065,8 @@ def test_claude_schema_block_is_cache_control_marked_even_with_no_history(app_fa
     cacheable. The new-prompt block right after it is left unmarked, since
     it ends in the ever-changing prompt text and would gain nothing from
     caching."""
-    env = app_factory(env={"LLM_PROVIDER": "claude", "ANTHROPIC_API_KEY": "fake-key-1"})
+    env = app_factory(env={"ANTHROPIC_API_KEY": "fake-key-1"})
+    select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
     harness.queue_response(FakeClaudeResponse("SELECT 1;"))
@@ -1037,7 +1085,8 @@ def test_claude_reports_cache_read_tokens_via_cached_content_tokens(app_factory,
     """cached_content_tokens in the NDJSON response is how a caller sees
     whether caching is actually paying off - it's fed from Anthropic's
     usage.cache_read_input_tokens (see _call_claude)."""
-    env = app_factory(env={"LLM_PROVIDER": "claude", "ANTHROPIC_API_KEY": "fake-key-1"})
+    env = app_factory(env={"ANTHROPIC_API_KEY": "fake-key-1"})
+    select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
     harness.queue_response(FakeClaudeResponse("SELECT 1;", cache_read_tokens=1234))
@@ -1049,7 +1098,8 @@ def test_claude_reports_cache_read_tokens_via_cached_content_tokens(app_factory,
 
 
 def test_claude_default_model_is_claude_sonnet_5(app_factory, monkeypatch):
-    env = app_factory(env={"LLM_PROVIDER": "claude", "ANTHROPIC_API_KEY": "fake-key-1"})
+    env = app_factory(env={"ANTHROPIC_API_KEY": "fake-key-1"})
+    select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
     harness.queue_response(FakeClaudeResponse("SELECT 1;"))
@@ -1060,9 +1110,10 @@ def test_claude_default_model_is_claude_sonnet_5(app_factory, monkeypatch):
 
 def test_claude_model_env_var_overrides_default(app_factory, monkeypatch):
     env = app_factory(env={
-        "LLM_PROVIDER": "claude", "ANTHROPIC_API_KEY": "fake-key-1",
-        "CLAUDE_MODEL": "claude-opus-x",
+        "ANTHROPIC_API_KEY": "fake-key-1",
+        "ANTHROPIC_MODELS": "claude-opus-x",
     })
+    select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
     harness.queue_response(FakeClaudeResponse("SELECT 1;"))
@@ -1072,7 +1123,8 @@ def test_claude_model_env_var_overrides_default(app_factory, monkeypatch):
 
 
 def test_claude_model_override_via_request_body(app_factory, monkeypatch):
-    env = app_factory(env={"LLM_PROVIDER": "claude", "ANTHROPIC_API_KEY": "fake-key-1"})
+    env = app_factory(env={"ANTHROPIC_API_KEY": "fake-key-1"})
+    select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
     harness.queue_response(FakeClaudeResponse("SELECT 1;"))
@@ -1089,10 +1141,10 @@ def test_claude_429_never_rotates_key_and_retries_with_delay(app_factory, monkey
     TRANSLATION_RETRY_DELAY_SECONDS, exactly like a 5xx/connection error -
     see _classify_claude_error's docstring."""
     env = app_factory(env={
-        "LLM_PROVIDER": "claude",
         "CLAUDE_PRESET_KEYS": "fake-key-1,fake-key-2",
         "TRANSLATION_RETRY_DELAY_SECONDS": "2.5",
     })
+    select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
     sleep_calls = []
@@ -1118,9 +1170,9 @@ def test_claude_529_overloaded_never_rotates_key_and_retries_with_delay(app_fact
     error has no equivalent status code. Like the 429 case above, this no
     longer rotates keys - it just waits and retries with the same key."""
     env = app_factory(env={
-        "LLM_PROVIDER": "claude",
         "CLAUDE_PRESET_KEYS": "fake-key-1,fake-key-2",
     })
+    select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
     sleep_calls = []
@@ -1139,7 +1191,8 @@ def test_claude_529_overloaded_never_rotates_key_and_retries_with_delay(app_fact
 
 
 def test_claude_server_error_retries_with_same_key(app_factory, monkeypatch):
-    env = app_factory(env={"LLM_PROVIDER": "claude", "ANTHROPIC_API_KEY": "fake-key-1"})
+    env = app_factory(env={"ANTHROPIC_API_KEY": "fake-key-1"})
+    select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
     monkeypatch.setattr(env.translate_routes.time, "sleep", lambda *a, **k: None)
@@ -1162,9 +1215,10 @@ def test_claude_connection_error_retries_with_same_key(app_factory, monkeypatch)
     retries with the same key after TRANSLATION_RETRY_DELAY_SECONDS, exactly
     like a 5xx APIStatusError)."""
     env = app_factory(env={
-        "LLM_PROVIDER": "claude", "ANTHROPIC_API_KEY": "fake-key-1",
+        "ANTHROPIC_API_KEY": "fake-key-1",
         "TRANSLATION_RETRY_DELAY_SECONDS": "2.5",
     })
+    select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
     sleep_calls = []
@@ -1183,7 +1237,8 @@ def test_claude_connection_error_retries_with_same_key(app_factory, monkeypatch)
 
 
 def test_claude_non_retryable_error_fails_immediately(app_factory, monkeypatch):
-    env = app_factory(env={"LLM_PROVIDER": "claude", "ANTHROPIC_API_KEY": "fake-key-1"})
+    env = app_factory(env={"ANTHROPIC_API_KEY": "fake-key-1"})
+    select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
     monkeypatch.setattr(env.translate_routes.time, "sleep", lambda *a, **k: None)
@@ -1204,7 +1259,8 @@ def test_claude_exhausts_all_retry_attempts_and_reports_failure_in_body(app_fact
     not a key-rotation budget - configuring 2 CLAUDE_PRESET_KEYS here is
     deliberate: it proves the extra key is never touched (only one
     Anthropic(...) client is ever constructed) even though it's available."""
-    env = app_factory(env={"LLM_PROVIDER": "claude", "CLAUDE_PRESET_KEYS": "fake-key-1,fake-key-2"})
+    env = app_factory(env={"CLAUDE_PRESET_KEYS": "fake-key-1,fake-key-2"})
+    select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
     monkeypatch.setattr(env.translate_routes.time, "sleep", lambda *a, **k: None)
@@ -1256,3 +1312,646 @@ def test_get_claude_api_keys_prefers_preset_keys_over_single_var(app_factory):
         "ANTHROPIC_API_KEY": "sk-ant-single",
     })
     assert env.translate_routes.get_claude_api_keys() == ["key-a", "key-b"]
+
+
+# --- OpenAI provider (llm_provider="openai") ---------------------------------
+#
+# translate_query() dispatches to _call_openai/_classify_openai_error/
+# build_openai_history_messages/pick_openai_api_key (via OpenAiProvider - see
+# translate_routes.py's module docstring) whenever the session's saved
+# llm_provider is "openai" - see helpers.select_llm_provider().
+# Everything upstream of provider dispatch (dialect intro selection, schema
+# fetch, NDJSON streaming shape, markdown fence stripping) is shared code
+# already covered by the Gemini tests above, so the tests below focus on
+# what's actually different: this provider is built on the Responses API
+# (client.responses.create), not Chat Completions - see _call_openai's
+# docstring for why - so its call shape (model/instructions/input, not
+# model/system/messages or model/contents/config) and its usage-field names
+# (usage.input_tokens_details.cached_tokens, usage.output_tokens_details.
+# reasoning_tokens) differ from both other providers'. Its retry-
+# classification rules mirror Claude's exactly (no key rotation - see
+# _classify_openai_error's docstring) except that OpenAI's SDK already
+# scopes RateLimitError/InternalServerError to their own status codes, so
+# there's no generic-status-code fake needed the way Claude's
+# FakeClaudeStatusError is.
+
+
+class FakeOpenAiResponse:
+    def __init__(self, text, input_tokens=10, output_tokens=5, total_tokens=15,
+                 cached_tokens=0, reasoning_tokens=0):
+        self.output_text = text
+        self.usage = pytypes.SimpleNamespace(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+            input_tokens_details=pytypes.SimpleNamespace(cached_tokens=cached_tokens),
+            output_tokens_details=pytypes.SimpleNamespace(reasoning_tokens=reasoning_tokens),
+        )
+
+
+class OpenAiHarness:
+    def __init__(self):
+        self.queue = []  # list of FakeOpenAiResponse or Exception instances
+        self.client_api_keys = []  # api_key each OpenAI(...) was constructed with
+        self.create_calls = []  # kwargs of each responses.create call
+
+    def queue_response(self, resp):
+        self.queue.append(resp)
+
+    def queue_error(self, exc):
+        self.queue.append(exc)
+
+    def make_client_class(self):
+        harness = self
+
+        class FakeResponses:
+            def create(self, model, instructions, input):
+                harness.create_calls.append(
+                    {"model": model, "instructions": instructions, "input": input,
+                     "api_key": harness.client_api_keys[-1]}
+                )
+                if not harness.queue:
+                    raise AssertionError("OpenAiHarness queue exhausted - test didn't queue enough responses")
+                item = harness.queue.pop(0)
+                if isinstance(item, Exception):
+                    raise item
+                return item
+
+        class FakeClient:
+            def __init__(self, api_key=None):
+                self.api_key = api_key
+                harness.client_api_keys.append(api_key)
+                self.responses = FakeResponses()
+
+        return FakeClient
+
+
+class FakeOpenAiRateLimitError(openai.RateLimitError):
+    """A real 429 raises openai.RateLimitError specifically -
+    _classify_openai_error checks for this exact type. Unlike Claude's
+    FakeClaudeStatusError(429) (Claude's SDK only has one generic
+    APIStatusError for every status code), openai.RateLimitError is
+    already scoped to 429 by the SDK itself, so no separate status_code
+    needs to be set here at all. Bypasses RateLimitError's real __init__
+    (which requires a live httpx2 Response) since only the type itself is
+    ever checked."""
+    def __init__(self):
+        Exception.__init__(self, "fake rate limit")
+
+
+class FakeOpenAiInternalServerError(openai.InternalServerError):
+    """Same idea for a 5xx - openai.InternalServerError is already scoped
+    to the 5xx range by the SDK, unlike Claude's shared APIStatusError, so
+    there's no generic-status-code fake needed here the way
+    FakeClaudeStatusError is."""
+    def __init__(self):
+        Exception.__init__(self, "fake internal server error")
+
+
+class FakeOpenAiConnectionError(openai.APIConnectionError):
+    """Same connection-level case as Claude's FakeClaudeConnectionError -
+    openai.APIConnectionError also covers APITimeoutError (a subclass of
+    it), so this one fake covers both."""
+    def __init__(self):
+        Exception.__init__(self, "fake connection error")
+
+
+class FakeOpenAiBadRequestError(openai.BadRequestError):
+    """Non-retryable (a real 400) - _classify_openai_error returns None
+    for anything that isn't RateLimitError/InternalServerError/
+    APIConnectionError, same policy as Claude's equivalent case."""
+    def __init__(self):
+        Exception.__init__(self, "fake bad request")
+
+
+def test_openai_missing_api_key_returns_400(app_factory):
+    env = app_factory(env={})
+    select_llm_provider(env, "openai")
+    resp = env.client.post('/api/translate', json={'prompt': 'show users'})
+    assert resp.status_code == 400
+    assert "OpenAI API key is not configured." in resp.get_json()['error']
+
+
+def test_openai_success_strips_markdown_fences_and_returns_token_counts(app_factory, monkeypatch):
+    env = app_factory(env={"OPENAI_API_KEY": "fake-key-1"})
+    select_llm_provider(env, "openai")
+    harness = OpenAiHarness()
+    monkeypatch.setattr(env.translate_routes.openai, "OpenAI", harness.make_client_class())
+    harness.queue_response(FakeOpenAiResponse("```sql\nSELECT * FROM users;\n```", input_tokens=20, output_tokens=8, total_tokens=28))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'Show all users'})
+    assert resp.status_code == 200
+    retry_events, data = parse_translate_stream(resp)
+    assert retry_events == []
+    assert data['success'] is True
+    assert data['sql'] == "SELECT * FROM users;"
+    assert data['total_tokens'] == 28
+    assert data['input_tokens'] == 20
+    assert data['output_tokens'] == 8
+
+
+def test_openai_success_records_translation_history(app_factory, monkeypatch):
+    env = app_factory(env={"OPENAI_API_KEY": "fake-key-1"})
+    harness = OpenAiHarness()
+    monkeypatch.setattr(env.translate_routes.openai, "OpenAI", harness.make_client_class())
+    harness.queue_response(FakeOpenAiResponse("SELECT 1;"))
+
+    # Not select_llm_provider(env, ...) here - see the matching comment in
+    # test_claude_success_records_translation_history above.
+    env.app_config.state_store.set_session("alice@example.com", llm_provider="openai")
+    env.client.set_cookie("crbot_user_id", "alice@example.com")
+    env.client.post('/api/translate', json={'prompt': 'give me one'})
+
+    rows, stats, total_count = env.app_config.state_store.get_translation_history("alice@example.com")
+    assert total_count == 1
+    assert rows[0]['sql_command'] == "SELECT 1;"
+
+
+def test_openai_call_uses_responses_api_shape_not_chat_completions(app_factory, monkeypatch):
+    """Pins down the one thing genuinely unique to this provider: the call
+    is client.responses.create(model=, instructions=, input=) - Responses'
+    own shape - not client.chat.completions.create(model=, messages=). The
+    system prompt goes through `instructions`, never folded into `input`."""
+    env = app_factory(env={"OPENAI_API_KEY": "fake-key-1"})
+    select_llm_provider(env, "openai")
+    harness = OpenAiHarness()
+    monkeypatch.setattr(env.translate_routes.openai, "OpenAI", harness.make_client_class())
+    harness.queue_response(FakeOpenAiResponse("SELECT 1;"))
+
+    env.client.post('/api/translate', json={'prompt': 'hi'})
+
+    call = harness.create_calls[0]
+    assert "PostgreSQL-compatible RDBMSs" in call["instructions"]
+    assert isinstance(call["input"], list)
+    assert all("PostgreSQL-compatible RDBMSs" not in (m.get("content") or "") for m in call["input"])
+
+
+def test_openai_history_uses_assistant_role_and_appends_results(app_factory, monkeypatch):
+    """build_openai_history_messages() maps Gemini's "model" role to
+    "assistant" (same mapping as Claude's), leaving "user" untouched, and
+    appends query-results text exactly like the other two providers'
+    history builders do."""
+    env = app_factory(env={"OPENAI_API_KEY": "fake-key-1"})
+    select_llm_provider(env, "openai")
+    harness = OpenAiHarness()
+    monkeypatch.setattr(env.translate_routes.openai, "OpenAI", harness.make_client_class())
+    harness.queue_response(FakeOpenAiResponse("SELECT 2;"))
+
+    history = [
+        {"role": "user", "text": "show users"},
+        {"role": "model", "text": "SELECT * FROM users;",
+         "results": [{"columns": ["id"], "rows": [[1]], "rowCount": 1}]},
+    ]
+    env.client.post('/api/translate', json={'prompt': 'now show orders', 'history': history})
+
+    messages = harness.create_calls[0]["input"]
+    assert messages[0]["role"] == "user"
+    assert messages[0]["content"].endswith("show users")
+    assert messages[1]["role"] == "assistant"
+    assert "SELECT * FROM users;" in messages[1]["content"]
+    assert "[Query Result 1" in messages[1]["content"]
+    assert messages[2]["role"] == "user"
+
+
+def test_openai_schema_precedes_history_and_is_not_glued_to_the_new_prompt(app_factory, monkeypatch):
+    """Same ordering regression guard as the Gemini/Claude versions above:
+    the schema is prepended to the first historical message, not glued
+    onto the ever-changing new prompt."""
+    env = app_factory(env={"OPENAI_API_KEY": "fake-key-1"})
+    select_llm_provider(env, "openai")
+    harness = OpenAiHarness()
+    monkeypatch.setattr(env.translate_routes.openai, "OpenAI", harness.make_client_class())
+    harness.queue_response(FakeOpenAiResponse("SELECT 2;"))
+
+    history = [{"role": "user", "text": "show users"}]
+    env.client.post('/api/translate', json={'prompt': 'now show orders', 'history': history})
+
+    messages = harness.create_calls[0]["input"]
+    assert messages[0]["content"] == "Database Schema:\nNo schema description available.\n\nshow users"
+    assert "Database Schema:" not in messages[-1]["content"]
+    assert "now show orders" in messages[-1]["content"]
+
+
+def test_openai_schema_attaches_to_new_prompt_when_there_is_no_history(app_factory, monkeypatch):
+    """With no prior history, unlike Claude's two-content-block split
+    (there's no cache_control marker to place - see _call_openai's
+    docstring on why OpenAI's caching is automatic), the schema is simply
+    concatenated onto the new prompt in one plain string, same as Gemini's
+    no-history case."""
+    env = app_factory(env={"OPENAI_API_KEY": "fake-key-1"})
+    select_llm_provider(env, "openai")
+    harness = OpenAiHarness()
+    monkeypatch.setattr(env.translate_routes.openai, "OpenAI", harness.make_client_class())
+    harness.queue_response(FakeOpenAiResponse("SELECT 1;"))
+
+    env.client.post('/api/translate', json={'prompt': 'show users'})
+
+    messages = harness.create_calls[0]["input"]
+    assert len(messages) == 1
+    assert messages[0]["content"] == "Database Schema:\nNo schema description available.\n\nUser Request: show users\n\nSQL Query:"
+
+
+def test_openai_reports_cached_tokens(app_factory, monkeypatch):
+    """cached_content_tokens in the NDJSON response is fed from OpenAI's
+    usage.input_tokens_details.cached_tokens (see _call_openai)."""
+    env = app_factory(env={"OPENAI_API_KEY": "fake-key-1"})
+    select_llm_provider(env, "openai")
+    harness = OpenAiHarness()
+    monkeypatch.setattr(env.translate_routes.openai, "OpenAI", harness.make_client_class())
+    harness.queue_response(FakeOpenAiResponse("SELECT 1;", cached_tokens=1234))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'hi'})
+    _, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    assert data['cached_content_tokens'] == 1234
+
+
+def test_openai_reports_reasoning_tokens_as_thinking_tokens(app_factory, monkeypatch):
+    """thinking_tokens in the NDJSON response is fed from OpenAI's
+    usage.output_tokens_details.reasoning_tokens - no Claude equivalent
+    (always 0 there, see _call_claude), and unlike Gemini's
+    thoughts_token_count this is a genuinely distinct field name per
+    provider, all folded into the same shared usage_dict key."""
+    env = app_factory(env={"OPENAI_API_KEY": "fake-key-1"})
+    select_llm_provider(env, "openai")
+    harness = OpenAiHarness()
+    monkeypatch.setattr(env.translate_routes.openai, "OpenAI", harness.make_client_class())
+    harness.queue_response(FakeOpenAiResponse("SELECT 1;", reasoning_tokens=42))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'hi'})
+    _, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    assert data['thinking_tokens'] == 42
+
+
+def test_openai_default_model_is_gpt_5_6_luna(app_factory, monkeypatch):
+    env = app_factory(env={"OPENAI_API_KEY": "fake-key-1"})
+    select_llm_provider(env, "openai")
+    harness = OpenAiHarness()
+    monkeypatch.setattr(env.translate_routes.openai, "OpenAI", harness.make_client_class())
+    harness.queue_response(FakeOpenAiResponse("SELECT 1;"))
+
+    env.client.post('/api/translate', json={'prompt': 'hi'})
+    assert harness.create_calls[0]["model"] == "gpt-5.6-luna"
+
+
+def test_openai_model_env_var_overrides_default(app_factory, monkeypatch):
+    env = app_factory(env={
+        "OPENAI_API_KEY": "fake-key-1",
+        "OPENAI_MODELS": "gpt-5.6-terra",
+    })
+    select_llm_provider(env, "openai")
+    harness = OpenAiHarness()
+    monkeypatch.setattr(env.translate_routes.openai, "OpenAI", harness.make_client_class())
+    harness.queue_response(FakeOpenAiResponse("SELECT 1;"))
+
+    env.client.post('/api/translate', json={'prompt': 'hi'})
+    assert harness.create_calls[0]["model"] == "gpt-5.6-terra"
+
+
+def test_openai_model_override_via_request_body(app_factory, monkeypatch):
+    env = app_factory(env={"OPENAI_API_KEY": "fake-key-1"})
+    select_llm_provider(env, "openai")
+    harness = OpenAiHarness()
+    monkeypatch.setattr(env.translate_routes.openai, "OpenAI", harness.make_client_class())
+    harness.queue_response(FakeOpenAiResponse("SELECT 1;"))
+
+    env.client.post('/api/translate', json={'prompt': 'hi', 'openai_model': 'gpt-5.6-custom'})
+    assert harness.create_calls[0]["model"] == "gpt-5.6-custom"
+
+
+def test_openai_rate_limit_never_rotates_key_and_retries_with_delay(app_factory, monkeypatch):
+    """Same policy as Claude's 429 case - no key rotation for OpenAI either
+    (see _classify_openai_error's docstring), even with multiple
+    OPENAI_PRESET_KEYS configured: a RateLimitError just retries with the
+    SAME key after TRANSLATION_RETRY_DELAY_SECONDS."""
+    env = app_factory(env={
+        "OPENAI_PRESET_KEYS": "fake-key-1,fake-key-2",
+        "TRANSLATION_RETRY_DELAY_SECONDS": "2.5",
+    })
+    select_llm_provider(env, "openai")
+    harness = OpenAiHarness()
+    monkeypatch.setattr(env.translate_routes.openai, "OpenAI", harness.make_client_class())
+    sleep_calls = []
+    monkeypatch.setattr(env.translate_routes.time, "sleep", lambda secs: sleep_calls.append(secs))
+    harness.queue_error(FakeOpenAiRateLimitError())
+    harness.queue_response(FakeOpenAiResponse("SELECT 1;"))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'hi'})
+    assert resp.status_code == 200
+    retry_events, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    # Same key reused - no second OpenAI(...) construction at all, even
+    # though a second OPENAI_PRESET_KEYS entry is configured and available.
+    assert len(harness.client_api_keys) == 1
+    assert len(retry_events) == 1
+    assert retry_events[0]["rotatedKey"] is False
+    assert retry_events[0]["delaySeconds"] == 2.5
+    assert sleep_calls == [2.5]
+
+
+def test_openai_internal_server_error_retries_with_same_key(app_factory, monkeypatch):
+    env = app_factory(env={"OPENAI_API_KEY": "fake-key-1"})
+    select_llm_provider(env, "openai")
+    harness = OpenAiHarness()
+    monkeypatch.setattr(env.translate_routes.openai, "OpenAI", harness.make_client_class())
+    monkeypatch.setattr(env.translate_routes.time, "sleep", lambda *a, **k: None)
+    harness.queue_error(FakeOpenAiInternalServerError())
+    harness.queue_response(FakeOpenAiResponse("SELECT 1;"))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'hi'})
+    assert resp.status_code == 200
+    retry_events, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    assert len(retry_events) == 1
+    assert retry_events[0]["rotatedKey"] is False
+    assert len(harness.client_api_keys) == 1
+    assert len(harness.create_calls) == 2
+
+
+def test_openai_connection_error_retries_with_same_key(app_factory, monkeypatch):
+    env = app_factory(env={
+        "OPENAI_API_KEY": "fake-key-1",
+        "TRANSLATION_RETRY_DELAY_SECONDS": "2.5",
+    })
+    select_llm_provider(env, "openai")
+    harness = OpenAiHarness()
+    monkeypatch.setattr(env.translate_routes.openai, "OpenAI", harness.make_client_class())
+    sleep_calls = []
+    monkeypatch.setattr(env.translate_routes.time, "sleep", lambda secs: sleep_calls.append(secs))
+    harness.queue_error(FakeOpenAiConnectionError())
+    harness.queue_response(FakeOpenAiResponse("SELECT 1;"))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'hi'})
+    assert resp.status_code == 200
+    retry_events, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    assert retry_events[0]["rotatedKey"] is False
+    assert retry_events[0]["delaySeconds"] == 2.5
+    assert sleep_calls == [2.5]
+    assert len(harness.client_api_keys) == 1
+
+
+def test_openai_non_retryable_error_fails_immediately(app_factory, monkeypatch):
+    env = app_factory(env={"OPENAI_API_KEY": "fake-key-1"})
+    select_llm_provider(env, "openai")
+    harness = OpenAiHarness()
+    monkeypatch.setattr(env.translate_routes.openai, "OpenAI", harness.make_client_class())
+    monkeypatch.setattr(env.translate_routes.time, "sleep", lambda *a, **k: None)
+    harness.queue_error(FakeOpenAiBadRequestError())  # _classify_openai_error returns None
+
+    resp = env.client.post('/api/translate', json={'prompt': 'hi'})
+    assert resp.status_code == 200
+    retry_events, data = parse_translate_stream(resp)
+    assert retry_events == []
+    assert data['success'] is False
+    assert len(harness.create_calls) == 1  # no retry attempted
+
+
+def test_openai_exhausts_all_retry_attempts_and_reports_failure_in_body(app_factory, monkeypatch):
+    """Same as Claude's equivalent test: since OpenAI never rotates keys,
+    a run of RateLimitErrors exhausts the shared transient-error budget
+    (MAX_TRANSLATION_ATTEMPTS), not a key-rotation budget - configuring 2
+    OPENAI_PRESET_KEYS here is deliberate: it proves the extra key is
+    never touched (only one OpenAI(...) client is ever constructed) even
+    though it's available."""
+    env = app_factory(env={"OPENAI_PRESET_KEYS": "fake-key-1,fake-key-2"})
+    select_llm_provider(env, "openai")
+    harness = OpenAiHarness()
+    monkeypatch.setattr(env.translate_routes.openai, "OpenAI", harness.make_client_class())
+    monkeypatch.setattr(env.translate_routes.time, "sleep", lambda *a, **k: None)
+    for _ in range(env.translate_routes.MAX_TRANSLATION_ATTEMPTS):
+        harness.queue_error(FakeOpenAiRateLimitError())
+
+    resp = env.client.post('/api/translate', json={'prompt': 'hi'})
+    assert resp.status_code == 200
+    retry_events, data = parse_translate_stream(resp)
+    assert data['success'] is False
+    assert "error" in data
+    assert len(retry_events) == env.translate_routes.MAX_TRANSLATION_ATTEMPTS - 1
+    assert len(harness.create_calls) == env.translate_routes.MAX_TRANSLATION_ATTEMPTS
+    assert len(harness.client_api_keys) == 1
+    assert all(action["rotatedKey"] is False for action in retry_events)
+
+
+def test_pick_openai_api_key_returns_none_when_no_keys_configured(app_env):
+    assert app_env.translate_routes.pick_openai_api_key() is None
+
+
+def test_pick_openai_api_key_avoids_excluded_when_alternative_exists(app_factory):
+    env = app_factory(env={"OPENAI_PRESET_KEYS": "key-a,key-b"})
+    picked = env.translate_routes.pick_openai_api_key(exclude={"key-a"})
+    assert picked == "key-b"
+
+
+def test_pick_openai_api_key_falls_back_to_full_pool_when_all_excluded(app_factory):
+    env = app_factory(env={"OPENAI_PRESET_KEYS": "key-a"})
+    picked = env.translate_routes.pick_openai_api_key(exclude={"key-a"})
+    assert picked == "key-a"
+
+
+def test_get_openai_api_keys_returns_empty_list_when_nothing_configured(app_env):
+    assert app_env.translate_routes.get_openai_api_keys() == []
+
+
+def test_get_openai_api_keys_falls_back_to_openai_api_key_when_no_preset_keys(app_factory):
+    env = app_factory(env={"OPENAI_API_KEY": "sk-single"})
+    assert env.translate_routes.get_openai_api_keys() == ["sk-single"]
+
+
+def test_get_openai_api_keys_prefers_preset_keys_over_single_var(app_factory):
+    env = app_factory(env={
+        "OPENAI_PRESET_KEYS": "key-a,key-b",
+        "OPENAI_API_KEY": "sk-single",
+    })
+    assert env.translate_routes.get_openai_api_keys() == ["key-a", "key-b"]
+
+
+# --- LlmProvider dispatch (provider-agnostic) --------------------------------
+#
+# The tests above (across all three providers) already exercise
+# get_llm_provider()/LlmProvider indirectly via /api/translate - this small
+# section covers the dispatch/registry mechanics directly: an unrecognized
+# saved llm_provider value must still behave exactly as it did before this
+# app removed the separate LLM_PROVIDER env var (silently default to
+# Google, not error) - including a value that was only ever valid under the
+# OLD "gemini"/"claude" labels, e.g. a session saved before that rename -
+# and each registered name must resolve to the right adapter.
+
+def test_get_llm_provider_falls_back_to_google_for_unknown_name(app_env):
+    provider = app_env.translate_routes.get_llm_provider("not-a-real-provider")
+    assert provider.name == "google"
+
+
+def test_get_llm_provider_falls_back_to_google_for_empty_string(app_env):
+    provider = app_env.translate_routes.get_llm_provider("")
+    assert provider.name == "google"
+
+
+def test_get_llm_provider_returns_registered_providers_by_name(app_env):
+    tr = app_env.translate_routes
+    assert isinstance(tr.get_llm_provider("google"), tr.GeminiProvider)
+    assert isinstance(tr.get_llm_provider("anthropic"), tr.ClaudeProvider)
+    assert isinstance(tr.get_llm_provider("openai"), tr.OpenAiProvider)
+
+
+def test_unrecognized_persisted_llm_provider_falls_back_to_google_end_to_end(app_factory, monkeypatch):
+    """End-to-end version of the unit test above: a session whose saved
+    llm_provider is unrecognized - either a plain typo, or a stale value
+    from before this app's provider labels were renamed from gemini/claude
+    to google/anthropic - still translates via Google, exactly as
+    get_llm_provider()'s own fallback guarantees. There's no LLM_PROVIDER
+    env var anymore to misconfigure fleet-wide in the first place - this is
+    purely a per-session concern now."""
+    env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
+    select_llm_provider(env, "gemini")  # the pre-rename label - now unrecognized
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(FakeGenaiResponse("SELECT 1;"))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'hi'})
+    _, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    assert len(harness.generate_calls) == 1
+
+
+# --- LlmProvider.preset_models / default_model / list_llm_providers_info() ---
+#
+# Each provider has exactly one *_MODELS env var (GOOGLE_MODELS/
+# ANTHROPIC_MODELS/OPENAI_MODELS), comma-separated - its first entry doubles
+# as that provider's default_model, the full list is preset_models (the
+# model-selection modal's data source). Left unset, a provider falls back
+# to its own hardcoded single-model fallback_models.
+
+def test_preset_models_and_default_model_fall_back_when_env_var_unset(app_env):
+    tr = app_env.translate_routes
+    assert tr.get_llm_provider("google").preset_models == ["gemini-3.7-flash"]
+    assert tr.get_llm_provider("google").default_model == "gemini-3.7-flash"
+    assert tr.get_llm_provider("anthropic").preset_models == ["claude-sonnet-5"]
+    assert tr.get_llm_provider("anthropic").default_model == "claude-sonnet-5"
+    assert tr.get_llm_provider("openai").preset_models == ["gpt-5.6-luna"]
+    assert tr.get_llm_provider("openai").default_model == "gpt-5.6-luna"
+
+
+def test_models_env_var_parses_comma_separated_list_first_entry_is_default(app_factory):
+    env = app_factory(env={"GOOGLE_MODELS": "gemini-3.6-flash,gemini-2.5-pro"})
+    provider = env.translate_routes.get_llm_provider("google")
+    assert provider.preset_models == ["gemini-3.6-flash", "gemini-2.5-pro"]
+    assert provider.default_model == "gemini-3.6-flash"
+
+
+def test_models_env_var_first_entry_becomes_the_new_default_when_reordered(app_factory):
+    # Nothing hardcodes which entry is "the default" beyond position - a
+    # deploy that wants gemini-2.5-pro to be the fleet-wide default just
+    # lists it first, no separate GEMINI_MODEL var to keep in sync.
+    env = app_factory(env={"ANTHROPIC_MODELS": "claude-opus-5,claude-sonnet-5"})
+    provider = env.translate_routes.get_llm_provider("anthropic")
+    assert provider.default_model == "claude-opus-5"
+    assert provider.preset_models == ["claude-opus-5", "claude-sonnet-5"]
+
+
+def test_models_env_var_trims_whitespace_and_drops_blank_entries(app_factory):
+    env = app_factory(env={"OPENAI_MODELS": " gpt-5.6-sol , , gpt-5.6-terra "})
+    provider = env.translate_routes.get_llm_provider("openai")
+    assert provider.preset_models == ["gpt-5.6-sol", "gpt-5.6-terra"]
+    assert provider.default_model == "gpt-5.6-sol"
+
+
+def test_models_env_var_change_is_reflected_live_not_cached(app_factory):
+    # Read fresh on every access (like get_gemini_api_keys() already does
+    # for GEMINI_PRESET_KEYS), not memoized at import time - lets
+    # fresh_import()-based tests reconfigure it per test case, and would
+    # let a future admin settings change take effect immediately.
+    env = app_factory(env={"GOOGLE_MODELS": "gemini-2.5-flash"})
+    import os as _os
+    provider = env.translate_routes.get_llm_provider("google")
+    assert "gemini-2.5-pro" not in provider.preset_models
+    _os.environ["GOOGLE_MODELS"] = "gemini-2.5-flash,gemini-2.5-pro"
+    try:
+        assert "gemini-2.5-pro" in provider.preset_models
+    finally:
+        del _os.environ["GOOGLE_MODELS"]
+
+
+def test_list_llm_providers_info_returns_all_three_providers_in_order(app_env):
+    info = app_env.translate_routes.list_llm_providers_info()
+    assert [p["name"] for p in info] == ["google", "anthropic", "openai"]
+    gemini_info = info[0]
+    assert gemini_info["default_model"] == "gemini-3.7-flash"
+    assert gemini_info["preset_models"] == ["gemini-3.7-flash"]
+
+
+# --- Session-persisted model selection (model-selection UI) ------------------
+#
+# translate_query() resolves the effective provider/model from the current
+# session's saved llm_provider/llm_model (see state_store.py's get_session/
+# set_session and config_routes.py's POST /api/config), falling back to the
+# one hardcoded default (Google) and that provider's own default_model
+# whenever nothing's been saved - see get_llm_provider()'s docstring.
+
+def test_translate_uses_persisted_session_provider_over_env_default(app_factory, monkeypatch):
+    env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1", "ANTHROPIC_API_KEY": "fake-key-1"})
+    login_as(env.client, "alice@example.com")
+    env.app_config.state_store.set_session(
+        "alice@example.com", llm_provider="anthropic", llm_model="claude-sonnet-5",
+    )
+
+    harness = ClaudeHarness()
+    monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
+    harness.queue_response(FakeClaudeResponse("SELECT 1;"))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'hi'})
+    _, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    assert harness.create_calls[0]["model"] == "claude-sonnet-5"
+
+
+def test_translate_falls_back_to_env_provider_when_session_never_saved_a_choice(app_factory, monkeypatch):
+    # Regression guard: a session that never touched the model-selection UI
+    # (session_data["llm_provider"] == "") must behave identically to before
+    # persisted selection existed - this is what keeps every other test in
+    # this file (none of which touch state_store) passing unchanged.
+    env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
+    login_as(env.client, "alice@example.com")
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(FakeGenaiResponse("SELECT 1;"))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'hi'})
+    _, data = parse_translate_stream(resp)
+    assert data['success'] is True
+
+
+def test_translate_request_body_model_override_still_wins_over_persisted_session_model(app_factory, monkeypatch):
+    env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
+    login_as(env.client, "alice@example.com")
+    env.app_config.state_store.set_session(
+        "alice@example.com", llm_provider="google", llm_model="gemini-saved-model",
+    )
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(FakeGenaiResponse("SELECT 1;"))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'hi', 'model': 'request-override-model'})
+    _, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    assert harness.generate_calls[0]["model"] == "request-override-model"
+
+
+def test_translate_falls_back_to_provider_default_model_when_only_provider_persisted(app_factory, monkeypatch):
+    # A session that saved a provider but somehow has no model saved (e.g.
+    # an old/partial write) falls back to that provider's own default_model,
+    # not an empty string.
+    env = app_factory(env={"ANTHROPIC_API_KEY": "fake-key-1"})
+    login_as(env.client, "alice@example.com")
+    env.app_config.state_store.set_session("alice@example.com", llm_provider="anthropic")
+
+    harness = ClaudeHarness()
+    monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
+    harness.queue_response(FakeClaudeResponse("SELECT 1;"))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'hi'})
+    _, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    assert harness.create_calls[0]["model"] == "claude-sonnet-5"

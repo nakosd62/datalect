@@ -16,6 +16,7 @@ presets_local.json
 presets_CR.json
 grand-cosmos-716-*.json
 cloudsql-ca.pem
+atlas-credentials.env
 
 # Logs
 *.log

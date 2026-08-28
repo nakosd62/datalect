@@ -106,7 +106,7 @@ def test_translate_route_is_reachable_without_auth_when_disabled(client):
     # not a 401 from the auth guard - proves the guard let it through.
     resp = client.post('/api/translate', json={"prompt": "show users"})
     assert resp.status_code == 400
-    assert "Gemini API key" in resp.get_json()["error"]
+    assert "Google API key" in resp.get_json()["error"]
 
 
 def test_auth_me_endpoint_is_always_exempt(app_factory):

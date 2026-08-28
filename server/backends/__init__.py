@@ -19,6 +19,7 @@ from .oracle import OracleBackend
 from .redshift import RedshiftBackend
 from .mssql import MssqlBackend
 from .sheets import SheetsBackend
+from .mongodb_sql import MongoSqlBackend
 
 _BACKENDS = {
     "postgres": PostgresBackend(),
@@ -30,6 +31,7 @@ _BACKENDS = {
     "redshift": RedshiftBackend(),
     "mssql": MssqlBackend(),
     "sheets": SheetsBackend(),
+    "MongoDB": MongoSqlBackend(),
 }
 
 

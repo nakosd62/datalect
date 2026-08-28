@@ -80,6 +80,40 @@ def test_sessions_are_isolated_per_user(tmp_path):
     assert store.get_session("bob")["connection_id"] == "bob-conn"
 
 
+# --- llm_provider / llm_model (model-selection UI) ------------------------------
+# Same "" -> "nothing explicitly selected yet, resolve the env-configured
+# default elsewhere" convention connection_id already uses - see
+# get_session's docstring.
+
+def test_get_session_defaults_llm_fields_to_blank(tmp_path):
+    store = make_store(tmp_path)
+    session = store.get_session("alice")
+    assert session["llm_provider"] == ""
+    assert session["llm_model"] == ""
+
+
+def test_set_and_get_session_round_trips_llm_fields(tmp_path):
+    store = make_store(tmp_path)
+    store.set_session("alice", llm_provider="anthropic", llm_model="claude-sonnet-5")
+    session = store.get_session("alice")
+    assert session["llm_provider"] == "anthropic"
+    assert session["llm_model"] == "claude-sonnet-5"
+    # Untouched by an llm-only save - same independence auto_sql_execute/
+    # connection_id already have from each other.
+    assert session["connection_id"] == ""
+
+
+def test_set_session_llm_fields_do_not_clobber_connection_fields(tmp_path):
+    store = make_store(tmp_path)
+    store.set_session("alice", connection_id="preset+Default DB", auto_sql_execute=False)
+    store.set_session("alice", llm_provider="openai", llm_model="gpt-5.6-luna")
+    session = store.get_session("alice")
+    assert session["connection_id"] == "preset+Default DB"
+    assert session["auto_sql_execute"] is False
+    assert session["llm_provider"] == "openai"
+    assert session["llm_model"] == "gpt-5.6-luna"
+
+
 def test_none_user_id_bucketed_under_global(tmp_path):
     store = make_store(tmp_path)
     store.set_session(None, connection_id="global-conn")
@@ -384,6 +418,43 @@ def test_purge_translation_history_does_not_affect_other_users(tmp_path):
 
 # --- init() migrations: legacy schema upgrade paths ----------------------------
 
+def test_init_migrates_sessions_table_predating_llm_fields(tmp_path):
+    # A DB already upgraded past the connection_id rebuild (see the
+    # pre_connection_id tests below) but predating llm_provider/llm_model -
+    # a plain ALTER ADD COLUMN, no data backfill needed (unlike
+    # connection_id's own migration), since a blank value already means
+    # "fall back to the env-configured default" everywhere this is read.
+    db_path = str(tmp_path / "state.db")
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        CREATE TABLE sessions (
+            session_id TEXT PRIMARY KEY,
+            auto_sql_execute INTEGER NOT NULL DEFAULT 1,
+            is_custom INTEGER NOT NULL DEFAULT 0,
+            connection_id TEXT NOT NULL DEFAULT '',
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    conn.execute(
+        "INSERT INTO sessions (session_id, auto_sql_execute, is_custom, connection_id) "
+        "VALUES (?, ?, ?, ?)",
+        ("alice", 1, 0, "preset+Default DB"),
+    )
+    conn.commit()
+    conn.close()
+
+    store = SqliteStateStore(db_path)
+    store.init()  # must not raise
+
+    session = store.get_session("alice")
+    assert session["connection_id"] == "preset+Default DB"  # untouched
+    assert session["llm_provider"] == ""
+    assert session["llm_model"] == ""
+
+    store.set_session("alice", llm_provider="anthropic", llm_model="claude-sonnet-5")
+    assert store.get_session("alice")["llm_provider"] == "anthropic"
+
+
 def test_init_migrates_pre_connection_key_db_connections_table(tmp_path):
     db_path = str(tmp_path / "state.db")
     # Simulate a pre-migration DB: db_connections keyed by (user_id,
@@ -450,6 +521,11 @@ def test_init_migrates_pre_connection_id_sessions_table_for_custom_row(tmp_path)
     assert session["is_custom"] is True
     assert session["connection_id"] == "custom-key-123"  # reused as-is
     assert session["auto_sql_execute"] is False
+    # llm_provider/llm_model survive this rebuild too (added via the
+    # earlier ALTER guards, before this table gets renamed/rebuilt) -
+    # blank here since this legacy row predates them entirely.
+    assert session["llm_provider"] == ""
+    assert session["llm_model"] == ""
 
     # The old descriptor columns must actually be gone (a hard rebuild, not
     # just an added column) - no lingering credentials in an unread column.
@@ -457,7 +533,10 @@ def test_init_migrates_pre_connection_id_sessions_table_for_custom_row(tmp_path)
         cursor = check_conn.cursor()
         cursor.execute("PRAGMA table_info(sessions);")
         cols = {c[1] for c in cursor.fetchall()}
-    assert cols == {"session_id", "auto_sql_execute", "is_custom", "connection_id", "updated_at"}
+    assert cols == {
+        "session_id", "auto_sql_execute", "is_custom", "connection_id",
+        "llm_provider", "llm_model", "updated_at",
+    }
 
 
 def test_init_migrates_pre_connection_id_sessions_table_for_preset_row(tmp_path, monkeypatch):

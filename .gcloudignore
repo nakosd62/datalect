@@ -8,6 +8,8 @@ venv/
 # Ignore local env setting
 .env
 presets_local.json
+atlas-credentials.env
+
 
 # Ignore utility scripts
 *.sh

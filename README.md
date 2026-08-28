@@ -179,20 +179,80 @@ All configuration is via environment variables. Nothing is required
 except a Gemini key and a database to connect to — everything else has a
 sensible default.
 
-### Gemini / model
+### LLM provider / model
+
+`/api/translate` supports three interchangeable LLM providers, registered
+under the labels `google` (Gemini under the hood - the default), `anthropic`
+(Claude under the hood), and `openai`. There's no fleet-wide provider-select
+env var - each signed-in/anonymous session picks its own provider and model
+via the model-selection badge in the app's header (see "Model selection UI"
+below); that per-session choice is what `/api/translate` actually uses once
+one has been saved, falling back to this app's one hardcoded default
+(`google` / `gemini-3.7-flash`) otherwise. See
+[`translate_routes.py`](./server/translate_routes.py)'s module docstring
+for how a new provider is added (one `LlmProvider` subclass); this section
+just covers the env vars for the three that exist today.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MAX_TRANSLATION_ATTEMPTS` | `5` | Max attempts (initial call + retries) for a single translation request before giving up, for transient (rate-limit/server-error/connection) failures. Shared by all three providers — see [`translate_routes.py`](./server/translate_routes.py). (Formerly `MAX_GEMINI_ATTEMPTS`.) |
+| `TRANSLATION_RETRY_DELAY_SECONDS` | `1` | Seconds to wait between transient-error retry attempts. Shared by all three providers. (Formerly `GEMINI_RETRY_DELAY_SECONDS`.) |
+
+#### Google (Gemini)
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `GEMINI_API_KEY` / `GOOGLE_API_KEY` | — | A single Gemini API key. Either name works. |
-| `GEMINI_PRESET_KEYS` | — | Comma-separated list of additional Gemini API keys. The app picks one at random per request and, on a rate-limit (429) error, automatically retries with a different key from the pool — immediately, with no delay, for up to one attempt per configured key (this budget is independent of `MAX_TRANSLATION_ATTEMPTS` below and is a Gemini-only mechanism; it does not apply when `LLM_PROVIDER=claude`). See [`translate_routes.py`](./server/translate_routes.py) for the full retry policy. |
-| `GEMINI_MODEL` | `gemini-2.5-flash` | Default model used for translation. |
-| `GEMINI_PRESET_MODELS` | `gemini-2.5-flash,gemini-2.5-pro` | Comma-separated list of models offered in the UI. `GEMINI_MODEL` is auto-added if missing. |
-| `MAX_TRANSLATION_ATTEMPTS` | `5` | Max attempts (initial call + retries) for a single translation request before giving up, for transient (rate-limit/server-error/connection) failures. Shared by both Gemini and Claude — see [`translate_routes.py`](./server/translate_routes.py). (Formerly `MAX_GEMINI_ATTEMPTS`.) |
-| `TRANSLATION_RETRY_DELAY_SECONDS` | `1` | Seconds to wait between transient-error retry attempts. Shared by both providers. (Formerly `GEMINI_RETRY_DELAY_SECONDS`.) |
+| `GEMINI_PRESET_KEYS` | — | Comma-separated list of additional Gemini API keys. The app picks one at random per request and, on a rate-limit (429) error, automatically retries with a different key from the pool — immediately, with no delay, for up to one attempt per configured key (this budget is independent of `MAX_TRANSLATION_ATTEMPTS` above and is a Gemini-only mechanism; no other provider rotates keys this way). See [`translate_routes.py`](./server/translate_routes.py) for the full retry policy. |
+| `GOOGLE_MODELS` | `gemini-3.7-flash` | Comma-separated list of models this provider can use. The **first** entry is the default used for translation (per-request override: `gemini_model` or the generic `model`; per-session override via the model-selection UI) - and, since this is also the app's default provider, this first entry doubles as the app's one fleet-wide default model when no session has picked anything at all yet. The full list is what the model-selection UI offers for Google. |
 
 At least one of `GEMINI_API_KEY`, `GOOGLE_API_KEY`, or
 `GEMINI_PRESET_KEYS` must be set, or `/api/translate` returns a 400
-("Gemini API key is not configured").
+("Google API key is not configured").
+
+#### Anthropic (Claude)
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | — | A single Claude API key. |
+| `CLAUDE_PRESET_KEYS` | — | Comma-separated list of additional Claude API keys - same pool-of-keys idea as `GEMINI_PRESET_KEYS`, but a rate limit here never rotates keys, it just waits and retries the same key (see `_classify_claude_error` in [`translate_routes.py`](./server/translate_routes.py)). |
+| `ANTHROPIC_MODELS` | `claude-sonnet-5` | Comma-separated list of models this provider can use - same "first entry is the default" convention as `GOOGLE_MODELS`. |
+
+At least one of `ANTHROPIC_API_KEY` or `CLAUDE_PRESET_KEYS` must be set to
+select Anthropic via the model-selection UI, or `/api/translate` returns a
+400 ("Anthropic API key is not configured").
+
+#### OpenAI
+
+Built on the [Responses API](https://developers.openai.com/api/docs/guides/migrate-to-responses)
+(`client.responses.create`), not the older Chat Completions API - see
+`_call_openai` in [`translate_routes.py`](./server/translate_routes.py).
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `OPENAI_API_KEY` | — | A single OpenAI API key. |
+| `OPENAI_PRESET_KEYS` | — | Comma-separated list of additional OpenAI API keys - same pool-of-keys idea as `CLAUDE_PRESET_KEYS`; a rate limit here never rotates keys either, it just waits and retries the same key. |
+| `OPENAI_MODELS` | `gpt-5.6-luna` | Comma-separated list of models this provider can use - same "first entry is the default" convention as `GOOGLE_MODELS`. |
+
+At least one of `OPENAI_API_KEY` or `OPENAI_PRESET_KEYS` must be set to
+select OpenAI via the model-selection UI, or `/api/translate` returns a 400
+("OpenAI API key is not configured").
+
+#### Model selection UI
+
+The header shows a model badge (next to the database connection badge)
+naming the model currently in use; clicking it opens a modal listing every
+provider's models (see the `*_MODELS` env vars above) as radio buttons,
+organized by provider (labeled Google/Anthropic/OpenAI). Saving a
+selection there persists it on the current session (`state_store.py`'s
+`llm_provider`/`llm_model` fields, same persistence mechanism the active
+database connection already uses) via `POST /api/config`, and every
+subsequent `/api/translate` call from that session uses it, though a
+request-body override (`gemini_model`/`claude_model`/`openai_model`/
+`model`) still wins over the session's saved choice when both are present.
+A session that has never saved a selection falls back to this app's one
+hardcoded default (`google` / `gemini-3.7-flash`), exactly as before this
+UI existed.
 
 ### Database connections
 
@@ -477,9 +537,10 @@ any kind:
   (auth, routes, all four backends, both state-store implementations, the
   full BigQuery billing-project policy and Snowflake credential policy).
   Everything is mocked at the library boundary (fake
-  `psycopg2`/`pymysql`/`bigquery`/`snowflake.connector`/`firestore`/`genai`
-  clients) - no real Postgres, MySQL, BigQuery, Snowflake, Firestore, or
-  Gemini API key is ever needed. Any service-account keys used in tests are freshly
+  `psycopg2`/`pymysql`/`bigquery`/`snowflake.connector`/`firestore`/`genai`/
+  `anthropic`/`openai` clients) - no real Postgres, MySQL, BigQuery,
+  Snowflake, Firestore, Gemini, Claude, or OpenAI API key is ever needed.
+  Any service-account keys used in tests are freshly
   generated, throwaway RSA keypairs, never real credentials.
 - **`tests/e2e/`** — a JS/TS Playwright suite driving a real browser
   against a real Flask server + real (isolated, gitignored) SQLite state
@@ -521,7 +582,7 @@ run alongside `./run_server.sh`'s normal dev server.
 
 ## Troubleshooting
 
-- **"Gemini API key is not configured."** — set `GEMINI_API_KEY`,
+- **"Google API key is not configured."** — set `GEMINI_API_KEY`,
   `GOOGLE_API_KEY`, or `GEMINI_PRESET_KEYS`.
 - **Cloud Run deploy fails at startup with a `RuntimeError` about
   Firestore** — `GCP_PROJECT_ID` (or equivalent) isn't resolving to a

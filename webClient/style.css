@@ -1371,6 +1371,16 @@ textarea:focus {
   font-weight: 400;
 }
 
+/* Standalone hint line under the MongoDB Atlas SQL ODBC field (not nested
+   inside a .custom-db-field-label, so the rule above doesn't reach it) -
+   deliberately smaller/lower-contrast than even that hint style. */
+.custom-db-mongo-hint {
+  display: block;
+  font-size: 0.6rem;
+  opacity: 0.45;
+  font-weight: 400;
+}
+
 .custom-db-field input,
 .custom-db-field select,
 .custom-db-field textarea {
