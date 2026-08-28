@@ -201,6 +201,7 @@ _DIALECT_PROMPT_INTROS = {
         "Each MongoDB collection is presented in the schema below as a table, and each of its (already type-inferred, already flattened) document fields as a column - the underlying documents are schemaless, so treat the schema as this driver's best-effort inference, not a guaranteed rigid structure the way a real RDBMS table is.\n"
         "Stick to the SQL-92 core (SELECT/FROM/WHERE/GROUP BY/HAVING/ORDER BY/LIMIT, standard aggregates, standard joins) rather than another dialect's vendor-specific functions or syntax extensions - MongoSQL does not implement Postgres/MySQL/T-SQL-specific functions.\n"
         "Use double quotes for identifiers that need quoting; string literals use single quotes only.\n"
+        "Wrap all column names inside backticks (`) to prevent clashing with reserved keywords.\n"
         "You may return one or more independent SELECT statements if the user's request calls for it.\n"
         "If asked to document the SQL command, add comments at the top of the query using the supported convention (if there is any) for how to mark comments.\n"
     ),
