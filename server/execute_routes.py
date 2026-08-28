@@ -12,6 +12,11 @@ backends/base.py) - this route no longer knows or cares whether it's
 talking to psycopg2, a BigQuery job client, or anything else. Its own job
 is just: resolve the connection, time the call, shape the HTTP response,
 and translate any backend exception into the existing error JSON shape.
+That execute() call is wrapped in a wall-clock bound (see
+SQL_EXECUTE_TIMEOUT_SECONDS/_execute_with_timeout below) so a runaway or
+stuck query fails with a clear timeout error instead of hanging the
+request forever - the execute-time counterpart to backends/base.py's
+DB_CONNECT_TIMEOUT_SECONDS, which only covers connect().
 
 A multi-statement script (semicolon-separated) that fails partway through
 raises backends.SqlExecutionError instead of a bare exception (see that
@@ -36,6 +41,8 @@ dot (see that route's own docstring for why it isn't just /api/execute
 with a hardcoded query string).
 """
 
+import concurrent.futures
+import os
 import time
 
 from flask import Blueprint, request, jsonify
@@ -46,6 +53,71 @@ from db import resolve_conn_str
 from backends import get_backend, SqlExecutionError
 
 execute_bp = Blueprint('execute', __name__)
+
+# --- SQL execution timeout ---------------------------------------------------
+# Bounds how long backend.execute() (below and in ping()) may run once a
+# connection is already open - the execute-time counterpart to
+# backends/base.py's DB_CONNECT_TIMEOUT_SECONDS, which only bounds connect().
+# Without this, a runaway or accidentally-huge query (or a connection that
+# goes silently dead mid-query) blocks the request indefinitely - same
+# unbounded-hang problem DB_CONNECT_TIMEOUT_SECONDS already solves for
+# connect(), just at the other end of the same call.
+#
+# Enforced generically (see _execute_with_timeout below) rather than via a
+# per-dialect driver kwarg the way DB_CONNECT_TIMEOUT_SECONDS threads
+# connect_timeout/tcp_connect_timeout/login_timeout per backend: there's no
+# one statement-timeout knob shared across the ~10 supported dialects
+# (BigQuery's is job-level, Sheets has no real query concept, MongoDB Atlas
+# SQL/Databricks/Snowflake each differ again), so chasing down and
+# maintaining a different driver-specific setting per backend isn't worth it
+# for what's fundamentally the same fix everywhere. One shared env var
+# covers all of them uniformly instead.
+#
+# 0 (or any non-positive value) disables this entirely - execute() then runs
+# exactly as it did before this was added, with no wall-clock bound at all.
+SQL_EXECUTE_TIMEOUT_SECONDS = float(os.environ.get("SQL_EXECUTE_TIMEOUT_SECONDS", 30))
+
+
+def _execute_with_timeout(backend, conn, sql_text):
+    """Runs backend.execute(conn, sql_text), bounded by
+    SQL_EXECUTE_TIMEOUT_SECONDS (see that constant's docstring for why this
+    is a generic thread-race rather than a per-backend driver setting).
+
+    This can only bound how long the CALLER waits, not truly cancel work
+    already in flight against the database - the executing thread is simply
+    abandoned once the timeout fires (its eventual result or exception is
+    discarded), left for the existing `finally: backend.close(conn)` in
+    execute_query()/ping() to clean up. Closing `conn` from the caller's
+    thread while the abandoned thread may still be blocked on it (a network
+    read, typically) is what actually nudges most drivers to unblock and
+    give up rather than hang forever - a best-effort nudge, not a
+    guarantee, and driver-specific in exactly how it behaves. Either way
+    `conn` must be treated as dead the moment this raises; nothing here
+    tries to reuse it afterward.
+
+    Raises the original exception unchanged on any non-timeout failure
+    (a real SqlExecutionError or any other backend.execute() exception) -
+    only a timeout gets a new, friendlier TimeoutError raised in its place.
+    """
+    if SQL_EXECUTE_TIMEOUT_SECONDS <= 0:
+        return backend.execute(conn, sql_text)
+
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        future = pool.submit(backend.execute, conn, sql_text)
+        try:
+            return future.result(timeout=SQL_EXECUTE_TIMEOUT_SECONDS)
+        except concurrent.futures.TimeoutError:
+            raise TimeoutError(
+                f"Query execution timed out after {SQL_EXECUTE_TIMEOUT_SECONDS:g} seconds"
+            ) from None
+    finally:
+        # wait=False, always - see docstring: the whole point of this
+        # timeout is that the caller must not block on the abandoned
+        # thread, and a `with ThreadPoolExecutor(...)` block (or an
+        # explicit wait=True shutdown) would do exactly that by waiting
+        # for it to finish before letting this function return/raise.
+        pool.shutdown(wait=False)
 
 
 @execute_bp.route('/api/execute', methods=['POST'])
@@ -71,7 +143,7 @@ def execute_query():
         backend = get_backend(descriptor)
         conn = backend.connect(descriptor)
 
-        results = backend.execute(conn, raw_query)
+        results = _execute_with_timeout(backend, conn, raw_query)
         total_row_count = sum(r.get('rowCount', 0) for r in results)
 
         execution_time_ms = round((time.time() - start_time) * 1000)
@@ -155,7 +227,7 @@ def ping():
     try:
         backend = get_backend(descriptor)
         conn = backend.connect(descriptor)
-        backend.execute(conn, backend.liveness_sql)
+        _execute_with_timeout(backend, conn, backend.liveness_sql)
         resp = jsonify({'success': True})
         return apply_session_cookie(resp, session_id)
     except Exception as e:

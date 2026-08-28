@@ -22,11 +22,14 @@ gets a fresh reimport, silently failing execute_routes.py's `except
 SqlExecutionError` isinstance check.
 """
 
+import threading
+import time
+
 import pytest
 
 
 class _FakeBackend:
-    def __init__(self, results=None, raise_exc=None, connect_exc=None, liveness_sql="SELECT 1"):
+    def __init__(self, results=None, raise_exc=None, connect_exc=None, liveness_sql="SELECT 1", delay=0):
         self._results = results if results is not None else []
         self._raise_exc = raise_exc
         self._connect_exc = connect_exc
@@ -38,6 +41,18 @@ class _FakeBackend:
         # this attribute (not a hardcoded string) that gets executed.
         self.liveness_sql = liveness_sql
         self.executed_sql = None
+        # Seconds execute() blocks before returning/raising - see
+        # test_execute_times_out_and_returns_friendly_error below (and its
+        # neighbors), the only tests that pass a nonzero delay to simulate a
+        # runaway/hung query against _execute_with_timeout's thread race.
+        self._delay = delay
+        # Set once execute()'s sleep actually finishes - lets a timeout test
+        # confirm the abandoned worker thread really did keep running past
+        # the timeout (proving the timeout fired while it was still in
+        # flight, not just because it happened to be slower than expected)
+        # without the test itself needing to sleep any longer than the
+        # timeout it's testing.
+        self.execute_finished = threading.Event()
 
     def connect(self, descriptor):
         if self._connect_exc:
@@ -50,6 +65,9 @@ class _FakeBackend:
 
     def execute(self, connection, sql_text):
         self.executed_sql = sql_text
+        if self._delay:
+            time.sleep(self._delay)
+        self.execute_finished.set()
         if self._raise_exc:
             raise self._raise_exc
         return self._results
@@ -202,6 +220,89 @@ def test_execute_sets_session_cookie(app_env, monkeypatch):
     _patch_backend(monkeypatch, app_env, fake)
     resp = app_env.client.post('/api/execute', json={'sql': 'SELECT 1;'})
     assert "crbot_session_id" in resp.headers.get("Set-Cookie", "")
+
+
+# --- SQL execution timeout ---------------------------------------------------
+# SQL_EXECUTE_TIMEOUT_SECONDS/_execute_with_timeout - the execute-time
+# counterpart to DB_CONNECT_TIMEOUT_SECONDS (backends/base.py), which only
+# bounds connect(). _FakeBackend's `delay` param (see its docstring above)
+# simulates a runaway/hung query long enough for the timeout to actually
+# fire mid-flight, using a tiny SQL_EXECUTE_TIMEOUT_SECONDS so these tests
+# stay fast rather than actually waiting out a realistic default.
+
+def test_sql_execute_timeout_seconds_defaults_to_30(app_env):
+    assert app_env.execute_routes.SQL_EXECUTE_TIMEOUT_SECONDS == 30
+
+
+def test_sql_execute_timeout_seconds_env_var_overrides_default(app_factory):
+    env = app_factory(env={"SQL_EXECUTE_TIMEOUT_SECONDS": "5"})
+    assert env.execute_routes.SQL_EXECUTE_TIMEOUT_SECONDS == 5
+
+
+def test_execute_times_out_and_returns_friendly_error(app_factory, monkeypatch):
+    env = app_factory(env={"SQL_EXECUTE_TIMEOUT_SECONDS": "0.05"})
+    fake = _FakeBackend(
+        results=[{"statement": "SELECT pg_sleep(999)", "columns": None, "rows": None, "rowCount": 0}],
+        delay=0.3,
+    )
+    _patch_backend(monkeypatch, env, fake)
+    resp = env.client.post('/api/execute', json={'sql': 'SELECT pg_sleep(999);'})
+    assert resp.status_code == 400
+    data = resp.get_json()
+    assert data['success'] is False
+    assert data['error'] == "Query execution timed out after 0.05 seconds"
+    # No partial-results keys - a timeout isn't a SqlExecutionError, so it
+    # keeps the same flat shape any other plain backend.execute() exception
+    # produces (see test_execute_failure_returns_raw_error_message above).
+    assert 'results' not in data
+    # Proves this test actually exercised the timeout path (the abandoned
+    # worker thread was still mid-sleep when the response was built), not
+    # just that the fake happened to be a bit slow.
+    assert not fake.execute_finished.is_set()
+    # Let the abandoned thread actually finish before the test ends, so it
+    # doesn't leak past this test's own lifetime.
+    fake.execute_finished.wait(timeout=1)
+
+
+def test_execute_closes_connection_after_timeout(app_factory, monkeypatch):
+    env = app_factory(env={"SQL_EXECUTE_TIMEOUT_SECONDS": "0.05"})
+    fake = _FakeBackend(results=[], delay=0.3)
+    _patch_backend(monkeypatch, env, fake)
+    env.client.post('/api/execute', json={'sql': 'SELECT 1;'})
+    # The existing finally-block close() (execute_query()'s own, not
+    # _execute_with_timeout's) still runs after a timeout, same as any
+    # other failure.
+    assert fake.closed_conn is not None
+    fake.execute_finished.wait(timeout=1)
+
+
+def test_sql_execute_timeout_disabled_when_set_to_zero(app_factory, monkeypatch):
+    env = app_factory(env={"SQL_EXECUTE_TIMEOUT_SECONDS": "0"})
+    fake = _FakeBackend(
+        results=[{"statement": "SELECT 1", "columns": ["x"], "rows": [{"x": 1}], "rowCount": 1}],
+        delay=0.1,
+    )
+    _patch_backend(monkeypatch, env, fake)
+    resp = env.client.post('/api/execute', json={'sql': 'SELECT 1;'})
+    # 0 disables the timeout entirely (see SQL_EXECUTE_TIMEOUT_SECONDS's
+    # docstring) - a query slower than what a nonzero timeout would have
+    # allowed still succeeds.
+    assert resp.status_code == 200
+    assert resp.get_json()['success'] is True
+
+
+def test_ping_times_out_and_returns_success_false(app_factory, monkeypatch):
+    env = app_factory(env={"SQL_EXECUTE_TIMEOUT_SECONDS": "0.05"})
+    fake = _FakeBackend(results=[], delay=0.3)
+    _patch_backend(monkeypatch, env, fake)
+    resp = env.client.get('/api/ping')
+    # Same "never leak error detail" posture as any other /api/ping failure
+    # (see test_ping_query_failure_returns_400_and_success_false_without_
+    # leaking_error_detail above) - a timeout is just another failure as far
+    # as /api/ping's response shape is concerned.
+    assert resp.status_code == 400
+    assert resp.get_json() == {"success": False}
+    fake.execute_finished.wait(timeout=1)
 
 
 # --- /api/ping ---------------------------------------------------------------

@@ -197,6 +197,7 @@ just covers the env vars for the three that exist today.
 |---|---|---|
 | `MAX_TRANSLATION_ATTEMPTS` | `5` | Max attempts (initial call + retries) for a single translation request before giving up, for transient (rate-limit/server-error/connection) failures. Shared by all three providers — see [`translate_routes.py`](./server/translate_routes.py). (Formerly `MAX_GEMINI_ATTEMPTS`.) |
 | `TRANSLATION_RETRY_DELAY_SECONDS` | `1` | Seconds to wait between transient-error retry attempts. Shared by all three providers. (Formerly `GEMINI_RETRY_DELAY_SECONDS`.) |
+| `TRANSLATION_TIMEOUT_SECONDS` | `60` | How long one call to the configured LLM provider may take before it's treated as a timeout (a retryable transient failure, same as a 5xx — see `MAX_TRANSLATION_ATTEMPTS` above). Shared by all three providers. |
 
 #### Google (Gemini)
 
@@ -259,6 +260,8 @@ UI existed.
 | Variable | Default | Purpose |
 |---|---|---|
 | `DATABASE_PRESETS_FILE` | — (no presets) | Path to a JSON file listing the admin-configured preset connections shown in the UI. Supports Postgres, MySQL, and BigQuery presets — see the shape below. If unset, the app falls back to a single synthetic "Default DB" Postgres preset pointing at `postgresql://postgres:password@host:23456/defaultdb?sslmode=verify-full`. |
+| `DB_CONNECT_TIMEOUT_SECONDS` | `10` | Bounds how long establishing a new database connection may take, so a wrong/unreachable host fails fast instead of hanging indefinitely. Covers every dialect except Databricks (no connect-only timeout knob in its driver) and BigQuery (doesn't dial out synchronously). See [`backends/base.py`](./server/backends/base.py). |
+| `SQL_EXECUTE_TIMEOUT_SECONDS` | `30` | Bounds how long running a query may take once the connection is already open — the execute-time counterpart to `DB_CONNECT_TIMEOUT_SECONDS` above. Applies to `/api/execute` and the `/api/ping` liveness check. Set to `0` to disable. See [`execute_routes.py`](./server/execute_routes.py). |
 
 `DATABASE_PRESETS_FILE` points at a file rather than holding the JSON
 inline in an env var, so presets can be written multi-line and reviewed

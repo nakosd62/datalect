@@ -57,6 +57,16 @@ from google.genai import types
 from google.genai import errors as genai_errors
 import anthropic
 import openai
+import httpx
+try:
+    # google-genai vendors a drop-in httpx fork under this separate import
+    # namespace for some of its internal transport - see
+    # _classify_gemini_error's TRANSLATION_TIMEOUT_SECONDS case below for
+    # why both need checking. Not a direct dependency of this app; guarded
+    # in case a future google-genai release drops it.
+    import httpx2
+except ImportError:  # pragma: no cover - present today via google-genai
+    httpx2 = None
 
 # from app_config import logger, log_and_generalize_error
 from app_config import logger, state_store
@@ -268,6 +278,41 @@ HISTORY_MAX_TURNS = int(os.environ.get("HISTORY_MAX_TURNS", 10))
 # needs updating.
 MAX_TRANSLATION_ATTEMPTS = int(os.environ.get("MAX_TRANSLATION_ATTEMPTS", 5))
 TRANSLATION_RETRY_DELAY_SECONDS = float(os.environ.get("TRANSLATION_RETRY_DELAY_SECONDS", 1))
+
+# --- LLM call timeout --------------------------------------------------------
+# Bounds how long ONE call to the configured LLM provider (Gemini/Claude/
+# OpenAI) may take, threaded into each provider's make_client() below - the
+# same "a hung network call must fail fast instead of blocking forever"
+# problem backends/base.py's DB_CONNECT_TIMEOUT_SECONDS solves for a stalled
+# DB connect() (see that constant's docstring for the fuller threaded=True/
+# blast-radius reasoning, which applies identically here: server.py handles
+# one request at a time per worker, so a single hung LLM call still stalls
+# every other user's request for however long it hangs, unbounded, without
+# this). Deliberately one shared knob across all three providers rather than
+# a per-provider *_TIMEOUT_SECONDS - the failure mode ("this provider isn't
+# responding") is identical regardless of which one a session happens to be
+# using, same reasoning DB_CONNECT_TIMEOUT_SECONDS already applies across
+# every SQL dialect.
+#
+# Each SDK is handed this in whatever unit/shape IT expects (see each
+# make_client() below) rather than a shared wrapper, since the three differ:
+# anthropic.Anthropic/openai.OpenAI both take a plain `timeout=<seconds>`
+# kwarg directly, while google-genai's genai.Client takes it in milliseconds
+# via a nested HttpOptions object.
+#
+# A timeout is just another transient failure to the existing retry loop
+# (see MAX_TRANSLATION_ATTEMPTS/TRANSLATION_RETRY_DELAY_SECONDS above and
+# each provider's classify_error) - no separate handling needed there.
+# anthropic.APITimeoutError/openai.APITimeoutError both already subclass
+# their SDK's APIConnectionError, which _classify_claude_error/
+# _classify_openai_error already retry. google-genai has no equivalent typed
+# exception - a timeout there surfaces as a raw httpx.TimeoutException (or
+# httpx2.TimeoutException - see the import above) instead, since this app
+# doesn't opt into google-genai's own separate, SDK-internal retry_options
+# (which would otherwise silently multiply this timeout by however many
+# attempts that's configured for); _classify_gemini_error below has a
+# dedicated case for it, treated the same as a transient 5xx.
+TRANSLATION_TIMEOUT_SECONDS = float(os.environ.get("TRANSLATION_TIMEOUT_SECONDS", 60))
 
 
 def get_gemini_api_keys():
@@ -485,6 +530,18 @@ def _classify_gemini_error(exc):
     # exact same thing again.
     is_server_error = (isinstance(code, int) and 500 <= code < 600) or isinstance(exc, genai_errors.ServerError)
     if is_server_error:
+        return {"rotate_key": False, "delay": TRANSLATION_RETRY_DELAY_SECONDS}
+
+    # TRANSLATION_TIMEOUT_SECONDS exceeded (see that constant's docstring) -
+    # google-genai has no typed timeout exception the way anthropic/openai
+    # do, so this surfaces as a raw httpx.TimeoutException/httpx2.
+    # TimeoutException instead, with no .code/.status_code for
+    # _gemini_error_code above to find. Treated the same as the 5xx case
+    # just above: same key, retry after TRANSLATION_RETRY_DELAY_SECONDS -
+    # a timeout is exactly the kind of transient condition that delay is
+    # meant to give a moment to clear.
+    timeout_exc_types = (httpx.TimeoutException,) if httpx2 is None else (httpx.TimeoutException, httpx2.TimeoutException)
+    if isinstance(exc, timeout_exc_types):
         return {"rotate_key": False, "delay": TRANSLATION_RETRY_DELAY_SECONDS}
 
     return None
@@ -962,7 +1019,13 @@ class GeminiProvider(LlmProvider):
         return pick_gemini_api_key(exclude=exclude)
 
     def make_client(self, api_key):
-        return genai.Client(api_key=api_key)
+        # http_options.timeout is milliseconds, unlike anthropic's/openai's
+        # plain-seconds `timeout` kwarg (see ClaudeProvider's/OpenAiProvider's
+        # make_client() below) - see TRANSLATION_TIMEOUT_SECONDS's docstring.
+        return genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(timeout=int(TRANSLATION_TIMEOUT_SECONDS * 1000)),
+        )
 
     def build_llm_input(self, history, schema_block, new_prompt_content):
         contents = build_gemini_history_contents(history)
@@ -1001,7 +1064,9 @@ class ClaudeProvider(LlmProvider):
         return pick_claude_api_key(exclude=exclude)
 
     def make_client(self, api_key):
-        return anthropic.Anthropic(api_key=api_key)
+        # See TRANSLATION_TIMEOUT_SECONDS's docstring - this SDK takes a
+        # plain seconds value directly, unlike GeminiProvider's milliseconds.
+        return anthropic.Anthropic(api_key=api_key, timeout=TRANSLATION_TIMEOUT_SECONDS)
 
     def build_llm_input(self, history, schema_block, new_prompt_content):
         messages = build_claude_history_messages(history)
@@ -1056,7 +1121,9 @@ class OpenAiProvider(LlmProvider):
         return pick_openai_api_key(exclude=exclude)
 
     def make_client(self, api_key):
-        return openai.OpenAI(api_key=api_key)
+        # See TRANSLATION_TIMEOUT_SECONDS's docstring - same plain-seconds
+        # kwarg as ClaudeProvider's make_client() above.
+        return openai.OpenAI(api_key=api_key, timeout=TRANSLATION_TIMEOUT_SECONDS)
 
     def build_llm_input(self, history, schema_block, new_prompt_content):
         # Structurally identical to GeminiProvider's version above (prepend

@@ -1271,13 +1271,14 @@ textarea:focus {
 
 .custom-db-toggle-btn,
 .custom-db-remove-btn {
+  /* Doubled from the original 0.15rem 0.6rem padding / 0.7rem font-size -
+     these are the only way to expand/collapse or delete a saved custom
+     connection, so they need to read as clearly clickable rather than
+     blend into the row alongside the type/name fields. */
   flex: 0 0 auto;
-  padding: 0.15rem 0.6rem;
+  padding: 0.3rem 1.2rem;
   line-height: 1;
-}
-
-.custom-db-toggle-btn {
-  font-size: 0.7rem;
+  font-size: 1.4rem;
 }
 
 .custom-db-field-row {

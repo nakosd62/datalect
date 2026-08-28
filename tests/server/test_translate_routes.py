@@ -64,6 +64,7 @@ and test_exhausts_all_retry_attempts_and_reports_failure_in_body() below.
 import types as pytypes
 
 import anthropic
+import httpx
 import openai
 import pytest
 
@@ -90,6 +91,7 @@ class GenaiHarness:
     def __init__(self):
         self.queue = []  # list of FakeGenaiResponse or Exception instances
         self.client_api_keys = []  # api_key each Client(...) was constructed with
+        self.client_http_options = []  # http_options each Client(...) was constructed with
         self.generate_calls = []  # kwargs of each generate_content call
 
     def queue_response(self, resp):
@@ -115,9 +117,10 @@ class GenaiHarness:
                 return item
 
         class FakeClient:
-            def __init__(self, api_key=None):
+            def __init__(self, api_key=None, http_options=None):
                 self.api_key = api_key
                 harness.client_api_keys.append(api_key)
+                harness.client_http_options.append(http_options)
                 self.models = FakeModels()
 
         return FakeClient
@@ -495,6 +498,54 @@ def test_translation_retry_delay_seconds_env_var_is_used_as_sleep_duration(app_f
     assert sleep_calls == [3.5]
 
 
+def test_translation_timeout_seconds_defaults_to_60(app_env):
+    assert app_env.translate_routes.TRANSLATION_TIMEOUT_SECONDS == 60
+
+
+def test_translation_timeout_seconds_env_var_overrides_default(app_factory):
+    env = app_factory(env={"TRANSLATION_TIMEOUT_SECONDS": "15"})
+    assert env.translate_routes.TRANSLATION_TIMEOUT_SECONDS == 15
+
+
+def test_gemini_client_is_constructed_with_translation_timeout_in_milliseconds(app_factory, monkeypatch):
+    # google-genai's http_options.timeout is milliseconds, unlike anthropic's/
+    # openai's plain-seconds `timeout` kwarg - see GeminiProvider.make_client's
+    # comment and TRANSLATION_TIMEOUT_SECONDS's docstring.
+    env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1", "TRANSLATION_TIMEOUT_SECONDS": "45"})
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(FakeGenaiResponse("SELECT 1;"))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'hi'})
+    assert resp.status_code == 200
+    parse_translate_stream(resp)
+    assert len(harness.client_http_options) == 1
+    assert harness.client_http_options[0].timeout == 45000
+
+
+def test_classify_gemini_error_retries_httpx_timeout_with_same_key(app_factory, monkeypatch):
+    """A TRANSLATION_TIMEOUT_SECONDS timeout surfaces as a raw
+    httpx.TimeoutException (google-genai has no typed timeout exception the
+    way anthropic/openai do - see _classify_gemini_error's added case and
+    TRANSLATION_TIMEOUT_SECONDS's docstring), and should retry with the same
+    key after TRANSLATION_RETRY_DELAY_SECONDS, same as a transient 5xx."""
+    env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    monkeypatch.setattr(env.translate_routes.time, "sleep", lambda *a, **k: None)
+    harness.queue_error(httpx.TimeoutException("timed out"))
+    harness.queue_response(FakeGenaiResponse("SELECT 1;"))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'hi'})
+    assert resp.status_code == 200
+    retry_events, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    assert len(retry_events) == 1
+    assert retry_events[0]["rotatedKey"] is False
+    assert len(harness.client_api_keys) == 1  # same client/key reused, no rotation
+    assert len(harness.generate_calls) == 2
+
+
 def test_sets_session_cookie(app_factory, monkeypatch):
     env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
     harness = GenaiHarness()
@@ -757,6 +808,7 @@ class ClaudeHarness:
     def __init__(self):
         self.queue = []  # list of FakeClaudeResponse or Exception instances
         self.client_api_keys = []  # api_key each Anthropic(...) was constructed with
+        self.client_timeouts = []  # timeout each Anthropic(...) was constructed with
         self.create_calls = []  # kwargs of each messages.create call
 
     def queue_response(self, resp):
@@ -782,9 +834,10 @@ class ClaudeHarness:
                 return item
 
         class FakeClient:
-            def __init__(self, api_key=None):
+            def __init__(self, api_key=None, timeout=None):
                 self.api_key = api_key
                 harness.client_api_keys.append(api_key)
+                harness.client_timeouts.append(timeout)
                 self.messages = FakeMessages()
 
         return FakeClient
@@ -848,6 +901,23 @@ def test_claude_success_strips_markdown_fences_and_returns_token_counts(app_fact
     # rather than provider-specific missing fields.
     assert data['thinking_tokens'] == 0
     assert data['cached_content_tokens'] == 0
+
+
+def test_claude_client_is_constructed_with_translation_timeout_in_seconds(app_factory, monkeypatch):
+    # Unlike GeminiProvider's milliseconds (see that test in the Gemini
+    # section above), anthropic.Anthropic takes a plain seconds value - see
+    # ClaudeProvider.make_client's comment and TRANSLATION_TIMEOUT_SECONDS's
+    # docstring.
+    env = app_factory(env={"ANTHROPIC_API_KEY": "fake-key-1", "TRANSLATION_TIMEOUT_SECONDS": "45"})
+    select_llm_provider(env, "anthropic")
+    harness = ClaudeHarness()
+    monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
+    harness.queue_response(FakeClaudeResponse("SELECT 1;"))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'hi'})
+    assert resp.status_code == 200
+    parse_translate_stream(resp)
+    assert harness.client_timeouts == [45]
 
 
 def test_claude_success_records_translation_history(app_factory, monkeypatch):
@@ -1353,6 +1423,7 @@ class OpenAiHarness:
     def __init__(self):
         self.queue = []  # list of FakeOpenAiResponse or Exception instances
         self.client_api_keys = []  # api_key each OpenAI(...) was constructed with
+        self.client_timeouts = []  # timeout each OpenAI(...) was constructed with
         self.create_calls = []  # kwargs of each responses.create call
 
     def queue_response(self, resp):
@@ -1378,9 +1449,10 @@ class OpenAiHarness:
                 return item
 
         class FakeClient:
-            def __init__(self, api_key=None):
+            def __init__(self, api_key=None, timeout=None):
                 self.api_key = api_key
                 harness.client_api_keys.append(api_key)
+                harness.client_timeouts.append(timeout)
                 self.responses = FakeResponses()
 
         return FakeClient
@@ -1448,6 +1520,21 @@ def test_openai_success_strips_markdown_fences_and_returns_token_counts(app_fact
     assert data['total_tokens'] == 28
     assert data['input_tokens'] == 20
     assert data['output_tokens'] == 8
+
+
+def test_openai_client_is_constructed_with_translation_timeout_in_seconds(app_factory, monkeypatch):
+    # Same plain-seconds kwarg as ClaudeProvider's - see that test in the
+    # Anthropic section above.
+    env = app_factory(env={"OPENAI_API_KEY": "fake-key-1", "TRANSLATION_TIMEOUT_SECONDS": "45"})
+    select_llm_provider(env, "openai")
+    harness = OpenAiHarness()
+    monkeypatch.setattr(env.translate_routes.openai, "OpenAI", harness.make_client_class())
+    harness.queue_response(FakeOpenAiResponse("SELECT 1;"))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'hi'})
+    assert resp.status_code == 200
+    parse_translate_stream(resp)
+    assert harness.client_timeouts == [45]
 
 
 def test_openai_success_records_translation_history(app_factory, monkeypatch):
