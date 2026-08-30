@@ -699,6 +699,38 @@ def test_history_result_truncation_reaches_the_real_claude_call(app_factory, mon
     assert "[3]" not in history_text
 
 
+# --- Google Sheets (GViz) dialect intro: comments stay forbidden ---------------
+# GViz has no comment syntax at all (see backends/sheets.py's module
+# docstring), so this dialect's intro tells the model to never add one,
+# unconditionally - unlike every other dialect, nothing ever asks the model
+# to write a '-- database: ...' marker line itself; in "all databases" mode
+# that marker is always prepended mechanically, server-side, after
+# generation returns (see translate_routes.py's _classify_generation_outcome
+# and execute_routes.py's _strip_database_marker_lines), so there's no
+# contradiction for this test to guard against beyond the plain rule itself.
+
+def test_sheets_dialect_intro_still_forbids_comments_generally(app_env):
+    intro = app_env.translate_routes._DIALECT_PROMPT_INTROS["Google Visualization API Query Language"]
+    assert "NEVER add any comments" in intro
+
+
+# --- "All databases" mode, Phase C summary prompt: one paragraph per database ---
+# The real per-database paragraph breaks (and the brevity of each one) are
+# entirely down to what this prompt asks the LLM for - nothing client-side
+# enforces the shape (renderMarkdownLite() just honors whatever blank
+# lines/bold the model produced, same as any other free-text reply) - so
+# this guards the prompt text itself, the only place this behavior is
+# actually specified.
+def test_summary_prompt_asks_for_one_paragraph_per_database(app_env):
+    instruction = app_env.translate_routes._SUMMARY_SYSTEM_INSTRUCTION
+    assert "PER DATABASE" in instruction
+    assert "brief" in instruction.lower()
+    assert "blank line" in instruction.lower()
+    # Still allows a single combined figure for a question that genuinely
+    # needs one (e.g. a grand total) - just not as the default shape.
+    assert "combined" in instruction.lower()
+
+
 # --- History turn-count cap (HISTORY_MAX_TURNS) ---
 # Separate lever from HISTORY_RESULT_MAX_ROWS above: that one trims the row
 # data WITHIN a turn's results; this one drops whole OLDER turns outright.
@@ -1152,23 +1184,20 @@ def test_claude_schema_block_is_cache_control_marked_even_with_no_history(app_fa
 
 
 def test_claude_build_llm_input_with_no_history_and_no_schema_sends_one_unmarked_block(app_factory):
-    """Regression test: connection_router.py's Phase A always calls
-    build_llm_input(history=[], schema_block="", ...) - there's no schema
-    in play at that stage at all (see that module's docstring). Before this
-    was special-cased, an empty history fell into the same "conversation's
-    very first call" branch test_claude_schema_attaches_to_new_prompt_when_
-    there_is_no_history above covers - which unconditionally cache_control-
-    marks the schema block, even when it's "". Anthropic rejects
-    cache_control on an empty text block outright ("cache_control cannot
-    be set for empty text blocks"), so every Phase A call to Claude used to
-    fail with a 400 - select_relevant_connections has no way to tell that
-    apart from a genuine transient error, so it just retried once, failed
-    identically, and silently fell back to candidate 0 every single time,
-    regardless of the question. This test pins down the fix
-    directly at the build_llm_input level: an empty schema_block with no
-    history produces exactly one content block (the new prompt, as a plain
-    string - not a content-block list at all), never an empty
-    cache_control-marked block."""
+    """Regression test: connection_router.py's triage_all_mode_question
+    always calls build_llm_input(history=[], schema_block="", ...) - there's
+    no schema in play at that stage at all (see that module's docstring).
+    Before this was special-cased, an empty history fell into the same
+    "conversation's very first call" branch
+    test_claude_schema_attaches_to_new_prompt_when_there_is_no_history above
+    covers - which unconditionally cache_control-marks the schema block,
+    even when it's "". Anthropic rejects cache_control on an empty text
+    block outright ("cache_control cannot be set for empty text blocks"),
+    so every triage call to Claude used to fail with a 400 outright. This
+    test pins down the fix directly at the build_llm_input level: an empty
+    schema_block with no history produces exactly one content block (the
+    new prompt, as a plain string - not a content-block list at all), never
+    an empty cache_control-marked block."""
     env = app_factory(env={"ANTHROPIC_API_KEY": "fake-key-1"})
     provider = env.translate_routes.ClaudeProvider()
 

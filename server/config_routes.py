@@ -249,9 +249,9 @@ config_bp = Blueprint('config', __name__)
 # there for why: it's the single cap on how many database connections are
 # involved anywhere in the multi-database question-answering feature (both
 # how many a user may mark "in scope" here, and how many of those
-# in-scope connections one question's Phase A routing may select -
-# connection_router.py's select_relevant_connections), no longer two
-# separate constants to keep in sync.
+# in-scope connections "all databases" mode's triage - connection_router.
+# py's triage_all_mode_question - may select for one question), no longer
+# two separate constants to keep in sync.
 
 # These 7 dialects have no real url of their own - what used to be stored
 # as "url" for a CUSTOM connection of one of these types was always a
@@ -1348,6 +1348,19 @@ def handle_config():
         if not isinstance(new_auto_sql_execute, bool):
             new_auto_sql_execute = None
 
+        # Theme (Preferences modal's color-scheme choice) - an independent
+        # concern from every other field here (same "a request can touch
+        # one, the other, both, or neither" reasoning as auto_sql_execute),
+        # persisted per session/user rather than only in the browser's
+        # localStorage (see state_store.py's get_session/set_session
+        # docstrings). Only "dark"/"light" are accepted; anything else is
+        # silently ignored (left as None -> "don't change this") rather
+        # than persisting garbage that then breaks client.js's own
+        # data-theme reconciliation on the next load.
+        new_theme = data.get('theme')
+        if new_theme not in ('dark', 'light'):
+            new_theme = None
+
         # LLM provider/model selection - an independent concern from the
         # database connection fields above/below (same "a request can touch
         # one, the other, both, or neither" reasoning as auto_sql_execute),
@@ -1483,6 +1496,7 @@ def handle_config():
                 in_scope_preset_ids=new_in_scope_preset_ids_to_save,
                 in_scope_custom_connection_keys=new_in_scope_custom_keys_to_save,
                 in_scope_mode=new_in_scope_mode_to_save,
+                theme=new_theme,
             )
         elif is_custom:
             new_db_type, new_db_url, new_db_config, connection_error = _parse_incoming_connection(
@@ -1602,6 +1616,7 @@ def handle_config():
                     in_scope_preset_ids=new_in_scope_preset_ids_to_save,
                     in_scope_custom_connection_keys=new_in_scope_custom_keys_to_save,
                     in_scope_mode=new_in_scope_mode_to_save,
+                    theme=new_theme,
                 )
                 if db_name_to_save is not None:
                     # new_db_url_to_persist, not new_db_url: for the 7
@@ -1618,7 +1633,7 @@ def handle_config():
                     custom_list_saved = True
         elif (new_auto_sql_execute is not None or new_llm_provider is not None or new_llm_model is not None
               or new_in_scope_preset_ids_to_save is not None or new_in_scope_custom_keys_to_save is not None
-              or new_in_scope_mode_to_save is not None):
+              or new_in_scope_mode_to_save is not None or new_theme is not None):
             # Neither a preset nor a custom connection was actively
             # selected in this request (e.g. only the auto-execute toggle
             # changed, only the in-scope checkboxes changed, or - the
@@ -1635,6 +1650,7 @@ def handle_config():
                 in_scope_preset_ids=new_in_scope_preset_ids_to_save,
                 in_scope_custom_connection_keys=new_in_scope_custom_keys_to_save,
                 in_scope_mode=new_in_scope_mode_to_save,
+                theme=new_theme,
             )
 
         if not custom_list_saved and merged_custom_databases is not None:
@@ -1659,6 +1675,14 @@ def handle_config():
     active_db_type = active_descriptor.get("type") or "postgres"
     active_db_config = {k: v for k, v in active_descriptor.items() if k not in ("type", "url")}
     auto_sql_execute = session_data["auto_sql_execute"]
+    # "" ("nothing explicitly saved yet") is echoed back as-is, not coerced
+    # to "dark" here - client.js's fetchBackendConfig() is what decides
+    # whether a blank value means "leave the client's own current/
+    # localStorage theme alone" vs. applying an explicitly-saved one (see
+    # that function's own reasoning), same blank-means-unset handling
+    # active_llm_provider/active_llm_model do NOT need (those always
+    # resolve to a concrete default here) but connection_id-style fields do.
+    saved_theme = session_data.get("theme") or ""
 
     # A blank/never-set session field falls back to get_llm_provider()'s own
     # hardcoded default (Google), exactly like translate_query()'s own
@@ -1938,6 +1962,10 @@ def handle_config():
         'active_llm_provider': active_llm_provider,
         'active_llm_model': active_llm_model,
         'auto_sql_execute': auto_sql_execute,
+        # "" means "nothing explicitly saved server-side yet" - client.js's
+        # fetchBackendConfig() is what decides what to do with that (see
+        # this file's own comment above saved_theme's assignment).
+        'theme': saved_theme,
         # So the client's own turn-navigation cap (chatStore in client.js)
         # can match the number of turns /api/translate actually replays to
         # the LLM, rather than carrying an independent hardcoded constant

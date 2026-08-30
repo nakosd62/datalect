@@ -262,6 +262,20 @@ def parse_translate_stream(resp):
     return retry_events, final_data
 
 
+def parse_translate_stream_events(resp):
+    """Like parse_translate_stream above, but returns EVERY parsed NDJSON
+    line in arrival order, unfiltered - needed by tests asserting on the
+    "all databases" mode streaming events (`phase_a_route`/
+    `phase_b_connection_done` - see translate_routes.py's
+    stream_translation() docstring) that parse_translate_stream's
+    retry_events/final_data split doesn't surface at all (it only ever
+    looks at "retrying" lines and the true last line). The terminal
+    {"status": "done", ...} line is always parsed[-1] here, same
+    guarantee parse_translate_stream relies on."""
+    lines = [ln for ln in resp.get_data(as_text=True).splitlines() if ln.strip()]
+    return [json.loads(ln) for ln in lines]
+
+
 def write_database_presets_file(tmp_path, presets, filename="database_presets.json"):
     """Writes `presets` (a list of preset dicts) as JSON to a file under
     `tmp_path` and returns its absolute path string, ready to hand to

@@ -79,4 +79,45 @@ test.describe('first-run onboarding', () => {
       expect(Math.abs(spotlightBox.y - badgeBox.y)).toBeLessThan(10);
     }).toPass({ timeout: 2000 });
   });
+
+  test('the tour includes a step spotlighting the Preferences gear button', async ({ page }) => {
+    await page.goto('/');
+    await expect(page.locator('#tourOverlay')).not.toHaveClass(/hidden/);
+
+    // Same "click Next until the title shows up" approach as the
+    // model-badge test above - getTourSteps() places this step right
+    // after the model badge one, at desktop width (under the narrow-
+    // header breakpoint it's folded into the combined more-menu step
+    // instead - see that step's own body text, covered separately below).
+    const title = page.locator('#tourTooltipTitle');
+    for (let i = 0; i < 10; i++) {
+      if ((await title.textContent()) === 'Make it yours') break;
+      await page.locator('#tourNextBtn').click();
+    }
+    await expect(title).toHaveText('Make it yours');
+    await expect(page.locator('#tourTooltipBody')).toContainText('dark and light mode');
+
+    // The spotlight is actually positioned over the gear button, not some
+    // other element - same regression guard as the model-badge test.
+    const gearBox = await page.locator('#prefsBtn').boundingBox();
+    await expect(async () => {
+      const spotlightBox = await page.locator('#tourSpotlight').boundingBox();
+      expect(Math.abs(spotlightBox.x - gearBox.x)).toBeLessThan(10);
+      expect(Math.abs(spotlightBox.y - gearBox.y)).toBeLessThan(10);
+    }).toPass({ timeout: 2000 });
+  });
+
+  test('on a narrow (mobile) header, the combined more-menu tour step also mentions Preferences', async ({ page }) => {
+    await page.setViewportSize({ width: 420, height: 800 });
+    await page.goto('/');
+    await expect(page.locator('#tourOverlay')).not.toHaveClass(/hidden/);
+
+    const title = page.locator('#tourTooltipTitle');
+    for (let i = 0; i < 10; i++) {
+      if ((await title.textContent())?.includes('preferences')) break;
+      await page.locator('#tourNextBtn').click();
+    }
+    await expect(title).toContainText('preferences');
+    await expect(page.locator('#tourTooltipBody')).toContainText('preferences (color theme and auto-execute)');
+  });
 });

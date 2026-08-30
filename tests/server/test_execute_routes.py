@@ -494,6 +494,65 @@ def test_two_connection_script_dispatches_to_both_and_reassembles(app_env, monke
     assert fake_b.closed_conn is not None
 
 
+def test_strip_database_marker_lines_removes_only_the_marker_line(app_env):
+    # Uses app_env.execute_routes (the fresh-imported module this app
+    # instance actually holds), not a bare top-level `import
+    # execute_routes` - see this file's module docstring on why that
+    # matters (a different fresh-import elsewhere in the suite can leave
+    # a bare import bound to a different module object).
+    strip = app_env.execute_routes._strip_database_marker_lines
+    text = "-- database: preset:pg-a (Sales Postgres)\nSELECT 1;\n-- database: preset:pg-a (Sales Postgres)\nSELECT 3;"
+    assert strip(text) == "SELECT 1;\nSELECT 3;"
+
+
+def test_strip_database_marker_lines_is_a_noop_for_marker_free_text(app_env):
+    strip = app_env.execute_routes._strip_database_marker_lines
+    assert strip("  SELECT 1;  ") == "SELECT 1;"
+
+
+def test_marker_line_never_reaches_the_backends_own_execute_call(app_env, monkeypatch):
+    """The core bug this guards against: Google Sheets' GViz query
+    language (backends/sheets.py) has no '--' comment syntax at all, so a
+    marker-tagged multi-database script that reaches gviz with its
+    leading '-- database: ...' line still attached is a syntax error, not
+    a harmless no-op like it is for every real SQL dialect. This doesn't
+    need a real Sheets fake to prove: any backend that raises on a leading
+    '--' line demonstrates the marker is stripped before execute() ever
+    sees it, regardless of which dialect is on the other end."""
+
+    class _RejectsCommentSyntaxBackend:
+        """Stands in for backends/sheets.py's execute(), which has no
+        concept of '--' as a comment - a leading one is a hard syntax
+        error there, not silently ignored the way a real SQL engine
+        would. Raising here if the marker line ever leaks through is
+        exactly that failure mode."""
+
+        def connect(self, descriptor):
+            return object()
+
+        def close(self, connection):
+            pass
+
+        def execute(self, connection, sql_text):
+            if sql_text.strip().startswith("--"):
+                raise Exception("GViz syntax error: unexpected '--'")
+            return [{"statement": sql_text, "columns": ["A"], "rows": [{"A": 1}], "rowCount": 1}]
+
+    fake_sheet = _RejectsCommentSyntaxBackend()
+    _patch_multi_db(
+        monkeypatch, app_env,
+        {("preset", "sheet-a"): ({"marker": "sheet"}, "My Sheet")},
+        {"sheet": fake_sheet},
+    )
+    sql = "-- database: preset:sheet-a (My Sheet)\nSELECT A WHERE A > 0"
+    resp = app_env.client.post('/api/execute', json={'sql': sql})
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data['success'] is True
+    assert 'failures' not in data
+    assert data['results'][0]['statement'] == "SELECT A WHERE A > 0"
+
+
 def test_one_connection_failing_still_runs_and_returns_the_other(app_env, monkeypatch):
     fake_a = _FakeMultiBackend(raise_exc=Exception("relation \"a\" does not exist"))
     fake_b = _FakeMultiBackend(results=[

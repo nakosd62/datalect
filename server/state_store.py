@@ -315,6 +315,24 @@ def compute_connection_key(name, url, credentials_json=None):
     return hashlib.sha256(raw.encode('utf-8')).hexdigest()[:24]
 
 
+# How many rows get_translation_history() returns for the history popup's
+# translations list, most-recent first - NOT a cap on how much history is
+# actually stored (purge is still the only way to remove rows) and NOT a
+# cap on the aggregated per-day stats the same call returns alongside it
+# (see get_translation_history's docstring below and both backends'
+# implementations: the stats query has no LIMIT, so the stats tab always
+# reflects the complete history even once the list has been truncated to
+# this many rows). Same "env var, sane default" pattern as app_config.py's
+# MAX_IN_SCOPE_CONNECTIONS and translate_routes.py's HISTORY_RESULT_MAX_ROWS/
+# HISTORY_MAX_TURNS, but defined here (not app_config.py) since app_config.py
+# imports FROM this module (see its own "Startup / Module Scope Guard"
+# section) - state_store.py importing back from app_config.py would be
+# circular, and this constant has exactly one consumer (this module's two
+# StateStore implementations) so there's no shared-module reason to hoist
+# it up there anyway.
+TRANSLATION_HISTORY_LIST_LIMIT = int(os.environ.get("TRANSLATION_HISTORY_LIST_LIMIT", 50))
+
+
 class StateStore(ABC):
     """Backend-agnostic persistence for sessions, saved DB connections, and
     translation history/stats. Deliberately holds no notion of "the default
@@ -334,8 +352,8 @@ class StateStore(ABC):
     def get_session(self, user_id):
         """Returns {"auto_sql_execute", "is_custom", "connection_id",
         "llm_provider", "llm_model", "in_scope_preset_ids",
-        "in_scope_custom_connection_keys", "in_scope_mode"} for a user/
-        session id - identity only,
+        "in_scope_custom_connection_keys", "in_scope_mode", "theme"} for a
+        user/session id - identity only,
         never a connection's actual details/credentials (see db.py's
         resolve_active_descriptor, which resolves those FRESH from
         CONFIGURED_DBS or get_db_connections() every time something needs
@@ -397,21 +415,32 @@ class StateStore(ABC):
         a dynamic set that automatically includes a connection added after
         this was saved, not a list frozen at Save time. That's the whole
         reason this is a separate field rather than just a third possible
-        shape for in_scope_preset_ids/in_scope_custom_connection_keys."""
+        shape for in_scope_preset_ids/in_scope_custom_connection_keys.
+
+        "theme" ("dark" or "light", defaulting to "" - "nothing explicitly
+        saved yet") is the Preferences modal's color-scheme choice,
+        persisted per session/user like every other field here (see
+        get_current_user_identity) rather than only in the browser's
+        localStorage. Same blank-means-unset convention as llm_provider/
+        llm_model, not auto_sql_execute's baked-in-default one: a blank
+        value means the client's own existing default/localStorage value
+        keeps applying (see client.js's getCurrentTheme(), which already
+        defaults to "dark") rather than this layer forcing a particular
+        theme on a session that never explicitly chose one."""
 
     @abstractmethod
     def set_session(self, user_id, connection_id=None, auto_sql_execute=None, is_custom=None,
                      llm_provider=None, llm_model=None,
                      in_scope_preset_ids=None, in_scope_custom_connection_keys=None,
-                     in_scope_mode=None):
+                     in_scope_mode=None, theme=None):
         """Persists the active connection reference (connection_id,
         is_custom), auto_sql_execute flag, llm_provider/llm_model
-        selection, in-scope connection set, and/or in-scope mode for a
-        user/session id. Only the fields passed (not None) are changed -
-        the others are left as-is. Pass connection_id="" (not None) to
-        explicitly clear it, e.g. when switching to a fresh/default
-        connection - same not-None-means-"change this" convention
-        is_custom/llm_provider/llm_model/in_scope_mode already use.
+        selection, in-scope connection set, in-scope mode, and/or theme
+        for a user/session id. Only the fields passed (not None) are
+        changed - the others are left as-is. Pass connection_id="" (not
+        None) to explicitly clear it, e.g. when switching to a fresh/
+        default connection - same not-None-means-"change this" convention
+        is_custom/llm_provider/llm_model/in_scope_mode/theme already use.
         in_scope_preset_ids/in_scope_custom_connection_keys follow the
         same convention: pass [] (not None) to explicitly clear one to
         empty, None to leave it untouched - callers that mean to update
@@ -471,7 +500,12 @@ class StateStore(ABC):
 
     @abstractmethod
     def get_translation_history(self, user_id):
-        """Returns (rows, daily_stats, total_count) for a user."""
+        """Returns (rows, daily_stats, total_count) for a user. rows is
+        capped at TRANSLATION_HISTORY_LIST_LIMIT, sorted newest-first;
+        daily_stats and total_count are always computed over the user's
+        COMPLETE history, uncapped, so the history popup's aggregated
+        stats tab stays accurate even once the translations list itself
+        has been truncated."""
 
     @abstractmethod
     def purge_translation_history(self, user_id):
@@ -526,6 +560,7 @@ class SqliteStateStore(StateStore):
                         in_scope_preset_ids TEXT,
                         in_scope_custom_connection_keys TEXT,
                         in_scope_mode TEXT,
+                        theme TEXT NOT NULL DEFAULT '',
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     );
                 """)
@@ -702,6 +737,21 @@ class SqliteStateStore(StateStore):
                         ))
                     cursor.execute("DROP TABLE sessions_old;")
 
+                # Migration: existing DBs created before the theme preference
+                # existed - placed after the connection_id rebuild above (not
+                # baked into that rebuild's own CREATE TABLE) so it correctly
+                # covers both cases with one check: a legacy pre-connection_id
+                # DB that just went through the rebuild (whose freshly-created
+                # table above predates this field too) and a DB that already
+                # had connection_id and skipped the rebuild entirely. Defaults
+                # to '' - "nothing explicitly saved yet" - same convention
+                # llm_provider/llm_model already use, not auto_sql_execute's
+                # baked-in-default one (see get_session's docstring).
+                if "theme" not in session_columns:
+                    cursor.execute(
+                        "ALTER TABLE sessions ADD COLUMN theme TEXT NOT NULL DEFAULT '';"
+                    )
+
                 # Drop table if it exists under the old schema (where user_id was
                 # the single primary key) or if the temporary custom_databases
                 # column is present.
@@ -844,7 +894,7 @@ class SqliteStateStore(StateStore):
                 cursor = conn.cursor()
                 cursor.execute(
                     "SELECT auto_sql_execute, is_custom, connection_id, llm_provider, llm_model, "
-                    "in_scope_preset_ids, in_scope_custom_connection_keys, in_scope_mode "
+                    "in_scope_preset_ids, in_scope_custom_connection_keys, in_scope_mode, theme "
                     "FROM sessions WHERE session_id = ?",
                     (effective_user,),
                 )
@@ -871,6 +921,7 @@ class SqliteStateStore(StateStore):
                         "in_scope_preset_ids": in_scope_preset_ids,
                         "in_scope_custom_connection_keys": in_scope_custom_connection_keys,
                         "in_scope_mode": row[7] or "single",
+                        "theme": row[8] or "",
                     }
         except Exception:
             logger.exception("Error fetching session from SQLite")
@@ -883,16 +934,17 @@ class SqliteStateStore(StateStore):
             "in_scope_preset_ids": [],
             "in_scope_custom_connection_keys": [],
             "in_scope_mode": "single",
+            "theme": "",
         }
 
     def set_session(self, user_id, connection_id=None, auto_sql_execute=None, is_custom=None,
                      llm_provider=None, llm_model=None,
                      in_scope_preset_ids=None, in_scope_custom_connection_keys=None,
-                     in_scope_mode=None):
+                     in_scope_mode=None, theme=None):
         if (connection_id is None and auto_sql_execute is None and is_custom is None
                 and llm_provider is None and llm_model is None
                 and in_scope_preset_ids is None and in_scope_custom_connection_keys is None
-                and in_scope_mode is None):
+                and in_scope_mode is None and theme is None):
             return
         effective_user = _effective_user(user_id)
         try:
@@ -932,6 +984,9 @@ class SqliteStateStore(StateStore):
                 if in_scope_mode is not None:
                     insert_cols.append("in_scope_mode")
                     insert_vals.append(in_scope_mode)
+                if theme is not None:
+                    insert_cols.append("theme")
+                    insert_vals.append(theme)
                 placeholders = ", ".join("?" for _ in insert_cols)
                 cursor.execute(f"""
                     INSERT INTO sessions ({', '.join(insert_cols)})
@@ -965,6 +1020,9 @@ class SqliteStateStore(StateStore):
                 if in_scope_mode is not None:
                     updates.append("in_scope_mode = ?")
                     params.append(in_scope_mode)
+                if theme is not None:
+                    updates.append("theme = ?")
+                    params.append(theme)
                 updates.append("updated_at = CURRENT_TIMESTAMP")
                 params.append(effective_user)
                 cursor.execute(
@@ -1098,8 +1156,8 @@ class SqliteStateStore(StateStore):
             cursor.execute("""
                 SELECT nl_prompt, sql_command, created_at
                 FROM translations WHERE user_id = ?
-                ORDER BY created_at DESC LIMIT 50
-            """, (effective_user,))
+                ORDER BY created_at DESC LIMIT ?
+            """, (effective_user, TRANSLATION_HISTORY_LIST_LIMIT))
             rows = [dict(row) for row in cursor.fetchall()]
 
             cursor.execute("""
@@ -1146,6 +1204,7 @@ class FirestoreStateStore(StateStore):
             "in_scope_preset_ids": [],
             "in_scope_custom_connection_keys": [],
             "in_scope_mode": "single",
+            "theme": "",
         }
         if not user_id:
             return default_session
@@ -1209,6 +1268,7 @@ class FirestoreStateStore(StateStore):
                         "in_scope_preset_ids": in_scope_preset_ids,
                         "in_scope_custom_connection_keys": in_scope_custom_connection_keys,
                         "in_scope_mode": data.get("in_scope_mode") or "single",
+                        "theme": data.get("theme") or "",
                     }
                 if "in_scope_preset_ids" not in data or "in_scope_custom_connection_keys" not in data:
                     # Never explicitly saved (a session that already had
@@ -1231,6 +1291,7 @@ class FirestoreStateStore(StateStore):
                     "in_scope_preset_ids": in_scope_preset_ids,
                     "in_scope_custom_connection_keys": in_scope_custom_connection_keys,
                     "in_scope_mode": data.get("in_scope_mode") or "single",
+                    "theme": data.get("theme") or "",
                 }
         except Exception:
             logger.exception("Error fetching session from Firestore")
@@ -1239,11 +1300,11 @@ class FirestoreStateStore(StateStore):
     def set_session(self, user_id, connection_id=None, auto_sql_execute=None, is_custom=None,
                      llm_provider=None, llm_model=None,
                      in_scope_preset_ids=None, in_scope_custom_connection_keys=None,
-                     in_scope_mode=None):
+                     in_scope_mode=None, theme=None):
         if not user_id or (connection_id is None and auto_sql_execute is None and is_custom is None
                             and llm_provider is None and llm_model is None
                             and in_scope_preset_ids is None and in_scope_custom_connection_keys is None
-                            and in_scope_mode is None):
+                            and in_scope_mode is None and theme is None):
             return
         update_data = {"updated_at": firestore.SERVER_TIMESTAMP}
         if connection_id is not None:
@@ -1262,6 +1323,8 @@ class FirestoreStateStore(StateStore):
             update_data["in_scope_custom_connection_keys"] = list(in_scope_custom_connection_keys)
         if in_scope_mode is not None:
             update_data["in_scope_mode"] = in_scope_mode
+        if theme is not None:
+            update_data["theme"] = theme
         try:
             # merge=list(update_data.keys()) - NOT the boolean merge=True -
             # is what actually gives "patch these top-level fields, leave
@@ -1398,7 +1461,7 @@ class FirestoreStateStore(StateStore):
             self.client.collection("translations")
             .where("user_id", "==", user_id)
             .order_by("created_at", direction=firestore.Query.DESCENDING)
-            .limit(50)
+            .limit(TRANSLATION_HISTORY_LIST_LIMIT)
             .stream()
         )
         rows = []

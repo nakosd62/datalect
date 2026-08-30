@@ -289,18 +289,39 @@ document.addEventListener('DOMContentLoaded', async () => {
   let activeResultIndex = 0;
 
   // "All databases" mode's "route" outcome (see translate_routes.py's
-  // module docstring): stashes the triage routing summary and any
-  // per-database '*** NO SQL ***' notes / generation failures a
-  // /api/translate response carried, so the eventual /api/execute call
-  // (or the immediate no-SQL-generated-at-all case) can build one
-  // combined set of tabs via renderAllModeCombinedResults() instead of
-  // the plain single-connection renderer. Set ONLY inside
-  // translatePrompt() - deliberately NOT inside clearResultsDisplay(),
-  // since executeSql() also calls that same helper at its own start and
-  // would otherwise wipe this out before executeSql() gets a chance to
-  // read it just a few lines later. Consumed (cleared back to null)
-  // exactly once by whichever branch of executeSql() actually renders
-  // with it.
+  // module docstring): tracks ONE streaming turn's progressive-render
+  // state from the moment its "phase_a_route" NDJSON event arrives
+  // (startAllModeStreaming()) through however many "phase_b_connection_
+  // done" events follow (handlePhaseBConnectionDone()), any per-
+  // connection /api/execute calls that fire along the way
+  // (executeOneAllModeConnection()), and finally maybeFinalize() once
+  // every selected connection has settled AND the terminal /api/translate
+  // line has arrived. Set ONLY inside translatePrompt() - deliberately
+  // NOT inside clearResultsDisplay(), since executeSql() also calls that
+  // same helper at its own start and would otherwise wipe this out before
+  // a manual Execute click (auto-execute disabled - see executeSql()'s
+  // own router-route branch below) gets a chance to read it. Null again
+  // once a turn has fully settled (maybeFinalize()) or hit its one
+  // "never persists history" partial-failure branch (executeSql()'s
+  // failure branch, matching this mode's pre-existing behavior from
+  // before this streaming redesign).
+  let allModeStreamState = null;
+
+  // Fallback for a router_route response that arrives with NO live
+  // "phase_a_route"/"phase_b_connection_done" events at all - i.e.
+  // allModeStreamState above was never created for this turn. In real
+  // production traffic this never happens (translate_routes.py's
+  // stream_translation() always emits phase_a_route before any "route"
+  // outcome's terminal line), but a non-streamed single-JSON response
+  // still needs to work correctly - the old-browser fallback in
+  // readTranslateStream() (no ReadableStream support), or a test double
+  // that mocks /api/translate as one flat body with no NDJSON framing at
+  // all. Same shape/lifecycle this app used for EVERY router_route turn
+  // before progressive streaming existed: set in translatePrompt()'s
+  // router_route branch (only in its `else` - no live stream - case),
+  // consumed (cleared back to null) exactly once by whichever branch of
+  // executeSql() actually renders with it, or immediately in
+  // translatePrompt() itself when there's nothing left to execute at all.
   let pendingAllModeNotes = null;
 
   // Helper function to include Google ID tokens or auth headers in fetch requests
@@ -340,6 +361,45 @@ document.addEventListener('DOMContentLoaded', async () => {
     modalEl.style.zIndex = String(nextModalZIndex++);
   }
 
+  // ===========================================================================
+  // THEME SWITCHING (dark/light - see the Preferences modal below). Persisted
+  // client-side only (localStorage), unlike auto_sql_execute which is a
+  // server-side session field - there's no server-rendered content whose
+  // correctness depends on theme, so there's nothing for the backend to know.
+  // An inline <head> script in index.html reads the same storage key before
+  // any stylesheet loads (see its comment there) so the very first paint
+  // already has the right data-theme attribute - this section only handles
+  // switching it after load, plus keeping CodeMirror/Chart.js in sync since
+  // neither reads CSS custom properties on its own.
+  // ===========================================================================
+  const THEME_STORAGE_KEY = 'datalectTheme';
+
+  function getCurrentTheme() {
+    const attr = document.documentElement.getAttribute('data-theme');
+    return attr === 'light' ? 'light' : 'dark';
+  }
+
+  function setTheme(theme) {
+    const normalized = theme === 'light' ? 'light' : 'dark';
+    document.documentElement.setAttribute('data-theme', normalized);
+    try {
+      window.localStorage.setItem(THEME_STORAGE_KEY, normalized);
+    } catch (e) {
+      // localStorage unavailable (private browsing, disabled storage, etc.) -
+      // the theme still applies for this page view, it just won't persist.
+    }
+    if (sqlEditor) {
+      sqlEditor.setOption('theme', normalized === 'light' ? 'eclipse' : 'dracula');
+    }
+    // The history-stats charts bake resolved colors into their Chart.js
+    // config at creation time (Chart.js doesn't read CSS custom properties
+    // live), so the only way to re-theme an already-rendered chart is to
+    // rebuild it from the same data used last time.
+    if ((chartCountInstance || chartTotalTokensInstance) && lastStatsDataForCharts) {
+      renderStatisticsCharts(lastStatsDataForCharts);
+    }
+  }
+
   // DOM Elements - Primary Controls
   const aiPrompt = document.getElementById('aiPrompt');
   const sqlQueryTextarea = document.getElementById('sqlQuery');
@@ -356,7 +416,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   const configTriggerBadge = document.getElementById('configTriggerBadge');
   const modalCloseBtn = document.getElementById('modalCloseBtn');
   const configSaveBtn = document.getElementById('configSaveBtn');
-  const autoSqlExecuteCheckbox = document.getElementById('autoSqlExecuteCheckbox');
   const connDbName = document.getElementById('connDbName');
   const connDbDot = document.getElementById('connDbDot');
 
@@ -367,6 +426,19 @@ document.addEventListener('DOMContentLoaded', async () => {
   const modelModalCloseBtn = document.getElementById('modelModalCloseBtn');
   const modelSaveBtn = document.getElementById('modelSaveBtn');
   const modelBadgeName = document.getElementById('modelBadgeName');
+
+  // DOM Elements - Preferences Modal (theme + auto-execute-SQL - opened from
+  // the header's #prefsBtn on desktop, or #moreMenuPrefsBtn on mobile; see
+  // the wiring block below). autoSqlExecuteCheckbox used to live in
+  // #configModal - its id is unchanged so every other reference to it below
+  // still resolves, only its home in the DOM (and its save flow) moved.
+  const preferencesModal = document.getElementById('preferencesModal');
+  const prefsBtn = document.getElementById('prefsBtn');
+  const preferencesModalCloseBtn = document.getElementById('preferencesModalCloseBtn');
+  const preferencesSaveBtn = document.getElementById('preferencesSaveBtn');
+  const themeOptionDark = document.getElementById('themeOptionDark');
+  const themeOptionLight = document.getElementById('themeOptionLight');
+  const autoSqlExecuteCheckbox = document.getElementById('autoSqlExecuteCheckbox');
 
   // DOM Elements - Login Required Modal. Not currently triggered by
   // anything: translation history and saving a custom DB connection were
@@ -538,7 +610,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   if (sqlQueryTextarea && window.CodeMirror) {
     sqlEditor = window.CodeMirror.fromTextArea(sqlQueryTextarea, {
       mode: 'text/x-sql',
-      theme: 'dracula',
+      theme: getCurrentTheme() === 'light' ? 'eclipse' : 'dracula',
       lineNumbers: true,
       lineWrapping: true,
       placeholder: sqlQueryTextarea.getAttribute('placeholder') || "You may enter SQL here and execute it..."
@@ -745,6 +817,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const moreMenuDropdown = document.getElementById('moreMenuDropdown');
   const moreMenuHelpBtn = document.getElementById('moreMenuHelpBtn');
   const moreMenuHistoryBtn = document.getElementById('moreMenuHistoryBtn');
+  const moreMenuPrefsBtn = document.getElementById('moreMenuPrefsBtn');
   const moreMenuAuthSlot = document.getElementById('moreMenuAuthSlot');
   const headerActionsEl = document.querySelector('.header-actions');
 
@@ -779,6 +852,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     moreMenuHistoryBtn.addEventListener('click', () => {
       closeMoreMenu();
       historyBtn?.click();
+    });
+  }
+
+  if (moreMenuPrefsBtn) {
+    moreMenuPrefsBtn.addEventListener('click', () => {
+      closeMoreMenu();
+      prefsBtn?.click();
     });
   }
 
@@ -911,20 +991,32 @@ document.addEventListener('DOMContentLoaded', async () => {
   // /api/translate streams newline-delimited JSON (see
   // translate_routes.py's module docstring): zero or more
   // {"status": "retrying", ...} progress lines emitted live as the
-  // server's one Gemini-call retry loop runs, followed by exactly one
-  // terminal {"status": "done", success, sql/error, ...token usage...}
-  // line - the same shape /api/translate used to return as its whole
-  // body before streaming existed. A request that never reaches that
-  // retry loop at all (missing prompt/API key, a 401 from the auth
+  // server's one Gemini-call retry loop runs, plus - for the "all
+  // databases" mode "route" outcome only - one {"status": "phase_a_route",
+  // ...} line followed by one {"status": "phase_b_connection_done", ...}
+  // line per selected connection (see translate_routes.py's
+  // stream_translation() docstring), followed in every case by exactly
+  // one terminal {"status": "done", success, sql/error, ...token
+  // usage...} line - the same shape /api/translate used to return as its
+  // whole body before streaming existed. A request that never reaches
+  // that retry loop at all (missing prompt/API key, a 401 from the auth
   // guard, or a mocked response in tests - see fixtures.js's
   // mockTranslate()) isn't streamed - it's still a single plain JSON
   // object, which this reads exactly the same way: one line, no
   // "status" field, straight into finalData.
-  async function readTranslateStream(response) {
+  //
+  // `onEvent`, if given, is called for every line EXCEPT the terminal
+  // 'done' one, in arrival order, as soon as each is parsed - this is
+  // what lets a caller react to 'retrying'/'phase_a_route'/
+  // 'phase_b_connection_done' lines live rather than only after the
+  // whole stream has finished (this function's own return value is
+  // still just the terminal line, same as before onEvent existed).
+  async function readTranslateStream(response, onEvent) {
     if (!response.body || !response.body.getReader) {
       // No ReadableStream support (very old browser) - fall back to a
-      // single json() read. No retry-progress display in that case, but
-      // still functionally correct once the whole body has arrived.
+      // single json() read. No live progress/streaming events in that
+      // case, but still functionally correct once the whole body has
+      // arrived.
       return response.json();
     }
 
@@ -943,9 +1035,22 @@ document.addEventListener('DOMContentLoaded', async () => {
         console.warn('Failed to parse a line of the /api/translate stream:', trimmed, err);
         return;
       }
-      if (parsed.status === 'retrying') {
-        showRetryStatus(parsed);
+      const isProgressLine = parsed.status === 'retrying'
+        || parsed.status === 'phase_a_route'
+        || parsed.status === 'phase_b_connection_done';
+      if (isProgressLine) {
+        // 'retrying' is today's only pre-existing progress line;
+        // 'phase_a_route'/'phase_b_connection_done' are new (see this
+        // function's docstring above) - and, going forward, any other
+        // intermediate status this stream ever grows can be handled the
+        // same way without this function needing to know about it by
+        // name.
+        if (onEvent) onEvent(parsed);
       } else {
+        // The terminal 'done' line, or (old-browser/mocked-response
+        // fallback) a single-line body with no "status" field at all -
+        // either way, this becomes the function's return value, same as
+        // before onEvent existed.
         finalData = parsed;
       }
     };
@@ -1267,6 +1372,25 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       if (data.auto_sql_execute !== undefined) {
         autoSqlExecuteEnabled = Boolean(data.auto_sql_execute);
+      }
+
+      // Theme (Preferences modal's color-scheme choice) is now persisted
+      // server-side (session, or user if logged in - see state_store.py),
+      // not just in localStorage. A real "dark"/"light" value here means
+      // the user explicitly saved a preference at some point, so it wins
+      // over whatever's currently applied (e.g. a fresh browser/device
+      // with no localStorage entry of its own, or a stale localStorage
+      // value from before this account last saved a different choice) -
+      // reapplying via setTheme() also re-syncs localStorage, so the next
+      // page load's flash-prevention script (index.html's inline <head>
+      // script, which only ever reads localStorage before this fetch can
+      // resolve) picks up the right value too. A blank value ("" - never
+      // explicitly saved) deliberately leaves the current theme alone,
+      // whatever localStorage/the default already applied for first paint.
+      if (data.theme === 'dark' || data.theme === 'light') {
+        if (getCurrentTheme() !== data.theme) {
+          setTheme(data.theme);
+        }
       }
 
       // Keeps the turn-navigation cap in lockstep with HISTORY_MAX_TURNS,
@@ -2387,6 +2511,84 @@ document.addEventListener('DOMContentLoaded', async () => {
     modelSaveBtn.addEventListener('click', saveModelSelection);
   }
 
+  // ===========================================================================
+  // PREFERENCES MODAL (theme + auto-execute-SQL). Mirrors the Model Selection
+  // Modal above: a small, independent settings surface with its own minimal
+  // POST to /api/config, distinct from the DB connection form's
+  // triggerConfigSave(). Theme itself never goes to the server (see the
+  // THEME SWITCHING section) - only auto_sql_execute is persisted there.
+  // ===========================================================================
+
+  function closePreferencesModal() {
+    if (preferencesModal) preferencesModal.classList.add('hidden');
+  }
+
+  function loadPreferencesIntoUI() {
+    const currentTheme = getCurrentTheme();
+    if (themeOptionDark) themeOptionDark.checked = currentTheme === 'dark';
+    if (themeOptionLight) themeOptionLight.checked = currentTheme === 'light';
+    if (autoSqlExecuteCheckbox) {
+      autoSqlExecuteCheckbox.checked = autoSqlExecuteEnabled;
+    }
+  }
+
+  async function savePreferences() {
+    const preferencesSaveErrorEl = document.getElementById('preferencesSaveError');
+    if (preferencesSaveErrorEl) {
+      preferencesSaveErrorEl.style.display = 'none';
+      preferencesSaveErrorEl.textContent = '';
+    }
+
+    const selectedTheme = themeOptionLight && themeOptionLight.checked ? 'light' : 'dark';
+    setTheme(selectedTheme);
+
+    const autoSqlExecuteValue = autoSqlExecuteCheckbox
+      ? autoSqlExecuteCheckbox.checked
+      : autoSqlExecuteEnabled;
+
+    try {
+      const response = await fetch('/api/config', {
+        method: 'POST',
+        headers: getApiHeaders(),
+        credentials: 'same-origin',
+        body: JSON.stringify({ auto_sql_execute: autoSqlExecuteValue, theme: selectedTheme }),
+      });
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(errData.error || 'Failed to save preferences.');
+      }
+      await fetchBackendConfig();
+      closePreferencesModal();
+    } catch (err) {
+      if (preferencesSaveErrorEl) {
+        preferencesSaveErrorEl.textContent = err.message || 'Failed to save preferences.';
+        preferencesSaveErrorEl.style.display = 'block';
+      }
+    }
+  }
+
+  if (prefsBtn && preferencesModal) {
+    prefsBtn.addEventListener('click', async () => {
+      await fetchBackendConfig();
+      loadPreferencesIntoUI();
+      const preferencesSaveErrorEl = document.getElementById('preferencesSaveError');
+      if (preferencesSaveErrorEl) {
+        preferencesSaveErrorEl.style.display = 'none';
+        preferencesSaveErrorEl.textContent = '';
+      }
+      preferencesModal.classList.remove('hidden');
+      bringModalToFront(preferencesModal);
+    });
+  }
+
+  if (preferencesModalCloseBtn) {
+    preferencesModalCloseBtn.addEventListener('click', closePreferencesModal);
+  }
+
+  if (preferencesSaveBtn) {
+    preferencesSaveBtn.addEventListener('click', savePreferences);
+  }
+
   async function triggerConfigSave({ closeModal = false } = {}) {
     let dbType = 'postgres';
     let dbUrlValue = null;
@@ -2711,10 +2913,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       dbNameValue = "Default DB";
     }
 
-    const autoSqlExecuteValue = autoSqlExecuteCheckbox
-      ? autoSqlExecuteCheckbox.checked
-      : autoSqlExecuteEnabled;
-
     const payload = {
       database_name: dbNameValue,
       database_type: dbType,
@@ -2840,7 +3038,6 @@ document.addEventListener('DOMContentLoaded', async () => {
           }
           return simpleUrlOut;
         }),
-      auto_sql_execute: autoSqlExecuteValue
     };
     if (presetId !== null) {
       payload.preset_id = presetId;
@@ -3025,9 +3222,11 @@ document.addEventListener('DOMContentLoaded', async () => {
           // the user actually wants questions routed to, so it's cleared
           // the same way a real connection-identity change would be. The
           // server independently guards against a stale pin too (see
-          // translate_routes.py's _resolve_pinned_subset), this just keeps
-          // the UI's own prompt/SQL/results in sync immediately rather
-          // than waiting for the next question to discover it server-side.
+          // execute_routes.py's resolve_descriptor_by_reference fallback,
+          // which is the only place a client-echoed pinned_connections
+          // entry is still read at all), this just keeps the UI's own
+          // prompt/SQL/results in sync immediately rather than waiting for
+          // the next execute call to discover it server-side.
           clearActiveQueryState();
         }
 
@@ -3074,9 +3273,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     const config = loadConfig();
     renderDbRadioButtons(config.dbUrl);
     updateHistoryTurnsSubtitle();
-    if (autoSqlExecuteCheckbox) {
-      autoSqlExecuteCheckbox.checked = autoSqlExecuteEnabled;
-    }
   }
 
   function closeConfigModal() {
@@ -3173,11 +3369,16 @@ document.addEventListener('DOMContentLoaded', async () => {
       },
       ...(isNarrowHeader ? [{
         target: moreMenuBtn,
-        title: 'Help, history & sign-in live here',
+        title: 'Help, history, preferences & sign-in live here',
         body: isAnonymousUser
-          ? "Tap this menu for the full docs, your past translations, and to sign in with Google so your connections and history follow you across devices."
-          : 'Tap this menu for the full docs, your past translations, and to sign out.'
+          ? "Tap this menu for the full docs, your past translations, your preferences (color theme and auto-execute), and to sign in with Google so your connections and history follow you across devices."
+          : 'Tap this menu for the full docs, your past translations, your preferences (color theme and auto-execute), and to sign out.'
       }] : [
+      {
+        target: prefsBtn,
+        title: 'Make it yours',
+        body: 'Click this gear icon to switch between dark and light mode, and to control whether generated SQL runs automatically.'
+      },
       {
         target: historyBtn,
         title: 'Past queries, saved',
@@ -3390,22 +3591,41 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
+  // Cached so setTheme() can rebuild these charts with the new theme's
+  // colors without needing to re-fetch /api/history's stats - Chart.js
+  // bakes resolved color strings into its config at creation time and
+  // never re-reads CSS custom properties on its own.
+  let lastStatsDataForCharts = null;
+
   function renderStatisticsCharts(statsData) {
     if (!statsData || statsData.length === 0 || typeof window.Chart === 'undefined') return;
+    lastStatsDataForCharts = statsData;
 
     const dates = statsData.map(item => item.day_date || item.date || 'Unknown');
     const totalTranslations = statsData.map(item => item.total_translations || 0);
     const sumTotalTokens = statsData.map(item => item.sum_total_tokens || 0);
 
+    // Read the active theme's resolved colors rather than hardcoding hex
+    // values, so these charts stay correct in both themes (see the THEME
+    // SWITCHING section, which rebuilds these charts from
+    // lastStatsDataForCharts whenever the theme changes).
+    const rootStyle = getComputedStyle(document.documentElement);
+    const tickColor = rootStyle.getPropertyValue('--text-secondary').trim() || '#94a3b8';
+    const gridColor = rootStyle.getPropertyValue('--overlay-1').trim() || 'rgba(255,255,255,0.05)';
+    const cyanColor = rootStyle.getPropertyValue('--accent-cyan').trim() || '#38bdf8';
+    const cyanRgb = rootStyle.getPropertyValue('--accent-cyan-rgb').trim() || '56, 189, 248';
+    const primaryColor = rootStyle.getPropertyValue('--primary').trim() || '#10b981';
+    const primaryRgb = rootStyle.getPropertyValue('--primary-rgb').trim() || '16, 185, 129';
+
     const commonOptions = {
       responsive: true,
       maintainAspectRatio: false,
-      plugins: { 
-        legend: { display: false } 
+      plugins: {
+        legend: { display: false }
       },
       scales: {
-        x: { ticks: { color: '#94a3b8', font: { size: 10 } }, grid: { color: 'rgba(255,255,255,0.05)' } },
-        y: { ticks: { color: '#94a3b8', font: { size: 10 } }, grid: { color: 'rgba(255,255,255,0.05)' } }
+        x: { ticks: { color: tickColor, font: { size: 10 } }, grid: { color: gridColor } },
+        y: { ticks: { color: tickColor, font: { size: 10 } }, grid: { color: gridColor } }
       }
     };
 
@@ -3419,8 +3639,8 @@ document.addEventListener('DOMContentLoaded', async () => {
           datasets: [{
             label: 'Total Translations',
             data: totalTranslations,
-            backgroundColor: 'rgba(56, 189, 248, 0.6)',
-            borderColor: '#38bdf8',
+            backgroundColor: `rgba(${cyanRgb}, 0.6)`,
+            borderColor: cyanColor,
             borderWidth: 1
           }]
         },
@@ -3438,8 +3658,8 @@ document.addEventListener('DOMContentLoaded', async () => {
           datasets: [{
             label: 'Sum of Total Tokens',
             data: sumTotalTokens,
-            backgroundColor: 'rgba(16, 185, 129, 0.6)',
-            borderColor: '#10b981',
+            backgroundColor: `rgba(${primaryRgb}, 0.6)`,
+            borderColor: primaryColor,
             borderWidth: 1
           }]
         },
@@ -3607,6 +3827,35 @@ document.addEventListener('DOMContentLoaded', async () => {
     resultsHeader.innerHTML = '';
     resultsBody.innerHTML = '';
 
+    // "All databases" mode's live-streaming placeholder tab (see
+    // startAllModeStreaming()) - stands in for one selected connection
+    // from the moment triage picks it until either its own generation
+    // call settles (handlePhaseBConnectionDone() swaps this out for a
+    // real Note/error tab) or, for a real-SQL outcome, its /api/execute
+    // call resolves (executeOneAllModeConnection()). Checked first since
+    // it never carries isText/isError.
+    if (result && result.isPending) {
+      const tr = document.createElement('tr');
+      const td = document.createElement('td');
+      td.className = 'response-cell';
+
+      if (result.database && result.database.name) {
+        const dbP = document.createElement('p');
+        dbP.className = 'text-muted';
+        dbP.textContent = `Database: ${result.database.name}`;
+        td.appendChild(dbP);
+      }
+
+      const p = document.createElement('p');
+      p.className = 'response-text animate-pulse';
+      p.textContent = 'Fetching results…';
+      td.appendChild(p);
+
+      tr.appendChild(td);
+      resultsBody.appendChild(tr);
+      return;
+    }
+
     // All-databases mode's own synthetic text tab entries (see
     // renderAllModeCombinedResults() below) - a "Summary" tab built from
     // the triage routing message, or a per-database "Note" tab built from
@@ -3630,7 +3879,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       const p = document.createElement('p');
       p.className = 'response-text';
-      p.textContent = result.text || '';
+      p.innerHTML = renderMarkdownLite(result.text || '');
       td.appendChild(p);
 
       tr.appendChild(td);
@@ -3714,25 +3963,34 @@ document.addEventListener('DOMContentLoaded', async () => {
       const btn = document.createElement('button');
       const isError = !!res.isError;
       const isText = !!res.isText;
-      btn.className = `result-tab-btn ${idx === activeResultIndex ? 'active' : ''} ${isError ? 'result-tab-btn--error' : ''}`.trim();
+      const isPending = !!res.isPending;
+      btn.className = `result-tab-btn ${idx === activeResultIndex ? 'active' : ''} ${isError ? 'result-tab-btn--error' : ''} ${isPending ? 'result-tab-btn--pending' : ''}`.trim();
 
       const sqlText = res.query || res.sql || res.statement || '';
       // Multi-database question-answering: a result tagged with which
       // connection it came from (see execute_routes.py's module docstring)
-      // gets that connection's name prefixed onto its tab, so a script
-      // that spanned more than one database still reads clearly tab-by-
-      // tab - absent entirely for a single-connection script, which never
-      // carries this field at all.
-      const dbLabel = res.database && res.database.name ? `[${res.database.name}] ` : '';
+      // gets that connection's name prefixed onto its tab (its own line -
+      // see .result-tab-btn's CSS - above the "Query N (rows)"/"Note"/etc.
+      // line below it), so a script that spanned more than one database
+      // still reads clearly tab-by-tab - absent entirely for a
+      // single-connection script, which never carries this field at all.
+      const dbLabel = res.database && res.database.name ? `${res.database.name}\n` : '';
       if (sqlText) {
-        btn.setAttribute('title', dbLabel ? `${dbLabel}${sqlText}` : sqlText);
+        btn.setAttribute('title', dbLabel ? `${res.database.name}\n${sqlText}` : sqlText);
       }
 
-      if (isText) {
+      if (isPending) {
+        // "All databases" mode's live-streaming placeholder tab (see
+        // startAllModeStreaming()/renderTableResult()'s own isPending
+        // branch) - same two-line name-then-status convention as every
+        // other per-database tab, with a short status word instead of a
+        // row count (there's nothing to count yet).
+        btn.textContent = `${dbLabel}${res.tabLabel || 'Fetching…'}`;
+      } else if (isText) {
         // All-databases mode's own synthetic text tabs (see
         // renderAllModeCombinedResults()) - a leading "Summary" tab (no
-        // `.database`, so no prefix) or a per-database "Note" tab (same
-        // `[name] ` prefix convention as every other tab here).
+        // `.database`, so no name line) or a per-database "Note" tab (same
+        // two-line convention as every other tab here).
         btn.textContent = `${dbLabel}${res.tabLabel || 'Note'}`;
       } else if (isError) {
         // Colored differently (via the result-tab-btn--error class) so a
@@ -3839,6 +4097,43 @@ document.addEventListener('DOMContentLoaded', async () => {
     return (rawText || '').replace(/^\*\*\*\s*NO\s*SQL\s*\*\*\*\s*/i, '').trim();
   }
 
+  function escapeHtml(text) {
+    return (text || '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+  }
+
+  // Minimal, dependency-free Markdown-lite renderer for LLM free-text
+  // replies (single-connection NO-SQL answers, and the all-mode Summary/
+  // Note tabs - see renderNoSqlResponse() and the `isText` branch in
+  // renderTableResult()) - these commonly come back with **bold**,
+  // *italic*/_italic_ emphasis, and occasional `inline code`, which used
+  // to show up as literal asterisks/underscores/backticks now that this
+  // was rendered via .textContent. Escapes HTML first (this is LLM
+  // output, not trusted markup) then applies a deliberately small set of
+  // inline substitutions - not a full Markdown parser (no lists, links,
+  // or headings), just the emphasis these replies actually use. Newlines
+  // are left untouched - .response-text's `white-space: pre-wrap` already
+  // renders them as line breaks, same as before this function existed.
+  function renderMarkdownLite(rawText) {
+    let html = escapeHtml(rawText);
+    // Code spans first, so a literal asterisk/underscore inside one isn't
+    // then misread as emphasis syntax by the patterns below.
+    html = html.replace(/`([^`\n]+)`/g, '<code>$1</code>');
+    // Bold before italic - by the time the italic patterns run, every
+    // real **bold**/__bold__ pair has already been consumed, so a
+    // leftover single */_ can only be genuine italic syntax.
+    html = html.replace(/\*\*([^\n*]+)\*\*/g, '<strong>$1</strong>');
+    html = html.replace(/__([^\n_]+)__/g, '<strong>$1</strong>');
+    html = html.replace(/\*([^\n*]+)\*/g, '<em>$1</em>');
+    // Underscore italics require a non-word char (or start of string) on
+    // either side, so a snake_case_identifier in the reply doesn't get
+    // partially italicized.
+    html = html.replace(/(^|[^\w\\])_([^\n_]+)_(?!\w)/g, '$1<em>$2</em>');
+    return html;
+  }
+
   function renderNoSqlResponse(rawText) {
     const cleanText = stripNoSqlPrefix(rawText) || rawText || '';
 
@@ -3852,7 +4147,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       const p = document.createElement('p');
       p.className = 'response-text';
-      p.textContent = cleanText;
+      p.innerHTML = renderMarkdownLite(cleanText);
 
       td.appendChild(p);
       tr.appendChild(td);
@@ -3860,9 +4155,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
-  // "All databases" mode's own combined renderer (see translatePrompt()'s
-  // `router_route` branch and executeSql()'s pendingAllModeNotes check
-  // below): merges a leading "Summary" text tab (built from the triage
+  // "All databases" mode's own combined renderer - used for history
+  // restoration (restoreLatestTurn()) and for the manual-Execute-button
+  // batched flow (executeSql()'s router-route branch, when auto-execute
+  // was off) - live streaming turns render progressively instead, see
+  // startAllModeStreaming() and friends below. Merges a leading "Summary"
+  // text tab (built from the triage
   // call's routing message, when there is one), one "Note" text tab per
   // database that came back with a '*** NO SQL ***' reply instead of real
   // SQL, the real per-database /api/execute results (if any SQL was
@@ -3928,9 +4226,9 @@ document.addEventListener('DOMContentLoaded', async () => {
   // necessarily can't say what the answer actually turned out to be,
   // since it's written before any real data is fetched.
   //
-  // `notes` is the same shape pendingAllModeNotes already carries
+  // `notes` is the same shape allModeStreamState carries
   // (routingMessage/databaseNotes/generationFailures, plus the ORIGINAL
-  // prompt - see translatePrompt()'s router_route branch); `executeResults`/
+  // prompt - see startAllModeStreaming()); `executeResults`/
   // `executeFailures` are /api/execute's own results/failures for THIS
   // execution, exactly as passed into renderAllModeCombinedResults just
   // before this is called.
@@ -4055,6 +4353,274 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
+  // "All databases" mode's PROGRESSIVE render path - the streaming
+  // counterpart to renderAllModeCombinedResults() above (still used
+  // unchanged for history restoration and, deliberately, for the manual-
+  // Execute-button batched flow below - see executeSql()'s router-route
+  // branch and this plan's "streaming-execute only when auto-execute is
+  // on" decision). Kicks off the moment /api/translate's "phase_a_route"
+  // NDJSON line arrives (see translate_routes.py's stream_translation()
+  // docstring) - well before any single selected connection's own
+  // generation call, let alone execution, has finished. Renders the
+  // Summary tab immediately, plus one PENDING placeholder tab per
+  // selected connection, and stashes everything handlePhaseBConnectionDone()/
+  // executeOneAllModeConnection()/maybeFinalize() below need to keep
+  // updating those tabs live as the rest of this turn's events arrive.
+  function startAllModeStreaming(evt, promptText) {
+    const connectionSelection = evt.connection_selection || [];
+    allModeStreamState = {
+      prompt: promptText,
+      routingMessage: evt.routing_message || null,
+      databaseNotes: [],
+      generationFailures: [],
+      executeResults: [],
+      executeFailures: [],
+      expectedTotal: connectionSelection.length,
+      settledCount: 0,
+      // Per-connection /api/execute calls kicked off below (auto-execute
+      // only) - translatePrompt() awaits all of these before it can
+      // safely call maybeFinalize(), since by then every one of these has
+      // necessarily already been created (they're only ever pushed here,
+      // synchronously, while /api/translate's own NDJSON body is still
+      // being parsed - see readTranslateStream()'s docstring for why that
+      // happens strictly before the terminal line resolves this promise).
+      pendingExecutions: [],
+      terminalData: null,
+      modelEntry: null,
+      finalized: false,
+      // Captured once per turn (rather than re-read live) so a mid-flight
+      // preference change can't make one turn behave inconsistently -
+      // some connections streaming-executed, others not.
+      autoExecute: autoSqlExecuteEnabled,
+    };
+
+    const summaryTab = allModeStreamState.routingMessage
+      ? [{ isText: true, tabLabel: 'Summary', text: allModeStreamState.routingMessage }]
+      : [];
+    const placeholderTabs = connectionSelection.map((e) => ({
+      isPending: true,
+      tabLabel: 'Fetching…',
+      database: { kind: e.kind, id: e.id, name: e.name },
+    }));
+    currentResultsList = [...summaryTab, ...placeholderTabs];
+    activeResultIndex = 0;
+    buildResultsTabsNav();
+    renderTableResult(currentResultsList[0] || null);
+    showAllModeStreamStatus(allModeStreamState.expectedTotal, 0);
+  }
+
+  // Locates the still-pending placeholder tab for one connection - always
+  // by (kind, id), never by a snapshotted array index, since several
+  // connections' own handlers can each replace an entry in
+  // currentResultsList across an `await` boundary (a /api/execute round
+  // trip), which would silently invalidate any index captured beforehand.
+  function findAllModePendingIndex(kind, id) {
+    return currentResultsList.findIndex(
+      (r) => r.isPending && r.database && r.database.kind === kind && r.database.id === id
+    );
+  }
+
+  function replaceAllModePlaceholder(dbRef, tab) {
+    const idx = findAllModePendingIndex(dbRef.kind, dbRef.id);
+    if (idx >= 0) {
+      currentResultsList[idx] = tab;
+    } else {
+      // Shouldn't happen in practice (every selected connection gets a
+      // placeholder up front in startAllModeStreaming()) - falling back
+      // to appending rather than silently dropping the result keeps this
+      // defensive rather than lossy.
+      currentResultsList.push(tab);
+    }
+  }
+
+  // Re-renders the tabs nav/active tab in place after a placeholder was
+  // just swapped for real content, and refreshes the progress banner.
+  // Deliberately does NOT change which tab is active (unlike
+  // renderAllModeCombinedResults' one-shot "jump to the first failure"
+  // behavior) - the whole point of streaming is that whichever tab the
+  // user is currently looking at flips from "Fetching…" to real content
+  // in place, without yanking their view elsewhere.
+  function rerenderAllModeStream() {
+    const state = allModeStreamState;
+    if (!state) return;
+    if (activeResultIndex >= currentResultsList.length) activeResultIndex = 0;
+    buildResultsTabsNav();
+    renderTableResult(currentResultsList[activeResultIndex] || null);
+    showAllModeStreamStatus(state.expectedTotal, state.settledCount);
+  }
+
+  // Reuses the existing retry-status banner element/styling (see
+  // showRetryStatus()/hideRetryStatus() above) - it's never shown at the
+  // same time as a real per-attempt retry (that's a single-connection-
+  // only code path), so there's no risk of the two treading on each
+  // other.
+  function showAllModeStreamStatus(total, settled) {
+    if (!resultsRetryStatus) return;
+    const progress = settled ? ` (${settled} of ${total} done)` : '';
+    resultsRetryStatus.innerHTML =
+      `<span class="retry-status-icon animate-spin">⟳</span> ` +
+      `Fetching results from ${total} database${total === 1 ? '' : 's'}${progress}…`;
+    resultsRetryStatus.classList.remove('hidden');
+  }
+
+  function hideAllModeStreamStatus() {
+    hideRetryStatus();
+  }
+
+  // Handles one "phase_b_connection_done" NDJSON event (see
+  // translate_routes.py's stream_translation() docstring) - called once
+  // per selected connection, in COMPLETION order (not necessarily the
+  // order connection_selection listed them in).
+  function handlePhaseBConnectionDone(evt) {
+    const state = allModeStreamState;
+    if (!state) return; // a phase_a_route event always precedes this - defensive only
+
+    if (evt.outcome === 'note') {
+      const tab = {
+        isText: true, tabLabel: 'Note',
+        text: evt.text || 'No response was returned for this database.',
+        database: { kind: evt.kind, id: evt.id, name: evt.name },
+      };
+      replaceAllModePlaceholder({ kind: evt.kind, id: evt.id }, tab);
+      if (evt.text) {
+        state.databaseNotes.push({ kind: evt.kind, id: evt.id, name: evt.name, text: evt.text });
+      }
+      state.settledCount += 1;
+      rerenderAllModeStream();
+      return;
+    }
+
+    if (evt.outcome === 'failed') {
+      const tab = {
+        isError: true, error: evt.error || 'An error occurred generating SQL for this database.',
+        database: { kind: evt.kind, id: evt.id, name: evt.name },
+      };
+      replaceAllModePlaceholder({ kind: evt.kind, id: evt.id }, tab);
+      state.generationFailures.push({ kind: evt.kind, id: evt.id, name: evt.name, error: evt.error });
+      state.settledCount += 1;
+      rerenderAllModeStream();
+      return;
+    }
+
+    // evt.outcome === 'sql'
+    if (!state.autoExecute) {
+      // Leave the placeholder in place (just relabeled) - this connection
+      // only settles once the user clicks Execute manually, which re-runs
+      // today's existing BATCHED /api/execute flow (see executeSql()'s
+      // router-route branch below) for every connection still in this
+      // state at once.
+      const idx = findAllModePendingIndex(evt.kind, evt.id);
+      if (idx >= 0) {
+        currentResultsList[idx] = { ...currentResultsList[idx], tabLabel: 'Ready to execute' };
+        rerenderAllModeStream();
+      }
+      return;
+    }
+
+    state.pendingExecutions.push(executeOneAllModeConnection(evt));
+  }
+
+  // Fires a single-connection /api/execute call the moment its own SQL
+  // has been generated (evt.sql already carries the '-- database: ...'
+  // marker translate_routes.py prepended) - exploiting execute_routes.py's
+  // existing single-marker-group handling, which already works correctly
+  // for exactly one connection's SQL with zero backend changes. Never
+  // awaited by its caller inline - tracked in
+  // allModeStreamState.pendingExecutions instead, so N connections'
+  // executions can run fully in parallel with each other (and with
+  // whichever other connections' generation calls are still in flight).
+  async function executeOneAllModeConnection(evt) {
+    const state = allModeStreamState;
+    const dbRef = { kind: evt.kind, id: evt.id, name: evt.name };
+    try {
+      const response = await fetch('/api/execute', {
+        method: 'POST',
+        headers: getApiHeaders(),
+        credentials: 'same-origin',
+        body: JSON.stringify({ sql: evt.sql, pinned_connections: PINNED_CONNECTIONS }),
+      });
+      const data = await response.json();
+      if (response.ok && data.success && Array.isArray(data.results) && data.results.length) {
+        const result = data.results[0];
+        if (!result.database) result.database = dbRef;
+        replaceAllModePlaceholder(dbRef, result);
+        state.executeResults.push(result);
+      } else {
+        const errMsg = (data && data.error)
+          || (Array.isArray(data && data.failures) && data.failures[0] && data.failures[0].error)
+          || 'An error occurred during SQL execution.';
+        replaceAllModePlaceholder(dbRef, { isError: true, error: errMsg, database: dbRef });
+        state.executeFailures.push({ database: dbRef, error: errMsg });
+      }
+    } catch (err) {
+      const errMsg = err.message || 'Failed to reach the execution backend server.';
+      replaceAllModePlaceholder(dbRef, { isError: true, error: errMsg, database: dbRef });
+      state.executeFailures.push({ database: dbRef, error: errMsg });
+    }
+    state.settledCount += 1;
+    rerenderAllModeStream();
+  }
+
+  // Runs once every selected connection has settled (note, generation
+  // failure, or executed-or-failed) AND the terminal /api/translate line
+  // has arrived (translatePrompt() stashes it onto
+  // allModeStreamState.terminalData/.modelEntry - see its router_route
+  // branch) - these two conditions are checked independently since they
+  // can complete in either order: the terminal line always arrives no
+  // later than the LAST phase_b_connection_done event server-side, but
+  // each connection's own CLIENT-driven /api/execute call is a separate
+  // race that can easily still be in flight once the terminal line shows
+  // up. Idempotent (guarded by .finalized) - safe to call from more than
+  // one place without double-running Phase C or double-persisting
+  // history.
+  async function maybeFinalize() {
+    const state = allModeStreamState;
+    if (!state || state.finalized) return;
+    if (state.settledCount < state.expectedTotal) return;
+    if (!state.terminalData) return;
+    state.finalized = true;
+    hideAllModeStreamStatus();
+
+    const notes = {
+      prompt: state.prompt,
+      routingMessage: state.routingMessage,
+      databaseNotes: state.databaseNotes,
+      generationFailures: state.generationFailures,
+    };
+
+    // Phase C - see requestAllModeResultsSummary's docstring. Awaited so
+    // callers (translatePrompt()/executeSql()) keep their buttons
+    // disabled for this extra round trip, same as the pre-streaming
+    // batched flow always did.
+    await requestAllModeResultsSummary(notes, state.executeResults, state.executeFailures);
+    const summaryEntry = getSummaryTabEntry();
+    if (summaryEntry) notes.routingMessage = summaryEntry.text;
+
+    const modelEntry = state.modelEntry;
+    if (modelEntry) {
+      const summarizedResults = state.executeResults.map(summarizeResultForHistory);
+      if (chatStore.getPending() && !chatStore.isPendingCurrent()) {
+        // Stale reference (e.g. left over from navigating through a
+        // no-SQL turn) - drop it rather than risk mutating the wrong turn.
+        chatStore.clearPending();
+      }
+      if (chatStore.isPendingCurrent()) {
+        // SQL just generated by this same turn and now executed for the
+        // first time - fill in its results rather than creating a
+        // duplicate turn.
+        const pending = chatStore.getPending();
+        pending.entry.results = summarizedResults;
+        captureAllModeHistory(pending.entry, notes, state.executeFailures);
+        chatStore.clearPending();
+      } else {
+        modelEntry.results = summarizedResults;
+        captureAllModeHistory(modelEntry, notes, state.executeFailures);
+      }
+    }
+
+    allModeStreamState = null;
+  }
+
   // ===========================================================================
   // 9. TRANSLATE (NL -> SQL) AND EXECUTE SQL
   // ===========================================================================
@@ -4062,11 +4628,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     await fetchBackendConfig();
 
     clearResultsDisplay();
-    // Reset the "all databases" mode notes stashed by a PREVIOUS
-    // router_route turn - reset unconditionally
-    // so a stale summary/note set never leaks into this turn's rendering
-    // (re-populated below only if THIS response is itself a router_route
-    // "route" outcome).
+    // Reset the "all databases" mode streaming state left over from a
+    // PREVIOUS router_route turn - reset unconditionally so a stale
+    // summary/note/placeholder set never leaks into this turn's rendering
+    // (re-created below, by startAllModeStreaming(), only if THIS
+    // response's own stream turns out to carry a "phase_a_route" event).
+    allModeStreamState = null;
+    // Same reset for the no-live-stream fallback (see its own declaration
+    // comment above).
     pendingAllModeNotes = null;
 
     const promptText = aiPrompt ? aiPrompt.value.trim() : "";
@@ -4100,14 +4669,26 @@ document.addEventListener('DOMContentLoaded', async () => {
         body: JSON.stringify({
           prompt: promptText,
           history: chatStore.toPayload(),
-          // Harmless no-op whenever this session has 0 or 1 connections in
-          // scope (server-side, translate_routes.py only ever reads this
-          // when multi_db is true) - see PINNED_CONNECTIONS' docstring.
+          // translate_routes.py's /api/translate handler doesn't read this
+          // key at all - the only server-side consumer of a client-echoed
+          // pinned_connections entry today is execute_routes.py's
+          // marker-free fallback (see below). Sent here anyway since it's
+          // harmless and keeps this payload shape consistent with
+          // /api/execute's - see PINNED_CONNECTIONS' docstring.
           pinned_connections: PINNED_CONNECTIONS
         })
       });
 
-      data = await readTranslateStream(response);
+      data = await readTranslateStream(response, (evt) => {
+        if (evt.status === 'retrying') { showRetryStatus(evt); return; }
+        // "All databases" mode's "route" outcome streams these two extra
+        // event kinds ahead of the terminal line - see
+        // translate_routes.py's stream_translation() docstring and
+        // startAllModeStreaming()/handlePhaseBConnectionDone() above.
+        // Neither ever fires for any other response shape.
+        if (evt.status === 'phase_a_route') { startAllModeStreaming(evt, promptText); return; }
+        if (evt.status === 'phase_b_connection_done') { handlePhaseBConnectionDone(evt); return; }
+      });
       hideRetryStatus();
 
       // connection_selection is only ever present when this session had
@@ -4116,7 +4697,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       // PINNED_CONNECTIONS is left as whatever it already was (a NO-SQL/
       // help response, or a plain error, doesn't change what's pinned).
       // Which database(s) were actually used is still disclosed to the
-      // user via the per-tab `[name]` labels (buildResultsTabsNav) and the
+      // user via the per-tab name line (buildResultsTabsNav) and the
       // `-- database: ...` comment translate_routes.py writes directly
       // into the generated SQL - no separate banner needed on top of that.
       if (data && data.connection_selection && data.connection_selection.length) {
@@ -4134,23 +4715,17 @@ document.addEventListener('DOMContentLoaded', async () => {
       // real error status because they're not streamed at all.
       if (response && response.ok && data && data.router_route) {
         // "All databases" mode's "route" outcome (see translate_routes.py's
-        // module docstring): `data.sql` may legitimately be empty (every
-        // selected database noted or failed instead of returning real
-        // SQL) - checked as its own branch, ahead of the plain `data.sql`
-        // check below, precisely because that empty-string case must NOT
-        // fall through to the "Translation Error" branch the way a truly
+        // module docstring): the Summary/per-database tabs were already
+        // rendered PROGRESSIVELY as this stream's own "phase_a_route"/
+        // "phase_b_connection_done" events arrived (see
+        // startAllModeStreaming()/handlePhaseBConnectionDone() above) -
+        // `allModeStreamState` is non-null here precisely when that
+        // happened. `data.sql` may legitimately be empty (every selected
+        // database noted or failed instead of returning real SQL) -
+        // checked as its own branch, ahead of the plain `data.sql` check
+        // below, precisely because that empty-string case must NOT fall
+        // through to the "Translation Error" branch the way a truly
         // absent/falsy `sql` would for every other response shape.
-        pendingAllModeNotes = {
-          // The ORIGINAL question that started this whole turn - captured
-          // here (not re-read from aiPrompt.value later) since that field
-          // may have already changed by the time Phase C's summarization
-          // request goes out (see requestAllModeResultsSummary() below).
-          prompt: promptText,
-          routingMessage: data.routing_message || null,
-          databaseNotes: data.database_notes || [],
-          generationFailures: data.generation_failures || [],
-        };
-
         const modelEntry = { role: 'model', text: data.sql || '' };
         chatStore.pushTurn(promptText, modelEntry);
         updateHistoryTurnsSubtitle();
@@ -4158,23 +4733,59 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (data.sql) {
           setSqlQuery(data.sql);
           chatStore.setPending(modelEntry, normalizeSqlForCompare(data.sql));
-
-          if (autoSqlExecuteEnabled) {
-            await executeSql();
-          }
         } else {
-          // Nothing to execute at all - render immediately, with no
-          // /api/execute call, straight from the notes/failures already
-          // stashed above.
           setSqlQuery('');
           chatStore.clearPending();
-          captureAllModeHistory(modelEntry, pendingAllModeNotes, []);
-          renderAllModeCombinedResults({
-            notes: pendingAllModeNotes,
-            executeResults: [],
-            executeFailures: [],
-          });
-          pendingAllModeNotes = null;
+        }
+
+        if (allModeStreamState) {
+          // Attach this terminal line/turn's modelEntry so maybeFinalize()
+          // can persist history once every selected connection has
+          // actually settled - auto-execute may have already kicked off
+          // per-connection /api/execute calls above (via
+          // handlePhaseBConnectionDone()) that are still in flight, so
+          // wait for every one of them before even attempting to finalize
+          // (maybeFinalize() itself no-ops until settledCount reaches
+          // expectedTotal - e.g. auto-execute off, with real SQL still
+          // sitting in a "Ready to execute" placeholder).
+          allModeStreamState.terminalData = data;
+          allModeStreamState.modelEntry = modelEntry;
+          await Promise.all(allModeStreamState.pendingExecutions);
+          await maybeFinalize();
+        } else {
+          // No live "phase_a_route"/"phase_b_connection_done" events ever
+          // arrived for this turn (see pendingAllModeNotes' own
+          // declaration comment above for when this happens) - fall back
+          // to the ORIGINAL, fully batched rendering this app used for
+          // every router_route turn before progressive streaming existed.
+          pendingAllModeNotes = {
+            // The ORIGINAL question that started this whole turn -
+            // captured here (not re-read from aiPrompt.value later) since
+            // that field may have already changed by the time Phase C's
+            // summarization request goes out (see
+            // requestAllModeResultsSummary() below).
+            prompt: promptText,
+            routingMessage: data.routing_message || null,
+            databaseNotes: data.database_notes || [],
+            generationFailures: data.generation_failures || [],
+          };
+
+          if (data.sql) {
+            if (autoSqlExecuteEnabled) {
+              await executeSql();
+            }
+          } else {
+            // Nothing to execute at all - render immediately, with no
+            // /api/execute call, straight from the notes/failures already
+            // stashed above.
+            captureAllModeHistory(modelEntry, pendingAllModeNotes, []);
+            renderAllModeCombinedResults({
+              notes: pendingAllModeNotes,
+              executeResults: [],
+              executeFailures: [],
+            });
+            pendingAllModeNotes = null;
+          }
         }
       } else if (response && response.ok && data && data.sql) {
         const trimmedSql = data.sql.trim();
@@ -4294,8 +4905,18 @@ document.addEventListener('DOMContentLoaded', async () => {
   async function executeSql(customSql = null) {
     await fetchBackendConfig();
 
-    clearResultsDisplay();
-  
+    // A live "all databases" mode streaming turn (auto-execute was off,
+    // and the user is now clicking Execute manually - see
+    // handlePhaseBConnectionDone()'s "Ready to execute" placeholders and
+    // this function's own router-route branch below) already has its
+    // Summary/Note/generation-failure/placeholder tabs live in
+    // currentResultsList - preserve them instead of wiping the results
+    // area, since this call only needs to settle whichever placeholders
+    // are still pending, not rebuild everything from scratch.
+    if (!allModeStreamState) {
+      clearResultsDisplay();
+    }
+
     const sql = customSql || getSqlQuery();
     if (!sql) return;
   
@@ -4315,72 +4936,89 @@ document.addEventListener('DOMContentLoaded', async () => {
           // entirely) - only meaningful for a hand-edited/re-run
           // multi-database script with no markers left at all, where it's
           // the fallback target (see execute_routes.py's module docstring
-          // and _resolve_pinned_subset in translate_routes.py for the same
-          // convention on the generation side).
+          // and its resolve_descriptor_by_reference fallback just above).
           pinned_connections: PINNED_CONNECTIONS
         })
       });
   
       const data = await response.json();
       if (response.ok && data.success) {
-        // "All databases" mode's "route" outcome left a summary/notes
-        // bundle behind for THIS execution (see translatePrompt()'s
-        // router_route branch) - render the combined view instead of the
-        // plain multi-tab renderer, and consume (clear) it so it doesn't
-        // linger into some later, unrelated execution. Captured into its
-        // own variable (rather than re-reading pendingAllModeNotes further
-        // down, after it's already been nulled out) so it's still around
-        // once execution has settled, to persist onto this turn's history
-        // entry below - see captureAllModeHistory()'s docstring for why
-        // that's needed at all.
-        const allModeNotes = pendingAllModeNotes;
-        if (allModeNotes) {
-          renderAllModeCombinedResults({
-            notes: allModeNotes,
-            executeResults: data.results,
-            executeFailures: [],
+        // A live "all databases" mode streaming turn (see this function's
+        // top comment above) - this batched call only ever carries SQL
+        // for connections still sitting in a "Ready to execute"
+        // placeholder (every noted/failed connection's own SQL was never
+        // part of the editor's `sql` text in the first place - see
+        // translate_routes.py's sql_blocks construction), so settle
+        // exactly those, matched by the `.database` tag execute_routes.py
+        // already attaches to each returned row, then let maybeFinalize()
+        // handle Phase C and history exactly as it would for a fully
+        // auto-executed turn.
+        const streamState = allModeStreamState;
+        if (streamState) {
+          (data.results || []).forEach((result) => {
+            const db = result.database || {};
+            replaceAllModePlaceholder(db, result);
+            streamState.executeResults.push(result);
+            streamState.settledCount += 1;
           });
-          pendingAllModeNotes = null;
-          // Phase C - see requestAllModeResultsSummary's docstring.
-          // Awaited (not fire-and-forget) so buttons stay disabled for
-          // this extra round trip, same as every other step of this
-          // function already does. That call mutates the Summary tab's
-          // text in currentResultsList in place, once it resolves - pull
-          // the (possibly now Phase-C-augmented) text back out immediately
-          // after, so allModeNotes.routingMessage - and therefore whatever
-          // gets persisted onto the history entry just below - reflects
-          // the FINAL answer, not triage's earlier, data-free guess at it.
-          await requestAllModeResultsSummary(allModeNotes, data.results, []);
-          const summaryEntry = getSummaryTabEntry();
-          if (summaryEntry) allModeNotes.routingMessage = summaryEntry.text;
+          rerenderAllModeStream();
+          await maybeFinalize();
         } else {
-          renderMultiTurnResults(data.results);
-        }
+          // pendingAllModeNotes fallback (see its own declaration comment
+          // above) - a router_route turn that never got any live
+          // "phase_a_route"/"phase_b_connection_done" events, so this is
+          // still the ORIGINAL fully-batched render this app used for
+          // every router_route turn before progressive streaming existed.
+          const allModeNotes = pendingAllModeNotes;
+          if (allModeNotes) {
+            renderAllModeCombinedResults({
+              notes: allModeNotes,
+              executeResults: data.results,
+              executeFailures: [],
+            });
+            pendingAllModeNotes = null;
+            // Phase C - see requestAllModeResultsSummary's docstring.
+            // Awaited (not fire-and-forget) so buttons stay disabled for
+            // this extra round trip, same as every other step of this
+            // function already does. That call mutates the Summary tab's
+            // text in currentResultsList in place, once it resolves - pull
+            // the (possibly now Phase-C-augmented) text back out
+            // immediately after, so allModeNotes.routingMessage - and
+            // therefore whatever gets persisted onto the history entry
+            // just below - reflects the FINAL answer, not triage's
+            // earlier, data-free guess at it.
+            await requestAllModeResultsSummary(allModeNotes, data.results, []);
+            const summaryEntry = getSummaryTabEntry();
+            if (summaryEntry) allModeNotes.routingMessage = summaryEntry.text;
+          } else {
+            renderMultiTurnResults(data.results);
+          }
 
-        const promptText = aiPrompt && aiPrompt.value.trim() ? aiPrompt.value.trim() : "[Direct SQL Execution]";
-        const summarizedResults = Array.isArray(data.results) ? data.results.map(summarizeResultForHistory) : [];
+          const promptText = aiPrompt && aiPrompt.value.trim() ? aiPrompt.value.trim() : "[Direct SQL Execution]";
+          const summarizedResults = Array.isArray(data.results) ? data.results.map(summarizeResultForHistory) : [];
 
-        if (chatStore.getPending() && !chatStore.isPendingCurrent()) {
-          // Stale reference (e.g. left over from navigating through a no-SQL
-          // turn) - drop it rather than risk mutating the wrong turn.
-          chatStore.clearPending();
-        }
+          if (chatStore.getPending() && !chatStore.isPendingCurrent()) {
+            // Stale reference (e.g. left over from navigating through a no-SQL
+            // turn) - drop it rather than risk mutating the wrong turn.
+            chatStore.clearPending();
+          }
 
-        if (chatStore.isPendingCurrent()) {
-          // SQL just generated by translate() and now executed for the first
-          // time - fill in its results rather than creating a duplicate turn.
-          const pending = chatStore.getPending();
-          pending.entry.text = sql;
-          pending.entry.results = summarizedResults;
-          if (allModeNotes) captureAllModeHistory(pending.entry, allModeNotes, []);
-          chatStore.clearPending();
-        } else {
-          // Any other execution (direct SQL entry, or re-running a query
-          // that isn't the pending just-generated one) is its own turn.
-          const modelEntry = { role: 'model', text: sql, results: summarizedResults };
-          if (allModeNotes) captureAllModeHistory(modelEntry, allModeNotes, []);
-          chatStore.pushTurn(promptText, modelEntry);
-          updateHistoryTurnsSubtitle();
+          if (chatStore.isPendingCurrent()) {
+            // SQL just generated by translate() and now executed for the first
+            // time - fill in its results rather than creating a duplicate turn.
+            const pending = chatStore.getPending();
+            pending.entry.text = sql;
+            pending.entry.results = summarizedResults;
+            if (allModeNotes) captureAllModeHistory(pending.entry, allModeNotes, []);
+            chatStore.clearPending();
+          } else {
+            // Any other execution (direct SQL entry, or re-running a query
+            // that isn't the pending just-generated one) is its own turn.
+            const modelEntry = { role: 'model', text: sql, results: summarizedResults };
+            if (allModeNotes) captureAllModeHistory(modelEntry, allModeNotes, []);
+            chatStore.pushTurn(promptText, modelEntry);
+            updateHistoryTurnsSubtitle();
+          }
         }
 
         if (connDbDot) connDbDot.className = 'status-dot connected';
@@ -4393,7 +5031,48 @@ document.addEventListener('DOMContentLoaded', async () => {
         // priority over both existing failure shapes below - it needs the
         // Summary/Note text tabs alongside whatever DID execute, not just
         // the raw execute-failure shape those existing renderers show.
-        if (pendingAllModeNotes) {
+        if (allModeStreamState) {
+          const streamState = allModeStreamState;
+          const executeResults = Array.isArray(data.results) ? data.results : [];
+          const executeFailures = Array.isArray(data.failures) ? data.failures : [];
+          executeResults.forEach((result) => {
+            const db = result.database || {};
+            replaceAllModePlaceholder(db, result);
+            streamState.executeResults.push(result);
+            streamState.settledCount += 1;
+          });
+          executeFailures.forEach((f) => {
+            const db = f.database || {};
+            replaceAllModePlaceholder(db, {
+              isError: true, error: f.error || 'An error occurred during SQL execution.', database: db,
+            });
+            streamState.executeFailures.push(f);
+            streamState.settledCount += 1;
+          });
+          rerenderAllModeStream();
+          // Phase C - see requestAllModeResultsSummary's docstring. Still
+          // worth attempting even on a partial failure: whatever DID
+          // execute successfully is real data worth summarizing, and the
+          // failed connection(s) are already fed in as their own entries
+          // (see buildAllModeSummaryPayload) so the summary can note that
+          // too if it affects the answer. Deliberately NOT routed through
+          // maybeFinalize() here, matching this branch's pre-existing
+          // behavior (from before this streaming redesign) of never
+          // persisting history for a partial execute failure - only the
+          // success branch above ever reaches maybeFinalize().
+          await requestAllModeResultsSummary(
+            {
+              prompt: streamState.prompt, routingMessage: streamState.routingMessage,
+              databaseNotes: streamState.databaseNotes, generationFailures: streamState.generationFailures,
+            },
+            streamState.executeResults, streamState.executeFailures,
+          );
+          allModeStreamState = null;
+        // pendingAllModeNotes fallback (see its own declaration comment
+        // above) - same "never persists history for a partial execute
+        // failure" behavior the live-streaming branch just above
+        // preserves, from before this streaming redesign.
+        } else if (pendingAllModeNotes) {
           const allModeNotes = pendingAllModeNotes;
           const executeResults = Array.isArray(data.results) ? data.results : [];
           const executeFailures = Array.isArray(data.failures) ? data.failures : [];
@@ -4403,12 +5082,6 @@ document.addEventListener('DOMContentLoaded', async () => {
             executeFailures: executeFailures,
           });
           pendingAllModeNotes = null;
-          // Phase C - see requestAllModeResultsSummary's docstring. Still
-          // worth attempting even on a partial failure: whatever DID
-          // execute successfully is real data worth summarizing, and the
-          // failed connection(s) are already fed in as their own entries
-          // (see buildAllModeSummaryPayload) so the summary can note that
-          // too if it affects the answer.
           await requestAllModeResultsSummary(allModeNotes, executeResults, executeFailures);
         // Multi-database question-answering's own partial-failure shape
         // (see execute_routes.py's module docstring) - `failures` is a

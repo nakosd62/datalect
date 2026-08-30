@@ -12,6 +12,7 @@ from helpers import SERVER_DIR
 if SERVER_DIR not in sys.path:
     sys.path.insert(0, SERVER_DIR)
 
+import state_store
 from state_store import SqliteStateStore, compute_connection_key
 
 
@@ -119,6 +120,45 @@ def test_none_user_id_bucketed_under_global(tmp_path):
     store.set_session(None, connection_id="global-conn")
     assert store.get_session(None)["connection_id"] == "global-conn"
     assert store.get_session("global")["connection_id"] == "global-conn"
+
+
+# --- theme (Preferences modal) --------------------------------------------------
+# Same "" -> "nothing explicitly saved yet, let the client's own current/
+# localStorage value keep applying" convention llm_provider/llm_model already
+# use - see get_session's docstring - not auto_sql_execute's baked-in-default
+# one.
+
+def test_get_session_defaults_theme_to_blank(tmp_path):
+    store = make_store(tmp_path)
+    session = store.get_session("alice")
+    assert session["theme"] == ""
+
+
+def test_set_and_get_session_round_trips_theme(tmp_path):
+    store = make_store(tmp_path)
+    store.set_session("alice", theme="light")
+    session = store.get_session("alice")
+    assert session["theme"] == "light"
+    # Untouched by a theme-only save - same independence auto_sql_execute/
+    # connection_id already have from each other.
+    assert session["connection_id"] == ""
+
+
+def test_set_session_theme_does_not_clobber_other_fields(tmp_path):
+    store = make_store(tmp_path)
+    store.set_session("alice", connection_id="preset+Default DB", auto_sql_execute=False)
+    store.set_session("alice", theme="light")
+    session = store.get_session("alice")
+    assert session["connection_id"] == "preset+Default DB"
+    assert session["auto_sql_execute"] is False
+    assert session["theme"] == "light"
+
+
+def test_set_session_other_fields_do_not_clobber_theme(tmp_path):
+    store = make_store(tmp_path)
+    store.set_session("alice", theme="light")
+    store.set_session("alice", auto_sql_execute=False)
+    assert store.get_session("alice")["theme"] == "light"
 
 
 # --- db_connections (saved custom connections) --------------------------------
@@ -416,6 +456,73 @@ def test_purge_translation_history_does_not_affect_other_users(tmp_path):
     assert bob_count == 1
 
 
+# --- translation history list cap (TRANSLATION_HISTORY_LIST_LIMIT) -------------
+# record_translation()'s created_at defaults to CURRENT_TIMESTAMP (second
+# granularity), so a tight loop of record_translation() calls can't be
+# trusted to produce distinct, orderable timestamps within a single test.
+# These tests instead insert rows directly with explicit, controlled
+# created_at values - same "build the row by hand" approach the legacy-
+# schema migration tests above already use for a different reason.
+
+def _insert_translation_row(db_path, user_id, nl_prompt, created_at):
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "INSERT INTO translations "
+        "(user_id, database_type, database_name, nl_prompt, sql_command, model, "
+        " duration, input_tokens, output_tokens, total_tokens, thinking_tokens, "
+        " cached_content_tokens, created_at) "
+        "VALUES (?, 'postgres', 'DB', ?, 'SELECT 1;', 'm', 1, 1, 1, 2, 0, 0, ?)",
+        (user_id, nl_prompt, created_at),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_get_translation_history_defaults_to_50_row_limit(tmp_path):
+    store = make_store(tmp_path)
+    db_path = tmp_path / "state.db"
+    for i in range(60):
+        _insert_translation_row(db_path, "alice", f"p{i}", f"2024-01-01 00:{i:02d}:00")
+    rows, stats, total_count = store.get_translation_history("alice")
+    assert total_count == 60  # uncapped
+    assert len(rows) == 50  # capped
+    assert sum(s["total_translations"] for s in stats) == 60  # stats: complete history
+
+
+def test_get_translation_history_list_is_sorted_newest_first(tmp_path):
+    store = make_store(tmp_path)
+    db_path = tmp_path / "state.db"
+    _insert_translation_row(db_path, "alice", "oldest", "2024-01-01 00:00:00")
+    _insert_translation_row(db_path, "alice", "middle", "2024-01-02 00:00:00")
+    _insert_translation_row(db_path, "alice", "newest", "2024-01-03 00:00:00")
+    rows, _, _ = store.get_translation_history("alice")
+    assert [r["nl_prompt"] for r in rows] == ["newest", "middle", "oldest"]
+
+
+def test_get_translation_history_limit_is_configurable_via_env_var(tmp_path, monkeypatch):
+    # Patches the SAME module object SqliteStateStore's globals resolve
+    # TRANSLATION_HISTORY_LIST_LIMIT from - this file's own top-level
+    # `import state_store` (not one done here, function-local) - since
+    # other test files' app_factory/fresh_import calls swap sys.modules
+    # entries for "state_store" during the test-execution phase, well
+    # after this file's collection-time imports already bound both names
+    # to the one original module. A function-local `import state_store`
+    # here would risk fetching whatever the CURRENT sys.modules entry is
+    # by the time this test runs (possibly a different, later-reloaded
+    # module object than the one SqliteStateStore itself was defined in),
+    # silently patching a module the code under test never reads from.
+    monkeypatch.setattr(state_store, "TRANSLATION_HISTORY_LIST_LIMIT", 3)
+    store = make_store(tmp_path)
+    db_path = tmp_path / "state.db"
+    for i in range(10):
+        _insert_translation_row(db_path, "alice", f"p{i}", f"2024-01-01 00:{i:02d}:00")
+    rows, stats, total_count = store.get_translation_history("alice")
+    assert total_count == 10  # uncapped
+    assert len(rows) == 3  # capped to the overridden limit
+    assert [r["nl_prompt"] for r in rows] == ["p9", "p8", "p7"]  # still newest-first
+    assert sum(s["total_translations"] for s in stats) == 10  # stats: complete history
+
+
 # --- init() migrations: legacy schema upgrade paths ----------------------------
 
 def test_init_migrates_sessions_table_predating_llm_fields(tmp_path):
@@ -453,6 +560,47 @@ def test_init_migrates_sessions_table_predating_llm_fields(tmp_path):
 
     store.set_session("alice", llm_provider="anthropic", llm_model="claude-sonnet-5")
     assert store.get_session("alice")["llm_provider"] == "anthropic"
+
+
+def test_init_migrates_sessions_table_predating_theme(tmp_path):
+    # A DB already upgraded past every other migration but predating the
+    # theme column - same plain-ALTER, no-backfill-needed shape as the
+    # llm_provider/llm_model migration above (a blank value already means
+    # "leave whatever theme the client already has applied" everywhere
+    # this is read).
+    db_path = str(tmp_path / "state.db")
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        CREATE TABLE sessions (
+            session_id TEXT PRIMARY KEY,
+            auto_sql_execute INTEGER NOT NULL DEFAULT 1,
+            is_custom INTEGER NOT NULL DEFAULT 0,
+            connection_id TEXT NOT NULL DEFAULT '',
+            llm_provider TEXT NOT NULL DEFAULT '',
+            llm_model TEXT NOT NULL DEFAULT '',
+            in_scope_preset_ids TEXT,
+            in_scope_custom_connection_keys TEXT,
+            in_scope_mode TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    conn.execute(
+        "INSERT INTO sessions (session_id, auto_sql_execute, is_custom, connection_id) "
+        "VALUES (?, ?, ?, ?)",
+        ("alice", 1, 0, "preset+Default DB"),
+    )
+    conn.commit()
+    conn.close()
+
+    store = SqliteStateStore(db_path)
+    store.init()  # must not raise
+
+    session = store.get_session("alice")
+    assert session["connection_id"] == "preset+Default DB"  # untouched
+    assert session["theme"] == ""
+
+    store.set_session("alice", theme="light")
+    assert store.get_session("alice")["theme"] == "light"
 
 
 def test_init_migrates_pre_connection_key_db_connections_table(tmp_path):
@@ -537,6 +685,7 @@ def test_init_migrates_pre_connection_id_sessions_table_for_custom_row(tmp_path)
         "session_id", "auto_sql_execute", "is_custom", "connection_id",
         "llm_provider", "llm_model",
         "in_scope_preset_ids", "in_scope_custom_connection_keys", "in_scope_mode",
+        "theme",
         "updated_at",
     }
 

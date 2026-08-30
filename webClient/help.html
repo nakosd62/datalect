@@ -6,14 +6,18 @@
     <p>
     By default, you're offered a playground database for each supported type of database.
     You may select which one to use by clicking the database badge in the header and using the dialog that will pop up.
-    You may connect your own database using the same pop-up dialog (custom connections are private. i.e. session- or user-scoped).
+    Or, you may connect your own database using the same pop-up dialog.
     </p>
     <p>
-    Your custom connections are kept private and secure. If you do not log in, your custom connections are 
+    Your custom database connections are kept private and secure. If you do not log in, your custom connections are 
     scoped to your current browser session only - nobody else can see or use them. If you log in, your connections 
     are scoped to your account instead, so they follow you across sessions and devices, but are still never visible 
     to any other user. Sensitive fields - passwords, service-account keys, private keys, access tokens - are encrypted 
     at rest in the App's state database, and are never sent back to your browser once saved. 
+    </p>
+    <p>
+    To allow the Application to automatically select the most appropriate database to answer your question 
+    (out of all databases that have been configured) select the <strong>'All Configured Databases'</strong> option.    
     </p>
 
     <h3>Natural Language Prompt</h3>
@@ -31,10 +35,10 @@
     
     <h3>Multi-turn Conversations</h3>
     <p>
-    The application remembers your last <strong>10 turns</strong>. Each turn contains the prompt, the SQL
+    The application remembers your last <strong>5 turns</strong>. Each turn contains the prompt, the SQL
     it generated, and the results that came back from the database. Use the <strong>&#9664; / &#9654;</strong>
-    arrows in the NL prompt text box to step back and forward through previous turns. Reloading the app
-    will erase past chat history/turns.
+    arrows in the NL prompt text box to step back and forward through previous turns. 
+    Selecting a different database or reloading the application will erase past chat history/turns.
     </p>
     
     <h3>User Authentication</h3>
@@ -43,9 +47,9 @@
     Otherwise, custom database connections and past translation history stays with the browser session where they occurred.
     </p>
 
-    <h3>Application Metadata</h3>
+    <h3>About Datalect Agent</h3>
     <p>
     The Datalect Agent was built by <a href="mailto:nakosd@gmail.com" target="_blank" rel="noopener noreferrer">nakosd@gmail.com</a> in 2026
-    and its source is available on <a href="https://github.com/nakosd62/ydyl" target="_blank" rel="noopener noreferrer">GitHub</a>.
+    and its source is available on <a href="https://github.com/nakosd62/datalect" target="_blank" rel="noopener noreferrer">GitHub</a>.
     If you have comments or questions, please send them along.
     </p>

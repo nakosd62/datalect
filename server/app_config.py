@@ -891,10 +891,10 @@ DEFAULT_PRESET_ID = _postgres_presets[0]["id"] if _postgres_presets else None
 # a single question's response, at every stage that concept comes up -
 # how many a user may mark "in scope" at once (config_routes.py's POST
 # validation of in_scope_preset_ids/in_scope_custom_connection_keys) AND
-# how many of those in-scope connections a single question's Phase A
-# routing may ever select for one response (connection_router.py's
-# select_relevant_connections, clamped to this regardless of what the
-# model returns). These used to be two separate constants
+# how many of those in-scope connections "all databases" mode's triage may
+# ever select for one response (connection_router.py's
+# triage_all_mode_question, clamped to this regardless of what the model
+# returns). These used to be two separate constants
 # (MAX_IN_SCOPE_CONNECTIONS and connection_router.py's own
 # MAX_DATABASES_PER_QUERY, defaulting to 5) on the theory that "how many
 # databases could a question ever pick from" and "how many can one

@@ -1,30 +1,188 @@
-/* CSS Variables for Premium Design System */
+/* CSS Variables for Premium Design System
+   =========================================================================
+   THEME ARCHITECTURE (dark default here in :root; light overrides in the
+   [data-theme="light"] block right below) - see client.js's "THEME
+   SWITCHING" section for how the data-theme attribute itself gets set
+   (persisted in localStorage, applied before first paint to avoid a
+   flash-of-wrong-theme, and kept in sync with the Preferences modal).
+
+   Two families of tokens:
+   - The original small set (--bg-dark/--bg-card/--primary/--text-* etc.) -
+     unchanged in spirit, still what most of this file uses directly.
+   - A newer --surface / --overlay / --text-table set added alongside it,
+     covering colors that used to be hardcoded hex/rgba literals scattered
+     through specific components (the results table, the SQL/NL input
+     boxes, dropdown menus, the scrollbar, etc.) - each was a dark-only
+     "white wash over a dark surface" trick (e.g. rgba(255,255,255,0.05) as
+     a subtle hover/border), which does NOT work unchanged on a light
+     background, so those all needed their own explicit light-theme value
+     rather than just being left as literals.
+
+   --primary/--secondary/--danger keep the SAME hue in both themes (still
+   unmistakably "this app's green", "error red", etc.) but the light theme
+   shifts each to a slightly deeper shade - the original values were tuned
+   for light text on a near-black page and don't have enough contrast for
+   dark text on a light one wherever they're used as TEXT color (not just
+   as a badge/button background), e.g. .status-success, .stat-card-title.
+   ========================================================================= */
 :root {
   --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   --font-mono: 'Fira Code', 'Courier New', Courier, monospace;
-  
+
   /* Color Palette */
   --bg-dark: #080b11;
   --bg-card: rgba(15, 23, 42, 0.65);
   --bg-card-border: rgba(255, 255, 255, 0.08);
   --bg-input: rgba(5, 8, 16, 0.85);
-  
+
   --primary: #10b981; /* Glowing CockroachDB green */
   --primary-hover: #34d399;
   --primary-glow: rgba(16, 185, 129, 0.15);
-  
+  /* RGB triplets (no alpha) for the rgba(var(--x-rgb), N) glow/shadow
+     accents scattered through the file - lets those keep their own
+     per-instance alpha while still tracking the theme's actual hue. */
+  --primary-rgb: 16, 185, 129;
+  --primary-hover-rgb: 52, 211, 153;
+
   --secondary: #6366f1; /* Modern Indigo */
   --secondary-hover: #818cf8;
-  
+  --secondary-rgb: 99, 102, 241;
+
   --danger: #f87171;
   --danger-hover: #ef4444;
   --danger-glow: rgba(248, 113, 113, 0.15);
-  
+  --danger-rgb: 248, 113, 113;
+  --danger-hover-rgb: 239, 68, 68;
+
+  --warning: #f59e0b;
+  --warning-rgb: 245, 158, 11;
+
   --text-primary: #f8fafc;
   --text-secondary: #94a3b8;
   --text-muted: #64748b;
-  
+
+  /* Modal/dropdown/table "surface" scale - previously hardcoded slate
+     hexes (#0f172a/#1e293b/#334155/#131d31) repeated throughout the
+     results table, tab bar, modal cards, and dropdown menus. */
+  --surface-1: #0f172a;
+  --surface-2: #1e293b;
+  --surface-3: #334155;
+  --surface-stripe: #131d31;
+
+  /* Generic translucent-white "wash" tiers - borders/hovers/chip
+     backgrounds that used to be one-off rgba(255,255,255,0.0N) literals.
+     Named by their dark-theme alpha for readability; the light theme
+     below redefines each as a dark-based wash instead (white-on-white
+     would be invisible). */
+  --overlay-1: rgba(255, 255, 255, 0.03);
+  --overlay-2: rgba(255, 255, 255, 0.05);
+  --overlay-3: rgba(255, 255, 255, 0.08);
+  --overlay-4: rgba(255, 255, 255, 0.12);
+  --overlay-6: rgba(255, 255, 255, 0.06);
+  --overlay-18: rgba(255, 255, 255, 0.18);
+
+  /* Results-table-specific text tones (distinct from --text-primary/
+     --text-secondary, which are tuned for the app chrome, not a dense
+     data grid). */
+  --text-table: #e2e8f0;
+  --text-table-strong: #f1f5f9;
+  --chip-text: #cbd5e1;
+
+  /* Distinct decorative accent (active tab, model-badge tagline) - kept
+     separate from --primary so the two stay visually distinguishable in
+     both themes. */
+  --accent-cyan: #38bdf8;
+  --accent-cyan-rgb: 56, 189, 248;
+
+  /* Text color that sits ON TOP of a solid --primary-colored button/badge -
+     constant across themes: --primary is always bright enough that a dark
+     label reads well on it, on either background. */
+  --on-primary: #080b11;
+
+  --scrollbar-thumb: rgba(255, 255, 255, 0.1);
+  --scrollbar-thumb-hover: rgba(255, 255, 255, 0.2);
+
+  /* The NL prompt textarea's own text color (not the same as
+     --text-primary since it's set with !important against a hardcoded
+     .speech-bubble-wrapper background - see that rule). */
+  --prompt-text: #ffffff;
+
+  /* Shared by --modal-scrim below and the guided tour's spotlight cutout
+     (.tour-spotlight's box-shadow) - both are a full-page dimming scrim,
+     just applied via two different CSS mechanisms. */
+  --scrim-rgb: 3, 6, 12;
+  --modal-scrim: rgba(var(--scrim-rgb), 0.7);
+
+  /* .table-responsive/.stats-card-vertical's own "recessed input-like
+     panel" background - same rgb as --bg-input's dark-theme value, but
+     needs its own alpha so it stays valid once --bg-input goes solid
+     (opaque, no alpha channel at all) in the light theme below. */
+  --recessed-panel-bg: rgba(5, 8, 16, 0.45);
+
   --transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* Light theme - see the block comment above :root. Applied via
+   <html data-theme="light">, set by client.js before first paint. */
+:root[data-theme="light"] {
+  --bg-dark: #eef1f6;
+  --bg-card: rgba(255, 255, 255, 0.75);
+  --bg-card-border: rgba(15, 23, 42, 0.10);
+  --bg-input: #eef2f7;
+
+  --primary: #059669;
+  --primary-hover: #047857;
+  --primary-glow: rgba(5, 150, 105, 0.15);
+  --primary-rgb: 5, 150, 105;
+  --primary-hover-rgb: 4, 120, 87;
+
+  --secondary: #4f46e5;
+  --secondary-hover: #4338ca;
+  --secondary-rgb: 79, 70, 229;
+
+  --danger: #dc2626;
+  --danger-hover: #b91c1c;
+  --danger-glow: rgba(220, 38, 38, 0.12);
+  --danger-rgb: 220, 38, 38;
+  --danger-hover-rgb: 185, 28, 28;
+
+  --warning: #b45309;
+  --warning-rgb: 180, 83, 9;
+
+  --text-primary: #0f172a;
+  --text-secondary: #475569;
+  --text-muted: #64748b;
+
+  --surface-1: #ffffff;
+  --surface-2: #f1f5f9;
+  --surface-3: #e2e8f0;
+  --surface-stripe: #f8fafc;
+
+  --overlay-1: rgba(15, 23, 42, 0.03);
+  --overlay-2: rgba(15, 23, 42, 0.05);
+  --overlay-3: rgba(15, 23, 42, 0.08);
+  --overlay-4: rgba(15, 23, 42, 0.12);
+  --overlay-6: rgba(15, 23, 42, 0.05);
+  --overlay-18: rgba(15, 23, 42, 0.16);
+
+  --text-table: #1e293b;
+  --text-table-strong: #0f172a;
+  --chip-text: #334155;
+
+  --accent-cyan: #0284c7;
+  --accent-cyan-rgb: 2, 132, 199;
+
+  --on-primary: #ffffff;
+
+  --scrollbar-thumb: rgba(15, 23, 42, 0.15);
+  --scrollbar-thumb-hover: rgba(15, 23, 42, 0.28);
+
+  --prompt-text: #0f172a;
+
+  --scrim-rgb: 15, 23, 42;
+  --modal-scrim: rgba(var(--scrim-rgb), 0.4);
+
+  --recessed-panel-bg: rgba(15, 23, 42, 0.05);
 }
 
 /* Reset & Global Styles */
@@ -56,7 +214,7 @@ body {
   right: -5%;
   width: 500px;
   height: 500px;
-  background: radial-gradient(circle, rgba(16, 185, 129, 0.06) 0%, rgba(0,0,0,0) 70%);
+  background: radial-gradient(circle, rgba(var(--primary-rgb), 0.06) 0%, rgba(0,0,0,0) 70%);
   z-index: -1;
   pointer-events: none;
 }
@@ -67,7 +225,7 @@ body {
   left: -5%;
   width: 600px;
   height: 600px;
-  background: radial-gradient(circle, rgba(99, 102, 241, 0.04) 0%, rgba(0,0,0,0) 70%);
+  background: radial-gradient(circle, rgba(var(--secondary-rgb), 0.04) 0%, rgba(0,0,0,0) 70%);
   z-index: -1;
   pointer-events: none;
 }
@@ -92,7 +250,7 @@ body {
   align-items: center;
   gap: 0.35rem;
   border-radius: 9999px;
-  background: rgba(255, 255, 255, 0.03);
+  background: var(--overlay-1);
   border: 1px solid var(--bg-card-border);
   padding: 0.2rem 0.75rem;
   font-size: 0.8125rem;
@@ -152,6 +310,15 @@ select {
   background-repeat: no-repeat;
   background-position: right 0.6rem center;
   background-size: 0.9rem;
+}
+
+/* The dropdown chevron above is a data-URI SVG with its stroke color baked
+   in at build time (--text-secondary can't be referenced inside a
+   data-URI) - this re-bakes it with the light theme's --text-secondary so
+   the arrow stays visible against a light dropdown instead of rendering
+   as a near-invisible dark-on-dark-ish sliver. */
+:root[data-theme="light"] select {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23475569' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");
 }
 
 select:focus {
@@ -228,12 +395,12 @@ textarea:focus {
 
 .btn-primary {
   background-color: var(--primary);
-  color: #080b11;
+  color: var(--on-primary);
 }
 
 .btn-primary:hover:not(:disabled) {
   background-color: var(--primary-hover);
-  box-shadow: 0 0 15px rgba(16, 185, 129, 0.35);
+  box-shadow: 0 0 15px rgba(var(--primary-rgb), 0.35);
 }
 
 .btn-primary:disabled {
@@ -242,13 +409,13 @@ textarea:focus {
 }
 
 .btn-secondary {
-  background-color: rgba(255, 255, 255, 0.04);
+  background-color: var(--overlay-2);
   color: var(--text-primary);
   border: 1px solid var(--bg-card-border);
 }
 
 .btn-secondary:hover {
-  background-color: rgba(255, 255, 255, 0.08);
+  background-color: var(--overlay-3);
 }
 
 /* Microphone Button Styles */
@@ -272,13 +439,13 @@ textarea:focus {
 
 .mic-btn:hover {
   color: var(--primary);
-  background: rgba(255, 255, 255, 0.05);
+  background: var(--overlay-2);
 }
 
 .mic-btn.listening {
   color: var(--danger);
   animation: pulse 1.5s infinite;
-  background: rgba(248, 113, 113, 0.1);
+  background: rgba(var(--danger-rgb), 0.1);
 }
 
 .stat-label {
@@ -294,8 +461,8 @@ textarea:focus {
 }
 
 .status-unknown { color: var(--text-secondary); }
-.status-success { color: var(--primary); text-shadow: 0 0 10px rgba(16, 185, 129, 0.2); }
-.status-error { color: var(--danger); text-shadow: 0 0 10px rgba(248, 113, 113, 0.2); }
+.status-success { color: var(--primary); text-shadow: 0 0 10px rgba(var(--primary-rgb), 0.2); }
+.status-error { color: var(--danger); text-shadow: 0 0 10px rgba(var(--danger-rgb), 0.2); }
 
 /* Tables & Results Container */
 .table-responsive {
@@ -305,7 +472,7 @@ textarea:focus {
   width: 100%;
   border-radius: 8px;
   border: 1px solid var(--bg-card-border);
-  background: rgba(5, 8, 16, 0.4);
+  background: var(--recessed-panel-bg);
 }
 
 .data-table {
@@ -325,13 +492,13 @@ textarea:focus {
   position: sticky;
   top: 0;
   z-index: 10;
-  background-color: #0f172a;
+  background-color: var(--surface-1);
   font-weight: 600;
   font-size: 0.75rem;
   color: var(--text-secondary);
   text-transform: uppercase;
   letter-spacing: 0.08em;
-  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.1);
+  box-shadow: 0 1px 0 var(--scrollbar-thumb);
 }
 
 .data-table tbody tr {
@@ -339,7 +506,7 @@ textarea:focus {
 }
 
 .data-table tbody tr:hover {
-  background-color: rgba(255, 255, 255, 0.02);
+  background-color: var(--overlay-1);
 }
 
 .cell-numeric {
@@ -360,8 +527,8 @@ textarea:focus {
 .success-message {
   padding: 1.5rem;
   border-radius: 8px;
-  background: rgba(16, 185, 129, 0.06);
-  border: 1px solid rgba(16, 185, 129, 0.2);
+  background: rgba(var(--primary-rgb), 0.06);
+  border: 1px solid rgba(var(--primary-rgb), 0.2);
   color: var(--text-primary);
 }
 
@@ -380,7 +547,7 @@ textarea:focus {
   display: flex;
   gap: 1rem;
   padding: 1.5rem;
-  background: rgba(239, 68, 68, 0.06);
+  background: rgba(var(--danger-hover-rgb), 0.06);
   border-top: 4px solid var(--danger);
   border-radius: 0 0 8px 8px;
 }
@@ -470,7 +637,7 @@ textarea:focus {
 }
 
 .gear-btn, .help-btn, .history-btn, .more-menu-btn {
-  background: rgba(255, 255, 255, 0.05);
+  background: var(--overlay-2);
   border: 1px solid var(--bg-card-border);
   color: var(--text-primary);
   padding: 0.35rem;
@@ -491,7 +658,7 @@ textarea:focus {
 }
 
 .gear-btn:hover {
-  background: rgba(255, 255, 255, 0.12);
+  background: var(--overlay-4);
   color: var(--primary);
   transform: rotate(30deg);
 }
@@ -499,7 +666,7 @@ textarea:focus {
 .help-btn:hover,
 .history-btn:hover,
 .more-menu-btn:hover {
-  background: rgba(255, 255, 255, 0.12);
+  background: var(--overlay-4);
   color: var(--primary);
 }
 
@@ -518,6 +685,23 @@ textarea:focus {
 
 .more-menu-dropdown {
   min-width: 160px;
+}
+
+/* .auth-dropdown-menu (this dropdown's own base class - see the Google Auth
+   section further down) carries a stray `overflow: hidden` left over from
+   an older, otherwise-superseded duplicate of that ruleset - harmless for
+   the standalone avatar dropdown, but fatal here: renderAuthUI()'s signed-in
+   markup (.auth-menu-wrapper > #authDropdown, also a .auth-dropdown-menu)
+   gets reparented straight into #moreMenuAuthSlot below, so its own popup
+   dropdown is nested INSIDE this one. With this box clipping its own
+   overflow, that nested dropdown - including the "Log out" button - was
+   being clipped down to nothing, i.e. present in the DOM and technically
+   clickable in theory but invisible and unreachable in practice. An ID
+   selector beats a plain class regardless of source order, so this reliably
+   wins over that stray declaration without touching the standalone avatar
+   dropdown's own (purely cosmetic) corner-clipping elsewhere. */
+#moreMenuDropdown {
+  overflow: visible;
 }
 
 .more-menu-auth-slot:not(:empty) {
@@ -570,12 +754,12 @@ textarea:focus {
 }
 
 .history-btn.icon-disabled:hover {
-  background: rgba(255, 255, 255, 0.05);
+  background: var(--overlay-2);
   color: var(--text-primary);
 }
 
 .status-badge.badge-disabled:hover {
-  background: rgba(255, 255, 255, 0.03);
+  background: var(--overlay-1);
 }
 
 .crbot-icon-wrapper {
@@ -597,14 +781,14 @@ textarea:focus {
 
 .header-icon-label .full-text {
   display: inline;
-  color: #38bdf8;
+  color: var(--accent-cyan);
   font-size: 0.8rem;
   font-weight: 600;
 }
 
 .header-icon-label .short-text {
   display: none;
-  color: #38bdf8;
+  color: var(--accent-cyan);
   font-size: 0.85rem;
   font-weight: 700;
 }
@@ -635,6 +819,7 @@ textarea:focus {
      instead of being hidden along with the header copy. */
   .header-actions > .help-btn,
   .header-actions > .history-btn,
+  .header-actions > .gear-btn,
   .header-actions > .auth-container {
     display: none !important;
   }
@@ -656,20 +841,20 @@ textarea:focus {
 .speech-bubble-wrapper {
   position: relative;
   flex: 1;
-  background: #0f172a;
-  border: 3px solid #334155;
+  background: var(--surface-1);
+  border: 3px solid var(--surface-3);
   border-radius: 0;
   transform: none;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4), inset 0 0 12px rgba(16, 185, 129, 0.08);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4), inset 0 0 12px rgba(var(--primary-rgb), 0.08);
   padding: 4px;
   box-sizing: border-box;
 }
 
 .speech-bubble-wrapper.sql-bubble {
-  background: #0f172a;
-  border: 3px solid #334155;
+  background: var(--surface-1);
+  border: 3px solid var(--surface-3);
   border-radius: 0;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4), inset 0 0 12px rgba(16, 185, 129, 0.08);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4), inset 0 0 12px rgba(var(--primary-rgb), 0.08);
   height: 100px;
   min-height: 100px;
   max-height: 600px;
@@ -711,7 +896,7 @@ textarea:focus {
   background: transparent !important;
   border: none !important;
   box-shadow: none !important;
-  color: #ffffff !important;
+  color: var(--prompt-text) !important;
   font-family: var(--font-mono) !important;
   font-size: 0.85rem;
   line-height: 1.25;
@@ -725,7 +910,7 @@ textarea:focus {
 }
 
 .speech-bubble-wrapper textarea#aiPrompt::placeholder {
-  color: #64748b;
+  color: var(--text-muted);
   font-weight: 400;
   font-style: italic;
   opacity: 0.8;
@@ -737,7 +922,7 @@ textarea:focus {
   background: transparent !important;
   border: none !important;
   box-shadow: none !important;
-  color: #34d399 !important;
+  color: var(--primary-hover) !important;
   font-family: var(--font-mono) !important;
   font-size: 0.9rem;
   line-height: 1.45;
@@ -765,9 +950,9 @@ textarea:focus {
   border-radius: 4px;    /* scaled down radius */
   z-index: 2;
   /* z-index: 10; Ensures it renders on top of CodeMirror scroll/gutters */
-  background: rgba(16, 185, 129, 0.85); /* Emerald accent */
+  background: rgba(var(--primary-rgb), 0.85); /* Emerald accent */
   color: #ffffff;
-  border: 1px solid rgba(52, 211, 153, 0.4);
+  border: 1px solid rgba(var(--primary-hover-rgb), 0.4);
   border-radius: 6px;
   backdrop-filter: blur(4px);
   cursor: pointer;
@@ -775,8 +960,8 @@ textarea:focus {
 }
 
 #runBtn.sql-overlay-btn:hover:not(:disabled) {
-  background: rgba(16, 185, 129, 1);
-  box-shadow: 0 0 10px rgba(16, 185, 129, 0.4);
+  background: rgba(var(--primary-rgb), 1);
+  box-shadow: 0 0 10px rgba(var(--primary-rgb), 0.4);
 }
 
 #runBtn.sql-overlay-btn:disabled {
@@ -797,7 +982,7 @@ textarea:focus {
 
 /* Stats Cards */
 .stats-card-vertical {
-  background: rgba(5, 8, 16, 0.5);
+  background: var(--recessed-panel-bg);
   border: 1px solid var(--bg-card-border);
   border-radius: 8px;
   padding: 0.15rem 0.5rem;
@@ -817,7 +1002,7 @@ textarea:focus {
 }
 
 .status-working {
-  color: #f59e0b;
+  color: var(--warning);
   font-weight: 600;
 }
 
@@ -828,7 +1013,7 @@ textarea:focus {
   left: 0;
   width: 100vw;
   height: 100vh;
-  background-color: rgba(0, 0, 0, 0.7);
+  background-color: var(--modal-scrim);
   backdrop-filter: blur(8px);
   display: flex;
   align-items: center;
@@ -843,7 +1028,7 @@ textarea:focus {
 }
 
 .modal-card {
-  background-color: #0f172a;
+  background-color: var(--surface-1);
   border: 1px solid var(--bg-card-border);
   border-radius: 12px;
   width: 100%;
@@ -903,7 +1088,7 @@ textarea:focus {
 .tour-spotlight {
   position: fixed;
   border-radius: 10px;
-  box-shadow: 0 0 0 9999px rgba(3, 6, 12, 0.78);
+  box-shadow: 0 0 0 9999px rgba(var(--scrim-rgb), 0.78);
   border: 2px solid var(--primary);
   pointer-events: none;
   transition: top 0.3s ease, left 0.3s ease, width 0.3s ease, height 0.3s ease;
@@ -913,11 +1098,11 @@ textarea:focus {
   position: fixed;
   width: 300px;
   max-width: calc(100vw - 2rem);
-  background: #0f1626;
+  background: var(--surface-1);
   border: 1px solid var(--bg-card-border);
   border-radius: 12px;
   padding: 1.1rem 1.15rem 1rem;
-  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(16, 185, 129, 0.15);
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(var(--primary-rgb), 0.15);
   transition: top 0.3s ease, left 0.3s ease;
 }
 
@@ -983,7 +1168,7 @@ textarea:focus {
   gap: 0.5rem;
   padding: 0.6rem 1.25rem;
   border-bottom: 1px solid var(--bg-card-border);
-  background: rgba(255, 255, 255, 0.03);
+  background: var(--overlay-1);
 }
 
 .restore-quick-prompts-btn {
@@ -1077,7 +1262,7 @@ textarea:focus {
 }
 
 .help-dialog-body .help-quickstart {
-  background: rgba(255, 255, 255, 0.04);
+  background: var(--overlay-2);
   border: 1px solid var(--bg-card-border);
   border-radius: 8px;
   padding: 0.9rem 1rem 0.9rem 0.4rem;
@@ -1141,12 +1326,12 @@ textarea:focus {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.1);
+  background: var(--scrollbar-thumb);
   border-radius: 3px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.2);
+  background: var(--scrollbar-thumb-hover);
 }
 
 .app-footer {
@@ -1485,7 +1670,7 @@ textarea:focus {
   height: 100%;
   flex: 1;
   min-height: 0;
-  background-color: #0f172a;
+  background-color: var(--surface-1);
   border-radius: 8px;
   overflow: hidden;
 }
@@ -1496,9 +1681,9 @@ textarea:focus {
   align-items: center;
   gap: 0.5rem;
   padding: 0.6rem 1rem;
-  background: rgba(245, 158, 11, 0.08);
-  border-bottom: 1px solid rgba(245, 158, 11, 0.3);
-  color: #fbbf24;
+  background: rgba(var(--warning-rgb), 0.08);
+  border-bottom: 1px solid rgba(var(--warning-rgb), 0.3);
+  color: var(--warning);
   font-size: 0.85rem;
 }
 
@@ -1512,12 +1697,12 @@ textarea:focus {
   flex-shrink: 0;
   display: flex;
   align-items: flex-end;
-  background-color: #1e293b;
+  background-color: var(--surface-2);
   padding: 6px 8px 0 8px;
   gap: 0px;
   overflow-x: auto;
   user-select: none;
-  border-bottom: 1px solid #334155;
+  border-bottom: 1px solid var(--surface-3);
 }
 
 .result-tab-btn {
@@ -1525,17 +1710,27 @@ textarea:focus {
   display: inline-flex;
   align-items: center;
   justify-content: space-between;
-  height: 34px;
-  padding: 0 16px;
+  min-height: 34px;
+  padding: 6px 16px;
   font-size: 0.8125rem;
   font-family: inherit;
-  color: #94a3b8;
+  color: var(--text-secondary);
   background: transparent;
   border: none;
   outline: none;
   cursor: pointer;
-  max-width: 200px;
+  /* Two lines - the database name (multi-database mode only - see
+     buildResultsTabsNav()'s dbLabel) above the "Query N (rows)"/"Note"/
+     etc. line - separated by a literal "\n" client.js puts in
+     textContent, honored here instead of collapsed to a space. No
+     max-width and no flex-shrink: a tab is exactly as wide as its longer
+     line needs, however many tabs that adds up to - .results-tabs-nav's
+     own overflow-x: auto scrolls the row instead of anything here
+     truncating or wrapping either line further. */
+  white-space: pre-line;
+  line-height: 1.3;
   min-width: 120px;
+  flex-shrink: 0;
   transition: color 0.15s ease, background-color 0.15s ease;
   z-index: 1;
 }
@@ -1549,8 +1744,8 @@ textarea:focus {
 
 .result-tab-badge {
   font-size: 0.7rem;
-  background: #334155;
-  color: #cbd5e1;
+  background: var(--surface-3);
+  color: var(--chip-text);
   padding: 1px 6px;
   border-radius: 10px;
   margin-left: 6px;
@@ -1563,7 +1758,7 @@ textarea:focus {
   top: 8px;
   bottom: 8px;
   width: 1px;
-  background-color: #334155;
+  background-color: var(--surface-3);
   transition: opacity 0.15s;
 }
 
@@ -1574,14 +1769,14 @@ textarea:focus {
 }
 
 .result-tab-btn:hover:not(.active) {
-  background-color: #334155;
+  background-color: var(--surface-3);
   border-radius: 8px 8px 0 0;
-  color: #f1f5f9;
+  color: var(--text-table-strong);
 }
 
 .result-tab-btn.active {
-  background-color: #0f172a;
-  color: #38bdf8;
+  background-color: var(--surface-1);
+  color: var(--accent-cyan);
   font-weight: 500;
   border-radius: 8px 8px 0 0;
   z-index: 3;
@@ -1601,9 +1796,23 @@ textarea:focus {
 }
 
 .result-tab-btn--error.active {
-  background-color: #0f172a;
+  background-color: var(--surface-1);
   color: var(--danger);
   box-shadow: inset 0 -2px 0 var(--danger);
+}
+
+/* "All databases" mode's live-streaming placeholder tab (see client.js's
+   startAllModeStreaming()/handlePhaseBConnectionDone()) - a connection
+   still being fetched, muted and pulsing so it reads as "in progress"
+   rather than as just another result. Reuses .animate-pulse (defined
+   above) rather than a new keyframe. */
+.result-tab-btn--pending {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.result-tab-btn--pending:not(.active) {
+  animation: pulse 2s ease-in-out infinite;
 }
 
 .results-table-wrapper {
@@ -1618,38 +1827,38 @@ textarea:focus {
   border-collapse: collapse;
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
   font-size: 0.8125rem;
-  color: #e2e8f0;
+  color: var(--text-table);
   text-align: left;
 }
 
 .results-table-wrapper th {
   position: sticky;
   top: 0;
-  background-color: #1e293b;
-  color: #94a3b8;
+  background-color: var(--surface-2);
+  color: var(--text-secondary);
   font-weight: 600;
   text-transform: uppercase;
   font-size: 0.75rem;
   letter-spacing: 0.05em;
   padding: 10px 16px;
-  border-bottom: 2px solid #334155;
+  border-bottom: 2px solid var(--surface-3);
   white-space: nowrap;
   z-index: 2;
 }
 
 .results-table-wrapper td {
   padding: 10px 16px;
-  border-bottom: 1px solid #1e293b;
+  border-bottom: 1px solid var(--surface-2);
   white-space: pre-wrap;
   word-break: break-word;
 }
 
 .results-table-wrapper tbody tr:nth-child(even) {
-  background-color: #131d31;
+  background-color: var(--surface-stripe);
 }
 
 .results-table-wrapper tbody tr:hover {
-  background-color: #1e293b;
+  background-color: var(--surface-2);
 }
 
 .results-table-wrapper th.cell-numeric,
@@ -1697,7 +1906,7 @@ textarea:focus {
 }
 
 .example-chip {
-  background: rgba(255, 255, 255, 0.05);
+  background: var(--overlay-2);
   border: 1px solid var(--bg-card-border);
   color: var(--text-secondary);
   padding: 0.3rem 0.75rem;
@@ -1720,7 +1929,7 @@ textarea:focus {
 }
 
 .example-chip:disabled:hover {
-  background: rgba(255, 255, 255, 0.05);
+  background: var(--overlay-2);
   border-color: var(--bg-card-border);
   color: var(--text-secondary);
 }
@@ -1739,7 +1948,7 @@ textarea:focus {
 
 .example-prompts-dismiss:hover {
   color: var(--text-primary);
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--overlay-3);
 }
 
 /* Action Buttons Column */
@@ -1784,7 +1993,7 @@ textarea:focus {
   text-transform: uppercase;
   letter-spacing: 0.05em;
   margin-bottom: 0.15rem;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  border-bottom: 1px solid var(--overlay-2);
   padding-bottom: 0.15rem;
 }
 
@@ -1804,12 +2013,12 @@ textarea:focus {
 }
 
 .btn-modal-secondary {
-  background-color: #3f444d;
-  color: #f5f6f8;
+  background-color: var(--overlay-3);
+  color: var(--text-primary);
 }
 
 .btn-modal-secondary:hover {
-  background-color: #4f5660;
+  background-color: var(--overlay-4);
 }
 
 /* --- Google Authentication & Avatar Header Styles --- */
@@ -1826,7 +2035,7 @@ textarea:focus {
 }
 
 .auth-avatar-circle {
-  background: rgba(255, 255, 255, 0.05);
+  background: var(--overlay-2);
   border: 1px solid var(--bg-card-border);
   color: var(--text-primary);
   padding: 0.35rem; /* Match header buttons padding */
@@ -1845,7 +2054,7 @@ textarea:focus {
 }
 
 .auth-avatar-circle:hover {
-  background: rgba(255, 255, 255, 0.12);
+  background: var(--overlay-4);
   border-color: var(--primary);
   color: var(--primary);
 }
@@ -1868,7 +2077,7 @@ textarea:focus {
   position: absolute;
   right: 0;
   top: calc(100% + 8px);
-  background-color: #0f172a;
+  background-color: var(--surface-1);
   border: 1px solid var(--bg-card-border);
   border-radius: 8px;
   box-shadow: 0 10px 25px rgba(0, 0, 0, 0.4);
@@ -1909,7 +2118,7 @@ textarea:focus {
 }
 
 .auth-dropdown-item:hover {
-  background-color: rgba(255, 255, 255, 0.05);
+  background-color: var(--overlay-2);
   color: var(--danger);
 }
 
@@ -1921,7 +2130,7 @@ textarea:focus {
 }
 
 .auth-avatar-circle {
-  background: rgba(255, 255, 255, 0.05);
+  background: var(--overlay-2);
   border: 1px solid var(--bg-card-border);
   color: var(--text-primary);
   padding: 0;
@@ -1938,7 +2147,7 @@ textarea:focus {
 }
 
 .auth-avatar-circle:hover {
-  background: rgba(255, 255, 255, 0.12);
+  background: var(--overlay-4);
   color: var(--primary);
   border-color: var(--primary);
 }
@@ -1961,7 +2170,7 @@ textarea:focus {
   position: absolute;
   right: 0;
   top: calc(100% + 8px);
-  background-color: #0f172a;
+  background-color: var(--surface-1);
   border: 1px solid var(--bg-card-border);
   border-radius: 8px;
   box-shadow: 0 10px 25px rgba(0, 0, 0, 0.5);
@@ -2006,7 +2215,7 @@ textarea:focus {
 }
 
 .auth-dropdown-item:hover {
-  background-color: rgba(255, 255, 255, 0.05);
+  background-color: var(--overlay-2);
   color: var(--primary);
 }
 
@@ -2210,13 +2419,13 @@ textarea:focus {
   font-family: var(--font-mono);
   font-size: 0.85rem;
   font-style: italic;
-  color: #64748b;
+  color: var(--text-muted);
   opacity: 0.8;
 }
 
 /* CodeMirror Placeholder Styling */
 .CodeMirror-placeholder {
-  color: #64748b !important;
+  color: var(--text-muted) !important;
   font-family: var(--font-mono) !important;
   font-size: 0.9rem !important;
   font-style: italic !important;
@@ -2276,6 +2485,17 @@ textarea:focus {
   margin: 0;
 }
 
+/* Markdown-lite emphasis inside a NO-SQL reply (see client.js's
+   renderMarkdownLite()) - strong/em already inherit weight/style from the
+   browser default, this just gives an inline `code` span a subtle pill so
+   it reads as code rather than blending into the surrounding mono text. */
+.response-text code {
+  background: var(--overlay-3);
+  border-radius: 4px;
+  padding: 0.1em 0.35em;
+  font-size: 0.85em;
+}
+
 /* Inline History Navigation Control inside NL Prompt */
 .speech-bubble-wrapper .inline-history-nav {
   position: absolute;
@@ -2284,8 +2504,8 @@ textarea:focus {
   transform: translateY(-50%);
   display: inline-flex;
   align-items: center;
-  background: rgba(255, 255, 255, 0.06);
-  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: var(--overlay-6);
+  border: 1px solid var(--overlay-18);
   border-radius: 4px;
   overflow: hidden;
   height: 24px;
@@ -2313,16 +2533,16 @@ textarea:focus {
 }
 
 .speech-bubble-wrapper .inline-history-nav button:hover {
-  background: rgba(255, 255, 255, 0.18);
+  background: var(--overlay-18);
   color: var(--text-primary);
 }
 
 .speech-bubble-wrapper .inline-history-nav button:first-child {
-  border-right: 1px solid rgba(255, 255, 255, 0.18);
+  border-right: 1px solid var(--overlay-18);
 }
 
 .speech-bubble-wrapper .inline-history-nav button:last-child {
-  border-left: 1px solid rgba(255, 255, 255, 0.18);
+  border-left: 1px solid var(--overlay-18);
 }
 
 .speech-bubble-wrapper .inline-history-nav button:disabled,

@@ -335,6 +335,12 @@ own connection (see the module docstrings on
 [`translate_routes.py`](./server/translate_routes.py),
 [`connection_router.py`](./server/connection_router.py), and
 [`execute_routes.py`](./server/execute_routes.py) for the full design).
+The marker comment itself is stripped back out before a statement ever
+reaches its own connection's `execute()` call, so it plays no part in the
+actual query — this matters beyond tidiness for a Google Sheets connection
+specifically, since GViz (its query language) has no comment syntax at all
+and would otherwise reject a marker-tagged statement outright (see
+`execute_routes.py`'s `_strip_database_marker_lines`).
 
 A session with 0 or 1 connections in scope — the default, and the
 overwhelming majority of sessions — takes none of this: no extra LLM
@@ -529,6 +535,17 @@ Either way, translation history is recorded against a non-sensitive
 `username@dbname` identifier (see `get_conn_identifier` in
 [`db.py`](./server/db.py)) — raw connection strings, including credentials,
 are never written to the history table.
+
+`GET /api/history` (the history popup) returns two things from
+`get_translation_history()`: the translations list itself, capped to
+`TRANSLATION_HISTORY_LIST_LIMIT` most-recent rows (sorted newest-first),
+and the aggregated per-day stats shown on the popup's Statistics tab,
+which are always computed over the user's **complete** history —
+uncapped, regardless of how many rows the list above is limited to.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `TRANSLATION_HISTORY_LIST_LIMIT` | `50` | How many rows the history popup's translations list shows, most-recent first. Does not affect the popup's Statistics tab (always the full history) or how much history is actually stored (`DELETE/POST /api/history/purge` is still the only way to remove rows). See [`state_store.py`](./server/state_store.py). |
 
 Every saved connection's `database_config` is encrypted at rest before
 either backend ever writes it — see [Encryption at

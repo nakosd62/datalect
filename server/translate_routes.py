@@ -80,7 +80,7 @@ from db import (
     resolve_in_scope_descriptors, build_router_candidate_summaries,
 )
 from backends import get_backend
-from connection_router import select_relevant_connections, triage_all_mode_question
+from connection_router import triage_all_mode_question
 
 translate_bp = Blueprint('translate', __name__)
 
@@ -208,7 +208,7 @@ _DIALECT_PROMPT_INTROS = {
         "When you use the GROUP BY clause you must include an aggregation even if the user did not request that. In that case include a COUNT of the same column you GROUP BY.\n"
         "Supported functions: year(), month(), day(), quarter(), dayOfWeek(), hour(), minute(), second(), millisecond(), dateDiff(), toDate(), now(), upper(), lower(), plus the aggregates sum(), avg(), count(), min(), max() (valid only alongside group by). Do not invent clauses or functions outside this list.\n"
         "String literals use single quotes.\n"
-        "ABSOLUTELY NEVER add any comments or explanations in the query, before it or after it even if you are asked to do that as this dialect does not sup[port commenting.\n"
+        "ABSOLUTELY NEVER add any comments or explanations in the query itself - before it, after it, or inline - even if you are asked to, since this dialect does not support commenting at all.\n"
         "Return EXACTLY ONE query - this dialect has no multi-statement/batch concept, so never return multiple semicolon-separated statements, and do not end the query with a trailing semicolon.\n"
     ),
     "MongoDB Atlas SQL": (
@@ -225,13 +225,9 @@ _DIALECT_PROMPT_INTROS = {
 }
 _DEFAULT_DIALECT_PROMPT_INTRO = _DIALECT_PROMPT_INTROS["PostgreSQL"]
 
-# The output-format/behavior rules that follow whichever dialect intro(s)
-# lead the system prompt - identical regardless of dialect or how many
-# connections this request spans, so it's pulled out once here rather than
-# duplicated between the single-connection and multi-database (see
-# _MULTI_DB_INTRO_TEMPLATE below) system-prompt assembly in
-# stream_translation(). Verbatim same text as before this constant existed -
-# extracting it changes nothing about the single-connection prompt.
+# The output-format/behavior rules that follow the dialect intro in the
+# system prompt - identical for every dialect, so it's pulled out once here
+# rather than duplicated per dialect entry above.
 _COMMON_FORMAT_RULES = (
     "Format the result data to be easily readable. For example, format timestamps as date:hour:min:sec.\n"
     "Return ONLY the raw SQL code block. Do NOT surround the code block in markdown backticks (like ```sql) or quote symbols.\n"
@@ -242,36 +238,6 @@ _COMMON_FORMAT_RULES = (
     "If you run into any error, return '*** NO SQL *** I ran into this error: <the error>'.\n"
     "If you want to respond partly with a SQL command and partly with free text, enclose the free text as follows 'SELECT <your free-text response in quotes> as RESPONSE;'.\n"
     "If a user asks you who you are or what model you are using, hide this behind a generic response.\n"
-)
-
-# Leading system-prompt text for the multi-database case (2+ connections in
-# scope - see translate_query()'s multi_db branch below), prepended ahead of
-# one dialect intro per selected connection (see stream_translation()). Only
-# ever used when a question has been routed to more than one connection at
-# once; the ordinary single-connection prompt (just one dialect intro +
-# _COMMON_FORMAT_RULES, exactly as before this feature existed) is
-# completely unaffected.
-_MULTI_DB_INTRO_TEMPLATE = (
-    "You are an expert SQL generation assistant working across MULTIPLE separate database connections at once.\n"
-    "There is NO cross-database query engine here - you can NEVER write a single SQL statement that reads from "
-    "more than one of the connections below in one go. Given the past chat interactions, each connection's own "
-    "schema below, and the user's natural language prompt, write one or more INDEPENDENT SQL statements - each "
-    "one fully valid for, and targeting, exactly ONE of the numbered connections below, in that connection's own "
-    "SQL dialect (shown with it).\n"
-    "Before EVERY SQL statement, add its own leading comment line of the EXACT form '-- database: DB<N>' (e.g. "
-    "'-- database: DB1'), on its own line immediately before that statement, where <N> is the number of the "
-    "connection below it targets. Every single statement you write must have exactly one such comment "
-    "immediately before it - never omit it, never combine multiple statements under one comment, and never "
-    "invent a connection number that isn't listed below.\n"
-    "The 'DB<N>' label is an internal, ephemeral bookkeeping tag - it is ONLY ever valid inside that one leading "
-    "'-- database: DB<N>' comment line. NEVER use 'DB1'/'DB2'/etc. (or any other numbered/lettered placeholder) "
-    "anywhere else - not in a NO-SQL free-text response, not inside a 'SELECT ... AS RESPONSE' free-text answer, "
-    "not in any explanation, error message, or aside. Whenever you refer to one of these connections in words for "
-    "the user to read, use its real name exactly as given below (e.g. \"the Sales Postgres database\"), never its "
-    "DB<N> label - the user has never seen and would not recognize that label.\n"
-    "Most questions only genuinely need ONE of these connections - only write statements against more than one "
-    "when the question clearly needs data from more than one of them. Never target more than {count} "
-    "connections, since that's all you were given below.\n"
 )
 
 # Past-turn query results embedded back into the prompt as chat history were
@@ -759,15 +725,6 @@ def _call_gemini(client, model, contents, system_instruction):
     # the NDJSON response) does real arithmetic on these values, which
     # raises TypeError the moment one of them is None instead of an int.
     cached_content_tokens = (getattr(usage, 'cached_content_token_count', 0) or 0) if usage else 0
-    # Logged at INFO (this app's default LOG_LEVEL) so cache behavior can be
-    # confirmed directly from the server's own logs rather than relying on
-    # a provider console's dashboard - see the matching log in _call_claude
-    # below for why this was added (both are the concrete way to verify a
-    # cache hit actually happened on a given call, immediately, per-call).
-    logger.info(
-        "Gemini call cache stats: cached_content_tokens=%s prompt_tokens=%s",
-        cached_content_tokens, usage.prompt_token_count if usage else 0,
-    )
     return text, {
         "input_tokens": (usage.prompt_token_count or 0) if usage else 0,
         "output_tokens": (usage.candidates_token_count or 0) if usage else 0,
@@ -832,21 +789,6 @@ def _call_claude(client, model, messages, system_instruction):
     # downstream consumer's real arithmetic on this dict can't tolerate.
     cache_read_tokens = (getattr(usage, 'cache_read_input_tokens', 0) or 0) if usage else 0
     cache_creation_tokens = (getattr(usage, 'cache_creation_input_tokens', 0) or 0) if usage else 0
-    # Logged at INFO (this app's default LOG_LEVEL) rather than only
-    # exposed via the Anthropic Console's own usage dashboard - that
-    # dashboard aggregates across the whole workspace/account with its own
-    # refresh delay, so it can't tell you whether THIS call actually hit
-    # the cache. Both numbers are logged (not just the read count carried
-    # in cached_content_tokens below): cache_creation_input_tokens > 0 on a
-    # call means this call WROTE a new cache entry (a miss that primes the
-    # next one), while cache_read_input_tokens > 0 means it actually reused
-    # one written by an earlier call - seeing only the former for a while
-    # after a change like this one is expected and fine, it's the latter
-    # ever becoming nonzero that confirms reuse is really happening.
-    logger.info(
-        "Claude call cache stats: cache_creation_input_tokens=%s cache_read_input_tokens=%s input_tokens=%s",
-        cache_creation_tokens, cache_read_tokens, usage.input_tokens if usage else 0,
-    )
     return text, {
         "input_tokens": (usage.input_tokens or 0) if usage else 0,
         "output_tokens": (usage.output_tokens or 0) if usage else 0,
@@ -901,13 +843,6 @@ def _call_openai(client, model, llm_input, system_instruction):
     # tolerate.
     cached_tokens = (getattr(input_tokens_details, 'cached_tokens', 0) or 0) if input_tokens_details else 0
     reasoning_tokens = (getattr(output_tokens_details, 'reasoning_tokens', 0) or 0) if output_tokens_details else 0
-    # Logged at INFO for the same reason _call_gemini/_call_claude log their
-    # own cache stats - a provider console's own usage dashboard can't tell
-    # you whether THIS particular call actually hit the cache.
-    logger.info(
-        "OpenAI call cache stats: cached_tokens=%s input_tokens=%s",
-        cached_tokens, usage.input_tokens if usage else 0,
-    )
     return text, {
         "input_tokens": (usage.input_tokens or 0) if usage else 0,
         "output_tokens": (usage.output_tokens or 0) if usage else 0,
@@ -1174,23 +1109,19 @@ class ClaudeProvider(LlmProvider):
             })
         else:
             # No history AND no schema block at all - e.g.
-            # connection_router.py's Phase A call (select_relevant_
-            # connections, the legacy router), which always passes
-            # history=[] and schema_block="" (there's no schema in play at
-            # that stage - see its module docstring); triage_all_mode_
-            # question's first-ever call in a brand-new conversation lands
-            # here too, before it has any history to thread through (see
-            # its own docstring - once a conversation has turns, its calls
-            # take the branch above instead, same as any other history-
-            # bearing call). Anthropic rejects cache_control on an empty
-            # text block outright ("cache_control cannot be set for empty
-            # text blocks"), so this must NOT fall into the branch above
-            # with an empty `schema_block` - that would make this call
-            # always fail with a 400 on a fresh conversation, which neither
-            # caller has any way to distinguish from a genuine transient
-            # error: each just retries once, fails identically, and
-            # silently falls back to its own "couldn't route" behavior
-            # every single time, regardless of the question. There's
+            # triage_all_mode_question's first-ever call in a brand-new
+            # conversation lands here, before it has any history to thread
+            # through (see its own docstring - once a conversation has
+            # turns, its calls take the branch above instead, same as any
+            # other history-bearing call). Anthropic rejects cache_control
+            # on an empty text block outright ("cache_control cannot be
+            # set for empty text blocks"), so this must NOT fall into the
+            # branch above with an empty `schema_block` - that would make
+            # this call always fail with a 400 on a fresh conversation,
+            # which the caller has no way to distinguish from a genuine
+            # transient error: it just retries once, fails identically,
+            # and silently falls back to its own "couldn't route"
+            # behavior every single time, regardless of the question. There's
             # nothing worth cache-marking here anyway (a single plain-text
             # prompt with no stable prefix to reuse), so this is just the
             # one message, unmarked.
@@ -1281,60 +1212,6 @@ def list_llm_providers_info():
     ]
 
 
-_DATABASE_LABEL_RE = re.compile(r'--\s*database:\s*DB(\d+)\b')
-
-
-def _resolve_pinned_subset(pinned_refs, in_scope_entries):
-    """Returns the subset of `in_scope_entries` matching the client-echoed
-    `pinned_refs` ({"kind", "id"} dicts from a prior turn's
-    connection_selection - see this module's docstring on the pin
-    mechanism), in the order given, or None if there's nothing usable to
-    pin: an empty/missing list, or any pinned reference that no longer
-    matches a CURRENTLY in-scope connection (e.g. the user unchecked it
-    since the pin was set). None means "nothing safe to reuse - run Phase A
-    fresh" rather than silently using a partial/stale subset."""
-    if not pinned_refs:
-        return None
-    by_ref = {(e["kind"], e["id"]): e for e in in_scope_entries}
-    resolved = []
-    for ref in pinned_refs:
-        if not isinstance(ref, dict):
-            return None
-        entry = by_ref.get((ref.get("kind"), ref.get("id")))
-        if entry is None:
-            return None
-        resolved.append(entry)
-    return resolved or None
-
-
-def _rewrite_database_labels(generated_sql, selected_entries):
-    """Post-generation pass (see this module's docstring on the multi-
-    database feature): replaces every ephemeral '-- database: DB<N>'
-    marker the model emitted (N is 1-based, matching the order
-    `selected_entries` was presented in the Phase B prompt) with a stable,
-    independently-resolvable reference plus the connection's human name -
-    e.g. '-- database: preset:sales_pg (Sales Postgres)'. This runs
-    exactly once, immediately after generation, before generated_sql is
-    ever returned to the client, stored in chat history, or shown
-    anywhere - see db.py's resolve_descriptor_by_reference, the function
-    that later turns this stable tag back into a real connection at
-    execute time, independent of any per-request ephemeral state.
-
-    A 'DB<N>' referencing an index outside selected_entries (the model
-    hallucinated a number it wasn't given) is left untouched rather than
-    guessed at - execute_routes.py's marker parser only recognizes the
-    'preset:'/'custom:' form, so a leftover 'DB<N>' simply won't match at
-    execute time, same graceful degradation as no marker at all for
-    whichever single statement carries it."""
-    def _repl(match):
-        index = int(match.group(1)) - 1
-        if 0 <= index < len(selected_entries):
-            entry = selected_entries[index]
-            return f"-- database: {entry['kind']}:{entry['id']} ({entry['name']})"
-        return match.group(0)
-    return _DATABASE_LABEL_RE.sub(_repl, generated_sql)
-
-
 _NO_SQL_PREFIX_RE = re.compile(r'^\*\*\*\s*NO\s*SQL\s*\*\*\*\s*', re.IGNORECASE)
 
 
@@ -1369,11 +1246,10 @@ def generate_sql_for_connection(descriptor, prompt, history, provider, client, m
     provider.classify_error()/provider.get_key_pool_size()) before calling
     provider.call(). This is a standalone module-level function (not a
     refactor of stream_translation()'s inline code, which keeps its own
-    copy of this same logic for the single-connection and legacy multi_db
-    paths, both separately tested - see this module's docstring on the
-    backward-compatibility guarantee) so it can be safely reused by
-    _run_phase_b_fanout below without touching either of those existing,
-    already-tested code paths at all.
+    copy of this same logic for the single-connection path, separately
+    tested - see this module's docstring on the backward-compatibility
+    guarantee) so it can be safely reused by _run_phase_b_fanout below
+    without touching that existing, already-tested code path at all.
 
     Generator: yields fully wire-encoded NDJSON progress lines
     (`json.dumps({"status": "retrying", ...}) + "\\n"`), identical in
@@ -1498,6 +1374,38 @@ def _drain_generation(gen):
         return stop.value
 
 
+def _classify_generation_outcome(entry, outcome):
+    """Classifies one connection's raw Phase B outcome - either
+    ("ok", generated_sql, usage_info) or ("failed", error_str), the exact
+    tuple shapes _run_phase_b_fanout's ThreadPoolExecutor loop already
+    produces - into the one shape both that function's per-completion
+    streaming event AND its final original-order summary loop need, so
+    the marker-prepend/note-strip logic is written exactly once instead
+    of twice. Returns one of:
+      {"outcome": "sql", "sql": <marker-prepended text>}
+      {"outcome": "note", "text": <str, '*** NO SQL ***' prefix stripped -
+        "" for the rare case where the model returned a blank response;
+        _run_phase_b_fanout's own final loop intentionally still drops
+        that case from `database_notes`, exactly like this function's
+        pre-extraction inline code always has - but the streaming event
+        still needs SOME event for it, so it's surfaced here as an empty
+        note rather than silently vanishing from the stream too>
+      {"outcome": "failed", "error": <str>}
+    Never raises - a raised generation call is already represented as
+    outcome[0] == "failed" by the caller before this is invoked.
+    """
+    if outcome[0] == "failed":
+        return {"outcome": "failed", "error": outcome[1]}
+    _, generated_sql, _usage_info = outcome
+    stripped = (generated_sql or "").strip()
+    if not stripped:
+        return {"outcome": "note", "text": ""}
+    if _NO_SQL_PREFIX_RE.match(stripped):
+        return {"outcome": "note", "text": _strip_no_sql_prefix(stripped)}
+    marked = f"-- database: {entry['kind']}:{entry['id']} ({entry['name']})\n{stripped}"
+    return {"outcome": "sql", "sql": marked}
+
+
 def _run_phase_b_fanout(selected_entries, prompts, provider, client, model, user_identity, force_schema_refresh):
     """"All databases" mode's Phase B: runs generate_sql_for_connection()
     once per entry in `selected_entries`, in PARALLEL via a
@@ -1506,6 +1414,20 @@ def _run_phase_b_fanout(selected_entries, prompts, provider, client, model, user
     build_router_candidate_summaries, one worker per connection - no
     artificial cap, since this is already bounded by
     MAX_IN_SCOPE_CONNECTIONS upstream in triage_all_mode_question).
+
+    This is a GENERATOR: as each connection's call completes (in
+    COMPLETION order, not original order - this is what lets
+    stream_translation()'s router_only_all_mode branch report each
+    database's own result to the client as soon as it's ready, rather
+    than waiting for the slowest one), it yields `(entry, classified)`,
+    where `classified` is _classify_generation_outcome's return shape for
+    that connection. A caller uninterested in the streaming events (e.g.
+    a test only checking the final aggregate) should drain it with the
+    same `_drain_generation`-style idiom already used elsewhere in this
+    module. Once every connection has completed, this function `return`s
+    (captured via `StopIteration.value`, same idiom) the exact same four
+    values it has always returned - see below - rebuilt in
+    `selected_entries`' ORIGINAL order (not completion order).
 
     `prompts` is a list the same length/order as `selected_entries` - each
     connection's OWN instruction, not necessarily the user's original
@@ -1565,15 +1487,24 @@ def _run_phase_b_fanout(selected_entries, prompts, provider, client, model, user
         }
         for future in concurrent.futures.as_completed(future_to_index):
             index = future_to_index[future]
+            entry = selected_entries[index]
             try:
                 generated_sql, usage_info, _duration, _key, _client = future.result()
                 outcomes[index] = ("ok", generated_sql, usage_info)
             except Exception as e:
                 logger.warning(
                     "Phase B generation failed for %s:%s: %s",
-                    selected_entries[index]["kind"], selected_entries[index]["id"], e,
+                    entry["kind"], entry["id"], e,
                 )
                 outcomes[index] = ("failed", str(e))
+            # Yielded in COMPLETION order (whatever order this loop
+            # actually reaches each future in) - NOT `index` order. The
+            # final, order-stable return value below is rebuilt from
+            # `outcomes` in ORIGINAL order regardless of what order this
+            # loop yielded in, so callers that only care about the
+            # aggregate (draining this generator to completion) see
+            # exactly the same result they always have.
+            yield entry, _classify_generation_outcome(entry, outcomes[index])
 
     sql_blocks, database_notes, generation_failures = [], [], []
     usage_totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
@@ -1595,17 +1526,21 @@ def _run_phase_b_fanout(selected_entries, prompts, provider, client, model, user
             # _call_openai above, which are the real fix (never return
             # None in the first place) - this is a defensive backstop.
             usage_totals[k] += (usage_info or {}).get(k) or 0
-        stripped = (generated_sql or "").strip()
-        if not stripped:
-            continue
-        if _NO_SQL_PREFIX_RE.match(stripped):
+        classified = _classify_generation_outcome(entry, outcome)
+        if classified["outcome"] == "sql":
+            sql_blocks.append((entry, classified["sql"]))
+        elif classified["outcome"] == "note" and classified["text"]:
+            # The empty-text case (generated_sql was blank after
+            # stripping) is intentionally still dropped here - same
+            # behavior this function's inline code always had before the
+            # _classify_generation_outcome extraction - only the
+            # per-completion streaming event above surfaces it at all (as
+            # an empty note), so a client-side placeholder tab still has
+            # something to settle into.
             database_notes.append({
                 "kind": entry["kind"], "id": entry["id"], "name": entry["name"],
-                "text": _strip_no_sql_prefix(stripped),
+                "text": classified["text"],
             })
-        else:
-            marked = f"-- database: {entry['kind']}:{entry['id']} ({entry['name']})\n{stripped}"
-            sql_blocks.append((entry, marked))
     return sql_blocks, database_notes, generation_failures, usage_totals
 
 
@@ -1621,21 +1556,21 @@ def _run_phase_b_fanout(selected_entries, prompts, provider, client, model, user
 # see client.js's renderAllModeCombinedResults) is necessarily written
 # BEFORE any real data was fetched - it can say "Checking Sales Postgres
 # and Marketing Postgres for your question" but has no way to say what
-# the actual combined answer IS. This closes that gap: one more LLM call,
-# now that the real numbers are in, synthesizing everything gathered
-# into one direct answer to the original question - appended underneath
-# the routing message in that same Summary tab (see
-# appendPhaseCSummaryToSummaryTab in client.js).
+# was actually found. This closes that gap: one more LLM call, now that
+# the real numbers are in, writing a brief per-database answer (see
+# _SUMMARY_SYSTEM_INSTRUCTION below for the exact paragraph-per-database
+# shape) - appended underneath the routing message in that same Summary
+# tab (see appendPhaseCSummaryToSummaryTab in client.js).
 #
 # Deliberately a SEPARATE endpoint the client calls once /api/execute
 # finishes, rather than folded into /api/execute itself: execute_routes.py
 # is a generic, dialect-agnostic SQL runner with no LLM provider/session
 # infrastructure of its own (no provider resolution, no API key rotation,
-# no translations-table logging), and reused byte-for-byte by BOTH this
-# feature and the unrelated legacy multi_db checkbox path - adding this
-# module's entire LLM-calling machinery there just for this one new,
-# "all databases"-mode-only step would mean duplicating (or awkwardly
-# importing) everything already established here. This route is Best-
+# no translations-table logging), and reused byte-for-byte by the
+# single-connection path too - adding this module's entire LLM-calling
+# machinery there just for this one new, "all databases"-mode-only step
+# would mean duplicating (or awkwardly importing) everything already
+# established here. This route is Best-
 # effort/additive on top of a turn that has already fully succeeded by
 # the time it's ever called - any failure here (missing API key, the LLM
 # call itself exhausting its own retry) is reported back as
@@ -1648,14 +1583,18 @@ _SUMMARY_SYSTEM_INSTRUCTION = (
     "queries have now been run against each of them. You will be given the user's ORIGINAL question and, "
     "for each database that was queried, exactly one of: its actual result rows, a note that it had "
     "nothing relevant to contribute, or an error explaining that querying it failed.\n"
-    "Write ONE clear, concise, plain-language answer to the original question, synthesizing across every "
-    "database's results TOGETHER as a single combined answer - not a separate per-database recap or a "
-    "restatement of the raw data. If a database noted it had nothing relevant or failed, you may mention "
-    "that briefly ONLY if it affects how complete or trustworthy the answer is - otherwise leave it out "
-    "entirely.\n"
-    "Respond with plain text only - no SQL, no markdown tables, no code fences, no bullet points. When "
-    "you need to name a database, use its real name exactly as given below - never an index or a label "
-    "like \"Database 1\".\n"
+    "Write ONE separate short paragraph PER DATABASE, answering the original question using just that "
+    "database's own results. Start each paragraph with the database's real name in bold, exactly as given "
+    "below - never an index or a label like \"Database 1\" - followed by a colon, e.g. \"**Sales "
+    "Postgres:** ...\". Separate paragraphs with a single blank line. Keep every paragraph brief - one or "
+    "two sentences - even if the underlying result set is large: this is a summary, not a report. If a "
+    "database noted it had nothing relevant or failed, say so in one short sentence rather than skipping "
+    "it silently, so the user can see every database was actually considered. Only if the question "
+    "genuinely asks for a single figure or conclusion combined across databases (e.g. a grand total), add "
+    "ONE final short paragraph with that combined answer after the per-database ones - otherwise leave it "
+    "out entirely; do not restate or recap the per-database paragraphs a second time.\n"
+    "Respond with plain text only - no SQL, no markdown tables, no code fences, no bullet points, no "
+    "headings. The bold database-name lead-in above is the only formatting to use.\n"
 )
 
 
@@ -1698,10 +1637,12 @@ def _build_summary_prompt(user_question, database_results):
 
 def summarize_all_mode_results(user_question, database_results, provider, client, model):
     """"All databases" mode's Phase C - see the section comment above for
-    the fuller picture of when/why this runs. One synthesized plain-
-    language answer to `user_question`, over the ACTUAL data gathered
-    from every database Phase B was routed to, rather than the routing
-    message triage produced before any of it was known.
+    the fuller picture of when/why this runs. A brief, plain-text answer
+    to `user_question` - one short paragraph per database, over the
+    ACTUAL data gathered from every database Phase B was routed to,
+    rather than the routing message triage produced before any of it was
+    known (see _SUMMARY_SYSTEM_INSTRUCTION for the exact shape asked
+    for).
 
     Bounded 2-attempt retry, same shape as connection_router.py's
     triage_all_mode_question - a call that raises (or comes back empty)
@@ -1737,9 +1678,8 @@ def summarize_results():
     """See the "All databases" mode, Phase C section comment above for the
     full picture. Called by the client exactly once per "route" outcome
     turn, only after /api/execute has actually run every database Phase B
-    selected (never for the legacy multi_db checkbox path, and never for
-    a single-connection session - client.js only ever calls this from
-    executeSql()'s router_route handling)."""
+    selected (never for a single-connection session - client.js only ever
+    calls this from executeSql()'s router_route handling)."""
     session_id = get_or_create_session_id()
     user_identity = get_current_user_identity(session_id)
     data = request.get_json() or {}
@@ -1824,23 +1764,8 @@ def translate_query():
 
     # An explicit database_url override always means "use exactly this one
     # connection" (see resolve_conn_str above, which conn_str already
-    # reflects) - it wins over BOTH the legacy multi-select path and "all"
-    # mode below, same as it always has.
+    # reflects) - it wins over "all" mode below, same as it always has.
     explicit_db_override = bool(data.get('database_url'))
-
-    # Multi-database question-answering (the LEGACY arbitrary-subset path -
-    # see translate_routes.py's module docstring): only ever engaged when a
-    # session has 2+ connections in scope AND in_scope_mode isn't "all" (see
-    # router_only_all_mode below, which takes priority whenever it is). A
-    # single-connection session takes none of the branches below - see
-    # stream_translation()'s `if not multi_db` branch, which is byte-for-
-    # byte the same code path this endpoint always ran.
-    in_scope_entries = resolve_in_scope_descriptors(session_data, user_identity)
-    router_only_all_mode = session_data.get('in_scope_mode') == 'all' and not explicit_db_override
-    multi_db = len(in_scope_entries) > 1 and not explicit_db_override and not router_only_all_mode
-    pinned_selected_entries = (
-        _resolve_pinned_subset(data.get('pinned_connections'), in_scope_entries) if multi_db else None
-    )
 
     # "All configured databases" mode (see db.py's
     # resolve_in_scope_descriptors) runs a real two-phase flow - see
@@ -1853,11 +1778,13 @@ def translate_query():
     # regardless of how many connections are actually configured (even
     # just one) - triage still needs to decide "answer directly" vs.
     # "actually go query this database" either way, so there's no
-    # connection-count threshold below which it's skipped. Deliberately
-    # does NOT consult pinned_selected_entries: a pin describes a single
-    # specific connection from a PRIOR "route" outcome, but this mode
-    # always re-runs its own triage fresh, over every currently in-scope
-    # connection, every turn.
+    # connection-count threshold below which it's skipped. A session whose
+    # in_scope_mode isn't "all" (the default "single", or an explicit
+    # database_url override) takes none of the branches below - see
+    # stream_translation()'s single-connection path, which is byte-for-byte
+    # the same code path this endpoint has always run.
+    in_scope_entries = resolve_in_scope_descriptors(session_data, user_identity)
+    router_only_all_mode = session_data.get('in_scope_mode') == 'all' and not explicit_db_override
     #
     # The triage call itself DOES get this turn's ordinary conversation
     # history (see triage_all_mode_question's docstring) - it's a single,
@@ -1901,7 +1828,6 @@ def translate_query():
         nonlocal api_key
         try:
             client = provider.make_client(api_key)
-            resolved_selected_entries = None
 
             if router_only_all_mode:
                 # "All databases" mode's real two-phase flow (see
@@ -1954,9 +1880,7 @@ def translate_query():
                 elif triage_result["outcome"] == "failed":
                     # Triage itself couldn't produce anything usable after
                     # its own bounded retry - deliberately NOT a fallback
-                    # guess at some candidate connection (unlike the
-                    # legacy router's select_relevant_connections): a wrong
-                    # guess here would mean actually generating and
+                    # guess at some candidate connection: a wrong
                     # running real SQL against a database the user never
                     # asked about, so this shows the app's existing fixed
                     # apology instead.
@@ -1979,13 +1903,52 @@ def translate_query():
                     entry_prompts = [
                         database_prompts_by_index.get(i) or prompt for i in triage_result["indices"]
                     ]
-                    sql_blocks, database_notes, generation_failures, phase_b_usage = _run_phase_b_fanout(
-                        selected_entries, entry_prompts, provider, client, llm_model, user_identity, force_schema_refresh,
-                    )
-                    generated_sql = "\n\n".join(marked for _, marked in sql_blocks)
+                    # Both computed BEFORE Phase B even starts (unlike
+                    # before this streaming redesign, when routing_message
+                    # was only computed once Phase B had already fully
+                    # returned) - triage resolving to "route" is all
+                    # either of these needs, and the client needs them
+                    # immediately: the Summary tab text and one placeholder
+                    # tab per selected connection, well before any single
+                    # connection's own generation call has finished.
                     routing_message = triage_result.get("message") or (
                         "Checking " + ", ".join(e["name"] for e in selected_entries) + " for your question."
                     )
+                    connection_selection = [
+                        {"kind": e["kind"], "id": e["id"], "name": e["name"]} for e in selected_entries
+                    ]
+                    yield json.dumps({
+                        "status": "phase_a_route",
+                        "routing_message": routing_message,
+                        "connection_selection": connection_selection,
+                    }) + "\n"
+
+                    # Manually drains _run_phase_b_fanout (a generator -
+                    # see its own docstring) rather than a plain `yield
+                    # from`, since each per-completion event needs to be
+                    # wrapped into its OWN NDJSON status line here, unlike
+                    # generate_sql_for_connection's retry-progress `yield
+                    # from` above, which forwards already-final dicts
+                    # unchanged. The final four-value aggregate - the same
+                    # shape a single blocking call to this function used
+                    # to return before this redesign - is captured via
+                    # StopIteration.value, the same idiom _drain_generation
+                    # uses.
+                    phase_b_gen = _run_phase_b_fanout(
+                        selected_entries, entry_prompts, provider, client, llm_model, user_identity, force_schema_refresh,
+                    )
+                    try:
+                        while True:
+                            done_entry, classified = next(phase_b_gen)
+                            yield json.dumps({
+                                "status": "phase_b_connection_done",
+                                "kind": done_entry["kind"], "id": done_entry["id"], "name": done_entry["name"],
+                                **classified,
+                            }) + "\n"
+                    except StopIteration as stop:
+                        sql_blocks, database_notes, generation_failures, phase_b_usage = stop.value
+
+                    generated_sql = "\n\n".join(marked for _, marked in sql_blocks)
                     for k in phase_b_usage:
                         # `or 0` on both sides - same None-vs-missing-key
                         # defensive reasoning as _run_phase_b_fanout's own
@@ -2001,10 +1964,9 @@ def translate_query():
                         # what drives client.js's existing disclosure
                         # banner/pin-handling code - unchanged, since it
                         # already fires generically for any response
-                        # carrying this field.
-                        "connection_selection": [
-                            {"kind": e["kind"], "id": e["id"], "name": e["name"]} for e in selected_entries
-                        ],
+                        # carrying this field. Same list already sent in
+                        # the phase_a_route line above.
+                        "connection_selection": connection_selection,
                         # Marks this as the new "route" shape for
                         # client.js (byte-identical to today's response
                         # for the "answer"/"failed" outcomes above - zero
@@ -2079,59 +2041,22 @@ def translate_query():
                 }) + "\n"
                 return
 
-            if not multi_db:
-                # Byte-for-byte the same single-connection path this
-                # endpoint has always run - see this module's docstring/
-                # the multi-database feature's backward-compatibility
-                # guarantee. Nothing in the `else` branch below runs at all
-                # when a session has 0 or 1 connections in scope (the
-                # overwhelming majority of sessions today).
-                schema = get_database_schema(conn_str, user_identity, force_refresh=force_schema_refresh)
+            # Byte-for-byte the same single-connection path this endpoint
+            # has always run - see this module's docstring. Only reached
+            # when router_only_all_mode is False (its own branch above
+            # always returns before falling through to here), i.e. for the
+            # overwhelming majority of sessions today: in_scope_mode isn't
+            # "all", or an explicit database_url override is in play.
+            schema = get_database_schema(conn_str, user_identity, force_refresh=force_schema_refresh)
 
-                try:
-                    dialect_name = get_backend(conn_str).dialect_name
-                except Exception:
-                    dialect_name = "PostgreSQL"
-                dialect_intro = _DIALECT_PROMPT_INTROS.get(dialect_name, _DEFAULT_DIALECT_PROMPT_INTRO)
+            try:
+                dialect_name = get_backend(conn_str).dialect_name
+            except Exception:
+                dialect_name = "PostgreSQL"
+            dialect_intro = _DIALECT_PROMPT_INTROS.get(dialect_name, _DEFAULT_DIALECT_PROMPT_INTRO)
 
-                system_instruction = dialect_intro + _COMMON_FORMAT_RULES
-                schema_block = f"Database Schema:\n{schema}\n\n"
-            else:
-                # Phase A (unless a still-valid pinned set was echoed back
-                # by the client - see _resolve_pinned_subset - in which
-                # case it's reused as-is and Phase A doesn't run at all for
-                # this turn, same as a real follow-up question shouldn't
-                # re-decide which connection(s) it's about from scratch).
-                if pinned_selected_entries is not None:
-                    resolved_selected_entries = pinned_selected_entries
-                else:
-                    candidate_summaries = build_router_candidate_summaries(in_scope_entries, user_identity)
-                    router_result = select_relevant_connections(
-                        candidate_summaries, prompt, provider, client, llm_model
-                    )
-                    resolved_selected_entries = [in_scope_entries[i] for i in router_result["indices"]]
-
-                # Phase B: one dialect intro + one full (TTL-cached) schema
-                # per selected connection, each clearly numbered/labeled so
-                # the model can tag every statement it writes with which
-                # connection it targets (see _MULTI_DB_INTRO_TEMPLATE and
-                # _rewrite_database_labels below).
-                intro_parts = [_MULTI_DB_INTRO_TEMPLATE.format(count=len(resolved_selected_entries))]
-                schema_parts = []
-                for i, entry in enumerate(resolved_selected_entries):
-                    try:
-                        dialect_name = get_backend(entry["descriptor"]).dialect_name
-                    except Exception:
-                        dialect_name = "PostgreSQL"
-                    dialect_intro = _DIALECT_PROMPT_INTROS.get(dialect_name, _DEFAULT_DIALECT_PROMPT_INTRO)
-                    intro_parts.append(f"--- DB{i + 1}: {entry['name']} ({dialect_name}) ---\n{dialect_intro}")
-                    schema_text = get_database_schema(
-                        entry["descriptor"], user_identity, force_refresh=force_schema_refresh
-                    )
-                    schema_parts.append(f"=== DB{i + 1} ({entry['name']}) Schema ===\n{schema_text}")
-
-                system_instruction = "\n\n".join(intro_parts) + "\n\n" + _COMMON_FORMAT_RULES
-                schema_block = "Database Schemas:\n\n" + "\n\n".join(schema_parts) + "\n\n"
+            system_instruction = dialect_intro + _COMMON_FORMAT_RULES
+            schema_block = f"Database Schema:\n{schema}\n\n"
 
             # Sequencing matters here for prompt-caching purposes: the schema
             # is large and identical across every call in a given session
@@ -2249,17 +2174,6 @@ def translate_query():
                     lines = lines[:-1]
                 generated_sql = "\n".join(lines).strip()
 
-            # Multi-database only: rewrite each statement's ephemeral
-            # '-- database: DB<N>' marker into a stable, independently-
-            # resolvable '-- database: preset:<id>|custom:<key> (<name>)'
-            # tag - see _rewrite_database_labels' docstring. Runs before
-            # generated_sql is returned/logged/stored anywhere. Absent
-            # entirely (resolved_selected_entries stays None) for the
-            # single-connection path - generated_sql is never touched by
-            # this at all in that case.
-            if resolved_selected_entries:
-                generated_sql = _rewrite_database_labels(generated_sql, resolved_selected_entries)
-
             duration = round(1000 * (end_time - start_time))
             input_tokens = usage_info.get("input_tokens", 0)
             output_tokens = usage_info.get("output_tokens", 0)
@@ -2272,18 +2186,10 @@ def translate_query():
             # the translation is recorded the same way regardless - both for
             # aggregate usage/cost visibility (e.g. via export_state.py) and
             # because anonymous visitors can view/purge their own history via
-            # the app same as anyone else (see history_routes.py). For a
-            # multi-database turn, history logging uses the FIRST selected
-            # connection's descriptor (the same "primary" convention
-            # connection_id now carries - see state_store.py's docstring) -
-            # this is analytics/history only, not something execution
-            # dispatch relies on.
-            record_translation_descriptor = (
-                resolved_selected_entries[0]["descriptor"] if resolved_selected_entries else conn_str
-            )
-            record_translation(user_identity, record_translation_descriptor, prompt, generated_sql, llm_model, duration, input_tokens, output_tokens, total_tokens, thinking_tokens, cached_content_tokens)
+            # the app same as anyone else (see history_routes.py).
+            record_translation(user_identity, conn_str, prompt, generated_sql, llm_model, duration, input_tokens, output_tokens, total_tokens, thinking_tokens, cached_content_tokens)
 
-            done_payload = {
+            yield json.dumps({
                 'status': 'done',
                 'success': True,
                 'sql': generated_sql,
@@ -2293,18 +2199,7 @@ def translate_query():
                 'thinking_tokens': thinking_tokens,
                 'cached_content_tokens': cached_content_tokens,
                 'duration': duration,
-            }
-            if resolved_selected_entries:
-                # Plural from the start (a list, not a single object) even
-                # for a length-1 pick - see this module's docstring on the
-                # multi-database feature. Absent entirely (not an empty
-                # list) whenever multi_db is False - the single-connection
-                # response shape is completely unchanged.
-                done_payload['connection_selection'] = [
-                    {"kind": e["kind"], "id": e["id"], "name": e["name"]}
-                    for e in resolved_selected_entries
-                ]
-            yield json.dumps(done_payload) + "\n"
+            }) + "\n"
 
         except Exception as e:
             logger.exception("Translation failed")

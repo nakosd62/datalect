@@ -4,7 +4,27 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Datalect</title>
-  
+
+  <!-- Applies the saved theme (see client.js's THEME SWITCHING section)
+       to <html> before any stylesheet below is even requested, so the
+       page never flashes the wrong theme's colors on load. Deliberately
+       inline (not a separate .js file) and placed before every <link>
+       here - a script tag placed AFTER a stylesheet link waits for that
+       stylesheet to finish downloading before it runs, which would be too
+       late to avoid the flash. Kept tiny and dependency-free on purpose:
+       it must never throw (a private-browsing/disabled-localStorage
+       visitor just gets the default dark theme, silently). -->
+  <script>
+    (function () {
+      try {
+        var saved = window.localStorage.getItem('datalectTheme');
+        if (saved === 'light' || saved === 'dark') {
+          document.documentElement.setAttribute('data-theme', saved);
+        }
+      } catch (e) { /* localStorage unavailable - default (dark) theme */ }
+    })();
+  </script>
+
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 160 160' fill='none'><defs><linearGradient id='crbotBgGrad' x1='0%' y1='0%' x2='100%' y2='100%'><stop offset='0%' stop-color='%231E293B'/><stop offset='100%' stop-color='%230F172A'/></linearGradient><linearGradient id='crbotCyanGreen' x1='0%' y1='0%' x2='100%' y2='100%'><stop offset='0%' stop-color='%2338BDF8'/><stop offset='100%' stop-color='%2310B981'/></linearGradient><filter id='crbotGlow' x='-20%' y='-20%' width='140%' height='140%'><feGaussianBlur stdDeviation='3.5' result='blur'/><feComposite in='SourceGraphic' in2='blur' operator='over'/></filter></defs><path d='M 28 24 H 132 A 16 16 0 0 1 148 40 V 104 A 16 16 0 0 1 132 120 H 68 L 44 140 V 120 H 28 A 16 16 0 0 1 12 104 V 40 A 16 16 0 0 1 28 24 Z' fill='url(%23crbotBgGrad)' stroke='%2338BDF8' stroke-width='5' stroke-linecap='round' stroke-linejoin='round'/><g filter='url(%23crbotGlow)'><ellipse cx='50' cy='50' rx='22' ry='7' fill='none' stroke='%23FFFFFF' stroke-width='4.5'/><path d='M 28 50 V 66 C 28 70 38 73 50 73 C 62 73 72 70 72 66 V 50' fill='none' stroke='%2338BDF8' stroke-width='4.5'/><path d='M 28 66 V 82 C 28 86 38 89 50 89 C 62 89 72 86 72 82 V 66' fill='none' stroke='%2338BDF8' stroke-width='4.5'/><circle cx='50' cy='50' r='3.5' fill='%23FFFFFF'/><circle cx='40' cy='66' r='3' fill='%2334D399'/><circle cx='60' cy='82' r='3' fill='%2334D399'/></g><g filter='url(%23crbotGlow)'><rect x='88' y='44' width='44' height='34' rx='8' fill='none' stroke='%2334D399' stroke-width='4.5'/><path d='M 98 78 L 92 86 V 78' stroke='%2334D399' stroke-width='4.5' stroke-linecap='round' stroke-linejoin='round' fill='none'/><path d='M 103 54 C 100 54, 99 56, 99 58 C 99 60, 97 61, 95 61 C 97 61, 99 62, 99 64 C 99 66, 100 68, 103 68' stroke='%23FFFFFF' stroke-width='3' stroke-linecap='round' fill='none'/><path d='M 117 54 C 120 54, 121 56, 121 58 C 121 60, 123 61, 125 61 C 123 61, 121 62, 121 64 C 121 66, 120 68, 117 68' stroke='%23FFFFFF' stroke-width='3' stroke-linecap='round' fill='none'/></g><path d='M 74 58 H 82 L 78 54' stroke='%23FFFFFF' stroke-width='3.5' stroke-linecap='round' stroke-linejoin='round'/><path d='M 86 68 H 78 L 82 72' stroke='%23FFFFFF' stroke-width='3.5' stroke-linecap='round' stroke-linejoin='round'/><line x1='42' y1='102' x2='118' y2='102' stroke='%23475569' stroke-width='4' stroke-linecap='round'/><line x1='42' y1='102' x2='85' y2='102' stroke='%2334D399' stroke-width='4' stroke-linecap='round' filter='url(%23crbotGlow)'/><circle cx='85' cy='102' r='4' fill='%23FFFFFF' filter='url(%23crbotGlow)'/></svg>">
   
   <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -12,7 +32,12 @@
   <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
   
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/codemirror.min.css">
+  <!-- Dark theme's SQL editor syntax highlighting. eclipse.min.css (light
+       theme's editor theme) loaded alongside it - see client.js's THEME
+       SWITCHING section, which swaps the CodeMirror `theme` option between
+       the two rather than swapping which stylesheet is loaded. -->
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/theme/dracula.min.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/theme/eclipse.min.css">
   <link rel="stylesheet" href="style.css">
 
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
@@ -114,6 +139,13 @@
             </svg>
           </button>
 
+          <button id="prefsBtn" class="gear-btn" title="Preferences">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="3"></circle>
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+            </svg>
+          </button>
+
           <div id="g_id_signin" class="auth-container"></div>
 
           <div class="more-menu-wrapper" id="moreMenuWrapper">
@@ -127,6 +159,7 @@
             <div id="moreMenuDropdown" class="auth-dropdown-menu more-menu-dropdown hidden">
               <button id="moreMenuHelpBtn" class="auth-dropdown-item" type="button">Doc</button>
               <button id="moreMenuHistoryBtn" class="auth-dropdown-item" type="button">History</button>
+              <button id="moreMenuPrefsBtn" class="auth-dropdown-item" type="button">Preferences</button>
               <div class="auth-dropdown-divider"></div>
               <div id="moreMenuAuthSlot" class="more-menu-auth-slot"></div>
             </div>
@@ -162,7 +195,6 @@
               <button type="button" class="example-chip" data-prompt="Muéstrame 20 filas de muestra de las dos tablas que parezcan más interesantes.">Datos de muestra</button>
               <button type="button" class="example-chip" data-prompt="Write an analytical query over this data and explain what it does.">Analytical query</button>
               <button type="button" class="example-chip" data-prompt="Create a new table called demo with 2 columns and insert random data into it. Then query it. Then drop it. Finally, confirm it is gone.">DML/DDL</button>
-              <button type="button" class="example-chip" data-prompt="我当前是以什么用户身份连接的？在这个数据库中我拥有哪些权限？">用户权限</button>
               <button type="button" class="example-chip" data-prompt="What are a few interesting questions to ask about the data">What to ask</button>
             </div>
             <div class="input-row">
@@ -306,18 +338,46 @@
           </div>
         </div>
         <div class="modal-footer-fixed">
-          <div class="config-section">
-            <label class="checkbox-option">
-              <input type="checkbox" id="autoSqlExecuteCheckbox">
-              <span class="checkbox-label">Automatic SQL Execution</span>
-            </label>
-          </div>
-          <div id="configSaveError" class="config-error-message" style="display: none; color: #e05d5d; font-size: 0.85rem;"></div>
+          <div id="configSaveError" class="config-error-message" style="display: none; color: var(--danger); font-size: 0.85rem;"></div>
           <div class="modal-actions" style="display: flex; gap: 0.5rem; justify-content: flex-end; align-items: center;">
             <button type="button" id="configSaveBtn" class="btn btn-primary">Save Changes</button>
           </div>
         </div>
       </form>
+    </div>
+  </div>
+
+  <div id="preferencesModal" class="modal-overlay hidden">
+    <div class="modal-card" style="max-width: 420px;">
+      <div class="modal-header">
+        <h2 class="modal-title">Preferences</h2>
+        <button id="preferencesModalCloseBtn" class="modal-close-btn" type="button">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="config-section">
+          <span class="config-label">Theme</span>
+          <div class="radio-group" id="themeRadioGroup">
+            <label class="radio-option">
+              <input type="radio" name="theme_option" value="dark" id="themeOptionDark">
+              <span>Dark</span>
+            </label>
+            <label class="radio-option">
+              <input type="radio" name="theme_option" value="light" id="themeOptionLight">
+              <span>Light</span>
+            </label>
+          </div>
+        </div>
+        <div class="config-section">
+          <label class="checkbox-option">
+            <input type="checkbox" id="autoSqlExecuteCheckbox">
+            <span class="checkbox-label">Automatic SQL Execution</span>
+          </label>
+        </div>
+        <div id="preferencesSaveError" class="config-error-message" style="display: none; color: var(--danger); font-size: 0.85rem;"></div>
+        <div class="modal-actions" style="display: flex; gap: 0.5rem; justify-content: flex-end; align-items: center;">
+          <button type="button" id="preferencesSaveBtn" class="btn btn-primary">Save Changes</button>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -335,7 +395,7 @@
           </div>
         </div>
         <div class="modal-footer-fixed">
-          <div id="modelSaveError" class="config-error-message" style="display: none; color: #e05d5d; font-size: 0.85rem;"></div>
+          <div id="modelSaveError" class="config-error-message" style="display: none; color: var(--danger); font-size: 0.85rem;"></div>
           <div class="modal-actions" style="display: flex; gap: 0.5rem; justify-content: flex-end; align-items: center;">
             <button type="button" id="modelSaveBtn" class="btn btn-primary">Save Changes</button>
           </div>

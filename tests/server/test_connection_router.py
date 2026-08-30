@@ -1,13 +1,15 @@
 """
-connection_router.py (Phase A of multi-database question-answering - see
+connection_router.py (Phase A of "all databases" mode - see
 translate_routes.py's module docstring) and its wiring into
-/api/translate's stream_translation(): a session with 0/1 connections in
-scope never imports/calls this module at all (the core backward-compat
-regression guard - see translate_routes.py's `if not multi_db` branch),
-a session with 2+ runs Phase A then generates tagged multi-statement SQL,
-a client-echoed still-valid pinned set skips Phase A entirely, and a
-Phase A failure (bad JSON, or the LLM call itself raising) falls back to
-the first in-scope candidate rather than failing the whole request.
+/api/translate's stream_translation(): a session whose in_scope_mode
+isn't "all" never calls triage_all_mode_question at all (the core
+regression guard - single-connection sessions and an explicit
+database_url override both take that path), a session in "all" mode
+runs triage first, which decides "answer" (no real data access needed),
+"route" (generate and execute real SQL against one or more connections,
+mechanically tagged with a stable marker server-side), or "failed" (the
+triage LLM call never produced anything usable even after a bounded
+retry - deliberately not a fallback guess at some candidate connection).
 
 Also covers backends/base.py's extract_entry_names_from_schema_text
 against each of this codebase's known schema-heading conventions
@@ -21,7 +23,7 @@ import threading
 import time
 import types as pytypes
 
-from helpers import login_as, parse_translate_stream, write_database_presets_file
+from helpers import login_as, parse_translate_stream, parse_translate_stream_events, write_database_presets_file
 
 
 class GenaiHarness:
@@ -114,26 +116,18 @@ def _two_preset_env(app_factory, tmp_path, extra_env=None):
     return app_factory(env=env)
 
 
-def _put_both_in_scope(client):
-    resp = client.post('/api/config', json={
-        "in_scope_preset_ids": ["pg-a", "pg-b"],
-        "in_scope_custom_connection_keys": [],
-    })
-    assert resp.status_code == 200
-
-
 def _set_all_mode(client):
     resp = client.post('/api/config', json={"in_scope_mode": "all"})
     assert resp.status_code == 200
 
 
-# --- select_relevant_connections / _parse_router_response, direct unit tests ---
+# --- triage_all_mode_question's "database_prompts" - direct unit tests ---
 
 
 class _FakeProvider:
     """Minimal stand-in for translate_routes.py's LlmProvider - just enough
-    of build_llm_input()/call() for select_relevant_connections to drive,
-    with no real client/network involved at all."""
+    of build_llm_input()/call() for triage_all_mode_question to drive, with
+    no real client/network involved at all."""
 
     def __init__(self, responses):
         self._responses = list(responses)  # list of str (response text) or Exception
@@ -152,82 +146,6 @@ class _FakeProvider:
         return item, {}
 
 
-def test_select_relevant_connections_parses_plain_json_array():
-    from connection_router import select_relevant_connections
-
-    provider = _FakeProvider(["[1, 0]"])
-    candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": ["x"]},
-                  {"name": "B", "dialect": "MySQL", "table_names": ["y"]}]
-    result = select_relevant_connections(candidates, "some question", provider, client=None, model="m")
-    assert result["indices"] == [1, 0]
-    assert result["reasoning"] is None  # a bare array carries no reasoning
-    assert result["usage"] == {}
-    assert len(provider.calls) == 1
-
-
-def test_select_relevant_connections_tolerates_markdown_fence_and_wrapped_object():
-    from connection_router import select_relevant_connections
-
-    provider = _FakeProvider(['```json\n{"indices": [0], "reasoning": "Only one candidate given."}\n```'])
-    candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": []}]
-    result = select_relevant_connections(candidates, "q", provider, client=None, model="m")
-    assert result["indices"] == [0]
-    assert result["reasoning"] == "Only one candidate given."
-
-
-def test_select_relevant_connections_clamps_to_max_connections():
-    from connection_router import select_relevant_connections
-
-    provider = _FakeProvider(["[0, 1, 2, 3]"])
-    candidates = [{"name": f"C{i}", "dialect": "PostgreSQL", "table_names": []} for i in range(4)]
-    result = select_relevant_connections(candidates, "q", provider, client=None, model="m", max_connections=2)
-    assert result["indices"] == [0, 1]
-
-
-def test_select_relevant_connections_falls_back_to_zero_after_bad_json_twice():
-    from connection_router import select_relevant_connections
-
-    provider = _FakeProvider(["not json at all", "still not json"])
-    candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": []},
-                  {"name": "B", "dialect": "PostgreSQL", "table_names": []}]
-    result = select_relevant_connections(candidates, "q", provider, client=None, model="m")
-    assert result["indices"] == [0]
-    assert result["reasoning"] is None
-    assert result["usage"] is None  # no attempt actually succeeded
-    assert len(provider.calls) == 2  # one bounded retry, then fallback
-
-
-def test_select_relevant_connections_falls_back_to_zero_when_call_raises():
-    from connection_router import select_relevant_connections
-
-    provider = _FakeProvider([RuntimeError("boom"), RuntimeError("boom again")])
-    candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": []}]
-    result = select_relevant_connections(candidates, "q", provider, client=None, model="m")
-    assert result["indices"] == [0]
-    assert result["usage"] is None
-
-
-def test_select_relevant_connections_drops_out_of_range_and_duplicate_indices():
-    from connection_router import select_relevant_connections
-
-    provider = _FakeProvider(["[5, 0, 0, -1, 1]"])
-    candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": []},
-                  {"name": "B", "dialect": "PostgreSQL", "table_names": []}]
-    result = select_relevant_connections(candidates, "q", provider, client=None, model="m")
-    assert result["indices"] == [0, 1]
-
-
-def test_select_relevant_connections_reasoning_absent_when_response_lacks_it():
-    from connection_router import select_relevant_connections
-
-    provider = _FakeProvider(['{"indices": [0]}'])
-    candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": []}]
-    result = select_relevant_connections(candidates, "q", provider, client=None, model="m")
-    assert result["indices"] == [0]
-    assert result["reasoning"] is None
-
-
-# --- triage_all_mode_question's "database_prompts" - direct unit tests ---
 #
 # Phase B's per-connection calls are fully independent - each only ever
 # sees ONE connection's own schema, never the original question's full
@@ -363,15 +281,12 @@ def test_extract_entry_names_respects_max_names_cap():
     assert extract_entry_names_from_schema_text(schema, max_names=3) == ["t0", "t1", "t2"]
 
 
-# --- /api/translate wiring: single- vs multi-in-scope, pin, Phase A failure ---
-
-
-def test_single_in_scope_never_calls_phase_a_and_response_has_no_connection_selection(app_factory, monkeypatch):
+def test_single_in_scope_never_calls_triage_and_response_has_no_connection_selection(app_factory, monkeypatch):
     env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
 
     def _boom(*a, **kw):
-        raise AssertionError("Phase A should never be reached for a single-in-scope session")
-    monkeypatch.setattr(env.translate_routes, "select_relevant_connections", _boom)
+        raise AssertionError("Triage should never be reached for a non-'all'-mode session")
+    monkeypatch.setattr(env.translate_routes, "triage_all_mode_question", _boom)
 
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
@@ -384,110 +299,11 @@ def test_single_in_scope_never_calls_phase_a_and_response_has_no_connection_sele
     assert len(harness.generate_calls) == 1
 
 
-def test_multi_in_scope_runs_phase_a_then_tags_generated_sql(app_factory, tmp_path, monkeypatch):
-    env = _two_preset_env(app_factory, tmp_path)
-    login_as(env.client, "alice@example.com")
-    _put_both_in_scope(env.client)
-
-    harness = GenaiHarness()
-    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    # Phase A: picks both, most-relevant first (candidate 1 = Marketing, then 0 = Sales).
-    harness.queue_response(_gemini_ok("[1, 0]"))
-    # Phase B: one statement per selected connection, tagged with the
-    # ephemeral DB<N> ordinal matching resolved_selected_entries' order
-    # (DB1 = Marketing Postgres, DB2 = Sales Postgres, since Phase A's [1, 0]
-    # became that order).
-    harness.queue_response(_gemini_ok(
-        "-- database: DB1\nSELECT * FROM campaigns;\n\n-- database: DB2\nSELECT * FROM deals;"
-    ))
-
-    resp = env.client.post('/api/translate', json={'prompt': 'campaigns and deals'})
-    _, data = parse_translate_stream(resp)
-    assert data['success'] is True
-    assert len(harness.generate_calls) == 2
-
-    assert data['connection_selection'] == [
-        {"kind": "preset", "id": "pg-b", "name": "Marketing Postgres"},
-        {"kind": "preset", "id": "pg-a", "name": "Sales Postgres"},
-    ]
-    assert "-- database: preset:pg-b (Marketing Postgres)" in data['sql']
-    assert "-- database: preset:pg-a (Sales Postgres)" in data['sql']
-    assert "DB1" not in data['sql']
-    assert "DB2" not in data['sql']
-
-
-def test_pinned_connections_skip_phase_a(app_factory, tmp_path, monkeypatch):
-    env = _two_preset_env(app_factory, tmp_path)
-    login_as(env.client, "alice@example.com")
-    _put_both_in_scope(env.client)
-
-    def _boom(*a, **kw):
-        raise AssertionError("Phase A should be skipped when a still-valid pin is echoed back")
-    monkeypatch.setattr(env.translate_routes, "select_relevant_connections", _boom)
-
-    harness = GenaiHarness()
-    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(_gemini_ok("-- database: DB1\nSELECT * FROM deals;"))
-
-    resp = env.client.post('/api/translate', json={
-        'prompt': 'more deals please',
-        'pinned_connections': [{"kind": "preset", "id": "pg-a"}],
-    })
-    _, data = parse_translate_stream(resp)
-    assert data['success'] is True
-    assert len(harness.generate_calls) == 1  # Phase B only
-    assert data['connection_selection'] == [{"kind": "preset", "id": "pg-a", "name": "Sales Postgres"}]
-    assert "-- database: preset:pg-a (Sales Postgres)" in data['sql']
-
-
-def test_stale_pinned_connection_falls_back_to_running_phase_a_fresh(app_factory, tmp_path, monkeypatch):
-    env = _two_preset_env(app_factory, tmp_path)
-    login_as(env.client, "alice@example.com")
-    _put_both_in_scope(env.client)
-
-    harness = GenaiHarness()
-    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(_gemini_ok("[0]"))  # Phase A actually runs
-    harness.queue_response(_gemini_ok("-- database: DB1\nSELECT * FROM deals;"))
-
-    resp = env.client.post('/api/translate', json={
-        'prompt': 'more deals please',
-        # References a connection no longer in scope - not a valid pin.
-        'pinned_connections': [{"kind": "preset", "id": "no-longer-in-scope"}],
-    })
-    _, data = parse_translate_stream(resp)
-    assert data['success'] is True
-    assert len(harness.generate_calls) == 2
-
-
-def test_phase_a_failure_falls_back_to_first_in_scope_candidate(app_factory, tmp_path, monkeypatch):
-    env = _two_preset_env(app_factory, tmp_path)
-    login_as(env.client, "alice@example.com")
-    _put_both_in_scope(env.client)
-
-    harness = GenaiHarness()
-    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    # Phase A gets one bounded retry inside select_relevant_connections
-    # itself, so two unparseable responses exhausts it and falls back to
-    # candidate 0 (Sales Postgres, first in stable in-scope order).
-    harness.queue_response(_gemini_ok("not json"))
-    harness.queue_response(_gemini_ok("still not json"))
-    harness.queue_response(_gemini_ok("-- database: DB1\nSELECT * FROM deals;"))
-
-    resp = env.client.post('/api/translate', json={'prompt': 'ambiguous question'})
-    _, data = parse_translate_stream(resp)
-    assert data['success'] is True
-    assert len(harness.generate_calls) == 3  # 2 Phase A attempts + 1 Phase B
-    assert data['connection_selection'] == [{"kind": "preset", "id": "pg-a", "name": "Sales Postgres"}]
-
-
 # --- "all configured databases" mode: 2-phase triage -> parallel Phase B ---
 #
 # connection_router.triage_all_mode_question's system prompt asks for
 # {"action": "answer", "answer": "..."} or {"action": "route", "indices":
-# [...], "message": "..."} (see that function's docstring) - a brand-new
-# contract, NOT select_relevant_connections' {"indices": [...],
-# "reasoning": "..."} shape the legacy multi_db tests above queue.
+# [...], "message": "..."} (see that function's docstring).
 
 
 def _schema_fetch_by_url(mapping):
@@ -623,8 +439,7 @@ def test_all_mode_route_outcome_runs_phase_b_in_parallel_for_both_selected_conne
     assert "-- database: preset:pg-a (Sales Postgres)\nSELECT * FROM deals;" in data['sql']
     assert "-- database: preset:pg-b (Marketing Postgres)\nSELECT * FROM campaigns;" in data['sql']
     # The server injected these markers mechanically - the model never saw
-    # more than one connection per call, so it had nothing to mislabel
-    # (unlike the legacy multi_db path's ephemeral DB<N> convention).
+    # more than one connection per call, so it had nothing to mislabel.
     assert "DB1" not in data['sql'] and "DB2" not in data['sql']
     assert data['connection_selection'] == [
         {"kind": "preset", "id": "pg-a", "name": "Sales Postgres"},
@@ -732,6 +547,130 @@ def test_all_mode_route_outcome_all_databases_fail_or_note_returns_empty_sql_but
     ]
 
 
+def test_all_mode_route_outcome_streams_phase_a_route_then_phase_b_connection_done_before_terminal_done(
+    app_factory, tmp_path, monkeypatch,
+):
+    # Progressive-rendering support (see translate_routes.py's
+    # stream_translation() docstring on the router_only_all_mode "route"
+    # branch): a "phase_a_route" line reports the routing message and
+    # full connection_selection BEFORE either Phase B call has finished,
+    # then one "phase_b_connection_done" line per selected connection
+    # (this test doesn't care which order those two arrive in - see the
+    # completion-order test below for that), then the existing terminal
+    # "done" line last, unchanged in shape.
+    env = _two_preset_env(app_factory, tmp_path)
+    login_as(env.client, "alice@example.com")
+    _set_all_mode(env.client)
+
+    import db as db_module
+    monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
+        "postgresql://u:p@host-a:5432/a": "Table: deals\nid INTEGER\n",
+        "postgresql://u:p@host-b:5432/b": "Table: campaigns\nid INTEGER\n",
+    }))
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(_gemini_ok(
+        '{"action": "route", "indices": [0, 1], "message": "Checking both."}'
+    ))
+    harness.register_marker("deals", _gemini_ok("SELECT * FROM deals;"))
+    harness.register_marker("campaigns", _gemini_ok("*** NO SQL *** Campaigns data doesn't cover this question."))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'first database question, plus something else'})
+    events = parse_translate_stream_events(resp)
+
+    assert events[0]['status'] == 'phase_a_route'
+    assert events[0]['routing_message'] == 'Checking both.'
+    assert events[0]['connection_selection'] == [
+        {"kind": "preset", "id": "pg-a", "name": "Sales Postgres"},
+        {"kind": "preset", "id": "pg-b", "name": "Marketing Postgres"},
+    ]
+
+    connection_done_events = [e for e in events if e['status'] == 'phase_b_connection_done']
+    assert len(connection_done_events) == 2
+    by_id = {e['id']: e for e in connection_done_events}
+    assert by_id['pg-a']['outcome'] == 'sql'
+    assert by_id['pg-a']['sql'] == "-- database: preset:pg-a (Sales Postgres)\nSELECT * FROM deals;"
+    assert by_id['pg-b']['outcome'] == 'note'
+    assert by_id['pg-b']['text'] == "Campaigns data doesn't cover this question."
+
+    # Every phase_b_connection_done line comes strictly after the
+    # phase_a_route line and strictly before the terminal 'done' line.
+    assert events[-1]['status'] == 'done'
+    assert events.index(events[-1]) == len(events) - 1
+    for e in connection_done_events:
+        assert events.index(e) > 0
+        assert events.index(e) < len(events) - 1
+
+
+def test_all_mode_route_outcome_streams_phase_b_connection_done_in_completion_order_not_original_order(
+    app_factory, tmp_path, monkeypatch,
+):
+    # The whole point of turning _run_phase_b_fanout into a generator:
+    # pg-a is selected FIRST (indices=[0, 1]) but its own generation call
+    # is deliberately slow, so the client should still see pg-b's
+    # phase_b_connection_done event first - proving these events reflect
+    # real completion order, not selected_entries' original order (which
+    # the terminal 'done' line's sql_blocks/database_notes/
+    # generation_failures still preserve, unchanged - see the other
+    # route-outcome tests above).
+    env = _two_preset_env(app_factory, tmp_path)
+    login_as(env.client, "alice@example.com")
+    _set_all_mode(env.client)
+
+    import db as db_module
+    monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
+        "postgresql://u:p@host-a:5432/a": "Table: deals\nid INTEGER\n",
+        "postgresql://u:p@host-b:5432/b": "Table: campaigns\nid INTEGER\n",
+    }))
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(_gemini_ok(
+        '{"action": "route", "indices": [0, 1], "message": "Checking both."}'
+    ))
+
+    def _slow_deals_response():
+        time.sleep(0.3)
+        return _gemini_ok("SELECT * FROM deals;")
+
+    harness.register_marker("deals", _slow_deals_response)
+    harness.register_marker("campaigns", _gemini_ok("SELECT * FROM campaigns;"))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'first database question, plus something else'})
+    events = parse_translate_stream_events(resp)
+
+    connection_done_events = [e for e in events if e['status'] == 'phase_b_connection_done']
+    assert [e['id'] for e in connection_done_events] == ['pg-b', 'pg-a']
+
+    # The terminal line's own ordering guarantee is untouched by any of
+    # this - still selected_entries' ORIGINAL order (pg-a, then pg-b).
+    _, data = parse_translate_stream(resp)
+    assert data['sql'].index('preset:pg-a') < data['sql'].index('preset:pg-b')
+
+
+def test_classify_generation_outcome_covers_sql_note_empty_and_failed_shapes(app_factory, tmp_path):
+    # Direct unit test of the small helper _run_phase_b_fanout's
+    # per-completion streaming event and its final original-order summary
+    # loop both call, so the marker-prepend/note-strip logic is verified
+    # once, in isolation, rather than only indirectly through the fuller
+    # end-to-end route-outcome tests above.
+    env = _two_preset_env(app_factory, tmp_path)
+    classify = env.translate_routes._classify_generation_outcome
+    entry = {"kind": "preset", "id": "pg-a", "name": "Sales Postgres"}
+
+    assert classify(entry, ("ok", "SELECT * FROM deals;", {})) == {
+        "outcome": "sql",
+        "sql": "-- database: preset:pg-a (Sales Postgres)\nSELECT * FROM deals;",
+    }
+    assert classify(entry, ("ok", "*** NO SQL *** nothing relevant here", {})) == {
+        "outcome": "note",
+        "text": "nothing relevant here",
+    }
+    assert classify(entry, ("ok", "   ", {})) == {"outcome": "note", "text": ""}
+    assert classify(entry, ("failed", "boom")) == {"outcome": "failed", "error": "boom"}
+
+
 def test_all_mode_failed_outcome_returns_fixed_apology_text_not_candidate_zero_fallback(app_factory, tmp_path, monkeypatch):
     env = _two_preset_env(app_factory, tmp_path)
     login_as(env.client, "alice@example.com")
@@ -747,9 +686,9 @@ def test_all_mode_failed_outcome_returns_fixed_apology_text_not_candidate_zero_f
     assert data['success'] is True
     assert len(harness.generate_calls) == 2  # triage's own bounded retry, then "failed"
     assert data['sql'] == '*** NO SQL *** I am not able to respond to your prompt.'
-    # NOT a candidate-0 fallback guess (unlike select_relevant_connections'
-    # legacy behavior) - a wrong guess here would mean actually running
-    # real SQL against a database the user never asked about.
+    # NOT a candidate-0 fallback guess - a wrong guess here would mean
+    # actually running real SQL against a database the user never asked
+    # about.
     assert 'Sales Postgres' not in data['sql']
     assert 'router_route' not in data
     assert 'connection_selection' not in data

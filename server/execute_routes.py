@@ -140,20 +140,49 @@ def _execute_with_timeout(backend, conn, sql_text):
 
 # --- Multi-database dispatch -------------------------------------------------
 #
-# Support for the multi-database question-answering feature (see
-# translate_routes.py's module docstring): a script generated (or later
-# hand-edited) for a session with 2+ in-scope connections carries one
-# '-- database: preset:<id>'/'-- database: custom:<key>' comment
-# immediately before EVERY statement, tagging which connection it targets
-# (see translate_routes.py's _rewrite_database_labels - this is the fixed,
-# permanent reference format that rewrite produces, NOT the ephemeral
-# 'DB<N>' ordinal the model itself emits, which never survives past
-# generation). A script with NO such marker anywhere - every script this
-# app has ever generated before this feature, any hand-typed SQL, or one
-# where the user stripped the comment - is completely unaffected: see
-# execute_query() below, which only enters this dispatch path when at
-# least one marker is found at all.
+# Support for "all databases" mode (see translate_routes.py's module
+# docstring): a script generated (or later hand-edited) for a "route"
+# outcome carries one '-- database: preset:<id>'/'-- database:
+# custom:<key>' comment immediately before EVERY statement, tagging which
+# connection it targets (see translate_routes.py's
+# _classify_generation_outcome - this marker is mechanically prepended
+# server-side once Phase B's per-connection call returns, never something
+# the model itself is asked to write). A script with NO such marker
+# anywhere - every script generated before this feature existed, any
+# hand-typed SQL, or one where the user stripped the comment - is
+# completely unaffected: see execute_query() below, which only enters
+# this dispatch path when at least one marker is found at all.
 _DB_MARKER_RE = re.compile(r'^--\s*database:\s*(preset|custom):(\S+)', re.MULTILINE)
+
+# Matches a WHOLE '-- database: ...' marker line (including its trailing
+# '(<name>)' and the newline that ends it, not just the (kind, ref_id)
+# prefix _DB_MARKER_RE itself captures) - see _strip_database_marker_lines
+# below for why this exists as its own pattern.
+_DB_MARKER_LINE_RE = re.compile(r'^--\s*database:\s*(?:preset|custom):\S+.*\n?', re.MULTILINE)
+
+
+def _strip_database_marker_lines(sql_text):
+    """Removes every '-- database: ...' marker line from sql_text before
+    it ever reaches a backend's execute(). The marker's only job - telling
+    _split_by_database_markers which connection a chunk targets - is
+    already done by the time _execute_one_group has a concatenated group
+    to run; nothing downstream needs the comment text itself.
+
+    This matters for more than tidiness: real SQL dialects treat a line
+    starting with '--' as a harmless comment, so leaving the marker in
+    never broke anything there and easily went unnoticed - but Google
+    Sheets' GViz query language (backends/sheets.py) is SQL-*like*, not
+    real SQL, and has no comment syntax at all. A leading '-- database:
+    ...' line isn't silently ignored there, it's a syntax error that
+    breaks every Sheets connection's turn in ANY multi-database script,
+    even though the actual query right below it would have run fine on
+    its own. Stripping the marker once, centrally, here - rather than
+    teaching sheets.py (or every future backend with the same limitation)
+    to defensively strip a marker it was never supposed to know existed -
+    fixes Sheets and keeps every other backend's behavior unchanged (a
+    '--' comment they were already silently discarding at execution time
+    just never reaches them at all now)."""
+    return _DB_MARKER_LINE_RE.sub('', sql_text).strip()
 
 
 def _split_by_database_markers(sql_text):
@@ -216,7 +245,7 @@ def _execute_one_group(kind, ref_id, concatenated_sql, user_identity):
     try:
         backend = get_backend(descriptor)
         conn = backend.connect(descriptor)
-        group_results = _execute_with_timeout(backend, conn, concatenated_sql)
+        group_results = _execute_with_timeout(backend, conn, _strip_database_marker_lines(concatenated_sql))
         for r in group_results:
             r["database"] = {"kind": kind, "id": ref_id, "name": name}
         return {"results": group_results, "failure": None}

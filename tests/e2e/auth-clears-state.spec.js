@@ -120,6 +120,73 @@ async function mockCloudRunConfig(page) {
   });
 }
 
+test.describe('logging out from the narrow-screen "more" menu', () => {
+  // Same breakpoint more-menu.spec.js exercises for the Help/History
+  // collapse - see style.css's @media (max-width: 480px) block and
+  // client.js's relocateAuthContainer(). At this width the signed-in
+  // avatar (#g_id_signin, holding .auth-menu-wrapper > #authAvatarBtn +
+  // #authDropdown) is reparented into #moreMenuAuthSlot, itself nested
+  // inside the triple-dot #moreMenuDropdown - so opening the avatar's own
+  // dropdown here means one .auth-dropdown-menu popping up inside another.
+  test.use({ viewport: { width: 375, height: 700 } });
+
+  test('the avatar submenu inside the more menu is actually clickable, not just present in the DOM', async ({ page }) => {
+    await stubGoogleIdentityServices(page);
+    await mockCloudRunConfig(page);
+
+    await gotoApp(page);
+    await page.evaluate(
+      (token) => window.__gisCallback({ credential: token }),
+      fakeIdToken('mobileuser@example.com')
+    );
+
+    // Signed in - the avatar lives inside the more menu's own slot at this
+    // width, not in the header directly.
+    await expect(page.locator('#moreMenuAuthSlot #authAvatarBtn')).toBeAttached();
+    await expect(page.locator('.header-actions > .auth-container')).toHaveCount(0);
+
+    await page.locator('#moreMenuBtn').click();
+    await page.locator('#authAvatarBtn').click();
+    await expect(page.locator('#authDropdown')).not.toHaveClass(/hidden/);
+
+    // The regression this guards against: #moreMenuDropdown's base
+    // .auth-dropdown-menu styling carried a stray `overflow: hidden` (a
+    // leftover from an older, otherwise-superseded duplicate ruleset in
+    // style.css) that clipped this nested dropdown down to nothing - it
+    // existed in the DOM with `.hidden` correctly removed, yet sat at
+    // coordinates nothing could actually reach: a real click at its own
+    // center hit whatever was rendered underneath instead (e.g. the SQL
+    // editor). A plain locator.click() alone isn't a reliable guard against
+    // this - Playwright's own actionability retries silently absorb a
+    // transient "hasn't painted yet" race, which looks identical to this
+    // bug for the first couple of retries and can let a click() pass
+    // either way. Assert the real hit-test directly instead.
+    const logoutIsHitTestable = await page.evaluate(() => {
+      const btn = document.getElementById('logoutBtn');
+      const r = btn.getBoundingClientRect();
+      const hit = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+      return !!hit && (hit === btn || btn.contains(hit));
+    });
+    expect(logoutIsHitTestable).toBe(true);
+
+    await page.locator('#logoutBtn').click();
+
+    // Logging out tears down the whole signed-in subtree and rebuilds the
+    // (stubbed) sign-in button in the very same slot.
+    await expect(page.locator('#authAvatarBtn')).toHaveCount(0);
+
+    // The more menu itself also closes as an incidental side effect here
+    // (the click event keeps bubbling toward document's own outside-click
+    // listener after logoutBtn's own handler has already detached it from
+    // the DOM, so `moreMenuWrapper.contains(e.target)` reads false) -
+    // harmless, and consistent with the menu already closing after
+    // Help/History navigation. Reopen it to confirm the stubbed sign-in
+    // control renders correctly in the same slot the avatar just vacated.
+    await page.locator('#moreMenuBtn').click();
+    await expect(page.locator('#moreMenuAuthSlot #fakeGsiButton')).toBeVisible();
+  });
+});
+
 test.describe('auth-triggered state clearing (Cloud Run)', () => {
   test('logging in via Google Sign-In clears the NL prompt, SQL, and results', async ({ page }) => {
     await stubGoogleIdentityServices(page);
