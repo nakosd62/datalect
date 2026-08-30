@@ -25,7 +25,15 @@
     })();
   </script>
 
-  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 160 160' fill='none'><defs><linearGradient id='crbotBgGrad' x1='0%' y1='0%' x2='100%' y2='100%'><stop offset='0%' stop-color='%231E293B'/><stop offset='100%' stop-color='%230F172A'/></linearGradient><linearGradient id='crbotCyanGreen' x1='0%' y1='0%' x2='100%' y2='100%'><stop offset='0%' stop-color='%2338BDF8'/><stop offset='100%' stop-color='%2310B981'/></linearGradient><filter id='crbotGlow' x='-20%' y='-20%' width='140%' height='140%'><feGaussianBlur stdDeviation='3.5' result='blur'/><feComposite in='SourceGraphic' in2='blur' operator='over'/></filter></defs><path d='M 28 24 H 132 A 16 16 0 0 1 148 40 V 104 A 16 16 0 0 1 132 120 H 68 L 44 140 V 120 H 28 A 16 16 0 0 1 12 104 V 40 A 16 16 0 0 1 28 24 Z' fill='url(%23crbotBgGrad)' stroke='%2338BDF8' stroke-width='5' stroke-linecap='round' stroke-linejoin='round'/><g filter='url(%23crbotGlow)'><ellipse cx='50' cy='50' rx='22' ry='7' fill='none' stroke='%23FFFFFF' stroke-width='4.5'/><path d='M 28 50 V 66 C 28 70 38 73 50 73 C 62 73 72 70 72 66 V 50' fill='none' stroke='%2338BDF8' stroke-width='4.5'/><path d='M 28 66 V 82 C 28 86 38 89 50 89 C 62 89 72 86 72 82 V 66' fill='none' stroke='%2338BDF8' stroke-width='4.5'/><circle cx='50' cy='50' r='3.5' fill='%23FFFFFF'/><circle cx='40' cy='66' r='3' fill='%2334D399'/><circle cx='60' cy='82' r='3' fill='%2334D399'/></g><g filter='url(%23crbotGlow)'><rect x='88' y='44' width='44' height='34' rx='8' fill='none' stroke='%2334D399' stroke-width='4.5'/><path d='M 98 78 L 92 86 V 78' stroke='%2334D399' stroke-width='4.5' stroke-linecap='round' stroke-linejoin='round' fill='none'/><path d='M 103 54 C 100 54, 99 56, 99 58 C 99 60, 97 61, 95 61 C 97 61, 99 62, 99 64 C 99 66, 100 68, 103 68' stroke='%23FFFFFF' stroke-width='3' stroke-linecap='round' fill='none'/><path d='M 117 54 C 120 54, 121 56, 121 58 C 121 60, 123 61, 125 61 C 123 61, 121 62, 121 64 C 121 66, 120 68, 117 68' stroke='%23FFFFFF' stroke-width='3' stroke-linecap='round' fill='none'/></g><path d='M 74 58 H 82 L 78 54' stroke='%23FFFFFF' stroke-width='3.5' stroke-linecap='round' stroke-linejoin='round'/><path d='M 86 68 H 78 L 82 72' stroke='%23FFFFFF' stroke-width='3.5' stroke-linecap='round' stroke-linejoin='round'/><line x1='42' y1='102' x2='118' y2='102' stroke='%23475569' stroke-width='4' stroke-linecap='round'/><line x1='42' y1='102' x2='85' y2='102' stroke='%2334D399' stroke-width='4' stroke-linecap='round' filter='url(%23crbotGlow)'/><circle cx='85' cy='102' r='4' fill='%23FFFFFF' filter='url(%23crbotGlow)'/></svg>">
+  <!-- Datalect favicon set (see webClient/favicon.svg for the source artwork).
+       favicon.ico covers older browsers; the sized PNGs are for browsers that
+       prefer PNG; apple-touch-icon.png is used when the site is added to an
+       iOS/iPadOS home screen. -->
+  <link rel="icon" href="favicon.ico" sizes="any">
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
+  <link rel="icon" type="image/png" sizes="32x32" href="favicon-32x32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="favicon-16x16.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
   
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -54,49 +62,53 @@
       <div class="crbot-header">
         <div class="crbot-title-group">
           <div class="crbot-icon-wrapper">
-            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 160" width="40" height="40" fill="none">
-              <defs>
-                <linearGradient id="crbotBgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-                  <stop offset="0%" stop-color="#1E293B"/>
-                  <stop offset="100%" stop-color="#0F172A"/>
-                </linearGradient>
+            <!-- Datalect brand mark (logo.svg) - replaces the old placeholder icon above.
+                 viewBox/paths are the artwork as supplied; only width/height are set here
+                 to fit the existing 40x40 header slot. -->
+            <svg width="60" height="60" viewBox="0 0 128 128" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <g transform="translate(14, 20)">
+                    <!-- Agent Icon -->
+                    <g transform="translate(0, 0)">
+                        <!-- Antenna -->
+                        <line x1="30" y1="12" x2="30" y2="4" stroke="#0284c7" stroke-width="3.5" stroke-linecap="round"/>
+                        <circle cx="30" cy="3" r="3.5" fill="#0284c7"/>
+                        <!-- Head -->
+                        <rect x="10" y="12" width="40" height="24" rx="9" fill="#0ea5e9"/>
+                        <!-- Eyes -->
+                        <ellipse cx="22" cy="24" rx="4" ry="4.5" fill="#ffffff"/>
+                        <ellipse cx="38" cy="24" rx="4" ry="4.5" fill="#ffffff"/>
+                        <circle cx="23" cy="24" r="2" fill="#0f172a"/>
+                        <circle cx="37" cy="24" r="2" fill="#0f172a"/>
+                        <!-- Side Connectors / Ears -->
+                        <rect x="5" y="19" width="5" height="10" rx="2.5" fill="#0284c7"/>
+                        <rect x="50" y="19" width="5" height="10" rx="2.5" fill="#0284c7"/>
+                        <!-- Body ('A' shape) - was a near-black fill (#0f172a) that all but
+                             disappeared against the app's near-black dark-theme background;
+                             lightened the fill and added a cyan stroke (matching the
+                             antenna/ear accents) so the shape stays legible on any theme. -->
+                        <path d="M 16 80 L 25 42 L 35 42 L 44 80 L 35 80 L 33 66 L 27 66 L 25 80 Z" fill="#1e293b" stroke="#38bdf8" stroke-width="2" stroke-linejoin="round"/>
+                        <path d="M 28 57 L 32 57 L 30 48 Z" fill="#ffffff"/>
+                        <!-- Arms -->
+                        <path d="M 15 45 C 7 51 7 63 12 71" stroke="#0ea5e9" stroke-width="4.5" stroke-linecap="round" fill="none"/>
+                        <path d="M 45 45 C 53 51 53 63 48 71" stroke="#0ea5e9" stroke-width="4.5" stroke-linecap="round" fill="none"/>
+                    </g>
 
-                <linearGradient id="crbotCyanGreen" x1="0%" y1="0%" x2="100%" y2="100%">
-                  <stop offset="0%" stop-color="#38BDF8"/>
-                  <stop offset="100%" stop-color="#10B981"/>
-                </linearGradient>
+                    <!-- Database Stacks (Tightly Positioned) -->
+                    <g transform="translate(56, 18)">
+                        <!-- Stack 1 (Top) -->
+                        <path d="M 0 10 C 0 4.5, 9 0, 20 0 C 31 0, 40 4.5, 40 10 C 40 15.5, 31 20, 20 20 C 9 20, 0 15.5, 0 10 Z" fill="#38bdf8"/>
+                        <path d="M 0 10 L 0 20 C 0 25.5, 9 30, 20 30 C 31 30, 40 25.5, 40 20 L 40 10 C 40 15.5, 31 20, 20 20 C 9 20, 0 15.5, 0 10 Z" fill="#0284c7"/>
+                        <circle cx="30" cy="21" r="2" fill="#ffffff"/>
 
-                <filter id="crbotGlow" x="-20%" y="-20%" width="140%" height="140%">
-                  <feGaussianBlur stdDeviation="3.5" result="blur" />
-                  <feComposite in="SourceGraphic" in2="blur" operator="over"/>
-                </filter>
-              </defs>
+                        <!-- Stack 2 (Middle) -->
+                        <path d="M 0 25 L 0 35 C 0 40.5, 9 45, 20 45 C 31 45, 40 40.5, 40 35 L 40 25 C 40 30.5, 31 35, 20 35 C 9 35, 0 30.5, 0 25 Z" fill="#0369a1"/>
+                        <circle cx="30" cy="36" r="2" fill="#ffffff"/>
 
-              <path d="M 28 24 H 132 A 16 16 0 0 1 148 40 V 104 A 16 16 0 0 1 132 120 H 68 L 44 140 V 120 H 28 A 16 16 0 0 1 12 104 V 40 A 16 16 0 0 1 28 24 Z" 
-                    fill="url(#crbotBgGrad)" stroke="#38BDF8" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
-
-              <g filter="url(#crbotGlow)">
-                <ellipse cx="50" cy="50" rx="22" ry="7" fill="none" stroke="#FFFFFF" stroke-width="4.5"/>
-                <path d="M 28 50 V 66 C 28 70 38 73 50 73 C 62 73 72 70 72 66 V 50" fill="none" stroke="#38BDF8" stroke-width="4.5"/>
-                <path d="M 28 66 V 82 C 28 86 38 89 50 89 C 62 89 72 86 72 82 V 66" fill="none" stroke="#38BDF8" stroke-width="4.5"/>
-                <circle cx="50" cy="50" r="3.5" fill="#FFFFFF"/>
-                <circle cx="40" cy="66" r="3" fill="#34D399"/>
-                <circle cx="60" cy="82" r="3" fill="#34D399"/>
-              </g>
-
-              <g filter="url(#crbotGlow)">
-                <rect x="88" y="44" width="44" height="34" rx="8" fill="none" stroke="#34D399" stroke-width="4.5"/>
-                <path d="M 98 78 L 92 86 V 78" stroke="#34D399" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
-                <path d="M 103 54 C 100 54, 99 56, 99 58 C 99 60, 97 61, 95 61 C 97 61, 99 62, 99 64 C 99 66, 100 68, 103 68" stroke="#FFFFFF" stroke-width="3" stroke-linecap="round" fill="none"/>
-                <path d="M 117 54 C 120 54, 121 56, 121 58 C 121 60, 123 61, 125 61 C 123 61, 121 62, 121 64 C 121 66, 120 68, 117 68" stroke="#FFFFFF" stroke-width="3" stroke-linecap="round" fill="none"/>
-              </g>
-
-              <path d="M 74 58 H 82 L 78 54" stroke="#FFFFFF" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
-              <path d="M 86 68 H 78 L 82 72" stroke="#FFFFFF" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
-
-              <line x1="42" y1="102" x2="118" y2="102" stroke="#475569" stroke-width="4" stroke-linecap="round"/>
-              <line x1="42" y1="102" x2="85" y2="102" stroke="#34D399" stroke-width="4" stroke-linecap="round" filter="url(#crbotGlow)"/>
-              <circle cx="85" cy="102" r="4" fill="#FFFFFF" filter="url(#crbotGlow)"/>
+                        <!-- Stack 3 (Bottom) -->
+                        <path d="M 0 40 L 0 50 C 0 55.5, 9 60, 20 60 C 31 60, 40 55.5, 40 50 L 40 40 C 40 45.5, 31 50, 20 50 C 9 50, 0 45.5, 0 40 Z" fill="#0f172a"/>
+                        <circle cx="30" cy="51" r="2" fill="#38bdf8"/>
+                    </g>
+                </g>
             </svg>
 
             <div class="header-icon-label">

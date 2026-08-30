@@ -1,0 +1,31 @@
+<svg width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <rect width="64" height="64" rx="14" fill="#0f172a"/>
+    <g transform="translate(6, 8)">
+        <!-- Agent Icon -->
+        <g transform="translate(0, 0) scale(0.65)">
+            <line x1="30" y1="12" x2="30" y2="4" stroke="#38bdf8" stroke-width="3" stroke-linecap="round"/>
+            <circle cx="30" cy="3" r="3" fill="#38bdf8"/>
+            <rect x="12" y="12" width="36" height="22" rx="8" fill="#38bdf8"/>
+            <ellipse cx="23" cy="23" rx="3.5" ry="4" fill="#0f172a"/>
+            <ellipse cx="37" cy="23" rx="3.5" ry="4" fill="#0f172a"/>
+            <circle cx="24" cy="23" r="1.5" fill="#ffffff"/>
+            <circle cx="38" cy="23" r="1.5" fill="#ffffff"/>
+            <rect x="8" y="18" width="4" height="10" rx="2" fill="#0284c7"/>
+            <rect x="48" y="18" width="4" height="10" rx="2" fill="#0284c7"/>
+            <path d="M 18 70 L 25 38 L 35 38 L 42 70 L 34 70 L 32 58 L 26 58 L 24 70 Z" fill="#ffffff"/>
+            <path d="M 27 50 L 31 50 L 29 42 Z" fill="#0f172a"/>
+            <path d="M 17 40 C 10 45 10 55 14 62" stroke="#38bdf8" stroke-width="4" stroke-linecap="round" fill="none"/>
+            <path d="M 43 40 C 50 45 50 55 46 62" stroke="#38bdf8" stroke-width="4" stroke-linecap="round" fill="none"/>
+        </g>
+        <!-- Database Stacks -->
+        <g transform="translate(32, 8) scale(0.65)">
+            <path d="M 0 8 C 0 3.5, 7 0, 16 0 C 25 0, 32 3.5, 32 8 C 32 12.5, 25 16, 16 16 C 7 16, 0 12.5, 0 8 Z" fill="#38bdf8"/>
+            <path d="M 0 8 L 0 16 C 0 20.5, 7 24, 16 24 C 25 24, 32 20.5, 32 16 L 32 8 C 32 12.5, 25 16, 16 16 C 7 16, 0 12.5, 0 8 Z" fill="#0284c7"/>
+            <circle cx="24" cy="17" r="1.5" fill="#ffffff"/>
+            <path d="M 0 20 L 0 28 C 0 32.5, 7 36, 16 36 C 25 36, 32 32.5, 32 28 L 32 20 C 32 24.5, 25 28, 16 28 C 7 28, 0 24.5, 0 20 Z" fill="#0369a1"/>
+            <circle cx="24" cy="29" r="1.5" fill="#ffffff"/>
+            <path d="M 0 32 L 0 40 C 0 44.5, 7 48, 16 48 C 25 48, 32 44.5, 32 40 L 32 32 C 32 36.5, 25 40, 16 40 C 7 40, 0 36.5, 0 32 Z" fill="#ffffff"/>
+            <circle cx="24" cy="41" r="1.5" fill="#0284c7"/>
+        </g>
+    </g>
+</svg>
