@@ -269,6 +269,14 @@ test.describe('config modal', () => {
             has_custom_credentials: false,
           }],
           auto_sql_execute: false,
+          // Lazily derived server-side from active_is_custom/
+          // active_custom_connection_key above (see state_store.py's
+          // _lazy_derive_in_scope) - this visitor's one active custom
+          // connection is its sole in-scope entry, same as a real,
+          // never-explicitly-saved session would report.
+          in_scope_preset_ids: [],
+          in_scope_custom_connection_keys: ['anon-key-1'],
+          max_in_scope_connections: 20,
         }),
       });
     });
@@ -634,9 +642,12 @@ test.describe('config modal', () => {
     await expect(page.locator('#aiPrompt')).toHaveValue('list users');
 
     // Now switch back to the default preset - this is the connection
-    // change the prompt/SQL/results should be wiped on.
+    // change the prompt/SQL/results should be wiped on. Matched by its
+    // preset: value rather than .first() - the very first radio in the
+    // group is now the "All configured databases" option (see
+    // renderDbRadioButtons() in client.js), not a specific connection.
     await openConfigModal(page);
-    await page.locator('#modalDbRadioGroup input[type="radio"]').first().check();
+    await page.locator('#modalDbRadioGroup input[name="db_connection_option"][value^="preset:"]').first().check();
     await page.locator('#configSaveBtn').click();
     await expect(page.locator('#configModal')).toHaveClass(/hidden/);
     await expect(page.locator('#connDbName')).toHaveText('Default DB');
@@ -676,9 +687,10 @@ test.describe('config modal', () => {
 
     // Open the modal and save again without changing the selection (e.g.
     // just toggling auto-execute) - the active connection identity is
-    // unchanged, so nothing should be cleared.
+    // unchanged, so nothing should be cleared. Matched by its preset:
+    // value, not .first() - see the test above for why.
     await openConfigModal(page);
-    await page.locator('#modalDbRadioGroup input[type="radio"]').first().check();
+    await page.locator('#modalDbRadioGroup input[name="db_connection_option"][value^="preset:"]').first().check();
     await page.locator('#configSaveBtn').click();
     await expect(page.locator('#configModal')).toHaveClass(/hidden/);
 
@@ -1372,7 +1384,7 @@ test.describe('config modal', () => {
       await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ success: true }) });
     });
 
-    await page.locator('#modalDbRadioGroup input[type="radio"]').first().check();
+    await page.locator('#modalDbRadioGroup input[name="db_connection_option"][value^="preset:"]').first().check();
 
     const start = Date.now();
     await page.locator('#configSaveBtn').click();

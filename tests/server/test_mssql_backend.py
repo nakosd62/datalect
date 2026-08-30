@@ -32,6 +32,8 @@ comment and backends/mssql.py's module docstring for the full story.
 """
 
 import sys
+import threading
+import time
 from decimal import Decimal
 from datetime import date
 
@@ -42,6 +44,7 @@ from helpers import SERVER_DIR
 if SERVER_DIR not in sys.path:
     sys.path.insert(0, SERVER_DIR)
 
+import backends.mssql as mssql_module
 from backends.mssql import MssqlBackend
 from backends.base import DB_CONNECT_TIMEOUT_SECONDS, SqlExecutionError
 from helpers import install_fake_mssql_connect, make_fake_mssql_connection
@@ -98,6 +101,117 @@ def test_connect_passes_core_kwargs(monkeypatch):
     # pytds's login_timeout, not its separate (query-scoped) "timeout" kwarg.
     assert call["login_timeout"] == DB_CONNECT_TIMEOUT_SECONDS
     assert "timeout" not in call
+
+
+# --- connect(): hard external timeout enforcement (_connect_with_hard_timeout) ---
+#
+# pytds's own login_timeout kwarg (asserted above) is NOT a reliable hard
+# deadline - see backends/mssql.py's _connect_with_hard_timeout docstring
+# for the real accounting bug that lets it run well past the configured
+# budget. These tests drive that external ThreadPoolExecutor/
+# future.result(timeout=...) enforcement directly, via
+# FakeMssqlConnectHarness's `delay`/`raise_exc` (a slow real connect() is
+# simulated with time.sleep(), same pattern test_execute_routes.py's
+# _FakeBackend uses for SQL_EXECUTE_TIMEOUT_SECONDS).
+
+def test_connect_raises_friendly_timeout_error_when_pytds_connect_blocks_past_the_configured_budget(monkeypatch):
+    backend, harness = _ms(monkeypatch)
+    monkeypatch.setattr(mssql_module, "DB_CONNECT_TIMEOUT_SECONDS", 0.2)
+    harness.delay = 2  # far longer than the 0.2s budget below
+
+    start = time.perf_counter()
+    with pytest.raises(TimeoutError, match="timed out after 0.2 seconds"):
+        backend.connect({
+            "type": "mssql", "host": "db.example.com", "database": "sales",
+            "user": "alice", "password": "hunter2", "encrypt": False,
+        })
+    elapsed = time.perf_counter() - start
+
+    # Bounded by the configured budget, not by harness.delay (2s) - the
+    # whole point of wrapping this externally.
+    assert elapsed < 1.0
+
+
+def test_connect_still_succeeds_normally_when_pytds_connect_returns_within_the_budget(monkeypatch):
+    backend, harness = _ms(monkeypatch)
+    monkeypatch.setattr(mssql_module, "DB_CONNECT_TIMEOUT_SECONDS", 5)
+    harness.delay = 0
+
+    connection = backend.connect({
+        "type": "mssql", "host": "db.example.com", "database": "sales",
+        "user": "alice", "password": "hunter2", "encrypt": False,
+    })
+    assert connection is harness.connections[-1]
+    assert connection.closed is False
+
+
+def test_connect_zero_timeout_disables_the_wrapper_and_calls_pytds_connect_directly(monkeypatch):
+    # Mirrors SQL_EXECUTE_TIMEOUT_SECONDS's own "<= 0 disables entirely"
+    # escape hatch in execute_routes.py - a slow harness.delay is still
+    # honored in full (no external deadline enforced at all) rather than
+    # raising immediately.
+    backend, harness = _ms(monkeypatch)
+    monkeypatch.setattr(mssql_module, "DB_CONNECT_TIMEOUT_SECONDS", 0)
+    harness.delay = 0.3
+
+    start = time.perf_counter()
+    connection = backend.connect({
+        "type": "mssql", "host": "db.example.com", "database": "sales",
+        "user": "alice", "password": "hunter2", "encrypt": False,
+    })
+    elapsed = time.perf_counter() - start
+
+    assert connection is harness.connections[-1]
+    assert elapsed >= 0.3
+
+
+def test_connect_closes_a_connection_that_arrives_late_after_the_timeout_already_fired(monkeypatch):
+    # The abandoned background thread isn't joined (see
+    # _connect_with_hard_timeout's docstring - the caller must not block
+    # waiting for it), but if pytds.connect() eventually DOES succeed after
+    # we've already given up and raised, that live connection must still
+    # get closed rather than leaking a real, open server-side session
+    # forever with no reference left to close it.
+    backend, harness = _ms(monkeypatch)
+    monkeypatch.setattr(mssql_module, "DB_CONNECT_TIMEOUT_SECONDS", 0.2)
+    harness.delay = 0.6
+    harness.connect_finished = threading.Event()
+
+    with pytest.raises(TimeoutError):
+        backend.connect({
+            "type": "mssql", "host": "db.example.com", "database": "sales",
+            "user": "alice", "password": "hunter2", "encrypt": False,
+        })
+
+    # The background connect() call was still in flight when we raised -
+    # wait for it to actually finish (well under its own 0.6s delay) rather
+    # than sleeping blindly, then confirm the late-arriving connection got
+    # closed by the done-callback.
+    assert harness.connect_finished.wait(timeout=2), "background connect() never finished"
+    assert len(harness.connections) == 1
+    assert harness.connections[-1].closed is True
+
+
+def test_connect_does_not_crash_when_the_late_arriving_connect_call_itself_fails(monkeypatch):
+    # Symmetric case: the abandoned attempt eventually raises (its own
+    # unrelated connection failure) rather than succeeding late - the
+    # done-callback must swallow that quietly too, not propagate it
+    # anywhere (there's no caller left waiting for this background
+    # thread's outcome by the time it finishes).
+    backend, harness = _ms(monkeypatch)
+    monkeypatch.setattr(mssql_module, "DB_CONNECT_TIMEOUT_SECONDS", 0.2)
+    harness.delay = 0.5
+    harness.raise_exc = Exception("simulated late connection failure")
+    harness.connect_finished = threading.Event()
+
+    with pytest.raises(TimeoutError):
+        backend.connect({
+            "type": "mssql", "host": "db.example.com", "database": "sales",
+            "user": "alice", "password": "hunter2", "encrypt": False,
+        })
+
+    assert harness.connect_finished.wait(timeout=2), "background connect() never finished"
+    assert harness.connections == []  # never got far enough to construct one
 
 
 def test_connect_defaults_port_to_1433_when_omitted(monkeypatch):

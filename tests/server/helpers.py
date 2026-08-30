@@ -20,6 +20,7 @@ determine behavior.
 import json
 import os
 import sys
+import time
 import types
 from datetime import datetime, timedelta, timezone
 
@@ -44,6 +45,7 @@ if SERVER_DIR not in sys.path:
 _APP_MODULE_NAMES = [
     "app_config", "auth", "config_routes", "execute_routes",
     "translate_routes", "history_routes", "db", "schema_cache", "state_store",
+    "connection_router",
 ]
 
 # Every env var any of the above modules reads at import or request time.
@@ -1021,9 +1023,36 @@ class FakeMssqlConnectHarness:
     def __init__(self):
         self.calls = []  # list of kwargs dicts, one per connect() call
         self.connections = []  # the FakeMssqlConnection returned by each call
+        # Seconds connect() blocks before returning/raising - 0 (the
+        # default) is instant, same as every other test using this
+        # harness. Set nonzero only by the hard-timeout tests in
+        # test_mssql_backend.py, which simulate pytds.connect() itself
+        # hanging past DB_CONNECT_TIMEOUT_SECONDS (see backends/mssql.py's
+        # _connect_with_hard_timeout) - mirrors _FakeBackend's own `delay`
+        # param in test_execute_routes.py.
+        self.delay = 0
+        # Exception connect() raises after `delay` (instead of returning a
+        # connection) - unset (None) by default. Lets a test simulate a
+        # connect() that eventually fails on its own, distinct from one
+        # that eventually succeeds late (see connect() below).
+        self.raise_exc = None
+        # Set once connect()'s sleep actually finishes - lets a timeout
+        # test confirm the abandoned background thread really did keep
+        # running (and, on the "late success" path, that the resulting
+        # connection was actually closed by _close_late_connection) without
+        # the test itself needing to sleep any longer than the timeout
+        # it's testing. Mirrors _FakeBackend.execute_finished in
+        # test_execute_routes.py.
+        self.connect_finished = None
 
     def connect(self, **kwargs):
         self.calls.append(kwargs)
+        if self.delay:
+            time.sleep(self.delay)
+        if self.connect_finished is not None:
+            self.connect_finished.set()
+        if self.raise_exc:
+            raise self.raise_exc
         connection = FakeMssqlConnection()
         self.connections.append(connection)
         return connection

@@ -219,7 +219,7 @@ from urllib.parse import urlparse
 from flask import Blueprint, request, jsonify
 
 from app_config import (
-    CONFIGURED_DBS, DEFAULT_PRESET_ID,
+    CONFIGURED_DBS, DEFAULT_PRESET_ID, MAX_IN_SCOPE_CONNECTIONS,
     AUTH_ENABLED, IS_CLOUD_RUN, state_store,
 )
 import os
@@ -243,6 +243,15 @@ from translate_routes import (
 )
 
 config_bp = Blueprint('config', __name__)
+
+# MAX_IN_SCOPE_CONNECTIONS itself now lives in app_config.py (imported
+# above, alongside CONFIGURED_DBS/DEFAULT_PRESET_ID) - see its docstring
+# there for why: it's the single cap on how many database connections are
+# involved anywhere in the multi-database question-answering feature (both
+# how many a user may mark "in scope" here, and how many of those
+# in-scope connections one question's Phase A routing may select -
+# connection_router.py's select_relevant_connections), no longer two
+# separate constants to keep in sync.
 
 # These 7 dialects have no real url of their own - what used to be stored
 # as "url" for a CUSTOM connection of one of these types was always a
@@ -1373,6 +1382,87 @@ def handle_config():
         )
         custom_list_saved = False
 
+        # In-scope connections (multi-database question-answering - see
+        # translate_routes.py's module docstring): the set of connections a
+        # question may ever be routed to, curated via the connection
+        # picker's checkboxes. An independent concern from the single
+        # active-connection fields above/below (same "a request can touch
+        # one, the other, both, or neither" reasoning as llm_provider/
+        # auto_sql_execute) - sent as an all-or-nothing pair, same
+        # convention custom_databases uses, since a partial update would
+        # leave the two lists describing an inconsistent set (see
+        # StateStore.set_session's docstring). in_scope_custom_keys is
+        # validated against `merged_custom_databases` (this SAME request's
+        # about-to-be-saved list, already carrying each entry's final
+        # connection_key - see _parse_incoming_custom_databases' docstring)
+        # when the request also touches the saved-connection list, so a
+        # connection added and marked in-scope in the same Save doesn't get
+        # spuriously dropped for not existing yet; otherwise it's checked
+        # against the currently-saved list.
+        new_in_scope_preset_ids = data.get('in_scope_preset_ids')
+        new_in_scope_custom_keys = data.get('in_scope_custom_connection_keys')
+        if new_in_scope_preset_ids is not None or new_in_scope_custom_keys is not None:
+            candidate_preset_ids = new_in_scope_preset_ids if isinstance(new_in_scope_preset_ids, list) else []
+            candidate_custom_keys = new_in_scope_custom_keys if isinstance(new_in_scope_custom_keys, list) else []
+
+            valid_preset_ids = {db.get("id") for db in CONFIGURED_DBS}
+            reference_custom_databases = (
+                merged_custom_databases if merged_custom_databases is not None
+                else state_store.get_db_connections(user_identity)
+            )
+            valid_custom_keys = {
+                db.get("connection_key") for db in reference_custom_databases if db.get("connection_key")
+            }
+
+            # Filtered (unknown/stale references silently dropped - same
+            # leniency resolve_active_descriptor already applies to a
+            # single stale connection_id) and deduped, preserving the
+            # order the client sent, via dict.fromkeys.
+            filtered_preset_ids = list(dict.fromkeys(
+                pid for pid in candidate_preset_ids if isinstance(pid, str) and pid in valid_preset_ids
+            ))
+            filtered_custom_keys = list(dict.fromkeys(
+                key for key in candidate_custom_keys if isinstance(key, str) and key in valid_custom_keys
+            ))
+
+            total_in_scope = len(filtered_preset_ids) + len(filtered_custom_keys)
+            if total_in_scope == 0:
+                resp = jsonify({
+                    'success': False,
+                    'error': 'At least one database connection must be in scope.',
+                })
+                return apply_session_cookie(resp, session_id), 400
+            if total_in_scope > MAX_IN_SCOPE_CONNECTIONS:
+                resp = jsonify({
+                    'success': False,
+                    'error': f'At most {MAX_IN_SCOPE_CONNECTIONS} database connections may be in scope at once.',
+                })
+                return apply_session_cookie(resp, session_id), 400
+
+            new_in_scope_preset_ids_to_save = filtered_preset_ids
+            new_in_scope_custom_keys_to_save = filtered_custom_keys
+        else:
+            new_in_scope_preset_ids_to_save = None
+            new_in_scope_custom_keys_to_save = None
+
+        # in_scope_mode ("single" | "all" - see StateStore.get_session's
+        # docstring): the binary connection-scope choice behind
+        # webClient/client.js's radio picker. An invalid/unrecognized value
+        # is silently treated as "nothing to save" here (None), same
+        # leniency new_llm_provider above already applies to an unknown
+        # provider name, rather than rejecting the whole request over one
+        # bad enum field. Note this is intentionally independent of the
+        # in_scope_preset_ids/in_scope_custom_connection_keys validation
+        # above: the client always sends both fields together (see
+        # triggerConfigSave's payload construction), but they're saved
+        # through three separate call sites below, so in_scope_mode needs
+        # its own None-means-"don't touch" plumbing through all three,
+        # exactly like every other independently-optional field here.
+        new_in_scope_mode = data.get('in_scope_mode')
+        new_in_scope_mode_to_save = (
+            new_in_scope_mode if new_in_scope_mode in ("single", "all") else None
+        )
+
         preset_id = data.get('preset_id') if not is_custom else None
         preset = next((db for db in CONFIGURED_DBS if db.get("id") == preset_id), None) if preset_id else None
 
@@ -1390,6 +1480,9 @@ def handle_config():
                 user_identity, connection_id=preset["id"], is_custom=False,
                 auto_sql_execute=new_auto_sql_execute,
                 llm_provider=new_llm_provider, llm_model=new_llm_model,
+                in_scope_preset_ids=new_in_scope_preset_ids_to_save,
+                in_scope_custom_connection_keys=new_in_scope_custom_keys_to_save,
+                in_scope_mode=new_in_scope_mode_to_save,
             )
         elif is_custom:
             new_db_type, new_db_url, new_db_config, connection_error = _parse_incoming_connection(
@@ -1506,6 +1599,9 @@ def handle_config():
                     user_identity, connection_id=active_connection_key, is_custom=True,
                     auto_sql_execute=new_auto_sql_execute,
                     llm_provider=new_llm_provider, llm_model=new_llm_model,
+                    in_scope_preset_ids=new_in_scope_preset_ids_to_save,
+                    in_scope_custom_connection_keys=new_in_scope_custom_keys_to_save,
+                    in_scope_mode=new_in_scope_mode_to_save,
                 )
                 if db_name_to_save is not None:
                     # new_db_url_to_persist, not new_db_url: for the 7
@@ -1520,19 +1616,25 @@ def handle_config():
                         connection_key=(active_connection_key or None),
                     )
                     custom_list_saved = True
-        elif new_auto_sql_execute is not None or new_llm_provider is not None or new_llm_model is not None:
+        elif (new_auto_sql_execute is not None or new_llm_provider is not None or new_llm_model is not None
+              or new_in_scope_preset_ids_to_save is not None or new_in_scope_custom_keys_to_save is not None
+              or new_in_scope_mode_to_save is not None):
             # Neither a preset nor a custom connection was actively
             # selected in this request (e.g. only the auto-execute toggle
-            # changed, or - the model-selection modal's own save, which
-            # never sends preset_id/is_custom at all - only llm_provider/
-            # llm_model changed) - leave the active connection exactly as
-            # it is. There's no hardcoded default to reset it to here
-            # anymore the way there used to be: a blank/never-set
-            # connection_id already resolves to the app default on its own
-            # - see db.py's resolve_active_descriptor.
+            # changed, only the in-scope checkboxes changed, or - the
+            # model-selection modal's own save, which never sends
+            # preset_id/is_custom at all - only llm_provider/llm_model
+            # changed) - leave the active connection exactly as it is.
+            # There's no hardcoded default to reset it to here anymore the
+            # way there used to be: a blank/never-set connection_id already
+            # resolves to the app default on its own - see db.py's
+            # resolve_active_descriptor.
             state_store.set_session(
                 user_identity, auto_sql_execute=new_auto_sql_execute,
                 llm_provider=new_llm_provider, llm_model=new_llm_model,
+                in_scope_preset_ids=new_in_scope_preset_ids_to_save,
+                in_scope_custom_connection_keys=new_in_scope_custom_keys_to_save,
+                in_scope_mode=new_in_scope_mode_to_save,
             )
 
         if not custom_list_saved and merged_custom_databases is not None:
@@ -1714,6 +1816,35 @@ def handle_config():
         # that happens to point at the same database".
         active_is_custom_out = bool(session_data.get("is_custom"))
 
+    # Multi-database question-answering's in-scope set, for DISPLAY
+    # (what the connection picker's checkboxes render as checked) - see
+    # the in_scope_preset_ids/in_scope_custom_connection_keys fields
+    # below. state_store.py's _lazy_derive_in_scope deliberately leaves a
+    # brand-new/never-explicitly-saved session's raw fields as two empty
+    # lists when connection_id is blank (its own docstring explains why:
+    # the same "nothing configured, fall back to the app default"
+    # convention resolve_active_descriptor already uses) - but the
+    # checkbox UI has no room for that nuance, and showing NOTHING
+    # checked for a first-time visitor who nonetheless already has an
+    # effective default connection is a real regression from the single-
+    # radio picker this replaced (which always had exactly one radio
+    # checked). Mirrors active_preset_id's own "or DEFAULT_PRESET_ID"
+    # fallback just above: only kicks in when BOTH raw lists are empty
+    # (an explicitly-saved empty set can't happen - config_routes.py's
+    # POST handler rejects that outright), and reflects whichever
+    # connection this response's other active_* fields already resolved
+    # to, so the checkbox state is never inconsistent with the rest of
+    # this same response.
+    raw_in_scope_preset_ids = session_data.get('in_scope_preset_ids') or []
+    raw_in_scope_custom_keys = session_data.get('in_scope_custom_connection_keys') or []
+    if raw_in_scope_preset_ids or raw_in_scope_custom_keys:
+        display_in_scope_preset_ids = raw_in_scope_preset_ids
+        display_in_scope_custom_keys = raw_in_scope_custom_keys
+    elif session_data.get("is_custom") and active_custom_connection_key:
+        display_in_scope_preset_ids, display_in_scope_custom_keys = [], [active_custom_connection_key]
+    else:
+        display_in_scope_preset_ids, display_in_scope_custom_keys = [active_preset_id or DEFAULT_PRESET_ID], []
+
     resp = jsonify({
         'auth_enabled': AUTH_ENABLED,
         'google_client_id': os.getenv("GOOGLE_CLIENT_ID"),
@@ -1784,6 +1915,21 @@ def handle_config():
         'custom_database_name': user_custom_name or "",
         'custom_database_url': user_custom_url or "",
         'custom_databases': custom_databases or [],
+        # Multi-database question-answering (see translate_routes.py's
+        # module docstring): the set of connections a question may ever be
+        # routed to - what the connection picker's checkboxes render as
+        # checked. Additive fields; every existing single-connection field
+        # above is still computed purely off connection_id/is_custom
+        # (now "the primary connection" - the first entry of this set, in
+        # stable display order - see state_store.py's docstring), so an
+        # older client that's never heard of these two fields keeps working
+        # exactly as before. max_in_scope_connections is sent so the
+        # frontend can show a friendly message before a Save would be
+        # rejected, rather than only finding out from a 400 response.
+        'in_scope_preset_ids': display_in_scope_preset_ids,
+        'in_scope_custom_connection_keys': display_in_scope_custom_keys,
+        'in_scope_mode': session_data.get('in_scope_mode') or 'single',
+        'max_in_scope_connections': MAX_IN_SCOPE_CONNECTIONS,
         # Organized by provider (see list_llm_providers_info()'s docstring)
         # so the model-selection modal can render one radio-button section
         # per provider without the client needing its own hardcoded notion

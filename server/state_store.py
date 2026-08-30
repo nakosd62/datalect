@@ -142,6 +142,47 @@ def _effective_user(user_id):
     return user_id or "global"
 
 
+def _lazy_derive_in_scope(connection_id, is_custom):
+    """Fallback (preset_ids, custom_keys) pair for a session that predates
+    the in-scope-connections feature (see get_session's docstring) - i.e.
+    one that has never explicitly saved in_scope_preset_ids/
+    in_scope_custom_connection_keys. Derives a single-entry in-scope set
+    from the session's existing (connection_id, is_custom) identity
+    reference, so an existing session's current connection becomes its
+    sole initially-"checked" box for free, with no proactive migration/
+    rewrite needed - this just runs again on every read until the session
+    is explicitly saved with the new fields (e.g. the first time the user
+    opens the now-checkbox connection picker and hits Save).
+
+    connection_id == "" (nothing ever explicitly selected) derives to two
+    empty lists - db.py's resolution layer already treats an empty in-scope
+    set as "nothing configured, fall back to the app default", the same
+    convention resolve_active_descriptor uses for a blank connection_id."""
+    if not connection_id:
+        return [], []
+    if is_custom:
+        return [], [connection_id]
+    return [connection_id], []
+
+
+def _encode_in_scope_list(value):
+    """JSON-encodes an in-scope id/key list for a SQLite TEXT column."""
+    return json.dumps(list(value) if value is not None else [])
+
+
+def _decode_in_scope_list(raw_json):
+    """Best-effort decode for a stored in-scope id/key list column - never
+    raises, degrades to [] on anything malformed/foreign, same posture as
+    _loads_config above."""
+    if not raw_json:
+        return []
+    try:
+        decoded = json.loads(raw_json)
+        return decoded if isinstance(decoded, list) else []
+    except Exception:
+        return []
+
+
 # Default value for a session's "Automatic SQL Execution" preference before
 # it's ever been explicitly set. Applies to brand-new sessions in both
 # backends below (SQLite's schema default and Firestore's missing-field
@@ -292,7 +333,9 @@ class StateStore(ABC):
     @abstractmethod
     def get_session(self, user_id):
         """Returns {"auto_sql_execute", "is_custom", "connection_id",
-        "llm_provider", "llm_model"} for a user/session id - identity only,
+        "llm_provider", "llm_model", "in_scope_preset_ids",
+        "in_scope_custom_connection_keys", "in_scope_mode"} for a user/
+        session id - identity only,
         never a connection's actual details/credentials (see db.py's
         resolve_active_descriptor, which resolves those FRESH from
         CONFIGURED_DBS or get_db_connections() every time something needs
@@ -321,18 +364,60 @@ class StateStore(ABC):
         own fallback IS that hardcoded default - see its docstring), not
         baked into a default here, since unlike auto_sql_execute's
         True/False there's no single hardcoded stand-in value that would
-        stay correct if that hardcoded default ever changed."""
+        stay correct if that hardcoded default ever changed.
+
+        "in_scope_preset_ids"/"in_scope_custom_connection_keys" (both lists
+        of ids/keys, in the same reference space as connection_id/is_custom
+        above - a preset's CONFIGURED_DBS "id", or a saved custom
+        connection's compute_connection_key() value) are the set of
+        connections a question may ever be routed to, per the multi-
+        database question-answering feature - a separate, broader concept
+        from connection_id/is_custom, which now specifically means "the
+        primary connection" (the first entry, in stable display order, of
+        this set) rather than "the one connection in use". A session that
+        has never explicitly saved these two fields has them lazily
+        derived from its existing connection_id/is_custom on every read
+        (see _lazy_derive_in_scope) rather than migrated/rewritten
+        proactively - so an existing session's current connection becomes
+        its sole initially-in-scope entry for free. Empty lists (for a
+        brand-new session with connection_id == "") mean "nothing
+        explicitly configured yet"; db.py's resolution layer treats that
+        the same way resolve_active_descriptor treats a blank
+        connection_id - falling back to the app default connection.
+
+        "in_scope_mode" ("single" or "all", defaulting to "single" for a
+        session that's never explicitly saved it) is the connection
+        picker's binary choice (see webClient/client.js's
+        renderDbRadioButtons()): "single" means in_scope_preset_ids/
+        in_scope_custom_connection_keys above are the actual in-scope set,
+        exactly as described above; "all" means db.py's
+        resolve_in_scope_descriptors ignores those two lists entirely and
+        instead resolves EVERY currently-configured preset plus every one
+        of this user's saved custom connections, fresh, on every request -
+        a dynamic set that automatically includes a connection added after
+        this was saved, not a list frozen at Save time. That's the whole
+        reason this is a separate field rather than just a third possible
+        shape for in_scope_preset_ids/in_scope_custom_connection_keys."""
 
     @abstractmethod
     def set_session(self, user_id, connection_id=None, auto_sql_execute=None, is_custom=None,
-                     llm_provider=None, llm_model=None):
+                     llm_provider=None, llm_model=None,
+                     in_scope_preset_ids=None, in_scope_custom_connection_keys=None,
+                     in_scope_mode=None):
         """Persists the active connection reference (connection_id,
-        is_custom), auto_sql_execute flag, and/or llm_provider/llm_model
-        selection for a user/session id. Only the fields passed (not None)
-        are changed - the others are left as-is. Pass connection_id=""
-        (not None) to explicitly clear it, e.g. when switching to a
-        fresh/default connection - same not-None-means-"change this"
-        convention is_custom/llm_provider/llm_model already use."""
+        is_custom), auto_sql_execute flag, llm_provider/llm_model
+        selection, in-scope connection set, and/or in-scope mode for a
+        user/session id. Only the fields passed (not None) are changed -
+        the others are left as-is. Pass connection_id="" (not None) to
+        explicitly clear it, e.g. when switching to a fresh/default
+        connection - same not-None-means-"change this" convention
+        is_custom/llm_provider/llm_model/in_scope_mode already use.
+        in_scope_preset_ids/in_scope_custom_connection_keys follow the
+        same convention: pass [] (not None) to explicitly clear one to
+        empty, None to leave it untouched - callers that mean to update
+        the in-scope set always pass both together (see config_routes.py),
+        since a partial update would leave the two lists describing an
+        inconsistent set."""
 
     @abstractmethod
     def get_db_connections(self, user_id, include_credentials=False):
@@ -438,6 +523,9 @@ class SqliteStateStore(StateStore):
                         connection_id TEXT NOT NULL DEFAULT '',
                         llm_provider TEXT NOT NULL DEFAULT '',
                         llm_model TEXT NOT NULL DEFAULT '',
+                        in_scope_preset_ids TEXT,
+                        in_scope_custom_connection_keys TEXT,
+                        in_scope_mode TEXT,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     );
                 """)
@@ -464,6 +552,34 @@ class SqliteStateStore(StateStore):
                 if "llm_model" not in session_columns:
                     cursor.execute(
                         "ALTER TABLE sessions ADD COLUMN llm_model TEXT NOT NULL DEFAULT '';"
+                    )
+                # Migration: existing DBs created before the in-scope-
+                # connections feature. NULL (not '[]') is the default and
+                # stays meaningfully different from an explicit '[]' -
+                # get_session() below treats NULL as "never explicitly
+                # saved, lazily derive from connection_id/is_custom" and an
+                # explicit '[]' as "explicitly saved as empty" (see
+                # _lazy_derive_in_scope / StateStore.set_session's
+                # docstring for why an explicit empty save is otherwise
+                # rejected before it ever reaches here - config_routes.py
+                # requires at least one in-scope connection).
+                if "in_scope_preset_ids" not in session_columns:
+                    cursor.execute(
+                        "ALTER TABLE sessions ADD COLUMN in_scope_preset_ids TEXT;"
+                    )
+                if "in_scope_custom_connection_keys" not in session_columns:
+                    cursor.execute(
+                        "ALTER TABLE sessions ADD COLUMN in_scope_custom_connection_keys TEXT;"
+                    )
+                # Migration: existing DBs created before the binary
+                # single/all in-scope-mode choice existed (see
+                # get_session's docstring on in_scope_mode). NULL is the
+                # default and means "single" (get_session() below), same
+                # "never explicitly saved" convention in_scope_preset_ids/
+                # in_scope_custom_connection_keys already use above.
+                if "in_scope_mode" not in session_columns:
+                    cursor.execute(
+                        "ALTER TABLE sessions ADD COLUMN in_scope_mode TEXT;"
                     )
                 # Migration: existing DBs created before is_custom existed.
                 # Defaults to 0/False - every legacy row predates the
@@ -520,6 +636,9 @@ class SqliteStateStore(StateStore):
                             connection_id TEXT NOT NULL DEFAULT '',
                             llm_provider TEXT NOT NULL DEFAULT '',
                             llm_model TEXT NOT NULL DEFAULT '',
+                            in_scope_preset_ids TEXT,
+                            in_scope_custom_connection_keys TEXT,
+                            in_scope_mode TEXT,
                             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                         );
                     """)
@@ -534,18 +653,32 @@ class SqliteStateStore(StateStore):
                     # custom_connection_key/database_url's own
                     # already-established defensive pattern just above, in
                     # case this rebuild path is ever reordered ahead of those
-                    # guards in the future.
+                    # guards in the future. Same reasoning for
+                    # in_scope_preset_ids/in_scope_custom_connection_keys/
+                    # in_scope_mode, added by this same guard mechanism just
+                    # before this rebuild - a legacy DB migrating for the
+                    # first time after one of these features shipped never
+                    # has them yet on sessions_old, so they fall back to NULL
+                    # (lazy-derived / "single" on next read, same as any
+                    # other session).
                     old_has_llm_provider = "llm_provider" in old_columns
                     old_has_llm_model = "llm_model" in old_columns
+                    old_has_in_scope_presets = "in_scope_preset_ids" in old_columns
+                    old_has_in_scope_custom = "in_scope_custom_connection_keys" in old_columns
+                    old_has_in_scope_mode = "in_scope_mode" in old_columns
                     select_cols = "session_id, auto_sql_execute, is_custom"
                     select_cols += ", custom_connection_key" if old_has_custom_key else ", NULL"
                     select_cols += ", database_url" if old_has_url else ", NULL"
                     select_cols += ", llm_provider" if old_has_llm_provider else ", ''"
                     select_cols += ", llm_model" if old_has_llm_model else ", ''"
+                    select_cols += ", in_scope_preset_ids" if old_has_in_scope_presets else ", NULL"
+                    select_cols += ", in_scope_custom_connection_keys" if old_has_in_scope_custom else ", NULL"
+                    select_cols += ", in_scope_mode" if old_has_in_scope_mode else ", NULL"
                     select_cols += ", updated_at" if "updated_at" in old_columns else ", CURRENT_TIMESTAMP"
                     cursor.execute(f"SELECT {select_cols} FROM sessions_old;")
                     for (old_session_id, old_auto_exec, old_is_custom,
                          old_custom_key, old_url, old_llm_provider, old_llm_model,
+                         old_in_scope_presets, old_in_scope_custom, old_in_scope_mode,
                          old_updated_at) in cursor.fetchall():
                         if old_is_custom and old_custom_key:
                             new_connection_id = old_custom_key
@@ -558,11 +691,13 @@ class SqliteStateStore(StateStore):
                         cursor.execute("""
                             INSERT OR REPLACE INTO sessions
                                 (session_id, auto_sql_execute, is_custom, connection_id,
-                                 llm_provider, llm_model, updated_at)
-                            VALUES (?, ?, ?, ?, ?, ?, ?);
+                                 llm_provider, llm_model, in_scope_preset_ids,
+                                 in_scope_custom_connection_keys, in_scope_mode, updated_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                         """, (
                             old_session_id, old_auto_exec, old_is_custom,
                             new_connection_id, old_llm_provider or '', old_llm_model or '',
+                            old_in_scope_presets, old_in_scope_custom, old_in_scope_mode,
                             old_updated_at,
                         ))
                     cursor.execute("DROP TABLE sessions_old;")
@@ -708,18 +843,34 @@ class SqliteStateStore(StateStore):
             with self._connect() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    "SELECT auto_sql_execute, is_custom, connection_id, llm_provider, llm_model "
+                    "SELECT auto_sql_execute, is_custom, connection_id, llm_provider, llm_model, "
+                    "in_scope_preset_ids, in_scope_custom_connection_keys, in_scope_mode "
                     "FROM sessions WHERE session_id = ?",
                     (effective_user,),
                 )
                 row = cursor.fetchone()
                 if row:
+                    connection_id = row[2] or ""
+                    is_custom = bool(row[1])
+                    if row[5] is None and row[6] is None:
+                        # Never explicitly saved - lazily derive from this
+                        # row's own connection_id/is_custom (see
+                        # _lazy_derive_in_scope's docstring).
+                        in_scope_preset_ids, in_scope_custom_connection_keys = (
+                            _lazy_derive_in_scope(connection_id, is_custom)
+                        )
+                    else:
+                        in_scope_preset_ids = _decode_in_scope_list(row[5])
+                        in_scope_custom_connection_keys = _decode_in_scope_list(row[6])
                     return {
                         "auto_sql_execute": bool(row[0]),
-                        "is_custom": bool(row[1]),
-                        "connection_id": row[2] or "",
+                        "is_custom": is_custom,
+                        "connection_id": connection_id,
                         "llm_provider": row[3] or "",
                         "llm_model": row[4] or "",
+                        "in_scope_preset_ids": in_scope_preset_ids,
+                        "in_scope_custom_connection_keys": in_scope_custom_connection_keys,
+                        "in_scope_mode": row[7] or "single",
                     }
         except Exception:
             logger.exception("Error fetching session from SQLite")
@@ -729,12 +880,19 @@ class SqliteStateStore(StateStore):
             "connection_id": "",
             "llm_provider": "",
             "llm_model": "",
+            "in_scope_preset_ids": [],
+            "in_scope_custom_connection_keys": [],
+            "in_scope_mode": "single",
         }
 
     def set_session(self, user_id, connection_id=None, auto_sql_execute=None, is_custom=None,
-                     llm_provider=None, llm_model=None):
+                     llm_provider=None, llm_model=None,
+                     in_scope_preset_ids=None, in_scope_custom_connection_keys=None,
+                     in_scope_mode=None):
         if (connection_id is None and auto_sql_execute is None and is_custom is None
-                and llm_provider is None and llm_model is None):
+                and llm_provider is None and llm_model is None
+                and in_scope_preset_ids is None and in_scope_custom_connection_keys is None
+                and in_scope_mode is None):
             return
         effective_user = _effective_user(user_id)
         try:
@@ -746,23 +904,40 @@ class SqliteStateStore(StateStore):
                 # clobbers an already-saved connection_id/is_custom, or vice
                 # versa. A brand-new row that isn't explicitly setting
                 # auto_sql_execute here still gets DEFAULT_AUTO_SQL_EXECUTE
-                # (matching the column's own DEFAULT 1), not False.
+                # (matching the column's own DEFAULT 1), not False. The two
+                # in_scope_* columns are left NULL on this initial insert
+                # when not being explicitly set here (SQLite's implicit
+                # column default for an omitted column), same "never
+                # explicitly saved yet" meaning as a brand-new row always
+                # had for these two before this INSERT even ran.
                 insert_auto_sql_execute = (
                     auto_sql_execute if auto_sql_execute is not None else DEFAULT_AUTO_SQL_EXECUTE
                 )
-                cursor.execute("""
-                    INSERT INTO sessions
-                        (session_id, auto_sql_execute, is_custom, connection_id, llm_provider, llm_model)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(session_id) DO NOTHING;
-                """, (
+                insert_cols = ["session_id", "auto_sql_execute", "is_custom", "connection_id",
+                               "llm_provider", "llm_model"]
+                insert_vals = [
                     effective_user,
                     1 if insert_auto_sql_execute else 0,
                     1 if is_custom else 0,
                     connection_id or "",
                     llm_provider or "",
                     llm_model or "",
-                ))
+                ]
+                if in_scope_preset_ids is not None:
+                    insert_cols.append("in_scope_preset_ids")
+                    insert_vals.append(_encode_in_scope_list(in_scope_preset_ids))
+                if in_scope_custom_connection_keys is not None:
+                    insert_cols.append("in_scope_custom_connection_keys")
+                    insert_vals.append(_encode_in_scope_list(in_scope_custom_connection_keys))
+                if in_scope_mode is not None:
+                    insert_cols.append("in_scope_mode")
+                    insert_vals.append(in_scope_mode)
+                placeholders = ", ".join("?" for _ in insert_cols)
+                cursor.execute(f"""
+                    INSERT INTO sessions ({', '.join(insert_cols)})
+                    VALUES ({placeholders})
+                    ON CONFLICT(session_id) DO NOTHING;
+                """, insert_vals)
 
                 updates = []
                 params = []
@@ -781,6 +956,15 @@ class SqliteStateStore(StateStore):
                 if llm_model is not None:
                     updates.append("llm_model = ?")
                     params.append(llm_model)
+                if in_scope_preset_ids is not None:
+                    updates.append("in_scope_preset_ids = ?")
+                    params.append(_encode_in_scope_list(in_scope_preset_ids))
+                if in_scope_custom_connection_keys is not None:
+                    updates.append("in_scope_custom_connection_keys = ?")
+                    params.append(_encode_in_scope_list(in_scope_custom_connection_keys))
+                if in_scope_mode is not None:
+                    updates.append("in_scope_mode = ?")
+                    params.append(in_scope_mode)
                 updates.append("updated_at = CURRENT_TIMESTAMP")
                 params.append(effective_user)
                 cursor.execute(
@@ -959,6 +1143,9 @@ class FirestoreStateStore(StateStore):
             "connection_id": "",
             "llm_provider": "",
             "llm_model": "",
+            "in_scope_preset_ids": [],
+            "in_scope_custom_connection_keys": [],
+            "in_scope_mode": "single",
         }
         if not user_id:
             return default_session
@@ -1010,28 +1197,53 @@ class FirestoreStateStore(StateStore):
                         }, merge=True)
                     except Exception:
                         logger.exception("Error scrubbing legacy session fields in Firestore")
+                    in_scope_preset_ids, in_scope_custom_connection_keys = (
+                        _lazy_derive_in_scope(connection_id, old_is_custom)
+                    )
                     return {
                         "auto_sql_execute": bool(data.get("auto_sql_execute", DEFAULT_AUTO_SQL_EXECUTE)),
                         "is_custom": old_is_custom,
                         "connection_id": connection_id,
                         "llm_provider": data.get("llm_provider") or "",
                         "llm_model": data.get("llm_model") or "",
+                        "in_scope_preset_ids": in_scope_preset_ids,
+                        "in_scope_custom_connection_keys": in_scope_custom_connection_keys,
+                        "in_scope_mode": data.get("in_scope_mode") or "single",
                     }
+                if "in_scope_preset_ids" not in data or "in_scope_custom_connection_keys" not in data:
+                    # Never explicitly saved (a session that already had
+                    # connection_id but predates this feature) - lazily
+                    # derive, same as the legacy-migration branch above,
+                    # just without needing a field-scrubbing rewrite since
+                    # there's nothing legacy to clean up here.
+                    in_scope_preset_ids, in_scope_custom_connection_keys = _lazy_derive_in_scope(
+                        data.get("connection_id") or "", bool(data.get("is_custom", False))
+                    )
+                else:
+                    in_scope_preset_ids = list(data.get("in_scope_preset_ids") or [])
+                    in_scope_custom_connection_keys = list(data.get("in_scope_custom_connection_keys") or [])
                 return {
                     "auto_sql_execute": bool(data.get("auto_sql_execute", DEFAULT_AUTO_SQL_EXECUTE)),
                     "is_custom": bool(data.get("is_custom", False)),
                     "connection_id": data.get("connection_id") or "",
                     "llm_provider": data.get("llm_provider") or "",
                     "llm_model": data.get("llm_model") or "",
+                    "in_scope_preset_ids": in_scope_preset_ids,
+                    "in_scope_custom_connection_keys": in_scope_custom_connection_keys,
+                    "in_scope_mode": data.get("in_scope_mode") or "single",
                 }
         except Exception:
             logger.exception("Error fetching session from Firestore")
         return default_session
 
     def set_session(self, user_id, connection_id=None, auto_sql_execute=None, is_custom=None,
-                     llm_provider=None, llm_model=None):
+                     llm_provider=None, llm_model=None,
+                     in_scope_preset_ids=None, in_scope_custom_connection_keys=None,
+                     in_scope_mode=None):
         if not user_id or (connection_id is None and auto_sql_execute is None and is_custom is None
-                            and llm_provider is None and llm_model is None):
+                            and llm_provider is None and llm_model is None
+                            and in_scope_preset_ids is None and in_scope_custom_connection_keys is None
+                            and in_scope_mode is None):
             return
         update_data = {"updated_at": firestore.SERVER_TIMESTAMP}
         if connection_id is not None:
@@ -1044,6 +1256,12 @@ class FirestoreStateStore(StateStore):
             update_data["llm_provider"] = llm_provider
         if llm_model is not None:
             update_data["llm_model"] = llm_model
+        if in_scope_preset_ids is not None:
+            update_data["in_scope_preset_ids"] = list(in_scope_preset_ids)
+        if in_scope_custom_connection_keys is not None:
+            update_data["in_scope_custom_connection_keys"] = list(in_scope_custom_connection_keys)
+        if in_scope_mode is not None:
+            update_data["in_scope_mode"] = in_scope_mode
         try:
             # merge=list(update_data.keys()) - NOT the boolean merge=True -
             # is what actually gives "patch these top-level fields, leave

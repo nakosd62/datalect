@@ -535,7 +535,9 @@ def test_init_migrates_pre_connection_id_sessions_table_for_custom_row(tmp_path)
         cols = {c[1] for c in cursor.fetchall()}
     assert cols == {
         "session_id", "auto_sql_execute", "is_custom", "connection_id",
-        "llm_provider", "llm_model", "updated_at",
+        "llm_provider", "llm_model",
+        "in_scope_preset_ids", "in_scope_custom_connection_keys", "in_scope_mode",
+        "updated_at",
     }
 
 

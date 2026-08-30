@@ -886,6 +886,31 @@ if _postgres_presets:
 # blank.
 DEFAULT_PRESET_ID = _postgres_presets[0]["id"] if _postgres_presets else None
 
+# Multi-database question-answering (see translate_routes.py's module
+# docstring): the ONE cap on how many database connections are involved in
+# a single question's response, at every stage that concept comes up -
+# how many a user may mark "in scope" at once (config_routes.py's POST
+# validation of in_scope_preset_ids/in_scope_custom_connection_keys) AND
+# how many of those in-scope connections a single question's Phase A
+# routing may ever select for one response (connection_router.py's
+# select_relevant_connections, clamped to this regardless of what the
+# model returns). These used to be two separate constants
+# (MAX_IN_SCOPE_CONNECTIONS and connection_router.py's own
+# MAX_DATABASES_PER_QUERY, defaulting to 5) on the theory that "how many
+# databases could a question ever pick from" and "how many can one
+# question actually use" were different concerns worth tuning
+# independently - in practice that was just two knobs to remember for one
+# mental model ("how many databases," full stop), so this is now the
+# single source of truth for both. Lives here, not in config_routes.py
+# (where it originated) or connection_router.py, specifically so both
+# modules can import the same constant without a circular import:
+# config_routes.py already imports FROM translate_routes.py, which
+# imports FROM connection_router.py - a chain that would make
+# connection_router.py importing back from config_routes.py circular.
+# app_config.py sits underneath all three, imported by each, imported by
+# none of them.
+MAX_IN_SCOPE_CONNECTIONS = int(os.environ.get("MAX_IN_SCOPE_CONNECTIONS", 20))
+
 # Model configuration for all three LLM providers (Google included) lives
 # in translate_routes.py now, not here - each provider's own single
 # *_MODELS env var (GOOGLE_MODELS/ANTHROPIC_MODELS/OPENAI_MODELS) doubles as

@@ -372,3 +372,389 @@ def test_ping_sets_session_cookie(app_env, monkeypatch):
     _patch_backend(monkeypatch, app_env, fake)
     resp = app_env.client.get('/api/ping')
     assert "crbot_session_id" in resp.headers.get("Set-Cookie", "")
+
+
+# --- Multi-database dispatch --------------------------------------------------
+# See execute_routes.py's "Multi-database dispatch" module-level comment and
+# _execute_multi_database's docstring, and translate_routes.py's module
+# docstring for the feature as a whole. These tests stub
+# execute_routes.resolve_descriptor_by_reference directly (same idea as
+# _patch_backend above stubbing get_backend) rather than going through real
+# sessions/presets - _execute_multi_database only ever calls that one
+# function by (kind, ref_id), so a plain dict-backed stub is enough to
+# exercise this route's own dispatch/reassembly logic in isolation.
+
+class _FakeMultiBackend:
+    """Like _FakeBackend above, but tracks how many times connect() was
+    called and every execute() call's SQL text (not just the last one) -
+    needed to assert a connection referenced by multiple, possibly
+    non-contiguous marker chunks is still opened exactly once and receives
+    its statements concatenated in their original relative order."""
+
+    def __init__(self, results=None, raise_exc=None, delay=0):
+        self._results = results if results is not None else []
+        self._raise_exc = raise_exc
+        self.connect_count = 0
+        self.closed_conn = None
+        self.executed_sql_calls = []
+        # Seconds execute() blocks before returning/raising - see the
+        # concurrency tests below, which use this to prove groups run in
+        # parallel (not serially) and that ordering in the final response
+        # is driven by group_order, not by which group's thread finishes
+        # first.
+        self._delay = delay
+        self.execute_started = threading.Event()
+
+    def connect(self, descriptor):
+        self.connect_count += 1
+        return object()
+
+    def close(self, connection):
+        self.closed_conn = connection
+
+    def execute(self, connection, sql_text):
+        self.executed_sql_calls.append(sql_text)
+        self.execute_started.set()
+        if self._delay:
+            time.sleep(self._delay)
+        if self._raise_exc:
+            raise self._raise_exc
+        return self._results
+
+
+def _descriptor_resolver(mapping):
+    """Builds a resolve_descriptor_by_reference stand-in from a
+    {(kind, ref_id): (descriptor, name)} mapping - an unmapped (kind,
+    ref_id) resolves to (None, None), same as a stale/removed reference
+    would for real."""
+    def _resolve(kind, ref_id, user_identity):
+        return mapping.get((kind, ref_id), (None, None))
+    return _resolve
+
+
+def _backend_router(backends_by_descriptor_marker):
+    """Builds a get_backend stand-in that looks up the fake backend by a
+    "marker" key on the (fake) descriptor dict - each connection's
+    descriptor in these tests is just {"marker": <str>}, since get_backend
+    itself is faked and never needs a real connection shape."""
+    def _get_backend(descriptor):
+        return backends_by_descriptor_marker[descriptor["marker"]]
+    return _get_backend
+
+
+def _patch_multi_db(monkeypatch, app_env, resolver_mapping, backends_by_marker):
+    monkeypatch.setattr(app_env.execute_routes, "resolve_descriptor_by_reference", _descriptor_resolver(resolver_mapping))
+    monkeypatch.setattr(app_env.execute_routes, "get_backend", _backend_router(backends_by_marker))
+
+
+def test_marker_free_script_is_byte_identical_to_today(app_env, monkeypatch):
+    # Core regression guard: a script with no '-- database: ...' marker
+    # anywhere never enters the multi-database dispatch path at all - same
+    # flat response shape as before this feature existed, no "failures"
+    # key, no "database" field on any result.
+    fake = _FakeBackend(results=[{"statement": "SELECT 1", "columns": ["x"], "rows": [{"x": 1}], "rowCount": 1}])
+    _patch_backend(monkeypatch, app_env, fake)
+    resp = app_env.client.post('/api/execute', json={'sql': 'SELECT 1;'})
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data['success'] is True
+    assert 'failures' not in data
+    assert 'database' not in data['results'][0]
+
+
+def test_two_connection_script_dispatches_to_both_and_reassembles(app_env, monkeypatch):
+    fake_a = _FakeMultiBackend(results=[
+        {"statement": "INSERT INTO a VALUES (1)", "columns": None, "rows": None, "rowCount": 1},
+    ])
+    fake_b = _FakeMultiBackend(results=[
+        {"statement": "INSERT INTO b VALUES (2)", "columns": None, "rows": None, "rowCount": 1},
+    ])
+    _patch_multi_db(
+        monkeypatch, app_env,
+        {("preset", "pg-a"): ({"marker": "a"}, "Sales"), ("preset", "pg-b"): ({"marker": "b"}, "Marketing")},
+        {"a": fake_a, "b": fake_b},
+    )
+    sql = (
+        "-- database: preset:pg-a (Sales)\nINSERT INTO a VALUES (1);\n\n"
+        "-- database: preset:pg-b (Marketing)\nINSERT INTO b VALUES (2);"
+    )
+    resp = app_env.client.post('/api/execute', json={'sql': sql})
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data['success'] is True
+    assert 'failures' not in data
+    assert data['rowCount'] == 2
+    assert [r['database'] for r in data['results']] == [
+        {"kind": "preset", "id": "pg-a", "name": "Sales"},
+        {"kind": "preset", "id": "pg-b", "name": "Marketing"},
+    ]
+    assert fake_a.connect_count == 1
+    assert fake_b.connect_count == 1
+    assert fake_a.closed_conn is not None
+    assert fake_b.closed_conn is not None
+
+
+def test_one_connection_failing_still_runs_and_returns_the_other(app_env, monkeypatch):
+    fake_a = _FakeMultiBackend(raise_exc=Exception("relation \"a\" does not exist"))
+    fake_b = _FakeMultiBackend(results=[
+        {"statement": "SELECT * FROM b", "columns": ["x"], "rows": [{"x": 1}], "rowCount": 1},
+    ])
+    _patch_multi_db(
+        monkeypatch, app_env,
+        {("preset", "pg-a"): ({"marker": "a"}, "Sales"), ("preset", "pg-b"): ({"marker": "b"}, "Marketing")},
+        {"a": fake_a, "b": fake_b},
+    )
+    sql = (
+        "-- database: preset:pg-a\nSELECT * FROM a;\n\n"
+        "-- database: preset:pg-b\nSELECT * FROM b;"
+    )
+    resp = app_env.client.post('/api/execute', json={'sql': sql})
+    assert resp.status_code == 400
+    data = resp.get_json()
+    assert data['success'] is False
+    # The independent, unrelated database's statement still ran and
+    # returned its result - a failure in one group must not block the
+    # other (see execute_routes.py's module docstring).
+    assert len(data['results']) == 1
+    assert data['results'][0]['database'] == {"kind": "preset", "id": "pg-b", "name": "Marketing"}
+    assert len(data['failures']) == 1
+    assert data['failures'][0]['database'] == {"kind": "preset", "id": "pg-a", "name": "Sales"}
+    assert data['failures'][0]['error'] == 'relation "a" does not exist'
+
+
+def test_group_mid_script_failure_still_reports_its_own_partial_successes(app_env, monkeypatch):
+    """A SqlExecutionError raised for one connection group's own
+    multi-statement script still surfaces that group's successful
+    statements (same partial-results contract as the single-connection
+    path), tagged with its database, alongside the OTHER group's own
+    (unrelated) results."""
+    succeeded = [{"statement": "UPDATE a SET x=1", "columns": None, "rows": None, "rowCount": 1}]
+    exc = app_env.execute_routes.SqlExecutionError(
+        'syntax error', results=succeeded, failed_statement="SELEC bad", statement_index=1, total_statements=2,
+    )
+    fake_a = _FakeMultiBackend(raise_exc=exc)
+    fake_b = _FakeMultiBackend(results=[
+        {"statement": "SELECT * FROM b", "columns": ["x"], "rows": [{"x": 1}], "rowCount": 1},
+    ])
+    _patch_multi_db(
+        monkeypatch, app_env,
+        {("preset", "pg-a"): ({"marker": "a"}, "Sales"), ("preset", "pg-b"): ({"marker": "b"}, "Marketing")},
+        {"a": fake_a, "b": fake_b},
+    )
+    sql = (
+        "-- database: preset:pg-a\nUPDATE a SET x=1;\n-- database: preset:pg-a\nSELEC bad;\n\n"
+        "-- database: preset:pg-b\nSELECT * FROM b;"
+    )
+    resp = app_env.client.post('/api/execute', json={'sql': sql})
+    data = resp.get_json()
+    assert data['success'] is False
+    databases_in_results = [r['database']['id'] for r in data['results']]
+    assert databases_in_results == ["pg-a", "pg-b"]
+    assert data['failures'][0]['failedStatement'] == "SELEC bad"
+    assert data['failures'][0]['totalStatements'] == 2
+
+
+def test_connection_reference_that_no_longer_resolves_is_its_own_failure(app_env, monkeypatch):
+    fake_b = _FakeMultiBackend(results=[
+        {"statement": "SELECT * FROM b", "columns": ["x"], "rows": [{"x": 1}], "rowCount": 1},
+    ])
+    _patch_multi_db(
+        monkeypatch, app_env,
+        {("preset", "pg-b"): ({"marker": "b"}, "Marketing")},  # pg-a deliberately NOT in the mapping
+        {"b": fake_b},
+    )
+    sql = (
+        "-- database: preset:pg-a\nSELECT * FROM a;\n\n"
+        "-- database: preset:pg-b\nSELECT * FROM b;"
+    )
+    resp = app_env.client.post('/api/execute', json={'sql': sql})
+    assert resp.status_code == 400
+    data = resp.get_json()
+    assert data['success'] is False
+    assert len(data['results']) == 1  # pg-b's still ran
+    assert len(data['failures']) == 1
+    assert data['failures'][0]['database'] == {"kind": "preset", "id": "pg-a", "name": None}
+    assert "no longer exists" in data['failures'][0]['error']
+
+
+def test_same_connection_referenced_twice_non_contiguously_opens_once_and_concatenates_in_order(app_env, monkeypatch):
+    fake_a = _FakeMultiBackend(results=[
+        {"statement": "s1", "columns": None, "rows": None, "rowCount": 1},
+        {"statement": "s2", "columns": None, "rows": None, "rowCount": 1},
+    ])
+    fake_b = _FakeMultiBackend(results=[
+        {"statement": "s-mid", "columns": None, "rows": None, "rowCount": 1},
+    ])
+    _patch_multi_db(
+        monkeypatch, app_env,
+        {("preset", "pg-a"): ({"marker": "a"}, "Sales"), ("preset", "pg-b"): ({"marker": "b"}, "Marketing")},
+        {"a": fake_a, "b": fake_b},
+    )
+    # pg-a's two statements are interleaved with pg-b's single statement in
+    # the original text - still one connect() call for pg-a, with both of
+    # its chunks concatenated (in their original relative order) into one
+    # execute() call.
+    sql = (
+        "-- database: preset:pg-a\nSELECT 1;\n\n"
+        "-- database: preset:pg-b\nSELECT 2;\n\n"
+        "-- database: preset:pg-a\nSELECT 3;"
+    )
+    resp = app_env.client.post('/api/execute', json={'sql': sql})
+    assert resp.status_code == 200
+    assert fake_a.connect_count == 1
+    assert fake_b.connect_count == 1
+    assert len(fake_a.executed_sql_calls) == 1
+    assert "SELECT 1;" in fake_a.executed_sql_calls[0]
+    assert "SELECT 3;" in fake_a.executed_sql_calls[0]
+    assert fake_a.executed_sql_calls[0].index("SELECT 1;") < fake_a.executed_sql_calls[0].index("SELECT 3;")
+    # Results are grouped by each connection's first appearance (pg-a
+    # first, since its marker appears first in the text), not replayed in
+    # strict original per-statement text order - a documented v1 scope cut
+    # (see _execute_multi_database's docstring).
+    data = resp.get_json()
+    assert [r['database']['id'] for r in data['results']] == ["pg-a", "pg-a", "pg-b"]
+
+
+def test_multi_database_groups_execute_concurrently_not_serially(app_env, monkeypatch):
+    # _execute_multi_database now runs each distinct connection group's
+    # execute() in its own ThreadPoolExecutor worker (see that function's
+    # docstring) - both groups here block for delay_seconds; run serially
+    # this would take at least 2 * delay_seconds, run in parallel it stays
+    # well under that.
+    delay_seconds = 0.4
+    fake_a = _FakeMultiBackend(results=[
+        {"statement": "SELECT * FROM a", "columns": ["x"], "rows": [{"x": 1}], "rowCount": 1},
+    ], delay=delay_seconds)
+    fake_b = _FakeMultiBackend(results=[
+        {"statement": "SELECT * FROM b", "columns": ["x"], "rows": [{"x": 1}], "rowCount": 1},
+    ], delay=delay_seconds)
+    _patch_multi_db(
+        monkeypatch, app_env,
+        {("preset", "pg-a"): ({"marker": "a"}, "Sales"), ("preset", "pg-b"): ({"marker": "b"}, "Marketing")},
+        {"a": fake_a, "b": fake_b},
+    )
+    sql = (
+        "-- database: preset:pg-a\nSELECT * FROM a;\n\n"
+        "-- database: preset:pg-b\nSELECT * FROM b;"
+    )
+    start = time.perf_counter()
+    resp = app_env.client.post('/api/execute', json={'sql': sql})
+    elapsed = time.perf_counter() - start
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data['success'] is True
+    assert elapsed < delay_seconds * 1.8
+
+
+def test_slower_group_listed_first_still_returns_results_in_original_group_order(app_env, monkeypatch):
+    # pg-a is listed FIRST in the script (and so is first in group_order)
+    # but is the SLOWER of the two to finish; pg-b is listed second but
+    # finishes first. The final `results` order must still follow
+    # group_order (pg-a's statement before pg-b's), not completion order -
+    # this is what the pre-allocated, index-addressed `outcomes` list in
+    # _execute_multi_database guarantees under real concurrency.
+    fake_a = _FakeMultiBackend(results=[
+        {"statement": "SELECT * FROM a", "columns": ["x"], "rows": [{"x": 1}], "rowCount": 1},
+    ], delay=0.3)
+    fake_b = _FakeMultiBackend(results=[
+        {"statement": "SELECT * FROM b", "columns": ["x"], "rows": [{"x": 2}], "rowCount": 1},
+    ], delay=0)
+    _patch_multi_db(
+        monkeypatch, app_env,
+        {("preset", "pg-a"): ({"marker": "a"}, "Sales"), ("preset", "pg-b"): ({"marker": "b"}, "Marketing")},
+        {"a": fake_a, "b": fake_b},
+    )
+    sql = (
+        "-- database: preset:pg-a\nSELECT * FROM a;\n\n"
+        "-- database: preset:pg-b\nSELECT * FROM b;"
+    )
+    resp = app_env.client.post('/api/execute', json={'sql': sql})
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data['success'] is True
+    assert [r['database']['id'] for r in data['results']] == ["pg-a", "pg-b"]
+
+
+def test_one_group_crashing_unexpectedly_does_not_prevent_others_from_completing(app_env, monkeypatch):
+    # Same tolerant, per-group failure isolation as
+    # test_one_connection_failing_still_runs_and_returns_the_other above,
+    # but now proven under genuine concurrency: pg-a's worker thread
+    # raises partway through its (slower) run while pg-b's worker is still
+    # in flight - pg-b's result must still come back, and pg-a's crash
+    # must show up as its own failure entry, not abort the whole request
+    # or corrupt pg-b's outcome.
+    fake_a = _FakeMultiBackend(raise_exc=Exception("connection reset by peer"), delay=0.3)
+    fake_b = _FakeMultiBackend(results=[
+        {"statement": "SELECT * FROM b", "columns": ["x"], "rows": [{"x": 1}], "rowCount": 1},
+    ], delay=0)
+    _patch_multi_db(
+        monkeypatch, app_env,
+        {("preset", "pg-a"): ({"marker": "a"}, "Sales"), ("preset", "pg-b"): ({"marker": "b"}, "Marketing")},
+        {"a": fake_a, "b": fake_b},
+    )
+    sql = (
+        "-- database: preset:pg-a\nSELECT * FROM a;\n\n"
+        "-- database: preset:pg-b\nSELECT * FROM b;"
+    )
+    resp = app_env.client.post('/api/execute', json={'sql': sql})
+    assert resp.status_code == 400
+    data = resp.get_json()
+    assert data['success'] is False
+    assert [r['database']['id'] for r in data['results']] == ["pg-b"]
+    assert len(data['failures']) == 1
+    assert data['failures'][0]['database']['id'] == "pg-a"
+    assert "connection reset by peer" in data['failures'][0]['error']
+
+
+def test_malformed_database_marker_falls_back_to_single_connection_path(app_env, monkeypatch):
+    # "BOGUS" isn't "preset"/"custom" - _DB_MARKER_RE never matches it, so
+    # this script is treated as marker-free entirely (falls straight
+    # through to the single-connection path, honoring whatever's pinned/
+    # resolved for the session) rather than erroring.
+    fake = _FakeBackend(results=[{"statement": "SELECT 1", "columns": ["x"], "rows": [{"x": 1}], "rowCount": 1}])
+    _patch_backend(monkeypatch, app_env, fake)
+    resp = app_env.client.post('/api/execute', json={'sql': '-- database: BOGUS\nSELECT 1;'})
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data['success'] is True
+    assert 'failures' not in data
+
+
+def test_marker_free_script_uses_pinned_connection_over_session_primary(app_env, monkeypatch):
+    # A marker-free (hand-typed/edited) script still honors a client-
+    # echoed pinned connection over the session's single "primary"
+    # connection - see execute_query()'s own comment on this.
+    pinned_fake = _FakeBackend(results=[{"statement": "SELECT 1", "columns": ["x"], "rows": [{"x": 1}], "rowCount": 1}])
+    seen_descriptors = []
+
+    def _get_backend(descriptor):
+        seen_descriptors.append(descriptor)
+        return pinned_fake
+
+    monkeypatch.setattr(
+        app_env.execute_routes, "resolve_descriptor_by_reference",
+        lambda kind, ref_id, user_identity: ({"marker": "pinned"}, "Pinned DB") if (kind, ref_id) == ("preset", "pg-a") else (None, None),
+    )
+    monkeypatch.setattr(app_env.execute_routes, "get_backend", _get_backend)
+
+    resp = app_env.client.post('/api/execute', json={
+        'sql': 'SELECT 1;',
+        'pinned_connections': [{"kind": "preset", "id": "pg-a"}],
+    })
+    assert resp.status_code == 200
+    assert seen_descriptors == [{"marker": "pinned"}]
+
+
+def test_marker_free_script_falls_back_to_session_default_when_pin_is_stale(app_env, monkeypatch):
+    fake = _FakeBackend(results=[{"statement": "SELECT 1", "columns": ["x"], "rows": [{"x": 1}], "rowCount": 1}])
+    _patch_backend(monkeypatch, app_env, fake)
+    monkeypatch.setattr(
+        app_env.execute_routes, "resolve_descriptor_by_reference",
+        lambda kind, ref_id, user_identity: (None, None),
+    )
+    resp = app_env.client.post('/api/execute', json={
+        'sql': 'SELECT 1;',
+        'pinned_connections': [{"kind": "preset", "id": "deleted-connection"}],
+    })
+    assert resp.status_code == 200
+    assert resp.get_json()['success'] is True

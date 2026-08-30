@@ -39,17 +39,35 @@ shape: {"success": false, "error": ..., "executionTimeMs": ...} - no
 Also owns /api/ping, a separate lightweight liveness check for the status
 dot (see that route's own docstring for why it isn't just /api/execute
 with a hardcoded query string).
+
+Multi-database question-answering (see translate_routes.py's module
+docstring) adds a second dispatch path, entered only when the submitted
+SQL carries at least one '-- database: preset:<id>'/'-- database:
+custom:<key>' marker comment (see the "Multi-database dispatch" section
+below) - a script with no such marker anywhere takes the single-connection
+path above completely unchanged, byte-for-byte, including its response
+shape. A marker-tagged script instead dispatches each distinct referenced
+connection's statements to their own connection (opened once each, even
+if interleaved in the original text) via this same single-connection
+execute() path per connection, and merges every group's results into one
+response shaped like:
+  {"success": <false iff any group failed>, "results": [...every
+   succeeded statement, across every group, each tagged with a
+   "database": {"kind","id","name"} field...], "rowCount": ...,
+   "executionTimeMs": ..., "failures": [...one entry per group that
+   failed - only present when success is false...]}
 """
 
 import concurrent.futures
 import os
+import re
 import time
 
 from flask import Blueprint, request, jsonify
 
 from app_config import logger
 from auth import get_or_create_session_id, get_current_user_identity, apply_session_cookie
-from db import resolve_conn_str
+from db import resolve_conn_str, resolve_descriptor_by_reference
 from backends import get_backend, SqlExecutionError
 
 execute_bp = Blueprint('execute', __name__)
@@ -120,6 +138,188 @@ def _execute_with_timeout(backend, conn, sql_text):
         pool.shutdown(wait=False)
 
 
+# --- Multi-database dispatch -------------------------------------------------
+#
+# Support for the multi-database question-answering feature (see
+# translate_routes.py's module docstring): a script generated (or later
+# hand-edited) for a session with 2+ in-scope connections carries one
+# '-- database: preset:<id>'/'-- database: custom:<key>' comment
+# immediately before EVERY statement, tagging which connection it targets
+# (see translate_routes.py's _rewrite_database_labels - this is the fixed,
+# permanent reference format that rewrite produces, NOT the ephemeral
+# 'DB<N>' ordinal the model itself emits, which never survives past
+# generation). A script with NO such marker anywhere - every script this
+# app has ever generated before this feature, any hand-typed SQL, or one
+# where the user stripped the comment - is completely unaffected: see
+# execute_query() below, which only enters this dispatch path when at
+# least one marker is found at all.
+_DB_MARKER_RE = re.compile(r'^--\s*database:\s*(preset|custom):(\S+)', re.MULTILINE)
+
+
+def _split_by_database_markers(sql_text):
+    """Splits `sql_text` into an ordered list of (kind, ref_id, chunk_text)
+    tuples, one per '-- database: ...' marker found, each chunk_text
+    running from that marker's own line up to (not including) the next
+    marker (or the end of the script). Returns None if no marker is found
+    at all - the caller's signal to fall back to today's single-connection
+    execution path unchanged.
+
+    Any content before the FIRST marker (rare - normally just blank lines/
+    stray comments, since translate_routes.py always tags every statement
+    starting with the very first one) is folded into that first chunk
+    rather than silently dropped, so a user's own leading comment/
+    formatting above the first statement still gets sent to whichever
+    connection that first statement targets."""
+    matches = list(_DB_MARKER_RE.finditer(sql_text))
+    if not matches:
+        return None
+    chunks = []
+    for i, m in enumerate(matches):
+        start = m.start()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(sql_text)
+        chunks.append((m.group(1), m.group(2), sql_text[start:end]))
+    if matches[0].start() > 0:
+        kind, ref_id, chunk_text = chunks[0]
+        chunks[0] = (kind, ref_id, sql_text[:matches[0].start()] + chunk_text)
+    return chunks
+
+
+def _execute_one_group(kind, ref_id, concatenated_sql, user_identity):
+    """Runs one connection group's concatenated statements (see
+    _execute_multi_database below) and NEVER raises - every outcome,
+    including a since-deleted connection reference or a real execution
+    failure, is captured and returned as
+    {"results": [...succeeded statement dicts, "database"-tagged...],
+     "failure": <failure dict, shaped like the old inline except-branches
+     below, or None if the whole group succeeded>}.
+
+    Returning rather than raising/appending-to-a-shared-list is what makes
+    this safe to run from a ThreadPoolExecutor worker: each call only ever
+    touches its own locals and its own connection, so N of these can run
+    concurrently (one per distinct connection group) with no shared
+    mutable state to race on - the caller (_execute_multi_database) is the
+    only place results get merged, sequentially, back on the calling
+    thread."""
+    descriptor, name = resolve_descriptor_by_reference(kind, ref_id, user_identity)
+    if descriptor is None:
+        return {
+            "results": [],
+            "failure": {
+                "database": {"kind": kind, "id": ref_id, "name": None},
+                "error": f"This SQL references a database connection ({kind}:{ref_id}) that no longer exists.",
+                "failedStatement": concatenated_sql.strip(),
+            },
+        }
+
+    backend = None
+    conn = None
+    try:
+        backend = get_backend(descriptor)
+        conn = backend.connect(descriptor)
+        group_results = _execute_with_timeout(backend, conn, concatenated_sql)
+        for r in group_results:
+            r["database"] = {"kind": kind, "id": ref_id, "name": name}
+        return {"results": group_results, "failure": None}
+    except SqlExecutionError as e:
+        for r in e.results:
+            r["database"] = {"kind": kind, "id": ref_id, "name": name}
+        return {
+            "results": e.results,
+            "failure": {
+                "database": {"kind": kind, "id": ref_id, "name": name},
+                "error": str(e),
+                "failedStatement": e.failed_statement,
+                "failedIndex": e.statement_index,
+                "totalStatements": e.total_statements,
+            },
+        }
+    except Exception as e:
+        logger.warning(
+            "Multi-database SQL execution error for user=%s, connection=%s:%s: %s",
+            user_identity, kind, ref_id, e,
+        )
+        return {
+            "results": [],
+            "failure": {
+                "database": {"kind": kind, "id": ref_id, "name": name},
+                "error": str(e),
+            },
+        }
+    finally:
+        if conn and backend:
+            backend.close(conn)
+
+
+def _execute_multi_database(chunks, user_identity):
+    """Runs a marker-tagged multi-database script (see
+    _split_by_database_markers above) and returns (results, failures) -
+    `results` is every statement that succeeded, ACROSS every connection
+    group, each tagged with a "database" field ({"kind","id","name"});
+    `failures` is one entry per connection group that failed at all
+    (empty when everything succeeded).
+
+    Each distinct (kind, ref_id) referenced anywhere in the script gets
+    its own connection, opened exactly ONCE regardless of how many
+    separate marker chunks target it (its chunks are concatenated, in
+    their original relative order, into one script and handed to that
+    connection's OWN backend.execute() - fully reusing that existing,
+    unmodified per-connection multi-statement/semicolon-splitting and
+    SqlExecutionError partial-results handling, rather than reimplementing
+    any of it here). A group whose connection reference no longer resolves
+    (resolve_descriptor_by_reference returned None - a preset removed or a
+    custom connection deleted since this SQL was generated/saved) is
+    recorded as its own failure rather than raising, same "keep the other,
+    independent groups running" posture as a real execution failure gets.
+
+    Every distinct connection group runs in PARALLEL (one worker per
+    group, via the same pre-allocate-results-array + future_to_index +
+    as_completed pattern used elsewhere in this codebase - see db.py's
+    build_router_candidate_summaries and translate_routes.py's
+    _run_phase_b_fanout) - one group being slow (or hanging up to
+    SQL_EXECUTE_TIMEOUT_SECONDS) no longer delays the others.
+
+    Ordering note: the final `results` list is ordered by each DISTINCT
+    connection group's first appearance in the script, with that group's
+    own statements in their correct relative order within it - not a
+    perfect global interleave down to individual-statement granularity
+    across groups whose marker chunks are non-contiguous in the original
+    text (a rare pattern - translate_routes.py's prompt has the model tag
+    every statement, but naturally groups a given connection's statements
+    together). This is a deliberate v1 scope cut: correct dispatch and
+    correct per-group ordering either way, just not a byte-for-byte replay
+    of an unusual interleaved-authoring order across groups. This ordering
+    is driven by `group_order`'s original index, NOT by which group's
+    thread happens to finish first - outcomes are written into a
+    pre-allocated, index-addressed list precisely so parallelizing this
+    doesn't change the response shape a client (or existing test) sees."""
+    groups = {}
+    group_order = []
+    for kind, ref_id, chunk_text in chunks:
+        key = (kind, ref_id)
+        if key not in groups:
+            groups[key] = []
+            group_order.append(key)
+        groups[key].append(chunk_text)
+
+    outcomes = [None] * len(group_order)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(group_order)) as pool:
+        future_to_index = {
+            pool.submit(_execute_one_group, kind, ref_id, "\n".join(groups[(kind, ref_id)]), user_identity): i
+            for i, (kind, ref_id) in enumerate(group_order)
+        }
+        for future in concurrent.futures.as_completed(future_to_index):
+            outcomes[future_to_index[future]] = future.result()
+
+    all_results = []
+    failures = []
+    for outcome in outcomes:
+        all_results.extend(outcome["results"])
+        if outcome["failure"] is not None:
+            failures.append(outcome["failure"])
+
+    return all_results, failures
+
+
 @execute_bp.route('/api/execute', methods=['POST'])
 def execute_query():
     # session_id resolved first and passed into get_current_user_identity()
@@ -129,15 +329,62 @@ def execute_query():
     user_identity = get_current_user_identity(session_id)
     data = request.get_json() or {}
 
-    descriptor = resolve_conn_str(data.get('database_url'), user_identity)
+    # A marker-free script (see the dispatch below) still honors a
+    # client-echoed pinned connection (see translate_routes.py's module
+    # docstring on the pin mechanism) over the session's single "primary"
+    # connection, whenever the caller hasn't passed an explicit
+    # database_url override - this is what makes hand-typed/edited SQL run
+    # against the conversation's actually-pinned connection rather than
+    # always falling back to the first in-scope one. Harmless/no-op for a
+    # single-connection session, which never has anything pinned (empty
+    # pinned_connections is falsy below) - byte-identical to before this
+    # feature existed. Only the FIRST pinned reference is used here (a
+    # marker-free script is inherently single-connection - if it needed
+    # more than one it would carry markers); if it fails to resolve
+    # (deleted/removed since it was pinned), this silently falls back to
+    # the session's primary connection, same graceful-degradation posture
+    # as every other stale-reference case in this feature.
+    pinned_connections = data.get('pinned_connections') or []
+    if not data.get('database_url') and pinned_connections and isinstance(pinned_connections[0], dict):
+        pinned_descriptor, _pinned_name = resolve_descriptor_by_reference(
+            pinned_connections[0].get('kind'), pinned_connections[0].get('id'), user_identity
+        )
+        descriptor = pinned_descriptor if pinned_descriptor is not None else resolve_conn_str(None, user_identity)
+    else:
+        descriptor = resolve_conn_str(data.get('database_url'), user_identity)
 
     raw_query = (data.get('sql') or data.get('query') or '').strip()
     if not raw_query:
         return jsonify({'error': 'Query cannot be empty'}), 400
 
+    start_time = time.time()
+
+    # Multi-database dispatch - see this module's "Multi-database dispatch"
+    # section above. Only entered when at least one '-- database: ...'
+    # marker is found anywhere in the script; a marker-free script (every
+    # script this app generated before this feature existed, any hand-
+    # typed SQL, or one where the user stripped the comment) falls straight
+    # through to the single-connection path below, completely unchanged.
+    database_marker_chunks = _split_by_database_markers(raw_query)
+    if database_marker_chunks is not None:
+        results, failures = _execute_multi_database(database_marker_chunks, user_identity)
+        total_row_count = sum(r.get('rowCount', 0) for r in results)
+        execution_time_ms = round((time.time() - start_time) * 1000)
+        resp_body = {
+            'success': not failures,
+            'results': results,
+            'rowCount': total_row_count,
+            'executionTimeMs': execution_time_ms,
+        }
+        if failures:
+            resp_body['failures'] = failures
+        resp = jsonify(resp_body)
+        if failures:
+            return apply_session_cookie(resp, session_id), 400
+        return apply_session_cookie(resp, session_id)
+
     backend = None
     conn = None
-    start_time = time.time()
 
     try:
         backend = get_backend(descriptor)

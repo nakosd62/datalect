@@ -10,7 +10,7 @@ test.describe('app shell', () => {
   test('loads and shows the main prompt/query UI', async ({ page }) => {
     await gotoApp(page);
 
-    await expect(page).toHaveTitle(/yDyL/);
+    await expect(page).toHaveTitle(/Datalect/);
     await expect(page.locator('#aiPrompt')).toBeVisible();
     await expect(page.locator('#runBtn')).toBeVisible();
     await expect(page.locator('#configTriggerBadge')).toBeVisible();

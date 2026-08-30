@@ -155,6 +155,49 @@ document.addEventListener('DOMContentLoaded', async () => {
   // active connection isn't a preset at all (a custom connection instead).
   let ACTIVE_PRESET_ID = null;
   let CONFIGURED_DBS = [];
+  // Multi-database question-answering (see server/translate_routes.py's
+  // module docstring): the set of connections the user has marked "in
+  // scope". Populated straight from /api/config's in_scope_preset_ids/
+  // in_scope_custom_connection_keys (see fetchBackendConfig()). The
+  // connection picker is a single-select radio group again (see
+  // renderDbRadioButtons()) - EITHER one specific connection OR the "All
+  // configured databases" option, and which one is checked is decided by
+  // IN_SCOPE_MODE (below), not by how many entries these two arrays
+  // happen to sum to - see isAllConnectionsSelected(). A single in-scope
+  // connection behaves exactly as before any of this multi-database
+  // feature existed - these two arrays existing/being non-empty is what
+  // the rest of the client uses to decide whether any of the new
+  // multi-database UI (the disclosure banner, per-tab database labels,
+  // pinning) is even relevant for the current session.
+  let IN_SCOPE_PRESET_IDS = [];
+  let IN_SCOPE_CUSTOM_KEYS = [];
+  // The server's persisted "single"|"all" choice (see state_store.py's
+  // in_scope_mode docstring) - always one of those two strings once
+  // /api/config has ever returned (the server itself defaults a
+  // blank/never-set session to "single", never a raw null/undefined), so
+  // isAllConnectionsSelected() can just check this directly instead of
+  // inferring "all" from the in-scope arrays' combined length. That
+  // length-based inference used to be the only signal available (before
+  // the server persisted in_scope_mode at all) and gets two edge cases
+  // wrong on its own: a legacy session with 2+ specific connections
+  // in scope (in_scope_mode still "single") would misread as "All", and a
+  // session in "all" mode with only ONE connection actually configured
+  // (in_scope_preset_ids/in_scope_custom_connection_keys summing to 1)
+  // would misread as that one specific connection instead of "All".
+  let IN_SCOPE_MODE = 'single';
+  let MAX_IN_SCOPE_CONNECTIONS = 20;
+  // Which connection(s) THIS conversation has actually used, as
+  // {kind: "preset"|"custom", id, name} references (never raw descriptors/
+  // credentials - the server re-resolves fresh, credentialed descriptors
+  // from these on every request). Set from a /api/translate response's
+  // connection_selection field (only ever present when 2+ connections are
+  // in scope) and echoed back on every subsequent /api/translate/
+  // /api/execute call in the same conversation as `pinned_connections`, so
+  // a follow-up question reuses the same connection(s) rather than
+  // re-deciding from scratch. Reset by clearActiveQueryState() - the same
+  // single reset point new-chat/logout/sign-in/connection-switch already
+  // funnel through - so it never outlives the conversation it was set for.
+  let PINNED_CONNECTIONS = [];
   // Model-selection state (see fetchBackendConfig()/updateModelBadge()/
   // renderModelRadioButtons()) - mirrors CONFIGURED_DBS/ACTIVE_DB_URL's own
   // "fetched once per /api/config round-trip, read by the badge and the
@@ -244,6 +287,21 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Active state tracker for multi-tab query results
   let currentResultsList = [];
   let activeResultIndex = 0;
+
+  // "All databases" mode's "route" outcome (see translate_routes.py's
+  // module docstring): stashes the triage routing summary and any
+  // per-database '*** NO SQL ***' notes / generation failures a
+  // /api/translate response carried, so the eventual /api/execute call
+  // (or the immediate no-SQL-generated-at-all case) can build one
+  // combined set of tabs via renderAllModeCombinedResults() instead of
+  // the plain single-connection renderer. Set ONLY inside
+  // translatePrompt() - deliberately NOT inside clearResultsDisplay(),
+  // since executeSql() also calls that same helper at its own start and
+  // would otherwise wipe this out before executeSql() gets a chance to
+  // read it just a few lines later. Consumed (cleared back to null)
+  // exactly once by whichever branch of executeSql() actually renders
+  // with it.
+  let pendingAllModeNotes = null;
 
   // Helper function to include Google ID tokens or auth headers in fetch requests
   function getApiHeaders() {
@@ -666,6 +724,94 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   // ===========================================================================
+  // MORE MENU (triple-dot mobile header menu)
+  //    Collapses Help/History/Sign-in into one dropdown under the same
+  //    narrow-header breakpoint style.css uses to hide them (see
+  //    NARROW_HEADER_MEDIA_QUERY below, and the @media (max-width: 480px)
+  //    block in style.css). The Help/History items just forward a .click()
+  //    to the real (CSS-hidden-at-this-width) header buttons, which fires
+  //    their existing real listeners unchanged - no logic duplicated. The
+  //    sign-in control is different: #g_id_signin holds a real, cross-origin
+  //    Google Sign-In iframe (or, once signed in, our own avatar+dropdown)
+  //    that can't be click-forwarded into - so instead the very same live
+  //    node is physically reparented between the header and
+  //    #moreMenuAuthSlot whenever the breakpoint is crossed. renderAuthUI()
+  //    looks the container up by ID and only ever sets its innerHTML, so it
+  //    doesn't care which parent currently holds it.
+  // ===========================================================================
+  const NARROW_HEADER_MEDIA_QUERY = '(max-width: 480px)';
+  const moreMenuWrapper = document.getElementById('moreMenuWrapper');
+  const moreMenuBtn = document.getElementById('moreMenuBtn');
+  const moreMenuDropdown = document.getElementById('moreMenuDropdown');
+  const moreMenuHelpBtn = document.getElementById('moreMenuHelpBtn');
+  const moreMenuHistoryBtn = document.getElementById('moreMenuHistoryBtn');
+  const moreMenuAuthSlot = document.getElementById('moreMenuAuthSlot');
+  const headerActionsEl = document.querySelector('.header-actions');
+
+  function closeMoreMenu() {
+    if (!moreMenuDropdown || moreMenuDropdown.classList.contains('hidden')) return;
+    moreMenuDropdown.classList.add('hidden');
+    moreMenuBtn?.setAttribute('aria-expanded', 'false');
+  }
+
+  if (moreMenuBtn && moreMenuDropdown && moreMenuWrapper) {
+    moreMenuBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const isHidden = moreMenuDropdown.classList.toggle('hidden');
+      moreMenuBtn.setAttribute('aria-expanded', String(!isHidden));
+    });
+
+    document.addEventListener('click', (e) => {
+      if (!moreMenuDropdown.classList.contains('hidden') && !moreMenuWrapper.contains(e.target)) {
+        closeMoreMenu();
+      }
+    });
+  }
+
+  if (moreMenuHelpBtn) {
+    moreMenuHelpBtn.addEventListener('click', () => {
+      closeMoreMenu();
+      helpBtn?.click();
+    });
+  }
+
+  if (moreMenuHistoryBtn) {
+    moreMenuHistoryBtn.addEventListener('click', () => {
+      closeMoreMenu();
+      historyBtn?.click();
+    });
+  }
+
+  // Keeps the live #g_id_signin node in the right place as the viewport
+  // crosses the narrow-header breakpoint - see the block comment above.
+  function relocateAuthContainer(isNarrow) {
+    const authContainer = document.getElementById('g_id_signin');
+    if (!authContainer || !headerActionsEl || !moreMenuAuthSlot || !moreMenuWrapper) return;
+    if (isNarrow) {
+      if (authContainer.parentElement !== moreMenuAuthSlot) {
+        moreMenuAuthSlot.appendChild(authContainer);
+      }
+    } else {
+      if (authContainer.parentElement !== headerActionsEl) {
+        headerActionsEl.insertBefore(authContainer, moreMenuWrapper);
+      }
+      closeMoreMenu();
+    }
+  }
+
+  if (moreMenuWrapper) {
+    const narrowHeaderQuery = window.matchMedia(NARROW_HEADER_MEDIA_QUERY);
+    relocateAuthContainer(narrowHeaderQuery.matches);
+    const handleNarrowHeaderChange = (e) => relocateAuthContainer(e.matches);
+    if (narrowHeaderQuery.addEventListener) {
+      narrowHeaderQuery.addEventListener('change', handleNarrowHeaderChange);
+    } else if (narrowHeaderQuery.addListener) {
+      // Safari <14 / older WebKit fallback.
+      narrowHeaderQuery.addListener(handleNarrowHeaderChange);
+    }
+  }
+
+  // ===========================================================================
   // 4. SHARED UI HELPERS
   //    (button/textarea state, SQL formatting/display, results-display
   //    resets, history-nav button state, live DB connection status)
@@ -838,6 +984,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     clearResultsDisplay();
     chatStore.clear();
     updateHistoryTurnsSubtitle();
+    // A pinned multi-database selection only ever makes sense for the
+    // conversation it was picked for - every existing trigger for this
+    // function (new chat, logout, sign-in, connection-identity change) is
+    // already exactly the boundary a pin should reset at, so this rides
+    // along with zero new call sites.
+    PINNED_CONNECTIONS = [];
   }
 
   function updateHistoryTurnsSubtitle() {
@@ -919,8 +1071,59 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
+  // Multi-database question-answering (see server/translate_routes.py's
+  // module docstring): the badge has room for exactly one name, but 2+
+  // connections can now be in scope at once - showing just the primary's
+  // name in that case silently implies the OTHER in-scope connection(s)
+  // don't exist, which is exactly the confusion a user checking 2+ boxes
+  // in the connection picker and then seeing only one name in the badge
+  // would run into. Returns {count, label, names} - `label` is what the
+  // badge text should show (the primary's own name when count <= 1,
+  // "All databases" otherwise) and `names` is the full in-scope name list
+  // (resolved via configured_databases/custom_databases, both already
+  // present on every /api/config response) for the tooltip.
+  //
+  // "All" (data.in_scope_mode === 'all') is checked FIRST and directly -
+  // the same source of truth isAllConnectionsSelected() uses - rather
+  // than inferred from in_scope_preset_ids/in_scope_custom_connection_keys'
+  // combined length the way the fallback branch below still does for a
+  // legacy multi-select session. Those two arrays are NOT what decides
+  // "all" mode (see db.py's resolve_in_scope_descriptors: "all" ignores
+  // them entirely in favor of dynamically resolving every currently-
+  // configured connection) and can be arbitrarily short - even a single
+  // leftover entry from whatever was last explicitly picked before "All"
+  // was selected (see triggerConfigSave(): picking "All" leaves them
+  // untouched rather than sending fresh ones) - so counting them would
+  // wrongly show just one connection's name for a session genuinely in
+  // "all" mode, exactly the bug this once had.
+  function summarizeInScopeConnections(data) {
+    const configuredDbs = data?.configured_databases || [];
+    const customDbs = data?.custom_databases || [];
+    if (data?.in_scope_mode === 'all') {
+      const names = [...configuredDbs.map(db => db.name), ...customDbs.map(db => db.name)];
+      return { count: names.length, label: names.length > 1 ? 'All databases' : null, names };
+    }
+    const presetIds = data?.in_scope_preset_ids || [];
+    const customKeys = data?.in_scope_custom_connection_keys || [];
+    const count = presetIds.length + customKeys.length;
+    if (count <= 1) return { count, label: null, names: [] };
+    // A legacy session that saved an arbitrary multi-connection subset
+    // before the binary single/all choice existed (see
+    // resolve_in_scope_descriptors' docstring) - still more than one
+    // connection in scope, so this reuses the same "All databases" badge
+    // text as real "all" mode above (this badge has no separate copy for
+    // "several specific connections"), just resolved from the explicit
+    // arrays instead of the full configured/custom lists.
+    const names = [
+      ...presetIds.map(id => configuredDbs.find(db => db.id === id)?.name || id),
+      ...customKeys.map(key => customDbs.find(db => db.connection_key === key)?.name || key),
+    ];
+    return { count, label: 'All databases', names };
+  }
+
   async function updateConnectionDetails(data) {
     const badge = document.getElementById('configTriggerBadge');
+    const inScopeSummary = summarizeInScopeConnections(data);
 
     if (isAnonymousUser && !data?.active_is_custom) {
       // The backend withholds a PRESET's username/connection string from
@@ -933,16 +1136,18 @@ document.addEventListener('DOMContentLoaded', async () => {
       // hidden from them, so that falls through to the same real-details
       // path an authenticated user gets, below.
       if (badge) badge.style.display = '';
-      const anonDbLabel = data?.database_name || 'Database';
+      const anonDbLabel = inScopeSummary.label || data?.database_name || 'Database';
       if (connDbName) {
         connDbName.textContent = data?.active_connection_missing ? `⚠ ${anonDbLabel}` : anonDbLabel;
       }
       if (configTriggerBadge) {
         configTriggerBadge.title = data?.active_connection_missing
           ? (data.active_connection_missing_message || anonDbLabel)
-          : `Connected to: ${anonDbLabel} (Click to configure)`;
+          : inScopeSummary.count > 1
+            ? `In scope: ${inScopeSummary.names.join(', ')} (Click to configure)`
+            : `Connected to: ${anonDbLabel} (Click to configure)`;
       }
-      document.title = `yDyL`;
+      document.title = `Datalect`;
       // Deliberately not awaited - see checkDbStatus()'s own comment on
       // why this must never block the modal open/Save flow that calls
       // into this function.
@@ -966,9 +1171,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     // picked) breaks the tie - without it, a colliding preset match would
     // always win here even when the user explicitly selected their own
     // custom connection with the same URL.
-    const dbDisplayName = data.active_is_custom
+    const primaryDisplayName = data.active_is_custom
       ? (data.custom_database_name || data.database_name || "Database")
       : (matchedPreset?.name || data.database_name || "Database");
+    // 2+ connections in scope (see summarizeInScopeConnections above) -
+    // the badge shows a count instead of just the primary's name, since
+    // showing only one name would silently hide that other connection(s)
+    // are also in play for this session's questions.
+    const dbDisplayName = inScopeSummary.label || primaryDisplayName;
 
     // A previously-selected preset/custom connection that's since been
     // removed or renamed still resolves to a real (default) connection -
@@ -983,7 +1193,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (connDbName) {
         connDbName.textContent = `⚠ ${dbDisplayName}`;
       }
-      document.title = `yDyL`;
+      document.title = `Datalect`;
       // Deliberately not awaited - see checkDbStatus()'s own comment on
       // why this must never block the modal open/Save flow that calls
       // into this function.
@@ -992,14 +1202,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     if (configTriggerBadge) {
-      configTriggerBadge.title = `Connected to: ${dbDisplayName} (Click to configure)`;
+      configTriggerBadge.title = inScopeSummary.count > 1
+        ? `In scope: ${inScopeSummary.names.join(', ')} (Click to configure)`
+        : `Connected to: ${dbDisplayName} (Click to configure)`;
     }
 
     if (connDbName) {
       connDbName.textContent = dbDisplayName;
     }
 
-    document.title = `yDyL`;
+    document.title = `Datalect`;
 
     // Deliberately not awaited - see checkDbStatus()'s own comment on why
     // this must never block the modal open/Save flow that calls into
@@ -1081,6 +1293,13 @@ document.addEventListener('DOMContentLoaded', async () => {
       LLM_PROVIDERS = data.llm_providers || [];
       ACTIVE_LLM_PROVIDER = data.active_llm_provider || "";
       ACTIVE_LLM_MODEL = data.active_llm_model || "";
+
+      IN_SCOPE_PRESET_IDS = data.in_scope_preset_ids || [];
+      IN_SCOPE_CUSTOM_KEYS = data.in_scope_custom_connection_keys || [];
+      IN_SCOPE_MODE = data.in_scope_mode === 'all' ? 'all' : 'single';
+      if (data.max_in_scope_connections) {
+        MAX_IN_SCOPE_CONNECTIONS = data.max_in_scope_connections;
+      }
 
       renderDbRadioButtons();
       loadConfigIntoUI();
@@ -1191,6 +1410,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     const container = document.getElementById('customDbsContainer');
     if (!container) return;
 
+    const allSelected = isAllConnectionsSelected();
+
+    // Focusing/editing a custom row's own field checks that row's radio -
+    // true radio semantics (this is a single-select group again, see
+    // renderDbRadioButtons()) mean that alone is enough to uncheck
+    // whatever else was checked, so there's nothing else to track here.
+    function selectDbConnectionRow(radio) {
+      if (radio) radio.checked = true;
+    }
+
     let html = '';
     customDatabases.forEach((db, index) => {
       const cfg = db.config || {};
@@ -1204,30 +1433,15 @@ document.addEventListener('DOMContentLoaded', async () => {
       const isSheets = db.type === 'sheets';
       const isMongoSql = db.type === 'MongoDB';
       const sfAuthMethod = cfg.auth_method || (cfg.private_key ? 'private_key' : 'password');
-      // ACTIVE_IS_CUSTOM gates this, not just URL equality - a custom
-      // connection's URL can collide with a preset's, and when the active
-      // connection is actually the preset (ACTIVE_IS_CUSTOM false), no
-      // custom row should show as selected even if one happens to share
-      // that URL (see renderDbRadioButtons()'s matching isCustom check).
-      // Beyond that, prefer matching by connection_key over URL whenever
-      // the server gave us one - two saved custom connections can
-      // themselves share a URL (e.g. two BigQuery connections on the same
-      // project/dataset with different service-account keys), so URL
-      // matching alone can't tell which specific one is active. Falls back
-      // to URL matching only when ACTIVE_CUSTOM_CONNECTION_KEY is blank -
-      // a session saved before that field existed. The old unconditional
-      // `Boolean(db.url) &&` guard is gone: BigQuery/Snowflake/Databricks/
-      // Oracle/Redshift/SQL Server/Sheets rows never carry a real db.url
-      // any more (the server only ever sends "" for those - see
-      // config_routes.py's module docstring), so requiring it here would
-      // make those 7 types permanently unselectable. It's still applied,
-      // just moved into the URL-fallback branch below, where it actually
-      // belongs (Postgres/MySQL, the two types the fallback branch is for).
-      const isSelected = ACTIVE_IS_CUSTOM && (
-        ACTIVE_CUSTOM_CONNECTION_KEY
-          ? db.connection_key === ACTIVE_CUSTOM_CONNECTION_KEY
-          : Boolean(db.url) && activeUrl === db.url
-      );
+      // Checked state comes from the in-scope set (see IN_SCOPE_CUSTOM_KEYS'
+      // docstring) matched by connection_key - but, same as a preset
+      // option above, only when "All" isn't the current selection (see
+      // isAllConnectionsSelected()). Falls back to the legacy single-
+      // active-connection URL match only for a row with no connection_key
+      // at all (saved before that field existed on individual rows).
+      const isSelected = !allSelected && (db.connection_key
+        ? IN_SCOPE_CUSTOM_KEYS.includes(db.connection_key)
+        : (ACTIVE_IS_CUSTOM && !ACTIVE_CUSTOM_CONNECTION_KEY && Boolean(db.url) && activeUrl === db.url));
 
       // A connection_key is only ever present on a row that came back from
       // the server (see config_routes.py's get_db_connections) - a row
@@ -1595,9 +1809,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     container.querySelectorAll('.custom-db-name-input').forEach(input => {
       const index = parseInt(input.dataset.index);
       const radio = container.querySelector(`input[value="custom-${index}"]`);
-      input.addEventListener('focus', () => { if (radio) radio.checked = true; });
+      input.addEventListener('focus', () => { if (radio) selectDbConnectionRow(radio, index); });
       input.addEventListener('input', () => {
-        if (radio) radio.checked = true;
+        if (radio) selectDbConnectionRow(radio, index);
         customDatabases[index].name = input.value.trim();
         if (radio) radio.dataset.dbname = customDatabases[index].name;
       });
@@ -1606,9 +1820,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     container.querySelectorAll('.custom-db-url-input').forEach(input => {
       const index = parseInt(input.dataset.index);
       const radio = container.querySelector(`input[value="custom-${index}"]`);
-      input.addEventListener('focus', () => { if (radio) radio.checked = true; });
+      input.addEventListener('focus', () => { if (radio) selectDbConnectionRow(radio, index); });
       input.addEventListener('input', () => {
-        if (radio) radio.checked = true;
+        if (radio) selectDbConnectionRow(radio, index);
         const unmaskedUrl = unmaskConnectionUrl(input.value.trim(), customDatabases[index].url);
         customDatabases[index].url = unmaskedUrl;
         // Only auto-fill the name from the URL while the user hasn't typed
@@ -1626,9 +1840,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     container.querySelectorAll('.custom-db-mongo-uri').forEach(input => {
       const index = parseInt(input.dataset.index);
       const radio = container.querySelector(`input[value="custom-${index}"]`);
-      input.addEventListener('focus', () => { if (radio) radio.checked = true; });
+      input.addEventListener('focus', () => { if (radio) selectDbConnectionRow(radio, index); });
       input.addEventListener('input', () => {
-        if (radio) radio.checked = true;
+        if (radio) selectDbConnectionRow(radio, index);
         // Unlike Postgres/MySQL's url, Mongo's uri never carries a
         // credential any more (see backends/mongodb_sql.py's module
         // docstring) - no masking/unmasking needed, this is just an
@@ -1642,9 +1856,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     ).forEach(input => {
       const index = parseInt(input.dataset.index);
       const radio = container.querySelector(`input[value="custom-${index}"]`);
-      input.addEventListener('focus', () => { if (radio) radio.checked = true; });
+      input.addEventListener('focus', () => { if (radio) selectDbConnectionRow(radio, index); });
       input.addEventListener('input', () => {
-        if (radio) radio.checked = true;
+        if (radio) selectDbConnectionRow(radio, index);
         const db = customDatabases[index];
         if (!db.config) db.config = {};
         if (input.classList.contains('custom-db-mongo-database')) db.config.database = input.value.trim();
@@ -1664,9 +1878,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     container.querySelectorAll('.custom-db-cacert').forEach(input => {
       const index = parseInt(input.dataset.index);
       const radio = container.querySelector(`input[value="custom-${index}"]`);
-      input.addEventListener('focus', () => { if (radio) radio.checked = true; });
+      input.addEventListener('focus', () => { if (radio) selectDbConnectionRow(radio, index); });
       input.addEventListener('input', () => {
-        if (radio) radio.checked = true;
+        if (radio) selectDbConnectionRow(radio, index);
         if (!customDatabases[index].config) customDatabases[index].config = {};
         // Not a secret (see backends/postgres.py's/backends/mysql.py's
         // module docstrings), so unlike every credential textarea below
@@ -1680,9 +1894,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     container.querySelectorAll('.custom-db-bq-project, .custom-db-bq-dataset, .custom-db-bq-billing, .custom-db-bq-creds').forEach(input => {
       const index = parseInt(input.dataset.index);
       const radio = container.querySelector(`input[value="custom-${index}"]`);
-      input.addEventListener('focus', () => { if (radio) radio.checked = true; });
+      input.addEventListener('focus', () => { if (radio) selectDbConnectionRow(radio, index); });
       input.addEventListener('input', () => {
-        if (radio) radio.checked = true;
+        if (radio) selectDbConnectionRow(radio, index);
         const db = customDatabases[index];
         if (!db.config) db.config = {};
         if (input.classList.contains('custom-db-bq-project')) db.config.project_id = input.value.trim();
@@ -1723,9 +1937,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     ).forEach(input => {
       const index = parseInt(input.dataset.index);
       const radio = container.querySelector(`input[value="custom-${index}"]`);
-      input.addEventListener('focus', () => { if (radio) radio.checked = true; });
+      input.addEventListener('focus', () => { if (radio) selectDbConnectionRow(radio, index); });
       input.addEventListener('input', () => {
-        if (radio) radio.checked = true;
+        if (radio) selectDbConnectionRow(radio, index);
         const db = customDatabases[index];
         if (!db.config) db.config = {};
         if (input.classList.contains('custom-db-sf-account')) db.config.account = input.value.trim();
@@ -1757,9 +1971,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     ).forEach(input => {
       const index = parseInt(input.dataset.index);
       const radio = container.querySelector(`input[value="custom-${index}"]`);
-      input.addEventListener('focus', () => { if (radio) radio.checked = true; });
+      input.addEventListener('focus', () => { if (radio) selectDbConnectionRow(radio, index); });
       input.addEventListener('input', () => {
-        if (radio) radio.checked = true;
+        if (radio) selectDbConnectionRow(radio, index);
         const db = customDatabases[index];
         if (!db.config) db.config = {};
         if (input.classList.contains('custom-db-dbx-hostname')) db.config.server_hostname = input.value.trim();
@@ -1793,10 +2007,10 @@ document.addEventListener('DOMContentLoaded', async () => {
       // tabbing in) - only wired to 'change', not 'focus', unlike every
       // other Oracle field below.
       if (!isCheckbox) {
-        input.addEventListener('focus', () => { if (radio) radio.checked = true; });
+        input.addEventListener('focus', () => { if (radio) selectDbConnectionRow(radio, index); });
       }
       input.addEventListener(isCheckbox ? 'change' : 'input', () => {
-        if (radio) radio.checked = true;
+        if (radio) selectDbConnectionRow(radio, index);
         const db = customDatabases[index];
         if (!db.config) db.config = {};
         if (input.classList.contains('custom-db-ora-host')) db.config.host = input.value.trim();
@@ -1830,9 +2044,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     ).forEach(input => {
       const index = parseInt(input.dataset.index);
       const radio = container.querySelector(`input[value="custom-${index}"]`);
-      input.addEventListener('focus', () => { if (radio) radio.checked = true; });
+      input.addEventListener('focus', () => { if (radio) selectDbConnectionRow(radio, index); });
       input.addEventListener('input', () => {
-        if (radio) radio.checked = true;
+        if (radio) selectDbConnectionRow(radio, index);
         const db = customDatabases[index];
         if (!db.config) db.config = {};
         if (input.classList.contains('custom-db-rs-host')) db.config.host = input.value.trim();
@@ -1865,10 +2079,10 @@ document.addEventListener('DOMContentLoaded', async () => {
       // Same "no focus-to-select moment" reasoning as Oracle's ssl checkbox
       // above - only wired to 'change', not 'focus'.
       if (!isCheckbox) {
-        input.addEventListener('focus', () => { if (radio) radio.checked = true; });
+        input.addEventListener('focus', () => { if (radio) selectDbConnectionRow(radio, index); });
       }
       input.addEventListener(isCheckbox ? 'change' : 'input', () => {
-        if (radio) radio.checked = true;
+        if (radio) selectDbConnectionRow(radio, index);
         const db = customDatabases[index];
         if (!db.config) db.config = {};
         if (input.classList.contains('custom-db-ms-host')) db.config.host = input.value.trim();
@@ -1895,9 +2109,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     container.querySelectorAll('.custom-db-sh-url, .custom-db-sh-tab, .custom-db-sh-creds').forEach(input => {
       const index = parseInt(input.dataset.index);
       const radio = container.querySelector(`input[value="custom-${index}"]`);
-      input.addEventListener('focus', () => { if (radio) radio.checked = true; });
+      input.addEventListener('focus', () => { if (radio) selectDbConnectionRow(radio, index); });
       input.addEventListener('input', () => {
-        if (radio) radio.checked = true;
+        if (radio) selectDbConnectionRow(radio, index);
         const db = customDatabases[index];
         if (!db.config) db.config = {};
         if (input.classList.contains('custom-db-sh-url')) db.config.spreadsheet_url = input.value.trim();
@@ -1935,24 +2149,41 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
+  // Multi-database question-answering (see server/translate_routes.py's
+  // module docstring) is scoped to a binary choice, not an arbitrary
+  // subset: either ONE specific connection is in scope (today's original,
+  // unchanged behavior) or EVERY configured connection is ("All", see
+  // renderDbRadioButtons()' new radio option below). Which one is true is
+  // read straight from the server-persisted IN_SCOPE_MODE (see its
+  // declaration above for why this is more reliable than inferring "all"
+  // from the in-scope arrays' combined length) - so this stays correct
+  // even for a session with only one connection actually configured but
+  // in_scope_mode "all", or a legacy session with 2+ specific connections
+  // saved under the old checkbox picker's arbitrary-subset UI but
+  // in_scope_mode still "single" (or never explicitly saved at all).
+  function isAllConnectionsSelected() {
+    return IN_SCOPE_MODE === 'all';
+  }
+
   function renderDbRadioButtons(currentDbUrl) {
     const radioGroup = document.getElementById('modalDbRadioGroup');
     if (!radioGroup) return;
 
     const activeUrl = currentDbUrl || ACTIVE_DB_URL || DEFAULT_DB_URL;
+    const allSelected = isAllConnectionsSelected();
 
-    // ACTIVE_IS_CUSTOM (the server's record of what was actually picked) is
-    // the primary signal, taking priority over the id match - a saved
-    // custom connection can share its URL with a preset, in which case a
-    // preset's id would still be "active" (config_routes.py's active_preset
-    // is computed by URL, independent of is_custom), and matching would
-    // wrongly pick the preset radio instead of the custom one. This one
-    // rule now works identically for anonymous and signed-in users, since
-    // ACTIVE_PRESET_ID (unlike the URL it replaced) is never a secret and is
-    // sent to every visitor regardless of auth state - see fetchBackendConfig().
-    const isCustom = ACTIVE_IS_CUSTOM;
+    let html = `
+      <label class="radio-option all-databases-option">
+        <input type="radio" name="db_connection_option" value="all" ${allSelected ? 'checked' : ''}>
+        <span class="radio-label">All configured databases</span>
+      </label>
+      <p class="all-databases-hint">
+        Ask a question without picking a database first - the app figures out which connection(s) it applies to,
+        and can query more than one at once when a question genuinely needs it.
+      </p>
+    `;
 
-    let html = `<div class="radio-group-heading">Pre-configured Database Playgrounds</div>`;
+    html += `<div class="radio-group-heading">Pre-configured Database Playgrounds</div>`;
 
     // Two visual columns, purely a layout grouping (no change to what's
     // selectable or how - db_connection_option/preset:<id> works exactly
@@ -1985,7 +2216,17 @@ document.addEventListener('DOMContentLoaded', async () => {
       // CONFIGURED_DBS entries are redacted (see fetchBackendConfig()).
       // Resolved server-side via payload.preset_id (see triggerConfigSave()).
       const value = `preset:${db.id}`;
-      const isSelected = !isCustom && db.id === ACTIVE_PRESET_ID;
+      // Checked state comes from the in-scope set (see IN_SCOPE_PRESET_IDS'
+      // docstring), not ACTIVE_PRESET_ID directly, but is only ever true
+      // for this SPECIFIC preset when "All" isn't the current selection
+      // (see isAllConnectionsSelected()) - the radio group is single-select
+      // again, so exactly one of "All" or one specific connection is
+      // checked at a time. A session that's never explicitly saved an
+      // in-scope set has this array lazily derived server-side from the
+      // single active connection (state_store.py's get_session), so a
+      // never-touched session's one radio shows checked exactly as before
+      // this feature existed.
+      const isSelected = !allSelected && IN_SCOPE_PRESET_IDS.includes(db.id);
       return `
         <label class="radio-option">
           <input type="radio" name="db_connection_option" value="${value}" data-dbname="${db.name}" ${isSelected ? 'checked' : ''}>
@@ -2274,15 +2515,44 @@ document.addEventListener('DOMContentLoaded', async () => {
     const isCompleteMongo = (db) => db && db.type === 'MongoDB' && db.url && db.url.trim() !== ""
       && db.config && db.config.database && db.config.user
       && (db.config.password || db.has_custom_credentials);
+    // Combined "is this custom row saveable/selectable at all" check,
+    // hoisted out of the custom-connection branch below so the "All"
+    // synthesis just above it can reuse the exact same definition of
+    // "complete" when there are no presets configured at all.
+    const isCompleteCustomDb = (d) => isCompleteBigQuery(d) || isCompleteSnowflake(d) || isCompleteDatabricks(d) || isCompleteOracle(d) || isCompleteRedshift(d) || isCompleteMssql(d) || isCompleteSheets(d) || isCompleteMongo(d) || isCompleteSimpleUrlDb(d);
 
+    // The radio group is single-select again (see renderDbRadioButtons()),
+    // so exactly one input is ever checked - no more "most recently
+    // focused row" tiebreaking needed among several simultaneously-checked
+    // boxes the way the old checkbox-based picker required.
     const selectedDbRadio = document.querySelector('input[name="db_connection_option"]:checked');
-    if (selectedDbRadio) {
-      if (selectedDbRadio.value.startsWith('custom-')) {
+
+    // "All configured databases" (see renderDbRadioButtons()'s new radio
+    // option) has no dedicated preset/custom fields of its own - the
+    // single PRIMARY connection (today's pre-existing connection_id/
+    // is_custom fields) is still just whichever connection would be
+    // first in stable order (presets, then custom - see db.py's
+    // resolve_in_scope_descriptors), same rule already used server-side
+    // for resolving the primary out of an in-scope set. Synthesizing an
+    // equivalent preset:<id>/custom-<index> value here lets the exact same
+    // branch logic below (already handling every dialect) run unchanged
+    // rather than duplicating it for this option.
+    let effectiveSelectionValue = selectedDbRadio ? selectedDbRadio.value : null;
+    if (effectiveSelectionValue === 'all') {
+      if (CONFIGURED_DBS.length > 0) {
+        effectiveSelectionValue = `preset:${CONFIGURED_DBS[0].id}`;
+      } else {
+        const firstCompleteIndex = customDatabases.findIndex(isCompleteCustomDb);
+        effectiveSelectionValue = firstCompleteIndex >= 0 ? `custom-${firstCompleteIndex}` : null;
+      }
+    }
+
+    if (effectiveSelectionValue) {
+      if (effectiveSelectionValue.startsWith('custom-')) {
         isCustomOption = true;
-        const index = parseInt(selectedDbRadio.value.split('-')[1]);
+        const index = parseInt(effectiveSelectionValue.split('-')[1]);
         const selectedDb = customDatabases[index];
-        const isComplete = (d) => isCompleteBigQuery(d) || isCompleteSnowflake(d) || isCompleteDatabricks(d) || isCompleteOracle(d) || isCompleteRedshift(d) || isCompleteMssql(d) || isCompleteSheets(d) || isCompleteMongo(d) || isCompleteSimpleUrlDb(d);
-        const chosen = isComplete(selectedDb) ? selectedDb : customDatabases.find(isComplete);
+        const chosen = isCompleteCustomDb(selectedDb) ? selectedDb : customDatabases.find(isCompleteCustomDb);
 
         if (isCompleteBigQuery(chosen)) {
           dbType = 'bigquery';
@@ -2415,7 +2685,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         customDbName = dbNameValue;
         customDbUrl = dbUrlValue;
-      } else if (selectedDbRadio.value.startsWith('preset:')) {
+      } else if (effectiveSelectionValue.startsWith('preset:')) {
         // Both anonymous and signed-in users select a preset purely by its
         // stable, non-secret id (see renderDbRadioButtons()) - never by
         // resending its own fields, let alone its credentials. The server
@@ -2430,7 +2700,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         // redacted for them; either way, only its id and name are used
         // below (dbType/dbNameValue are display-only for this payload -
         // the server ignores them for a preset selection).
-        const matchedPresetId = selectedDbRadio.value.slice('preset:'.length);
+        const matchedPresetId = effectiveSelectionValue.slice('preset:'.length);
         const matchedDb = CONFIGURED_DBS.find(db => db.id === matchedPresetId);
         dbType = (matchedDb && matchedDb.type) || 'postgres';
         dbNameValue = matchedDb ? matchedDb.name : "Preset DB";
@@ -2647,6 +2917,45 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     const configSaveErrorEl = document.getElementById('configSaveError');
 
+    // Multi-database question-answering (see server/translate_routes.py's
+    // module docstring): the picker is a binary single-select choice again
+    // (see renderDbRadioButtons()) - one specific connection, or "All".
+    // in_scope_mode is what the server actually keys its behavior off of
+    // (see db.py's resolve_in_scope_descriptors/
+    // _resolve_all_configured_descriptors): "all" is expanded dynamically,
+    // at request time, to every connection configured THEN - not a list
+    // frozen at Save time, which is the whole point of "All" over the old
+    // arbitrary-checkbox picker. Picking one SPECIFIC connection still
+    // narrows scope back down to exactly that one immediately, below,
+    // which is what keeps a single in-scope connection's behavior
+    // byte-identical to before this feature existed.
+    const allMode = selectedDbRadio && selectedDbRadio.value === 'all';
+    payload.in_scope_mode = allMode ? 'all' : 'single';
+
+    if (!allMode) {
+      // A custom row with no connection_key yet (freshly added and
+      // completed in this SAME save) can't be represented in the in-scope
+      // arrays at all until a follow-up save actually persists it and
+      // assigns one (see _parse_incoming_custom_databases' docstring) - so
+      // in_scope_preset_ids/in_scope_custom_connection_keys are left
+      // unset entirely in that one case (same as "All" above: the server
+      // leaves whatever scope was previously saved alone) rather than sent
+      // as empty arrays, which would otherwise trip the server's own "at
+      // least one connection must be in scope" validation despite a
+      // perfectly valid connection having just been selected.
+      if (effectiveSelectionValue && effectiveSelectionValue.startsWith('preset:')) {
+        payload.in_scope_preset_ids = [effectiveSelectionValue.slice('preset:'.length)];
+        payload.in_scope_custom_connection_keys = [];
+      } else if (effectiveSelectionValue && effectiveSelectionValue.startsWith('custom-')) {
+        const index = parseInt(effectiveSelectionValue.split('-')[1], 10);
+        const db = customDatabases[index];
+        if (db && db.connection_key) {
+          payload.in_scope_preset_ids = [];
+          payload.in_scope_custom_connection_keys = [db.connection_key];
+        }
+      }
+    }
+
     try {
       const response = await fetch('/api/config', {
         method: 'POST',
@@ -2694,9 +3003,31 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (data.auto_sql_execute !== undefined) {
           autoSqlExecuteEnabled = Boolean(data.auto_sql_execute);
         }
+        if (data.in_scope_preset_ids !== undefined) {
+          IN_SCOPE_PRESET_IDS = data.in_scope_preset_ids || [];
+        }
+        if (data.in_scope_custom_connection_keys !== undefined) {
+          IN_SCOPE_CUSTOM_KEYS = data.in_scope_custom_connection_keys || [];
+        }
+        if (data.in_scope_mode !== undefined) {
+          IN_SCOPE_MODE = data.in_scope_mode === 'all' ? 'all' : 'single';
+        }
 
         const nextConnectionIdentity = `${ACTIVE_DB_URL}|${ACTIVE_IS_CUSTOM}|${ACTIVE_CUSTOM_CONNECTION_KEY}|${ACTIVE_PRESET_ID}`;
         if (nextConnectionIdentity !== previousConnectionIdentity) {
+          clearActiveQueryState();
+        } else if (PINNED_CONNECTIONS.some(p => (
+          p.kind === 'preset' ? !IN_SCOPE_PRESET_IDS.includes(p.id) : !IN_SCOPE_CUSTOM_KEYS.includes(p.id)
+        ))) {
+          // The primary connection didn't change, but a connection this
+          // conversation had pinned (see PINNED_CONNECTIONS' docstring) was
+          // just unchecked from scope - the pin no longer describes a set
+          // the user actually wants questions routed to, so it's cleared
+          // the same way a real connection-identity change would be. The
+          // server independently guards against a stale pin too (see
+          // translate_routes.py's _resolve_pinned_subset), this just keeps
+          // the UI's own prompt/SQL/results in sync immediately rather
+          // than waiting for the next question to discover it server-side.
           clearActiveQueryState();
         }
 
@@ -2797,6 +3128,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     const authContainer = googleAuthEnabled ? document.getElementById('g_id_signin') : null;
     const quickPrompts = document.getElementById('examplePrompts');
     const quickPromptsVisible = quickPrompts && !quickPrompts.classList.contains('hidden');
+    // Under the narrow-header breakpoint, historyBtn/authContainer/helpBtn
+    // are CSS-hidden (collapsed into the triple-dot #moreMenuBtn - see the
+    // MORE MENU section above) - they'd still exist in the DOM, so
+    // pointing the tour at them directly would spotlight a zero-size rect.
+    // Point at the visible moreMenuBtn instead, with one combined step.
+    const isNarrowHeader = !!(moreMenuWrapper && window.getComputedStyle(moreMenuWrapper).display !== 'none');
 
     const steps = [
       {
@@ -2826,7 +3163,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       },
       {
         target: configTriggerBadge,
-        title: "This is the databse you are connected to",
+        title: "This is the database you are connected to",
         body: "Click this badge to switch to any pre-configured database or connect to your own."
       },
       {
@@ -2834,6 +3171,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         title: "This is the AI model translating your questions",
         body: "Click this badge to switch between the available models, grouped by provider (Google, Anthropic, OpenAI)."
       },
+      ...(isNarrowHeader ? [{
+        target: moreMenuBtn,
+        title: 'Help, history & sign-in live here',
+        body: isAnonymousUser
+          ? "Tap this menu for the full docs, your past translations, and to sign in with Google so your connections and history follow you across devices."
+          : 'Tap this menu for the full docs, your past translations, and to sign out.'
+      }] : [
       {
         target: historyBtn,
         title: 'Past queries, saved',
@@ -2851,6 +3195,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         title: 'Stuck? Full docs are here',
         body: 'Come back to this Help button anytime for the full walkthrough, tips on multi-turn conversations, and more.'
       }
+      ])
     ];
 
     return steps.filter(s => s.target);
@@ -3262,12 +3607,51 @@ document.addEventListener('DOMContentLoaded', async () => {
     resultsHeader.innerHTML = '';
     resultsBody.innerHTML = '';
 
+    // All-databases mode's own synthetic text tab entries (see
+    // renderAllModeCombinedResults() below) - a "Summary" tab built from
+    // the triage routing message, or a per-database "Note" tab built from
+    // a '*** NO SQL ***' reply Phase B returned instead of real SQL.
+    // Reuses the exact same `.response-cell`/`.response-text` markup
+    // renderNoSqlResponse() already shows for a single-connection NO-SQL
+    // reply, plus the same "Database: <name>" note line the isError
+    // branch below shows when a result is tagged with a connection.
+    // Checked before isError since these entries never carry both flags.
+    if (result && result.isText) {
+      const tr = document.createElement('tr');
+      const td = document.createElement('td');
+      td.className = 'response-cell';
+
+      if (result.database && result.database.name) {
+        const dbP = document.createElement('p');
+        dbP.className = 'text-muted';
+        dbP.textContent = `Database: ${result.database.name}`;
+        td.appendChild(dbP);
+      }
+
+      const p = document.createElement('p');
+      p.className = 'response-text';
+      p.textContent = result.text || '';
+      td.appendChild(p);
+
+      tr.appendChild(td);
+      resultsBody.appendChild(tr);
+      return;
+    }
+
     // A synthetic "this statement failed" tab entry (see
     // renderResultsWithFailedStatement() below) - same error markup
     // executeSql() has always shown for a single-statement failure, just
     // scoped to one tab's content instead of replacing the whole results
     // area, so it sits alongside the other (successful) statements' tabs.
     if (result && result.isError) {
+      // Multi-database question-answering: a failure tagged with which
+      // connection it came from (see renderResultsWithDatabaseFailures())
+      // gets that named called out explicitly, since with more than one
+      // connection involved "Execution Error" alone no longer says which
+      // one - absent entirely for a single-connection failure, which never
+      // carries this field.
+      const dbNote = result.database && result.database.name
+        ? `<p class="text-muted">Database: ${result.database.name}</p>` : '';
       resultsBody.innerHTML = `
         <tr>
           <td class="error-cell">
@@ -3275,6 +3659,7 @@ document.addEventListener('DOMContentLoaded', async () => {
               <span class="error-icon">⚠️</span>
               <div class="error-details">
                 <strong>Execution Error</strong>
+                ${dbNote}
                 <p>${result.error || 'An error occurred during SQL execution.'}</p>
               </div>
             </div>
@@ -3328,23 +3713,37 @@ document.addEventListener('DOMContentLoaded', async () => {
     currentResultsList.forEach((res, idx) => {
       const btn = document.createElement('button');
       const isError = !!res.isError;
+      const isText = !!res.isText;
       btn.className = `result-tab-btn ${idx === activeResultIndex ? 'active' : ''} ${isError ? 'result-tab-btn--error' : ''}`.trim();
 
       const sqlText = res.query || res.sql || res.statement || '';
+      // Multi-database question-answering: a result tagged with which
+      // connection it came from (see execute_routes.py's module docstring)
+      // gets that connection's name prefixed onto its tab, so a script
+      // that spanned more than one database still reads clearly tab-by-
+      // tab - absent entirely for a single-connection script, which never
+      // carries this field at all.
+      const dbLabel = res.database && res.database.name ? `[${res.database.name}] ` : '';
       if (sqlText) {
-        btn.setAttribute('title', sqlText);
+        btn.setAttribute('title', dbLabel ? `${dbLabel}${sqlText}` : sqlText);
       }
 
-      if (isError) {
+      if (isText) {
+        // All-databases mode's own synthetic text tabs (see
+        // renderAllModeCombinedResults()) - a leading "Summary" tab (no
+        // `.database`, so no prefix) or a per-database "Note" tab (same
+        // `[name] ` prefix convention as every other tab here).
+        btn.textContent = `${dbLabel}${res.tabLabel || 'Note'}`;
+      } else if (isError) {
         // Colored differently (via the result-tab-btn--error class) so a
         // failed statement in an otherwise-successful multi-statement
         // script draws the eye immediately, instead of looking like just
         // another results tab.
-        btn.textContent = `Query ${idx + 1} (Error)`;
+        btn.textContent = `${dbLabel}Query ${idx + 1} (Error)`;
       } else {
         const count = res.rowCount !== undefined ? res.rowCount : (res.rows ? res.rows.length : 0);
         const rowLabel = count === 1 ? '1 row' : `${count} rows`;
-        btn.textContent = `Query ${idx + 1} (${rowLabel})`;
+        btn.textContent = `${dbLabel}Query ${idx + 1} (${rowLabel})`;
       }
 
       btn.addEventListener('click', () => {
@@ -3397,8 +3796,51 @@ document.addEventListener('DOMContentLoaded', async () => {
     renderTableResult(currentResultsList[activeResultIndex]);
   }
 
+  // Multi-database question-answering's own partial-failure shape (see
+  // execute_routes.py's module docstring): `data.results` holds every
+  // statement that succeeded ACROSS EVERY connection the script touched
+  // (each already tagged with a `.database` field - see
+  // buildResultsTabsNav()'s dbLabel), and `data.failures` holds one entry
+  // per connection that failed at all (the OTHER, independent connections
+  // keep running and their results are still in `data.results` - see this
+  // module's docstring on that policy). One synthetic error tab is
+  // rendered per failure, appended after every succeeded tab (ordering
+  // note: this mirrors execute_routes.py's own "grouped by connection,
+  // not perfectly interleaved with successes" ordering - see
+  // _execute_multi_database's docstring) - distinct from
+  // renderResultsWithFailedStatement above, which is the single-
+  // connection SqlExecutionError shape (exactly one failure, no
+  // `.database` tagging at all) and is left completely unchanged.
+  function renderResultsWithDatabaseFailures(data) {
+    const succeeded = Array.isArray(data.results) ? data.results : [];
+    const failureEntries = (Array.isArray(data.failures) ? data.failures : []).map((f) => ({
+      statement: f.failedStatement || '',
+      isError: true,
+      error: f.error || 'An error occurred during SQL execution.',
+      database: f.database,
+    }));
+    currentResultsList = [...succeeded, ...failureEntries];
+    // Jump to the FIRST failure tab, same "show the user what needs
+    // attention" reasoning as renderResultsWithFailedStatement's single-
+    // failure jump - there just may be more than one here.
+    const firstFailureIndex = currentResultsList.findIndex((r) => r.isError);
+    activeResultIndex = firstFailureIndex >= 0 ? firstFailureIndex : 0;
+
+    buildResultsTabsNav();
+    renderTableResult(currentResultsList[activeResultIndex]);
+  }
+
+  // Shared by renderNoSqlResponse() below and Phase C's summary text (see
+  // appendPhaseCSummaryToSummaryTab) - the "*** NO SQL ***" marker is an
+  // internal convention (also used server-side for translations-table
+  // logging, see translate_routes.py's record_all_databases_triage call
+  // sites) that a user should never actually see verbatim.
+  function stripNoSqlPrefix(rawText) {
+    return (rawText || '').replace(/^\*\*\*\s*NO\s*SQL\s*\*\*\*\s*/i, '').trim();
+  }
+
   function renderNoSqlResponse(rawText) {
-    const cleanText = (rawText || '').replace(/^\*\*\*\s*NO\s*SQL\s*\*\*\*\s*/i, '').trim() || rawText || '';
+    const cleanText = stripNoSqlPrefix(rawText) || rawText || '';
 
     if (resultsTabsNav) resultsTabsNav.classList.add('hidden');
     if (resultsHeader) resultsHeader.innerHTML = '';
@@ -3418,6 +3860,201 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
+  // "All databases" mode's own combined renderer (see translatePrompt()'s
+  // `router_route` branch and executeSql()'s pendingAllModeNotes check
+  // below): merges a leading "Summary" text tab (built from the triage
+  // call's routing message, when there is one), one "Note" text tab per
+  // database that came back with a '*** NO SQL ***' reply instead of real
+  // SQL, the real per-database /api/execute results (if any SQL was
+  // generated and executed at all), and error tabs for both execution
+  // failures (`executeFailures` - today's existing partial-failure shape,
+  // see renderResultsWithDatabaseFailures) and Phase B generation
+  // failures (`notes.generationFailures` - reuses that exact same error-
+  // tab shape, just a second source feeding the same list) into one
+  // `currentResultsList`.
+  function renderAllModeCombinedResults({ notes, executeResults, executeFailures }) {
+    const routingMessage = notes && notes.routingMessage;
+    const databaseNotes = (notes && notes.databaseNotes) || [];
+    const generationFailures = (notes && notes.generationFailures) || [];
+
+    const summaryTab = routingMessage
+      ? [{ isText: true, tabLabel: 'Summary', text: routingMessage }]
+      : [];
+    const noteTabs = databaseNotes.map((n) => ({
+      isText: true,
+      tabLabel: 'Note',
+      text: n.text || '',
+      database: { kind: n.kind, id: n.id, name: n.name },
+    }));
+    const succeeded = Array.isArray(executeResults) ? executeResults : [];
+    const executeFailureTabs = (Array.isArray(executeFailures) ? executeFailures : []).map((f) => ({
+      statement: f.failedStatement || '',
+      isError: true,
+      error: f.error || 'An error occurred during SQL execution.',
+      database: f.database,
+    }));
+    const generationFailureTabs = generationFailures.map((f) => ({
+      isError: true,
+      error: f.error || 'An error occurred generating SQL for this database.',
+      database: { kind: f.kind, id: f.id, name: f.name },
+    }));
+
+    currentResultsList = [...summaryTab, ...noteTabs, ...succeeded, ...executeFailureTabs, ...generationFailureTabs];
+
+    if (!currentResultsList.length) {
+      if (resultsTabsNav) resultsTabsNav.classList.add('hidden');
+      renderTableResult(null);
+      return;
+    }
+
+    // Same "show the user what needs attention first" reasoning as
+    // renderResultsWithFailedStatement/renderResultsWithDatabaseFailures -
+    // jump to the first failure if there is one, else the first entry
+    // (typically the Summary tab, or the first real result when there's
+    // no routing message to show).
+    const firstFailureIndex = currentResultsList.findIndex((r) => r.isError);
+    activeResultIndex = firstFailureIndex >= 0 ? firstFailureIndex : 0;
+
+    buildResultsTabsNav();
+    renderTableResult(currentResultsList[activeResultIndex]);
+  }
+
+  // "All databases" mode's Phase C (see translate_routes.py's
+  // /api/summarize-results docstring for the full picture): once
+  // /api/execute has actually run every database Phase B was routed to,
+  // one more LLM call synthesizes the REAL, now-known results into a
+  // single plain-language answer, which gets appended underneath the
+  // Summary tab's existing routing message - triage's own message
+  // necessarily can't say what the answer actually turned out to be,
+  // since it's written before any real data is fetched.
+  //
+  // `notes` is the same shape pendingAllModeNotes already carries
+  // (routingMessage/databaseNotes/generationFailures, plus the ORIGINAL
+  // prompt - see translatePrompt()'s router_route branch); `executeResults`/
+  // `executeFailures` are /api/execute's own results/failures for THIS
+  // execution, exactly as passed into renderAllModeCombinedResults just
+  // before this is called.
+  function buildAllModeSummaryPayload(notes, executeResults, executeFailures) {
+    const entries = [];
+    (Array.isArray(executeResults) ? executeResults : []).forEach((r) => {
+      const db = r.database || {};
+      entries.push({
+        kind: db.kind, id: db.id, name: db.name || 'Unknown database',
+        columns: r.columns || [], rows: r.rows || [], rowCount: r.rowCount,
+      });
+    });
+    ((notes && notes.databaseNotes) || []).forEach((n) => {
+      entries.push({ kind: n.kind, id: n.id, name: n.name || 'Unknown database', note: n.text || '' });
+    });
+    ((notes && notes.generationFailures) || []).forEach((f) => {
+      entries.push({
+        kind: f.kind, id: f.id, name: f.name || 'Unknown database',
+        error: f.error || 'Failed to generate SQL for this database.',
+      });
+    });
+    (Array.isArray(executeFailures) ? executeFailures : []).forEach((f) => {
+      const db = f.database || {};
+      entries.push({
+        kind: db.kind, id: db.id, name: db.name || 'Unknown database',
+        error: f.error || 'Query execution failed for this database.',
+      });
+    });
+    return entries;
+  }
+
+  // Patches Phase C's summary text into the Summary tab already built by
+  // renderAllModeCombinedResults - re-renders in place only if that tab
+  // happens to be the one currently showing, so it doesn't yank the user
+  // back to a tab they've since navigated away from while this was in
+  // flight.
+  function appendPhaseCSummaryToSummaryTab(summaryText) {
+    if (!currentResultsList || !currentResultsList.length) return;
+    const summaryEntry = currentResultsList.find((r) => r.isText && r.tabLabel === 'Summary');
+    if (!summaryEntry) return;
+    summaryEntry.text = summaryEntry.text ? `${summaryEntry.text}\n\n${summaryText}` : summaryText;
+    if (currentResultsList[activeResultIndex] === summaryEntry) {
+      renderTableResult(summaryEntry);
+    }
+  }
+
+  // Fire-and-await (not fire-and-forget - see the two call sites in
+  // executeSql() below, both already inside an async flow with buttons
+  // disabled) request for Phase C's summary. Best-effort: skipped
+  // entirely when there's no real data to summarize (every database just
+  // noted or failed - nothing Phase C could add over what those tabs
+  // already show), and any failure from the endpoint itself just leaves
+  // the Summary tab as it already is rather than surfacing an error, per
+  // /api/summarize-results' own docstring.
+  async function requestAllModeResultsSummary(notes, executeResults, executeFailures) {
+    if (!notes || !notes.prompt) return;
+    const databaseResults = buildAllModeSummaryPayload(notes, executeResults, executeFailures);
+    if (!databaseResults.some((e) => 'columns' in e)) return;
+
+    try {
+      const response = await fetch('/api/summarize-results', {
+        method: 'POST',
+        headers: getApiHeaders(),
+        credentials: 'same-origin',
+        body: JSON.stringify({ prompt: notes.prompt, database_results: databaseResults }),
+      });
+      const data = await response.json();
+      if (response.ok && data && data.success && data.summary) {
+        // The server prefixes this the same "*** NO SQL ***" way any
+        // other non-SQL LLM reply is (see translate_routes.py's
+        // /api/summarize-results docstring) - an internal convention,
+        // never meant to reach the user verbatim.
+        appendPhaseCSummaryToSummaryTab(stripNoSqlPrefix(data.summary));
+      }
+    } catch (err) {
+      console.error('Failed to summarize all-mode results:', err);
+    }
+  }
+
+  // The Summary tab's CURRENT text - i.e. triage's routing message, plus
+  // Phase C's synthesized answer once requestAllModeResultsSummary() has
+  // patched it in (see appendPhaseCSummaryToSummaryTab). Used to pull the
+  // FINAL, post-Phase-C text back out of the ephemeral currentResultsList
+  // so it can be persisted onto the turn's chat-history entry - see
+  // captureAllModeHistory() below.
+  function getSummaryTabEntry() {
+    if (!currentResultsList) return null;
+    return currentResultsList.find((r) => r.isText && r.tabLabel === 'Summary') || null;
+  }
+
+  // Persists everything renderAllModeCombinedResults() needs to rebuild the
+  // exact same tabbed view later - onto the turn's model entry, alongside
+  // the `.text`/`.results` fields every other kind of turn already carries.
+  // Without this, only the raw per-database rows survived past the current
+  // render: the routing/Phase-C summary message, per-database "Note" tabs,
+  // and any generation/execution failure tabs lived only in the ephemeral
+  // currentResultsList - so stepping back and then forward through an
+  // "all databases" turn (chatStore's undo()/redo()) silently dropped all
+  // of that, leaving restoreLatestTurn() with nothing but a bare (and,
+  // once summarizeResultForHistory() lost the `.database` tag too,
+  // unlabeled) set of per-statement result tabs - or, when every database
+  // just noted/failed instead of returning real SQL, nothing at all (see
+  // the empty-`.text` guard below).
+  function captureAllModeHistory(modelEntry, notes, executeFailures) {
+    modelEntry.allMode = {
+      routingMessage: (notes && notes.routingMessage) || null,
+      databaseNotes: (notes && notes.databaseNotes) || [],
+      generationFailures: (notes && notes.generationFailures) || [],
+      executeFailures: executeFailures || [],
+    };
+    // Every database just noted/failed - translatePrompt()'s router_route
+    // branch never sets modelEntry.text to anything but '' for this
+    // outcome, which would both drop this turn from the LLM's history
+    // entirely (build_gemini_history_contents/build_claude_history_messages/
+    // build_openai_history_messages all skip any message with falsy text)
+    // and make restoreLatestTurn()'s plain-text branch below treat it as
+    // "no turn at all". Give it the same non-empty, "never shown verbatim"
+    // text the single-connection "answer"/"failed" outcomes already use,
+    // so it survives both.
+    if (!modelEntry.text) {
+      modelEntry.text = `*** NO SQL *** ${(notes && notes.routingMessage) || 'No database returned any data for this question.'}`;
+    }
+  }
+
   // ===========================================================================
   // 9. TRANSLATE (NL -> SQL) AND EXECUTE SQL
   // ===========================================================================
@@ -3425,6 +4062,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     await fetchBackendConfig();
 
     clearResultsDisplay();
+    // Reset the "all databases" mode notes stashed by a PREVIOUS
+    // router_route turn - reset unconditionally
+    // so a stale summary/note set never leaks into this turn's rendering
+    // (re-populated below only if THIS response is itself a router_route
+    // "route" outcome).
+    pendingAllModeNotes = null;
 
     const promptText = aiPrompt ? aiPrompt.value.trim() : "";
     if (!promptText) return;
@@ -3456,12 +4099,29 @@ document.addEventListener('DOMContentLoaded', async () => {
         credentials: 'same-origin',
         body: JSON.stringify({
           prompt: promptText,
-          history: chatStore.toPayload()
+          history: chatStore.toPayload(),
+          // Harmless no-op whenever this session has 0 or 1 connections in
+          // scope (server-side, translate_routes.py only ever reads this
+          // when multi_db is true) - see PINNED_CONNECTIONS' docstring.
+          pinned_connections: PINNED_CONNECTIONS
         })
       });
 
       data = await readTranslateStream(response);
       hideRetryStatus();
+
+      // connection_selection is only ever present when this session had
+      // 2+ connections in scope for this turn (see translate_routes.py's
+      // module docstring) - absent entirely otherwise, in which case
+      // PINNED_CONNECTIONS is left as whatever it already was (a NO-SQL/
+      // help response, or a plain error, doesn't change what's pinned).
+      // Which database(s) were actually used is still disclosed to the
+      // user via the per-tab `[name]` labels (buildResultsTabsNav) and the
+      // `-- database: ...` comment translate_routes.py writes directly
+      // into the generated SQL - no separate banner needed on top of that.
+      if (data && data.connection_selection && data.connection_selection.length) {
+        PINNED_CONNECTIONS = data.connection_selection.map(e => ({ kind: e.kind, id: e.id }));
+      }
 
       // A streamed translation failure (every retry exhausted, or a
       // non-retryable error) comes back as HTTP 200 with success:false in
@@ -3472,7 +4132,51 @@ document.addEventListener('DOMContentLoaded', async () => {
       // matters for the auth-guard's real 401 (checked below) and for the
       // early-validation 400s (missing prompt/API key), which return a
       // real error status because they're not streamed at all.
-      if (response && response.ok && data && data.sql) {
+      if (response && response.ok && data && data.router_route) {
+        // "All databases" mode's "route" outcome (see translate_routes.py's
+        // module docstring): `data.sql` may legitimately be empty (every
+        // selected database noted or failed instead of returning real
+        // SQL) - checked as its own branch, ahead of the plain `data.sql`
+        // check below, precisely because that empty-string case must NOT
+        // fall through to the "Translation Error" branch the way a truly
+        // absent/falsy `sql` would for every other response shape.
+        pendingAllModeNotes = {
+          // The ORIGINAL question that started this whole turn - captured
+          // here (not re-read from aiPrompt.value later) since that field
+          // may have already changed by the time Phase C's summarization
+          // request goes out (see requestAllModeResultsSummary() below).
+          prompt: promptText,
+          routingMessage: data.routing_message || null,
+          databaseNotes: data.database_notes || [],
+          generationFailures: data.generation_failures || [],
+        };
+
+        const modelEntry = { role: 'model', text: data.sql || '' };
+        chatStore.pushTurn(promptText, modelEntry);
+        updateHistoryTurnsSubtitle();
+
+        if (data.sql) {
+          setSqlQuery(data.sql);
+          chatStore.setPending(modelEntry, normalizeSqlForCompare(data.sql));
+
+          if (autoSqlExecuteEnabled) {
+            await executeSql();
+          }
+        } else {
+          // Nothing to execute at all - render immediately, with no
+          // /api/execute call, straight from the notes/failures already
+          // stashed above.
+          setSqlQuery('');
+          chatStore.clearPending();
+          captureAllModeHistory(modelEntry, pendingAllModeNotes, []);
+          renderAllModeCombinedResults({
+            notes: pendingAllModeNotes,
+            executeResults: [],
+            executeFailures: [],
+          });
+          pendingAllModeNotes = null;
+        }
+      } else if (response && response.ok && data && data.sql) {
         const trimmedSql = data.sql.trim();
         const isOpenHelp = trimmedSql.toUpperCase().includes('OPEN HELP POPUP');
         const isNoSql = trimmedSql.startsWith('*** NO SQL ***');
@@ -3571,11 +4275,20 @@ document.addEventListener('DOMContentLoaded', async () => {
   // marker) if that becomes a problem in practice.
   function summarizeResultForHistory(result) {
     const rows = result.rows || [];
-    return {
+    const summarized = {
       columns: result.columns || [],
       rowCount: result.rowCount !== undefined ? result.rowCount : rows.length,
       rows: rows
     };
+    // "All databases" mode results are tagged with which connection they
+    // came from (see execute_routes.py and buildResultsTabsNav()'s dbLabel)
+    // - preserve that tag so a later history restore can still label each
+    // tab by database name instead of a bare "Query N". Server-side history
+    // formatting (build_gemini_history_contents et al.) only ever reads
+    // columns/rows/rowCount and ignores unknown keys, so this is harmless
+    // for what actually reaches the LLM.
+    if (result.database) summarized.database = result.database;
+    return summarized;
   }
 
   async function executeSql(customSql = null) {
@@ -3596,13 +4309,53 @@ document.addEventListener('DOMContentLoaded', async () => {
         headers: getApiHeaders(),
         credentials: 'same-origin',
         body: JSON.stringify({
-          sql: sql
+          sql: sql,
+          // Harmless whenever `sql` carries no '-- database: ...' markers
+          // (execute_routes.py's marker-free fast path ignores this
+          // entirely) - only meaningful for a hand-edited/re-run
+          // multi-database script with no markers left at all, where it's
+          // the fallback target (see execute_routes.py's module docstring
+          // and _resolve_pinned_subset in translate_routes.py for the same
+          // convention on the generation side).
+          pinned_connections: PINNED_CONNECTIONS
         })
       });
   
       const data = await response.json();
       if (response.ok && data.success) {
-        renderMultiTurnResults(data.results);
+        // "All databases" mode's "route" outcome left a summary/notes
+        // bundle behind for THIS execution (see translatePrompt()'s
+        // router_route branch) - render the combined view instead of the
+        // plain multi-tab renderer, and consume (clear) it so it doesn't
+        // linger into some later, unrelated execution. Captured into its
+        // own variable (rather than re-reading pendingAllModeNotes further
+        // down, after it's already been nulled out) so it's still around
+        // once execution has settled, to persist onto this turn's history
+        // entry below - see captureAllModeHistory()'s docstring for why
+        // that's needed at all.
+        const allModeNotes = pendingAllModeNotes;
+        if (allModeNotes) {
+          renderAllModeCombinedResults({
+            notes: allModeNotes,
+            executeResults: data.results,
+            executeFailures: [],
+          });
+          pendingAllModeNotes = null;
+          // Phase C - see requestAllModeResultsSummary's docstring.
+          // Awaited (not fire-and-forget) so buttons stay disabled for
+          // this extra round trip, same as every other step of this
+          // function already does. That call mutates the Summary tab's
+          // text in currentResultsList in place, once it resolves - pull
+          // the (possibly now Phase-C-augmented) text back out immediately
+          // after, so allModeNotes.routingMessage - and therefore whatever
+          // gets persisted onto the history entry just below - reflects
+          // the FINAL answer, not triage's earlier, data-free guess at it.
+          await requestAllModeResultsSummary(allModeNotes, data.results, []);
+          const summaryEntry = getSummaryTabEntry();
+          if (summaryEntry) allModeNotes.routingMessage = summaryEntry.text;
+        } else {
+          renderMultiTurnResults(data.results);
+        }
 
         const promptText = aiPrompt && aiPrompt.value.trim() ? aiPrompt.value.trim() : "[Direct SQL Execution]";
         const summarizedResults = Array.isArray(data.results) ? data.results.map(summarizeResultForHistory) : [];
@@ -3619,11 +4372,14 @@ document.addEventListener('DOMContentLoaded', async () => {
           const pending = chatStore.getPending();
           pending.entry.text = sql;
           pending.entry.results = summarizedResults;
+          if (allModeNotes) captureAllModeHistory(pending.entry, allModeNotes, []);
           chatStore.clearPending();
         } else {
           // Any other execution (direct SQL entry, or re-running a query
           // that isn't the pending just-generated one) is its own turn.
-          chatStore.pushTurn(promptText, { role: 'model', text: sql, results: summarizedResults });
+          const modelEntry = { role: 'model', text: sql, results: summarizedResults };
+          if (allModeNotes) captureAllModeHistory(modelEntry, allModeNotes, []);
+          chatStore.pushTurn(promptText, modelEntry);
           updateHistoryTurnsSubtitle();
         }
 
@@ -3633,15 +4389,47 @@ document.addEventListener('DOMContentLoaded', async () => {
           ? "Authentication required. Please click 'Sign in with Google' in the top-right corner to log in."
           : (data.error || "An error occurred during SQL execution.");
 
-        // A multi-statement script that failed partway through carries
-        // `results` (the statements that succeeded before the failure) and
-        // `failedStatement` (see execute_routes.py's module docstring) -
-        // render those as tabs, same as the success case, with the failed
-        // one flagged, instead of one generic error that loses track of
-        // what did or didn't run. A response with neither key (e.g. a
-        // connect() failure, or a single-statement script with nothing to
-        // report alongside it) falls back to the original flat block.
-        if (Array.isArray(data.results) || data.failedStatement !== undefined) {
+        // "All databases" mode's "route" outcome (see above) takes
+        // priority over both existing failure shapes below - it needs the
+        // Summary/Note text tabs alongside whatever DID execute, not just
+        // the raw execute-failure shape those existing renderers show.
+        if (pendingAllModeNotes) {
+          const allModeNotes = pendingAllModeNotes;
+          const executeResults = Array.isArray(data.results) ? data.results : [];
+          const executeFailures = Array.isArray(data.failures) ? data.failures : [];
+          renderAllModeCombinedResults({
+            notes: allModeNotes,
+            executeResults: executeResults,
+            executeFailures: executeFailures,
+          });
+          pendingAllModeNotes = null;
+          // Phase C - see requestAllModeResultsSummary's docstring. Still
+          // worth attempting even on a partial failure: whatever DID
+          // execute successfully is real data worth summarizing, and the
+          // failed connection(s) are already fed in as their own entries
+          // (see buildAllModeSummaryPayload) so the summary can note that
+          // too if it affects the answer.
+          await requestAllModeResultsSummary(allModeNotes, executeResults, executeFailures);
+        // Multi-database question-answering's own partial-failure shape
+        // (see execute_routes.py's module docstring) - `failures` is a
+        // LIST (one entry per connection that failed; the others keep
+        // running independently), distinct from the single-connection
+        // SqlExecutionError shape's one `failedStatement`/`error` pair
+        // checked just below. Checked first since a multi-database
+        // response's `results` array would otherwise also satisfy that
+        // next branch's Array.isArray(data.results) check.
+        } else if (Array.isArray(data.failures)) {
+          renderResultsWithDatabaseFailures(data);
+        // A single-connection multi-statement script that failed partway
+        // through carries `results` (the statements that succeeded before
+        // the failure) and `failedStatement` (see execute_routes.py's
+        // module docstring) - render those as tabs, same as the success
+        // case, with the failed one flagged, instead of one generic error
+        // that loses track of what did or didn't run. A response with
+        // neither key (e.g. a connect() failure, or a single-statement
+        // script with nothing to report alongside it) falls back to the
+        // original flat block.
+        } else if (Array.isArray(data.results) || data.failedStatement !== undefined) {
           renderResultsWithFailedStatement({ ...data, error: errMsg });
         } else if (resultsBody) {
           resultsBody.innerHTML = `
@@ -3768,7 +4556,37 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (aiPrompt) {
         aiPrompt.value = (lastUserEntry && lastUserEntry.text !== "[Direct SQL Execution]") ? lastUserEntry.text : '';
       }
-      
+
+      if (lastModelEntry && lastModelEntry.allMode) {
+        // "All databases" mode turn (see translatePrompt()'s router_route
+        // branch / executeSql()'s captureAllModeHistory() calls) - rebuild
+        // the exact same combined Summary/Note/result/failure tabs instead
+        // of falling into the plain per-statement branch below, which has
+        // no idea what any of those extra tab kinds even are. Always
+        // treated as fully "done" (never re-enters the pending/"awaiting
+        // first execution" state below) - an all-mode turn is only ever
+        // recorded here once every selected database has already either
+        // returned real SQL and been executed, or noted/failed outright.
+        chatStore.clearPending();
+        // modelEntry.text is the real SQL to show in the editor - except
+        // when captureAllModeHistory() had to invent a "*** NO SQL ***"
+        // placeholder (every database noted/failed, nothing was ever
+        // executed) purely so this turn wouldn't vanish from the LLM's
+        // history - that placeholder was never meant for the SQL editor.
+        const isPlaceholderText = lastModelEntry.text && lastModelEntry.text.startsWith('*** NO SQL ***');
+        setSqlQuery(isPlaceholderText ? '' : (lastModelEntry.text || ''));
+        renderAllModeCombinedResults({
+          notes: {
+            routingMessage: lastModelEntry.allMode.routingMessage,
+            databaseNotes: lastModelEntry.allMode.databaseNotes,
+            generationFailures: lastModelEntry.allMode.generationFailures,
+          },
+          executeResults: lastModelEntry.results || [],
+          executeFailures: lastModelEntry.allMode.executeFailures || [],
+        });
+        return;
+      }
+
       if (lastModelEntry && lastModelEntry.text) {
         const sqlText = lastModelEntry.text;
         const isNoSql = sqlText.startsWith('*** NO SQL ***');

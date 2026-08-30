@@ -23,8 +23,11 @@ cache_key()) before logging a translation event - so raw connection
 strings/credentials never end up in the translation-history table.
 """
 
+import concurrent.futures
+
 from app_config import DEFAULT_CONN, CONFIGURED_DBS, state_store, logger
 from backends import get_backend
+from backends.base import extract_entry_names_from_schema_text
 import schema_cache
 
 _SCHEMA_FETCH_FAILED = "No schema description available."
@@ -89,6 +92,180 @@ def resolve_active_descriptor(session, user_id):
             # shape into a flat descriptor).
             return {k: v for k, v in db.items() if k not in ("id", "name")}, False
     return _to_descriptor(DEFAULT_CONN), True
+
+
+def resolve_descriptor_by_reference(kind, ref_id, user_id):
+    """Resolves one {kind, id} in-scope/pinned-connection reference to a
+    fresh, credentialed descriptor plus its human-readable name - the
+    shared resolution primitive for both the multi-database "pin"
+    mechanism (translate_routes.py/execute_routes.py trust only
+    {kind, id} references from the client, never raw descriptors/
+    credentials) and for parsing a `-- database: preset:<id>`/
+    `-- database: custom:<key>` marker back out of generated/edited SQL
+    at execute time (execute_routes.py). Mirrors resolve_active_descriptor's
+    two branches exactly (same CONFIGURED_DBS/get_db_connections() sources
+    of truth), just addressed by an explicit kind+id instead of a
+    session's single connection_id/is_custom pair.
+
+    Returns (descriptor, name), or (None, None) if `ref_id` doesn't
+    resolve to anything real for this kind (a preset that's been removed/
+    renamed, or a custom connection the user has since deleted) - callers
+    are expected to treat that the same way resolve_active_descriptor's
+    missing=True is treated elsewhere: skip this one connection rather
+    than fail the whole request (see resolve_in_scope_descriptors below)."""
+    if kind == "custom":
+        for db in state_store.get_db_connections(user_id, include_credentials=True):
+            if db.get("connection_key") == ref_id:
+                descriptor = {"type": db.get("type") or "postgres", "url": db.get("url")}
+                descriptor.update(db.get("config") or {})
+                return descriptor, db.get("name") or "Custom"
+        return None, None
+    if kind == "preset":
+        for db in CONFIGURED_DBS:
+            if db.get("id") == ref_id:
+                return {k: v for k, v in db.items() if k not in ("id", "name")}, db.get("name") or ref_id
+        return None, None
+    return None, None
+
+
+def resolve_in_scope_descriptors(session, user_id):
+    """Resolves a session's whole in-scope connection set to a list of
+    {"kind", "id", "name", "descriptor"} dicts, in stable order (presets
+    first, then custom connections, each in the order stored) - the
+    candidate pool connection_router.py's Phase A chooses from, and what
+    determines whether a request even needs routing at all (see
+    translate_routes.py: len(...) <= 1 is the byte-identical-to-today fast
+    path).
+
+    session["in_scope_mode"] == "all" (see StateStore.get_session's
+    docstring) takes a completely different path here - see
+    _resolve_all_configured_descriptors below - ignoring
+    in_scope_preset_ids/in_scope_custom_connection_keys entirely in favor
+    of a dynamic, resolved-fresh-every-request "every configured
+    connection" set. Every other mode (the default "single", and any
+    legacy session that saved an arbitrary multi-connection subset before
+    the binary single/all choice existed) resolves the explicit
+    in_scope_preset_ids/in_scope_custom_connection_keys lists below,
+    exactly as this function always has.
+
+    A reference that no longer resolves (resolve_descriptor_by_reference
+    returned None - a removed preset, a deleted custom connection) is
+    silently skipped, same leniency resolve_active_descriptor already
+    applies to a single stale connection_id. Falls back to a single
+    app-default entry only if EVERY reference fails to resolve, or the
+    in-scope set is empty to begin with (a brand-new session, or one that
+    predates this feature and has never explicitly saved a connection at
+    all) - this is what guarantees the result is never empty, so callers
+    never need their own separate empty-list fallback."""
+    if session.get("in_scope_mode") == "all":
+        return _resolve_all_configured_descriptors(user_id)
+    entries = []
+    for preset_id in session.get("in_scope_preset_ids") or []:
+        descriptor, name = resolve_descriptor_by_reference("preset", preset_id, user_id)
+        if descriptor is not None:
+            entries.append({"kind": "preset", "id": preset_id, "name": name, "descriptor": descriptor})
+    for custom_key in session.get("in_scope_custom_connection_keys") or []:
+        descriptor, name = resolve_descriptor_by_reference("custom", custom_key, user_id)
+        if descriptor is not None:
+            entries.append({"kind": "custom", "id": custom_key, "name": name, "descriptor": descriptor})
+    if not entries:
+        return [{
+            "kind": "preset", "id": "", "name": "Default connection",
+            "descriptor": _to_descriptor(DEFAULT_CONN),
+        }]
+    return entries
+
+
+def _resolve_all_configured_descriptors(user_id):
+    """"All configured databases" (see webClient/client.js's
+    renderDbRadioButtons()) - the dynamic candidate pool for a session in
+    in_scope_mode == "all": EVERY currently-configured preset
+    (CONFIGURED_DBS, read fresh on every call, so a preset added or
+    removed since this was last true is immediately reflected - the whole
+    point of "All" over the frozen, save-time-computed subset the old
+    arbitrary checkbox picker produced) plus every one of this user's own
+    saved custom connections. Each resolved via
+    resolve_descriptor_by_reference exactly like the explicit-list branch
+    in resolve_in_scope_descriptors above, so a connection that
+    (implausibly, mid-request) stops resolving is silently skipped the
+    same way, not a special case. Falls back to the single app-default
+    entry only if there's nothing configured at all - CONFIGURED_DBS
+    always has at least DEFAULT_CONN in practice (see app_config.py), so
+    this is a defensive floor, not an expected path."""
+    entries = []
+    for db in CONFIGURED_DBS:
+        preset_id = db.get("id")
+        descriptor, name = resolve_descriptor_by_reference("preset", preset_id, user_id)
+        if descriptor is not None:
+            entries.append({"kind": "preset", "id": preset_id, "name": name, "descriptor": descriptor})
+    for db in state_store.get_db_connections(user_id, include_credentials=True):
+        custom_key = db.get("connection_key")
+        if not custom_key:
+            # A legacy custom connection saved before connection_key
+            # existed (see get_db_connections' docstring) can't be
+            # individually addressed by resolve_descriptor_by_reference at
+            # all - same "nothing to do here" this feature's explicit-list
+            # branch above always had for such a row.
+            continue
+        descriptor, name = resolve_descriptor_by_reference("custom", custom_key, user_id)
+        if descriptor is not None:
+            entries.append({"kind": "custom", "id": custom_key, "name": name, "descriptor": descriptor})
+    if not entries:
+        return [{
+            "kind": "preset", "id": "", "name": "Default connection",
+            "descriptor": _to_descriptor(DEFAULT_CONN),
+        }]
+    return entries
+
+
+def build_router_candidate_summaries(in_scope_entries, user_id):
+    """Builds compact, table-name-only summaries for connection_router.py's
+    Phase A prompt - one {"name", "dialect", "table_names"} dict per entry
+    in `in_scope_entries` (see resolve_in_scope_descriptors), in the same
+    order, so Phase A's returned candidate indices line up positionally
+    with this list.
+
+    Deliberately never includes column-level schema - only enough for the
+    router to guess relevance from table/tab names and dialect. Reuses the
+    same TTL-cached get_database_schema() every other schema-aware code
+    path already goes through (so this doesn't cost a second round-trip
+    for a connection whose schema is already cached), reduced via
+    backends/base.py's extract_entry_names_from_schema_text.
+
+    Fetched in parallel (one worker per in-scope connection) via
+    ThreadPoolExecutor, mirroring execute_routes.py's
+    _execute_with_timeout precedent - a cold cache on several connections
+    at once (e.g. right after the user adds a new connection to scope)
+    shouldn't serialize one slow schema fetch behind another. A single
+    connection's fetch failing degrades to an empty table_names list for
+    just that entry (get_database_schema() already degrades to its own
+    "schema fetch failed" placeholder text on failure, which
+    extract_entry_names_from_schema_text then reduces to []) rather than
+    failing the whole summary."""
+    if not in_scope_entries:
+        return []
+
+    def _summarize(entry):
+        schema_text = get_database_schema(entry["descriptor"], user_id)
+        table_names = extract_entry_names_from_schema_text(schema_text)
+        try:
+            dialect = get_backend(entry["descriptor"]).dialect_name
+        except Exception:
+            dialect = "SQL"
+        return {"name": entry["name"], "dialect": dialect, "table_names": table_names}
+
+    results = [None] * len(in_scope_entries)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(in_scope_entries)) as pool:
+        future_to_index = {pool.submit(_summarize, entry): i for i, entry in enumerate(in_scope_entries)}
+        for future in concurrent.futures.as_completed(future_to_index):
+            index = future_to_index[future]
+            try:
+                results[index] = future.result()
+            except Exception:
+                logger.exception("Error building router candidate summary")
+                entry = in_scope_entries[index]
+                results[index] = {"name": entry["name"], "dialect": "SQL", "table_names": []}
+    return results
 
 
 def resolve_conn_str(conn_str=None, user_id=None):
@@ -170,6 +347,34 @@ def record_translation(user_id, conn_str, nl_prompt, sql_command, gemini_model, 
     db_name = _resolve_database_name(descriptor, user_id)
     state_store.record_translation(
         user_id, db_type, db_name, nl_prompt, sql_command, gemini_model,
+        duration, input_tokens, output_tokens, total_tokens, thinking_tokens, cached_content_tokens
+    )
+
+
+def record_all_databases_triage(user_id, nl_prompt, sql_command, gemini_model, duration, input_tokens, output_tokens, total_tokens, thinking_tokens, cached_content_tokens):
+    """Logs "all databases" mode's Phase A (triage) step to the same
+    translations table record_translation() writes to, but tagged with the
+    literal database_type/database_name "All Databases"/"All Databases"
+    rather than any real connection descriptor - unlike every other row in
+    this table, a triage call isn't "about" one specific database at all
+    (it's the step that decides whether real data is even needed, and if
+    so, which connection(s) to route to), so there's no real descriptor to
+    resolve a db_type/db_name from the way record_translation() does above.
+
+    Deliberately bypasses record_translation()'s _to_descriptor/
+    _resolve_database_name resolution entirely rather than trying to feed
+    it a synthetic descriptor - "All Databases" is a fixed, literal label,
+    not a lookup result.
+
+    Called once per "all databases" request regardless of triage's outcome
+    (answer/failed/route - see translate_routes.py's router_only_all_mode
+    branch), always with ONLY triage's own duration and LLM token usage -
+    never folded in with any Phase B (per-database generation) numbers, so
+    a "route" outcome's real, per-database translations-table row (logged
+    separately, attributed to that specific connection) never double-counts
+    the tokens/time this row already accounts for."""
+    state_store.record_translation(
+        user_id, "All Databases", "All Databases", nl_prompt, sql_command, gemini_model,
         duration, input_tokens, output_tokens, total_tokens, thinking_tokens, cached_content_tokens
     )
 

@@ -140,6 +140,8 @@ connect(), which would skip hostname verification altogether while still
 only checking that some CA-trusted certificate was presented.
 """
 
+import concurrent.futures
+
 import certifi
 import pytds
 import pytds.tls
@@ -152,6 +154,86 @@ from .base import (
     DB_CONNECT_TIMEOUT_SECONDS,
     group_date_sharded_tables, cap_kept_tables, cap_schema_text,
 )
+
+
+def _connect_with_hard_timeout(connect_kwargs, timeout_seconds):
+    """Runs pytds.connect(**connect_kwargs), bounded by a real external
+    deadline - unlike every other network-dialing backend in this app
+    (Postgres/MySQL/Redshift/Oracle/Snowflake), passing `login_timeout` to
+    pytds.connect() alone is NOT sufficient here, even though pytds's own
+    docs describe it the same way those drivers describe their own
+    connect_timeout/tcp_connect_timeout/login_timeout kwargs (see
+    backends/base.py's DB_CONNECT_TIMEOUT_SECONDS docstring).
+
+    Confirmed by reading pytds's own installed source (python-tds 1.17.1):
+    pytds.utils.exponential_backoff (which pytds.connect()'s retry loop
+    calls) tracks elapsed time via a running `cur_time` that gets bumped by
+    each attempt's own *allotted* sub-timeout - not by how long that
+    attempt actually took - whenever an attempt overruns it (exactly what
+    the "Work attempt exceeded it's allocated time" WARNING log lines mean:
+    every attempt overran, every time). That accounting quirk lets the
+    total wall-clock time before pytds finally gives up run well past the
+    `login_timeout` we hand it - observed in production taking ~3x the
+    configured budget against a since-unreachable Azure SQL Database
+    preset. There is no pytds.connect() kwarg that closes this gap (a
+    single retry-disabling flag exists, but the same per-attempt
+    accounting quirk still applies to that one remaining attempt if IT
+    hangs) - the only reliable fix is exactly this app's other precedent
+    for "a third-party client's own timeout can't be trusted as a hard
+    deadline": execute_routes.py's _execute_with_timeout, which wraps
+    backend.execute() in a ThreadPoolExecutor and enforces
+    future.result(timeout=...) itself, external to whatever the driver
+    does or doesn't honor internally.
+
+    `timeout_seconds <= 0` disables this entirely (mirroring
+    SQL_EXECUTE_TIMEOUT_SECONDS's own escape hatch in execute_routes.py) -
+    pytds.connect() then runs exactly as it did before this wrapper
+    existed, sole reliance on pytds's own (imperfect) login_timeout
+    accounting.
+
+    On a real timeout, the background thread is abandoned (not joined) -
+    same "the caller must not block waiting for it" reasoning
+    _execute_with_timeout's own docstring gives - but unlike an abandoned
+    query, an abandoned connect() that eventually DOES succeed leaves a
+    real, live SQL Server connection open with nothing left to ever close
+    it. A done-callback added after the timeout closes that connection the
+    moment it actually arrives, so a slow-but-eventually-successful connect
+    doesn't leak a live server-side session forever."""
+    if timeout_seconds <= 0:
+        return pytds.connect(**connect_kwargs)
+
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = pool.submit(pytds.connect, **connect_kwargs)
+    try:
+        try:
+            return future.result(timeout=timeout_seconds)
+        except concurrent.futures.TimeoutError:
+            future.add_done_callback(_close_late_connection)
+            raise TimeoutError(
+                f"Connection to SQL Server timed out after {timeout_seconds:g} seconds"
+            ) from None
+    finally:
+        # wait=False, always - see docstring above: this function must not
+        # block on the abandoned connect() attempt once it has already
+        # given up (or already returned).
+        pool.shutdown(wait=False)
+
+
+def _close_late_connection(future):
+    """Done-callback for a connect() attempt that outlived our own timeout
+    (see _connect_with_hard_timeout above) - closes the connection if one
+    eventually arrived, so it doesn't stay open on the server forever with
+    no reference left anywhere in this process to close it. Silently
+    no-ops for the far more common case (the attempt eventually raised too,
+    same underlying unreachable host) - nothing to close there."""
+    try:
+        connection = future.result()
+    except Exception:
+        return
+    try:
+        connection.close()
+    except Exception:
+        pass
 
 
 def _validate_host_via_cryptography(cert, name):
@@ -253,7 +335,7 @@ class MssqlBackend(Backend):
             # box with a certificate chaining to a public root).
             kwargs["cafile"] = certifi.where()
 
-        connection = pytds.connect(**kwargs)
+        connection = _connect_with_hard_timeout(kwargs, DB_CONNECT_TIMEOUT_SECONDS)
         # Stashed on the connection itself, not threaded through as a
         # get_schema() parameter - the Backend ABC's get_schema(connection)
         # signature (shared by all 8 dialects) takes only a connection, not

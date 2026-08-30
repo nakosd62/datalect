@@ -469,7 +469,7 @@ textarea:focus {
   min-width: 0;
 }
 
-.gear-btn, .help-btn, .history-btn {
+.gear-btn, .help-btn, .history-btn, .more-menu-btn {
   background: rgba(255, 255, 255, 0.05);
   border: 1px solid var(--bg-card-border);
   color: var(--text-primary);
@@ -485,7 +485,7 @@ textarea:focus {
   flex-shrink: 0;
 }
 
-.gear-btn svg, .help-btn svg, .history-btn svg {
+.gear-btn svg, .help-btn svg, .history-btn svg, .more-menu-btn svg {
   width: clamp(20px, 2.2vw, 29px);
   height: clamp(20px, 2.2vw, 29px);
 }
@@ -497,9 +497,50 @@ textarea:focus {
 }
 
 .help-btn:hover,
-.history-btn:hover {
+.history-btn:hover,
+.more-menu-btn:hover {
   background: rgba(255, 255, 255, 0.12);
   color: var(--primary);
+}
+
+/* Triple-dot "more" menu - collapses Help/History/Sign-in into one menu on
+   very narrow screens (see the @media (max-width: 480px) block below) so
+   the connection/model status badges stop getting squashed. Hidden by
+   default; only shown under that breakpoint. Reuses the .auth-dropdown-*
+   panel styling (see the Google Auth section further down) for visual
+   consistency with the existing avatar dropdown. */
+.more-menu-wrapper {
+  position: relative;
+  display: none;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.more-menu-dropdown {
+  min-width: 160px;
+}
+
+.more-menu-auth-slot:not(:empty) {
+  padding: 0.4rem 1rem 0.5rem;
+  display: flex;
+  align-items: center;
+}
+
+.more-menu-auth-slot .auth-container {
+  width: 100%;
+}
+
+/* The reparented #g_id_signin div is only ever truly empty when Google
+   auth isn't configured for this deployment (local dev) or hasn't
+   finished loading yet - hide the slot and its divider in that case so the
+   menu doesn't show a blank padded row. Reactive to renderAuthUI() filling
+   or clearing the container's innerHTML, no JS wiring needed. */
+.more-menu-auth-slot:has(> .auth-container:empty) {
+  display: none;
+}
+
+.auth-dropdown-divider:has(+ .more-menu-auth-slot > .auth-container:empty) {
+  display: none;
 }
 
 /* First-run onboarding cue: subtle glowing ring on the Help button so a
@@ -582,7 +623,23 @@ textarea:focus {
     gap: 0.35rem;
   }
   .status-badge {
-    max-width: 130px;
+    max-width: 168px;
+  }
+  /* Collapse Help/History/Sign-in into the triple-dot menu. The ">"
+     combinator matters here: it only hides #g_id_signin while it's still a
+     direct child of .header-actions (its original header position).
+     client.js's relocateMoreMenuAuthSlot() moves that same live node into
+     #moreMenuAuthSlot (inside the dropdown below) whenever this breakpoint
+     is active, at which point it's no longer a direct child here and stays
+     visible in its new spot - so sign-in/sign-out keeps working on mobile
+     instead of being hidden along with the header copy. */
+  .header-actions > .help-btn,
+  .header-actions > .history-btn,
+  .header-actions > .auth-container {
+    display: none !important;
+  }
+  .more-menu-wrapper {
+    display: inline-flex;
   }
 }
 
@@ -1212,6 +1269,29 @@ textarea:focus {
   text-overflow: ellipsis;
 }
 
+/* "All configured databases" (see renderDbRadioButtons() in client.js) -
+   the first option in the group, ahead of the "Pre-configured Database
+   Playgrounds" heading, since it applies across both presets and custom
+   connections rather than belonging to either list. Bolded like a heading
+   would be, to read as a distinct top-level choice rather than just
+   another item in the preset list right below it. */
+.all-databases-option {
+  font-weight: 600;
+  white-space: normal;
+  margin-bottom: 0.15rem;
+}
+
+/* Short explanation directly under the "All configured databases" option
+   (see renderDbRadioButtons() in client.js) - quieter/smaller than the
+   option's own label, same relationship .custom-db-security-note has to
+   the "Custom Database Connections" heading above. */
+.all-databases-hint {
+  font-size: 0.72rem;
+  line-height: 1.35;
+  color: var(--text-muted);
+  margin: 0 0 0.9rem;
+}
+
 .checkbox-option {
   display: flex;
   align-items: center;
@@ -1653,7 +1733,6 @@ textarea:focus {
   line-height: 1;
   cursor: pointer;
   padding: 0.15rem 0.4rem;
-  margin-left: auto;
   border-radius: 4px;
   transition: var(--transition);
 }

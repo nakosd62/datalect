@@ -319,6 +319,34 @@ those are saved per-user (see [Data persistence](#data-persistence)) and
 are **not** available to anonymous users. There's currently no admin-preset
 path for Snowflake — see `config_routes.py`'s module docstring.
 
+### Multi-database question answering
+
+The connection picker (the database badge's modal) is a checkbox list,
+not a single-select radio — a user can mark more than one preset/custom
+connection as "in scope" for their questions, and a session with 2+ boxes
+checked no longer has to say *which* connection a question is about
+before asking it. When a question genuinely needs data from more than one
+of them, `/api/translate` can generate more than one SQL statement in a
+single response, each tagged with which connection it targets via a
+leading `-- database: preset:<id>|custom:<key> (<name>)` comment; the
+database(s) a turn actually used stay pinned for the rest of that
+conversation, and `/api/execute` dispatches each tagged statement to its
+own connection (see the module docstrings on
+[`translate_routes.py`](./server/translate_routes.py),
+[`connection_router.py`](./server/connection_router.py), and
+[`execute_routes.py`](./server/execute_routes.py) for the full design).
+
+A session with 0 or 1 connections in scope — the default, and the
+overwhelming majority of sessions — takes none of this: no extra LLM
+call, no `-- database:` comment, no added latency, and `/api/translate`'s/
+`/api/execute`'s response shapes are byte-identical to before this
+feature existed.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MAX_IN_SCOPE_CONNECTIONS` | `20` | The one cap on how many database connections are involved anywhere in multi-database question-answering: how many presets/custom connections a user may mark "in scope" at once (see [`config_routes.py`](./server/config_routes.py)), and how many of those in-scope connections a single question's Phase A routing may select for one response (clamped server-side regardless of what the model returns — see [`connection_router.py`](./server/connection_router.py)). See [`app_config.py`](./server/app_config.py). |
+| `ROUTER_MAX_TABLE_NAMES_PER_CONNECTION` | `200` | Caps how many table/tab names go into Phase A's routing prompt per candidate connection — independent of `SCHEMA_MAX_TABLES`, since the router only ever needs names, never full column-level schema. See [`backends/base.py`](./server/backends/base.py). |
+
 ### Authentication
 
 | Variable | Default | Purpose |
@@ -444,9 +472,9 @@ assets require authentication when running on Cloud Run or when
 | Method & Path | Purpose |
 |---|---|
 | `GET /api/auth/me` | Who am I? Returns `authenticated`, `user_id`, `session_id`, `auth_required`. |
-| `GET/POST /api/config` | `GET`: current session's active DB, auto-execute preference, configured/custom databases, available models. `POST`: update active DB and/or auto-execute preference (saving a *custom* connection is rejected for anonymous users on Cloud Run). |
-| `POST /api/translate` | Body: `{ prompt, history, database_url?, gemini_model?, refresh_schema? }`. Returns `{ success, sql, *_tokens, duration }`. |
-| `POST /api/execute` | Body: `{ sql, database_url? }` — runs one or more `;`-separated statements and returns per-statement results. Returns the **raw** Postgres error message on failure (intentionally — this is a SQL runner, the user needs the real error to fix their query). |
+| `GET/POST /api/config` | `GET`: current session's active DB, auto-execute preference, configured/custom databases, available models, and the multi-database in-scope set (`in_scope_preset_ids`/`in_scope_custom_connection_keys`/`max_in_scope_connections` — see [Multi-database question answering](#multi-database-question-answering)). `POST`: update active DB, auto-execute preference, and/or the in-scope set (saving a *custom* connection is rejected for anonymous users on Cloud Run; an in-scope set must never end up empty). |
+| `POST /api/translate` | Body: `{ prompt, history, database_url?, gemini_model?, refresh_schema?, pinned_connections? }`. Returns `{ success, sql, *_tokens, duration }`, plus `connection_selection: [{kind, id, name}, ...]` whenever the session has 2+ connections in scope. |
+| `POST /api/execute` | Body: `{ sql, database_url?, pinned_connections? }` — runs one or more `;`-separated statements and returns per-statement results. A script with no `-- database: ...` marker runs against one connection exactly as before; a marker-tagged script (see [Multi-database question answering](#multi-database-question-answering)) dispatches each connection's statements independently and the response gains a `failures` list plus a `database` field per result when at least one connection's statements fail. Returns the **raw** Postgres error message on failure (intentionally — this is a SQL runner, the user needs the real error to fix their query). |
 | `GET /api/history` | Returns recent translations plus per-day usage stats for the current identity — including anonymous Cloud Run visitors, whose history is isolated per browser session. |
 | `DELETE/POST /api/history/purge` | Deletes all translation history for the current identity (same per-session isolation for anonymous visitors as above). |
 

@@ -1151,6 +1151,33 @@ def test_claude_schema_block_is_cache_control_marked_even_with_no_history(app_fa
     assert "cache_control" not in content[1]
 
 
+def test_claude_build_llm_input_with_no_history_and_no_schema_sends_one_unmarked_block(app_factory):
+    """Regression test: connection_router.py's Phase A always calls
+    build_llm_input(history=[], schema_block="", ...) - there's no schema
+    in play at that stage at all (see that module's docstring). Before this
+    was special-cased, an empty history fell into the same "conversation's
+    very first call" branch test_claude_schema_attaches_to_new_prompt_when_
+    there_is_no_history above covers - which unconditionally cache_control-
+    marks the schema block, even when it's "". Anthropic rejects
+    cache_control on an empty text block outright ("cache_control cannot
+    be set for empty text blocks"), so every Phase A call to Claude used to
+    fail with a 400 - select_relevant_connections has no way to tell that
+    apart from a genuine transient error, so it just retried once, failed
+    identically, and silently fell back to candidate 0 every single time,
+    regardless of the question. This test pins down the fix
+    directly at the build_llm_input level: an empty schema_block with no
+    history produces exactly one content block (the new prompt, as a plain
+    string - not a content-block list at all), never an empty
+    cache_control-marked block."""
+    env = app_factory(env={"ANTHROPIC_API_KEY": "fake-key-1"})
+    provider = env.translate_routes.ClaudeProvider()
+
+    messages = provider.build_llm_input([], "", "some new prompt")
+
+    assert len(messages) == 1
+    assert messages[0] == {"role": "user", "content": "some new prompt"}
+
+
 def test_claude_reports_cache_read_tokens_via_cached_content_tokens(app_factory, monkeypatch):
     """cached_content_tokens in the NDJSON response is how a caller sees
     whether caching is actually paying off - it's fed from Anthropic's

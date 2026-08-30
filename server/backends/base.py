@@ -65,7 +65,16 @@ SCHEMA_MAX_CHARS = int(os.environ.get("SCHEMA_MAX_SCHEMA_CHARS", 100_000))
 # Bounds how long connect() may block dialing/handshaking out to a real
 # network host - Postgres, MySQL, Redshift, Oracle, and Snowflake all thread
 # this through to their respective driver's own connect-phase timeout kwarg
-# (see each backend's connect()). Without it, a wrong/unreachable host in an
+# (see each backend's connect()). SQL Server (backends/mssql.py) also passes
+# it through as pytds's own login_timeout, but - unlike those five drivers -
+# pytds doesn't reliably honor it as a hard deadline (a real accounting bug
+# in its own retry/backoff loop lets total wall-clock time run well past the
+# configured budget - confirmed live against a since-unreachable Azure SQL
+# preset), so that backend ALSO wraps the call in its own external
+# ThreadPoolExecutor/future.result(timeout=...) enforcement (see
+# backends/mssql.py's _connect_with_hard_timeout) - the same "the driver's
+# own timeout can't be trusted" fix execute_routes.py's _execute_with_timeout
+# already applies to query execution. Without it, a wrong/unreachable host in an
 # admin-configured preset (bad hostname, closed security group, blackholed
 # route - exactly the DNS-resolution/connection-timeout failures worked
 # through live against a real Redshift Serverless workgroup) doesn't fail
@@ -100,6 +109,18 @@ SCHEMA_MAX_CHARS = int(os.environ.get("SCHEMA_MAX_SCHEMA_CHARS", 100_000))
 # (bigquery.Client() construction doesn't dial out synchronously the way a
 # real TCP connect() does).
 DB_CONNECT_TIMEOUT_SECONDS = int(os.environ.get("DB_CONNECT_TIMEOUT_SECONDS", 10))
+
+# Hard cap on how many table/tab names extract_entry_names_from_schema_text
+# (below) returns for one connection's schema - independent of
+# SCHEMA_MAX_TABLES (which bounds the full, column-level schema text this
+# is extracted FROM). This caps the router's own prompt size (see
+# connection_router.py's Phase A - it only ever needs table/tab NAMES, not
+# columns, to guess which connection(s) a question is about), which
+# otherwise would scale with however many entries survived
+# SCHEMA_MAX_TABLES on every in-scope connection at once, not just one.
+ROUTER_MAX_TABLE_NAMES_PER_CONNECTION = int(
+    os.environ.get("ROUTER_MAX_TABLE_NAMES_PER_CONNECTION", 200)
+)
 
 # Minimum number of same-prefix, date-suffixed tables before they're treated
 # as a date-shard family and collapsed into one schema entry (see
@@ -198,6 +219,64 @@ def cap_schema_text(text, max_chars=SCHEMA_MAX_CHARS):
         + "reduce SCHEMA_MAX_CHARS/SCHEMA_MAX_TABLES scope on this "
         + "connection's dataset, to see more of it.]"
     )
+
+
+# Matches the entry-heading convention every backend's get_schema() already
+# emits, one per table/table-family/tab entry, always as the first line of
+# that entry's block: "Table: <name>", "Table family: <name-pattern> (...)",
+# or Sheets' "Tab: <name> (...)" (see e.g. backends/postgres.py, .../
+# bigquery.py, .../sheets.py). This is already a load-bearing convention -
+# the BigQuery dialect prompt in translate_routes.py references "Table
+# family:" text directly - so parsing it here is leaning on an existing
+# contract, not inventing a new coupling.
+_ENTRY_HEADING_RE = re.compile(r'^(?:Table family|Table|Tab):\s*(.+)$', re.MULTILINE)
+
+# A heading's descriptive parenthetical, when present (every "Table family"/
+# "Tab" heading has one; a plain "Table:" heading never does) - e.g.
+# " (12 date-sharded tables, e.g. ...)" or " (query this as the implicit
+# data source ...)". Stripped so router candidate summaries show just the
+# bare name/pattern, not the full explanatory text meant for the SQL-
+# generation prompt.
+_HEADING_PARENTHETICAL_RE = re.compile(r'\s*\([^)]*\)\s*$')
+
+
+def extract_entry_names_from_schema_text(schema_text, max_names=ROUTER_MAX_TABLE_NAMES_PER_CONNECTION):
+    """Cheap, loose extraction of every table/table-family/tab NAME (no
+    columns) from a full schema_text already produced by some backend's
+    get_schema() - used to build compact per-connection summaries for
+    connection_router.py's Phase A (see that module), so the router prompt
+    can stay small regardless of how wide any one connection's full schema
+    is.
+
+    Loose and line-oriented by design, not a real parser of get_schema()'s
+    output: matches on the heading convention every backend already commits
+    to (see _ENTRY_HEADING_RE above), which is simpler and less brittle
+    than trying to reconstruct backend-specific structure here. Never
+    raises - a schema_text that doesn't match this convention at all (a
+    future backend that changes it, or the "No schema description
+    available." failure placeholder from db.py) just yields an empty list,
+    degrading connection_router.py's candidate summary to "name + dialect,
+    no table names" rather than failing the whole request.
+
+    Deterministic and capped: returns at most `max_names` entries, in the
+    order they appear in schema_text (get_schema() already emits them
+    alphabetically - see cap_kept_tables), so repeated calls against an
+    unchanged schema return the same subset. A "Table family: <prefix>_
+    <date> (...)" heading's captured name already IS the literal pattern
+    text (e.g. "events_<date>"), not a real table name - intentional, since
+    that's exactly what a human/model reading the summary should see: one
+    entry standing in for the whole family, same as the full schema text
+    itself does."""
+    if not schema_text:
+        return []
+    names = []
+    for match in _ENTRY_HEADING_RE.finditer(schema_text):
+        name = _HEADING_PARENTHETICAL_RE.sub("", match.group(1)).strip()
+        if name:
+            names.append(name)
+        if len(names) >= max_names:
+            break
+    return names
 
 
 def materialize_ca_cert_tempfile(ca_cert_pem):
