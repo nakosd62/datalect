@@ -296,7 +296,7 @@ body {
 .status-badge .conn-badge-icon {
   margin-left: 2px;
   margin-right: 3px;
-  color: var(--text-secondary);
+  color: var(--accent-cyan);
   width: clamp(10px, 1.5vw, 14px);
   height: clamp(10px, 1.5vw, 14px);
 }
@@ -444,7 +444,7 @@ textarea:focus {
   transform: translateY(-50%);
   background: transparent;
   border: none;
-  color: var(--text-secondary);
+  color: var(--accent-cyan);
   cursor: pointer;
   padding: 6px;
   border-radius: 50%;
@@ -657,7 +657,6 @@ textarea:focus {
 .gear-btn, .help-btn, .history-btn, .more-menu-btn {
   background: var(--overlay-2);
   border: 1px solid var(--bg-card-border);
-  color: var(--text-primary);
   padding: 0.35rem;
   border-radius: 50%;
   cursor: pointer;
@@ -668,6 +667,21 @@ textarea:focus {
   width: clamp(36px, 4vw, 50px);
   height: clamp(36px, 4vw, 50px);
   flex-shrink: 0;
+}
+
+/* Doc/History/Preferences icons pick up the app's brand blue (matches the
+   logo and progress-reporting UI - see --accent-cyan) instead of the plain
+   text color, so they read as intentional brand accents rather than
+   generic UI chrome. The triple-dot "more" menu button (folds these three
+   into one menu on narrow screens) intentionally keeps the neutral
+   --text-primary color - it wasn't part of this ask and isn't a
+   brand-level action the way Doc/History/Preferences are. */
+.more-menu-btn {
+  color: var(--text-primary);
+}
+
+.gear-btn, .help-btn, .history-btn {
+  color: var(--accent-cyan);
 }
 
 .gear-btn svg, .help-btn svg, .history-btn svg, .more-menu-btn svg {
@@ -867,7 +881,7 @@ textarea:focus {
   position: relative;
   flex: 1;
   background: var(--surface-1);
-  border: 3px solid var(--surface-3);
+  border: 3px solid rgba(var(--accent-cyan-rgb), 0.35);
   border-radius: 0;
   transform: none;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4), inset 0 0 12px rgba(var(--primary-rgb), 0.08);
@@ -877,7 +891,7 @@ textarea:focus {
 
 .speech-bubble-wrapper.sql-bubble {
   background: var(--surface-1);
-  border: 3px solid var(--surface-3);
+  border: 3px solid rgba(var(--accent-cyan-rgb), 0.35);
   border-radius: 0;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4), inset 0 0 12px rgba(var(--primary-rgb), 0.08);
   height: 100px;
@@ -980,9 +994,9 @@ textarea:focus {
   border-radius: 4px;    /* scaled down radius */
   z-index: 2;
   /* z-index: 10; Ensures it renders on top of CodeMirror scroll/gutters */
-  background: rgba(var(--primary-rgb), 0.85); /* Emerald accent */
+  background: rgba(var(--accent-cyan-rgb), 0.85); /* Brand blue accent - matches logo/icons */
   color: #ffffff;
-  border: 1px solid rgba(var(--primary-hover-rgb), 0.4);
+  border: 1px solid rgba(var(--accent-cyan-rgb), 0.4);
   border-radius: 6px;
   backdrop-filter: blur(4px);
   cursor: pointer;
@@ -990,8 +1004,8 @@ textarea:focus {
 }
 
 #runBtn.sql-overlay-btn:hover:not(:disabled) {
-  background: rgba(var(--primary-rgb), 1);
-  box-shadow: 0 0 10px rgba(var(--primary-rgb), 0.4);
+  background: rgba(var(--accent-cyan-rgb), 1);
+  box-shadow: 0 0 10px rgba(var(--accent-cyan-rgb), 0.4);
 }
 
 #runBtn.sql-overlay-btn:disabled {
@@ -1374,7 +1388,7 @@ textarea:focus {
   text-align: center;
   padding: 0.35rem 0;
   border-top: 1px solid var(--bg-card-border);
-  color: var(--text-muted);
+  color: var(--accent-cyan);
   font-size: 0.825rem;
   margin-top: 0.25rem;
 }
@@ -2617,18 +2631,26 @@ textarea:focus {
   justify-content: center;
   background: transparent;
   border: none;
-  color: var(--text-primary);
   user-select: none;
 }
 
+.speech-bubble-wrapper .inline-history-nav span {
+  color: var(--text-primary);
+}
+
+/* The </> history-navigation arrows pick up the app's brand blue (see
+   --accent-cyan), matching the mic icon in the same input box; the
+   turn-position label (e.g. "3/7") next to them stays the neutral
+   --text-primary color above since it isn't a clickable control. */
 .speech-bubble-wrapper .inline-history-nav button {
+  color: var(--accent-cyan);
   cursor: pointer;
   transition: var(--transition);
 }
 
 .speech-bubble-wrapper .inline-history-nav button:hover {
   background: var(--overlay-18);
-  color: var(--text-primary);
+  color: var(--accent-cyan);
 }
 
 .speech-bubble-wrapper .inline-history-nav button:first-child {
