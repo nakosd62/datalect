@@ -17,11 +17,11 @@ async function openModelModal(page) {
 test.describe('model selection modal', () => {
   test('badge shows the default model on load', async ({ page }) => {
     await gotoApp(page);
-    // Reflects the real dev .env's GOOGLE_MODELS (no override in
-    // playwright.config.js's webServer env) - its first entry,
-    // gemini-3.7-flash, which also happens to match this app's own
-    // hardcoded fallback default (see GeminiProvider.fallback_models).
-    await expect(page.locator('#modelBadgeName')).toHaveText('gemini-3.7-flash');
+    // playwright.config.js's webServer deliberately skips the real dev
+    // .env (YDYL_SKIP_DOTENV) and sets no GOOGLE_MODELS override, so this
+    // reflects the app's own hardcoded fallback default -
+    // GeminiProvider.fallback_models.
+    await expect(page.locator('#modelBadgeName')).toHaveText('gemini-3.6-flash');
   });
 
   test('opens showing one radio-group heading per provider, and closes', async ({ page }) => {
@@ -33,7 +33,7 @@ test.describe('model selection modal', () => {
     await expect(radioGroup.locator('input[type="radio"]').first()).toBeVisible();
 
     // The currently-active model's radio is the one pre-checked.
-    await expect(page.locator('input[name="llm_model_option"]:checked')).toHaveValue('google::gemini-3.7-flash');
+    await expect(page.locator('input[name="llm_model_option"]:checked')).toHaveValue('google::gemini-3.6-flash');
 
     await page.locator('#modelModalCloseBtn').click();
     await expect(page.locator('#modelModal')).toHaveClass(/hidden/);

@@ -760,10 +760,17 @@ textarea:focus {
   50% { box-shadow: 0 0 0 6px var(--primary-glow); }
 }
 
-/* Anonymous-user restricted state - applied to the DB config badge and
-   the history button when the current (Cloud Run) request has no
-   verified login. Visually grayed-out; clicking shows an explanatory
-   modal instead of the normal dialog (handled in client.js). */
+/* Generic "grayed out, not clickable right now" look, shared by two
+   unrelated situations client.js triggers independently:
+   - .icon-disabled on the history button: an anonymous-user restricted
+     state (no verified login on this Cloud Run request) - clicking is
+     meant to show an explanatory modal instead of the normal one, though
+     that particular behavior isn't wired up yet.
+   - .badge-disabled on the DB connection / model badges: toggled by
+     setButtonsDisabled() while a query is in flight, so the active
+     connection/model can't be swapped out from under it - clicking is a
+     plain no-op here (see modelTriggerBadge's/configTriggerBadge's own
+     'click' listeners). */
 .history-btn.icon-disabled,
 .status-badge.badge-disabled {
   opacity: 0.45;
@@ -2091,6 +2098,28 @@ textarea:focus {
   display: flex;
   align-items: center;
   flex-shrink: 0;
+}
+
+/* Toggled by setButtonsDisabled() while a query is in flight - same
+   "don't let the ground shift under an in-flight turn" reasoning as
+   .badge-disabled above, for a control that can ALSO reset in-flight
+   state: the signed-out button starts a Google sign-in, and its
+   callback (renderAuthUI()) unconditionally calls
+   clearActiveQueryState() + fetchBackendConfig() once it completes; the
+   signed-in avatar's "Log out" does the exact same thing via
+   handleLogout(). Either firing mid-turn was the "unpredictable result"
+   this exists to prevent. pointer-events: none is what actually blocks
+   it - the signed-out button is Google's own cross-origin iframe
+   (google.accounts.id.renderButton()), which client.js has no script
+   access to and so cannot otherwise intercept clicks on; pointer-events
+   set on this ancestor stops the browser from ever delivering the click
+   to it (or to the signed-in state's real DOM avatar button) in the
+   first place, entirely at the hit-testing/compositing level, no
+   iframe cooperation required. */
+.auth-container.auth-disabled {
+  pointer-events: none;
+  opacity: 0.45;
+  filter: grayscale(1);
 }
 
 .auth-menu-wrapper {

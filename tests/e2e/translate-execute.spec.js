@@ -236,6 +236,58 @@ test.describe('translate + execute', () => {
     await expect.poll(() => normalizedSql(page), { timeout: 5000 }).toContain('SELECT 1');
   });
 
+  // Regression guard: the DB connection and model badges used to stay
+  // fully clickable while a translate/execute call was in flight, letting
+  // someone swap the active connection or model out from under a request
+  // that was already running against the old one. setButtonsDisabled()
+  // now grays both out (badge-disabled) and their own click handlers no-op
+  // while that class is present - see its comment in client.js. The
+  // doc/history/preferences icons are deliberately NOT covered by this -
+  // none of their popups touch state an in-flight turn depends on.
+  test('the DB connection and model badges are disabled while a query is in flight, and re-enabled once it settles', async ({ page }) => {
+    let resolveTranslate;
+    const translateStarted = new Promise((resolve) => { resolveTranslate = resolve; });
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      resolveTranslate();
+      await new Promise((r) => setTimeout(r, 2000));
+      await route.fulfill({
+        status: 200, contentType: 'application/x-ndjson',
+        body: JSON.stringify({ status: 'done', success: true, sql: 'SELECT 1;' }) + '\n',
+      });
+    });
+    await gotoApp(page);
+
+    const dbBadge = page.locator('#configTriggerBadge');
+    const modelBadge = page.locator('#modelTriggerBadge');
+    const historyBtn = page.locator('#historyBtn');
+
+    // Sanity check on the resting state, before anything is in flight.
+    await expect(dbBadge).not.toHaveClass(/badge-disabled/);
+    await expect(modelBadge).not.toHaveClass(/badge-disabled/);
+
+    await page.locator('#aiPrompt').fill('anything');
+    await page.locator('#aiPrompt').press('Enter');
+    await translateStarted;
+
+    await expect(dbBadge).toHaveClass(/badge-disabled/);
+    await expect(modelBadge).toHaveClass(/badge-disabled/);
+    // Not just visually grayed out - actually inert. Clicking either while
+    // disabled must not open its modal.
+    await dbBadge.click();
+    await expect(page.locator('#configModal')).toHaveClass(/hidden/);
+    await modelBadge.click();
+    await expect(page.locator('#modelModal')).toHaveClass(/hidden/);
+    // An unrelated icon (history) stays fully enabled the whole time - its
+    // popup doesn't touch the active connection/model.
+    await expect(historyBtn).not.toBeDisabled();
+
+    await expect.poll(() => normalizedSql(page), { timeout: 5000 }).toContain('SELECT 1');
+
+    await expect(dbBadge).not.toHaveClass(/badge-disabled/);
+    await expect(modelBadge).not.toHaveClass(/badge-disabled/);
+  });
+
   test('directly entering and running SQL bypasses translate entirely', async ({ page }) => {
     await mockExecute(page, {
       results: [{ columns: ['n'], rows: [{ n: 42 }], rowCount: 1 }],

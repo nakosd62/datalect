@@ -32,7 +32,7 @@ methods on an LlmProvider object (get_llm_provider(session_data.get(
 'llm_provider')) - see that function's and the LlmProvider class's
 docstrings in translate_routes.py; there's no separate LLM_PROVIDER env
 var anymore - a fresh session with nothing saved falls back to the one
-hardcoded default, Google/gemini-3.7-flash). The tests below don't test
+hardcoded default, Google/gemini-3.6-flash). The tests below don't test
 that class directly except in a small dedicated section near the end;
 they exercise it the same way they always exercised the old if/elif
 branches - through /api/translate with the session's saved llm_provider
@@ -2071,8 +2071,8 @@ def test_unrecognized_persisted_llm_provider_falls_back_to_google_end_to_end(app
 
 def test_preset_models_and_default_model_fall_back_when_env_var_unset(app_env):
     tr = app_env.translate_routes
-    assert tr.get_llm_provider("google").preset_models == ["gemini-3.7-flash"]
-    assert tr.get_llm_provider("google").default_model == "gemini-3.7-flash"
+    assert tr.get_llm_provider("google").preset_models == ["gemini-3.6-flash"]
+    assert tr.get_llm_provider("google").default_model == "gemini-3.6-flash"
     assert tr.get_llm_provider("anthropic").preset_models == ["claude-sonnet-5"]
     assert tr.get_llm_provider("anthropic").default_model == "claude-sonnet-5"
     assert tr.get_llm_provider("openai").preset_models == ["gpt-5.6-luna"]
@@ -2123,8 +2123,8 @@ def test_list_llm_providers_info_returns_all_three_providers_in_order(app_env):
     info = app_env.translate_routes.list_llm_providers_info()
     assert [p["name"] for p in info] == ["google", "anthropic", "openai"]
     gemini_info = info[0]
-    assert gemini_info["default_model"] == "gemini-3.7-flash"
-    assert gemini_info["preset_models"] == ["gemini-3.7-flash"]
+    assert gemini_info["default_model"] == "gemini-3.6-flash"
+    assert gemini_info["preset_models"] == ["gemini-3.6-flash"]
 
 
 # --- Session-persisted model selection (model-selection UI) ------------------

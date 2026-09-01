@@ -228,7 +228,7 @@ def select_llm_provider(env, provider_name):
     code path without a per-fleet LLM_PROVIDER env var - there isn't one
     anymore (see translate_routes.py's module docstring): a fresh session
     with nothing saved now falls back to the one hardcoded default,
-    Google/gemini-3.7-flash, rather than an env-configurable provider.
+    Google/gemini-3.6-flash, rather than an env-configurable provider.
 
     Call this AFTER app_factory() (it needs `env.app_config.state_store`,
     initialized by fresh_import()) and BEFORE the first /api/translate

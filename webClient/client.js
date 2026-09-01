@@ -994,6 +994,37 @@ document.addEventListener('DOMContentLoaded', async () => {
     // flight - it's the inverse of every other control toggled above.
     if (stopBtn) stopBtn.classList.toggle('hidden', !disabled);
 
+    // DB connection / model badges: opening either popup mid-turn would let
+    // someone switch the active connection or model out from under a
+    // request that's already running against the OLD one - the same
+    // "don't let the ground shift under an in-flight turn" reasoning as
+    // locking aiPrompt/sqlEditor above, just for a different pair of
+    // controls. badge-disabled is an existing (previously unused) "grayed
+    // out, not-allowed cursor" style - see its own comment in style.css,
+    // written for a different, still-unwired anonymous-user scenario, but
+    // the visual is exactly right here too, so it's reused rather than
+    // adding a near-identical second class. The badges are plain <div>s
+    // (no native `disabled`), so the click handlers themselves check for
+    // this class and no-op - see modelTriggerBadge's/configTriggerBadge's
+    // own 'click' listeners below. The doc/history/preferences icons next
+    // to them are deliberately left alone: none of their popups touch the
+    // active connection, model, or any state an in-flight turn depends on.
+    if (configTriggerBadge) configTriggerBadge.classList.toggle('badge-disabled', disabled);
+    if (modelTriggerBadge) modelTriggerBadge.classList.toggle('badge-disabled', disabled);
+
+    // Sign-in/sign-out control: signing in or out mid-turn tears down the
+    // whole active turn out from under it (see auth-disabled's own comment
+    // in style.css for exactly what renderAuthUI()'s sign-in callback and
+    // handleLogout() each do) - previously fully clickable throughout, with
+    // "unpredictable" results. Queried live rather than cached at the top
+    // of the file - same reasoning as the example-chip lookup above: this
+    // container's own node persists for the page's whole life (only its
+    // innerHTML is rebuilt, by renderAuthUI()), but querying it fresh here
+    // means this still works regardless of where in the file
+    // setButtonsDisabled() is called from.
+    const authContainer = document.getElementById('g_id_signin');
+    if (authContainer) authContainer.classList.toggle('auth-disabled', disabled);
+
     if (disabled) {
       if (goBackBtn) goBackBtn.disabled = true;
       if (goForwardBtn) goForwardBtn.disabled = true;
@@ -1072,7 +1103,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   // Single-connection-mode progress label ("Reading the database schema…",
-  // then "Writing the right command for the database…" - see
+  // then "Generating commands for the database…" - see
   // translate_routes.py's stream_translation() docstring for the
   // "phase_status" event this renders). Reuses the same banner element/
   // styling as showRetryStatus()/showAllModeStreamStatus() above rather
@@ -2618,6 +2649,11 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   if (modelTriggerBadge && modelModal) {
     modelTriggerBadge.addEventListener('click', async () => {
+      // See setButtonsDisabled()'s own comment on badge-disabled - a query
+      // is in flight, so opening this modal is blocked entirely rather
+      // than just visually grayed out (the div has no native `disabled`
+      // to rely on for that).
+      if (modelTriggerBadge.classList.contains('badge-disabled')) return;
       await fetchBackendConfig();
       renderModelRadioButtons();
       const modelSaveErrorEl = document.getElementById('modelSaveError');
@@ -3408,6 +3444,11 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   if (configTriggerBadge && configModal) {
     configTriggerBadge.addEventListener('click', async () => {
+      // See setButtonsDisabled()'s own comment on badge-disabled - a query
+      // is in flight, so opening this modal is blocked entirely rather
+      // than just visually grayed out (the div has no native `disabled`
+      // to rely on for that).
+      if (configTriggerBadge.classList.contains('badge-disabled')) return;
       // Anonymous users may open this dialog too - they can switch between
       // admin-configured presets AND save their own custom connections
       // (see isAnonymousUser's comment above and config_routes.py's
@@ -4625,7 +4666,8 @@ document.addEventListener('DOMContentLoaded', async () => {
       // side generation is done for this connection" signal, distinct from
       // settledCount just above (which only counts a real-SQL connection
       // once its execution ALSO finishes). Drives showAllModeStreamStatus()'s
-      // "Writing the right command…" -> "Fetching data…" transition below.
+      // "Generating commands (…)" -> "…and fetching results (…)" transition
+      // below.
       generationSettledCount: 0,
       // Per-connection /api/execute calls kicked off below (auto-execute
       // only) - translatePrompt() awaits all of these before it can
@@ -4888,7 +4930,8 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // Generation is done for this connection regardless of outcome - see
     // generationSettledCount's own declaration comment and
-    // showAllModeStreamStatus()'s "Writing…" -> "Fetching…" transition.
+    // showAllModeStreamStatus()'s "Generating commands…" -> "…and fetching
+    // results…" transition.
     state.generationSettledCount += 1;
 
     if (evt.outcome === 'note') {
@@ -4945,10 +4988,10 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     state.pendingExecutions.push(executeOneAllModeConnection(evt));
     // Re-render immediately (rather than waiting for this or some OTHER
-    // connection's own execution to finish) so the banner's "Writing…" ->
-    // "Fetching data…" transition fires the instant generation finishes
-    // for every connection, not whenever the next unrelated rerender
-    // happens to occur afterward.
+    // connection's own execution to finish) so the banner's "and fetching
+    // results (…)" clause appears the instant generation finishes for
+    // every connection, not whenever the next unrelated rerender happens
+    // to occur afterward.
     rerenderAllModeStream();
   }
 

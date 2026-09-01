@@ -5,11 +5,16 @@ MySQL-compatible databases, Google BigQuery, and Snowflake. Type a question in p
 language), review the SQL it generates, and run it — all from a single-page
 web app backed by a small Flask API.
 
-- **NL → SQL** via Gemini, grounded in a live introspection of your
-  database schema (tables, columns, constraints, indexes, views, grants,
-  triggers).
+- **NL → SQL** via your choice of Google Gemini, Anthropic Claude, or
+  OpenAI (switchable per session from the model badge), grounded in a
+  live introspection of your database schema (tables, columns,
+  constraints, indexes, views, grants, triggers).
 - **Multi-turn conversations** — the last 10 turns (prompt, SQL, and
   results) are kept in memory so follow-up questions have context.
+- **Multi-database question answering** — mark 2+ connections in scope
+  (or switch to "all configured databases") and ask a question without
+  saying which one it's about; a cheap triage step decides what's
+  actually needed, and results stream in per-database as they finish.
 - **Runs anywhere** — SQLite-backed for local development, Firestore-backed
   automatically when deployed on Cloud Run.
 - **Optional Google Sign-In** — works fully anonymously by default,
@@ -43,14 +48,20 @@ web app backed by a small Flask API.
    **Quick prompts** chips to try it immediately).
 2. The server introspects your target database's `public` schema
    (cached for a few minutes — see [`SCHEMA_CACHE_TTL_SECONDS`](#configuration))
-   and sends it, your prompt, and recent chat history to Gemini.
+   and sends it, your prompt, and recent chat history to whichever LLM
+   provider/model your session currently has selected — Gemini by
+   default, or Claude/OpenAI if you've switched (see
+   [Model selection UI](#model-selection-ui)).
 3. The generated SQL appears in the **SQL editor** box for you to review
    or edit — nothing runs automatically unless you've turned on
    **Automatic SQL Execution** in the connection settings.
 4. Click **Execute** to run it against the database and see results,
    grouped by statement if the model returned more than one query.
 
-If Gemini decides your prompt doesn't need SQL at all (a general
+While a translate or execute call is in flight, click **Cancel** to
+abandon it — see `POST /api/cancel` in the [API reference](#api-reference).
+
+If the model decides your prompt doesn't need SQL at all (a general
 knowledge question, or a question about the app itself), it responds
 directly instead — see the system prompt in
 [`translate_routes.py`](./server/translate_routes.py) for the exact protocol
@@ -79,10 +90,12 @@ directly instead — see the system prompt in
 │   ├── auth.py                # Session/identity resolution, auth guard, /api/auth/me
 │   ├── db.py                  # Connection resolution, schema introspection
 │   ├── schema_cache.py        # Short-TTL in-memory cache for schema introspection text
+│   ├── cancel_registry.py     # Process-local registry backing the Stop button / POST /api/cancel
 │   ├── state_store.py         # StateStore abstraction: SqliteStateStore / FirestoreStateStore
 │   ├── config_routes.py       # /api/config — session DB + model selection
-│   ├── translate_routes.py    # /api/translate — Gemini NL -> SQL, API key selection/retry
-│   ├── execute_routes.py      # /api/execute — run SQL, return results
+│   ├── connection_router.py   # "All databases" mode's triage step (see Multi-database question answering)
+│   ├── translate_routes.py    # /api/translate — NL -> SQL across 3 LLM providers, API key selection/retry
+│   ├── execute_routes.py      # /api/execute, /api/cancel — run SQL, return results
 │   └── history_routes.py      # /api/history, /api/history/purge
 └── webClient/                 # Static frontend, served by Flask (../webClient relative to server/)
     ├── index.html
@@ -188,7 +201,7 @@ env var - each signed-in/anonymous session picks its own provider and model
 via the model-selection badge in the app's header (see "Model selection UI"
 below); that per-session choice is what `/api/translate` actually uses once
 one has been saved, falling back to this app's one hardcoded default
-(`google` / `gemini-3.7-flash`) otherwise. See
+(`google` / `gemini-3.6-flash`) otherwise. See
 [`translate_routes.py`](./server/translate_routes.py)'s module docstring
 for how a new provider is added (one `LlmProvider` subclass); this section
 just covers the env vars for the three that exist today.
@@ -205,7 +218,7 @@ just covers the env vars for the three that exist today.
 |---|---|---|
 | `GEMINI_API_KEY` / `GOOGLE_API_KEY` | — | A single Gemini API key. Either name works. |
 | `GEMINI_PRESET_KEYS` | — | Comma-separated list of additional Gemini API keys. The app picks one at random per request and, on a rate-limit (429) error, automatically retries with a different key from the pool — immediately, with no delay, for up to one attempt per configured key (this budget is independent of `MAX_TRANSLATION_ATTEMPTS` above and is a Gemini-only mechanism; no other provider rotates keys this way). See [`translate_routes.py`](./server/translate_routes.py) for the full retry policy. |
-| `GOOGLE_MODELS` | `gemini-3.7-flash` | Comma-separated list of models this provider can use. The **first** entry is the default used for translation (per-request override: `gemini_model` or the generic `model`; per-session override via the model-selection UI) - and, since this is also the app's default provider, this first entry doubles as the app's one fleet-wide default model when no session has picked anything at all yet. The full list is what the model-selection UI offers for Google. |
+| `GOOGLE_MODELS` | `gemini-3.6-flash` | Comma-separated list of models this provider can use. The **first** entry is the default used for translation (per-request override: `gemini_model` or the generic `model`; per-session override via the model-selection UI) - and, since this is also the app's default provider, this first entry doubles as the app's one fleet-wide default model when no session has picked anything at all yet. The full list is what the model-selection UI offers for Google. |
 
 At least one of `GEMINI_API_KEY`, `GOOGLE_API_KEY`, or
 `GEMINI_PRESET_KEYS` must be set, or `/api/translate` returns a 400
@@ -252,7 +265,7 @@ subsequent `/api/translate` call from that session uses it, though a
 request-body override (`gemini_model`/`claude_model`/`openai_model`/
 `model`) still wins over the session's saved choice when both are present.
 A session that has never saved a selection falls back to this app's one
-hardcoded default (`google` / `gemini-3.7-flash`), exactly as before this
+hardcoded default (`google` / `gemini-3.6-flash`), exactly as before this
 UI existed.
 
 ### Database connections
@@ -321,32 +334,45 @@ path for Snowflake — see `config_routes.py`'s module docstring.
 
 ### Multi-database question answering
 
-The connection picker (the database badge's modal) is a checkbox list,
-not a single-select radio — a user can mark more than one preset/custom
-connection as "in scope" for their questions, and a session with 2+ boxes
-checked no longer has to say *which* connection a question is about
-before asking it. When a question genuinely needs data from more than one
-of them, `/api/translate` can generate more than one SQL statement in a
-single response, each tagged with which connection it targets via a
-leading `-- database: preset:<id>|custom:<key> (<name>)` comment; the
-database(s) a turn actually used stay pinned for the rest of that
-conversation, and `/api/execute` dispatches each tagged statement to its
-own connection (see the module docstrings on
+The connection badge is a radio choice between a **single active
+connection** (the default) and **all configured databases**
+(`in_scope_mode`, "single" or "all"). Switching to "all" also opens a
+checkbox list, in the same badge's modal, for marking which
+presets/custom connections are actually "in scope" for questions
+(`in_scope_preset_ids`/`in_scope_custom_connection_keys`) — a session no
+longer has to say *which* connection a question is about before asking
+it.
+
+In "all" mode, every question first goes through a cheap **triage** call
+([`connection_router.py`](./server/connection_router.py)'s
+`triage_all_mode_question`) that decides, from just the in-scope
+connections' names/dialects/table names — no full schema fetch yet —
+whether the question can be answered directly (e.g. "which of these are
+Postgres?") or genuinely needs real data, and if so from which specific
+connection(s). Only when real data is needed does the app fetch full
+column-level schema and generate SQL, one call per selected connection
+in parallel, each tagged with a leading
+`-- database: preset:<id>|custom:<key> (<name>)` comment; `/api/execute`
+dispatches each tagged statement to its own connection. Results stream
+back into their own tab as each connection finishes — you don't wait for
+the slowest one to see the first result — and once every connection has
+settled, a final call summarizes the combined results into a leading
+**Results Summary** tab (see the module docstrings on
 [`translate_routes.py`](./server/translate_routes.py),
 [`connection_router.py`](./server/connection_router.py), and
-[`execute_routes.py`](./server/execute_routes.py) for the full design).
-The marker comment itself is stripped back out before a statement ever
-reaches its own connection's `execute()` call, so it plays no part in the
-actual query — this matters beyond tidiness for a Google Sheets connection
-specifically, since GViz (its query language) has no comment syntax at all
-and would otherwise reject a marker-tagged statement outright (see
-`execute_routes.py`'s `_strip_database_marker_lines`).
+[`execute_routes.py`](./server/execute_routes.py) for the full
+triage/generation/summary design). The marker comment itself is stripped
+back out before a statement ever reaches its own connection's `execute()`
+call, so it plays no part in the actual query — this matters beyond
+tidiness for a Google Sheets connection specifically, since GViz (its
+query language) has no comment syntax at all and would otherwise reject a
+marker-tagged statement outright (see `execute_routes.py`'s
+`_strip_database_marker_lines`).
 
-A session with 0 or 1 connections in scope — the default, and the
-overwhelming majority of sessions — takes none of this: no extra LLM
-call, no `-- database:` comment, no added latency, and `/api/translate`'s/
-`/api/execute`'s response shapes are byte-identical to before this
-feature existed.
+A session in "single" mode — the default, and the overwhelming majority
+of sessions — takes none of this: no triage call, no `-- database:`
+comment, no added latency, and `/api/translate`'s/`/api/execute`'s
+response shapes are byte-identical to before this feature existed.
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -479,8 +505,9 @@ assets require authentication when running on Cloud Run or when
 |---|---|
 | `GET /api/auth/me` | Who am I? Returns `authenticated`, `user_id`, `session_id`, `auth_required`. |
 | `GET/POST /api/config` | `GET`: current session's active DB, auto-execute preference, configured/custom databases, available models, and the multi-database in-scope set (`in_scope_preset_ids`/`in_scope_custom_connection_keys`/`max_in_scope_connections` — see [Multi-database question answering](#multi-database-question-answering)). `POST`: update active DB, auto-execute preference, and/or the in-scope set (saving a *custom* connection is rejected for anonymous users on Cloud Run; an in-scope set must never end up empty). |
-| `POST /api/translate` | Body: `{ prompt, history, database_url?, gemini_model?, refresh_schema?, pinned_connections? }`. Returns `{ success, sql, *_tokens, duration }`, plus `connection_selection: [{kind, id, name}, ...]` whenever the session has 2+ connections in scope. |
+| `POST /api/translate` | Body: `{ prompt, history, database_url?, gemini_model?/claude_model?/openai_model?/model?, refresh_schema?, pinned_connections? }` — a model override always wins over the session's saved model-selection choice (see [Model selection UI](#model-selection-ui)). Returns `{ success, sql, *_tokens, duration }`, plus `connection_selection: [{kind, id, name}, ...]` in "all" mode (see [Multi-database question answering](#multi-database-question-answering)). |
 | `POST /api/execute` | Body: `{ sql, database_url?, pinned_connections? }` — runs one or more `;`-separated statements and returns per-statement results. A script with no `-- database: ...` marker runs against one connection exactly as before; a marker-tagged script (see [Multi-database question answering](#multi-database-question-answering)) dispatches each connection's statements independently and the response gains a `failures` list plus a `database` field per result when at least one connection's statements fail. Returns the **raw** Postgres error message on failure (intentionally — this is a SQL runner, the user needs the real error to fix their query). |
+| `POST /api/cancel` | Best-effort abandonment of whatever's currently in flight for this browser session (an `/api/translate` LLM call, or an `/api/execute` database call) — backs the header's **Cancel** button. Always returns `{ success: true, cancelled: <count> }`, even when nothing was registered (the work may have already finished on its own). See [`cancel_registry.py`](./server/cancel_registry.py) for the mechanism and its limits — it's a best-effort nudge (closing whatever connection/client the work is blocked on), not a guaranteed hard stop. |
 | `GET /api/history` | Returns recent translations plus per-day usage stats for the current identity — including anonymous Cloud Run visitors, whose history is isolated per browser session. |
 | `DELETE/POST /api/history/purge` | Deletes all translation history for the current identity (same per-session isolation for anonymous visitors as above). |
 

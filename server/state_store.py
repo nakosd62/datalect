@@ -377,7 +377,7 @@ class StateStore(ABC):
         not auto_sql_execute's baked-in-default one) are the user's saved
         model-selection choice (see translate_routes.py's LlmProvider/
         get_llm_provider). A blank value means "use this app's one
-        hardcoded default (Google/gemini-3.7-flash)" - resolved at the
+        hardcoded default (Google/gemini-3.6-flash)" - resolved at the
         point of use (translate_query() calls get_llm_provider(''), whose
         own fallback IS that hardcoded default - see its docstring), not
         baked into a default here, since unlike auto_sql_execute's

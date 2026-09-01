@@ -109,7 +109,7 @@ translate_bp = Blueprint('translate', __name__)
 # configuration - claude-sonnet-5 for Anthropic (strong structured-output
 # reasoning at a much lower cost than the top-tier model), gpt-5.6-luna for
 # OpenAI (its cost-efficient tier - "gpt-5.6" alone, no suffix, is an alias
-# for the top "-sol" tier instead), gemini-3.7-flash for Google - this last
+# for the top "-sol" tier instead), gemini-3.6-flash for Google - this last
 # one doubles as the app's ONE fleet-wide default when a session hasn't
 # picked a provider at all yet (see get_llm_provider() below and the
 # comment above this one).
@@ -1021,7 +1021,7 @@ class GeminiProvider(LlmProvider):
     # The app's ONE hardcoded fleet-wide default (see get_llm_provider()'s
     # docstring) - a session that never picked a provider at all ends up
     # here, with this list's first entry as the model actually used.
-    fallback_models = ["gemini-3.7-flash"]
+    fallback_models = ["gemini-3.6-flash"]
     missing_key_error = "Google API key is not configured."
     supports_key_rotation = True
 
@@ -2079,7 +2079,7 @@ def translate_query():
                 yield json.dumps({
                     "status": "phase_status",
                     "phase": "routing",
-                    "message": "Deciding which database(s) to check…",
+                    "message": "Deciding which databases to contact…",
                 }) + "\n"
                 triage_result = triage_all_mode_question(
                     candidate_summaries, prompt, provider, client, llm_model, history=history,
@@ -2365,7 +2365,7 @@ def translate_query():
             yield json.dumps({
                 "status": "phase_status",
                 "phase": "generating_sql",
-                "message": "Writing the right command for the database…",
+                "message": "Generating commands for the database…",
             }) + "\n"
 
             start_time = time.perf_counter()

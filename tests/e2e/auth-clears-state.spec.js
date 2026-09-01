@@ -236,4 +236,57 @@ test.describe('auth-triggered state clearing (Cloud Run)', () => {
 
     await assertPromptSqlAndResultsCleared(page);
   });
+
+  // Regression guard: the sign-in button (and, once signed in, the avatar's
+  // "Log out") used to stay fully clickable while a query was in flight -
+  // triggering either mid-turn tore down the whole turn via
+  // clearActiveQueryState() (see the two tests above), with unpredictable
+  // results depending on exactly when it landed. setButtonsDisabled() now
+  // grays the whole container out (auth-disabled) and sets pointer-events:
+  // none on it for that entire window - checked here via a real hit-test
+  // (see the "avatar submenu" test above for why a plain .click() isn't a
+  // strong enough guard on its own: it wouldn't distinguish "blocked" from
+  // "just hasn't painted yet").
+  test('the sign-in control is disabled while a query is in flight, and re-enabled once it settles', async ({ page }) => {
+    await stubGoogleIdentityServices(page);
+    await mockCloudRunConfig(page);
+
+    let resolveTranslate;
+    const translateStarted = new Promise((resolve) => { resolveTranslate = resolve; });
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      resolveTranslate();
+      await new Promise((r) => setTimeout(r, 2000));
+      await route.fulfill({
+        status: 200, contentType: 'application/x-ndjson',
+        body: JSON.stringify({ status: 'done', success: true, sql: 'SELECT 1;' }) + '\n',
+      });
+    });
+
+    await gotoApp(page);
+
+    const authContainer = page.locator('#g_id_signin');
+    const isSigninHitTestable = () => page.evaluate(() => {
+      const btn = document.getElementById('fakeGsiButton');
+      if (!btn) return false;
+      const r = btn.getBoundingClientRect();
+      const hit = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+      return !!hit && (hit === btn || btn.contains(hit));
+    });
+
+    await expect(authContainer).not.toHaveClass(/auth-disabled/);
+    expect(await isSigninHitTestable()).toBe(true);
+
+    await page.locator('#aiPrompt').fill('anything');
+    await page.locator('#aiPrompt').press('Enter');
+    await translateStarted;
+
+    await expect(authContainer).toHaveClass(/auth-disabled/);
+    expect(await isSigninHitTestable()).toBe(false);
+
+    await expect.poll(() => page.locator('#aiPrompt').isEnabled(), { timeout: 5000 }).toBe(true);
+
+    await expect(authContainer).not.toHaveClass(/auth-disabled/);
+    expect(await isSigninHitTestable()).toBe(true);
+  });
 });

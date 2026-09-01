@@ -10,6 +10,8 @@ venv/
 presets_local.json
 atlas-credentials.env
 
+# Leftovers
+_to_delete/
 
 # Ignore utility scripts
 *.sh

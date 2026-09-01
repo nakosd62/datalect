@@ -18,6 +18,9 @@ grand-cosmos-716-*.json
 cloudsql-ca.pem
 atlas-credentials.env
 
+# Leftovers
+_to_delete/
+
 # Logs
 *.log
 
