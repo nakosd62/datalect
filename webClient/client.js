@@ -4091,8 +4091,33 @@ document.addEventListener('DOMContentLoaded', async () => {
       return;
     }
 
+    // Server-side output a statement produced outside its own result set
+    // (currently: Oracle's DBMS_OUTPUT.PUT_LINE, captured by backends/
+    // oracle.py's execute() - see backends/base.py's execute() docstring
+    // for the "notices" key's contract). Rendered as its own row, reusing
+    // the same .response-cell/.response-text markup a NO-SQL reply's text
+    // gets (isText branch above) - shown ABOVE any real dataset the same
+    // statement also returned (rare, but not impossible), and standing in
+    // for the generic "No dataset returned" message below when there's no
+    // dataset at all, since the notices ARE the meaningful feedback here.
+    const hasNotices = !!(result && result.notices && result.notices.length > 0);
+    if (hasNotices) {
+      const tr = document.createElement('tr');
+      const td = document.createElement('td');
+      td.className = 'response-cell';
+      if (result.columns && result.columns.length > 1) td.colSpan = result.columns.length;
+      const p = document.createElement('p');
+      p.className = 'response-text';
+      p.textContent = result.notices.join('\n');
+      td.appendChild(p);
+      tr.appendChild(td);
+      resultsBody.appendChild(tr);
+    }
+
     if (!result || (!result.columns && !result.rows)) {
-      resultsBody.innerHTML = `<tr><td class="text-center text-muted py-8">Statement executed successfully. No dataset returned.</td></tr>`;
+      if (!hasNotices) {
+        resultsBody.innerHTML = `<tr><td class="text-center text-muted py-8">Statement executed successfully. No dataset returned.</td></tr>`;
+      }
       return;
     }
 

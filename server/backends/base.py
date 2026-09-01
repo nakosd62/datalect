@@ -398,7 +398,15 @@ class Backend(ABC):
         """Run one or more statements in `sql_text` and return a list of
         {"statement", "columns", "rows", "rowCount"} dicts, one per
         statement - the same shape execute_routes.py has always returned
-        to the frontend. If a statement partway through fails, raise
+        to the frontend. A dict MAY also carry an optional "notices": list
+        of str key - server-side text a statement itself produced outside
+        its own result set (e.g. Oracle's DBMS_OUTPUT.PUT_LINE, captured by
+        backends/oracle.py's execute() - see its _drain_dbms_output()) -
+        entirely absent for a backend/statement with nothing to report,
+        never an empty list. execute_routes.py passes results through
+        untouched, so this key reaches the client as-is; see webClient/
+        client.js's renderTableResult() for how it's displayed. If a
+        statement partway through fails, raise
         SqlExecutionError (see its docstring above) instead of letting the
         raw driver exception propagate directly, so the statements that
         succeeded before it aren't silently lost. A failure on the very

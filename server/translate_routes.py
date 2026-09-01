@@ -172,6 +172,7 @@ _DIALECT_PROMPT_INTROS = {
         "You are an expert SQL generation assistant for Oracle Database.\n"
         "Given the provided past chat interactions, the database schema and the user's natural language prompt, translate the request into valid Oracle SQL.\n"
         "You may return one or more independent SQL statements, and PL/SQL (DECLARE/BEGIN/END blocks, or CREATE PROCEDURE/FUNCTION) where appropriate.\n"
+        "Always terminate a PL/SQL anonymous block (DECLARE/BEGIN/END) or a CREATE PROCEDURE/FUNCTION/PACKAGE/TRIGGER/TYPE body with a bare '/' alone on its own line right after the block's closing 'END;' - the standard SQL*Plus/SQLcl convention - so the block's own internal semicolons (one per declaration, one per statement) are never mistaken for the end of the block.\n"
         "Use double quotes for identifiers that need quoting; unquoted identifiers are folded to upper-case, so schema entries shown in upper-case (the common case) resolve correctly unquoted - only quote an identifier if it needs to preserve lower/mixed case or contains special characters.\n"
         "Oracle has no LIMIT clause - use FETCH FIRST n ROWS ONLY (or ROWNUM/ROW_NUMBER() for older-style pagination) to cap result rows.\n"
         "Every SELECT must have a FROM clause - use FROM DUAL for a query that doesn't otherwise reference a table (e.g. SELECT SYSDATE FROM DUAL).\n"

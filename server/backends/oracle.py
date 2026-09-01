@@ -133,6 +133,141 @@ _IDENTIFIER_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_$#]{0,127}$')
 
 _CONSTRAINT_TYPE_LABELS = {"P": "PRIMARY KEY", "U": "UNIQUE", "R": "FOREIGN KEY"}
 
+# A line that (after stripping surrounding whitespace) is exactly a single
+# "/" - the SQL*Plus/SQLcl convention for terminating a PL/SQL anonymous
+# block or a CREATE ... PROCEDURE/FUNCTION/PACKAGE/TRIGGER/TYPE body. This
+# is a CLIENT-side script-parsing directive, never part of the SQL/PL-SQL
+# language itself - python-oracledb's cursor.execute() must never receive
+# it as SQL text (verified against python-oracledb's own "Executing
+# PL/SQL" docs: its anonymous-block example passes the block text ending
+# in "end;" straight to execute(), no trailing "/" involved at all).
+_SLASH_TERMINATOR_RE = re.compile(r'(?m)^[ \t]*/[ \t]*$')
+
+# A chunk that starts with one of these (after stripping leading
+# whitespace) is a PL/SQL unit that must be sent to Oracle as ONE single,
+# complete statement - unlike ordinary SQL, its internal semicolons (each
+# variable declaration in DECLARE, each statement inside BEGIN...END) are
+# part of the unit's own grammar, not statement separators. sqlparse.split()
+# has no notion of PL/SQL block structure (it only special-cases things
+# like $$-dollar-quoting, which Oracle PL/SQL doesn't use at all) - fed a
+# whole DECLARE/BEGIN/END block, it splits at every semicolon it sees,
+# including the one ending "DECLARE v_count NUMBER;", truncating the block
+# before Oracle ever receives a complete unit. This is exactly the
+# PLS-00103 "'end-of-file' ... not null range default character" error
+# this regex-and-chunking approach exists to prevent - see
+# translate_routes.py's Oracle dialect-prompt entry, which instructs the
+# model to always terminate these with a bare "/" so this split can find
+# the boundary reliably.
+_PLSQL_UNIT_RE = re.compile(
+    r'^\s*(?:DECLARE|BEGIN|CREATE(?:\s+OR\s+REPLACE)?\s+(?:PROCEDURE|FUNCTION|'
+    r'PACKAGE(?:\s+BODY)?|TRIGGER|TYPE(?:\s+BODY)?))\b',
+    re.IGNORECASE,
+)
+
+
+def _split_oracle_chunk(chunk):
+    """One "/"-delimited chunk (see _split_oracle_script) -> a list of
+    statements ready for cursor.execute(). A PL/SQL unit (_PLSQL_UNIT_RE)
+    is returned whole, exactly as written (including its final
+    semicolon-after-END, which is syntactically required, not an optional
+    separator to strip - see python-oracledb's own anonymous-block example,
+    which passes "...end;" straight to execute() unmodified). Anything else
+    is ordinary SQL, split by sqlparse.split() same as every other
+    backend's execute() here - unchanged behavior for plain statements."""
+    stripped = chunk.strip()
+    if not stripped:
+        return []
+    if _PLSQL_UNIT_RE.match(stripped):
+        return [stripped]
+    return [s.strip() for s in sqlparse.split(chunk) if s.strip()]
+
+
+# DBMS_OUTPUT capture: DBMS_OUTPUT.PUT_LINE (used throughout PL/SQL for
+# progress/status messages - see the model's own generated "write access
+# test" blocks, which report success/failure this way, per the dialect
+# prompt in translate_routes.py) writes into a session-level buffer that a
+# plain cursor.execute() call never sees - nothing surfaces it unless
+# something explicitly enables the buffer beforehand and drains it via
+# DBMS_OUTPUT.GET_LINES afterward (verified against python-oracledb's own
+# "Using DBMS_OUTPUT" docs). Without this, a PL/SQL block's PUT_LINE
+# messages vanish silently: the block still runs (and this app's own
+# write-test SQL still correctly reports success/failure internally), but
+# the user never sees any feedback text in the results tab - they'd see
+# "Statement executed successfully. No dataset returned." and nothing else.
+_DBMS_OUTPUT_CHUNK_SIZE = 100
+# Defensive cap on how many GET_LINES chunks a single statement's drain
+# will read - Oracle's own DBMS_OUTPUT buffer is itself bounded (2000
+# lines by default; up to 1,000,000 via DBMS_OUTPUT.ENABLE's buffer_size
+# argument, not used here), so this can never realistically bind in
+# practice - it exists purely so a pathological driver response couldn't
+# spin this loop forever.
+_DBMS_OUTPUT_MAX_CHUNKS = 1000
+
+
+def _enable_dbms_output(cursor):
+    """Best-effort, called once per execute() call before any statement
+    runs - see the module-level comment above. A role without EXECUTE on
+    DBMS_OUTPUT (unusual - it's PUBLIC-grantable and virtually always
+    available, but not guaranteed) degrades to "no output capture", never
+    to a failed script - mirrors get_schema()'s own best-effort try/except
+    sections. Also silently absorbs a test/fake cursor with no callproc()
+    at all (AttributeError) the same way - existing tests built against
+    the generic FakePgCursor (which has no callproc) keep passing
+    unmodified, simply never producing a "notices" key."""
+    try:
+        cursor.callproc("dbms_output.enable")
+    except Exception:
+        pass
+
+
+def _drain_dbms_output(cursor):
+    """Returns whatever DBMS_OUTPUT.PUT_LINE text has accumulated since
+    the last drain (or since _enable_dbms_output(), for the first
+    statement) - a list of lines, [] if nothing was written, including
+    when _enable_dbms_output() itself silently failed above (GET_LINES on
+    a disabled buffer just returns zero lines, not an error - and the same
+    AttributeError-swallowing applies here for a callproc-less cursor).
+    Uses the batch GET_LINES form (python-oracledb's documented faster
+    alternative to looping GET_LINE one line at a time), draining in
+    _DBMS_OUTPUT_CHUNK_SIZE-sized chunks until a short chunk signals the
+    buffer is empty - exactly the pattern shown in python-oracledb's own
+    "Using DBMS_OUTPUT" docs."""
+    lines = []
+    try:
+        lines_var = cursor.arrayvar(str, _DBMS_OUTPUT_CHUNK_SIZE)
+        num_lines_var = cursor.var(int)
+        for _ in range(_DBMS_OUTPUT_MAX_CHUNKS):
+            num_lines_var.setvalue(0, _DBMS_OUTPUT_CHUNK_SIZE)
+            cursor.callproc("dbms_output.get_lines", (lines_var, num_lines_var))
+            num_lines = num_lines_var.getvalue()
+            lines.extend(lines_var.getvalue()[:num_lines])
+            if num_lines < _DBMS_OUTPUT_CHUNK_SIZE:
+                break
+    except Exception:
+        # Never let a best-effort output capture turn an otherwise-
+        # successful statement into a failure - see _enable_dbms_output's
+        # docstring.
+        pass
+    return lines
+
+
+def _split_oracle_script(sql_text):
+    """The whole script -> statements ready for cursor.execute(). First
+    splits on a bare "/" line (Oracle's own PL/SQL-block boundary marker -
+    see _SLASH_TERMINATOR_RE), then splits each resulting chunk via
+    _split_oracle_chunk. A PL/SQL block/body with no trailing "/" (the
+    model didn't follow the dialect-prompt instruction, or it's the last
+    thing in the script) still comes out right: it's simply the last chunk,
+    running to the end of the text, and _split_oracle_chunk's PL/SQL check
+    still recognizes and returns it whole."""
+    statements = []
+    pos = 0
+    for match in _SLASH_TERMINATOR_RE.finditer(sql_text):
+        statements.extend(_split_oracle_chunk(sql_text[pos:match.start()]))
+        pos = match.end()
+    statements.extend(_split_oracle_chunk(sql_text[pos:]))
+    return statements
+
 
 def _named_in_params(prefix, values):
     """(fragment, params) for a dynamic IN (...) clause under the
@@ -432,12 +567,19 @@ class OracleBackend(Backend):
     def execute(self, connection, sql_text):
         connection.autocommit = True
 
-        statements = [s.strip() for s in sqlparse.split(sql_text) if s.strip()]
+        statements = _split_oracle_script(sql_text)
         results = []
 
         with connection.cursor() as cursor:
+            _enable_dbms_output(cursor)
             for stmt in statements:
-                stmt_clean = stmt.rstrip(';').strip()
+                if _PLSQL_UNIT_RE.match(stmt):
+                    # A PL/SQL block/body must reach Oracle exactly as
+                    # written, including its final semicolon-after-END -
+                    # see _split_oracle_chunk's docstring.
+                    stmt_clean = stmt
+                else:
+                    stmt_clean = stmt.rstrip(';').strip()
                 if not stmt_clean:
                     continue
 
@@ -469,12 +611,25 @@ class OracleBackend(Backend):
                     else:
                         count = row_count if row_count >= 0 else 0
 
-                    results.append({
+                    result_entry = {
                         'statement': stmt_clean,
                         'columns': columns,
                         'rows': rows,
                         'rowCount': count
-                    })
+                    }
+                    # Drained AFTER this statement's own columns/rows/count
+                    # are already captured above, so a subsequent
+                    # dbms_output.get_lines callproc() (which sets the
+                    # cursor's own description/rowcount as a side effect,
+                    # like any statement) can never clobber THIS
+                    # statement's result - see _drain_dbms_output's
+                    # docstring. Only ever attached when non-empty, so
+                    # every other backend's/existing test's result-dict
+                    # shape (no "notices" key) is unaffected.
+                    notices = _drain_dbms_output(cursor)
+                    if notices:
+                        result_entry['notices'] = notices
+                    results.append(result_entry)
                 except Exception as e:
                     # Don't let a mid-script failure silently drop every
                     # result already collected in `results` - see
