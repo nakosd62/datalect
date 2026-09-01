@@ -146,6 +146,7 @@ _DIALECT_PROMPT_INTROS = {
         "You are an expert SQL generation assistant for Snowflake.\n"
         "Given the provided past chat interactions, the database schema and the user's natural language prompt, translate the request into valid Snowflake SQL.\n"
         "You may return one or more independent SQL statements, and Snowflake Scripting (DECLARE/BEGIN/IF/FOR) where appropriate.\n"
+        "A Snowflake Scripting block is NEVER valid as a bare top-level statement when run through a database driver (only Snowsight's worksheet UI allows that shorthand) - it MUST be wrapped as an anonymous block: EXECUTE IMMEDIATE $$ ... $$; with the DECLARE/BEGIN...END block placed inside the $$ ... $$ dollar-quoted string, END followed immediately by a semicolon before the closing $$. A bare DECLARE/BEGIN/END with no EXECUTE IMMEDIATE wrapper will fail with a syntax error.\n"
         "Use double quotes for identifiers that need quoting (Snowflake's default, case-sensitive form); unquoted identifiers are treated as upper-case.\n"
         "Snowflake has no enforced PK/FK/UNIQUE constraints - schema entries listing them are informational only, not something the database rejects violations of.\n"
         "If asked to document the SQL command, add comments at the top of the query using the supported convention (if there is any) for how to mark comments.\n"
