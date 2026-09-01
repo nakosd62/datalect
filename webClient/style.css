@@ -56,6 +56,15 @@
 
   --warning: #f59e0b;
   --warning-rgb: 245, 158, 11;
+  /* Text color that would sit ON TOP of a solid --warning-colored badge -
+     same reasoning as --on-primary/--on-accent-cyan above, computed
+     per-theme since --warning (unlike --primary) isn't reliably
+     bright/dark enough in both themes to share one constant value.
+     Currently unused (#stopBtn.btn-stop moved to --accent-cyan/
+     --on-accent-cyan below - see there for why) but kept defined
+     alongside --warning itself for whenever a real warning-colored
+     badge is needed. */
+  --on-warning: #080b11;
 
   --text-primary: #f8fafc;
   --text-secondary: #94a3b8;
@@ -88,11 +97,18 @@
   --text-table-strong: #f1f5f9;
   --chip-text: #cbd5e1;
 
-  /* Distinct decorative accent (active tab, model-badge tagline) - kept
-     separate from --primary so the two stay visually distinguishable in
-     both themes. */
+  /* Distinct decorative accent (active tab, model-badge tagline; also
+     the progress-status banner and #stopBtn.btn-stop below - the same
+     blue as the header/logo mark, not a semantic "danger"/"warning"
+     color) - kept separate from --primary so the two stay visually
+     distinguishable in both themes. */
   --accent-cyan: #38bdf8;
   --accent-cyan-rgb: 56, 189, 248;
+  /* Text color that sits ON TOP of a solid --accent-cyan-colored button
+     (see #stopBtn.btn-stop) - same reasoning as --on-primary/--on-warning
+     above, computed per-theme since --accent-cyan isn't reliably
+     bright/dark enough in both themes to share one constant value. */
+  --on-accent-cyan: #080b11;
 
   /* Text color that sits ON TOP of a solid --primary-colored button/badge -
      constant across themes: --primary is always bright enough that a dark
@@ -148,6 +164,7 @@
 
   --warning: #b45309;
   --warning-rgb: 180, 83, 9;
+  --on-warning: #ffffff;
 
   --text-primary: #0f172a;
   --text-secondary: #475569;
@@ -171,6 +188,7 @@
 
   --accent-cyan: #0284c7;
   --accent-cyan-rgb: 2, 132, 199;
+  --on-accent-cyan: #ffffff;
 
   --on-primary: #ffffff;
 
@@ -916,6 +934,11 @@ textarea:focus {
   opacity: 0.8;
 }
 
+.speech-bubble-wrapper textarea#aiPrompt:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 .speech-bubble-wrapper.sql-bubble textarea#sqlQuery {
   width: 100%;
   height: 100px;
@@ -978,6 +1001,11 @@ textarea:focus {
 
 .sql-bubble .CodeMirror-lines {
   padding-right: 120px;
+}
+
+.speech-bubble-wrapper.sql-bubble .CodeMirror.cm-readonly {
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 
 /* Stats Cards */
@@ -1675,15 +1703,35 @@ textarea:focus {
   overflow: hidden;
 }
 
-.results-retry-status {
+/* Wraps the retry-status banner and the Cancel button as siblings -
+   needed because showRetryStatus()/showPhaseStatus()/etc. fully
+   overwrite #resultsRetryStatus's own innerHTML on every call, so the
+   Cancel button can't just live nested inside that div.
+   justify-content: flex-end keeps the button pinned to the right edge
+   even when #resultsRetryStatus is hidden (display: none via .hidden) -
+   without it, #stopBtn was the row's only flex item at that point and
+   fell back to flex-start, visibly jumping to the left every time the
+   status banner disappeared. */
+.results-status-row {
   flex-shrink: 0;
+  display: flex;
+  align-items: stretch;
+  justify-content: flex-end;
+}
+
+.results-retry-status {
+  /* The header/logo's own blue (--accent-cyan) - was --warning's amber
+     until the light theme's specific shade (#b45309, a dark rust/brown)
+     read as aggressively red rather than as a mild in-progress notice. */
+  flex: 1 1 auto;
+  min-width: 0;
   display: flex;
   align-items: center;
   gap: 0.5rem;
   padding: 0.6rem 1rem;
-  background: rgba(var(--warning-rgb), 0.08);
-  border-bottom: 1px solid rgba(var(--warning-rgb), 0.3);
-  color: var(--warning);
+  background: rgba(var(--accent-cyan-rgb), 0.08);
+  border-bottom: 1px solid rgba(var(--accent-cyan-rgb), 0.3);
+  color: var(--accent-cyan);
   font-size: 0.85rem;
 }
 
@@ -1691,6 +1739,23 @@ textarea:focus {
   display: inline-flex;
   font-size: 0.95rem;
   line-height: 1;
+}
+
+#stopBtn.btn-stop {
+  /* The header/logo's own blue (--accent-cyan), matching .results-retry-
+     status's own progress-banner color above - not --danger's bright red
+     (too alarming for "cancel an in-progress query"), and not --warning's
+     amber either (the light theme's particular shade of it read as
+     aggressively red-orange rather than as a mild notice). */
+  flex-shrink: 0;
+  align-self: center;
+  margin: 0 0.75rem;
+  background-color: var(--accent-cyan);
+  color: var(--on-accent-cyan);
+}
+
+#stopBtn.btn-stop:hover {
+  filter: brightness(1.1);
 }
 
 .results-tabs-nav {

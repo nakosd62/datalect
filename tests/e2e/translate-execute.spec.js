@@ -190,6 +190,52 @@ test.describe('translate + execute', () => {
     await expect(page.locator('#resultsRetryStatus')).toHaveClass(/hidden/);
   });
 
+  // The Cancel button (#stopBtn) shows/hides purely off setButtonsDisabled()
+  // - independent of #resultsRetryStatus, which single-connection mode never
+  // shows at all outside a real retry. .results-status-row used to lay the
+  // two out with plain flex-start, so the button sat wherever
+  // #resultsRetryStatus's box ended - flush against it when the status text
+  // was visible, but all the way over at the row's LEFT edge whenever that
+  // text was hidden (as it is for this entire test), visibly jumping left
+  // and right as the banner came and went. justify-content: flex-end pins
+  // it to the row's right edge unconditionally instead.
+  test('the Cancel button stays pinned to the right edge while the progress banner is hidden', async ({ page }) => {
+    let resolveTranslate;
+    const translateStarted = new Promise((resolve) => { resolveTranslate = resolve; });
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      resolveTranslate();
+      await new Promise((r) => setTimeout(r, 2000));
+      await route.fulfill({
+        status: 200, contentType: 'application/x-ndjson',
+        body: JSON.stringify({ status: 'done', success: true, sql: 'SELECT 1;' }) + '\n',
+      });
+    });
+    await gotoApp(page);
+
+    await page.locator('#aiPrompt').fill('anything');
+    await page.locator('#aiPrompt').press('Enter');
+    await translateStarted;
+
+    const stopBtn = page.locator('#stopBtn');
+    await expect(stopBtn).toBeVisible();
+    await expect(stopBtn).toHaveText(/Cancel/);
+    await expect(page.locator('#resultsRetryStatus')).toHaveClass(/hidden/);
+
+    const [btnBox, rowBox] = await Promise.all([
+      stopBtn.boundingBox(),
+      page.locator('.results-status-row').boundingBox(),
+    ]);
+    // #stopBtn.btn-stop carries its own 0.75rem (12px) right margin, so its
+    // right edge sits a little inside the row's - the regression this
+    // guards against was the button flush against the row's LEFT edge
+    // instead (tens/hundreds of pixels away), so a generous margin-sized
+    // tolerance is enough to distinguish "pinned right" from "fell left".
+    expect(rowBox.x + rowBox.width - (btnBox.x + btnBox.width)).toBeLessThan(20);
+
+    await expect.poll(() => normalizedSql(page), { timeout: 5000 }).toContain('SELECT 1');
+  });
+
   test('directly entering and running SQL bypasses translate entirely', async ({ page }) => {
     await mockExecute(page, {
       results: [{ columns: ['n'], rows: [{ n: 42 }], rowCount: 1 }],

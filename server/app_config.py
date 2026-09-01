@@ -49,6 +49,21 @@ logging.basicConfig(
 logger = logging.getLogger("ydyl")
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
+# python-tds (import name `pytds`, used by backends/mssql.py) logs a
+# WARNING on every connection retry attempt that overran its own allotted
+# sub-timeout: "Work attempt exceeded it's allocated time X, actual time
+# was Y." Per backends/mssql.py's _connect_with_hard_timeout docstring,
+# this isn't a one-off - it's a known quirk in pytds's own retry/backoff
+# accounting (it tracks elapsed time by each attempt's ALLOTTED time, not
+# how long the attempt actually took), so EVERY attempt against a slow or
+# unreachable SQL Server logs one of these, and they carry no information
+# this app doesn't already report itself (the eventual connect failure is
+# logged, with a real traceback, via this app's own `logger.exception`
+# call in db.py's _fetch_database_schema/execute_routes.py). Raised to
+# ERROR rather than silenced outright (no logger.disabled/NullHandler)
+# so a genuine pytds-side ERROR - if it ever logs one - still surfaces.
+logging.getLogger("pytds").setLevel(logging.ERROR)
+
 
 def log_and_generalize_error(context, exc):
     """
@@ -910,6 +925,17 @@ DEFAULT_PRESET_ID = _postgres_presets[0]["id"] if _postgres_presets else None
 # app_config.py sits underneath all three, imported by each, imported by
 # none of them.
 MAX_IN_SCOPE_CONNECTIONS = int(os.environ.get("MAX_IN_SCOPE_CONNECTIONS", 20))
+
+# Shared LLM-call retry policy - originated in translate_routes.py (its
+# single-connection retry loop and generate_sql_for_connection both use
+# these), moved here for the exact same reason MAX_IN_SCOPE_CONNECTIONS
+# just above did: connection_router.py's triage_all_mode_question now
+# needs its own real retry policy too (see that function's docstring),
+# and translate_routes.py already imports FROM connection_router.py, so
+# the reverse import would be circular. app_config.py sits underneath
+# both, imported by each, imported by neither.
+MAX_TRANSLATION_ATTEMPTS = int(os.environ.get("MAX_TRANSLATION_ATTEMPTS", 5))
+TRANSLATION_RETRY_DELAY_SECONDS = float(os.environ.get("TRANSLATION_RETRY_DELAY_SECONDS", 1))
 
 # Model configuration for all three LLM providers (Google included) lives
 # in translate_routes.py now, not here - each provider's own single

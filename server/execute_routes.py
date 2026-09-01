@@ -69,6 +69,7 @@ from app_config import logger
 from auth import get_or_create_session_id, get_current_user_identity, apply_session_cookie
 from db import resolve_conn_str, resolve_descriptor_by_reference
 from backends import get_backend, SqlExecutionError
+import cancel_registry
 
 execute_bp = Blueprint('execute', __name__)
 
@@ -213,7 +214,7 @@ def _split_by_database_markers(sql_text):
     return chunks
 
 
-def _execute_one_group(kind, ref_id, concatenated_sql, user_identity):
+def _execute_one_group(kind, ref_id, concatenated_sql, user_identity, session_id):
     """Runs one connection group's concatenated statements (see
     _execute_multi_database below) and NEVER raises - every outcome,
     including a since-deleted connection reference or a real execution
@@ -242,9 +243,12 @@ def _execute_one_group(kind, ref_id, concatenated_sql, user_identity):
 
     backend = None
     conn = None
+    cancel_token = None
+    cancel_handle = None
     try:
         backend = get_backend(descriptor)
         conn = backend.connect(descriptor)
+        cancel_token, cancel_handle = cancel_registry.register(session_id, lambda: backend.close(conn))
         group_results = _execute_with_timeout(backend, conn, _strip_database_marker_lines(concatenated_sql))
         for r in group_results:
             r["database"] = {"kind": kind, "id": ref_id, "name": name}
@@ -275,11 +279,15 @@ def _execute_one_group(kind, ref_id, concatenated_sql, user_identity):
             },
         }
     finally:
-        if conn and backend:
+        if cancel_token is not None:
+            cancel_registry.unregister(session_id, cancel_token)
+        if cancel_handle is not None:
+            cancel_handle.close()
+        elif conn and backend:
             backend.close(conn)
 
 
-def _execute_multi_database(chunks, user_identity):
+def _execute_multi_database(chunks, user_identity, session_id):
     """Runs a marker-tagged multi-database script (see
     _split_by_database_markers above) and returns (results, failures) -
     `results` is every statement that succeeded, ACROSS every connection
@@ -333,7 +341,7 @@ def _execute_multi_database(chunks, user_identity):
     outcomes = [None] * len(group_order)
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(group_order)) as pool:
         future_to_index = {
-            pool.submit(_execute_one_group, kind, ref_id, "\n".join(groups[(kind, ref_id)]), user_identity): i
+            pool.submit(_execute_one_group, kind, ref_id, "\n".join(groups[(kind, ref_id)]), user_identity, session_id): i
             for i, (kind, ref_id) in enumerate(group_order)
         }
         for future in concurrent.futures.as_completed(future_to_index):
@@ -347,6 +355,23 @@ def _execute_multi_database(chunks, user_identity):
             failures.append(outcome["failure"])
 
     return all_results, failures
+
+
+@execute_bp.route('/api/cancel', methods=['POST'])
+def cancel_query():
+    """Backs the client's Stop button (client.js's cancelInFlightQuery()):
+    best-effort abandonment of whatever work is currently registered for
+    this browser session in cancel_registry (an in-flight /api/execute
+    connection, or an in-flight /api/translate or /api/summarize-results
+    LLM call - see cancel_registry.py's module docstring for the
+    mechanism and its limits). Always returns 200 - there's nothing
+    actionable a client could do differently if 0 handles happened to be
+    registered (the work may have already finished on its own), so this
+    is not treated as an error case."""
+    session_id = get_or_create_session_id()
+    cancelled = cancel_registry.cancel(session_id)
+    resp = jsonify({'success': True, 'cancelled': cancelled})
+    return apply_session_cookie(resp, session_id)
 
 
 @execute_bp.route('/api/execute', methods=['POST'])
@@ -396,7 +421,7 @@ def execute_query():
     # through to the single-connection path below, completely unchanged.
     database_marker_chunks = _split_by_database_markers(raw_query)
     if database_marker_chunks is not None:
-        results, failures = _execute_multi_database(database_marker_chunks, user_identity)
+        results, failures = _execute_multi_database(database_marker_chunks, user_identity, session_id)
         total_row_count = sum(r.get('rowCount', 0) for r in results)
         execution_time_ms = round((time.time() - start_time) * 1000)
         resp_body = {
@@ -414,10 +439,13 @@ def execute_query():
 
     backend = None
     conn = None
+    cancel_token = None
+    cancel_handle = None
 
     try:
         backend = get_backend(descriptor)
         conn = backend.connect(descriptor)
+        cancel_token, cancel_handle = cancel_registry.register(session_id, lambda: backend.close(conn))
 
         results = _execute_with_timeout(backend, conn, raw_query)
         total_row_count = sum(r.get('rowCount', 0) for r in results)
@@ -470,7 +498,11 @@ def execute_query():
         })
         return apply_session_cookie(resp, session_id), 400
     finally:
-        if conn and backend:
+        if cancel_token is not None:
+            cancel_registry.unregister(session_id, cancel_token)
+        if cancel_handle is not None:
+            cancel_handle.close()
+        elif conn and backend:
             backend.close(conn)
 
 

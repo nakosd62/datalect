@@ -24,14 +24,24 @@ for why (picking connections and generating dialect-correct SQL are
 different-difficulty tasks best kept as two calls, but there's no
 standalone cheap model configured for the first one, so it just borrows
 whichever provider/model the session is already using). This means
-triage_all_mode_question is a second call against the same client - it
-does NOT construct its own client or manage its own API key/retry pool;
-that's translate_routes.py's job, same as the main generation call.
+triage_all_mode_question is a second call against the same client/API
+key translate_routes.py already picked for the main generation call -
+though it DOES run its own retry loop against that key pool (key
+rotation on a 429, wait-and-retry on a transient 5xx/timeout, see
+triage_all_mode_question's docstring) rather than deferring retry
+entirely to the caller: a bare "catch everything, retry the same key
+twice, give up" loop used to live here instead, which meant a capacity/
+rate-limit failure was retried uselessly (same key, doomed to fail the
+same way again) and then reported back indistinguishably from "the model
+gave an unparseable response" - see translate_routes.py's
+_TRIAGE_API_ERROR_TEXT for the user-facing half of that fix.
 """
 
 import json
+import re
+import time
 
-from app_config import logger, MAX_IN_SCOPE_CONNECTIONS
+from app_config import logger, MAX_IN_SCOPE_CONNECTIONS, MAX_TRANSLATION_ATTEMPTS, TRANSLATION_RETRY_DELAY_SECONDS
 
 # How many of a session's in-scope connections a single question's Phase A
 # routing may ever select at once - the same MAX_IN_SCOPE_CONNECTIONS cap
@@ -160,20 +170,41 @@ _TRIAGE_SYSTEM_INSTRUCTION = (
     "database?\" is fine verbatim once only one connection is being asked. "
     "Every index you put in \"indices\" needs its own entry here - do not "
     "omit any.\n"
+    "Both \"answer\" and \"message\" below (never \"database_prompts\" - those "
+    "are internal, per-connection instructions the end user never sees) have "
+    "two parts. FIRST, a label line: a short (one to two word) section-"
+    "heading label meaning \"Triage\" - in English this label is literally "
+    "the single word \"Triage\", but you must instead write it TRANSLATED "
+    "into the SAME LANGUAGE as the user's own question below, with nothing "
+    "else on that line, followed by a blank line. SECOND, immediately after "
+    "that blank line, your actual response text, ALSO written in that same "
+    "language - e.g., if the question was in English: \"Triage\\n\\nChecking "
+    "Sales Postgres, since it has an orders table and the question asks "
+    "about recent purchases.\" Never stop after the label - the label by "
+    "itself, with nothing following it, is not a valid \"answer\"/\"message\" "
+    "value; the label is a UI section heading prepended to your response, "
+    "not a substitute for writing one. The label itself is plain text with "
+    "no markdown emphasis of your own around it.\n"
     "Respond with ONLY a JSON object, no markdown fences, no other text:\n"
     "- For outcome 1: {\"action\": \"answer\", \"answer\": \"<your direct "
-    "response, written for the end user, plain text>\"}\n"
+    "response, written for the end user in the same language as their "
+    "question, plain text, starting with the translated label line "
+    "described above>\"}\n"
     "- For outcome 2: {\"action\": \"route\", \"indices\": [...0-based "
-    "candidate indices, most-relevant first...], \"message\": \"<one to two "
-    "short sentences, for the end user: name the real database name(s) "
+    "candidate indices, most-relevant first...], \"message\": \"<starting "
+    "with the translated label line described above, then one to two "
+    "short sentences, for the end user, in the same language as their "
+    "question: name the real database name(s) "
     "you're about to check, AND briefly explain WHY - what in the question "
     "and/or in those databases' table names made them the relevant pick, "
-    "e.g. 'Checking Sales Postgres, since it has an orders table and the "
-    "question asks about recent purchases.' A message that only names the "
-    "database(s) with no reason is NOT acceptable - always include the "
-    "brief why.>\", \"database_prompts\": {\"<index as a "
+    "e.g. (for an English question) 'Triage\\n\\nChecking Sales Postgres, "
+    "since it has an orders table "
+    "and the question asks about recent purchases.' A message whose second "
+    "part only names the database(s) with no reason is NOT acceptable - "
+    "always include the brief why.>\", \"database_prompts\": {\"<index as a "
     "string>\": \"<that connection's own self-contained rewritten "
-    "question>\", ...one entry per index in \"indices\"...}}\n"
+    "question - plain text, no \"Triage\" line, this one is never shown to "
+    "the end user>\", ...one entry per index in \"indices\"...}}\n"
     "Refer to a connection ONLY by its real 'name' field, never by its "
     "candidate index/bracket number (the '[0]', '[1]', etc. above is an "
     "internal ordinal for this prompt only, meaningless to the user and "
@@ -219,6 +250,52 @@ def _clean_database_prompts(raw, valid_indices):
     return cleaned
 
 
+def is_label_only_response(text):
+    """True when `text` is a known failure mode of the "<label line>
+    \\n\\n<body>" shape both _TRIAGE_SYSTEM_INSTRUCTION here and
+    translate_routes.py's _SUMMARY_SYSTEM_INSTRUCTION ask the model for (a
+    short section-heading label, written in the SAME LANGUAGE as the
+    user's own question - see those two prompts - followed by a blank
+    line, then the real response): the model wrote a leading line,
+    a blank line, and then stopped, leaving nothing (or only whitespace)
+    as the body. Also true for a genuinely empty/whitespace-only `text`.
+
+    Deliberately does NOT flag a response with no blank line at all as
+    invalid - that's a plain, un-labeled answer (the model skipped the
+    label-line convention entirely), which this app has always accepted
+    as-is rather than penalizing; only a response that visibly started
+    the two-part shape and then produced no real content counts as this
+    specific failure. This is also why the check is POSITION-based (the
+    first line, and only the first line, up to the first blank line)
+    rather than content-based: it doesn't need to know what the label
+    text actually says (impossible now that it's translated into the
+    user's own question's language - see those two prompts), only
+    whether whatever is there was followed by real content or not.
+
+    Used by triage_all_mode_question here and by translate_routes.py's
+    summarize_all_mode_results for the same reason. Both MUST call this
+    on the response text before applying their own `.strip()` to it (see
+    each call site) - a response that's just "<label>\\n\\n" with nothing
+    real after it has its tell-tale trailing blank line removed by a
+    naive `.strip()`, at which point it's indistinguishable from a plain
+    single-line, never-labeled response that must NOT be flagged; this
+    function only strips LEADING whitespace itself for exactly that
+    reason. client.js's own renderMarkdownLiteSummaryTab() separately
+    relies on this same first-line/blank-line convention to decide what
+    to bold - but purely for DISPLAY, not validity, so it has no need for
+    this check itself: by the time either "answer"/"message"/summary text
+    reaches the client, this function has already guaranteed it isn't
+    label-only."""
+    if not isinstance(text, str):
+        return False
+    if not text.strip():
+        return True
+    parts = re.split(r'\n[ \t]*\n', text.lstrip(), maxsplit=1)
+    if len(parts) != 2:
+        return False
+    return not parts[1].strip()
+
+
 def _parse_triage_response(text, num_candidates, max_connections):
     """Parses the triage call's raw response text into exactly one of:
       {"outcome": "answer", "answer": <non-empty str>}
@@ -256,8 +333,15 @@ def _parse_triage_response(text, num_candidates, max_connections):
 
     if action == "answer":
         answer = parsed.get("answer")
-        if isinstance(answer, str) and answer.strip():
+        if isinstance(answer, str) and answer.strip() and not is_label_only_response(answer):
             return {"outcome": "answer", "answer": answer.strip()}
+        # Either missing/empty, JUST the translated label with no real
+        # answer after it, or missing the label/blank-line shape entirely -
+        # the "answer" outcome has no further step to fall back on (unlike
+        # "message" below, which the caller already has a fallback sentence
+        # for), so this is a parse failure like any other, giving the
+        # bounded retry loop another attempt instead of showing the user a
+        # bare label heading (or an un-labeled reply) with nothing under it.
         return None
 
     if action == "route":
@@ -265,7 +349,25 @@ def _parse_triage_response(text, num_candidates, max_connections):
         if not indices:
             return None
         message = parsed.get("message")
+        # Checked on the RAW value, before the .strip() below collapses
+        # a "label line, then a blank line, then nothing" response down
+        # to just the label - is_label_only_response needs that blank
+        # line intact to tell "just the label" apart from "a plain
+        # single-line message with no label convention at all" (see its
+        # docstring); stripping first would erase exactly the evidence it
+        # depends on.
+        message_is_label_only = isinstance(message, str) and is_label_only_response(message)
         message = message.strip() if isinstance(message, str) and message.strip() else None
+        # A "message" that doesn't have a real body after its label line -
+        # JUST the label, or missing the label/blank-line shape entirely -
+        # is treated the same as a missing message - the caller
+        # (translate_routes.py's stream_translation()) already builds a
+        # translated-label fallback sentence for that case, so there's no
+        # need to fail this whole attempt (and lose a valid routing
+        # decision) over a message-only omission the way the "answer"
+        # outcome above must.
+        if message is not None and message_is_label_only:
+            message = None
         database_prompts = _clean_database_prompts(parsed.get("database_prompts"), indices)
         return {
             "outcome": "route", "indices": indices, "message": message,
@@ -276,7 +378,8 @@ def _parse_triage_response(text, num_candidates, max_connections):
 
 
 def triage_all_mode_question(candidate_summaries, user_question, provider, client, model,
-                              history=None, max_connections=MAX_IN_SCOPE_CONNECTIONS):
+                              history=None, max_connections=MAX_IN_SCOPE_CONNECTIONS,
+                              api_key=None, tried_keys=None):
     """"All databases" mode's first call: decides whether `user_question`
     can be answered directly from `candidate_summaries` alone (names,
     dialects, table names - no real data access), or genuinely needs real
@@ -284,7 +387,7 @@ def triage_all_mode_question(candidate_summaries, user_question, provider, clien
       {"outcome": "answer", "answer": <str>, "usage": <dict|None>}
       {"outcome": "route", "indices": [...], "message": <str|None>,
        "database_prompts": {int_index: str, ...}, "usage": <dict|None>}
-      {"outcome": "failed"}
+      {"outcome": "failed", "api_error": <bool>}
 
     "route"'s "database_prompts" is the model's own rewrite of
     `user_question` into a separate, self-contained instruction per
@@ -324,28 +427,119 @@ def triage_all_mode_question(candidate_summaries, user_question, provider, clien
     None (the default) is treated as no history at all - today's original
     behavior, unchanged for any caller that doesn't pass it.
 
-    Bounded 2-attempt retry. On total failure (every attempt either raised
-    or produced an unparseable response) returns {"outcome": "failed"} -
-    deliberately NOT a fallback guess at some candidate connection: a wrong
-    guess here means actually generating and running real SQL against a
-    database the user never asked about, so the caller must show a fixed
-    apology instead of silently picking one (see translate_routes.py's
-    router_only_all_mode branch, which maps "failed" to the app's existing
-    '*** NO SQL *** I am not able to respond to your prompt.' text)."""
+    Bounded 2-attempt retry at getting a PARSEABLE response - unchanged
+    from before this docstring paragraph was updated. What DID change: an
+    exception raised by the LLM call itself, within either of those 2
+    attempts, is no longer treated identically to "the model replied with
+    unparseable text." It's now retried using the exact same policy as
+    every other LLM call in this app - provider.classify_error() (see
+    translate_routes.py's generate_sql_for_connection, which the retry
+    loop below mirrors byte-for-byte): a 429/capacity error rotates to a
+    different configured key and retries immediately (budget: one attempt
+    per configured key, provider.get_key_pool_size()); a transient
+    5xx/timeout waits TRANSLATION_RETRY_DELAY_SECONDS and retries the same
+    key (budget: MAX_TRANSLATION_ATTEMPTS); a non-retryable error ends
+    this call's attempt immediately, with no further retry at all.
+    Previously this loop caught EVERY exception the same way, never
+    rotated keys, and reported the exact same generic {"outcome":
+    "failed"} whether the LLM call itself failed (e.g. every configured
+    Gemini key was out of capacity) or the model just replied with
+    something unparseable - masking a resource-exhaustion/API condition
+    as if the model had simply been unable to understand the question.
+    The two are now distinguished via the "api_error" flag on a "failed"
+    outcome:
+      api_error=True: the LLM call's own retry budget (key rotation
+        and/or transient-error retries) was used up, or it hit a non-
+        retryable API error outright - a real technical/capacity
+        problem, not a question-comprehension one. No fallback guess at
+        some candidate connection is made here either way: a wrong guess
+        would mean actually running real SQL against a database the user
+        never asked about.
+      api_error=False: every attempt got a real response back, but it
+        was unparseable garbage both times - genuinely nothing more
+        useful to try.
+    The caller (translate_routes.py's router_only_all_mode branch) shows
+    a different, honest message for the api_error=True case (see
+    _TRIAGE_API_ERROR_TEXT there) instead of its fixed "I am not able to
+    respond to your prompt" apology (_TRIAGE_FAILURE_TEXT), which is
+    reserved for the genuinely-unparseable case.
+
+    `api_key`/`tried_keys` mirror generate_sql_for_connection's own
+    parameters of the same name: both optional, defaulting to a freshly
+    picked key / a fresh single-key set when omitted (same "explicit, not
+    closed-over" reasoning applies as that function's docstring, even
+    though this call never runs in parallel across threads the way Phase
+    B's fan-out does - keeping the same shape avoids a third, subtly
+    different convention for the same idea). The caller
+    (translate_routes.py) passes its own already-picked `api_key` as the
+    starting point, so this doesn't burn a different key than the rest of
+    the request for no reason unless a rotation is actually needed."""
     llm_input = provider.build_llm_input(history or [], "", _build_candidate_prompt(candidate_summaries, user_question))
 
+    if api_key is None:
+        api_key = provider.pick_api_key()
+    if tried_keys is None:
+        tried_keys = {api_key}
+    key_pool_size = provider.get_key_pool_size()
+
     last_error = None
+    api_error = False
     for attempt in range(2):
-        try:
-            text, usage = provider.call(client, model, llm_input, _TRIAGE_SYSTEM_INSTRUCTION)
-        except Exception as e:
-            last_error = e
-            continue
+        text = None
+        transient_attempt = 1
+        while True:
+            try:
+                text, usage = provider.call(client, model, llm_input, _TRIAGE_SYSTEM_INSTRUCTION)
+                api_error = False
+                break
+            except Exception as e:
+                last_error = e
+                retry_action = provider.classify_error(e)
+                if retry_action is None:
+                    api_error = True
+                    break
+
+                if retry_action["rotate_key"]:
+                    if len(tried_keys) >= key_pool_size:
+                        api_error = True
+                        break
+                    next_key = provider.pick_api_key(exclude=tried_keys)
+                    if next_key != api_key:
+                        api_key = next_key
+                        client = provider.make_client(api_key)
+                    tried_keys.add(api_key)
+                    logger.warning(
+                        "Connection triage call failed (%d/%d configured keys tried), rotating API key and retrying immediately: %s",
+                        len(tried_keys), key_pool_size, e,
+                    )
+                    continue
+
+                if transient_attempt >= MAX_TRANSLATION_ATTEMPTS:
+                    api_error = True
+                    break
+                logger.warning(
+                    "Connection triage call failed (attempt %d/%d), retrying in %ds: %s",
+                    transient_attempt, MAX_TRANSLATION_ATTEMPTS, retry_action["delay"], e,
+                )
+                transient_attempt += 1
+                if retry_action["delay"]:
+                    time.sleep(retry_action["delay"])
+                continue
+
+        if text is None:
+            # The LLM call's own retry budget is exhausted, or it hit a
+            # non-retryable error outright - api_error is already True at
+            # this point. No point spending the second unparseable-
+            # response attempt on a call that's already just proven it
+            # can't succeed right now.
+            break
+
         parsed = _parse_triage_response(text, len(candidate_summaries), max_connections)
         if parsed is not None:
             parsed["usage"] = usage
             return parsed
         last_error = f"unparseable triage response: {text!r}"
+        api_error = False
 
     logger.warning("Connection triage (Phase A2, all-mode) failed after retry, no fallback: %s", last_error)
-    return {"outcome": "failed"}
+    return {"outcome": "failed", "api_error": api_error}

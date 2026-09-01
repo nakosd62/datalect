@@ -71,7 +71,7 @@ except ImportError:  # pragma: no cover - present today via google-genai
     httpx2 = None
 
 # from app_config import logger, log_and_generalize_error
-from app_config import logger, state_store
+from app_config import logger, state_store, MAX_TRANSLATION_ATTEMPTS, TRANSLATION_RETRY_DELAY_SECONDS
 
 from auth import get_or_create_session_id, get_current_user_identity, apply_session_cookie
 from db import (
@@ -80,7 +80,8 @@ from db import (
     resolve_in_scope_descriptors, build_router_candidate_summaries,
 )
 from backends import get_backend
-from connection_router import triage_all_mode_question
+from connection_router import triage_all_mode_question, is_label_only_response
+import cancel_registry
 
 translate_bp = Blueprint('translate', __name__)
 
@@ -297,9 +298,11 @@ HISTORY_MAX_TURNS = int(os.environ.get("HISTORY_MAX_TURNS", 10))
 # MAX_GEMINI_ATTEMPTS/GEMINI_RETRY_DELAY_SECONDS - renamed now that they
 # govern both providers' transient-error retries, not just Gemini's; there's
 # no back-compat alias, so an existing deployment setting the old names
-# needs updating.
-MAX_TRANSLATION_ATTEMPTS = int(os.environ.get("MAX_TRANSLATION_ATTEMPTS", 5))
-TRANSLATION_RETRY_DELAY_SECONDS = float(os.environ.get("TRANSLATION_RETRY_DELAY_SECONDS", 1))
+# needs updating. Now DEFINED in app_config.py, not here (imported above) -
+# connection_router.py's triage_all_mode_question needs the same two
+# constants for its own retry loop, and this module already imports FROM
+# connection_router.py, so the reverse import would be circular (see
+# app_config.py's own comment on this, right above where these now live).
 
 # --- LLM call timeout --------------------------------------------------------
 # Bounds how long ONE call to the configured LLM provider (Gemini/Claude/
@@ -1228,8 +1231,27 @@ def _strip_no_sql_prefix(text):
 # to _COMMON_FORMAT_RULES' own "I cannot respond at all with reasonable
 # confidence" convention, reused verbatim rather than inventing new
 # copy, since the user-facing meaning is the same: the app has nothing
-# useful to say about this prompt.
+# useful to say about this prompt. Reserved specifically for the
+# "api_error": False case - the model actually responded (twice), but
+# with something unparseable both times. See _TRIAGE_API_ERROR_TEXT just
+# below for the other "failed" case, which must NOT reuse this text.
 _TRIAGE_FAILURE_TEXT = "*** NO SQL *** I am not able to respond to your prompt."
+
+# Fixed, HONEST message for triage's "failed" outcome when it's really a
+# technical/capacity problem, not a comprehension one - triage_all_mode_
+# question's "api_error": True case (see its docstring): the LLM call
+# itself raised, and its own retry budget - key rotation and/or transient-
+# error retries, the exact same policy every other LLM call in this app
+# already uses - was fully used up without ever getting a response at
+# all. Before this text existed, this case was silently folded into
+# _TRIAGE_FAILURE_TEXT above, so a resource-exhausted/rate-limited/down
+# provider looked identical to "I couldn't understand your question" -
+# actively misleading, since the honest fix here is "wait and try again,"
+# not "rephrase your question."
+_TRIAGE_API_ERROR_TEXT = (
+    "*** NO SQL *** I couldn't reach the AI model right now - it looks like it's "
+    "temporarily out of capacity or unavailable. Please try again in a moment."
+)
 
 
 def generate_sql_for_connection(descriptor, prompt, history, provider, client, model,
@@ -1406,7 +1428,7 @@ def _classify_generation_outcome(entry, outcome):
     return {"outcome": "sql", "sql": marked}
 
 
-def _run_phase_b_fanout(selected_entries, prompts, provider, client, model, user_identity, force_schema_refresh):
+def _run_phase_b_fanout(selected_entries, prompts, provider, model, user_identity, force_schema_refresh):
     """"All databases" mode's Phase B: runs generate_sql_for_connection()
     once per entry in `selected_entries`, in PARALLEL via a
     ThreadPoolExecutor (same pre-allocate-results-array +
@@ -1441,17 +1463,25 @@ def _run_phase_b_fanout(selected_entries, prompts, provider, client, model, user
     itself stays oblivious to where each prompt came from, it just sends
     prompts[i] to selected_entries[i].
 
-    Each call is fully independent: its OWN freshly-picked api_key (never
-    a shared tried-keys set - N threads racing on one shared mutable set
-    would corrupt it - see generate_sql_for_connection's docstring), EMPTY
-    history (per-database chat history is explicitly deferred to later
-    work), and that connection's own full schema/dialect intro - i.e.
-    exactly as if the user had selected just that one connection and
-    submitted its own `prompts[i]` directly. One connection's call failing
-    (its own retry budget exhausted, or a non-retryable error) does NOT
-    prevent the others from completing - matches the same tolerant,
-    per-item failure isolation already used both by db.py's schema-summary
-    fan-out and by execute_routes.py's per-connection execution.
+    Each call is fully independent: its OWN freshly-picked api_key AND a
+    client built from that exact key (never a shared tried-keys set - N
+    threads racing on one shared mutable set would corrupt it - see
+    generate_sql_for_connection's docstring), EMPTY history (per-database
+    chat history is explicitly deferred to later work), and that
+    connection's own full schema/dialect intro - i.e. exactly as if the
+    user had selected just that one connection and submitted its own
+    `prompts[i]` directly. There is deliberately no shared `client`
+    parameter here (unlike triage_all_mode_question/
+    summarize_all_mode_results, which reuse the caller's already-picked
+    key/client as their starting point) - every worker's key is picked
+    independently at fan-out time, so a single client handed in from
+    outside would almost always belong to a DIFFERENT key than at least
+    some workers end up using (see _run_one's own comment for the bug this
+    fixes). One connection's call failing (its own retry budget exhausted,
+    or a non-retryable error) does NOT prevent the others from completing -
+    matches the same tolerant, per-item failure isolation already used
+    both by db.py's schema-summary fan-out and by execute_routes.py's
+    per-connection execution.
 
     Returns (sql_blocks, database_notes, generation_failures, usage_totals):
       sql_blocks: [(entry, marked_sql_text), ...] - one per entry that
@@ -1472,9 +1502,30 @@ def _run_phase_b_fanout(selected_entries, prompts, provider, client, model, user
         contributes nothing).
     """
     def _run_one(entry, entry_prompt):
+        # BUG FIXED HERE: this used to pick a fresh `worker_api_key` but
+        # then pass it alongside the OUTER, closed-over `client` - which
+        # was built (once, at the top of stream_translation()) for
+        # whatever key triage happened to be using, not this worker's own.
+        # provider.pick_api_key() (Gemini's own impl - see
+        # pick_gemini_api_key) picks RANDOMLY from the configured pool, so
+        # with 2+ keys configured, `worker_api_key` frequently differed
+        # from the key `client` was actually authenticated with. The
+        # request that hit the wire used `client`'s real key the whole
+        # time, but generate_sql_for_connection's retry loop believed it
+        # was using `worker_api_key` - so on a 429, it excluded the WRONG
+        # key from rotation (one that was never actually tried) and could
+        # rotate straight back onto the real, already-exhausted key, or
+        # give up as "budget exhausted" while a perfectly good configured
+        # key had never been attempted at all. Building the client here,
+        # from the SAME worker_api_key passed below, keeps the two
+        # permanently in sync - exactly what every other rotating call in
+        # this app (generate_sql_for_connection's own internal rotation,
+        # triage_all_mode_question, summarize_all_mode_results) already
+        # does whenever it picks a new key.
         worker_api_key = provider.pick_api_key()
+        worker_client = provider.make_client(worker_api_key)
         gen = generate_sql_for_connection(
-            entry["descriptor"], entry_prompt, [], provider, client, model, user_identity,
+            entry["descriptor"], entry_prompt, [], provider, worker_client, model, user_identity,
             force_schema_refresh=force_schema_refresh,
             api_key=worker_api_key, tried_keys={worker_api_key},
         )
@@ -1583,6 +1634,15 @@ _SUMMARY_SYSTEM_INSTRUCTION = (
     "queries have now been run against each of them. You will be given the user's ORIGINAL question and, "
     "for each database that was queried, exactly one of: its actual result rows, a note that it had "
     "nothing relevant to contribute, or an error explaining that querying it failed.\n"
+    "Your response has two parts. FIRST, a single label line: a short (one to two word) section-heading "
+    "label meaning \"Results Summary\" - in English this label is literally the phrase \"Results Summary\", "
+    "but you must instead write it TRANSLATED into the SAME LANGUAGE as the user's original question, with "
+    "nothing else on that line, followed by a blank line. SECOND, immediately after that blank line, your "
+    "real, substantive answer - the per-database paragraphs described below, ALSO written in that same "
+    "language. Example of the full shape, if the question was in English: \"Results Summary\\n\\n**Sales "
+    "Postgres:** ...\". Never stop after the label - the label by itself, with no paragraphs following it, "
+    "is not a valid response; the label is a UI section heading prepended to your answer, not a substitute "
+    "for writing one. The label itself is plain text with no markdown emphasis of your own around it.\n"
     "Write ONE separate short paragraph PER DATABASE, answering the original question using just that "
     "database's own results. Start each paragraph with the database's real name in bold, exactly as given "
     "below - never an index or a label like \"Database 1\" - followed by a colon, e.g. \"**Sales "
@@ -1594,7 +1654,8 @@ _SUMMARY_SYSTEM_INSTRUCTION = (
     "ONE final short paragraph with that combined answer after the per-database ones - otherwise leave it "
     "out entirely; do not restate or recap the per-database paragraphs a second time.\n"
     "Respond with plain text only - no SQL, no markdown tables, no code fences, no bullet points, no "
-    "headings. The bold database-name lead-in above is the only formatting to use.\n"
+    "other headings. The leading translated label line and the bold database-name lead-in above are the "
+    "only formatting to use.\n"
 )
 
 
@@ -1635,7 +1696,19 @@ def _build_summary_prompt(user_question, database_results):
     )
 
 
-def summarize_all_mode_results(user_question, database_results, provider, client, model):
+# is_label_only_response (imported from connection_router.py, shared with
+# triage_all_mode_question there) detects a response that's just the
+# leading label (see _SUMMARY_SYSTEM_INSTRUCTION) with no real paragraphs
+# after it, so it can be retried exactly like a genuinely empty response,
+# instead of silently showing the user a bare heading with nothing usable
+# underneath it - see its own docstring for why this is POSITION-based
+# rather than matching a specific word: the label is now translated into
+# the user's own question's language, so it can no longer be matched
+# against a fixed English string like "Result Summary"/"Results Summary".
+
+
+def summarize_all_mode_results(user_question, database_results, provider, client, model,
+                                api_key=None, tried_keys=None):
     """"All databases" mode's Phase C - see the section comment above for
     the fuller picture of when/why this runs. A brief, plain-text answer
     to `user_question` - one short paragraph per database, over the
@@ -1644,12 +1717,34 @@ def summarize_all_mode_results(user_question, database_results, provider, client
     known (see _SUMMARY_SYSTEM_INSTRUCTION for the exact shape asked
     for).
 
-    Bounded 2-attempt retry, same shape as connection_router.py's
-    triage_all_mode_question - a call that raises (or comes back empty)
-    on both attempts returns (None, None); the caller treats that as
-    "leave the Summary tab as it already is" rather than surfacing a hard
-    error, since this whole step is additive/best-effort on top of a
-    request that has already fully succeeded by this point.
+    Bounded 2-attempt retry at getting usable CONTENT back (a response
+    that comes back empty, or as JUST the label with no real paragraphs
+    after it - see is_label_only_response - counts as a failed attempt,
+    same as connection_router.py's triage_all_mode_question treats an
+    unparseable response). Nested
+    inside each of those 2 attempts is the SAME transient-error/key-
+    rotation retry loop generate_sql_for_connection/triage_all_mode_
+    question already run (provider.classify_error()/
+    MAX_TRANSLATION_ATTEMPTS/TRANSLATION_RETRY_DELAY_SECONDS/
+    provider.get_key_pool_size()) - this call used to be the one LLM call
+    in the whole "all databases" pipeline that did NOT get that treatment:
+    a real capacity/rate-limit error on the configured key would exhaust
+    a bare 2-attempt loop with no rotation and no wait, in well under a
+    second, silently leaving the Summary tab as if Phase C had simply
+    never run - easy to mistake for a rendering bug (which is exactly what
+    this looked like from the client side) rather than the resource-
+    exhaustion condition it actually was. `api_key`/`tried_keys` mirror
+    those two functions' own parameters of the same name for the same
+    reason: the caller's own already-picked key is the natural starting
+    point, and an explicit (not closed-over) `tried_keys` set is safe to
+    thread through a fresh call each time this fires.
+
+    On total failure (LLM call retry/rotation budget exhausted, or 2
+    consecutive content-invalid responses) returns (None, None); the
+    caller treats that as "leave the Summary tab as it already is" rather
+    than surfacing a hard error, since this whole step is additive/best-
+    effort on top of a request that has already fully succeeded by this
+    point.
 
     Returns (text, usage) on success - `text` is the model's own plain-
     text answer, NOT YET prefixed with the app's "*** NO SQL ***"
@@ -1657,17 +1752,75 @@ def summarize_all_mode_results(user_question, database_results, provider, client
     outcome does, so the prefix logic lives in exactly one place)."""
     llm_input = provider.build_llm_input([], "", _build_summary_prompt(user_question, database_results))
 
+    if api_key is None:
+        api_key = provider.pick_api_key()
+    if tried_keys is None:
+        tried_keys = {api_key}
+    key_pool_size = provider.get_key_pool_size()
+
     last_error = None
     for attempt in range(2):
-        try:
-            text, usage = provider.call(client, model, llm_input, _SUMMARY_SYSTEM_INSTRUCTION)
-        except Exception as e:
-            last_error = e
-            continue
+        text = None
+        transient_attempt = 1
+        while True:
+            try:
+                text, usage = provider.call(client, model, llm_input, _SUMMARY_SYSTEM_INSTRUCTION)
+                break
+            except Exception as e:
+                last_error = e
+                retry_action = provider.classify_error(e)
+                if retry_action is None:
+                    text = None
+                    break
+
+                if retry_action["rotate_key"]:
+                    if len(tried_keys) >= key_pool_size:
+                        text = None
+                        break
+                    next_key = provider.pick_api_key(exclude=tried_keys)
+                    if next_key != api_key:
+                        api_key = next_key
+                        client = provider.make_client(api_key)
+                    tried_keys.add(api_key)
+                    logger.warning(
+                        "Phase C summarization call failed (%d/%d configured keys tried), rotating API key and retrying immediately: %s",
+                        len(tried_keys), key_pool_size, e,
+                    )
+                    continue
+
+                if transient_attempt >= MAX_TRANSLATION_ATTEMPTS:
+                    text = None
+                    break
+                logger.warning(
+                    "Phase C summarization call failed (attempt %d/%d), retrying in %ds: %s",
+                    transient_attempt, MAX_TRANSLATION_ATTEMPTS, retry_action["delay"], e,
+                )
+                transient_attempt += 1
+                if retry_action["delay"]:
+                    time.sleep(retry_action["delay"])
+                continue
+
+        if text is None:
+            # The LLM call's own retry/key-rotation budget is exhausted, or
+            # it hit a non-retryable error outright - no point spending the
+            # second content-validity attempt on a call that's already
+            # just proven it can't succeed right now with any configured
+            # key (same reasoning as triage_all_mode_question's identical
+            # early break).
+            break
+
+        # is_label_only_response runs on the RAW `text` (before .strip()
+        # below collapses a "label line, then a blank line, then nothing"
+        # response down to just the label) - it needs that blank line
+        # intact to tell "just the label" apart from a plain single-line
+        # response with no label convention at all (see its docstring).
         stripped = (text or "").strip()
-        if stripped:
+        if stripped and not is_label_only_response(text or ""):
             return stripped, usage
-        last_error = "empty summarization response"
+        last_error = (
+            "response was only the label, or missing the label/blank-line shape, with no real content after it"
+            if stripped else "empty summarization response"
+        )
 
     logger.warning("All-mode results summarization (Phase C) failed after retry: %s", last_error)
     return None, None
@@ -1703,7 +1856,19 @@ def summarize_results():
 
     start_time = time.perf_counter()
     client = provider.make_client(api_key)
-    text, usage = summarize_all_mode_results(prompt, database_results, provider, client, llm_model)
+    cancel_token = cancel_handle = None
+    close_fn = getattr(client, "close", None)
+    if callable(close_fn):
+        cancel_token, cancel_handle = cancel_registry.register(session_id, close_fn)
+    try:
+        text, usage = summarize_all_mode_results(
+            prompt, database_results, provider, client, llm_model, api_key=api_key,
+        )
+    finally:
+        if cancel_token is not None:
+            cancel_registry.unregister(session_id, cancel_token)
+        if cancel_handle is not None:
+            cancel_handle.close()
     duration = round(1000 * (time.perf_counter() - start_time))
 
     if text is None:
@@ -1806,6 +1971,37 @@ def translate_query():
     # Zero or more progress lines are emitted first:
     #   {"status": "retrying", "attempt": <next attempt #>, "maxAttempts": N,
     #    "delaySeconds": <float>, "rotatedKey": <bool>}
+    # For the single-connection path specifically (router_only_all_mode
+    # False - see stream_translation() below), exactly two more progress
+    # lines are emitted ahead of the retry loop, so the client has
+    # something better than a bare spinner for the two real waits that
+    # happen before the first byte of SQL comes back - reading the schema,
+    # then the LLM call itself:
+    #   {"status": "phase_status", "phase": "schema"|"generating_sql",
+    #    "message": "<short human-readable sentence>"}
+    # This is deliberately just a label, not a progress bar - it doesn't
+    # shrink either wait, it just tells the user which one they're in.
+    # Router ("all databases") mode emits its OWN two "phase_status" lines
+    # first, ahead of ITS two real pre-SQL waits - collecting every in-
+    # scope connection's schema summary (build_router_candidate_summaries)
+    # and the triage LLM call itself (triage_all_mode_question) - using
+    # the exact same event shape, just different `phase` values:
+    #   {"status": "phase_status", "phase": "collecting_schema_summaries"
+    #    |"routing", "message": "<short human-readable sentence>"}
+    # These used to not exist at all: before them, a router-mode request
+    # streamed NOTHING for however long those two steps took (both can be
+    # genuinely slow - schema collection scales with how many connections
+    # are in scope, and triage now has its own real retry/key-rotation
+    # budget, see triage_all_mode_question's docstring), leaving the
+    # client with no visible progress until the FIRST event it could
+    # otherwise render - phase_a_route - which only ever arrives once
+    # triage has already fully finished, and only for the "route" outcome
+    # (an "answer"/"failed" outcome gets no intermediate event at all
+    # under the OLD design). router mode's own, more informative per-
+    # connection progress (phase_a_route/phase_b_connection_done below)
+    # still only starts once triage itself resolves to "route" - these two
+    # new lines are what covers everything before that point, for every
+    # outcome.
     # ...followed by exactly one terminal line:
     #   {"status": "done", "success": true, "sql": ..., "input_tokens": ...,
     #    "output_tokens": ..., "total_tokens": ..., "thinking_tokens": ...,
@@ -1826,8 +2022,13 @@ def translate_query():
     # since nothing has streamed yet at that point.)
     def stream_translation():
         nonlocal api_key
+        cancel_token = None
+        cancel_handle = None
         try:
             client = provider.make_client(api_key)
+            close_fn = getattr(client, "close", None)
+            if callable(close_fn):
+                cancel_token, cancel_handle = cancel_registry.register(session_id, close_fn)
 
             if router_only_all_mode:
                 # "All databases" mode's real two-phase flow (see
@@ -1854,9 +2055,35 @@ def translate_query():
                 # real SQL - defeating the point of this feature for that
                 # case.
                 start_time = time.perf_counter()
+
+                # First of router mode's two phase_status lines (see the
+                # module docstring above) - collecting every in-scope
+                # connection's schema summary can be a real, visible wait
+                # (scales with how many connections are in scope; each
+                # summary is itself schema_cache-backed, so this is fast
+                # on a warm cache but not on a cold one or a forced
+                # refresh), and previously had no progress indicator at
+                # all.
+                yield json.dumps({
+                    "status": "phase_status",
+                    "phase": "collecting_schema_summaries",
+                    "message": "Collecting database summaries…",
+                }) + "\n"
                 candidate_summaries = build_router_candidate_summaries(in_scope_entries, user_identity)
+
+                # Second of router mode's two phase_status lines - the
+                # triage LLM call itself, which now carries its own real
+                # retry/key-rotation budget (see triage_all_mode_question's
+                # docstring), so this wait can be the longest one and
+                # previously had no progress indicator at all either.
+                yield json.dumps({
+                    "status": "phase_status",
+                    "phase": "routing",
+                    "message": "Deciding which database(s) to check…",
+                }) + "\n"
                 triage_result = triage_all_mode_question(
                     candidate_summaries, prompt, provider, client, llm_model, history=history,
+                    api_key=api_key,
                 )
                 # Phase A's own elapsed time and LLM usage, isolated from
                 # whatever Phase B work (if any) happens next below -
@@ -1882,9 +2109,23 @@ def translate_query():
                     # its own bounded retry - deliberately NOT a fallback
                     # guess at some candidate connection: a wrong
                     # running real SQL against a database the user never
-                    # asked about, so this shows the app's existing fixed
-                    # apology instead.
-                    generated_sql = _TRIAGE_FAILURE_TEXT
+                    # asked about, so this shows a fixed apology instead.
+                    # WHICH apology depends on WHY it failed (see
+                    # triage_all_mode_question's docstring): "api_error"
+                    # distinguishes a real technical/capacity failure (the
+                    # LLM call itself raised and its own retry budget -
+                    # key rotation and/or transient-error retries - ran
+                    # out, e.g. every configured Gemini key was out of
+                    # capacity) from a response that genuinely came back
+                    # unparseable both times. These used to be
+                    # indistinguishable, both showing _TRIAGE_FAILURE_TEXT
+                    # - actively misleading for the api_error case, since
+                    # it reads as "I couldn't understand your question"
+                    # when the honest answer is "the AI service is
+                    # temporarily out of capacity, try again shortly."
+                    generated_sql = (
+                        _TRIAGE_API_ERROR_TEXT if triage_result.get("api_error") else _TRIAGE_FAILURE_TEXT
+                    )
                     triage_log_text = generated_sql
                 else:  # "route" - needs real data from specific connection(s)
                     selected_entries = [in_scope_entries[i] for i in triage_result["indices"]]
@@ -1911,8 +2152,19 @@ def translate_query():
                     # immediately: the Summary tab text and one placeholder
                     # tab per selected connection, well before any single
                     # connection's own generation call has finished.
+                    # The server-built fallback (the model's own "message"
+                    # was empty/missing) gets the same label-line header the
+                    # model is instructed to lead with itself (see
+                    # _TRIAGE_SYSTEM_INSTRUCTION), so the Summary tab always
+                    # shows one regardless of which source this text came
+                    # from. Deliberately hardcoded English here, unlike the
+                    # model's own (translated) label: this is a last-resort
+                    # fallback with no LLM call of its own to ask for a
+                    # translation from, and only ever fires when the model
+                    # itself failed to provide a usable "message" - routing
+                    # still succeeds either way, this is strictly cosmetic.
                     routing_message = triage_result.get("message") or (
-                        "Checking " + ", ".join(e["name"] for e in selected_entries) + " for your question."
+                        "Triage\n\nChecking " + ", ".join(e["name"] for e in selected_entries) + " for your question."
                     )
                     connection_selection = [
                         {"kind": e["kind"], "id": e["id"], "name": e["name"]} for e in selected_entries
@@ -1935,7 +2187,7 @@ def translate_query():
                     # StopIteration.value, the same idiom _drain_generation
                     # uses.
                     phase_b_gen = _run_phase_b_fanout(
-                        selected_entries, entry_prompts, provider, client, llm_model, user_identity, force_schema_refresh,
+                        selected_entries, entry_prompts, provider, llm_model, user_identity, force_schema_refresh,
                     )
                     try:
                         while True:
@@ -2047,6 +2299,18 @@ def translate_query():
             # always returns before falling through to here), i.e. for the
             # overwhelming majority of sessions today: in_scope_mode isn't
             # "all", or an explicit database_url override is in play.
+            #
+            # First of the two phase_status lines this path emits (see the
+            # module docstring above) - schema lookup is usually a cache
+            # hit and near-instant, but can be a real, visible wait on a
+            # cold cache or an explicit refresh_schema request, and the
+            # client has no other way to distinguish "still building the
+            # prompt" from "waiting on the model" without this.
+            yield json.dumps({
+                "status": "phase_status",
+                "phase": "schema",
+                "message": "Reading the database schema…",
+            }) + "\n"
             schema = get_database_schema(conn_str, user_identity, force_refresh=force_schema_refresh)
 
             try:
@@ -2090,6 +2354,19 @@ def translate_query():
             # this generator runs), so it's the natural running total of
             # distinct keys tried.
             key_pool_size = provider.get_key_pool_size()
+
+            # Second of the two phase_status lines (see the module
+            # docstring above) - emitted once, right before the retry loop
+            # below makes its first attempt. This is the wait that's
+            # normally the longest one and the one the "just a spinner"
+            # complaint was really about; a "retrying" line (if any) will
+            # naturally overwrite this same banner once/if the loop below
+            # actually needs one.
+            yield json.dumps({
+                "status": "phase_status",
+                "phase": "generating_sql",
+                "message": "Writing the right command for the database…",
+            }) + "\n"
 
             start_time = time.perf_counter()
             generated_sql = ""
@@ -2208,6 +2485,11 @@ def translate_query():
                 'success': False,
                 'error': str(e) or f"{type(e).__name__} occurred during translation.",
             }) + "\n"
+        finally:
+            if cancel_token is not None:
+                cancel_registry.unregister(session_id, cancel_token)
+            if cancel_handle is not None:
+                cancel_handle.close()
 
     resp = Response(stream_with_context(stream_translation()), mimetype='application/x-ndjson')
     return apply_session_cookie(resp, session_id)

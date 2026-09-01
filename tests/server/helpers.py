@@ -45,7 +45,7 @@ if SERVER_DIR not in sys.path:
 _APP_MODULE_NAMES = [
     "app_config", "auth", "config_routes", "execute_routes",
     "translate_routes", "history_routes", "db", "schema_cache", "state_store",
-    "connection_router",
+    "connection_router", "cancel_registry",
 ]
 
 # Every env var any of the above modules reads at import or request time.
@@ -136,8 +136,9 @@ def fresh_import(monkeypatch, tmp_path, env=None, register_blueprints=True, mock
 
     Returns a SimpleNamespace with at least `.app_config`; when
     register_blueprints=True (the default) also `.auth`, `.config_routes`,
-    `.execute_routes`, `.translate_routes`, `.history_routes`, and
-    `.client` (a Flask test client with state_store.init() already called).
+    `.execute_routes`, `.translate_routes`, `.history_routes`,
+    `.cancel_registry`, and `.client` (a Flask test client with
+    state_store.init() already called).
     """
     os.makedirs(tmp_path, exist_ok=True)
     monkeypatch.chdir(tmp_path)
@@ -175,6 +176,7 @@ def fresh_import(monkeypatch, tmp_path, env=None, register_blueprints=True, mock
         import execute_routes
         import translate_routes
         import history_routes
+        import cancel_registry
 
         app_config.app.before_request(auth.enforce_authentication)
         for bp in (
@@ -188,6 +190,7 @@ def fresh_import(monkeypatch, tmp_path, env=None, register_blueprints=True, mock
         ns.execute_routes = execute_routes
         ns.translate_routes = translate_routes
         ns.history_routes = history_routes
+        ns.cancel_registry = cancel_registry
 
         # Mirrors server.py's own '/' route registration (serves the SPA
         # shell) - not a blueprint, so it's not picked up above, but it's

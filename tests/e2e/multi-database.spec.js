@@ -621,6 +621,89 @@ test.describe('multi-database question answering', () => {
     await expect(summaryText).toContainText('Combined revenue across both databases is $700.');
   });
 
+  // Regression guard for the "Triage"/"Result Summary" section labels
+  // becoming language-agnostic (see connection_router.py's
+  // is_label_only_response and client.js's renderMarkdownLiteSummaryTab):
+  // the server now translates each label into the user's own question's
+  // language rather than always sending the literal English word, so the
+  // client can no longer detect what to bold by matching specific text -
+  // it has to work purely by POSITION (see those two functions'
+  // docstrings). Mocks both labels in Spanish specifically to prove this
+  // isn't hardcoded to English words anymore - a bug here would leave
+  // both labels rendered as plain, un-bolded text instead.
+  test('non-English triage and results-summary labels are still bolded, by position rather than by matching English words', async ({ page }) => {
+    await mockConfig(page);
+    await gotoApp(page);
+
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          router_route: true,
+          routing_message: 'Diagnóstico\n\nComprobando Sales Postgres y Marketing Postgres.',
+          sql:
+            '-- database: preset:p-a (Sales Postgres)\nSELECT * FROM deals;\n\n' +
+            '-- database: preset:p-b (Marketing Postgres)\nSELECT * FROM campaigns;',
+          database_notes: [],
+          generation_failures: [],
+          connection_selection: [
+            { kind: 'preset', id: 'p-a', name: 'Sales Postgres' },
+            { kind: 'preset', id: 'p-b', name: 'Marketing Postgres' },
+          ],
+        }),
+      });
+    });
+    await page.route('**/api/execute', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          results: [
+            { statement: 'SELECT * FROM deals', columns: ['total'], rows: [{ total: 500 }], rowCount: 1,
+              database: { kind: 'preset', id: 'p-a', name: 'Sales Postgres' } },
+            { statement: 'SELECT * FROM campaigns', columns: ['total'], rows: [{ total: 200 }], rowCount: 1,
+              database: { kind: 'preset', id: 'p-b', name: 'Marketing Postgres' } },
+          ],
+        }),
+      });
+    });
+    await page.route('**/api/summarize-results', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          summary: '*** NO SQL *** Resumen de resultados\n\nLos ingresos combinados son $700.',
+        }),
+      });
+    });
+
+    await page.locator('#aiPrompt').fill('ingresos combinados de ventas y marketing');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect.poll(() => currentSql(page)).toContain('SELECT');
+
+    await page.locator('#runBtn').click();
+
+    const summaryText = page.locator('.response-text');
+    await expect(summaryText).toContainText('Comprobando Sales Postgres y Marketing Postgres.');
+    await expect(summaryText).toContainText('Los ingresos combinados son $700.');
+
+    // Both labels - triage's own leading one, and Phase C's own leading
+    // one after the join - are real bolded+underlined headings, not left
+    // as plain text the way an English-only word-matching regex would
+    // have left them.
+    const boldedLabels = summaryText.locator('strong u');
+    await expect(boldedLabels).toHaveCount(2);
+    await expect(boldedLabels.nth(0)).toHaveText('Diagnóstico');
+    await expect(boldedLabels.nth(1)).toHaveText('Resumen de resultados');
+  });
+
   test('a Phase C summary with one bold-named paragraph per database renders as separate paragraphs with the names bolded', async ({ page }) => {
     // The prompt (server/translate_routes.py's _SUMMARY_SYSTEM_INSTRUCTION)
     // asks the LLM for "**Name:** ..." paragraphs separated by a blank
@@ -639,7 +722,11 @@ test.describe('multi-database question answering', () => {
         body: JSON.stringify({
           success: true,
           router_route: true,
-          routing_message: 'Checking Sales Postgres and Marketing Postgres.',
+          // Leading label lines included on both, matching the real
+          // shape _TRIAGE_SYSTEM_INSTRUCTION/_SUMMARY_SYSTEM_INSTRUCTION
+          // ask the model for - see the dedicated label test above for
+          // why that matters to this rendering pipeline now.
+          routing_message: 'Triage\n\nChecking Sales Postgres and Marketing Postgres.',
           sql:
             '-- database: preset:p-a (Sales Postgres)\nSELECT * FROM deals;\n\n' +
             '-- database: preset:p-b (Marketing Postgres)\nSELECT * FROM campaigns;',
@@ -676,7 +763,7 @@ test.describe('multi-database question answering', () => {
         body: JSON.stringify({
           success: true,
           summary:
-            '*** NO SQL *** **Sales Postgres:** Revenue was $500.\n\n' +
+            '*** NO SQL *** Results Summary\n\n**Sales Postgres:** Revenue was $500.\n\n' +
             '**Marketing Postgres:** No campaigns ran this period.',
         }),
       });
@@ -694,8 +781,11 @@ test.describe('multi-database question answering', () => {
     // "**" asterisks leaking through), and the two paragraphs are still
     // separated by a blank line in the underlying text - .response-text's
     // white-space: pre-wrap is what turns that into a genuine visible gap
-    // between them rather than one run-on paragraph.
-    await expect(summaryText.locator('strong')).toHaveText(['Sales Postgres:', 'Marketing Postgres:']);
+    // between them rather than one run-on paragraph. Scoped to exclude
+    // the two <strong><u>...</u></strong> section-heading labels (see the
+    // dedicated label test above) - this test is specifically about the
+    // per-database bold name convention.
+    await expect(summaryText.locator('strong:not(:has(u))')).toHaveText(['Sales Postgres:', 'Marketing Postgres:']);
     const rawText = await summaryText.evaluate((el) => el.textContent);
     expect(rawText).toContain('Revenue was $500.\n\nMarketing Postgres:');
   });
@@ -1087,6 +1177,190 @@ test.describe('multi-database question answering', () => {
     expect(executeCalls.some((c) => c.sql.includes('preset:p-b'))).toBe(true);
     await expect(tabs.nth(1)).toContainText('Sales Postgres');
     await expect(tabs.nth(2)).toContainText('Marketing Postgres');
+  });
+
+  // Regression test for a real bug report: a connection whose own generated
+  // script has MORE THAN ONE statement only ever showed the first
+  // statement's tab, silently dropping every statement after it - single-
+  // connection mode already shows one tab per statement
+  // (renderMultiTurnResults), "all databases" mode's live per-connection
+  // execute path (executeOneAllModeConnection in client.js) did not.
+  test('with auto-execute on, a connection whose script has multiple statements gets one tab per statement, not just the first', async ({ page }) => {
+    await mockConfig(page, { ...buildConfigState(), auto_sql_execute: true });
+    await gotoApp(page);
+
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      const ndjson = [
+        {
+          status: 'phase_a_route', routing_message: 'Checking both.',
+          connection_selection: [
+            { kind: 'preset', id: 'p-a', name: 'Sales Postgres' },
+            { kind: 'preset', id: 'p-b', name: 'Marketing Postgres' },
+          ],
+        },
+        {
+          status: 'phase_b_connection_done', kind: 'preset', id: 'p-a', name: 'Sales Postgres',
+          outcome: 'sql',
+          sql: '-- database: preset:p-a (Sales Postgres)\nSELECT * FROM deals; SELECT * FROM leads;',
+        },
+        {
+          status: 'phase_b_connection_done', kind: 'preset', id: 'p-b', name: 'Marketing Postgres',
+          outcome: 'sql', sql: '-- database: preset:p-b (Marketing Postgres)\nSELECT * FROM campaigns;',
+        },
+        {
+          status: 'done', success: true, router_route: true, routing_message: 'Checking both.',
+          sql:
+            '-- database: preset:p-a (Sales Postgres)\nSELECT * FROM deals; SELECT * FROM leads;\n\n' +
+            '-- database: preset:p-b (Marketing Postgres)\nSELECT * FROM campaigns;',
+          database_notes: [], generation_failures: [],
+          connection_selection: [
+            { kind: 'preset', id: 'p-a', name: 'Sales Postgres' },
+            { kind: 'preset', id: 'p-b', name: 'Marketing Postgres' },
+          ],
+        },
+      ].map((e) => JSON.stringify(e)).join('\n') + '\n';
+      await route.fulfill({ status: 200, contentType: 'application/x-ndjson', body: ndjson });
+    });
+
+    await page.route('**/api/execute', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      const body = route.request().postDataJSON();
+      const isA = body.sql.includes('preset:p-a');
+      await route.fulfill({
+        status: 200, contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          // Sales Postgres' own script has TWO statements - both must
+          // survive as their own tabs, tagged with the SAME database.
+          results: isA
+            ? [
+                { statement: 'SELECT * FROM deals', columns: ['x'], rows: [{ x: 1 }], rowCount: 1,
+                  database: { kind: 'preset', id: 'p-a', name: 'Sales Postgres' } },
+                { statement: 'SELECT * FROM leads', columns: ['x'], rows: [{ x: 2 }], rowCount: 1,
+                  database: { kind: 'preset', id: 'p-a', name: 'Sales Postgres' } },
+              ]
+            : [
+                { statement: 'SELECT * FROM campaigns', columns: ['x'], rows: [{ x: 3 }], rowCount: 1,
+                  database: { kind: 'preset', id: 'p-b', name: 'Marketing Postgres' } },
+              ],
+        }),
+      });
+    });
+    await page.route('**/api/summarize-results', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ success: true, summary: '' }) });
+    });
+
+    await page.locator('#aiPrompt').fill('deals, leads, and campaigns');
+    await page.locator('#aiPrompt').press('Enter');
+
+    // Summary + Sales Postgres' TWO statement tabs + Marketing Postgres'
+    // one tab = 4 total, not 3 (which is what the bug produced - Sales
+    // Postgres' second statement silently dropped).
+    const tabs = page.locator('#resultsTabsNav .result-tab-btn');
+    await expect(tabs).toHaveCount(4);
+    await expect(tabs.nth(0)).toContainText('Summary');
+    await expect(tabs.nth(1)).toContainText('Sales Postgres');
+    await expect(tabs.nth(2)).toContainText('Sales Postgres');
+    await expect(tabs.nth(3)).toContainText('Marketing Postgres');
+
+    await tabs.nth(1).click();
+    await expect(page.locator('#resultsBody td').first()).toHaveText('1');
+    await tabs.nth(2).click();
+    await expect(page.locator('#resultsBody td').first()).toHaveText('2');
+    await tabs.nth(3).click();
+    await expect(page.locator('#resultsBody td').first()).toHaveText('3');
+  });
+
+  // Regression test for the same underlying bug, on the manual-Execute-
+  // button (auto-execute off) batched path - settleAllModeBatchedResults()
+  // in client.js groups a single /api/execute response's results by
+  // connection before turning them into tabs, so this path needs its own
+  // coverage independent of executeOneAllModeConnection() above.
+  test('with auto-execute off, a manual Execute click also gives one tab per statement for a connection with multiple statements', async ({ page }) => {
+    await mockConfig(page); // auto_sql_execute: false (buildConfigState()'s default)
+    await gotoApp(page);
+
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      const ndjson = [
+        {
+          status: 'phase_a_route', routing_message: 'Checking both.',
+          connection_selection: [
+            { kind: 'preset', id: 'p-a', name: 'Sales Postgres' },
+            { kind: 'preset', id: 'p-b', name: 'Marketing Postgres' },
+          ],
+        },
+        {
+          status: 'phase_b_connection_done', kind: 'preset', id: 'p-a', name: 'Sales Postgres',
+          outcome: 'sql',
+          sql: '-- database: preset:p-a (Sales Postgres)\nSELECT * FROM deals; SELECT * FROM leads;',
+        },
+        {
+          status: 'phase_b_connection_done', kind: 'preset', id: 'p-b', name: 'Marketing Postgres',
+          outcome: 'sql', sql: '-- database: preset:p-b (Marketing Postgres)\nSELECT * FROM campaigns;',
+        },
+        {
+          status: 'done', success: true, router_route: true, routing_message: 'Checking both.',
+          sql:
+            '-- database: preset:p-a (Sales Postgres)\nSELECT * FROM deals; SELECT * FROM leads;\n\n' +
+            '-- database: preset:p-b (Marketing Postgres)\nSELECT * FROM campaigns;',
+          database_notes: [], generation_failures: [],
+          connection_selection: [
+            { kind: 'preset', id: 'p-a', name: 'Sales Postgres' },
+            { kind: 'preset', id: 'p-b', name: 'Marketing Postgres' },
+          ],
+        },
+      ].map((e) => JSON.stringify(e)).join('\n') + '\n';
+      await route.fulfill({ status: 200, contentType: 'application/x-ndjson', body: ndjson });
+    });
+
+    const executeCalls = [];
+    await page.route('**/api/execute', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      executeCalls.push(route.request().postDataJSON());
+      await route.fulfill({
+        status: 200, contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          results: [
+            // Both of Sales Postgres' statements come back in the SAME
+            // batched response, grouped with Marketing Postgres' one
+            // statement in between - settleAllModeBatchedResults() must
+            // group these back together by database, not by array position.
+            { statement: 'SELECT * FROM deals', columns: ['x'], rows: [{ x: 1 }], rowCount: 1,
+              database: { kind: 'preset', id: 'p-a', name: 'Sales Postgres' } },
+            { statement: 'SELECT * FROM campaigns', columns: ['x'], rows: [{ x: 3 }], rowCount: 1,
+              database: { kind: 'preset', id: 'p-b', name: 'Marketing Postgres' } },
+            { statement: 'SELECT * FROM leads', columns: ['x'], rows: [{ x: 2 }], rowCount: 1,
+              database: { kind: 'preset', id: 'p-a', name: 'Sales Postgres' } },
+          ],
+        }),
+      });
+    });
+    await page.route('**/api/summarize-results', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ success: true, summary: '' }) });
+    });
+
+    await page.locator('#aiPrompt').fill('deals, leads, and campaigns');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect.poll(() => currentSql(page)).toContain('SELECT');
+
+    const tabs = page.locator('#resultsTabsNav .result-tab-btn');
+    await expect(tabs).toHaveCount(3); // Summary + 2 "Ready to execute" placeholders
+    expect(executeCalls).toHaveLength(0);
+
+    await page.locator('#runBtn').click();
+    await expect.poll(() => executeCalls.length).toBe(1);
+
+    // Summary + Sales Postgres' TWO statement tabs + Marketing Postgres'
+    // one tab = 4 total.
+    await expect(tabs).toHaveCount(4);
+    await expect(tabs.nth(1)).toContainText('Sales Postgres');
+    await expect(tabs.nth(2)).toContainText('Sales Postgres');
+    await expect(tabs.nth(3)).toContainText('Marketing Postgres');
   });
 
   test('with auto-execute off, a router_route stream renders "Ready to execute" placeholders, and a manual Execute click still fires exactly one batched /api/execute call', async ({ page }) => {

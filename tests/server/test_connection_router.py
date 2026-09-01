@@ -18,6 +18,7 @@ as a lighter-weight stand-in for spinning up a real per-backend
 connection harness for every dialect.
 """
 
+import json
 import sqlite3
 import threading
 import time
@@ -121,29 +122,146 @@ def _set_all_mode(client):
     assert resp.status_code == 200
 
 
+class FakeApiError(Exception):
+    """Minimal stand-in for google.genai.errors.APIError - just needs a
+    `.code` int attribute, which translate_routes.py's
+    _gemini_error_code() checks first. Local copy of test_translate_
+    routes.py's own class of the same name (same shape) - duplicated
+    here rather than imported across test modules, same as this file's
+    GenaiHarness above."""
+    def __init__(self, code):
+        super().__init__(f"fake API error {code}")
+        self.code = code
+
+
+# --- Triage prompt: "answer"/"message" must lead with a "Triage" line ----
+# The end user's UI (client.js's renderMarkdownLite()) bolds+underlines a
+# standalone "Triage" line wherever it appears. Originally the parser
+# (_parse_triage_response) just extracted these fields as-is regardless of
+# content - but a real model turned out to sometimes over-comply with
+# "alone on its own line" and respond with JUST the label and nothing
+# else, which silently produced a bare heading with no actual triage text
+# under it (see is_label_only_response and its two call sites below for
+# the fix) - so both the prompt wording AND the parser's handling of that
+# failure mode are covered here now. The label itself was later made
+# language-agnostic (translated into the user's own question's language
+# instead of a fixed English word), which is why is_label_only_response
+# detects this failure mode by POSITION (a leading line, blank line, then
+# nothing) rather than by matching specific label text - see its own
+# docstring.
+
+def test_triage_prompt_requires_answer_and_message_to_lead_with_a_translated_label_line():
+    from connection_router import _TRIAGE_SYSTEM_INSTRUCTION
+
+    assert "TRANSLATED into the SAME LANGUAGE as the user's own question" in _TRIAGE_SYSTEM_INSTRUCTION
+    assert "\"answer\"" in _TRIAGE_SYSTEM_INSTRUCTION and "\"message\"" in _TRIAGE_SYSTEM_INSTRUCTION
+    # Explicitly never required of "database_prompts" - those are internal,
+    # per-connection instructions the end user never sees.
+    assert "never \"database_prompts\"" in _TRIAGE_SYSTEM_INSTRUCTION
+    # The label is explicitly called out as insufficient on its own - see
+    # is_label_only_response's own docstring comment for the real failure
+    # mode this guards against.
+    assert "is not a valid" in _TRIAGE_SYSTEM_INSTRUCTION
+
+
+def test_parse_triage_response_treats_an_answer_of_just_a_label_line_as_unparseable():
+    from connection_router import _parse_triage_response
+
+    # A label line (any language - "Triage"/"Clasificación" are just
+    # examples) followed by a blank line and nothing else is unparseable,
+    # regardless of what the label word actually is.
+    for answer in (
+        'Triage\n\n', '  Triage  \n\n   ', '**Triage**\n\n', '__Triage__\n\n',
+        'triage\n\n', 'Clasificación\n\n',
+    ):
+        assert _parse_triage_response(
+            json.dumps({"action": "answer", "answer": answer}), num_candidates=2, max_connections=20,
+        ) is None
+
+
+def test_parse_triage_response_accepts_a_bare_answer_with_no_label_line_at_all():
+    from connection_router import _parse_triage_response
+
+    # A response with no blank-line-separated leading line at all is NOT
+    # label-only - it's an ordinary (if non-compliant with the label
+    # convention) answer, and this app has always accepted that as-is
+    # rather than retrying over it - see is_label_only_response's
+    # docstring for why only a VISIBLE label-then-nothing shape is
+    # flagged, never a plain unlabeled response.
+    assert _parse_triage_response(
+        json.dumps({"action": "answer", "answer": "Sales Postgres has the most customers."}),
+        num_candidates=2, max_connections=20,
+    ) == {"outcome": "answer", "answer": "Sales Postgres has the most customers."}
+
+
+def test_parse_triage_response_downgrades_a_message_of_just_a_label_line_to_none():
+    from connection_router import _parse_triage_response
+
+    # Unlike "answer" above, a label-only "message" doesn't fail the whole
+    # attempt - the routing decision (indices) is still good, and the
+    # caller already has a translated-label fallback sentence for a
+    # missing message (see translate_routes.py's stream_translation()).
+    parsed = _parse_triage_response(
+        json.dumps({"action": "route", "indices": [0], "message": "Triage\n\n"}),
+        num_candidates=2, max_connections=20,
+    )
+    assert parsed == {
+        "outcome": "route", "indices": [0], "message": None, "database_prompts": {},
+    }
+
+
 # --- triage_all_mode_question's "database_prompts" - direct unit tests ---
 
 
 class _FakeProvider:
     """Minimal stand-in for translate_routes.py's LlmProvider - just enough
     of build_llm_input()/call() for triage_all_mode_question to drive, with
-    no real client/network involved at all."""
+    no real client/network involved at all.
 
-    def __init__(self, responses):
+    `key_pool` (default: one fake key) and `classify_error` (default:
+    every exception is non-retryable, i.e. always returns None) let a
+    test drive triage_all_mode_question's own retry loop directly -
+    key rotation on a 429-like classification, budget exhaustion, etc. -
+    without needing the full GenaiHarness/real-Gemini-exception machinery
+    the end-to-end tests further down use. Tests that don't care about
+    retry behavior at all (the large majority - see the existing
+    "database_prompts" tests below) get today's original behavior
+    unchanged: a single configured key, and any raised exception treated
+    as immediately non-retryable."""
+
+    def __init__(self, responses, key_pool=None, classify_error=None):
         self._responses = list(responses)  # list of str (response text) or Exception
         self.calls = []
+        self._key_pool = list(key_pool) if key_pool else ["fake-key-1"]
+        self._classify_error = classify_error or (lambda exc: None)
+        self.made_clients = []
 
     def build_llm_input(self, history, schema_block, new_prompt_content):
         return new_prompt_content
 
     def call(self, client, model, llm_input, system_instruction):
-        self.calls.append({"llm_input": llm_input, "system_instruction": system_instruction})
+        self.calls.append({"client": client, "llm_input": llm_input, "system_instruction": system_instruction})
         if not self._responses:
             raise AssertionError("_FakeProvider queue exhausted")
         item = self._responses.pop(0)
         if isinstance(item, Exception):
             raise item
         return item, {}
+
+    def classify_error(self, exc):
+        return self._classify_error(exc)
+
+    def pick_api_key(self, exclude=None):
+        exclude = exclude or set()
+        remaining = [k for k in self._key_pool if k not in exclude]
+        return remaining[0] if remaining else self._key_pool[0]
+
+    def make_client(self, api_key):
+        self.made_clients.append(api_key)
+        return f"client-for-{api_key}"
+
+    def get_key_pool_size(self):
+        return len(self._key_pool)
 
 
 #
@@ -240,6 +358,93 @@ def test_clean_database_prompts_returns_empty_dict_for_non_dict_input():
     assert _clean_database_prompts(["not", "a", "dict"], [0, 1]) == {}
     assert _clean_database_prompts(None, [0, 1]) == {}
     assert _clean_database_prompts("also not a dict", [0, 1]) == {}
+
+
+# --- triage_all_mode_question's own retry policy - direct unit tests ---
+#
+# Regression guard for the bug this fixes: the LLM call raising was
+# previously indistinguishable from the model replying with unparseable
+# text - both collapsed into the same generic {"outcome": "failed"}, with
+# no key rotation attempted at all even for a classified-retryable error.
+# These drive triage_all_mode_question directly via _FakeProvider's
+# configurable key_pool/classify_error, independent of the full
+# /api/translate round-trip (see the end-to-end GenaiHarness-based tests
+# further down for that).
+
+
+def test_triage_retries_a_retryable_error_and_succeeds_on_a_rotated_key():
+    from connection_router import triage_all_mode_question
+
+    # First call raises, second (after rotating to the pool's other key)
+    # succeeds - proves the retry loop actually recovers, which the old
+    # "catch everything, retry same key, give up after 2" loop never
+    # could for a genuinely per-key capacity error.
+    provider = _FakeProvider(
+        [RuntimeError("rate limited"), '{"action": "answer", "answer": "42"}'],
+        key_pool=["key-a", "key-b"],
+        classify_error=lambda exc: {"rotate_key": True, "delay": 0},
+    )
+    candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": []}]
+    result = triage_all_mode_question(candidates, "q", provider, client="initial-client", model="m")
+
+    assert result["outcome"] == "answer"
+    assert result["answer"] == "42"
+    assert len(provider.calls) == 2
+    # The retry rotated to a genuinely different key/client for the
+    # second attempt.
+    assert provider.made_clients == ["key-b"]
+    assert provider.calls[1]["client"] == "client-for-key-b"
+
+
+def test_triage_reports_api_error_when_key_rotation_budget_is_exhausted():
+    from connection_router import triage_all_mode_question
+
+    # Only ONE configured key (the common case) - a retryable/rotate-key
+    # classification has nowhere to rotate to, so this must give up
+    # immediately (1 call, not 2) rather than uselessly retrying the same
+    # doomed key a second time the way the old loop did.
+    provider = _FakeProvider(
+        [RuntimeError("resource exhausted")],
+        key_pool=["only-key"],
+        classify_error=lambda exc: {"rotate_key": True, "delay": 0},
+    )
+    candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": []}]
+    result = triage_all_mode_question(candidates, "q", provider, client=None, model="m")
+
+    assert result == {"outcome": "failed", "api_error": True}
+    assert len(provider.calls) == 1
+
+
+def test_triage_reports_api_error_for_a_non_retryable_exception():
+    from connection_router import triage_all_mode_question
+
+    # classify_error returning None (the _FakeProvider default) means
+    # "not retryable" - same bad-request/auth-failure/invalid-model bucket
+    # every other LLM call in this app raises immediately for. Still an
+    # "api_error", not the generic unparseable-response apology: a
+    # genuine API/config problem is never "I couldn't understand your
+    # question."
+    provider = _FakeProvider([RuntimeError("bad request")])
+    candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": []}]
+    result = triage_all_mode_question(candidates, "q", provider, client=None, model="m")
+
+    assert result == {"outcome": "failed", "api_error": True}
+    assert len(provider.calls) == 1
+
+
+def test_triage_unparseable_response_is_not_reported_as_api_error():
+    from connection_router import triage_all_mode_question
+
+    # Regression guard the other way: a call that succeeds twice but
+    # returns garbage both times is genuinely "couldn't understand the
+    # question," not an API/capacity problem - api_error must stay False
+    # so the caller shows _TRIAGE_FAILURE_TEXT, not _TRIAGE_API_ERROR_TEXT.
+    provider = _FakeProvider(["not json", "still not json"])
+    candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": []}]
+    result = triage_all_mode_question(candidates, "q", provider, client=None, model="m")
+
+    assert result == {"outcome": "failed", "api_error": False}
+    assert len(provider.calls) == 2
 
 
 # --- extract_entry_names_from_schema_text, against this codebase's known headings ---
@@ -449,6 +654,38 @@ def test_all_mode_route_outcome_runs_phase_b_in_parallel_for_both_selected_conne
     assert data['generation_failures'] == []
 
 
+def test_all_mode_route_outcome_falls_back_to_a_triage_labeled_message_when_the_model_omits_one(
+    app_factory, tmp_path, monkeypatch
+):
+    # The model's own "message" field is what normally carries the
+    # "Triage" leading line (see _TRIAGE_SYSTEM_INSTRUCTION); when a
+    # "route" response has no usable message at all, translate_routes.py
+    # builds a server-side fallback sentence instead - that fallback needs
+    # the same "Triage" leading line for the Summary tab to look
+    # consistent regardless of which source the text actually came from.
+    env = _two_preset_env(app_factory, tmp_path)
+    login_as(env.client, "alice@example.com")
+    _set_all_mode(env.client)
+
+    import db as db_module
+    monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
+        "postgresql://u:p@host-a:5432/a": "Table: deals\nid INTEGER\n",
+        "postgresql://u:p@host-b:5432/b": "Table: campaigns\nid INTEGER\n",
+    }))
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(_gemini_ok('{"action": "route", "indices": [0, 1]}'))
+    harness.register_marker("deals", _gemini_ok("SELECT * FROM deals;"))
+    harness.register_marker("campaigns", _gemini_ok("SELECT * FROM campaigns;"))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'how is everything performing across the board'})
+    _, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    assert data['routing_message'].startswith("Triage\n\n")
+    assert "Sales Postgres" in data['routing_message'] and "Marketing Postgres" in data['routing_message']
+
+
 def test_all_mode_route_outcome_with_one_database_returning_no_sql_note(app_factory, tmp_path, monkeypatch):
     env = _two_preset_env(app_factory, tmp_path)
     login_as(env.client, "alice@example.com")
@@ -547,6 +784,39 @@ def test_all_mode_route_outcome_all_databases_fail_or_note_returns_empty_sql_but
     ]
 
 
+def test_all_mode_emits_phase_status_lines_for_schema_collection_and_routing_before_any_outcome(
+    app_factory, tmp_path, monkeypatch,
+):
+    """Regression guard for the bug this fixes: before these two lines
+    existed, an "all databases" mode request streamed NOTHING at all while
+    collecting every in-scope connection's schema summary
+    (build_router_candidate_summaries) and while the triage LLM call
+    itself was in flight (triage_all_mode_question) - and for the
+    "answer"/"failed" outcomes specifically, NOTHING EVER arrived before
+    the terminal "done" line (phase_a_route only fires for the "route"
+    outcome - see the test below). Checked against the "answer" outcome
+    here since it's the starkest case: no other event of any kind exists
+    to mask the gap."""
+    env = _two_preset_env(app_factory, tmp_path)
+    login_as(env.client, "alice@example.com")
+    _set_all_mode(env.client)
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(_gemini_ok('{"action": "answer", "answer": "You have 2 databases configured."}'))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'how many databases do I have'})
+    events = parse_translate_stream_events(resp)
+
+    phase_status_events = [e for e in events if e['status'] == 'phase_status']
+    assert [e['phase'] for e in phase_status_events] == ['collecting_schema_summaries', 'routing']
+    assert all(isinstance(e['message'], str) and e['message'] for e in phase_status_events)
+    # Both precede the terminal line, in order.
+    assert events.index(phase_status_events[0]) < events.index(phase_status_events[1]) < len(events) - 1
+    assert events[-1]['status'] == 'done'
+    assert events[-1]['sql'] == '*** NO SQL *** You have 2 databases configured.'
+
+
 def test_all_mode_route_outcome_streams_phase_a_route_then_phase_b_connection_done_before_terminal_done(
     app_factory, tmp_path, monkeypatch,
 ):
@@ -579,9 +849,17 @@ def test_all_mode_route_outcome_streams_phase_a_route_then_phase_b_connection_do
     resp = env.client.post('/api/translate', json={'prompt': 'first database question, plus something else'})
     events = parse_translate_stream_events(resp)
 
-    assert events[0]['status'] == 'phase_a_route'
-    assert events[0]['routing_message'] == 'Checking both.'
-    assert events[0]['connection_selection'] == [
+    # Two phase_status lines now precede phase_a_route - schema-summary
+    # collection, then routing (see translate_routes.py's
+    # stream_translation() docstring and the dedicated test just below) -
+    # so phase_a_route is no longer necessarily events[0]; find it
+    # directly rather than assuming a fixed index.
+    phase_status_events = [e for e in events if e['status'] == 'phase_status']
+    assert [e['phase'] for e in phase_status_events] == ['collecting_schema_summaries', 'routing']
+
+    route_event = next(e for e in events if e['status'] == 'phase_a_route')
+    assert route_event['routing_message'] == 'Checking both.'
+    assert route_event['connection_selection'] == [
         {"kind": "preset", "id": "pg-a", "name": "Sales Postgres"},
         {"kind": "preset", "id": "pg-b", "name": "Marketing Postgres"},
     ]
@@ -598,8 +876,9 @@ def test_all_mode_route_outcome_streams_phase_a_route_then_phase_b_connection_do
     # phase_a_route line and strictly before the terminal 'done' line.
     assert events[-1]['status'] == 'done'
     assert events.index(events[-1]) == len(events) - 1
+    route_index = events.index(route_event)
     for e in connection_done_events:
-        assert events.index(e) > 0
+        assert events.index(e) > route_index
         assert events.index(e) < len(events) - 1
 
 
@@ -692,6 +971,110 @@ def test_all_mode_failed_outcome_returns_fixed_apology_text_not_candidate_zero_f
     assert 'Sales Postgres' not in data['sql']
     assert 'router_route' not in data
     assert 'connection_selection' not in data
+
+
+def test_all_mode_resource_exhausted_triage_shows_honest_message_not_generic_apology(
+    app_factory, tmp_path, monkeypatch,
+):
+    """End-to-end regression guard for the actual bug report this fixes:
+    with a single configured Gemini key, a 429 (RESOURCE_EXHAUSTED) on the
+    triage call has nowhere to rotate to and must give up immediately -
+    but the user-facing text must say so honestly (_TRIAGE_API_ERROR_TEXT),
+    NOT the generic "I am not able to respond to your prompt" apology
+    reserved for a genuinely unparseable response (see the test just
+    above, which must keep getting that exact text)."""
+    env = _two_preset_env(app_factory, tmp_path)  # GEMINI_PRESET_KEYS: one key
+    login_as(env.client, "alice@example.com")
+    _set_all_mode(env.client)
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_error(FakeApiError(429))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'ambiguous question'})
+    _, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    # No point retrying a second time against the same, already-exhausted
+    # key - one call only, not triage's usual 2-attempt budget.
+    assert len(harness.generate_calls) == 1
+    assert data['sql'].startswith('*** NO SQL *** I couldn\'t reach the AI model right now')
+    assert data['sql'] != '*** NO SQL *** I am not able to respond to your prompt.'
+    assert 'router_route' not in data
+    assert 'connection_selection' not in data
+
+
+def test_all_mode_triage_recovers_by_rotating_to_a_second_configured_gemini_key(
+    app_factory, tmp_path, monkeypatch,
+):
+    """The other half of the fix: with a SECOND configured key actually
+    available, a 429 on the first must not be given up on at all - it
+    rotates and the turn succeeds normally, exactly as every other LLM
+    call in this app already does for a per-key capacity error."""
+    env = _two_preset_env(app_factory, tmp_path, extra_env={
+        "GEMINI_PRESET_KEYS": "fake-key-1,fake-key-2",
+    })
+    login_as(env.client, "alice@example.com")
+    _set_all_mode(env.client)
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_error(FakeApiError(429))
+    harness.queue_response(_gemini_ok('{"action": "answer", "answer": "There are 2 databases configured."}'))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'how many databases do I have'})
+    _, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    assert len(harness.generate_calls) == 2
+    assert harness.client_api_keys[0] != harness.client_api_keys[1]
+    assert data['sql'] == '*** NO SQL *** There are 2 databases configured.'
+
+
+def test_all_mode_phase_b_generation_recovers_by_rotating_to_a_second_configured_gemini_key(
+    app_factory, tmp_path, monkeypatch,
+):
+    """Regression guard for a real bug: _run_phase_b_fanout's per-connection
+    worker (_run_one) used to pick a fresh, independent api_key but then
+    hand it to generate_sql_for_connection alongside the OUTER client built
+    for triage's own (separately, RANDOMLY picked - see
+    pick_gemini_api_key) key. With 2+ configured keys those two frequently
+    differed, so the request that actually hit the wire used one key while
+    the retry loop's bookkeeping thought it was using another - on a 429 it
+    could exclude a key that was never really tried and rotate straight
+    back onto the one that just failed, or give up as "budget exhausted"
+    while a perfectly good second key sat unused. Single connection here
+    (no ThreadPoolExecutor concurrency to race) so this is fully
+    deterministic: the queue is consumed in strict order (triage, then
+    Phase B's two attempts)."""
+    presets_path = write_database_presets_file(tmp_path, [
+        {"id": "pg-a", "name": "Sales Postgres", "type": "postgres", "url": "postgresql://u:p@host-a:5432/a"},
+    ])
+    env = app_factory(env={
+        "DATABASE_PRESETS_FILE": presets_path, "GEMINI_PRESET_KEYS": "fake-key-1,fake-key-2",
+    })
+    login_as(env.client, "alice@example.com")
+    _set_all_mode(env.client)
+
+    import db as db_module
+    monkeypatch.setattr(db_module, "_fetch_database_schema",
+                         _schema_fetch_by_url({"postgresql://u:p@host-a:5432/a": "Table: deals\nid INTEGER\n"}))
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(_gemini_ok('{"action": "route", "indices": [0], "message": "Checking Sales Postgres."}'))
+    harness.queue_error(FakeApiError(429))  # Phase B's first attempt
+    harness.queue_response(_gemini_ok("SELECT * FROM deals;"))  # Phase B's rotated retry
+
+    resp = env.client.post('/api/translate', json={'prompt': 'how many deals do we have'})
+    _, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    # Triage + 2 Phase B attempts (the first 429, the second recovered) -
+    # NOT a generation_failures entry, which is what the old bug would
+    # have produced once the (bogus) rotation budget looked exhausted.
+    assert len(harness.generate_calls) == 3
+    assert harness.generate_calls[1]['api_key'] != harness.generate_calls[2]['api_key']
+    assert data['router_route'] is True
+    assert data['generation_failures'] == []
+    assert "-- database: preset:pg-a (Sales Postgres)\nSELECT * FROM deals;" in data['sql']
 
 
 def test_all_mode_with_only_one_configured_connection_still_runs_triage_and_can_route(app_factory, tmp_path, monkeypatch):
@@ -1170,9 +1553,102 @@ def test_summarize_all_mode_results_returns_stripped_text_and_usage_on_success(a
     assert len(provider.calls) == 1
 
 
-def test_summarize_all_mode_results_gives_up_after_retry_returning_none(app_factory, tmp_path):
+def test_summarize_all_mode_results_gives_up_immediately_for_a_non_retryable_exception(app_factory, tmp_path):
+    # classify_error returning None (the _FakeProvider default) means "not
+    # retryable" - same bucket every other LLM call in this app raises
+    # immediately for (see triage_all_mode_question's identical test). No
+    # point spending a second content-validity attempt on a call that's
+    # already just proven it can't succeed right now.
     env = _two_preset_env(app_factory, tmp_path)
     provider = _FakeProvider([RuntimeError("boom"), RuntimeError("boom again")])
+    text, usage = env.translate_routes.summarize_all_mode_results(
+        "q", [{"name": "Sales Postgres", "columns": [], "rows": []}], provider, client=None, model="m",
+    )
+    assert (text, usage) == (None, None)
+    assert len(provider.calls) == 1
+
+
+# --- summarize_all_mode_results' own retry policy - direct unit tests ----
+#
+# Regression guard for the bug this fixes: unlike every other LLM call in
+# "all databases" mode (triage_all_mode_question, generate_sql_for_
+# connection), Phase C's summarization call used a bare 2-attempt retry
+# with no key rotation and no transient-error wait at all - a real
+# capacity/rate-limit error on the configured Gemini key exhausted that
+# budget in well under a second, silently leaving the Summary tab exactly
+# as it was before Phase C ran (no error surfaced anywhere) - easy to
+# mistake for a client-side rendering bug, which is exactly what it looked
+# like. These mirror triage_all_mode_question's own key-rotation tests
+# above almost exactly.
+
+def test_summarize_all_mode_results_retries_a_retryable_error_and_succeeds_on_a_rotated_key(
+    app_factory, tmp_path,
+):
+    env = _two_preset_env(app_factory, tmp_path)
+    provider = _FakeProvider(
+        [RuntimeError("rate limited"), "Result Summary\n\nSales is up 10%."],
+        key_pool=["key-a", "key-b"],
+        classify_error=lambda exc: {"rotate_key": True, "delay": 0},
+    )
+    text, usage = env.translate_routes.summarize_all_mode_results(
+        "how is everything performing", [{"name": "Sales Postgres", "columns": [], "rows": []}],
+        provider, client="initial-client", model="m",
+    )
+    assert text == "Result Summary\n\nSales is up 10%."
+    assert len(provider.calls) == 2
+    # The retry rotated to a genuinely different key/client for the
+    # second attempt, same as triage_all_mode_question's own retry does.
+    assert provider.made_clients == ["key-b"]
+    assert provider.calls[1]["client"] == "client-for-key-b"
+
+
+def test_summarize_all_mode_results_gives_up_immediately_when_key_rotation_budget_is_exhausted(
+    app_factory, tmp_path,
+):
+    # Only ONE configured key (the common case) - a retryable/rotate-key
+    # classification has nowhere to rotate to, so this gives up after 1
+    # call rather than uselessly retrying the same doomed key again.
+    env = _two_preset_env(app_factory, tmp_path)
+    provider = _FakeProvider(
+        [RuntimeError("resource exhausted")],
+        key_pool=["only-key"],
+        classify_error=lambda exc: {"rotate_key": True, "delay": 0},
+    )
+    text, usage = env.translate_routes.summarize_all_mode_results(
+        "q", [{"name": "Sales Postgres", "columns": [], "rows": []}], provider, client=None, model="m",
+    )
+    assert (text, usage) == (None, None)
+    assert len(provider.calls) == 1
+
+
+# A real model turned out to sometimes over-comply with
+# _SUMMARY_SYSTEM_INSTRUCTION's "alone on its own first line" wording and
+# respond with JUST the "Result Summary" label, nothing else - which used
+# to sail straight through the `if stripped:` check (a non-empty string)
+# and get shown to the user as a bare heading with no summary under it.
+# Treated the same as a genuinely empty response: retried once, and if the
+# second attempt is no better, (None, None) - same as any other
+# unrecoverable Phase C failure (the Summary tab is just left as-is).
+def test_summarize_all_mode_results_retries_a_response_that_is_just_the_results_summary_label(app_factory, tmp_path):
+    env = _two_preset_env(app_factory, tmp_path)
+    # A label line (any language - "Result(s) Summary"/"Résumé des
+    # résultats" are just examples) followed by a blank line and nothing
+    # else is unparseable, regardless of what the label word actually is -
+    # see is_label_only_response's docstring for why this is POSITION-
+    # based, not a match against a fixed English string.
+    for label in (
+        "Results Summary\n\n", "  Results Summary  \n\n  ", "**Results Summary**\n\n",
+        "result summary\n\n", "Résumé des résultats\n\n",
+    ):
+        provider = _FakeProvider([label, "Results Summary\n\nSales is up 10%."])
+        text, usage = env.translate_routes.summarize_all_mode_results(
+            "how is everything performing", [{"name": "Sales Postgres", "columns": [], "rows": []}],
+            provider, client=None, model="m",
+        )
+        assert text == "Results Summary\n\nSales is up 10%."
+        assert len(provider.calls) == 2
+
+    provider = _FakeProvider(["Results Summary\n\n", "Results Summary\n\n"])
     text, usage = env.translate_routes.summarize_all_mode_results(
         "q", [{"name": "Sales Postgres", "columns": [], "rows": []}], provider, client=None, model="m",
     )

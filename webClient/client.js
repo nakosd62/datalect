@@ -324,6 +324,58 @@ document.addEventListener('DOMContentLoaded', async () => {
   // translatePrompt() itself when there's nothing left to execute at all.
   let pendingAllModeNotes = null;
 
+  // Re-entrancy guard shared by translatePrompt() and executeSql(), the
+  // app's only two entry points that fire a translation/execution turn.
+  // Checked-and-set as the very FIRST synchronous statement in each -
+  // before either function's own `await fetchBackendConfig()` - so there
+  // is no gap for a second concurrent call to slip through. Before this
+  // flag existed, setButtonsDisabled(true) (the only "an action is in
+  // flight" signal either function had) wasn't applied until AFTER that
+  // first await resolved, so a second Enter press, Translate click, or
+  // Execute click landing during that real network round trip started a
+  // fully concurrent second call - both calls then mutated the exact same
+  // shared, non-request-scoped state (allModeStreamState,
+  // pendingAllModeNotes, currentResultsList, chatStore, the one shared
+  // CodeMirror sqlEditor instance, the one resultsRetryStatus banner) with
+  // no isolation, so whichever call's async work resolved last silently
+  // won - overwriting or corrupting the other's still-in-flight turn.
+  // executeSql() is also called internally, already-awaited, from within
+  // translatePrompt() itself (its two `autoSqlExecuteEnabled` branches) -
+  // those calls pass `{ internal: true }` to skip re-checking/re-setting
+  // this flag, since translatePrompt() already holds it for the whole
+  // turn, execute included.
+  let uiActionBusy = false;
+
+  // Backs the "Cancel" button (cancelInFlightQuery() below): the
+  // AbortController whose signal every fetch() belonging to the CURRENT
+  // turn is given, so aborting one call aborts every other in-flight
+  // fetch that's part of the same turn too (e.g. translatePrompt()'s own
+  // /api/translate call and any /api/execute call it kicked off
+  // internally). Replaced (never mutated) at the top of every NEW,
+  // non-internal translatePrompt()/executeSql() call - an internal
+  // executeSql() call (one made FROM WITHIN translatePrompt(), already
+  // awaited there) reuses whatever controller the enclosing turn already
+  // set, since it's part of the same turn, not a new one.
+  let currentAbortController = null;
+
+  // Monotonically increasing counter identifying the CURRENT turn, bumped
+  // only by a new, non-internal translatePrompt()/executeSql() call (an
+  // internal executeSql() call reads this without bumping it - see
+  // currentAbortController's comment above for why). Each such call
+  // captures its own `myTurnId` at the moment it starts; any cleanup code
+  // that runs later (a `.then()`/`.catch()`/`finally` on a fetch promise)
+  // checks `myTurnId === currentTurnId` before touching any shared UI
+  // state (buttons, uiActionBusy, banners, results). This is what makes
+  // cancelInFlightQuery() safe: it resets everything synchronously and
+  // bumps nothing itself, but the original (now-stale) call's own
+  // eventual cleanup - which can still arrive asynchronously well after
+  // the Cancel click, since aborting a fetch doesn't retroactively un-queue
+  // work already scheduled on it - will see its captured myTurnId no
+  // longer matches (either because the user cancelled, or because they
+  // started a newer turn before the old one's promise even settled) and
+  // skip mutating state a newer turn now owns.
+  let currentTurnId = 0;
+
   // Helper function to include Google ID tokens or auth headers in fetch requests
   function getApiHeaders() {
     const headers = { 'Content-Type': 'application/json' };
@@ -405,6 +457,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const sqlQueryTextarea = document.getElementById('sqlQuery');
   const translateBtn = document.getElementById('translateBtn');
   const runBtn = document.getElementById('runBtn');
+  const stopBtn = document.getElementById('stopBtn');
   const purgeHistoryBtn = document.getElementById('purgeHistoryBtn');
   const goBackBtn = document.getElementById('goBackBtn');
   const goForwardBtn = document.getElementById('goForwardBtn');
@@ -900,6 +953,33 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (translateBtn) translateBtn.disabled = disabled;
     if (runBtn) runBtn.disabled = disabled;
     if (micBtn) micBtn.disabled = disabled;
+    // Disable the NL prompt box itself while a translate/execute call is
+    // in flight - previously only the trigger buttons were disabled, so
+    // the box stayed editable (misleadingly implying a fresh edit could
+    // still do something) and, worse, its own Enter-key handler could
+    // still fire. A disabled textarea can't be focused or receive
+    // keyboard events at all, so this closes that off entirely rather
+    // than relying solely on the `translateBtn.disabled` check inside
+    // that handler.
+    if (aiPrompt) aiPrompt.disabled = disabled;
+    // The SQL editor itself, same reasoning as aiPrompt just above - and
+    // the SAME disabled/re-enabled window, which matters here specifically:
+    // setButtonsDisabled(true) fires before translatePrompt() even starts
+    // fetching, and setButtonsDisabled(false) only fires once the whole
+    // turn is over (translation, then auto-execute, then - in "all
+    // databases" mode - Phase C's summary - see translatePrompt()'s outer
+    // finally). So the box stays read-only for the entire time in between,
+    // including the moment setSqlQuery(data.sql) fills it in mid-turn:
+    // without this, the freshly-generated SQL was immediately editable
+    // even though auto-execute was often still running against the
+    // ORIGINAL text, silently editing "results still in flight" SQL that
+    // had nothing to do with what was about to be (or already being)
+    // executed. readOnly (not 'nocursor') still allows selecting/copying
+    // the SQL while it's inactive, just not typing into it.
+    if (sqlEditor) {
+      sqlEditor.setOption('readOnly', disabled);
+      sqlEditor.getWrapperElement().classList.toggle('cm-readonly', disabled);
+    }
     // Example prompt chips: queried live (rather than via the
     // examplePromptButtons closure declared further down) so this works
     // regardless of where in the file setButtonsDisabled is called from.
@@ -910,6 +990,9 @@ document.addEventListener('DOMContentLoaded', async () => {
       btn.disabled = disabled;
     });
     document.body.style.cursor = disabled ? 'wait' : 'default';
+    // Cancel button: only ever shown/enabled while something's actually in
+    // flight - it's the inverse of every other control toggled above.
+    if (stopBtn) stopBtn.classList.toggle('hidden', !disabled);
 
     if (disabled) {
       if (goBackBtn) goBackBtn.disabled = true;
@@ -988,22 +1071,65 @@ document.addEventListener('DOMContentLoaded', async () => {
     resultsRetryStatus.innerHTML = '';
   }
 
+  // Single-connection-mode progress label ("Reading the database schema…",
+  // then "Writing the right command for the database…" - see
+  // translate_routes.py's stream_translation() docstring for the
+  // "phase_status" event this renders). Reuses the same banner element/
+  // styling as showRetryStatus()/showAllModeStreamStatus() above rather
+  // than adding a second element - this is never shown at the same time as
+  // either of those (all three are mutually exclusive server-side response
+  // shapes), so there's no risk of them treading on each other. Unlike
+  // showRetryStatus(), there's no "attempt X of Y" counter here - just a
+  // plain label naming which of the two pre-LLM-call waits is currently
+  // happening, since neither wait has a meaningful progress count of its
+  // own. Once /api/translate's stream ends, this same banner element is
+  // reused again for "Fetching results from the database…" - see
+  // showFetchingResultsStatus() below, covering the THIRD real wait
+  // (submitting the generated SQL to the actual database and waiting on
+  // it), which previously had no indicator of any kind once the SQL
+  // arrived.
+  function showPhaseStatus(evt) {
+    if (!resultsRetryStatus) return;
+    resultsRetryStatus.innerHTML =
+      `<span class="retry-status-icon animate-spin">⟳</span> ${evt.message}`;
+    resultsRetryStatus.classList.remove('hidden');
+  }
+
+  // Single-connection mode's own execution-wait indicator - shown by
+  // executeSql() around its /api/execute call, but ONLY when this isn't
+  // an "all databases" mode turn (that mode has its own, per-connection
+  // progress banner - see showAllModeStreamStatus()/showAllModeSummarizing
+  // Status() above). /api/execute isn't itself streamed (unlike /api/
+  // translate), so there's no server-driven progress here - just a static
+  // label for the one real wait (the query actually running against the
+  // database) that used to leave nothing on screen at all once the SQL
+  // had already landed in the (now read-only) editor.
+  function showFetchingResultsStatus() {
+    if (!resultsRetryStatus) return;
+    resultsRetryStatus.innerHTML =
+      `<span class="retry-status-icon animate-spin">⟳</span> Fetching results from the database…`;
+    resultsRetryStatus.classList.remove('hidden');
+  }
+
   // /api/translate streams newline-delimited JSON (see
   // translate_routes.py's module docstring): zero or more
   // {"status": "retrying", ...} progress lines emitted live as the
-  // server's one Gemini-call retry loop runs, plus - for the "all
-  // databases" mode "route" outcome only - one {"status": "phase_a_route",
-  // ...} line followed by one {"status": "phase_b_connection_done", ...}
-  // line per selected connection (see translate_routes.py's
-  // stream_translation() docstring), followed in every case by exactly
-  // one terminal {"status": "done", success, sql/error, ...token
-  // usage...} line - the same shape /api/translate used to return as its
-  // whole body before streaming existed. A request that never reaches
-  // that retry loop at all (missing prompt/API key, a 401 from the auth
-  // guard, or a mocked response in tests - see fixtures.js's
-  // mockTranslate()) isn't streamed - it's still a single plain JSON
-  // object, which this reads exactly the same way: one line, no
-  // "status" field, straight into finalData.
+  // server's one Gemini-call retry loop runs, plus - for the
+  // single-connection path only - two {"status": "phase_status", "phase":
+  // "schema"|"generating_sql", "message": ...} lines emitted once each,
+  // ahead of the schema lookup and the LLM call respectively (see
+  // showPhaseStatus() above) - or, for the "all databases" mode "route"
+  // outcome only, one {"status": "phase_a_route", ...} line followed by
+  // one {"status": "phase_b_connection_done", ...} line per selected
+  // connection (see translate_routes.py's stream_translation() docstring).
+  // Followed in every case by exactly one terminal {"status": "done",
+  // success, sql/error, ...token usage...} line - the same shape
+  // /api/translate used to return as its whole body before streaming
+  // existed. A request that never reaches that retry loop at all (missing
+  // prompt/API key, a 401 from the auth guard, or a mocked response in
+  // tests - see fixtures.js's mockTranslate()) isn't streamed - it's still
+  // a single plain JSON object, which this reads exactly the same way: one
+  // line, no "status" field, straight into finalData.
   //
   // `onEvent`, if given, is called for every line EXCEPT the terminal
   // 'done' one, in arrival order, as soon as each is parsed - this is
@@ -1036,14 +1162,15 @@ document.addEventListener('DOMContentLoaded', async () => {
         return;
       }
       const isProgressLine = parsed.status === 'retrying'
+        || parsed.status === 'phase_status'
         || parsed.status === 'phase_a_route'
         || parsed.status === 'phase_b_connection_done';
       if (isProgressLine) {
         // 'retrying' is today's only pre-existing progress line;
-        // 'phase_a_route'/'phase_b_connection_done' are new (see this
-        // function's docstring above) - and, going forward, any other
-        // intermediate status this stream ever grows can be handled the
-        // same way without this function needing to know about it by
+        // 'phase_status'/'phase_a_route'/'phase_b_connection_done' are new
+        // (see this function's docstring above) - and, going forward, any
+        // other intermediate status this stream ever grows can be handled
+        // the same way without this function needing to know about it by
         // name.
         if (onEvent) onEvent(parsed);
       } else {
@@ -3879,7 +4006,13 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       const p = document.createElement('p');
       p.className = 'response-text';
-      p.innerHTML = renderMarkdownLite(result.text || '');
+      // The "Summary" tab carries the leading-label convention (see
+      // renderMarkdownLiteSummaryTab()'s own docstring) - a "Note" tab
+      // (Phase B's own per-database '*** NO SQL ***' reply) never does,
+      // so it's rendered plain like any other free-text reply.
+      p.innerHTML = result.tabLabel === 'Summary'
+        ? renderMarkdownLiteSummaryTab(result.text || '')
+        : renderMarkdownLite(result.text || '');
       td.appendChild(p);
 
       tr.appendChild(td);
@@ -4116,8 +4249,16 @@ document.addEventListener('DOMContentLoaded', async () => {
   // or headings), just the emphasis these replies actually use. Newlines
   // are left untouched - .response-text's `white-space: pre-wrap` already
   // renders them as line breaks, same as before this function existed.
+  // Does NOT know anything about the "All databases" mode section-label
+  // convention (see renderMarkdownLiteSummaryTab() below for that) - this
+  // is the plain version, safe to use on any free-text reply, including
+  // ones that were never asked to carry a label at all.
   function renderMarkdownLite(rawText) {
-    let html = escapeHtml(rawText);
+    return applyInlineMarkdown(escapeHtml(rawText));
+  }
+
+  function applyInlineMarkdown(escapedHtml) {
+    let html = escapedHtml;
     // Code spans first, so a literal asterisk/underscore inside one isn't
     // then misread as emphasis syntax by the patterns below.
     html = html.replace(/`([^`\n]+)`/g, '<code>$1</code>');
@@ -4134,7 +4275,70 @@ document.addEventListener('DOMContentLoaded', async () => {
     return html;
   }
 
-  function renderNoSqlResponse(rawText) {
+  // Strips a label's own **bold**/__bold__ wrapping, if the model added
+  // one despite _TRIAGE_SYSTEM_INSTRUCTION/_SUMMARY_SYSTEM_INSTRUCTION
+  // asking for a plain-text label - mirrors server/connection_router.py's
+  // split_leading_label_line(), which does the same unwrapping for the
+  // exact same reason.
+  function unwrapLabelEmphasis(label) {
+    const trimmed = (label || '').trim();
+    const m = /^(\*\*|__)([\s\S]*)\1$/.exec(trimmed);
+    return (m ? m[2] : trimmed).trim();
+  }
+
+  // Prepended by EVERY caller that hands a block of text to
+  // renderMarkdownLiteSummaryTab() below and wants its own leading line
+  // treated as a label - triage's own routing message (see
+  // renderAllModeCombinedResults()/startAllModeStreaming()'s Summary tab
+  // construction), Phase C's own summary text (see
+  // appendPhaseCSummaryToSummaryTab), and the all-mode "answer" outcome's
+  // own text (see renderNoSqlResponse()). Deliberately NOT inferred by
+  // POSITION (e.g. "the first line of the whole string") - an earlier
+  // version of this tried that, and it misfired on a Phase C summary
+  // whose own first per-database paragraph (also just one line followed
+  // by a blank line, per _SUMMARY_SYSTEM_INSTRUCTION's own "**Name:** ..."
+  // shape) looked exactly as label-shaped as a genuine label line, with
+  // no way to tell them apart from shape alone - and, separately, a
+  // routing message with NO label of its own still looked label-shaped
+  // once Phase C's text was joined underneath it, since the join itself
+  // always inserts a blank line after it. Marking every real block
+  // boundary explicitly, right where the code already knows one exists,
+  // sidesteps both problems entirely. Built around a NUL character,
+  // which escapeHtml() below passes through unaltered (it only touches
+  // &/</>) and which no real LLM reply can ever contain, so it can never
+  // collide with genuine text.
+  const SUMMARY_TAB_BLOCK_MARKER = '\u0000SUMMARY_BLOCK\u0000';
+
+  // Renders the "All databases" mode Summary tab's text (see the `isText`
+  // branch in renderTableResult(), and renderNoSqlResponse() for the
+  // all-mode "answer" outcome, which shares this same leading-label
+  // convention) - a superset of renderMarkdownLite() that ALSO bolds
+  // +underlines the leading line of every block marked with
+  // SUMMARY_TAB_BLOCK_MARKER (see its own docstring for why marking is
+  // done explicitly by each caller rather than inferred by position).
+  // Never matches specific words - connection_router.py's
+  // _TRIAGE_SYSTEM_INSTRUCTION / translate_routes.py's
+  // _SUMMARY_SYSTEM_INSTRUCTION both ask the model for a "<label line>
+  // \n\nbody" shape with the label written in the SAME LANGUAGE as the
+  // user's own question, so there is no fixed English word left to match
+  // against. Only call this for text where every block was actually
+  // marked; a plain single-connection reply or a per-database "Note" tab
+  // never marks anything and is rendered plain via renderMarkdownLite()
+  // instead.
+  function renderMarkdownLiteSummaryTab(rawText) {
+    let html = escapeHtml(rawText || '');
+    html = html.replace(
+      new RegExp(SUMMARY_TAB_BLOCK_MARKER + '[ \\t]*([^\\n]+)\\n[ \\t]*\\n', 'g'),
+      (_match, label) => `<strong><u>${unwrapLabelEmphasis(label)}</u></strong>\n\n`
+    );
+    return applyInlineMarkdown(html);
+  }
+
+  // `hasLabel` - true when `rawText` is known to carry the "All databases"
+  // mode leading-label convention (see renderMarkdownLiteSummaryTab()
+  // above): the all-mode triage "answer" outcome. False for a plain
+  // single-connection NO-SQL reply, which was never asked to include one.
+  function renderNoSqlResponse(rawText, { hasLabel = false } = {}) {
     const cleanText = stripNoSqlPrefix(rawText) || rawText || '';
 
     if (resultsTabsNav) resultsTabsNav.classList.add('hidden');
@@ -4147,7 +4351,14 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       const p = document.createElement('p');
       p.className = 'response-text';
-      p.innerHTML = renderMarkdownLite(cleanText);
+      // renderMarkdownLiteSummaryTab() only bolds a block whose leading
+      // line was explicitly marked (see SUMMARY_TAB_BLOCK_MARKER's own
+      // docstring) - this is the one block in this text, so mark it here
+      // at the call site, same as the Summary tab's construction sites do
+      // for triage's own routing message and Phase C's summary text.
+      p.innerHTML = hasLabel
+        ? renderMarkdownLiteSummaryTab(SUMMARY_TAB_BLOCK_MARKER + cleanText)
+        : renderMarkdownLite(cleanText);
 
       td.appendChild(p);
       tr.appendChild(td);
@@ -4176,7 +4387,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const generationFailures = (notes && notes.generationFailures) || [];
 
     const summaryTab = routingMessage
-      ? [{ isText: true, tabLabel: 'Summary', text: routingMessage }]
+      ? [{ isText: true, tabLabel: 'Summary', text: SUMMARY_TAB_BLOCK_MARKER + routingMessage }]
       : [];
     const noteTabs = databaseNotes.map((n) => ({
       isText: true,
@@ -4269,7 +4480,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (!currentResultsList || !currentResultsList.length) return;
     const summaryEntry = currentResultsList.find((r) => r.isText && r.tabLabel === 'Summary');
     if (!summaryEntry) return;
-    summaryEntry.text = summaryEntry.text ? `${summaryEntry.text}\n\n${summaryText}` : summaryText;
+    // Phase C's own text always gets its own SUMMARY_TAB_BLOCK_MARKER
+    // (see its docstring) so its leading label is bolded regardless of
+    // whether there's already a leading block (triage's own message) to
+    // join it underneath - renderMarkdownLiteSummaryTab() no longer
+    // infers anything by position, only by this explicit marking.
+    summaryEntry.text = summaryEntry.text
+      ? `${summaryEntry.text}\n\n${SUMMARY_TAB_BLOCK_MARKER}${summaryText}`
+      : `${SUMMARY_TAB_BLOCK_MARKER}${summaryText}`;
     if (currentResultsList[activeResultIndex] === summaryEntry) {
       renderTableResult(summaryEntry);
     }
@@ -4293,6 +4511,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         method: 'POST',
         headers: getApiHeaders(),
         credentials: 'same-origin',
+        signal: currentAbortController ? currentAbortController.signal : undefined,
         body: JSON.stringify({ prompt: notes.prompt, database_results: databaseResults }),
       });
       const data = await response.json();
@@ -4304,6 +4523,14 @@ document.addEventListener('DOMContentLoaded', async () => {
         appendPhaseCSummaryToSummaryTab(stripNoSqlPrefix(data.summary));
       }
     } catch (err) {
+      // See translatePrompt()'s identical guard - cancelInFlightQuery()
+      // has already reset the UI synchronously by the time an aborted
+      // fetch's promise rejects; patching the Summary tab (which may now
+      // belong to a stale, already-cleared turn) on top of that would be
+      // wrong.
+      if (err && err.name === 'AbortError') {
+        return;
+      }
       console.error('Failed to summarize all-mode results:', err);
     }
   }
@@ -4375,8 +4602,31 @@ document.addEventListener('DOMContentLoaded', async () => {
       generationFailures: [],
       executeResults: [],
       executeFailures: [],
+      // This turn's connections, in their ORIGINAL (not completion) order -
+      // the same order translate_routes.py's own final `sql_blocks` joins
+      // in for the terminal line's `data.sql`. Kept here so each
+      // connection's own "phase_b_connection_done" event (which arrives in
+      // COMPLETION order - see that event's own docstring) can still be
+      // slotted into sqlByIndex below at its correct ORIGINAL position,
+      // keeping the progressively-built editor text in the same order the
+      // terminal line will eventually settle on, regardless of which
+      // connection's generation call happens to finish first.
+      connectionOrder: connectionSelection,
+      // One marked SQL string per connection above, filled in (by index,
+      // not append order) as each connection's own generation finishes
+      // with a real 'sql' outcome - see updateSqlEditorFromAllModeState()
+      // below. A 'note'/'failed' outcome leaves its slot null, matching
+      // sql_blocks' own "only entries with real SQL" filtering server-side.
+      sqlByIndex: new Array(connectionSelection.length).fill(null),
       expectedTotal: connectionSelection.length,
       settledCount: 0,
+      // How many connections have gotten their OWN "phase_b_connection_done"
+      // event, regardless of outcome (note/failed/sql) - a pure "server-
+      // side generation is done for this connection" signal, distinct from
+      // settledCount just above (which only counts a real-SQL connection
+      // once its execution ALSO finishes). Drives showAllModeStreamStatus()'s
+      // "Writing the right command…" -> "Fetching data…" transition below.
+      generationSettledCount: 0,
       // Per-connection /api/execute calls kicked off below (auto-execute
       // only) - translatePrompt() awaits all of these before it can
       // safely call maybeFinalize(), since by then every one of these has
@@ -4394,8 +4644,15 @@ document.addEventListener('DOMContentLoaded', async () => {
       autoExecute: autoSqlExecuteEnabled,
     };
 
+    // Start empty rather than leaving whatever the PREVIOUS turn left
+    // behind sitting there - updateSqlEditorFromAllModeState() below fills
+    // this in progressively, one connection's marked SQL at a time, well
+    // before the terminal /api/translate line (which used to be the ONLY
+    // thing that ever touched this box for a "route" outcome) arrives.
+    setSqlQuery('');
+
     const summaryTab = allModeStreamState.routingMessage
-      ? [{ isText: true, tabLabel: 'Summary', text: allModeStreamState.routingMessage }]
+      ? [{ isText: true, tabLabel: 'Summary', text: SUMMARY_TAB_BLOCK_MARKER + allModeStreamState.routingMessage }]
       : [];
     const placeholderTabs = connectionSelection.map((e) => ({
       isPending: true,
@@ -4406,7 +4663,26 @@ document.addEventListener('DOMContentLoaded', async () => {
     activeResultIndex = 0;
     buildResultsTabsNav();
     renderTableResult(currentResultsList[0] || null);
-    showAllModeStreamStatus(allModeStreamState.expectedTotal, 0);
+    showAllModeStreamStatus(allModeStreamState);
+  }
+
+  // Rebuilds the SQL editor's text from every connection whose SQL has
+  // arrived SO FAR, in ORIGINAL connection order (state.connectionOrder) -
+  // called once per real 'sql' outcome as handlePhaseBConnectionDone()
+  // receives it, so the box fills in progressively, one database's command
+  // at a time, instead of staying empty until every connection is done.
+  // Joined with the same "\n\n" separator translate_routes.py's own final
+  // `sql_blocks` join uses, so the text this builds up is byte-identical
+  // to the terminal line's `data.sql` once every connection has reported
+  // in - that terminal line still overwrites this box one more time when
+  // it arrives (see translatePrompt()'s router_route branch), which is
+  // harmless (same text) when every connection succeeded, and is what
+  // actually applies formatSql() to the final result; it's also the ONLY
+  // thing that repopulates this box at all for the non-streaming
+  // (pendingAllModeNotes) fallback, since that path never calls this.
+  function updateSqlEditorFromAllModeState(state) {
+    const combined = state.sqlByIndex.filter(Boolean).join('\n\n');
+    setSqlQuery(combined);
   }
 
   // Locates the still-pending placeholder tab for one connection - always
@@ -4433,6 +4709,86 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
+  // Same as replaceAllModePlaceholder above, but for a connection whose
+  // OWN script had more than one statement (or partially failed partway
+  // through one) - splices ALL of `tabs` in at that connection's single
+  // placeholder position, instead of collapsing them down to one. Without
+  // this, a multi-statement per-database script in "all databases" mode
+  // only ever showed its FIRST statement's tab (see
+  // executeOneAllModeConnection()'s own history comment) - single-
+  // connection mode already shows one tab per statement
+  // (renderMultiTurnResults/renderResultsWithFailedStatement), this brings
+  // "all databases" mode's per-connection results to the same behavior.
+  function replaceAllModePlaceholderWithMany(dbRef, tabs) {
+    const idx = findAllModePendingIndex(dbRef.kind, dbRef.id);
+    if (idx >= 0) {
+      currentResultsList.splice(idx, 1, ...tabs);
+    } else {
+      // Same defensive fallback as replaceAllModePlaceholder above.
+      currentResultsList.push(...tabs);
+    }
+  }
+
+  // Settles every connection referenced in `results` and/or `failures`
+  // from a BATCHED /api/execute call made against a live "all databases"
+  // streaming turn - used by executeSql()'s two router-route call sites
+  // below (the manual-Execute-button path, taken when auto-execute was
+  // off for one or more connections still sitting in a "Ready to
+  // execute" placeholder when the user clicked Execute). Groups `results`
+  // by connection first - a connection whose own script had more than one
+  // statement gets ALL of them as separate tabs, same fix as
+  // executeOneAllModeConnection() below - then appends that connection's
+  // own failure tab (if `failures` has a matching entry) right after its
+  // succeeded tabs, same "don't lose partial results just because
+  // something later in the same script failed" behavior
+  // renderResultsWithFailedStatement already gives single-connection mode.
+  // Increments state.settledCount exactly ONCE per distinct connection
+  // touched here, regardless of how many statements/tabs it produced -
+  // settledCount must stay a per-CONNECTION counter (see expectedTotal's
+  // and showAllModeStreamStatus()'s own "M of N done" semantics), not a
+  // per-tab one.
+  function settleAllModeBatchedResults(state, results, failures) {
+    const byConnection = new Map();
+    const order = [];
+    const keyOf = (db) => `${db.kind}:${db.id}`;
+
+    (Array.isArray(results) ? results : []).forEach((result) => {
+      const db = result.database || {};
+      const key = keyOf(db);
+      if (!byConnection.has(key)) {
+        byConnection.set(key, { db, tabs: [] });
+        order.push(key);
+      }
+      byConnection.get(key).tabs.push(result);
+    });
+
+    (Array.isArray(failures) ? failures : []).forEach((f) => {
+      const db = f.database || {};
+      const key = keyOf(db);
+      if (!byConnection.has(key)) {
+        byConnection.set(key, { db, tabs: [] });
+        order.push(key);
+      }
+      byConnection.get(key).tabs.push({
+        isError: true,
+        error: f.error || 'An error occurred during SQL execution.',
+        statement: f.failedStatement || '',
+        database: db,
+      });
+      state.executeFailures.push(f);
+    });
+
+    order.forEach((key) => {
+      const { db, tabs } = byConnection.get(key);
+      replaceAllModePlaceholderWithMany(db, tabs);
+      // Only the real result tabs feed Phase C/history - the synthetic
+      // error tab pushed above isn't a row set, and state.executeFailures
+      // already recorded the failure info itself.
+      tabs.filter((t) => !t.isError).forEach((t) => state.executeResults.push(t));
+      state.settledCount += 1;
+    });
+  }
+
   // Re-renders the tabs nav/active tab in place after a placeholder was
   // just swapped for real content, and refreshes the progress banner.
   // Deliberately does NOT change which tab is active (unlike
@@ -4446,7 +4802,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (activeResultIndex >= currentResultsList.length) activeResultIndex = 0;
     buildResultsTabsNav();
     renderTableResult(currentResultsList[activeResultIndex] || null);
-    showAllModeStreamStatus(state.expectedTotal, state.settledCount);
+    showAllModeStreamStatus(state);
   }
 
   // Reuses the existing retry-status banner element/styling (see
@@ -4454,17 +4810,72 @@ document.addEventListener('DOMContentLoaded', async () => {
   // same time as a real per-attempt retry (that's a single-connection-
   // only code path), so there's no risk of the two treading on each
   // other.
-  function showAllModeStreamStatus(total, settled) {
+  //
+  // With auto-execute ON, generation and fetching are NOT sequential
+  // phases - handlePhaseBConnectionDone() fires a connection's own
+  // /api/execute call the instant THAT connection's SQL is generated,
+  // without waiting for any other still-in-flight connection's own
+  // generation call to finish (see its own dispatch of
+  // executeOneAllModeConnection()). So while database A is still having
+  // its SQL written, database B's results may already be coming back -
+  // a single combined line reports both counts at once instead of a
+  // "writing" -> "fetching" handoff that would misrepresent that overlap
+  // (and, worse, could show a stale "writing" message while a fetch had
+  // already failed or finished):
+  //   - state.generationSettledCount: connections whose OWN
+  //     "phase_b_connection_done" event has arrived (note/failed/sql,
+  //     regardless of whether a real-SQL one has been executed yet).
+  //   - state.settledCount: connections fully done end to end (a
+  //     note/failed outcome settles immediately since it needs no
+  //     execution; a real-SQL outcome settles once its own execute call
+  //     returns).
+  //
+  // With auto-execute OFF, nothing is ever fetched during streaming -
+  // every real-SQL connection just sits in its own "Ready to execute"
+  // placeholder until the user clicks Execute - so only the generation
+  // count is shown, and the banner hides once generation is done for
+  // every connection rather than claiming a fetch that isn't happening.
+  function showAllModeStreamStatus(state) {
     if (!resultsRetryStatus) return;
-    const progress = settled ? ` (${settled} of ${total} done)` : '';
+    const total = state.expectedTotal;
+
+    if (!state.autoExecute) {
+      if (state.generationSettledCount >= total) {
+        hideAllModeStreamStatus();
+        return;
+      }
+      resultsRetryStatus.innerHTML =
+        `<span class="retry-status-icon animate-spin">⟳</span> ` +
+        `Generating commands (${state.generationSettledCount} of ${total})…`;
+      resultsRetryStatus.classList.remove('hidden');
+      return;
+    }
+
     resultsRetryStatus.innerHTML =
       `<span class="retry-status-icon animate-spin">⟳</span> ` +
-      `Fetching results from ${total} database${total === 1 ? '' : 's'}${progress}…`;
+      `Generating commands (${state.generationSettledCount} of ${total}) and ` +
+      `fetching results (${state.settledCount} of ${total})…`;
     resultsRetryStatus.classList.remove('hidden');
   }
 
   function hideAllModeStreamStatus() {
     hideRetryStatus();
+  }
+
+  // Shown while Phase C's summarization call is in flight (see
+  // requestAllModeResultsSummary() and each of its call sites below) -
+  // reuses the same banner element/styling as showAllModeStreamStatus()
+  // above. Previously this window had NO visible indicator at all: every
+  // call site hid (or simply never showed) the progress banner as soon as
+  // every selected connection settled, then made ANOTHER full network
+  // round trip - a real LLM call - with nothing on screen suggesting the
+  // app was still working, while the Translate/Execute buttons stayed
+  // disabled for its entire duration.
+  function showAllModeSummarizingStatus() {
+    if (!resultsRetryStatus) return;
+    resultsRetryStatus.innerHTML =
+      `<span class="retry-status-icon animate-spin">⟳</span> Summarizing results…`;
+    resultsRetryStatus.classList.remove('hidden');
   }
 
   // Handles one "phase_b_connection_done" NDJSON event (see
@@ -4474,6 +4885,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   function handlePhaseBConnectionDone(evt) {
     const state = allModeStreamState;
     if (!state) return; // a phase_a_route event always precedes this - defensive only
+
+    // Generation is done for this connection regardless of outcome - see
+    // generationSettledCount's own declaration comment and
+    // showAllModeStreamStatus()'s "Writing…" -> "Fetching…" transition.
+    state.generationSettledCount += 1;
 
     if (evt.outcome === 'note') {
       const tab = {
@@ -4502,7 +4918,17 @@ document.addEventListener('DOMContentLoaded', async () => {
       return;
     }
 
-    // evt.outcome === 'sql'
+    // evt.outcome === 'sql' - slot this connection's marked SQL into its
+    // ORIGINAL position (not append order - see connectionOrder's own
+    // declaration comment) and refresh the editor immediately, regardless
+    // of whether auto-execute goes on to fetch anything for it, so the box
+    // fills in the moment each connection's own generation call returns.
+    const orderIndex = state.connectionOrder.findIndex(
+      (e) => e.kind === evt.kind && e.id === evt.id
+    );
+    if (orderIndex >= 0) state.sqlByIndex[orderIndex] = evt.sql;
+    updateSqlEditorFromAllModeState(state);
+
     if (!state.autoExecute) {
       // Leave the placeholder in place (just relabeled) - this connection
       // only settles once the user clicks Execute manually, which re-runs
@@ -4518,6 +4944,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     state.pendingExecutions.push(executeOneAllModeConnection(evt));
+    // Re-render immediately (rather than waiting for this or some OTHER
+    // connection's own execution to finish) so the banner's "Writing…" ->
+    // "Fetching data…" transition fires the instant generation finishes
+    // for every connection, not whenever the next unrelated rerender
+    // happens to occur afterward.
+    rerenderAllModeStream();
   }
 
   // Fires a single-connection /api/execute call the moment its own SQL
@@ -4537,22 +4969,53 @@ document.addEventListener('DOMContentLoaded', async () => {
         method: 'POST',
         headers: getApiHeaders(),
         credentials: 'same-origin',
+        signal: currentAbortController ? currentAbortController.signal : undefined,
         body: JSON.stringify({ sql: evt.sql, pinned_connections: PINNED_CONNECTIONS }),
       });
       const data = await response.json();
-      if (response.ok && data.success && Array.isArray(data.results) && data.results.length) {
-        const result = data.results[0];
-        if (!result.database) result.database = dbRef;
-        replaceAllModePlaceholder(dbRef, result);
-        state.executeResults.push(result);
+      const succeeded = Array.isArray(data.results) ? data.results : [];
+      succeeded.forEach((r) => { if (!r.database) r.database = dbRef; });
+
+      if (response.ok && data.success && succeeded.length) {
+        // This connection's script may have had more than one statement -
+        // every one of them gets its own tab (splice, not a single
+        // replace), same as single-connection mode's renderMultiTurnResults
+        // already does. Previously only succeeded[0] was ever kept,
+        // silently dropping every statement after the first.
+        replaceAllModePlaceholderWithMany(dbRef, succeeded);
+        state.executeResults.push(...succeeded);
       } else {
-        const errMsg = (data && data.error)
-          || (Array.isArray(data && data.failures) && data.failures[0] && data.failures[0].error)
+        // Either a total failure (e.g. connect() error - no succeeded
+        // statements at all) or a PARTIAL one: this connection's script had
+        // more than one statement and failed partway through (see
+        // execute_routes.py's SqlExecutionError-shaped `failures` entry),
+        // in which case `succeeded` still holds every statement that ran
+        // BEFORE the failure. Either way, keep whatever succeeded as its
+        // own tab(s) instead of discarding it just because something later
+        // in the same script failed - same behavior single-connection
+        // mode's renderResultsWithFailedStatement already gives.
+        const failureInfo = (Array.isArray(data.failures) && data.failures[0]) || null;
+        const errMsg = (data && data.error) || (failureInfo && failureInfo.error)
           || 'An error occurred during SQL execution.';
-        replaceAllModePlaceholder(dbRef, { isError: true, error: errMsg, database: dbRef });
+        const errorTab = {
+          isError: true, error: errMsg,
+          statement: (failureInfo && failureInfo.failedStatement) || '',
+          database: dbRef,
+        };
+        replaceAllModePlaceholderWithMany(dbRef, [...succeeded, errorTab]);
+        state.executeResults.push(...succeeded);
         state.executeFailures.push({ database: dbRef, error: errMsg });
       }
     } catch (err) {
+      // cancelInFlightQuery() may have already replaced `allModeStreamState`
+      // (or set it to null) by the time this abort actually rejects -
+      // mutating `state` (captured above, from the turn THIS call started
+      // in) past this point would touch a stale/replaced object rather
+      // than whatever the CURRENT turn (if any) is now using. Must be
+      // checked before anything below touches `state`.
+      if (err && err.name === 'AbortError') {
+        return;
+      }
       const errMsg = err.message || 'Failed to reach the execution backend server.';
       replaceAllModePlaceholder(dbRef, { isError: true, error: errMsg, database: dbRef });
       state.executeFailures.push({ database: dbRef, error: errMsg });
@@ -4579,7 +5042,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (state.settledCount < state.expectedTotal) return;
     if (!state.terminalData) return;
     state.finalized = true;
-    hideAllModeStreamStatus();
 
     const notes = {
       prompt: state.prompt,
@@ -4591,8 +5053,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Phase C - see requestAllModeResultsSummary's docstring. Awaited so
     // callers (translatePrompt()/executeSql()) keep their buttons
     // disabled for this extra round trip, same as the pre-streaming
-    // batched flow always did.
+    // batched flow always did. The progress banner switches to a
+    // "Summarizing…" message for this call rather than disappearing
+    // beforehand (as it used to) - this is a real, separate LLM call that
+    // can take a moment, and previously nothing on screen indicated the
+    // app was still working during it.
+    showAllModeSummarizingStatus();
     await requestAllModeResultsSummary(notes, state.executeResults, state.executeFailures);
+    hideAllModeStreamStatus();
     const summaryEntry = getSummaryTabEntry();
     if (summaryEntry) notes.routingMessage = summaryEntry.text;
 
@@ -4625,6 +5093,19 @@ document.addEventListener('DOMContentLoaded', async () => {
   // 9. TRANSLATE (NL -> SQL) AND EXECUTE SQL
   // ===========================================================================
   async function translatePrompt() {
+    // Synchronous re-entrancy guard - see uiActionBusy's declaration
+    // comment above. Must be the very first thing this function does,
+    // before the `await` below, so the check-and-set is atomic.
+    if (uiActionBusy) return;
+    uiActionBusy = true;
+    setButtonsDisabled(true);
+    // See currentAbortController/currentTurnId's own declaration comments
+    // above - this is a NEW, non-internal turn, so both get a fresh value
+    // here (never mutated in place).
+    const myTurnId = ++currentTurnId;
+    currentAbortController = new AbortController();
+
+    try {
     await fetchBackendConfig();
 
     clearResultsDisplay();
@@ -4640,8 +5121,6 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     const promptText = aiPrompt ? aiPrompt.value.trim() : "";
     if (!promptText) return;
-
-    setButtonsDisabled(true);
 
     // Not sending a database_url override here: fetchBackendConfig()
     // above already synced session state, and the server resolves the
@@ -4666,6 +5145,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         method: 'POST',
         headers: getApiHeaders(),
         credentials: 'same-origin',
+        signal: currentAbortController.signal,
         body: JSON.stringify({
           prompt: promptText,
           history: chatStore.toPayload(),
@@ -4681,6 +5161,18 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       data = await readTranslateStream(response, (evt) => {
         if (evt.status === 'retrying') { showRetryStatus(evt); return; }
+        // Single-connection mode: "reading the schema" / "writing the
+        // right command for the database". "All databases" mode ALSO
+        // emits this same event kind,
+        // with its own two `phase` values ("collecting_schema_summaries"/
+        // "routing") for its own two pre-triage waits - see
+        // translate_routes.py's stream_translation() docstring. Handled
+        // identically either way: showPhaseStatus() just renders
+        // evt.message verbatim, so no mode-specific branching is needed
+        // here at all. Whichever router-mode events fire next
+        // (phase_a_route/phase_b_connection_done below) naturally
+        // overwrite this same banner once they arrive.
+        if (evt.status === 'phase_status') { showPhaseStatus(evt); return; }
         // "All databases" mode's "route" outcome streams these two extra
         // event kinds ahead of the terminal line - see
         // translate_routes.py's stream_translation() docstring and
@@ -4772,7 +5264,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
           if (data.sql) {
             if (autoSqlExecuteEnabled) {
-              await executeSql();
+              await executeSql(null, { internal: true });
             }
           } else {
             // Nothing to execute at all - render immediately, with no
@@ -4807,19 +5299,28 @@ document.addEventListener('DOMContentLoaded', async () => {
         } else if (isNoSql) {
           setSqlQuery('');
           chatStore.clearPending();
-          renderNoSqlResponse(data.sql);
+          // "All databases" mode's own triage "answer" outcome (no
+          // real data needed) shares this exact branch with a plain
+          // single-connection reply - `data.router_route` is only ever
+          // set for a "route" outcome (see the branch above) - but ONLY
+          // the all-mode case carries the leading-label convention (see
+          // renderMarkdownLiteSummaryTab()'s docstring); a single-
+          // connection reply never does. IN_SCOPE_MODE reflects the mode
+          // this very request was just sent under, which is what decides
+          // which of the two this is.
+          renderNoSqlResponse(data.sql, { hasLabel: IN_SCOPE_MODE === 'all' });
         } else {
           setSqlQuery(data.sql);
           chatStore.setPending(modelEntry, normalizeSqlForCompare(data.sql));
 
           if (autoSqlExecuteEnabled) {
-            await executeSql();
+            await executeSql(null, { internal: true });
           }
         }
       } else {
         setSqlQuery('');
 
-        const errMsg = response && response.status === 401 
+        const errMsg = response && response.status === 401
           ? "Authentication required. Please click 'Sign in with Google' in the top-right corner to log in."
           : (data?.error || "An error occurred during translation.");
         console.error("Translation Error:", errMsg);
@@ -4842,6 +5343,14 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
       }
     } catch (err) {
+      // cancelInFlightQuery() (the Cancel button) has ALREADY fully reset the
+      // UI synchronously by the time an aborted fetch's promise rejects -
+      // letting this branch also render a "Network Error" tile (or touch
+      // any shared state below) on top of that would be wrong. Must be
+      // checked before anything else in this branch.
+      if (err && err.name === 'AbortError') {
+        return;
+      }
       setSqlQuery('');
 
       const errMsg = err.message || "Failed to reach the translation backend server.";
@@ -4863,13 +5372,26 @@ document.addEventListener('DOMContentLoaded', async () => {
             </td>
           </tr>`;
       }
+    }
     } finally {
       // Safety net for the network-error path (readTranslateStream()
       // itself throwing, e.g. the connection dropping mid-stream) - the
       // explicit hideRetryStatus() call above only runs once the stream
-      // actually finished parsing.
-      hideRetryStatus();
-      setButtonsDisabled(false);
+      // actually finished parsing. Also the single place that clears
+      // uiActionBusy - this outer finally covers every exit path from the
+      // try above, including the early `if (!promptText) return;`, so the
+      // guard can never get stuck "on" after a real turn ends.
+      //
+      // Guarded by myTurnId === currentTurnId (see that variable's
+      // declaration comment) so a CANCELLED or superseded turn's own
+      // eventual cleanup - which can still run here well after the Stop
+      // click, since aborting doesn't retroactively skip this finally -
+      // never clobbers a newer turn's buttons/uiActionBusy state.
+      if (myTurnId === currentTurnId) {
+        hideRetryStatus();
+        setButtonsDisabled(false);
+        uiActionBusy = false;
+      }
     }
   }
 
@@ -4902,7 +5424,34 @@ document.addEventListener('DOMContentLoaded', async () => {
     return summarized;
   }
 
-  async function executeSql(customSql = null) {
+  async function executeSql(customSql = null, { internal = false } = {}) {
+    // Synchronous re-entrancy guard - see uiActionBusy's declaration
+    // comment above. Skipped when `internal` is true: that's set only by
+    // translatePrompt()'s own two `autoSqlExecuteEnabled` call sites
+    // (above, in this same file), which are already-awaited, sequential
+    // (never concurrent) nested calls made while translatePrompt() itself
+    // still holds the flag for this whole turn - re-checking/re-setting/
+    // resetting it here would
+    // either be a same-call no-op deadlock (guard already true) or, worse,
+    // clear the flag out from under translatePrompt() while it still has
+    // work left to do (e.g. maybeFinalize()) after this call returns.
+    if (!internal) {
+      if (uiActionBusy) return;
+      uiActionBusy = true;
+      setButtonsDisabled(true);
+      // See currentAbortController/currentTurnId's declaration comments
+      // above - only a NEW, non-internal turn gets a fresh value; an
+      // internal call (from translatePrompt()) is part of the SAME turn
+      // as its caller, so it must NOT bump/replace either one here.
+      currentAbortController = new AbortController();
+      currentTurnId += 1;
+    }
+    // Read (never bump) here so an internal call captures the enclosing
+    // turn's own (already-current) id, while a non-internal call captures
+    // the value it just bumped above.
+    const myTurnId = currentTurnId;
+
+    try {
     await fetchBackendConfig();
 
     // A live "all databases" mode streaming turn (auto-execute was off,
@@ -4919,8 +5468,16 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     const sql = customSql || getSqlQuery();
     if (!sql) return;
-  
-    setButtonsDisabled(true);
+
+    // Single-connection mode's own "fetching" indicator - see
+    // showFetchingResultsStatus()'s own declaration comment. Neither "all
+    // databases" mode path shows this: a live streaming turn
+    // (allModeStreamState) settles each connection's execution
+    // individually via executeOneAllModeConnection() rather than through
+    // this shared function at all, and the manual-Execute-button fallback
+    // (pendingAllModeNotes, auto-execute was off) already has its own
+    // Phase-C-oriented banners further down.
+    if (!allModeStreamState && !pendingAllModeNotes) showFetchingResultsStatus();
 
     // See the comment in translatePrompt() above - no database_url
     // override here either, for the same reason.
@@ -4929,6 +5486,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         method: 'POST',
         headers: getApiHeaders(),
         credentials: 'same-origin',
+        signal: currentAbortController ? currentAbortController.signal : undefined,
         body: JSON.stringify({
           sql: sql,
           // Harmless whenever `sql` carries no '-- database: ...' markers
@@ -4955,12 +5513,11 @@ document.addEventListener('DOMContentLoaded', async () => {
         // auto-executed turn.
         const streamState = allModeStreamState;
         if (streamState) {
-          (data.results || []).forEach((result) => {
-            const db = result.database || {};
-            replaceAllModePlaceholder(db, result);
-            streamState.executeResults.push(result);
-            streamState.settledCount += 1;
-          });
+          // Groups data.results by connection and settles each one - a
+          // connection whose script had more than one statement gets a
+          // tab per statement (see settleAllModeBatchedResults' own
+          // docstring), not just its first.
+          settleAllModeBatchedResults(streamState, data.results, null);
           rerenderAllModeStream();
           await maybeFinalize();
         } else {
@@ -4986,8 +5543,12 @@ document.addEventListener('DOMContentLoaded', async () => {
             // immediately after, so allModeNotes.routingMessage - and
             // therefore whatever gets persisted onto the history entry
             // just below - reflects the FINAL answer, not triage's
-            // earlier, data-free guess at it.
+            // earlier, data-free guess at it. showAllModeSummarizingStatus()
+            // gives this real network round trip a visible indicator -
+            // previously there was none at all on this fallback path.
+            showAllModeSummarizingStatus();
             await requestAllModeResultsSummary(allModeNotes, data.results, []);
+            hideAllModeStreamStatus();
             const summaryEntry = getSummaryTabEntry();
             if (summaryEntry) allModeNotes.routingMessage = summaryEntry.text;
           } else {
@@ -5033,22 +5594,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         // the raw execute-failure shape those existing renderers show.
         if (allModeStreamState) {
           const streamState = allModeStreamState;
-          const executeResults = Array.isArray(data.results) ? data.results : [];
-          const executeFailures = Array.isArray(data.failures) ? data.failures : [];
-          executeResults.forEach((result) => {
-            const db = result.database || {};
-            replaceAllModePlaceholder(db, result);
-            streamState.executeResults.push(result);
-            streamState.settledCount += 1;
-          });
-          executeFailures.forEach((f) => {
-            const db = f.database || {};
-            replaceAllModePlaceholder(db, {
-              isError: true, error: f.error || 'An error occurred during SQL execution.', database: db,
-            });
-            streamState.executeFailures.push(f);
-            streamState.settledCount += 1;
-          });
+          // Same per-connection grouping as the success branch above - a
+          // failed connection's OWN succeeded-before-the-failure
+          // statements (already present in data.results, tagged with
+          // that connection - see execute_routes.py's SqlExecutionError
+          // handling) get their own tabs too, with the failure tab
+          // appended right after them, instead of being discarded.
+          settleAllModeBatchedResults(streamState, data.results, data.failures);
           rerenderAllModeStream();
           // Phase C - see requestAllModeResultsSummary's docstring. Still
           // worth attempting even on a partial failure: whatever DID
@@ -5059,7 +5611,12 @@ document.addEventListener('DOMContentLoaded', async () => {
           // maybeFinalize() here, matching this branch's pre-existing
           // behavior (from before this streaming redesign) of never
           // persisting history for a partial execute failure - only the
-          // success branch above ever reaches maybeFinalize().
+          // success branch above ever reaches maybeFinalize(). Same
+          // "Summarizing…" indicator maybeFinalize() shows for this call -
+          // previously this branch left the stale "N of N done" banner
+          // (from rerenderAllModeStream() just above) sitting unchanged
+          // through this entire extra network round trip.
+          showAllModeSummarizingStatus();
           await requestAllModeResultsSummary(
             {
               prompt: streamState.prompt, routingMessage: streamState.routingMessage,
@@ -5067,6 +5624,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             },
             streamState.executeResults, streamState.executeFailures,
           );
+          hideAllModeStreamStatus();
           allModeStreamState = null;
         // pendingAllModeNotes fallback (see its own declaration comment
         // above) - same "never persists history for a partial execute
@@ -5082,7 +5640,9 @@ document.addEventListener('DOMContentLoaded', async () => {
             executeFailures: executeFailures,
           });
           pendingAllModeNotes = null;
+          showAllModeSummarizingStatus();
           await requestAllModeResultsSummary(allModeNotes, executeResults, executeFailures);
+          hideAllModeStreamStatus();
         // Multi-database question-answering's own partial-failure shape
         // (see execute_routes.py's module docstring) - `failures` is a
         // LIST (one entry per connection that failed; the others keep
@@ -5120,11 +5680,105 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
       }
     } catch (err) {
+      // See translatePrompt()'s identical guard for why - cancelInFlightQuery()
+      // has already fully reset the UI synchronously by the time an
+      // aborted fetch's promise rejects.
+      if (err && err.name === 'AbortError') {
+        return;
+      }
       const errMsg = err.message || "Failed to reach the execution backend server.";
       console.error("Failed to execute SQL:", err);
-    } finally {
-      setButtonsDisabled(false);
     }
+    } finally {
+      // Clears showFetchingResultsStatus()'s banner (if it was ever shown
+      // above) regardless of outcome or of `internal` - unlike the button/
+      // flag reset just below, this one always needs to happen here: for
+      // an internal call, translatePrompt() itself never shows or expects
+      // to clear this particular banner, so nothing else would. Harmless
+      // to call when nothing is showing (e.g. an "all databases" mode
+      // call, which never sets it in the first place, or a call that hit
+      // the early `if (!sql) return;` above).
+      hideRetryStatus();
+      // Mirrors the `if (!internal)` guard at the top - an internal call
+      // (from translatePrompt()) leaves the flag and buttons exactly as
+      // translatePrompt() left them, since it still has work left to do
+      // (e.g. maybeFinalize()) after this call returns.
+      //
+      // Also guarded by myTurnId === currentTurnId (see translatePrompt()'s
+      // identical guard) - without it, a cancelled-but-still-settling
+      // external executeSql() call could re-enable buttons/clear
+      // uiActionBusy out from under a NEWER turn the user already started
+      // after clicking Cancel.
+      if (!internal && myTurnId === currentTurnId) {
+        setButtonsDisabled(false);
+        uiActionBusy = false;
+      }
+    }
+  }
+
+  // The Cancel button's click handler - see currentAbortController/
+  // currentTurnId's declaration comments above for the mechanism this
+  // relies on. Does NOT bump currentTurnId itself: the point is to make
+  // the CURRENT turn's own eventual (still in-flight, now-aborted)
+  // cleanup a no-op via the myTurnId checks those functions already do,
+  // not to start a new turn - the very next translatePrompt()/executeSql()
+  // call the user makes does that bump itself, same as any other turn.
+  //
+  // Best-effort by design (see cancel_registry.py's module docstring on
+  // the server side): aborting the client's own fetch() calls is
+  // immediate and guaranteed - the UI reset below is NOT waiting on
+  // anything server-side to confirm before it happens - but the POST to
+  // /api/cancel that asks the server to also abandon whatever it's doing
+  // (closing the DB connection or LLM client currently in flight for this
+  // session) is fired-and-forgotten (`.catch(() => {})`, never awaited):
+  // if it's slow, fails, or the server-side work has no cancel handle
+  // registered for some reason (see cancel_registry.py for the rare cases
+  // that can happen), the UI still resets immediately and correctly
+  // either way - the user is never made to wait on it.
+  function cancelInFlightQuery() {
+    if (!uiActionBusy) return;
+
+    if (currentAbortController) currentAbortController.abort();
+
+    fetch('/api/cancel', {
+      method: 'POST',
+      headers: getApiHeaders(),
+      credentials: 'same-origin',
+    }).catch(() => {});
+
+    // Full synchronous UI reset - everything below happens immediately,
+    // without waiting on any network call (the /api/cancel POST above, or
+    // whichever fetch(es) currentAbortController.abort() just aborted) to
+    // settle first. This is what lets a next query start safely right
+    // away: uiActionBusy/the buttons/the results area are all back to
+    // their idle state before this function even returns.
+    allModeStreamState = null;
+    pendingAllModeNotes = null;
+    chatStore.clearPending();
+    clearResultsDisplay();
+    setSqlQuery('');
+
+    if (resultsTabsNav) resultsTabsNav.classList.add('hidden');
+    if (resultsHeader) resultsHeader.innerHTML = '';
+    if (resultsBody) {
+      resultsBody.innerHTML = `
+        <tr>
+          <td class="error-cell">
+            <div class="error-container">
+              <span class="error-icon">⏹️</span>
+              <div class="error-details">
+                <strong>Query cancelled</strong>
+                <p>You stopped this query. Feel free to try again.</p>
+              </div>
+            </div>
+          </td>
+        </tr>`;
+    }
+
+    hideRetryStatus();
+    hideAllModeStreamStatus();
+    setButtonsDisabled(false);
+    uiActionBusy = false;
   }
 
   // ===========================================================================
@@ -5139,6 +5793,21 @@ document.addEventListener('DOMContentLoaded', async () => {
     aiPrompt.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
+        // Guard against double-submission while a translation is already
+        // in flight - every other trigger (the Translate button, the
+        // quick-prompt chips) is disabled via setButtonsDisabled(true)
+        // for the duration of a call, but Enter bypassed that entirely
+        // before this check existed. A second concurrent translatePrompt()
+        // call resets the shared allModeStreamState (see its own
+        // declaration comment) out from under the first call's still-
+        // in-flight "all databases" mode streaming updates, and the two
+        // calls' eventual setSqlQuery() results race on the same shared
+        // SQL editor - whichever call's network round trip finishes last
+        // wins, even if that's the accidental second Enter-press rather
+        // than the original request. translateBtn.disabled is the same
+        // signal setButtonsDisabled() already maintains for every other
+        // entry point, so this just extends it to cover this one too.
+        if (translateBtn && translateBtn.disabled) return;
         translatePrompt();
       }
     });
@@ -5198,16 +5867,31 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   if (translateBtn) translateBtn.addEventListener('click', translatePrompt);
   if (runBtn) runBtn.addEventListener('click', () => executeSql());
+  if (stopBtn) stopBtn.addEventListener('click', cancelInFlightQuery);
 
   // Example prompt chips (zero-state guidance for first-time users): fill
   // the NL prompt box with a working example and immediately run it, so
   // someone who has never used the app can see the whole prompt -> SQL ->
   // results flow without having to guess what to type first.
+  //
+  // Each chip's LABEL is fixed (see index.html), but the PROMPT TEXT it
+  // submits depends on the mode: data-prompt-all is used instead of
+  // data-prompt whenever "All databases" mode is selected (see
+  // isAllConnectionsSelected()) - "all" mode routes the question through
+  // a triage step that may pick a different connection than the single-
+  // connection wording assumes, so the two need independently editable
+  // text (see index.html's data-prompt/data-prompt-all comment for where
+  // to change the actual wording). Falls back to data-prompt if a chip
+  // has no data-prompt-all set at all, so this never regresses to an
+  // empty prompt for a chip that hasn't been given "all"-mode wording.
   const examplePromptButtons = document.querySelectorAll('.example-chip');
   if (examplePromptButtons.length && aiPrompt) {
     examplePromptButtons.forEach(btn => {
       btn.addEventListener('click', () => {
-        aiPrompt.value = btn.dataset.prompt || '';
+        const promptText = isAllConnectionsSelected()
+          ? (btn.dataset.promptAll || btn.dataset.prompt || '')
+          : (btn.dataset.prompt || '');
+        aiPrompt.value = promptText;
         // Setting .value directly doesn't fire the 'input' event, so the
         // listener above (which clears stale SQL as the user types) never
         // runs here - clear it explicitly so a chip click doesn't leave
@@ -5267,7 +5951,16 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (isNoSql) {
           setSqlQuery('');
           chatStore.clearPending();
-          renderNoSqlResponse(sqlText);
+          // Reached for a saved all-mode "answer" outcome turn too (it
+          // never got `.allMode` set - see the `lastModelEntry.allMode`
+          // branch above, which only covers "route" outcome turns) -
+          // same IN_SCOPE_MODE-based distinction translatePrompt()'s own
+          // renderNoSqlResponse() call makes, and equally a heuristic
+          // here: a turn recorded under a mode the user has since
+          // switched away from would guess wrong, a pre-existing class of
+          // minor cosmetic edge case this history-restoration code
+          // already accepts elsewhere.
+          renderNoSqlResponse(sqlText, { hasLabel: IN_SCOPE_MODE === 'all' });
         } else {
           setSqlQuery(sqlText);
 

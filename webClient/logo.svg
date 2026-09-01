@@ -36,8 +36,10 @@
             <path d="M 0 25 L 0 35 C 0 40.5, 9 45, 20 45 C 31 45, 40 40.5, 40 35 L 40 25 C 40 30.5, 31 35, 20 35 C 9 35, 0 30.5, 0 25 Z" fill="#0369a1"/>
             <circle cx="30" cy="36" r="2" fill="#ffffff"/>
 
-            <!-- Stack 3 (Bottom) -->
-            <path d="M 0 40 L 0 50 C 0 55.5, 9 60, 20 60 C 31 60, 40 55.5, 40 50 L 40 40 C 40 45.5, 31 50, 20 50 C 9 50, 0 45.5, 0 40 Z" fill="#0f172a"/>
+            <!-- Stack 3 (Bottom) - same fix as the robot body above: was a near-black
+                 fill (#0f172a) that blended into the app's near-black dark-theme
+                 background; lightened and outlined the same way. -->
+            <path d="M 0 40 L 0 50 C 0 55.5, 9 60, 20 60 C 31 60, 40 55.5, 40 50 L 40 40 C 40 45.5, 31 50, 20 50 C 9 50, 0 45.5, 0 40 Z" fill="#1e293b" stroke="#38bdf8" stroke-width="2" stroke-linejoin="round"/>
             <circle cx="30" cy="51" r="2" fill="#38bdf8"/>
         </g>
     </g>

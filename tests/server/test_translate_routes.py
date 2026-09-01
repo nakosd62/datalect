@@ -59,6 +59,29 @@ once a retry line has already gone out. Failure is reported via the
 terminal line's success/error fields instead - see
 test_non_retryable_error_fails_immediately_and_reports_failure_in_body()
 and test_exhausts_all_retry_attempts_and_reports_failure_in_body() below.
+
+IMPORTANT, and easy to trip over: env.client.post('/api/translate', ...)
+must always be captured and its body actually read (parse_translate_stream(
+resp), or resp.get_json()/get_data() for the two early-validation cases
+above) - even in a test that only cares about a side effect (translation
+history being recorded, the fake LLM client having been called with a
+particular shape, ...) and never inspects the response body itself. This
+is NOT optional bookkeeping: Werkzeug's test client only pulls the FIRST
+item out of a stream_with_context()-wrapped generator response to build
+its status/headers - it does NOT drain the rest unless something actually
+reads the body afterward. Since stream_translation() now yields two
+phase_status lines (see translate_routes.py's module docstring) before
+the single-connection path's real work (schema lookup, the LLM call,
+record_translation()), a bare `env.client.post(...)` with the return value
+discarded only advances the generator to that first phase_status line and
+leaves it suspended there - record_translation() and everything after it
+never runs, and the fake LLM client never gets called. Every test below
+was written before those two lines existed, when the very first (and
+only, in the no-retry case) yield was the terminal "done" line itself -
+meaning the entire function body, side effects included, had already run
+by the time a bare post() pulled that one item. That was always an
+implicit dependency on stream_translation()'s exact yield order, not a
+guarantee - it just happened to hold until this comment was added.
 """
 
 import types as pytypes
@@ -70,7 +93,8 @@ import pytest
 
 from helpers import (
     install_fake_bigquery, install_fake_mssql_connect, parse_translate_stream,
-    write_database_presets_file, login_as, select_llm_provider,
+    parse_translate_stream_events, write_database_presets_file, login_as,
+    select_llm_provider,
 )
 
 
@@ -164,6 +188,34 @@ def test_success_strips_markdown_fences_and_returns_token_counts(app_factory, mo
     assert data['output_tokens'] == 5
 
 
+def test_success_streams_schema_and_generating_sql_phase_status_before_done(app_factory, monkeypatch):
+    """The single-connection path (see stream_translation()'s module
+    docstring) emits two {"status": "phase_status", ...} lines ahead of the
+    terminal "done" line - one before the schema lookup, one before the LLM
+    call - so the client has something better than a bare spinner for the
+    two real waits that happen before any SQL comes back. Neither is a
+    "retrying" line, so parse_translate_stream's retry_events/final_data
+    split (used by every other test in this file) is unaffected by their
+    presence - this test uses parse_translate_stream_events instead, since
+    it needs to see every line, not just the terminal one."""
+    env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(FakeGenaiResponse("SELECT 1;"))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'give me one'})
+    events = parse_translate_stream_events(resp)
+
+    phase_statuses = [e for e in events if e.get("status") == "phase_status"]
+    assert [e["phase"] for e in phase_statuses] == ["schema", "generating_sql"]
+    assert all(isinstance(e["message"], str) and e["message"] for e in phase_statuses)
+
+    # Both phase_status lines come before the terminal "done" line, and
+    # neither is mistaken for it.
+    assert events[-1]["status"] == "done"
+    assert events[-1]["success"] is True
+
+
 def test_success_records_translation_history(app_factory, monkeypatch):
     env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
     harness = GenaiHarness()
@@ -171,7 +223,8 @@ def test_success_records_translation_history(app_factory, monkeypatch):
     harness.queue_response(FakeGenaiResponse("SELECT 1;"))
 
     env.client.set_cookie("crbot_user_id", "alice@example.com")
-    env.client.post('/api/translate', json={'prompt': 'give me one'})
+    resp = env.client.post('/api/translate', json={'prompt': 'give me one'})
+    parse_translate_stream(resp)  # drains the stream - see this file's module docstring
 
     rows, stats, total_count = env.app_config.state_store.get_translation_history("alice@example.com")
     assert total_count == 1
@@ -184,7 +237,8 @@ def test_postgres_dialect_intro_used_by_default(app_factory, monkeypatch):
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     harness.queue_response(FakeGenaiResponse("SELECT 1;"))
 
-    env.client.post('/api/translate', json={'prompt': 'hi'})
+    resp = env.client.post('/api/translate', json={'prompt': 'hi'})
+    parse_translate_stream(resp)  # drains the stream - see this file's module docstring
     system_instruction = harness.generate_calls[0]["config"].system_instruction
     assert "PostgreSQL-compatible RDBMSs" in system_instruction
     assert "BigQuery" not in system_instruction
@@ -216,7 +270,8 @@ def test_bigquery_dialect_intro_used_when_active_connection_is_bigquery(app_fact
         "global", connection_id="bigquery+BQ", is_custom=False,
     )
 
-    env.client.post('/api/translate', json={'prompt': 'hi'})
+    resp = env.client.post('/api/translate', json={'prompt': 'hi'})
+    parse_translate_stream(resp)  # drains the stream - see this file's module docstring
     system_instruction = harness.generate_calls[0]["config"].system_instruction
     assert "BigQuery Standard SQL" in system_instruction
     assert "_TABLE_SUFFIX" in system_instruction
@@ -242,7 +297,8 @@ def test_mssql_dialect_intro_used_when_active_connection_is_mssql(app_factory, t
         "global", connection_id="mssql+MS", is_custom=False,
     )
 
-    env.client.post('/api/translate', json={'prompt': 'hi'})
+    resp = env.client.post('/api/translate', json={'prompt': 'hi'})
+    parse_translate_stream(resp)  # drains the stream - see this file's module docstring
     system_instruction = harness.generate_calls[0]["config"].system_instruction
     assert "Microsoft SQL Server" in system_instruction
     assert "SELECT TOP" in system_instruction
@@ -272,7 +328,8 @@ def test_schema_precedes_history_and_is_not_glued_to_the_new_prompt(app_factory,
     harness.queue_response(FakeGenaiResponse("SELECT 2;"))
 
     history = [{"role": "user", "text": "show users"}]
-    env.client.post('/api/translate', json={'prompt': 'now show orders', 'history': history})
+    resp = env.client.post('/api/translate', json={'prompt': 'now show orders', 'history': history})
+    parse_translate_stream(resp)  # drains the stream - see this file's module docstring
 
     contents = harness.generate_calls[0]["contents"]
     assert contents[0].parts[0].text == "Database Schema:\nNo schema description available.\n\nshow users"
@@ -671,7 +728,8 @@ def test_history_result_truncation_reaches_the_real_gemini_call(app_factory, mon
     harness.queue_response(FakeGenaiResponse("SELECT 2;"))
 
     history = _make_history_with_results([[0], [1], [2], [3]], row_count=9999)
-    env.client.post('/api/translate', json={'prompt': 'now what', 'history': history})
+    resp = env.client.post('/api/translate', json={'prompt': 'now what', 'history': history})
+    parse_translate_stream(resp)  # drains the stream - see this file's module docstring
 
     contents = harness.generate_calls[0]["contents"]
     history_text = contents[0].parts[0].text  # schema is prepended here too, but the header text is still present
@@ -688,7 +746,8 @@ def test_history_result_truncation_reaches_the_real_claude_call(app_factory, mon
     harness.queue_response(FakeClaudeResponse("SELECT 2;"))
 
     history = _make_history_with_results([[0], [1], [2], [3]], row_count=9999)
-    env.client.post('/api/translate', json={'prompt': 'now what', 'history': history})
+    resp = env.client.post('/api/translate', json={'prompt': 'now what', 'history': history})
+    parse_translate_stream(resp)  # drains the stream - see this file's module docstring
 
     messages = harness.create_calls[0]["messages"]
     # Sole history turn is also the cache_control boundary (see the
@@ -731,6 +790,29 @@ def test_summary_prompt_asks_for_one_paragraph_per_database(app_env):
     assert "combined" in instruction.lower()
 
 
+# --- Phase C summary prompt: must lead with a "Result Summary" line ------
+# Mirrors connection_router.py's "Triage" leading-line requirement (see
+# test_connection_router.py's test_triage_prompt_requires_answer_and_
+# message_to_lead_with_a_triage_line, plus its two label-only-response
+# tests) - client.js's renderMarkdownLite() bolds+underlines a standalone
+# "Result Summary" line wherever it appears, so this guards the prompt
+# text. A real model turned out to sometimes over-comply with "alone on
+# its own line" and respond with JUST the label - see
+# test_connection_router.py's test_summarize_all_mode_results_retries_a_
+# response_that_is_just_the_result_summary_label for the server-side
+# retry that now catches that instead of silently showing a bare heading.
+def test_summary_prompt_requires_a_leading_translated_results_summary_line(app_env):
+    instruction = app_env.translate_routes._SUMMARY_SYSTEM_INSTRUCTION
+    # Pluralized ("Results Summary", not "Result Summary") and, per the
+    # instruction text, translated into the user's own question's
+    # language rather than a fixed literal English phrase - see
+    # is_label_only_response's docstring for why the retry-detection logic
+    # had to become language-agnostic to match.
+    assert "meaning \"Results Summary\"" in instruction
+    assert "TRANSLATED into the SAME LANGUAGE as the user's original question" in instruction
+    assert "is not a valid response" in instruction
+
+
 # --- History turn-count cap (HISTORY_MAX_TURNS) ---
 # Separate lever from HISTORY_RESULT_MAX_ROWS above: that one trims the row
 # data WITHIN a turn's results; this one drops whole OLDER turns outright.
@@ -757,7 +839,8 @@ def test_history_sent_to_gemini_is_capped_to_history_max_turns(app_factory, monk
     for i in range(3):  # 3 turns offered, cap is 2 - the oldest must be dropped entirely
         history.append({"role": "user", "text": f"prompt {i}"})
         history.append({"role": "model", "text": f"SELECT {i};"})
-    env.client.post('/api/translate', json={'prompt': 'newest prompt', 'history': history})
+    resp = env.client.post('/api/translate', json={'prompt': 'newest prompt', 'history': history})
+    parse_translate_stream(resp)  # drains the stream - see this file's module docstring
 
     contents = harness.generate_calls[0]["contents"]
     # 2 surviving turns (4 entries) + the new prompt appended = 5.
@@ -780,7 +863,8 @@ def test_history_sent_to_claude_is_capped_to_history_max_turns(app_factory, monk
     for i in range(3):
         history.append({"role": "user", "text": f"prompt {i}"})
         history.append({"role": "model", "text": f"SELECT {i};"})
-    env.client.post('/api/translate', json={'prompt': 'newest prompt', 'history': history})
+    resp = env.client.post('/api/translate', json={'prompt': 'newest prompt', 'history': history})
+    parse_translate_stream(resp)  # drains the stream - see this file's module docstring
 
     messages = harness.create_calls[0]["messages"]
     assert len(messages) == 5
@@ -964,7 +1048,8 @@ def test_claude_success_records_translation_history(app_factory, monkeypatch):
     # identity instead for it to actually take effect.
     env.app_config.state_store.set_session("alice@example.com", llm_provider="anthropic")
     env.client.set_cookie("crbot_user_id", "alice@example.com")
-    env.client.post('/api/translate', json={'prompt': 'give me one'})
+    resp = env.client.post('/api/translate', json={'prompt': 'give me one'})
+    parse_translate_stream(resp)  # drains the stream - see this file's module docstring
 
     rows, stats, total_count = env.app_config.state_store.get_translation_history("alice@example.com")
     assert total_count == 1
@@ -1012,7 +1097,8 @@ def test_claude_dialect_intro_reaches_the_system_param(app_factory, tmp_path, mo
         "global", connection_id="mssql+MS", is_custom=False,
     )
 
-    env.client.post('/api/translate', json={'prompt': 'hi'})
+    resp = env.client.post('/api/translate', json={'prompt': 'hi'})
+    parse_translate_stream(resp)  # drains the stream - see this file's module docstring
     # system is a one-block list now (see test_claude_system_prompt_is_
     # cache_control_marked below for why) rather than a plain string.
     system_instruction = harness.create_calls[0]["system"][0]["text"]
@@ -1038,7 +1124,8 @@ def test_claude_history_uses_assistant_role_and_appends_results(app_factory, mon
         {"role": "model", "text": "SELECT * FROM users;",
          "results": [{"columns": ["id"], "rows": [[1]], "rowCount": 1}]},
     ]
-    env.client.post('/api/translate', json={'prompt': 'now show orders', 'history': history})
+    resp = env.client.post('/api/translate', json={'prompt': 'now show orders', 'history': history})
+    parse_translate_stream(resp)  # drains the stream - see this file's module docstring
 
     messages = harness.create_calls[0]["messages"]
     # Two history messages, then the new user turn translate_query() appends.
@@ -1068,7 +1155,8 @@ def test_claude_schema_precedes_history_and_is_not_glued_to_the_new_prompt(app_f
     harness.queue_response(FakeClaudeResponse("SELECT 2;"))
 
     history = [{"role": "user", "text": "show users"}]
-    env.client.post('/api/translate', json={'prompt': 'now show orders', 'history': history})
+    resp = env.client.post('/api/translate', json={'prompt': 'now show orders', 'history': history})
+    parse_translate_stream(resp)  # drains the stream - see this file's module docstring
 
     messages = harness.create_calls[0]["messages"]
     # A single-entry history means this message is both the first (schema
@@ -1094,7 +1182,8 @@ def test_claude_schema_attaches_to_new_prompt_when_there_is_no_history(app_facto
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
     harness.queue_response(FakeClaudeResponse("SELECT 1;"))
 
-    env.client.post('/api/translate', json={'prompt': 'show users'})
+    resp = env.client.post('/api/translate', json={'prompt': 'show users'})
+    parse_translate_stream(resp)  # drains the stream - see this file's module docstring
 
     messages = harness.create_calls[0]["messages"]
     assert len(messages) == 1
@@ -1125,7 +1214,8 @@ def test_claude_system_prompt_is_cache_control_marked(app_factory, monkeypatch):
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
     harness.queue_response(FakeClaudeResponse("SELECT 1;"))
 
-    env.client.post('/api/translate', json={'prompt': 'hi'})
+    resp = env.client.post('/api/translate', json={'prompt': 'hi'})
+    parse_translate_stream(resp)  # drains the stream - see this file's module docstring
 
     system = harness.create_calls[0]["system"]
     assert isinstance(system, list) and len(system) == 1
@@ -1146,7 +1236,8 @@ def test_claude_cache_control_marks_last_history_turn_not_the_new_prompt(app_fac
         {"role": "user", "text": "now filter to active ones"},
         {"role": "model", "text": "SELECT * FROM users WHERE active;"},
     ]
-    env.client.post('/api/translate', json={'prompt': 'now just the count', 'history': history})
+    resp = env.client.post('/api/translate', json={'prompt': 'now just the count', 'history': history})
+    parse_translate_stream(resp)  # drains the stream - see this file's module docstring
 
     messages = harness.create_calls[0]["messages"]
     assert len(messages) == 5  # 4 history turns + the new prompt
@@ -1173,7 +1264,8 @@ def test_claude_schema_block_is_cache_control_marked_even_with_no_history(app_fa
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
     harness.queue_response(FakeClaudeResponse("SELECT 1;"))
 
-    env.client.post('/api/translate', json={'prompt': 'show users'})
+    resp = env.client.post('/api/translate', json={'prompt': 'show users'})
+    parse_translate_stream(resp)  # drains the stream - see this file's module docstring
 
     messages = harness.create_calls[0]["messages"]
     assert len(messages) == 1
@@ -1230,7 +1322,8 @@ def test_claude_default_model_is_claude_sonnet_5(app_factory, monkeypatch):
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
     harness.queue_response(FakeClaudeResponse("SELECT 1;"))
 
-    env.client.post('/api/translate', json={'prompt': 'hi'})
+    resp = env.client.post('/api/translate', json={'prompt': 'hi'})
+    parse_translate_stream(resp)  # drains the stream - see this file's module docstring
     assert harness.create_calls[0]["model"] == "claude-sonnet-5"
 
 
@@ -1244,7 +1337,8 @@ def test_claude_model_env_var_overrides_default(app_factory, monkeypatch):
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
     harness.queue_response(FakeClaudeResponse("SELECT 1;"))
 
-    env.client.post('/api/translate', json={'prompt': 'hi'})
+    resp = env.client.post('/api/translate', json={'prompt': 'hi'})
+    parse_translate_stream(resp)  # drains the stream - see this file's module docstring
     assert harness.create_calls[0]["model"] == "claude-opus-x"
 
 
@@ -1255,7 +1349,8 @@ def test_claude_model_override_via_request_body(app_factory, monkeypatch):
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
     harness.queue_response(FakeClaudeResponse("SELECT 1;"))
 
-    env.client.post('/api/translate', json={'prompt': 'hi', 'claude_model': 'claude-x-custom'})
+    resp = env.client.post('/api/translate', json={'prompt': 'hi', 'claude_model': 'claude-x-custom'})
+    parse_translate_stream(resp)  # drains the stream - see this file's module docstring
     assert harness.create_calls[0]["model"] == "claude-x-custom"
 
 
@@ -1603,7 +1698,8 @@ def test_openai_success_records_translation_history(app_factory, monkeypatch):
     # test_claude_success_records_translation_history above.
     env.app_config.state_store.set_session("alice@example.com", llm_provider="openai")
     env.client.set_cookie("crbot_user_id", "alice@example.com")
-    env.client.post('/api/translate', json={'prompt': 'give me one'})
+    resp = env.client.post('/api/translate', json={'prompt': 'give me one'})
+    parse_translate_stream(resp)  # drains the stream - see this file's module docstring
 
     rows, stats, total_count = env.app_config.state_store.get_translation_history("alice@example.com")
     assert total_count == 1
@@ -1621,7 +1717,8 @@ def test_openai_call_uses_responses_api_shape_not_chat_completions(app_factory, 
     monkeypatch.setattr(env.translate_routes.openai, "OpenAI", harness.make_client_class())
     harness.queue_response(FakeOpenAiResponse("SELECT 1;"))
 
-    env.client.post('/api/translate', json={'prompt': 'hi'})
+    resp = env.client.post('/api/translate', json={'prompt': 'hi'})
+    parse_translate_stream(resp)  # drains the stream - see this file's module docstring
 
     call = harness.create_calls[0]
     assert "PostgreSQL-compatible RDBMSs" in call["instructions"]
@@ -1645,7 +1742,8 @@ def test_openai_history_uses_assistant_role_and_appends_results(app_factory, mon
         {"role": "model", "text": "SELECT * FROM users;",
          "results": [{"columns": ["id"], "rows": [[1]], "rowCount": 1}]},
     ]
-    env.client.post('/api/translate', json={'prompt': 'now show orders', 'history': history})
+    resp = env.client.post('/api/translate', json={'prompt': 'now show orders', 'history': history})
+    parse_translate_stream(resp)  # drains the stream - see this file's module docstring
 
     messages = harness.create_calls[0]["input"]
     assert messages[0]["role"] == "user"
@@ -1667,7 +1765,8 @@ def test_openai_schema_precedes_history_and_is_not_glued_to_the_new_prompt(app_f
     harness.queue_response(FakeOpenAiResponse("SELECT 2;"))
 
     history = [{"role": "user", "text": "show users"}]
-    env.client.post('/api/translate', json={'prompt': 'now show orders', 'history': history})
+    resp = env.client.post('/api/translate', json={'prompt': 'now show orders', 'history': history})
+    parse_translate_stream(resp)  # drains the stream - see this file's module docstring
 
     messages = harness.create_calls[0]["input"]
     assert messages[0]["content"] == "Database Schema:\nNo schema description available.\n\nshow users"
@@ -1687,7 +1786,8 @@ def test_openai_schema_attaches_to_new_prompt_when_there_is_no_history(app_facto
     monkeypatch.setattr(env.translate_routes.openai, "OpenAI", harness.make_client_class())
     harness.queue_response(FakeOpenAiResponse("SELECT 1;"))
 
-    env.client.post('/api/translate', json={'prompt': 'show users'})
+    resp = env.client.post('/api/translate', json={'prompt': 'show users'})
+    parse_translate_stream(resp)  # drains the stream - see this file's module docstring
 
     messages = harness.create_calls[0]["input"]
     assert len(messages) == 1
@@ -1734,7 +1834,8 @@ def test_openai_default_model_is_gpt_5_6_luna(app_factory, monkeypatch):
     monkeypatch.setattr(env.translate_routes.openai, "OpenAI", harness.make_client_class())
     harness.queue_response(FakeOpenAiResponse("SELECT 1;"))
 
-    env.client.post('/api/translate', json={'prompt': 'hi'})
+    resp = env.client.post('/api/translate', json={'prompt': 'hi'})
+    parse_translate_stream(resp)  # drains the stream - see this file's module docstring
     assert harness.create_calls[0]["model"] == "gpt-5.6-luna"
 
 
@@ -1748,7 +1849,8 @@ def test_openai_model_env_var_overrides_default(app_factory, monkeypatch):
     monkeypatch.setattr(env.translate_routes.openai, "OpenAI", harness.make_client_class())
     harness.queue_response(FakeOpenAiResponse("SELECT 1;"))
 
-    env.client.post('/api/translate', json={'prompt': 'hi'})
+    resp = env.client.post('/api/translate', json={'prompt': 'hi'})
+    parse_translate_stream(resp)  # drains the stream - see this file's module docstring
     assert harness.create_calls[0]["model"] == "gpt-5.6-terra"
 
 
@@ -1759,7 +1861,8 @@ def test_openai_model_override_via_request_body(app_factory, monkeypatch):
     monkeypatch.setattr(env.translate_routes.openai, "OpenAI", harness.make_client_class())
     harness.queue_response(FakeOpenAiResponse("SELECT 1;"))
 
-    env.client.post('/api/translate', json={'prompt': 'hi', 'openai_model': 'gpt-5.6-custom'})
+    resp = env.client.post('/api/translate', json={'prompt': 'hi', 'openai_model': 'gpt-5.6-custom'})
+    parse_translate_stream(resp)  # drains the stream - see this file's module docstring
     assert harness.create_calls[0]["model"] == "gpt-5.6-custom"
 
 

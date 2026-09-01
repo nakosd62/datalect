@@ -1,6 +1,16 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+
+  <!-- Google tag (gtag.js) -->
+  <script async src="https://www.googletagmanager.com/gtag/js?id=G-1PMVBN5FHW"></script>
+  <script>
+    window.dataLayer = window.dataLayer || [];
+    function gtag(){dataLayer.push(arguments);}
+    gtag('js', new Date());
+    gtag('config', 'G-1PMVBN5FHW');
+  </script>
+
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Datalect</title>
@@ -104,8 +114,11 @@
                         <path d="M 0 25 L 0 35 C 0 40.5, 9 45, 20 45 C 31 45, 40 40.5, 40 35 L 40 25 C 40 30.5, 31 35, 20 35 C 9 35, 0 30.5, 0 25 Z" fill="#0369a1"/>
                         <circle cx="30" cy="36" r="2" fill="#ffffff"/>
 
-                        <!-- Stack 3 (Bottom) -->
-                        <path d="M 0 40 L 0 50 C 0 55.5, 9 60, 20 60 C 31 60, 40 55.5, 40 50 L 40 40 C 40 45.5, 31 50, 20 50 C 9 50, 0 45.5, 0 40 Z" fill="#0f172a"/>
+                        <!-- Stack 3 (Bottom) - same fix as the robot body above: was a
+                             near-black fill (#0f172a) that blended into the app's
+                             near-black dark-theme background; lightened and outlined
+                             the same way. -->
+                        <path d="M 0 40 L 0 50 C 0 55.5, 9 60, 20 60 C 31 60, 40 55.5, 40 50 L 40 40 C 40 45.5, 31 50, 20 50 C 9 50, 0 45.5, 0 40 Z" fill="#1e293b" stroke="#38bdf8" stroke-width="2" stroke-linejoin="round"/>
                         <circle cx="30" cy="51" r="2" fill="#38bdf8"/>
                     </g>
                 </g>
@@ -200,14 +213,25 @@
                 </button>
               </div>
             </div>
+            <!-- Quick prompts: each chip's LABEL (the visible button text)
+                 never changes between modes. The PROMPT TEXT that actually
+                 gets submitted does: data-prompt is used when one specific
+                 connection is selected, data-prompt-all is used instead
+                 when "All databases" mode is selected (see client.js's
+                 isAllConnectionsSelected()) - "all" mode routes the
+                 question through a triage step that may pick a DIFFERENT
+                 database than the single-connection wording assumes (e.g.
+                 "this database" doesn't make sense when there could be
+                 several), so its own phrasing can be edited independently
+                 right here without touching the single-connection text. -->
             <div id="examplePrompts" class="example-prompts">
               <button type="button" id="dismissExamplePromptsBtn" class="example-prompts-dismiss" title="Hide quick prompts">&times;</button>
               <span class="example-prompts-label">Quick prompts:</span>
-              <button type="button" class="example-chip" data-prompt="What tables are in this database and how are they related?">What's in here</button>
-              <button type="button" class="example-chip" data-prompt="Muéstrame 20 filas de muestra de las dos tablas que parezcan más interesantes.">Datos de muestra</button>
-              <button type="button" class="example-chip" data-prompt="Write an analytical query over this data and explain what it does.">Analytical query</button>
-              <button type="button" class="example-chip" data-prompt="Create a new table called demo with 2 columns and insert random data into it. Then query it. Then drop it. Finally, confirm it is gone.">DML/DDL</button>
-              <button type="button" class="example-chip" data-prompt="What are a few interesting questions to ask about the data">What to ask</button>
+              <button type="button" class="example-chip" data-prompt="What tables are in this database and how are they related?" data-prompt-all="What tables are in these databases?">What's in here</button>
+              <button type="button" class="example-chip" data-prompt="Muéstrame 20 filas de muestra de las dos tablas que parezcan más interesantes." data-prompt-all="Muéstrame algunos registros de una tabla de tu elección en 3 de estas bases de datos.">Datos de muestra</button>
+              <button type="button" class="example-chip" data-prompt="Write an analytical query over this data and explain what it does." data-prompt-all="Write an analytical query over the data in 3 of these databases and explain what it does.">Analytical query</button>
+              <button type="button" class="example-chip" data-prompt="Create a new table called demo with 2 columns and insert random data into it. Then query it. Then drop it. Finally, confirm it is gone." data-prompt-all="Write something in each database (like create a table or insert a record) and tell me if you succeeded. If you succeed in writing something, make sure you delete what you added.">DML/DDL</button>
+              <button type="button" class="example-chip" data-prompt="What are a few interesting questions to ask about the data" data-prompt-all="What are a few interesting questions to ask about the data in each of these databases">What to ask</button>
             </div>
             <div class="input-row">
               <div class="speech-bubble-wrapper sql-bubble">
@@ -226,7 +250,13 @@
 
       <section class="card table-card">
         <div class="results-container">
-          <div id="resultsRetryStatus" class="results-retry-status hidden"></div>
+          <div class="results-status-row">
+            <div id="resultsRetryStatus" class="results-retry-status hidden"></div>
+            <button type="button" id="stopBtn" class="btn btn-stop hidden" title="Cancel this query">
+              <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"></rect></svg>
+              <span>Cancel</span>
+            </button>
+          </div>
           <div id="resultsTabsNav" class="results-tabs-nav hidden"></div>
           <div class="results-table-wrapper">
             <table>
