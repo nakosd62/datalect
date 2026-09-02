@@ -94,7 +94,7 @@ import pytest
 from helpers import (
     install_fake_bigquery, install_fake_mssql_connect, parse_translate_stream,
     parse_translate_stream_events, write_database_presets_file, login_as,
-    select_llm_provider,
+    select_llm_provider, set_llm_byok_key,
 )
 
 
@@ -2201,3 +2201,376 @@ def test_translate_falls_back_to_provider_default_model_when_only_provider_persi
     _, data = parse_translate_stream(resp)
     assert data['success'] is True
     assert harness.create_calls[0]["model"] == "claude-sonnet-5"
+
+
+# --- User-facing LLM error messages (error_category()/format_llm_error_for_
+# user()/LlmCallFailed) -------------------------------------------------------
+#
+# These are the FINAL-failure classifier/formatter described in the section
+# comment above _gemini_error_category() in translate_routes.py - a
+# deliberately separate concern from _classify_*_error's retry policy above
+# (a call can be retried several times via that policy and only reach
+# error_category()/format_llm_error_for_user() once every retry budget is
+# exhausted, or immediately for a non-retryable exception). Reuses the same
+# Fake*Error test doubles defined above for the retry-policy tests, since the
+# real SDK exception shapes are identical either way.
+
+def test_gemini_error_category_prefers_semantic_status_string_over_numeric_code(app_env):
+    exc = FakeApiError(500)  # numeric code alone would read as "unavailable"
+    exc.status = "RESOURCE_EXHAUSTED"
+    assert app_env.translate_routes._gemini_error_category(exc) == "exhausted"
+
+
+def test_gemini_error_category_unavailable_status_string(app_env):
+    exc = FakeApiError(400)  # numeric code alone would read as "other"
+    exc.status = "UNAVAILABLE"
+    assert app_env.translate_routes._gemini_error_category(exc) == "unavailable"
+
+
+def test_gemini_error_category_falls_back_to_numeric_code_429(app_env):
+    assert app_env.translate_routes._gemini_error_category(FakeApiError(429)) == "exhausted"
+
+
+def test_gemini_error_category_falls_back_to_numeric_code_503_and_other_5xx(app_env):
+    assert app_env.translate_routes._gemini_error_category(FakeApiError(503)) == "unavailable"
+    assert app_env.translate_routes._gemini_error_category(FakeApiError(500)) == "unavailable"
+
+
+def test_gemini_error_category_httpx_timeout_is_unavailable(app_env):
+    exc = httpx.TimeoutException("timed out")
+    assert app_env.translate_routes._gemini_error_category(exc) == "unavailable"
+
+
+def test_gemini_error_category_unrecognized_exception_is_other(app_env):
+    assert app_env.translate_routes._gemini_error_category(FakeApiError(400)) == "other"
+    assert app_env.translate_routes._gemini_error_category(ValueError("boom")) == "other"
+
+
+def test_claude_error_category_rate_limit_is_always_exhausted(app_env):
+    assert app_env.translate_routes._claude_error_category(FakeClaudeRateLimitError()) == "exhausted"
+
+
+def test_claude_error_category_overloaded_and_other_5xx_are_unavailable(app_env):
+    assert app_env.translate_routes._claude_error_category(FakeClaudeStatusError(529)) == "unavailable"
+    assert app_env.translate_routes._claude_error_category(FakeClaudeStatusError(500)) == "unavailable"
+
+
+def test_claude_error_category_connection_error_is_unavailable(app_env):
+    assert app_env.translate_routes._claude_error_category(FakeClaudeConnectionError()) == "unavailable"
+
+
+def test_claude_error_category_non_retryable_status_is_other(app_env):
+    assert app_env.translate_routes._claude_error_category(FakeClaudeStatusError(400)) == "other"
+
+
+def test_openai_error_category_insufficient_quota_is_exhausted(app_env):
+    exc = FakeOpenAiRateLimitError()
+    exc.code = "insufficient_quota"
+    assert app_env.translate_routes._openai_error_category(exc) == "exhausted"
+
+
+def test_openai_error_category_ordinary_rate_limit_is_unavailable(app_env):
+    # No .code (or a different one) set - the ordinary "rate_limit_exceeded"
+    # kind, not a hard quota ceiling.
+    assert app_env.translate_routes._openai_error_category(FakeOpenAiRateLimitError()) == "unavailable"
+
+
+def test_openai_error_category_internal_server_and_connection_errors_are_unavailable(app_env):
+    assert app_env.translate_routes._openai_error_category(FakeOpenAiInternalServerError()) == "unavailable"
+    assert app_env.translate_routes._openai_error_category(FakeOpenAiConnectionError()) == "unavailable"
+
+
+def test_openai_error_category_bad_request_is_other(app_env):
+    assert app_env.translate_routes._openai_error_category(FakeOpenAiBadRequestError()) == "other"
+
+
+def test_format_llm_error_for_user_unavailable_template_includes_model_and_raw_error(app_env):
+    provider = app_env.translate_routes.get_llm_provider("google")
+    exc = FakeApiError(503)
+    message = app_env.translate_routes.format_llm_error_for_user(provider, "gemini-3.6-flash", exc)
+    assert message.startswith(
+        "The selected model (gemini-3.6-flash) is currently unavailable or too busy. "
+        "Please retry later or select a different model.\n\n"
+        "Actual error message received:\n"
+    )
+    assert message.endswith("fake API error 503")
+
+
+def test_format_llm_error_for_user_exhausted_template(app_env):
+    provider = app_env.translate_routes.get_llm_provider("anthropic")
+    exc = FakeClaudeRateLimitError()
+    message = app_env.translate_routes.format_llm_error_for_user(provider, "claude-sonnet-5", exc)
+    assert message.startswith(
+        "Datalect's reserved capacity for this model (claude-sonnet-5) has been exhausted. "
+        "Please select a different model.\n\n"
+        "Actual error message received:\n"
+    )
+    assert message.endswith("fake rate limit")
+
+
+def test_format_llm_error_for_user_other_template(app_env):
+    provider = app_env.translate_routes.get_llm_provider("openai")
+    exc = FakeOpenAiBadRequestError()
+    message = app_env.translate_routes.format_llm_error_for_user(provider, "gpt-5", exc)
+    assert message.startswith(
+        "The selected model (gpt-5) ran into an error. Please select a different model.\n\n"
+        "Actual error message received:\n"
+    )
+    assert message.endswith("fake bad request")
+
+
+def test_format_llm_error_for_user_falls_back_to_exception_type_name_when_str_is_empty(app_env):
+    # An exception with no message at all (str(exc) == "") still produces a
+    # non-empty "actual error" line rather than silently trailing off.
+    provider = app_env.translate_routes.get_llm_provider("google")
+    message = app_env.translate_routes.format_llm_error_for_user(provider, "gemini-3.6-flash", ValueError())
+    assert message.endswith("ValueError occurred.")
+
+
+def test_llm_call_failed_str_is_the_formatted_message_verbatim(app_env):
+    formatted = "The selected model (x) ran into an error. Please select a different model.\n\nActual error message received:\nboom"
+    wrapped = app_env.translate_routes.LlmCallFailed(formatted)
+    assert str(wrapped) == formatted
+
+
+def test_single_connection_translate_final_failure_shows_categorized_message(app_factory, monkeypatch):
+    """End-to-end check that LlmCallFailed's wrapper mechanism (raised at
+    stream_translation()'s inline single-connection retry loop) reaches the
+    client's data['error'] with the categorized message intact, with zero
+    special-casing needed at that loop's outer catch-all (see
+    format_llm_error_for_user()'s and LlmCallFailed's docstrings)."""
+    env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    monkeypatch.setattr(env.translate_routes.time, "sleep", lambda *a, **k: None)
+    # A 503 on every attempt (MAX_TRANSLATION_ATTEMPTS) - not a 429, so no
+    # key rotation kicks in first; this exhausts the same-key retry budget
+    # and reaches the final "give up" raise.
+    for _ in range(10):
+        harness.queue_error(FakeApiError(503))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'hi'})
+    assert resp.status_code == 200
+    _, data = parse_translate_stream(resp)
+    assert data['success'] is False
+    assert data['error'].startswith(
+        "The selected model (gemini-3.6-flash) is currently unavailable or too busy. "
+        "Please retry later or select a different model.\n\n"
+        "Actual error message received:\n"
+    )
+    assert data['error'].endswith("fake API error 503")
+
+
+# --- "invalid_key" category (a rejected/invalid API key) -----------------
+#
+# See the section comment above _gemini_error_category() in
+# translate_routes.py: a 401/403 (or Gemini's own PERMISSION_DENIED/
+# UNAUTHENTICATED status strings, or its documented 400 "API key not
+# valid" shape) or the SDKs' typed AuthenticationError/PermissionDeniedError
+# is classified "invalid_key" - distinct from "other" specifically so
+# format_llm_error_for_user() can word it around WHOSE key failed (see the
+# "Bring Your Own Key" feature) rather than a generic "ran into an error."
+
+def test_gemini_error_category_permission_denied_and_unauthenticated_status_are_invalid_key(app_env):
+    exc = FakeApiError(403)
+    exc.status = "PERMISSION_DENIED"
+    assert app_env.translate_routes._gemini_error_category(exc) == "invalid_key"
+
+    exc = FakeApiError(401)
+    exc.status = "UNAUTHENTICATED"
+    assert app_env.translate_routes._gemini_error_category(exc) == "invalid_key"
+
+
+def test_gemini_error_category_401_and_403_numeric_codes_are_invalid_key(app_env):
+    assert app_env.translate_routes._gemini_error_category(FakeApiError(401)) == "invalid_key"
+    assert app_env.translate_routes._gemini_error_category(FakeApiError(403)) == "invalid_key"
+
+
+def test_gemini_error_category_400_with_api_key_not_valid_message_is_invalid_key(app_env):
+    exc = FakeApiError(400)
+    exc.message = "API key not valid. Please pass a valid API key."
+    assert app_env.translate_routes._gemini_error_category(exc) == "invalid_key"
+
+    exc = FakeApiError(400)
+    exc.message = "API_KEY_INVALID: bad key"
+    assert app_env.translate_routes._gemini_error_category(exc) == "invalid_key"
+
+
+def test_gemini_error_category_bare_400_without_key_related_message_is_other(app_env):
+    # Regression guard for the deliberately conservative design described
+    # in _gemini_error_category's own docstring: Gemini overloads a plain
+    # 400 for a hundred unrelated bad-request reasons, so the message text
+    # must actually say the key was rejected - a 400 alone is NOT enough.
+    exc = FakeApiError(400)
+    exc.message = "Request contains an invalid argument."
+    assert app_env.translate_routes._gemini_error_category(exc) == "other"
+    assert app_env.translate_routes._gemini_error_category(FakeApiError(400)) == "other"
+
+
+def test_claude_error_category_authentication_and_permission_denied_are_invalid_key(app_env):
+    class FakeClaudeAuthenticationError(anthropic.AuthenticationError):
+        def __init__(self):
+            Exception.__init__(self, "fake auth error")
+            self.status_code = 401
+
+    class FakeClaudePermissionDeniedError(anthropic.PermissionDeniedError):
+        def __init__(self):
+            Exception.__init__(self, "fake permission denied")
+            self.status_code = 403
+
+    assert app_env.translate_routes._claude_error_category(FakeClaudeAuthenticationError()) == "invalid_key"
+    assert app_env.translate_routes._claude_error_category(FakeClaudePermissionDeniedError()) == "invalid_key"
+
+
+def test_openai_error_category_authentication_and_permission_denied_are_invalid_key(app_env):
+    class FakeOpenAiAuthenticationError(openai.AuthenticationError):
+        def __init__(self):
+            Exception.__init__(self, "fake auth error")
+
+    class FakeOpenAiPermissionDeniedError(openai.PermissionDeniedError):
+        def __init__(self):
+            Exception.__init__(self, "fake permission denied")
+
+    assert app_env.translate_routes._openai_error_category(FakeOpenAiAuthenticationError()) == "invalid_key"
+    assert app_env.translate_routes._openai_error_category(FakeOpenAiPermissionDeniedError()) == "invalid_key"
+
+
+# --- format_llm_error_for_user's using_byok wording (invalid_key only) ----
+
+def test_format_llm_error_for_user_invalid_key_env_template_tells_admin_not_user(app_env):
+    # using_byok omitted (defaults to False) - this app's OWN env-
+    # configured key was rejected, so the message points at the app's
+    # administrator, not at the user's Preferences dialog.
+    provider = app_env.translate_routes.get_llm_provider("google")
+    exc = FakeApiError(401)
+    message = app_env.translate_routes.format_llm_error_for_user(provider, "gemini-3.6-flash", exc)
+    assert message.startswith(
+        "The API key configured for this model (gemini-3.6-flash) was rejected. This is a problem "
+        "with the app's own configuration, not something selecting a different model fixes on its "
+        "own - please let the app's administrator know, or try a different model in the meantime.\n\n"
+        "Actual error message received:\n"
+    )
+    assert "Preferences" not in message
+    assert message.endswith("fake API error 401")
+
+
+def test_format_llm_error_for_user_invalid_key_byok_template_tells_user_to_fix_preferences(app_env):
+    provider = app_env.translate_routes.get_llm_provider("google")
+    exc = FakeApiError(401)
+    message = app_env.translate_routes.format_llm_error_for_user(
+        provider, "gemini-3.6-flash", exc, using_byok=True,
+    )
+    assert message.startswith(
+        "Your custom API key for this model (gemini-3.6-flash) was rejected. Please correct or "
+        "remove it in Preferences (Bring Your Own Key) - until then, this model will keep "
+        "failing.\n\nActual error message received:\n"
+    )
+    assert "administrator" not in message
+    assert message.endswith("fake API error 401")
+
+
+def test_format_llm_error_for_user_using_byok_only_changes_invalid_key_wording(app_env):
+    # Regression guard: using_byok=True must NOT change any of the other
+    # three categories' wording - it's specific to "invalid_key" (see
+    # format_llm_error_for_user's docstring).
+    provider = app_env.translate_routes.get_llm_provider("google")
+    exc = FakeApiError(503)
+    message = app_env.translate_routes.format_llm_error_for_user(
+        provider, "gemini-3.6-flash", exc, using_byok=True,
+    )
+    assert message.startswith(
+        "The selected model (gemini-3.6-flash) is currently unavailable or too busy. "
+        "Please retry later or select a different model.\n\n"
+        "Actual error message received:\n"
+    )
+
+
+# --- "Bring Your Own Key" actually used instead of the app's env key -----
+#
+# See state_store.py's get_llm_byok_key/set_session docstrings and
+# translate_query()'s own comment on where `byok_key` is resolved. These
+# are end-to-end checks (through /api/translate) that a saved BYOK value
+# is what actually gets used, and that a rejected BYOK key never silently
+# falls back to rotating through the app's own configured pool - see
+# generate_sql_for_connection's using_byok docstring for why that
+# fallback would be actively wrong (a billing/security surprise).
+
+def test_translate_uses_byok_key_instead_of_env_configured_key(app_factory, monkeypatch):
+    env = app_factory(env={"GEMINI_PRESET_KEYS": "env-key-1"})
+    login_as(env.client, "alice@example.com")
+    set_llm_byok_key(env, "google", "alices-own-key", user_identity="alice@example.com")
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(FakeGenaiResponse("SELECT 1;"))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'hi'})
+    _, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    assert harness.client_api_keys == ["alices-own-key"]
+
+
+def test_translate_falls_back_to_env_key_when_no_byok_key_is_saved(app_factory, monkeypatch):
+    # Regression guard the other way: a session with nothing saved for
+    # BYOK must behave exactly as before this feature existed - the app's
+    # own env-configured key is used, unchanged.
+    env = app_factory(env={"GEMINI_PRESET_KEYS": "env-key-1"})
+    login_as(env.client, "alice@example.com")
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(FakeGenaiResponse("SELECT 1;"))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'hi'})
+    _, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    assert harness.client_api_keys == ["env-key-1"]
+
+
+def test_translate_byok_key_failure_never_rotates_to_env_configured_keys_and_shows_byok_worded_message(
+    app_factory, monkeypatch,
+):
+    # Two env-configured keys are available - if the retry loop's
+    # key-rotation budget weren't forced down to 1 for a BYOK call (see
+    # generate_sql_for_connection's/stream_translation's using_byok
+    # handling), a 401 here would incorrectly rotate onto one of THOSE,
+    # silently abandoning the user's own key mid-request.
+    env = app_factory(env={"GEMINI_PRESET_KEYS": "env-key-1,env-key-2"})
+    login_as(env.client, "alice@example.com")
+    set_llm_byok_key(env, "google", "alices-bad-key", user_identity="alice@example.com")
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_error(FakeApiError(401))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'hi'})
+    assert resp.status_code == 200
+    _, data = parse_translate_stream(resp)
+    assert data['success'] is False
+    # Exactly one call, with the user's own key - no rotation attempt onto
+    # either of the two env-configured keys.
+    assert harness.client_api_keys == ["alices-bad-key"]
+    assert data['error'].startswith(
+        "Your custom API key for this model (gemini-3.6-flash) was rejected. Please correct or "
+        "remove it in Preferences (Bring Your Own Key)"
+    )
+
+
+def test_translate_byok_key_removed_falls_back_to_env_key_again(app_factory, monkeypatch):
+    # The "x" clear button in Preferences (client.js's byokProvidersMarkedFor
+    # Clear) saves an explicit empty string - state_store.py's set_session
+    # docstring on llm_byok_keys - which must behave exactly like never
+    # having saved one at all, not like an empty/blank key being "used".
+    env = app_factory(env={"GEMINI_PRESET_KEYS": "env-key-1"})
+    login_as(env.client, "alice@example.com")
+    set_llm_byok_key(env, "google", "alices-own-key", user_identity="alice@example.com")
+    set_llm_byok_key(env, "google", "", user_identity="alice@example.com")
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(FakeGenaiResponse("SELECT 1;"))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'hi'})
+    _, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    assert harness.client_api_keys == ["env-key-1"]

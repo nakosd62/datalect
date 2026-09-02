@@ -145,6 +145,59 @@ def test_set_session_leaves_theme_untouched_by_other_field_updates():
     assert session["auto_sql_execute"] is False  # updated
 
 
+# --- Bring Your Own Key (llm_byok_keys/llm_byok_key_set/get_llm_byok_key) ------
+# Same contract as test_state_store_sqlite.py's mirror section - see
+# StateStore.set_session's docstring. The raw key is never exposed through
+# get_session() (see llm_byok_key_set's docstring) - only get_llm_byok_key
+# (the server-only, call-time accessor) ever returns it.
+
+def test_get_session_defaults_byok_key_set_to_all_false():
+    store, client = make_store()
+    session = store.get_session("alice")
+    assert session["llm_byok_key_set"] == {"google": False, "anthropic": False, "openai": False}
+
+
+def test_get_llm_byok_key_returns_none_when_never_saved():
+    store, client = make_store()
+    assert store.get_llm_byok_key("alice", "google") is None
+
+
+def test_set_session_byok_key_is_reflected_in_key_set_and_get_llm_byok_key():
+    store, client = make_store()
+    store.set_session("alice", llm_byok_keys={"google": "my-google-key"})
+    session = store.get_session("alice")
+    assert session["llm_byok_key_set"] == {"google": True, "anthropic": False, "openai": False}
+    assert store.get_llm_byok_key("alice", "google") == "my-google-key"
+    assert store.get_llm_byok_key("alice", "anthropic") is None
+
+
+def test_set_session_byok_key_for_one_provider_does_not_touch_another():
+    store, client = make_store()
+    store.set_session("alice", llm_byok_keys={"google": "my-google-key"})
+    store.set_session("alice", llm_byok_keys={"anthropic": "my-claude-key"})
+    session = store.get_session("alice")
+    assert session["llm_byok_key_set"] == {"google": True, "anthropic": True, "openai": False}
+    assert store.get_llm_byok_key("alice", "google") == "my-google-key"
+    assert store.get_llm_byok_key("alice", "anthropic") == "my-claude-key"
+
+
+def test_set_session_byok_key_empty_string_clears_it():
+    store, client = make_store()
+    store.set_session("alice", llm_byok_keys={"google": "my-google-key"})
+    store.set_session("alice", llm_byok_keys={"google": ""})
+    session = store.get_session("alice")
+    assert session["llm_byok_key_set"]["google"] is False
+    assert store.get_llm_byok_key("alice", "google") is None
+
+
+def test_set_session_without_llm_byok_keys_leaves_saved_keys_untouched():
+    store, client = make_store()
+    store.set_session("alice", llm_byok_keys={"google": "my-google-key"})
+    store.set_session("alice", theme="light", auto_sql_execute=False)
+    assert store.get_llm_byok_key("alice", "google") == "my-google-key"
+    assert store.get_session("alice")["llm_byok_key_set"]["google"] is True
+
+
 # --- lazy migration: legacy sessions predating connection_id ------------------
 
 def test_get_session_lazily_migrates_legacy_custom_connection_doc():

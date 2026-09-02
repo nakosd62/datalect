@@ -240,6 +240,23 @@ def select_llm_provider(env, provider_name):
     env.app_config.state_store.set_session("global", llm_provider=provider_name)
 
 
+def set_llm_byok_key(env, provider_name, key, user_identity="global"):
+    """Pre-seeds a saved "Bring Your Own Key" value for one LLM provider
+    (state_store.py's llm_byok_keys session field) - the server-side
+    equivalent of a user pasting a key into Preferences' "Bring Your Own
+    Key" section and saving (see config_routes.py's POST /api/config
+    wiring). `key=""` clears a previously-set value, same as the real
+    POST /api/config handler treats an explicit empty string (see
+    state_store.py's set_session docstring on llm_byok_keys).
+
+    `user_identity` defaults to "global" (select_llm_provider's same
+    no-auth-configured default), but accepts a real email for tests that
+    also use login_as() to exercise a non-anonymous identity - call this
+    AFTER app_factory() and BEFORE the first request that should see the
+    key, same ordering contract as select_llm_provider()."""
+    env.app_config.state_store.set_session(user_identity, llm_byok_keys={provider_name: key})
+
+
 def parse_translate_stream(resp):
     """/api/translate streams newline-delimited JSON (NDJSON) rather than a
     single JSON body - see translate_routes.py's module docstring: zero or

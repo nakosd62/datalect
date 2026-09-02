@@ -228,9 +228,9 @@
               <button type="button" id="dismissExamplePromptsBtn" class="example-prompts-dismiss" title="Hide quick prompts">&times;</button>
               <span class="example-prompts-label">Quick prompts:</span>
               <button type="button" class="example-chip" data-prompt="What tables are in this database and how are they related?" data-prompt-all="What tables are in these databases?">What's in here</button>
-              <button type="button" class="example-chip" data-prompt="Muéstrame 20 filas de muestra de las dos tablas que parezcan más interesantes." data-prompt-all="Muéstrame algunos registros de una tabla de tu elección en 3 de estas bases de datos.">Datos de muestra</button>
-              <button type="button" class="example-chip" data-prompt="Write an analytical query over this data and explain what it does." data-prompt-all="Write an analytical query over the data in 3 of these databases and explain what it does.">Data Analysis</button>
-              <button type="button" class="example-chip" data-prompt="Write something in the database (like create a table or insert a record) and tell me if you succeeded. If you succeed in writing something, make sure you delete what you added." data-prompt-all="Write something in each database (like create a table or insert a record) and tell me if you succeeded. If you succeed in writing something, make sure you delete what you added.">Writes</button>
+              <button type="button" class="example-chip" data-prompt="Show me some records from a the tables that you find most interesting." data-prompt-all="Show me some records from a the tables that you find most interesting.">Sample Data</button>
+              <button type="button" class="example-chip" data-prompt="Analyze this data. Document your query." data-prompt-all="Analyze the data the dataset that you find most interesting. Document your queries.">Data Analysis</button>
+              <button type="button" class="example-chip" data-prompt="Write something in the database (like create a table or insert a record) and tell me if you succeeded. If you succeed in writing something, make sure you delete what you added." data-prompt-all="Write something in each database (like create a table or insert a record) and tell me if you succeeded. If you succeed in writing something, make sure you delete what you added.">Write Data</button>
               <button type="button" class="example-chip" data-prompt="What are a few interesting questions to ask about the data" data-prompt-all="What are a few interesting questions to ask about the data in each of these databases">What to ask</button>
             </div>
             <div class="input-row">
@@ -253,7 +253,7 @@
           <div class="results-status-row">
             <div id="resultsRetryStatus" class="results-retry-status hidden"></div>
             <button type="button" id="stopBtn" class="btn btn-stop hidden" title="Cancel this query">
-              <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"></rect></svg>
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"></rect></svg>
               <span>Cancel</span>
             </button>
           </div>
@@ -390,15 +390,15 @@
   </div>
 
   <div id="preferencesModal" class="modal-overlay hidden">
-    <div class="modal-card" style="max-width: 420px;">
+    <div class="modal-card" style="max-width: 540px;">
       <div class="modal-header">
         <h2 class="modal-title">Preferences</h2>
         <button id="preferencesModalCloseBtn" class="modal-close-btn" type="button">&times;</button>
       </div>
-      <div class="modal-body">
+      <div class="modal-body modal-body-spacious">
         <div class="config-section">
           <span class="config-label">Theme</span>
-          <div class="radio-group" id="themeRadioGroup">
+          <div class="radio-group radio-group-row" id="themeRadioGroup">
             <label class="radio-option">
               <input type="radio" name="theme_option" value="dark" id="themeOptionDark">
               <span>Dark</span>
@@ -410,10 +410,36 @@
           </div>
         </div>
         <div class="config-section">
+          <span class="config-label">Automatic SQL Execution</span>
           <label class="checkbox-option">
             <input type="checkbox" id="autoSqlExecuteCheckbox">
-            <span class="checkbox-label">Automatic SQL Execution</span>
+            <span class="checkbox-label">Run generated SQL automatically after each translation</span>
           </label>
+        </div>
+        <div class="config-section">
+          <span class="config-label">Bring Your Own Key</span>
+          <p class="text-muted" style="font-size: 0.8rem; margin: 0;">Use your own API key for a provider instead of this app's. Leave a field blank to keep using the app's key for that provider.</p>
+          <div class="byok-row">
+            <label class="byok-row-label" for="byokKeyGoogle">Google (Gemini)</label>
+            <div class="byok-row-fields">
+              <input type="password" id="byokKeyGoogle" class="config-input byok-key-input" data-byok-provider="google" autocomplete="off" spellcheck="false">
+              <button type="button" class="btn btn-secondary custom-db-remove-btn byok-clear-btn" data-byok-provider="google" title="Remove saved key">&times;</button>
+            </div>
+          </div>
+          <div class="byok-row">
+            <label class="byok-row-label" for="byokKeyAnthropic">Anthropic (Claude)</label>
+            <div class="byok-row-fields">
+              <input type="password" id="byokKeyAnthropic" class="config-input byok-key-input" data-byok-provider="anthropic" autocomplete="off" spellcheck="false">
+              <button type="button" class="btn btn-secondary custom-db-remove-btn byok-clear-btn" data-byok-provider="anthropic" title="Remove saved key">&times;</button>
+            </div>
+          </div>
+          <div class="byok-row">
+            <label class="byok-row-label" for="byokKeyOpenai">OpenAI</label>
+            <div class="byok-row-fields">
+              <input type="password" id="byokKeyOpenai" class="config-input byok-key-input" data-byok-provider="openai" autocomplete="off" spellcheck="false">
+              <button type="button" class="btn btn-secondary custom-db-remove-btn byok-clear-btn" data-byok-provider="openai" title="Remove saved key">&times;</button>
+            </div>
+          </div>
         </div>
         <div id="preferencesSaveError" class="config-error-message" style="display: none; color: var(--danger); font-size: 0.85rem;"></div>
         <div class="modal-actions" style="display: flex; gap: 0.5rem; justify-content: flex-end; align-items: center;">

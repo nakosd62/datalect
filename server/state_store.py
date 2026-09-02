@@ -205,6 +205,62 @@ DEFAULT_AUTO_SQL_EXECUTE = True
 # "password", already covered here.
 _CREDENTIAL_CONFIG_FIELDS = {"credentials_json", "password", "private_key", "private_key_passphrase", "access_token"}
 
+# The three "Bring Your Own Key" provider names (Preferences dialog) - kept
+# as a plain literal here rather than imported from translate_routes.py's
+# _LLM_PROVIDERS, which would be a circular import (translate_routes.py
+# already imports the `state_store` singleton from app_config.py; this
+# module can never import anything back from translate_routes.py). Same
+# "deferred/duplicated rather than circularly imported" reasoning already
+# used for CONFIGURED_DBS above - just a plain module-level constant this
+# time since, unlike CONFIGURED_DBS, this list never changes at runtime.
+LLM_BYOK_PROVIDER_NAMES = ("google", "anthropic", "openai")
+
+
+def _decode_byok_keys(raw_text):
+    """Decodes a stored llm_byok_keys column/field value into the raw
+    {"google": "<key>", ...} dict (only ever containing providers that
+    currently have a non-empty key saved) - reuses _loads_config's Fernet-
+    decrypt-then-JSON-parse logic as-is (see that function's docstring),
+    since an API key deserves exactly the same encryption-at-rest treatment
+    as database_config's credentials and the stored shape (an opaque
+    encrypted blob of a plain JSON dict) is identical either way. Never
+    raises - degrades to {} same as _loads_config does for anything
+    corrupt/foreign. This is the ONLY function in this module that returns
+    the raw key values - see get_llm_byok_key/get_session's docstrings for
+    why every other read path only ever exposes booleans."""
+    return _loads_config(raw_text)
+
+
+def _encode_byok_keys(keys_dict):
+    """Inverse of _decode_byok_keys for SQLite's TEXT column - reuses
+    _encrypt_config_to_text as-is. `keys_dict` should already have empty-
+    string entries removed (see _merge_byok_keys) - storing an empty string
+    would be indistinguishable from "no key saved" on next read anyway,
+    since get_llm_byok_key treats a missing/falsy entry as None either
+    way, so there's no reason to keep it in the persisted blob."""
+    return _encrypt_config_to_text(keys_dict)
+
+
+def _merge_byok_keys(existing_dict, updates_dict):
+    """Applies a set_session()-style llm_byok_keys update ({provider: new
+    value, ...} - only the provider(s) actually being changed) onto an
+    existing decoded keys dict, returning the new dict to persist. Per
+    LLM_BYOK_PROVIDER_NAMES entry present in `updates_dict`: a non-empty
+    string sets/replaces it, an empty string ("" - an explicit clear, not
+    the provider being absent from updates_dict at all) removes it
+    entirely from the result. A provider not mentioned in updates_dict is
+    carried over from existing_dict completely unchanged - see
+    StateStore.set_session's docstring for the full contract."""
+    merged = dict(existing_dict or {})
+    for provider_name, new_value in (updates_dict or {}).items():
+        if provider_name not in LLM_BYOK_PROVIDER_NAMES:
+            continue
+        if new_value:
+            merged[provider_name] = new_value
+        else:
+            merged.pop(provider_name, None)
+    return merged
+
 
 def _loads_config(raw_json):
     """Best-effort decode for a stored database_config value: SQLite's
@@ -351,7 +407,7 @@ class StateStore(ABC):
     @abstractmethod
     def get_session(self, user_id):
         """Returns {"auto_sql_execute", "is_custom", "connection_id",
-        "llm_provider", "llm_model", "in_scope_preset_ids",
+        "llm_provider", "llm_model", "llm_byok_key_set", "in_scope_preset_ids",
         "in_scope_custom_connection_keys", "in_scope_mode", "theme"} for a
         user/session id - identity only,
         never a connection's actual details/credentials (see db.py's
@@ -383,6 +439,25 @@ class StateStore(ABC):
         baked into a default here, since unlike auto_sql_execute's
         True/False there's no single hardcoded stand-in value that would
         stay correct if that hardcoded default ever changed.
+
+        "llm_byok_key_set" ({"google": bool, "anthropic": bool, "openai":
+        bool} - the "Bring Your Own Key" feature in the Preferences dialog)
+        reports, per provider, whether THIS user has saved their own API
+        key to use instead of this app's env-configured one - never the key
+        itself, same "report whether a credential is saved, never the
+        credential" posture get_db_connections' has_custom_credentials
+        already uses for BigQuery's service-account key. Getting the actual
+        key value (needed only at LLM-call time, server-side, never for an
+        API response) is deliberately a SEPARATE method, get_llm_byok_key -
+        see its docstring for why this is split out rather than folded into
+        this dict behind an include_credentials-style flag the way
+        get_db_connections does it: unlike that method (called from exactly
+        one place, config_routes.py, which always knows whether it wants
+        credentials), get_session is called from many places, several of
+        which build API responses directly from its return value - keeping
+        the raw key out of this dict's shape entirely means no call site
+        can accidentally leak it by omitting a flag, rather than relying on
+        every caller remembering to pass include_credentials=False.
 
         "in_scope_preset_ids"/"in_scope_custom_connection_keys" (both lists
         of ids/keys, in the same reference space as connection_id/is_custom
@@ -430,23 +505,48 @@ class StateStore(ABC):
 
     @abstractmethod
     def set_session(self, user_id, connection_id=None, auto_sql_execute=None, is_custom=None,
-                     llm_provider=None, llm_model=None,
+                     llm_provider=None, llm_model=None, llm_byok_keys=None,
                      in_scope_preset_ids=None, in_scope_custom_connection_keys=None,
                      in_scope_mode=None, theme=None):
         """Persists the active connection reference (connection_id,
         is_custom), auto_sql_execute flag, llm_provider/llm_model
-        selection, in-scope connection set, in-scope mode, and/or theme
-        for a user/session id. Only the fields passed (not None) are
-        changed - the others are left as-is. Pass connection_id="" (not
-        None) to explicitly clear it, e.g. when switching to a fresh/
-        default connection - same not-None-means-"change this" convention
-        is_custom/llm_provider/llm_model/in_scope_mode/theme already use.
-        in_scope_preset_ids/in_scope_custom_connection_keys follow the
-        same convention: pass [] (not None) to explicitly clear one to
-        empty, None to leave it untouched - callers that mean to update
-        the in-scope set always pass both together (see config_routes.py),
-        since a partial update would leave the two lists describing an
-        inconsistent set."""
+        selection, Bring-Your-Own-Key values, in-scope connection set,
+        in-scope mode, and/or theme for a user/session id. Only the fields
+        passed (not None) are changed - the others are left as-is. Pass
+        connection_id="" (not None) to explicitly clear it, e.g. when
+        switching to a fresh/default connection - same not-None-means-
+        "change this" convention is_custom/llm_provider/llm_model/
+        in_scope_mode/theme already use. in_scope_preset_ids/
+        in_scope_custom_connection_keys follow the same convention: pass []
+        (not None) to explicitly clear one to empty, None to leave it
+        untouched - callers that mean to update the in-scope set always
+        pass both together (see config_routes.py), since a partial update
+        would leave the two lists describing an inconsistent set.
+
+        llm_byok_keys is a dict of ONLY the provider(s) this call means to
+        change - {"google": "<new key>"} updates just Google's, leaving
+        Anthropic's/OpenAI's saved keys (if any) completely untouched, same
+        as omitting llm_provider from a call leaves it alone. Within that
+        dict, a non-empty string sets/replaces that provider's key; ""
+        (explicit empty, not the key being absent from the dict at all)
+        clears it - matching connection_id's own not-passed-at-all-vs-
+        explicit-"" distinction, just one level deeper since this dict
+        holds up to three independently-settable values instead of one.
+        Pass llm_byok_keys=None (not {}) to leave every provider's key
+        untouched - {} would be a no-op in practice (nothing to iterate)
+        but None is the unambiguous "don't even look at this" signal
+        matching every other optional param here."""
+
+    @abstractmethod
+    def get_llm_byok_key(self, user_id, provider_name):
+        """Returns the raw, saved Bring-Your-Own-Key value for `user_id`/
+        `provider_name` ("google"/"anthropic"/"openai"), or None if that
+        user has no key saved for that provider. Deliberately separate from
+        get_session() - see that method's docstring on llm_byok_key_set for
+        why - and meant to be called from exactly one place per request:
+        wherever translate_routes.py/connection_router.py already resolves
+        the active provider/model for an LLM call, right before making it.
+        Never call this to build an API response."""
 
     @abstractmethod
     def get_db_connections(self, user_id, include_credentials=False):
@@ -561,6 +661,7 @@ class SqliteStateStore(StateStore):
                         in_scope_custom_connection_keys TEXT,
                         in_scope_mode TEXT,
                         theme TEXT NOT NULL DEFAULT '',
+                        llm_byok_keys TEXT,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     );
                 """)
@@ -751,6 +852,22 @@ class SqliteStateStore(StateStore):
                     cursor.execute(
                         "ALTER TABLE sessions ADD COLUMN theme TEXT NOT NULL DEFAULT '';"
                     )
+                # Migration: existing DBs created before the "Bring Your Own
+                # Key" feature existed. NULL is the default and means "no
+                # keys saved for any provider" - same "never explicitly
+                # saved" convention in_scope_preset_ids/in_scope_mode
+                # already use above, not theme/llm_provider's "saved as
+                # blank" one, since the stored value here is a whole
+                # encrypted JSON blob (see _encrypt_config_to_text/
+                # _loads_config, reused as-is - this is exactly the same
+                # "encrypt the whole dict as one opaque blob" shape
+                # database_config already uses, for the same reason: an API
+                # key is just as much a credential as a saved connection's
+                # password) rather than a single scalar column.
+                if "llm_byok_keys" not in session_columns:
+                    cursor.execute(
+                        "ALTER TABLE sessions ADD COLUMN llm_byok_keys TEXT;"
+                    )
 
                 # Drop table if it exists under the old schema (where user_id was
                 # the single primary key) or if the temporary custom_databases
@@ -894,7 +1011,8 @@ class SqliteStateStore(StateStore):
                 cursor = conn.cursor()
                 cursor.execute(
                     "SELECT auto_sql_execute, is_custom, connection_id, llm_provider, llm_model, "
-                    "in_scope_preset_ids, in_scope_custom_connection_keys, in_scope_mode, theme "
+                    "in_scope_preset_ids, in_scope_custom_connection_keys, in_scope_mode, theme, "
+                    "llm_byok_keys "
                     "FROM sessions WHERE session_id = ?",
                     (effective_user,),
                 )
@@ -912,12 +1030,14 @@ class SqliteStateStore(StateStore):
                     else:
                         in_scope_preset_ids = _decode_in_scope_list(row[5])
                         in_scope_custom_connection_keys = _decode_in_scope_list(row[6])
+                    byok_keys = _decode_byok_keys(row[9])
                     return {
                         "auto_sql_execute": bool(row[0]),
                         "is_custom": is_custom,
                         "connection_id": connection_id,
                         "llm_provider": row[3] or "",
                         "llm_model": row[4] or "",
+                        "llm_byok_key_set": {name: bool(byok_keys.get(name)) for name in LLM_BYOK_PROVIDER_NAMES},
                         "in_scope_preset_ids": in_scope_preset_ids,
                         "in_scope_custom_connection_keys": in_scope_custom_connection_keys,
                         "in_scope_mode": row[7] or "single",
@@ -931,18 +1051,35 @@ class SqliteStateStore(StateStore):
             "connection_id": "",
             "llm_provider": "",
             "llm_model": "",
+            "llm_byok_key_set": {name: False for name in LLM_BYOK_PROVIDER_NAMES},
             "in_scope_preset_ids": [],
             "in_scope_custom_connection_keys": [],
             "in_scope_mode": "single",
             "theme": "",
         }
 
+    def get_llm_byok_key(self, user_id, provider_name):
+        effective_user = _effective_user(user_id)
+        try:
+            with self._connect() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT llm_byok_keys FROM sessions WHERE session_id = ?",
+                    (effective_user,),
+                )
+                row = cursor.fetchone()
+                if row:
+                    return _decode_byok_keys(row[0]).get(provider_name) or None
+        except Exception:
+            logger.exception("Error fetching BYOK key from SQLite")
+        return None
+
     def set_session(self, user_id, connection_id=None, auto_sql_execute=None, is_custom=None,
-                     llm_provider=None, llm_model=None,
+                     llm_provider=None, llm_model=None, llm_byok_keys=None,
                      in_scope_preset_ids=None, in_scope_custom_connection_keys=None,
                      in_scope_mode=None, theme=None):
         if (connection_id is None and auto_sql_execute is None and is_custom is None
-                and llm_provider is None and llm_model is None
+                and llm_provider is None and llm_model is None and llm_byok_keys is None
                 and in_scope_preset_ids is None and in_scope_custom_connection_keys is None
                 and in_scope_mode is None and theme is None):
             return
@@ -950,6 +1087,24 @@ class SqliteStateStore(StateStore):
         try:
             with self._connect() as conn:
                 cursor = conn.cursor()
+                # llm_byok_keys is stored as one whole encrypted blob (see
+                # _decode_byok_keys/_merge_byok_keys) but updated per-
+                # provider - unlike every other field here, applying it
+                # needs a read-modify-write: fetch whatever's already
+                # saved (a brand-new row that doesn't exist yet reads back
+                # as {}, which _merge_byok_keys handles the same as any
+                # other existing dict), merge this call's changes into it,
+                # then persist the merged result below through the exact
+                # same insert_cols/updates plumbing every other field uses.
+                new_byok_text = None
+                if llm_byok_keys is not None:
+                    cursor.execute(
+                        "SELECT llm_byok_keys FROM sessions WHERE session_id = ?",
+                        (effective_user,),
+                    )
+                    existing_row = cursor.fetchone()
+                    existing_byok_keys = _decode_byok_keys(existing_row[0] if existing_row else None)
+                    new_byok_text = _encode_byok_keys(_merge_byok_keys(existing_byok_keys, llm_byok_keys))
                 # Ensure a row exists first (defaults for whichever field
                 # isn't being set), then patch only the field(s) actually
                 # passed in - so e.g. toggling auto_sql_execute alone never
@@ -987,6 +1142,9 @@ class SqliteStateStore(StateStore):
                 if theme is not None:
                     insert_cols.append("theme")
                     insert_vals.append(theme)
+                if new_byok_text is not None:
+                    insert_cols.append("llm_byok_keys")
+                    insert_vals.append(new_byok_text)
                 placeholders = ", ".join("?" for _ in insert_cols)
                 cursor.execute(f"""
                     INSERT INTO sessions ({', '.join(insert_cols)})
@@ -1023,6 +1181,9 @@ class SqliteStateStore(StateStore):
                 if theme is not None:
                     updates.append("theme = ?")
                     params.append(theme)
+                if new_byok_text is not None:
+                    updates.append("llm_byok_keys = ?")
+                    params.append(new_byok_text)
                 updates.append("updated_at = CURRENT_TIMESTAMP")
                 params.append(effective_user)
                 cursor.execute(
@@ -1201,6 +1362,7 @@ class FirestoreStateStore(StateStore):
             "connection_id": "",
             "llm_provider": "",
             "llm_model": "",
+            "llm_byok_key_set": {name: False for name in LLM_BYOK_PROVIDER_NAMES},
             "in_scope_preset_ids": [],
             "in_scope_custom_connection_keys": [],
             "in_scope_mode": "single",
@@ -1259,12 +1421,16 @@ class FirestoreStateStore(StateStore):
                     in_scope_preset_ids, in_scope_custom_connection_keys = (
                         _lazy_derive_in_scope(connection_id, old_is_custom)
                     )
+                    legacy_byok_keys = _decrypt_firestore_config(data.get("llm_byok_keys"))
                     return {
                         "auto_sql_execute": bool(data.get("auto_sql_execute", DEFAULT_AUTO_SQL_EXECUTE)),
                         "is_custom": old_is_custom,
                         "connection_id": connection_id,
                         "llm_provider": data.get("llm_provider") or "",
                         "llm_model": data.get("llm_model") or "",
+                        "llm_byok_key_set": {
+                            name: bool(legacy_byok_keys.get(name)) for name in LLM_BYOK_PROVIDER_NAMES
+                        },
                         "in_scope_preset_ids": in_scope_preset_ids,
                         "in_scope_custom_connection_keys": in_scope_custom_connection_keys,
                         "in_scope_mode": data.get("in_scope_mode") or "single",
@@ -1282,12 +1448,14 @@ class FirestoreStateStore(StateStore):
                 else:
                     in_scope_preset_ids = list(data.get("in_scope_preset_ids") or [])
                     in_scope_custom_connection_keys = list(data.get("in_scope_custom_connection_keys") or [])
+                byok_keys = _decrypt_firestore_config(data.get("llm_byok_keys"))
                 return {
                     "auto_sql_execute": bool(data.get("auto_sql_execute", DEFAULT_AUTO_SQL_EXECUTE)),
                     "is_custom": bool(data.get("is_custom", False)),
                     "connection_id": data.get("connection_id") or "",
                     "llm_provider": data.get("llm_provider") or "",
                     "llm_model": data.get("llm_model") or "",
+                    "llm_byok_key_set": {name: bool(byok_keys.get(name)) for name in LLM_BYOK_PROVIDER_NAMES},
                     "in_scope_preset_ids": in_scope_preset_ids,
                     "in_scope_custom_connection_keys": in_scope_custom_connection_keys,
                     "in_scope_mode": data.get("in_scope_mode") or "single",
@@ -1297,12 +1465,25 @@ class FirestoreStateStore(StateStore):
             logger.exception("Error fetching session from Firestore")
         return default_session
 
+    def get_llm_byok_key(self, user_id, provider_name):
+        if not user_id:
+            return None
+        try:
+            doc = self.client.collection("sessions").document(user_id).get()
+            if doc.exists:
+                data = doc.to_dict() or {}
+                byok_keys = _decrypt_firestore_config(data.get("llm_byok_keys"))
+                return byok_keys.get(provider_name) or None
+        except Exception:
+            logger.exception("Error fetching BYOK key from Firestore")
+        return None
+
     def set_session(self, user_id, connection_id=None, auto_sql_execute=None, is_custom=None,
-                     llm_provider=None, llm_model=None,
+                     llm_provider=None, llm_model=None, llm_byok_keys=None,
                      in_scope_preset_ids=None, in_scope_custom_connection_keys=None,
                      in_scope_mode=None, theme=None):
         if not user_id or (connection_id is None and auto_sql_execute is None and is_custom is None
-                            and llm_provider is None and llm_model is None
+                            and llm_provider is None and llm_model is None and llm_byok_keys is None
                             and in_scope_preset_ids is None and in_scope_custom_connection_keys is None
                             and in_scope_mode is None and theme is None):
             return
@@ -1317,6 +1498,22 @@ class FirestoreStateStore(StateStore):
             update_data["llm_provider"] = llm_provider
         if llm_model is not None:
             update_data["llm_model"] = llm_model
+        if llm_byok_keys is not None:
+            # Same read-modify-write reasoning as SqliteStateStore.set_session
+            # - this is one whole-document field covering all three
+            # providers, but the caller only ever means to change the
+            # provider(s) present in llm_byok_keys (see _merge_byok_keys).
+            existing_byok_keys = {}
+            try:
+                existing_doc = self.client.collection("sessions").document(user_id).get()
+                if existing_doc.exists:
+                    existing_byok_keys = _decrypt_firestore_config(
+                        (existing_doc.to_dict() or {}).get("llm_byok_keys")
+                    )
+            except Exception:
+                logger.exception("Error reading existing BYOK keys from Firestore before merge")
+            merged_byok_keys = _merge_byok_keys(existing_byok_keys, llm_byok_keys)
+            update_data["llm_byok_keys"] = _config_value_to_store(merged_byok_keys)
         if in_scope_preset_ids is not None:
             update_data["in_scope_preset_ids"] = list(in_scope_preset_ids)
         if in_scope_custom_connection_keys is not None:

@@ -228,7 +228,7 @@ from auth import (
     is_anonymous_user,
 )
 from db import get_conn_identifier, resolve_active_descriptor
-from state_store import compute_connection_key
+from state_store import compute_connection_key, LLM_BYOK_PROVIDER_NAMES
 from sheets_util import extract_spreadsheet_id
 import schema_cache
 # Read-only reuse of translate_routes.py's HISTORY_MAX_TURNS - the client
@@ -1381,6 +1381,36 @@ def handle_config():
             new_llm_provider = None
             new_llm_model = None
 
+        # Bring Your Own Key (Preferences dialog's third section) - a dict
+        # of ONLY the provider(s) this request means to change: e.g.
+        # {"google": "<new key>"} sets/replaces just Google's saved key,
+        # leaving Anthropic's/OpenAI's completely untouched; {"google": ""}
+        # (explicit empty, not the name simply being absent from the dict)
+        # clears it - see StateStore.set_session's docstring on
+        # llm_byok_keys for the full contract, which this just validates
+        # and passes through unchanged. Whitespace-only paste (a stray
+        # trailing newline is an easy copy/paste mistake) is treated the
+        # same as an explicit clear, not saved as a "key" that would just
+        # fail every call. A malformed/empty request here is silently
+        # left as None ("don't touch any saved key"), same leniency
+        # new_llm_provider above already applies - this is exactly the
+        # kind of field a stale/buggy request should never be able to
+        # blow away by accident. The raw key is NEVER echoed back
+        # anywhere in this route's response, in either direction - see
+        # get_session's docstring on llm_byok_key_set, the only thing
+        # GET ever returns for this feature.
+        raw_llm_byok_keys = data.get('llm_byok_keys')
+        new_llm_byok_keys_to_save = None
+        if isinstance(raw_llm_byok_keys, dict):
+            valid_llm_provider_names = {p["name"] for p in list_llm_providers_info()}
+            filtered_llm_byok_keys = {
+                provider_name: key_value.strip()
+                for provider_name, key_value in raw_llm_byok_keys.items()
+                if provider_name in valid_llm_provider_names and isinstance(key_value, str)
+            }
+            if filtered_llm_byok_keys:
+                new_llm_byok_keys_to_save = filtered_llm_byok_keys
+
         # The saved custom-connections LIST and "which connection (if any)
         # is active this request" are independent concerns - a request can
         # touch one, the other, both, or neither (e.g. renaming a saved
@@ -1493,6 +1523,7 @@ def handle_config():
                 user_identity, connection_id=preset["id"], is_custom=False,
                 auto_sql_execute=new_auto_sql_execute,
                 llm_provider=new_llm_provider, llm_model=new_llm_model,
+                llm_byok_keys=new_llm_byok_keys_to_save,
                 in_scope_preset_ids=new_in_scope_preset_ids_to_save,
                 in_scope_custom_connection_keys=new_in_scope_custom_keys_to_save,
                 in_scope_mode=new_in_scope_mode_to_save,
@@ -1613,6 +1644,7 @@ def handle_config():
                     user_identity, connection_id=active_connection_key, is_custom=True,
                     auto_sql_execute=new_auto_sql_execute,
                     llm_provider=new_llm_provider, llm_model=new_llm_model,
+                    llm_byok_keys=new_llm_byok_keys_to_save,
                     in_scope_preset_ids=new_in_scope_preset_ids_to_save,
                     in_scope_custom_connection_keys=new_in_scope_custom_keys_to_save,
                     in_scope_mode=new_in_scope_mode_to_save,
@@ -1632,6 +1664,7 @@ def handle_config():
                     )
                     custom_list_saved = True
         elif (new_auto_sql_execute is not None or new_llm_provider is not None or new_llm_model is not None
+              or new_llm_byok_keys_to_save is not None
               or new_in_scope_preset_ids_to_save is not None or new_in_scope_custom_keys_to_save is not None
               or new_in_scope_mode_to_save is not None or new_theme is not None):
             # Neither a preset nor a custom connection was actively
@@ -1639,14 +1672,16 @@ def handle_config():
             # changed, only the in-scope checkboxes changed, or - the
             # model-selection modal's own save, which never sends
             # preset_id/is_custom at all - only llm_provider/llm_model
-            # changed) - leave the active connection exactly as it is.
-            # There's no hardcoded default to reset it to here anymore the
-            # way there used to be: a blank/never-set connection_id already
-            # resolves to the app default on its own - see db.py's
-            # resolve_active_descriptor.
+            # changed, or the Preferences dialog's Bring Your Own Key
+            # section saved on its own) - leave the active connection
+            # exactly as it is. There's no hardcoded default to reset it to
+            # here anymore the way there used to be: a blank/never-set
+            # connection_id already resolves to the app default on its own
+            # - see db.py's resolve_active_descriptor.
             state_store.set_session(
                 user_identity, auto_sql_execute=new_auto_sql_execute,
                 llm_provider=new_llm_provider, llm_model=new_llm_model,
+                llm_byok_keys=new_llm_byok_keys_to_save,
                 in_scope_preset_ids=new_in_scope_preset_ids_to_save,
                 in_scope_custom_connection_keys=new_in_scope_custom_keys_to_save,
                 in_scope_mode=new_in_scope_mode_to_save,
@@ -1691,6 +1726,15 @@ def handle_config():
     active_llm_provider_obj = get_llm_provider(session_data.get("llm_provider"))
     active_llm_provider = active_llm_provider_obj.name
     active_llm_model = session_data.get("llm_model") or active_llm_provider_obj.default_model
+
+    # Bring Your Own Key (Preferences dialog): booleans only, never the
+    # actual saved key - see StateStore.get_session's docstring on
+    # llm_byok_key_set for why this is the ONLY form the key ever takes in
+    # an API response. Falls back to all-False for a session predating
+    # this feature or hitting the get_session() error path (see that
+    # method's own default-dict fallback), same defensive `or {}` reasoning
+    # that would apply to any other dict-shaped session field.
+    llm_byok_key_set = session_data.get("llm_byok_key_set") or {name: False for name in LLM_BYOK_PROVIDER_NAMES}
 
     active_connection_missing_message = ""
     if connection_missing:
@@ -1961,6 +2005,10 @@ def handle_config():
         'llm_providers': list_llm_providers_info(),
         'active_llm_provider': active_llm_provider,
         'active_llm_model': active_llm_model,
+        # "Bring Your Own Key" - which provider(s) THIS user has a saved
+        # key for, never the key itself (see llm_byok_key_set's assignment
+        # above).
+        'llm_byok_key_set': llm_byok_key_set,
         'auto_sql_execute': auto_sql_execute,
         # "" means "nothing explicitly saved server-side yet" - client.js's
         # fetchBackendConfig() is what decides what to do with that (see

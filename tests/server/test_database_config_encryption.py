@@ -225,6 +225,78 @@ def test_firestore_legacy_native_map_doc_still_reads_after_a_key_is_configured(m
     assert conns[0]["config"]["password"] == SECRET_PASSWORD
 
 
+# --- llm_byok_keys (Bring Your Own Key) gets the exact same treatment --------
+# A user's own LLM API key is just as much a credential as a saved
+# connection's password - see state_store.py's LLM_BYOK_PROVIDER_NAMES/
+# _encode_byok_keys/_decode_byok_keys comment: same whole-blob Fernet
+# encryption, reusing _encrypt_config_to_text/_loads_config/
+# _config_value_to_store/_decrypt_firestore_config as-is, just for the
+# sessions table/doc instead of db_connections.
+
+BYOK_SECRET = "sk-my-super-secret-llm-key"
+
+
+def raw_sqlite_byok_keys(tmp_path, user_id):
+    conn = sqlite3.connect(str(tmp_path / "state.db"))
+    row = conn.execute(
+        "SELECT llm_byok_keys FROM sessions WHERE session_id = ?", (user_id,),
+    ).fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def test_sqlite_byok_with_no_key_stores_plain_json_as_before(tmp_path, monkeypatch):
+    monkeypatch.delenv("DB_CONFIG_ENCRYPTION_KEY", raising=False)
+    store = make_sqlite_store(tmp_path)
+    store.set_session("alice", llm_byok_keys={"google": BYOK_SECRET})
+    raw = raw_sqlite_byok_keys(tmp_path, "alice")
+    assert json.loads(raw)["google"] == BYOK_SECRET
+
+
+def test_sqlite_byok_with_valid_key_stores_ciphertext_not_plaintext(tmp_path, monkeypatch):
+    monkeypatch.setenv("DB_CONFIG_ENCRYPTION_KEY", make_fernet_key())
+    store = make_sqlite_store(tmp_path)
+    store.set_session("alice", llm_byok_keys={"google": BYOK_SECRET})
+    raw = raw_sqlite_byok_keys(tmp_path, "alice")
+
+    assert BYOK_SECRET not in raw
+    with pytest.raises(Exception):
+        json.loads(raw)  # genuinely ciphertext, not just reformatted JSON
+
+
+def test_sqlite_byok_with_valid_key_round_trips_correctly(tmp_path, monkeypatch):
+    monkeypatch.setenv("DB_CONFIG_ENCRYPTION_KEY", make_fernet_key())
+    store = make_sqlite_store(tmp_path)
+    store.set_session("alice", llm_byok_keys={"google": BYOK_SECRET})
+    assert store.get_llm_byok_key("alice", "google") == BYOK_SECRET
+
+
+def test_sqlite_byok_legacy_plaintext_row_still_reads_after_a_key_is_configured(tmp_path, monkeypatch):
+    monkeypatch.delenv("DB_CONFIG_ENCRYPTION_KEY", raising=False)
+    store = make_sqlite_store(tmp_path)
+    store.set_session("alice", llm_byok_keys={"google": BYOK_SECRET})
+
+    monkeypatch.setenv("DB_CONFIG_ENCRYPTION_KEY", make_fernet_key())
+    assert store.get_llm_byok_key("alice", "google") == BYOK_SECRET
+
+
+def test_firestore_byok_with_valid_key_stores_string_ciphertext_not_a_map(monkeypatch):
+    monkeypatch.setenv("DB_CONFIG_ENCRYPTION_KEY", make_fernet_key())
+    store, client = make_firestore_store()
+    store.set_session("alice", llm_byok_keys={"google": BYOK_SECRET})
+    doc = client.collection("sessions").document("alice").get()
+    raw = doc.to_dict()
+    assert isinstance(raw["llm_byok_keys"], str)
+    assert BYOK_SECRET not in raw["llm_byok_keys"]
+
+
+def test_firestore_byok_with_valid_key_round_trips_correctly(monkeypatch):
+    monkeypatch.setenv("DB_CONFIG_ENCRYPTION_KEY", make_fernet_key())
+    store, client = make_firestore_store()
+    store.set_session("alice", llm_byok_keys={"google": BYOK_SECRET})
+    assert store.get_llm_byok_key("alice", "google") == BYOK_SECRET
+
+
 # --- Cloud Run startup guard (app_config.py) --------------------------------
 # These need a real app_config.py import, unlike everything above - see
 # module docstring.

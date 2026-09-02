@@ -206,6 +206,14 @@ document.addEventListener('DOMContentLoaded', async () => {
   let LLM_PROVIDERS = [];
   let ACTIVE_LLM_PROVIDER = "";
   let ACTIVE_LLM_MODEL = "";
+  // "Bring Your Own Key" (Preferences dialog's third section) - the GET
+  // response's 'llm_byok_key_set' verbatim: {google: bool, anthropic: bool,
+  // openai: bool}, reporting whether THIS user has a saved key for each
+  // provider. Booleans only, same as every other field this module fetches
+  // from /api/config's response - the raw key is never sent to the
+  // browser at all (see state_store.py's get_session docstring on
+  // llm_byok_key_set), so there is no client-side variable holding it.
+  let LLM_BYOK_KEY_SET = { google: false, anthropic: false, openai: false };
   let currentGoogleClientId = null;
   let googleIdToken = null;
   let customDbUrl = "";
@@ -492,6 +500,33 @@ document.addEventListener('DOMContentLoaded', async () => {
   const themeOptionDark = document.getElementById('themeOptionDark');
   const themeOptionLight = document.getElementById('themeOptionLight');
   const autoSqlExecuteCheckbox = document.getElementById('autoSqlExecuteCheckbox');
+  // Bring Your Own Key (Preferences dialog's third section) - one
+  // {input, clearBtn} pair per provider, keyed by the same "google"/
+  // "anthropic"/"openai" names used everywhere else (LLM_PROVIDERS,
+  // LLM_BYOK_KEY_SET, translate_routes.py's _LLM_PROVIDERS).
+  const BYOK_PROVIDER_FIELDS = {
+    google: {
+      input: document.getElementById('byokKeyGoogle'),
+      clearBtn: document.querySelector('.byok-clear-btn[data-byok-provider="google"]'),
+    },
+    anthropic: {
+      input: document.getElementById('byokKeyAnthropic'),
+      clearBtn: document.querySelector('.byok-clear-btn[data-byok-provider="anthropic"]'),
+    },
+    openai: {
+      input: document.getElementById('byokKeyOpenai'),
+      clearBtn: document.querySelector('.byok-clear-btn[data-byok-provider="openai"]'),
+    },
+  };
+  // Tracks which provider(s) had their "x" (remove) button clicked since
+  // the modal was last opened - see loadPreferencesIntoUI()/savePreferences()
+  // below for why an empty input alone isn't enough to tell "leave this
+  // key untouched" apart from "actively clear it" (the key is never
+  // redisplayed, so a blank box is also what an already-saved key looks
+  // like - see LLM_BYOK_KEY_SET). Typing into a box after clicking its "x"
+  // un-marks it, so an immediate change of mind doesn't still send a clear
+  // alongside the freshly typed replacement.
+  const byokProvidersMarkedForClear = new Set();
 
   // DOM Elements - Login Required Modal. Not currently triggered by
   // anything: translation history and saving a custom DB connection were
@@ -1575,6 +1610,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       LLM_PROVIDERS = data.llm_providers || [];
       ACTIVE_LLM_PROVIDER = data.active_llm_provider || "";
       ACTIVE_LLM_MODEL = data.active_llm_model || "";
+      LLM_BYOK_KEY_SET = data.llm_byok_key_set || { google: false, anthropic: false, openai: false };
 
       IN_SCOPE_PRESET_IDS = data.in_scope_preset_ids || [];
       IN_SCOPE_CUSTOM_KEYS = data.in_scope_custom_connection_keys || [];
@@ -2693,6 +2729,21 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (autoSqlExecuteCheckbox) {
       autoSqlExecuteCheckbox.checked = autoSqlExecuteEnabled;
     }
+
+    // Bring Your Own Key - every box always starts blank (the saved key,
+    // if any, is never sent to the browser - see LLM_BYOK_KEY_SET's own
+    // comment); the placeholder is what actually shows whether a key is
+    // currently saved for that provider, same wording/pattern the custom
+    // connection form already uses for has_custom_credentials fields.
+    byokProvidersMarkedForClear.clear();
+    Object.keys(BYOK_PROVIDER_FIELDS).forEach((providerName) => {
+      const field = BYOK_PROVIDER_FIELDS[providerName];
+      if (!field.input) return;
+      field.input.value = '';
+      field.input.placeholder = LLM_BYOK_KEY_SET[providerName]
+        ? 'Key saved - leave blank to keep it, or paste a new one to replace it'
+        : 'Paste your API key';
+    });
   }
 
   async function savePreferences() {
@@ -2709,12 +2760,37 @@ document.addEventListener('DOMContentLoaded', async () => {
       ? autoSqlExecuteCheckbox.checked
       : autoSqlExecuteEnabled;
 
+    // Bring Your Own Key - only the provider(s) actually touched this save
+    // are included at all (see StateStore.set_session's llm_byok_keys
+    // contract): a freshly typed value replaces the saved key, an "x"-
+    // cleared-and-left-blank box sends "" to explicitly remove it, and a
+    // box that's just sitting blank because nothing was ever saved (or
+    // because a saved key simply isn't being changed right now) is
+    // omitted entirely rather than sent as "" - that would wrongly clear
+    // an already-saved key the user never asked to touch.
+    const llmByokKeys = {};
+    Object.keys(BYOK_PROVIDER_FIELDS).forEach((providerName) => {
+      const field = BYOK_PROVIDER_FIELDS[providerName];
+      if (!field.input) return;
+      const typedValue = field.input.value.trim();
+      if (typedValue) {
+        llmByokKeys[providerName] = typedValue;
+      } else if (byokProvidersMarkedForClear.has(providerName)) {
+        llmByokKeys[providerName] = '';
+      }
+    });
+
+    const preferencesPayload = { auto_sql_execute: autoSqlExecuteValue, theme: selectedTheme };
+    if (Object.keys(llmByokKeys).length > 0) {
+      preferencesPayload.llm_byok_keys = llmByokKeys;
+    }
+
     try {
       const response = await fetch('/api/config', {
         method: 'POST',
         headers: getApiHeaders(),
         credentials: 'same-origin',
-        body: JSON.stringify({ auto_sql_execute: autoSqlExecuteValue, theme: selectedTheme }),
+        body: JSON.stringify(preferencesPayload),
       });
       if (!response.ok) {
         const errData = await response.json().catch(() => ({}));
@@ -2751,6 +2827,30 @@ document.addEventListener('DOMContentLoaded', async () => {
   if (preferencesSaveBtn) {
     preferencesSaveBtn.addEventListener('click', savePreferences);
   }
+
+  // Bring Your Own Key - "x" click marks that provider for an explicit
+  // clear on the next Save (see byokProvidersMarkedForClear's comment) and
+  // gives immediate visual feedback (blanks the box, flips the placeholder
+  // to the "not set" wording) without waiting for the round trip; typing
+  // into the box again un-marks it, since that's a change of mind - the
+  // freshly typed value should replace the key, not clear-then-replace.
+  Object.keys(BYOK_PROVIDER_FIELDS).forEach((providerName) => {
+    const field = BYOK_PROVIDER_FIELDS[providerName];
+    if (field.clearBtn) {
+      field.clearBtn.addEventListener('click', () => {
+        byokProvidersMarkedForClear.add(providerName);
+        if (field.input) {
+          field.input.value = '';
+          field.input.placeholder = 'Paste your API key';
+        }
+      });
+    }
+    if (field.input) {
+      field.input.addEventListener('input', () => {
+        byokProvidersMarkedForClear.delete(providerName);
+      });
+    }
+  });
 
   async function triggerConfigSave({ closeModal = false } = {}) {
     let dbType = 'postgres';
@@ -4559,14 +4659,38 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
+  // Same idea as appendPhaseCSummaryToSummaryTab just above, for the
+  // failure case (see requestAllModeResultsSummary below) - Phase C's own
+  // categorized, honest error message (translate_routes.py's
+  // format_llm_error_for_user()) gets marked with SUMMARY_TAB_BLOCK_MARKER
+  // the same way a real summary would, so its leading "the selected
+  // model..." sentence is bolded and the "Actual error message received:"
+  // detail underneath it reads as a distinct, secondary line - same
+  // visual treatment as a real summary, just carrying an apology instead
+  // of an answer, so the user sees WHY no summary appeared instead of the
+  // Summary tab just silently staying as triage's routing message forever.
+  function appendPhaseCErrorToSummaryTab(errorText) {
+    if (!currentResultsList || !currentResultsList.length) return;
+    const summaryEntry = currentResultsList.find((r) => r.isText && r.tabLabel === 'Summary');
+    if (!summaryEntry) return;
+    summaryEntry.text = summaryEntry.text
+      ? `${summaryEntry.text}\n\n${SUMMARY_TAB_BLOCK_MARKER}${errorText}`
+      : `${SUMMARY_TAB_BLOCK_MARKER}${errorText}`;
+    if (currentResultsList[activeResultIndex] === summaryEntry) {
+      renderTableResult(summaryEntry);
+    }
+  }
+
   // Fire-and-await (not fire-and-forget - see the two call sites in
   // executeSql() below, both already inside an async flow with buttons
   // disabled) request for Phase C's summary. Best-effort: skipped
   // entirely when there's no real data to summarize (every database just
   // noted or failed - nothing Phase C could add over what those tabs
-  // already show), and any failure from the endpoint itself just leaves
-  // the Summary tab as it already is rather than surfacing an error, per
-  // /api/summarize-results' own docstring.
+  // already show). A failure from the endpoint itself is appended to the
+  // Summary tab via appendPhaseCErrorToSummaryTab above (rather than
+  // left silent, as it originally was) so the user can see why Phase C
+  // didn't produce a summary - see /api/summarize-results' own docstring
+  // for the two shapes `data.error` can take.
   async function requestAllModeResultsSummary(notes, executeResults, executeFailures) {
     if (!notes || !notes.prompt) return;
     const databaseResults = buildAllModeSummaryPayload(notes, executeResults, executeFailures);
@@ -4587,6 +4711,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         // /api/summarize-results docstring) - an internal convention,
         // never meant to reach the user verbatim.
         appendPhaseCSummaryToSummaryTab(stripNoSqlPrefix(data.summary));
+      } else if (data && data.error) {
+        appendPhaseCErrorToSummaryTab(data.error);
       }
     } catch (err) {
       // See translatePrompt()'s identical guard - cancelInFlightQuery()

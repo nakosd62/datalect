@@ -122,6 +122,20 @@ function currentSql(page) {
   });
 }
 
+/** client.js's setSqlQuery() also runs generated SQL through sql-formatter
+ * (a CDN script - see index.html) when it's available, pretty-printing it
+ * onto multiple lines (e.g. "SELECT 1;" becomes "SELECT\n  1;") - see
+ * translate-execute.spec.js's identical helper. Whether that happens is
+ * purely a function of whether that CDN script loaded, not anything this
+ * suite controls, so any assertion checking for more than one token of
+ * generated SQL (as opposed to a single word like 'SELECT', or a whole
+ * "-- database: ..." comment line, which the formatter leaves alone) needs
+ * to go through this normalized-whitespace form instead of currentSql()
+ * directly. */
+async function normalizedSql(page) {
+  return (await currentSql(page) || '').replace(/\s+/g, ' ').trim();
+}
+
 test.describe('multi-database question answering', () => {
   test('"All configured databases" and a specific preset are mutually exclusive radios, each saving the right scope', async ({ page }) => {
     const state = await mockConfig(page, {
@@ -402,11 +416,11 @@ test.describe('multi-database question answering', () => {
 
     await page.locator('#aiPrompt').fill('first question');
     await page.locator('#aiPrompt').press('Enter');
-    await expect.poll(() => currentSql(page)).toContain('SELECT 1');
+    await expect.poll(() => normalizedSql(page)).toContain('SELECT 1');
 
     await page.locator('#aiPrompt').fill('follow-up question');
     await page.locator('#aiPrompt').press('Enter');
-    await expect.poll(() => currentSql(page)).toContain('SELECT 2');
+    await expect.poll(() => normalizedSql(page)).toContain('SELECT 2');
 
     expect(capturedBodies).toHaveLength(2);
     expect(capturedBodies[0].pinned_connections).toEqual([]);

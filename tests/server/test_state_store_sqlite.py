@@ -161,6 +161,83 @@ def test_set_session_other_fields_do_not_clobber_theme(tmp_path):
     assert store.get_session("alice")["theme"] == "light"
 
 
+# --- Bring Your Own Key (llm_byok_keys/llm_byok_key_set/get_llm_byok_key) ------
+# A user's saved API key, one per provider - see StateStore.set_session's
+# docstring for the "only the provider(s) present in the dict are touched,
+# '' explicitly clears one" contract. Unlike every other session field
+# tested above, the raw value is never exposed through get_session() at all
+# (see get_session's docstring on llm_byok_key_set) - only get_llm_byok_key
+# (the server-only, call-time accessor) ever returns it.
+
+def test_get_session_defaults_byok_key_set_to_all_false(tmp_path):
+    store = make_store(tmp_path)
+    session = store.get_session("alice")
+    assert session["llm_byok_key_set"] == {"google": False, "anthropic": False, "openai": False}
+
+
+def test_get_llm_byok_key_returns_none_when_never_saved(tmp_path):
+    store = make_store(tmp_path)
+    assert store.get_llm_byok_key("alice", "google") is None
+
+
+def test_set_session_byok_key_is_reflected_in_key_set_and_get_llm_byok_key(tmp_path):
+    store = make_store(tmp_path)
+    store.set_session("alice", llm_byok_keys={"google": "my-google-key"})
+    session = store.get_session("alice")
+    assert session["llm_byok_key_set"] == {"google": True, "anthropic": False, "openai": False}
+    assert store.get_llm_byok_key("alice", "google") == "my-google-key"
+    assert store.get_llm_byok_key("alice", "anthropic") is None
+
+
+def test_set_session_byok_key_for_one_provider_does_not_touch_another(tmp_path):
+    store = make_store(tmp_path)
+    store.set_session("alice", llm_byok_keys={"google": "my-google-key"})
+    store.set_session("alice", llm_byok_keys={"anthropic": "my-claude-key"})
+    session = store.get_session("alice")
+    assert session["llm_byok_key_set"] == {"google": True, "anthropic": True, "openai": False}
+    assert store.get_llm_byok_key("alice", "google") == "my-google-key"
+    assert store.get_llm_byok_key("alice", "anthropic") == "my-claude-key"
+
+
+def test_set_session_byok_key_replaces_an_existing_value_for_the_same_provider(tmp_path):
+    store = make_store(tmp_path)
+    store.set_session("alice", llm_byok_keys={"google": "old-key"})
+    store.set_session("alice", llm_byok_keys={"google": "new-key"})
+    assert store.get_llm_byok_key("alice", "google") == "new-key"
+
+
+def test_set_session_byok_key_empty_string_clears_it(tmp_path):
+    store = make_store(tmp_path)
+    store.set_session("alice", llm_byok_keys={"google": "my-google-key"})
+    store.set_session("alice", llm_byok_keys={"google": ""})
+    session = store.get_session("alice")
+    assert session["llm_byok_key_set"]["google"] is False
+    assert store.get_llm_byok_key("alice", "google") is None
+
+
+def test_set_session_without_llm_byok_keys_leaves_saved_keys_untouched(tmp_path):
+    store = make_store(tmp_path)
+    store.set_session("alice", llm_byok_keys={"google": "my-google-key"})
+    # A totally unrelated save (llm_byok_keys not passed at all - None,
+    # not {}) must not clear or otherwise touch the already-saved key.
+    store.set_session("alice", theme="light", auto_sql_execute=False)
+    assert store.get_llm_byok_key("alice", "google") == "my-google-key"
+    assert store.get_session("alice")["llm_byok_key_set"]["google"] is True
+
+
+def test_set_session_byok_keys_ignores_unknown_provider_names(tmp_path):
+    store = make_store(tmp_path)
+    store.set_session("alice", llm_byok_keys={"not-a-real-provider": "whatever"})
+    session = store.get_session("alice")
+    assert session["llm_byok_key_set"] == {"google": False, "anthropic": False, "openai": False}
+
+
+def test_byok_keys_are_scoped_per_user(tmp_path):
+    store = make_store(tmp_path)
+    store.set_session("alice", llm_byok_keys={"google": "alice-key"})
+    assert store.get_llm_byok_key("bob", "google") is None
+
+
 # --- db_connections (saved custom connections) --------------------------------
 
 def test_get_db_connections_empty_for_new_user(tmp_path):
@@ -603,6 +680,46 @@ def test_init_migrates_sessions_table_predating_theme(tmp_path):
     assert store.get_session("alice")["theme"] == "light"
 
 
+def test_init_migrates_sessions_table_predating_byok_keys(tmp_path):
+    # Same plain-ALTER, no-backfill-needed shape as the theme migration
+    # above - a DB already upgraded past theme but predating the "Bring
+    # Your Own Key" column entirely.
+    db_path = str(tmp_path / "state.db")
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        CREATE TABLE sessions (
+            session_id TEXT PRIMARY KEY,
+            auto_sql_execute INTEGER NOT NULL DEFAULT 1,
+            is_custom INTEGER NOT NULL DEFAULT 0,
+            connection_id TEXT NOT NULL DEFAULT '',
+            llm_provider TEXT NOT NULL DEFAULT '',
+            llm_model TEXT NOT NULL DEFAULT '',
+            in_scope_preset_ids TEXT,
+            in_scope_custom_connection_keys TEXT,
+            in_scope_mode TEXT,
+            theme TEXT NOT NULL DEFAULT '',
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    conn.execute(
+        "INSERT INTO sessions (session_id, auto_sql_execute, is_custom, connection_id) "
+        "VALUES (?, ?, ?, ?)",
+        ("alice", 1, 0, "preset+Default DB"),
+    )
+    conn.commit()
+    conn.close()
+
+    store = SqliteStateStore(db_path)
+    store.init()  # must not raise
+
+    session = store.get_session("alice")
+    assert session["connection_id"] == "preset+Default DB"  # untouched
+    assert session["llm_byok_key_set"] == {"google": False, "anthropic": False, "openai": False}
+
+    store.set_session("alice", llm_byok_keys={"openai": "my-key"})
+    assert store.get_llm_byok_key("alice", "openai") == "my-key"
+
+
 def test_init_migrates_pre_connection_key_db_connections_table(tmp_path):
     db_path = str(tmp_path / "state.db")
     # Simulate a pre-migration DB: db_connections keyed by (user_id,
@@ -686,6 +803,7 @@ def test_init_migrates_pre_connection_id_sessions_table_for_custom_row(tmp_path)
         "llm_provider", "llm_model",
         "in_scope_preset_ids", "in_scope_custom_connection_keys", "in_scope_mode",
         "theme",
+        "llm_byok_keys",
         "updated_at",
     }
 

@@ -34,7 +34,7 @@ twice, give up" loop used to live here instead, which meant a capacity/
 rate-limit failure was retried uselessly (same key, doomed to fail the
 same way again) and then reported back indistinguishably from "the model
 gave an unparseable response" - see translate_routes.py's
-_TRIAGE_API_ERROR_TEXT for the user-facing half of that fix.
+format_llm_error_for_user for the user-facing half of that fix.
 """
 
 import json
@@ -379,7 +379,7 @@ def _parse_triage_response(text, num_candidates, max_connections):
 
 def triage_all_mode_question(candidate_summaries, user_question, provider, client, model,
                               history=None, max_connections=MAX_IN_SCOPE_CONNECTIONS,
-                              api_key=None, tried_keys=None):
+                              api_key=None, tried_keys=None, using_byok=False):
     """"All databases" mode's first call: decides whether `user_question`
     can be answered directly from `candidate_summaries` alone (names,
     dialects, table names - no real data access), or genuinely needs real
@@ -458,9 +458,17 @@ def triage_all_mode_question(candidate_summaries, user_question, provider, clien
       api_error=False: every attempt got a real response back, but it
         was unparseable garbage both times - genuinely nothing more
         useful to try.
+    A "failed" outcome also carries an "error" key: the raw exception the
+    LLM call finally failed with when api_error=True (guaranteed to be an
+    actual exception instance in that case - see the loop below, which
+    only ever sets api_error=True in the same breath as capturing the
+    exception that triggered it), or None when api_error=False (there is
+    no exception to report - the model responded twice, just not usably).
     The caller (translate_routes.py's router_only_all_mode branch) shows
-    a different, honest message for the api_error=True case (see
-    _TRIAGE_API_ERROR_TEXT there) instead of its fixed "I am not able to
+    a different, honest message for the api_error=True case - built by
+    format_llm_error_for_user() there from this result's "error" key (the
+    raw exception the LLM call finally failed with - see that key's own
+    docstring just below) - instead of its fixed "I am not able to
     respond to your prompt" apology (_TRIAGE_FAILURE_TEXT), which is
     reserved for the genuinely-unparseable case.
 
@@ -473,14 +481,21 @@ def triage_all_mode_question(candidate_summaries, user_question, provider, clien
     different convention for the same idea). The caller
     (translate_routes.py) passes its own already-picked `api_key` as the
     starting point, so this doesn't burn a different key than the rest of
-    the request for no reason unless a rotation is actually needed."""
+    the request for no reason unless a rotation is actually needed.
+
+    `using_byok`, like generate_sql_for_connection's own parameter of the
+    same name, forces the key-rotation budget down to exactly 1 (there's
+    no second key of the user's own to rotate to). This function never
+    calls format_llm_error_for_user() itself (it returns the raw
+    exception via "error" instead - see above), so unlike that function
+    it has nothing else to do with the flag."""
     llm_input = provider.build_llm_input(history or [], "", _build_candidate_prompt(candidate_summaries, user_question))
 
     if api_key is None:
         api_key = provider.pick_api_key()
     if tried_keys is None:
         tried_keys = {api_key}
-    key_pool_size = provider.get_key_pool_size()
+    key_pool_size = 1 if using_byok else provider.get_key_pool_size()
 
     last_error = None
     api_error = False
@@ -542,4 +557,8 @@ def triage_all_mode_question(candidate_summaries, user_question, provider, clien
         api_error = False
 
     logger.warning("Connection triage (Phase A2, all-mode) failed after retry, no fallback: %s", last_error)
-    return {"outcome": "failed", "api_error": api_error}
+    return {
+        "outcome": "failed",
+        "api_error": api_error,
+        "error": last_error if api_error else None,
+    }

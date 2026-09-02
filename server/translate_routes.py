@@ -574,6 +574,237 @@ def _classify_gemini_error(exc):
     return None
 
 
+# --- User-facing LLM error messages -----------------------------------------
+# A call's own retry/rotation budget (classify_error() above, per provider)
+# is about giving a TRANSIENT failure a chance to clear before giving up -
+# this is the separate, orthogonal question of what to tell the USER once
+# that budget IS exhausted (or the failure was never retryable to begin
+# with): today, every such failure just showed the raw SDK exception text
+# verbatim in an "error" field - technically accurate, but meaningless to
+# someone who isn't reading this app's source (a bare "503 UNAVAILABLE..."
+# or "Error code: 429 - {'error': {'code': 'insufficient_quota', ...", with
+# no indication of what to actually DO about it: retry, wait, or just pick
+# a different model). The three functions below turn that into an honest,
+# actionable sentence PLUS the original raw text (never hidden - just no
+# longer the only thing shown), classified into exactly three buckets:
+#   "unavailable" - the model/service itself is down or too busy right now
+#     (a 5xx, Anthropic's 529 "overloaded", a dropped connection/timeout) -
+#     the honest fix is "try again in a moment."
+#   "exhausted" - a capacity/quota ceiling was hit (Gemini/Claude's 429,
+#     OpenAI's "insufficient_quota" 429 specifically) - retrying the SAME
+#     model right now won't help; a different model is the actual fix.
+#   "invalid_key" - the API key itself was rejected (a 401/403, Gemini's
+#     documented 400 "API key not valid" shape, or the SDKs' typed
+#     AuthenticationError/PermissionDeniedError) - see the "Bring Your Own
+#     Key" feature (webClient's Preferences dialog): the fix here depends on
+#     WHOSE key failed, which format_llm_error_for_user's `using_byok` param
+#     (not error_category/classify - that's still purely about the
+#     exception's shape) decides between at formatting time: a user's own
+#     saved key gets told to fix/remove it in Preferences, while this app's
+#     own configured key failing is this app's problem, not something
+#     picking a different model or editing Preferences fixes.
+#   "other" - anything else (bad request, invalid model, an exception type
+#     this app doesn't specifically recognize) - no confident guess at why,
+#     so no specific advice beyond "try a different model."
+# _llm_error_category(exc) below classifies according to whichever
+# provider's exception shapes it's checking - it's never called directly;
+# each provider's LlmProvider.error_category() (see GeminiProvider/
+# ClaudeProvider/OpenAiProvider below) dispatches to its own provider-
+# specific version of it, mirroring how classify_error()/_classify_*_error
+# above are already split one-per-provider.
+
+def _gemini_error_category(exc):
+    """error_category() for Gemini. Prefers the semantic `.status` string
+    google-genai's APIError attaches (e.g. "RESOURCE_EXHAUSTED",
+    "UNAVAILABLE" - the same google.rpc.Code names gRPC/Google APIs use
+    everywhere) when present, falling back to the numeric code check
+    _gemini_error_code() already uses elsewhere - needed for a raw httpx
+    timeout (no .status at all) and for lightweight test doubles that only
+    set a numeric .code, same as _classify_gemini_error/_gemini_error_code
+    already tolerate.
+
+    "invalid_key" is Gemini's one genuinely ambiguous case: a rejected key
+    is documented (see https://firebase.google.com/docs/ai-logic/error-codes)
+    to come back as a plain HTTP 400 "API key not valid. Please pass a
+    valid API key." - the SAME status/code a hundred other bad-request
+    reasons also use - so a bare 400 is deliberately NOT enough on its own
+    (that would misclassify unrelated bad-request failures); this only
+    fires for 400 when the message text itself says so. A 401/403 (or the
+    matching PERMISSION_DENIED/UNAUTHENTICATED status strings) is
+    unambiguous and always treated as invalid_key."""
+    status = getattr(exc, "status", None)
+    if status == "RESOURCE_EXHAUSTED":
+        return "exhausted"
+    if status == "UNAVAILABLE":
+        return "unavailable"
+    if status in ("PERMISSION_DENIED", "UNAUTHENTICATED"):
+        return "invalid_key"
+
+    code = _gemini_error_code(exc)
+    if code == 429:
+        return "exhausted"
+    if code == 503 or (isinstance(code, int) and 500 <= code < 600):
+        return "unavailable"
+    if code in (401, 403):
+        return "invalid_key"
+    if code == 400:
+        message = str(getattr(exc, "message", None) or exc).lower()
+        if "api key not valid" in message or "api_key_invalid" in message:
+            return "invalid_key"
+
+    timeout_exc_types = (httpx.TimeoutException,) if httpx2 is None else (httpx.TimeoutException, httpx2.TimeoutException)
+    if isinstance(exc, timeout_exc_types):
+        return "unavailable"
+
+    return "other"
+
+
+def _claude_error_category(exc):
+    """error_category() for Claude. RateLimitError (429) is always
+    "exhausted" - Anthropic's rate limits are a request/token-budget
+    ceiling, not a "servers are momentarily busy" condition. AuthenticationError
+    (401 - missing/malformed/revoked key) and PermissionDeniedError (403 -
+    a key that's valid but not allowed to do this) are both unambiguous
+    typed exceptions, checked ahead of the generic APIStatusError branch
+    below (both subclass it) - "invalid_key". A 529 "overloaded" status or
+    any other 5xx (including a connection-level failure/timeout, which
+    subclasses APIConnectionError) reads as "unavailable", matching
+    _classify_claude_error's own retry policy for those same statuses."""
+    if isinstance(exc, anthropic.RateLimitError):
+        return "exhausted"
+    if isinstance(exc, (anthropic.AuthenticationError, anthropic.PermissionDeniedError)):
+        return "invalid_key"
+    if isinstance(exc, anthropic.APIStatusError):
+        code = getattr(exc, "status_code", None)
+        if code == 529 or (isinstance(code, int) and 500 <= code < 600):
+            return "unavailable"
+        return "other"
+    if isinstance(exc, anthropic.APIConnectionError):
+        return "unavailable"
+    return "other"
+
+
+def _openai_error_category(exc):
+    """error_category() for OpenAI. Unlike Gemini/Claude, OpenAI overloads
+    its one 429 RateLimitError for two very different conditions (see
+    https://platform.openai.com/docs/guides/error-codes), distinguished
+    only by the "code" the API attaches to the error body: "insufficient_
+    quota" is a hard billing/quota ceiling (genuinely "exhausted" - won't
+    clear on its own), while every other 429 (typically
+    "rate_limit_exceeded") is the ordinary "too many requests right now"
+    kind - transient, reads as "unavailable/busy" same as a 5xx would.
+    AuthenticationError (401) and PermissionDeniedError (403) are both
+    unambiguous typed exceptions - "invalid_key". An InternalServerError
+    (5xx) or a connection-level failure/timeout is "unavailable", matching
+    _classify_openai_error's own retry policy."""
+    if isinstance(exc, openai.RateLimitError):
+        code = getattr(exc, "code", None)
+        return "exhausted" if code == "insufficient_quota" else "unavailable"
+    if isinstance(exc, (openai.AuthenticationError, openai.PermissionDeniedError)):
+        return "invalid_key"
+    if isinstance(exc, openai.InternalServerError):
+        return "unavailable"
+    if isinstance(exc, openai.APIConnectionError):
+        return "unavailable"
+    return "other"
+
+
+_LLM_ERROR_UNAVAILABLE_TEMPLATE = (
+    "The selected model ({model}) is currently unavailable or too busy. "
+    "Please retry later or select a different model.\n\n"
+    "Actual error message received:\n"
+)
+_LLM_ERROR_EXHAUSTED_TEMPLATE = (
+    "Datalect's reserved capacity for this model ({model}) has been exhausted. "
+    "Please select a different model.\n\n"
+    "Actual error message received:\n"
+)
+_LLM_ERROR_OTHER_TEMPLATE = (
+    "The selected model ({model}) ran into an error. Please select a different model.\n\n"
+    "Actual error message received:\n"
+)
+# "invalid_key" has two variants, not one - see the section comment above
+# _gemini_error_category for why format_llm_error_for_user needs a
+# `using_byok` flag to choose between them, rather than error_category()
+# itself producing two different category strings for what is, from the
+# exception's own shape, exactly the same failure.
+_LLM_ERROR_INVALID_KEY_BYOK_TEMPLATE = (
+    "Your custom API key for this model ({model}) was rejected. Please correct or remove it in "
+    "Preferences (Bring Your Own Key) - until then, this model will keep failing.\n\n"
+    "Actual error message received:\n"
+)
+_LLM_ERROR_INVALID_KEY_ENV_TEMPLATE = (
+    "The API key configured for this model ({model}) was rejected. This is a problem with the "
+    "app's own configuration, not something selecting a different model fixes on its own - please "
+    "let the app's administrator know, or try a different model in the meantime.\n\n"
+    "Actual error message received:\n"
+)
+_LLM_ERROR_TEMPLATES = {
+    "unavailable": _LLM_ERROR_UNAVAILABLE_TEMPLATE,
+    "exhausted": _LLM_ERROR_EXHAUSTED_TEMPLATE,
+    "other": _LLM_ERROR_OTHER_TEMPLATE,
+}
+
+
+def format_llm_error_for_user(provider, model_name, exc, using_byok=False):
+    """Turns a call's FINAL exception (after classify_error()'s own retry
+    budget is exhausted, or immediately for a non-retryable one) into the
+    honest, categorized message described in the section comment above -
+    always ending with the original raw exception text, never hiding it.
+    `provider` is any registered LlmProvider (its error_category() is what
+    actually classifies `exc` - see GeminiProvider/ClaudeProvider/
+    OpenAiProvider). An unrecognized category (there isn't one today, but
+    error_category() implementations are free to extend) falls back to the
+    generic "other" wording rather than raising.
+
+    `using_byok` - whether THIS call used a user-saved Bring-Your-Own-Key
+    value (see state_store.py's llm_byok_keys) rather than this app's own
+    env-configured key - only changes anything when the category is
+    "invalid_key": a user's own key gets told to fix/remove it in
+    Preferences, while this app's own configured key failing is squarely
+    this app's problem, not the user's, so it gets a different message
+    entirely (see the two templates above). Every other category's wording
+    is identical either way - a model being unavailable/exhausted has
+    nothing to do with whose key hit that limit."""
+    category = provider.error_category(exc)
+    if category == "invalid_key":
+        template = _LLM_ERROR_INVALID_KEY_BYOK_TEMPLATE if using_byok else _LLM_ERROR_INVALID_KEY_ENV_TEMPLATE
+    else:
+        template = _LLM_ERROR_TEMPLATES.get(category, _LLM_ERROR_OTHER_TEMPLATE)
+    raw = str(exc) or f"{type(exc).__name__} occurred."
+    return template.format(model=model_name) + raw
+
+
+class LlmCallFailed(Exception):
+    """Wraps an LLM provider call's final exception once format_llm_error_
+    for_user() above has already turned it into the full, categorized,
+    user-facing message - this wrapper's __str__ IS that message verbatim.
+
+    Raised (replacing a bare `raise`) at every "give up" point inside a
+    retry loop that sits INSIDE a wider try/except also covering unrelated
+    failures (schema fetch, etc.) - see stream_translation()'s inline
+    single-connection retry loop and generate_sql_for_connection() below,
+    both of which report their final exception to a caller several frames
+    away via a generic `except Exception as e: ... str(e)`. Without this,
+    that generic catch has no way to tell "the LLM call itself failed" (do
+    format the friendly message) apart from "something unrelated blew up
+    nearby" (don't - str(e) should stay whatever that unrelated exception
+    already says) - wrapping the message INTO the exception at the one
+    point that's unambiguous means every existing `str(e)`-based caller
+    gets the improved text for free, with no changes needed at the catch
+    site itself.
+
+    Deliberately NOT used by triage_all_mode_question (connection_router.py)
+    or summarize_all_mode_results below - neither of those loops ever runs
+    anything else ambiguous in their scope (no schema fetch, nothing else
+    that could raise) between capturing the LLM exception and returning
+    it, so their callers (translate_routes.py's router_only_all_mode
+    branch, and the /api/summarize-results route) call
+    format_llm_error_for_user() directly on the raw exception instead -
+    one fewer layer of indirection where it isn't needed."""
+    pass
+
+
 def format_results_table_text(columns, rows, max_rows=500):
     """Render a query result set as plain text suitable for an LLM prompt."""
     cols = columns or []
@@ -976,6 +1207,16 @@ class LlmProvider(ABC):
         every provider."""
         raise NotImplementedError
 
+    @abstractmethod
+    def error_category(self, exc):
+        """Classifies a call's FINAL exception (retry budget exhausted, or
+        immediately for a non-retryable one) into "unavailable"/
+        "exhausted"/"other" for format_llm_error_for_user() - see the
+        section comment above _gemini_error_category (above that function's
+        first implementation) for what each bucket means and why this is a
+        separate question from classify_error()'s retry policy."""
+        raise NotImplementedError
+
     def get_key_pool_size(self):
         """How many attempts the key-ROTATION retry budget gets (see
         stream_translation()'s retry loop) - the number of distinct
@@ -1060,6 +1301,9 @@ class GeminiProvider(LlmProvider):
     def classify_error(self, exc):
         return _classify_gemini_error(exc)
 
+    def error_category(self, exc):
+        return _gemini_error_category(exc)
+
 
 class ClaudeProvider(LlmProvider):
     # Registered as "anthropic" (see `name`'s docstring above) - this class
@@ -1139,6 +1383,9 @@ class ClaudeProvider(LlmProvider):
     def classify_error(self, exc):
         return _classify_claude_error(exc)
 
+    def error_category(self, exc):
+        return _claude_error_category(exc)
+
 
 class OpenAiProvider(LlmProvider):
     name = "openai"
@@ -1181,6 +1428,9 @@ class OpenAiProvider(LlmProvider):
 
     def classify_error(self, exc):
         return _classify_openai_error(exc)
+
+    def error_category(self, exc):
+        return _openai_error_category(exc)
 
 
 _LLM_PROVIDERS = {
@@ -1235,30 +1485,22 @@ def _strip_no_sql_prefix(text):
 # copy, since the user-facing meaning is the same: the app has nothing
 # useful to say about this prompt. Reserved specifically for the
 # "api_error": False case - the model actually responded (twice), but
-# with something unparseable both times. See _TRIAGE_API_ERROR_TEXT just
-# below for the other "failed" case, which must NOT reuse this text.
+# with something unparseable both times. The OTHER "failed" case
+# (api_error=True: the LLM call itself raised, and its own retry budget -
+# key rotation and/or transient-error retries - was fully used up without
+# ever getting a response at all) used to show a second fixed apology
+# text here (identical regardless of which model or what actually went
+# wrong); it's now built per-call by format_llm_error_for_user() instead
+# (see that function's own section comment, and its call site in
+# stream_translation()'s router branch below) - honest about WHY it
+# failed, and including the real error, rather than one more generic
+# "try again in a moment."
 _TRIAGE_FAILURE_TEXT = "*** NO SQL *** I am not able to respond to your prompt."
-
-# Fixed, HONEST message for triage's "failed" outcome when it's really a
-# technical/capacity problem, not a comprehension one - triage_all_mode_
-# question's "api_error": True case (see its docstring): the LLM call
-# itself raised, and its own retry budget - key rotation and/or transient-
-# error retries, the exact same policy every other LLM call in this app
-# already uses - was fully used up without ever getting a response at
-# all. Before this text existed, this case was silently folded into
-# _TRIAGE_FAILURE_TEXT above, so a resource-exhausted/rate-limited/down
-# provider looked identical to "I couldn't understand your question" -
-# actively misleading, since the honest fix here is "wait and try again,"
-# not "rephrase your question."
-_TRIAGE_API_ERROR_TEXT = (
-    "*** NO SQL *** I couldn't reach the AI model right now - it looks like it's "
-    "temporarily out of capacity or unavailable. Please try again in a moment."
-)
 
 
 def generate_sql_for_connection(descriptor, prompt, history, provider, client, model,
                                  user_identity, force_schema_refresh=False,
-                                 api_key=None, tried_keys=None):
+                                 api_key=None, tried_keys=None, using_byok=False):
     """Generates SQL for exactly ONE connection - behaviorally identical to
     what happens today when a user has that one connection selected and
     submits `prompt`: fetches its full (TTL-cached) schema via
@@ -1293,12 +1535,26 @@ def generate_sql_for_connection(descriptor, prompt, history, provider, client, m
     this with a fresh, independently-picked key and a fresh {api_key} set
     (see _run_phase_b_fanout).
 
+    `using_byok=True` means `api_key` is a user's own "Bring Your Own Key"
+    (see state_store.py's get_llm_byok_key) rather than one of this app's
+    own env-configured keys: the retry loop's key-rotation budget is
+    forced down to exactly 1 (there is no second key to rotate to, and
+    silently falling back to an env key would defeat the whole point of
+    the user supplying their own), and format_llm_error_for_user() is
+    told so it can word an "invalid key" failure as "fix your key in
+    Preferences" rather than "this app's admin needs to fix this".
+
     Returns (via `return`, capturable by `yield from` or
     _drain_generation): (generated_sql, usage_info, duration_ms,
     final_api_key, final_client) - generated_sql already has markdown
-    code-fences stripped. Raises the final classified-as-fatal (or
-    retry-budget-exhausted) exception on total failure - never swallows
-    anything; the caller decides how to handle it."""
+    code-fences stripped. On total failure, raises the final classified-
+    as-fatal (or retry-budget-exhausted) exception wrapped as
+    LlmCallFailed (see its own docstring) - str() on it is already the
+    full, categorized, user-facing message format_llm_error_for_user()
+    builds, so a caller that just does str(exc) (e.g.
+    _run_phase_b_fanout's per-connection failure handling) gets that text
+    with no further changes. Never swallows anything; the caller decides
+    how to handle it."""
     schema = get_database_schema(descriptor, user_identity, force_refresh=force_schema_refresh)
 
     try:
@@ -1316,7 +1572,7 @@ def generate_sql_for_connection(descriptor, prompt, history, provider, client, m
         api_key = provider.pick_api_key()
     if tried_keys is None:
         tried_keys = {api_key}
-    key_pool_size = provider.get_key_pool_size()
+    key_pool_size = 1 if using_byok else provider.get_key_pool_size()
 
     start_time = time.perf_counter()
     generated_sql = ""
@@ -1329,11 +1585,11 @@ def generate_sql_for_connection(descriptor, prompt, history, provider, client, m
         except Exception as e:
             retry_action = provider.classify_error(e)
             if retry_action is None:
-                raise
+                raise LlmCallFailed(format_llm_error_for_user(provider, model, e, using_byok=using_byok)) from e
 
             if retry_action["rotate_key"]:
                 if len(tried_keys) >= key_pool_size:
-                    raise
+                    raise LlmCallFailed(format_llm_error_for_user(provider, model, e, using_byok=using_byok)) from e
                 next_key = provider.pick_api_key(exclude=tried_keys)
                 if next_key != api_key:
                     api_key = next_key
@@ -1353,7 +1609,7 @@ def generate_sql_for_connection(descriptor, prompt, history, provider, client, m
                 continue
 
             if transient_attempt >= MAX_TRANSLATION_ATTEMPTS:
-                raise
+                raise LlmCallFailed(format_llm_error_for_user(provider, model, e, using_byok=using_byok)) from e
             logger.warning(
                 "%s call failed (attempt %d/%d), retrying in %ds: %s",
                 provider.name, transient_attempt, MAX_TRANSLATION_ATTEMPTS, retry_action["delay"], e
@@ -1502,7 +1758,17 @@ def _run_phase_b_fanout(selected_entries, prompts, provider, model, user_identit
       usage_totals: the five usage_info keys, summed across every call
         that actually produced a billable response (a failed call
         contributes nothing).
+
+    Resolves `user_identity`'s "Bring Your Own Key" value for `provider`
+    (state_store.get_llm_byok_key) exactly ONCE here, up front - not
+    per-worker - since it's the same user/provider for every entry in
+    this fan-out. When set, every worker uses that key instead of picking
+    its own from the env-configured pool, and generate_sql_for_connection
+    is told using_byok=True so its own retry loop won't try to rotate to
+    a different (env-configured) key on an auth failure.
     """
+    byok_key = state_store.get_llm_byok_key(user_identity, provider.name)
+
     def _run_one(entry, entry_prompt):
         # BUG FIXED HERE: this used to pick a fresh `worker_api_key` but
         # then pass it alongside the OUTER, closed-over `client` - which
@@ -1524,12 +1790,16 @@ def _run_phase_b_fanout(selected_entries, prompts, provider, model, user_identit
         # this app (generate_sql_for_connection's own internal rotation,
         # triage_all_mode_question, summarize_all_mode_results) already
         # does whenever it picks a new key.
-        worker_api_key = provider.pick_api_key()
+        # BYOK short-circuits the "pick a fresh key per worker" scheme
+        # above entirely - there's only one key, so every worker uses it
+        # (and, per generate_sql_for_connection's using_byok docstring,
+        # its retry loop won't try to rotate away from it on failure).
+        worker_api_key = byok_key or provider.pick_api_key()
         worker_client = provider.make_client(worker_api_key)
         gen = generate_sql_for_connection(
             entry["descriptor"], entry_prompt, [], provider, worker_client, model, user_identity,
             force_schema_refresh=force_schema_refresh,
-            api_key=worker_api_key, tried_keys={worker_api_key},
+            api_key=worker_api_key, tried_keys={worker_api_key}, using_byok=bool(byok_key),
         )
         return _drain_generation(gen)  # (generated_sql, usage_info, duration_ms, _key, _client)
 
@@ -1710,7 +1980,7 @@ def _build_summary_prompt(user_question, database_results):
 
 
 def summarize_all_mode_results(user_question, database_results, provider, client, model,
-                                api_key=None, tried_keys=None):
+                                api_key=None, tried_keys=None, using_byok=False):
     """"All databases" mode's Phase C - see the section comment above for
     the fuller picture of when/why this runs. A brief, plain-text answer
     to `user_question` - one short paragraph per database, over the
@@ -1742,14 +2012,27 @@ def summarize_all_mode_results(user_question, database_results, provider, client
     thread through a fresh call each time this fires.
 
     On total failure (LLM call retry/rotation budget exhausted, or 2
-    consecutive content-invalid responses) returns (None, None); the
-    caller treats that as "leave the Summary tab as it already is" rather
-    than surfacing a hard error, since this whole step is additive/best-
-    effort on top of a request that has already fully succeeded by this
-    point.
+    consecutive content-invalid responses) returns (None, None, error) -
+    `error` is the raw exception the LLM call finally failed with when
+    that's what happened (guaranteed to be an actual exception instance in
+    that case - the same reasoning as triage_all_mode_question's own
+    "error" key: the only way to reach `text is None` below is via the
+    except block that just set `last_error = e`, and nothing after that
+    ever reassigns it to something else before this returns), or a plain
+    descriptive string when it was instead 2 consecutive content-invalid
+    responses (nothing genuinely went wrong at the API level, so there's
+    no exception to report - just isinstance-check `error` to tell the two
+    apart). The caller (the /api/summarize-results route below) uses
+    format_llm_error_for_user() to build an honest message from `error`
+    when it's a real exception, surfacing WHY Phase C didn't produce a
+    summary rather than just leaving the Summary tab silently as it
+    already was - it's the caller, not this function, that needs
+    `using_byok` for that (see generate_sql_for_connection's docstring
+    for the general reasoning); `using_byok` is accepted here only to
+    force the key-rotation budget down to 1 attempt, same as there.
 
-    Returns (text, usage) on success - `text` is the model's own plain-
-    text answer, NOT YET prefixed with the app's "*** NO SQL ***"
+    Returns (text, usage, None) on success - `text` is the model's own
+    plain-text answer, NOT YET prefixed with the app's "*** NO SQL ***"
     convention (the caller adds that, exactly like triage's "answer"
     outcome does, so the prefix logic lives in exactly one place)."""
     llm_input = provider.build_llm_input([], "", _build_summary_prompt(user_question, database_results))
@@ -1758,7 +2041,7 @@ def summarize_all_mode_results(user_question, database_results, provider, client
         api_key = provider.pick_api_key()
     if tried_keys is None:
         tried_keys = {api_key}
-    key_pool_size = provider.get_key_pool_size()
+    key_pool_size = 1 if using_byok else provider.get_key_pool_size()
 
     last_error = None
     for attempt in range(2):
@@ -1818,14 +2101,14 @@ def summarize_all_mode_results(user_question, database_results, provider, client
         # response with no label convention at all (see its docstring).
         stripped = (text or "").strip()
         if stripped and not is_label_only_response(text or ""):
-            return stripped, usage
+            return stripped, usage, None
         last_error = (
             "response was only the label, or missing the label/blank-line shape, with no real content after it"
             if stripped else "empty summarization response"
         )
 
     logger.warning("All-mode results summarization (Phase C) failed after retry: %s", last_error)
-    return None, None
+    return None, None, last_error
 
 
 @translate_bp.route('/api/summarize-results', methods=['POST'])
@@ -1845,7 +2128,8 @@ def summarize_results():
         data.get(provider.request_model_key) or data.get('model')
         or session_data.get('llm_model') or provider.default_model
     )
-    api_key = provider.pick_api_key()
+    byok_key = state_store.get_llm_byok_key(user_identity, provider.name)
+    api_key = byok_key or provider.pick_api_key()
     if not api_key:
         resp = jsonify({'success': False, 'error': provider.missing_key_error})
         return apply_session_cookie(resp, session_id), 400
@@ -1863,8 +2147,9 @@ def summarize_results():
     if callable(close_fn):
         cancel_token, cancel_handle = cancel_registry.register(session_id, close_fn)
     try:
-        text, usage = summarize_all_mode_results(
+        text, usage, error = summarize_all_mode_results(
             prompt, database_results, provider, client, llm_model, api_key=api_key,
+            using_byok=bool(byok_key),
         )
     finally:
         if cancel_token is not None:
@@ -1874,7 +2159,18 @@ def summarize_results():
     duration = round(1000 * (time.perf_counter() - start_time))
 
     if text is None:
-        resp = jsonify({'success': False, 'error': 'Unable to summarize results right now.'})
+        # `error` is the raw exception when the LLM call itself is what
+        # failed (see summarize_all_mode_results' docstring) - format that
+        # honestly, same as every other LLM-call failure in this app now
+        # does. The other case (2 consecutive content-invalid responses,
+        # nothing wrong at the API level) has no exception to report, so
+        # it keeps the original generic message instead.
+        error_message = (
+            format_llm_error_for_user(provider, llm_model, error, using_byok=bool(byok_key))
+            if isinstance(error, BaseException) else
+            'Unable to summarize results right now.'
+        )
+        resp = jsonify({'success': False, 'error': error_message})
         return apply_session_cookie(resp, session_id)
 
     summary_text = "*** NO SQL *** " + text
@@ -1918,7 +2214,18 @@ def translate_query():
         data.get(provider.request_model_key) or data.get('model')
         or session_data.get('llm_model') or provider.default_model
     )
-    api_key = provider.pick_api_key()
+    # A user's own "Bring Your Own Key" (see state_store.py's
+    # get_llm_byok_key/set_session docstrings), when saved for this
+    # provider, is used INSTEAD of the app's own env-configured pool for
+    # every LLM call this request makes - triage, Phase B's per-connection
+    # fan-out, and the single-connection retry loop below all resolve
+    # `byok_key` from here (either directly, or via `_run_phase_b_fanout`
+    # re-resolving it itself for its own worker threads - see that
+    # function's docstring). `byok_key` is read-only from this point
+    # down, so stream_translation() below can safely close over it without
+    # `nonlocal`.
+    byok_key = state_store.get_llm_byok_key(user_identity, provider.name)
+    api_key = byok_key or provider.pick_api_key()
     if not api_key:
         return jsonify({'error': provider.missing_key_error}), 400
     tried_llm_keys = {api_key}
@@ -2085,7 +2392,7 @@ def translate_query():
                 }) + "\n"
                 triage_result = triage_all_mode_question(
                     candidate_summaries, prompt, provider, client, llm_model, history=history,
-                    api_key=api_key,
+                    api_key=api_key, using_byok=bool(byok_key),
                 )
                 # Phase A's own elapsed time and LLM usage, isolated from
                 # whatever Phase B work (if any) happens next below -
@@ -2123,11 +2430,18 @@ def translate_query():
                     # indistinguishable, both showing _TRIAGE_FAILURE_TEXT
                     # - actively misleading for the api_error case, since
                     # it reads as "I couldn't understand your question"
-                    # when the honest answer is "the AI service is
-                    # temporarily out of capacity, try again shortly."
-                    generated_sql = (
-                        _TRIAGE_API_ERROR_TEXT if triage_result.get("api_error") else _TRIAGE_FAILURE_TEXT
-                    )
+                    # when the honest answer is a real, specific API/
+                    # capacity problem - format_llm_error_for_user() below
+                    # builds that message from triage_result["error"] (the
+                    # raw exception - see triage_all_mode_question's
+                    # docstring), including the actual provider error text,
+                    # not just a generic "try again" apology.
+                    if triage_result.get("api_error"):
+                        generated_sql = "*** NO SQL *** " + format_llm_error_for_user(
+                            provider, llm_model, triage_result["error"], using_byok=bool(byok_key)
+                        )
+                    else:
+                        generated_sql = _TRIAGE_FAILURE_TEXT
                     triage_log_text = generated_sql
                 else:  # "route" - needs real data from specific connection(s)
                     selected_entries = [in_scope_entries[i] for i in triage_result["indices"]]
@@ -2354,8 +2668,14 @@ def translate_query():
             # Claude/OpenAI, exactly as before this dispatch existed.
             # tried_llm_keys already starts as {api_key} (set above, before
             # this generator runs), so it's the natural running total of
-            # distinct keys tried.
-            key_pool_size = provider.get_key_pool_size()
+            # distinct keys tried. A "Bring Your Own Key" forces this down
+            # to 1 (already met by tried_llm_keys' own starting size), same
+            # reasoning as generate_sql_for_connection's own using_byok
+            # parameter - there's no second key of the user's own to
+            # rotate to, so this loop's rotate_key branch below is made
+            # unreachable exactly the same way it already is for a
+            # provider that doesn't support rotation at all.
+            key_pool_size = 1 if byok_key else provider.get_key_pool_size()
 
             # Second of the two phase_status lines (see the module
             # docstring above) - emitted once, right before the retry loop
@@ -2387,7 +2707,7 @@ def translate_query():
                 except Exception as e:
                     retry_action = provider.classify_error(e)
                     if retry_action is None:
-                        raise
+                        raise LlmCallFailed(format_llm_error_for_user(provider, llm_model, e, using_byok=bool(byok_key))) from e
 
                     if retry_action["rotate_key"]:
                         # Key-rotation budget: one attempt per configured
@@ -2396,7 +2716,7 @@ def translate_query():
                         # full-pool behavior) so exhaustion is decided here,
                         # not masked by that fallback.
                         if len(tried_llm_keys) >= key_pool_size:
-                            raise
+                            raise LlmCallFailed(format_llm_error_for_user(provider, llm_model, e, using_byok=bool(byok_key))) from e
                         next_key = provider.pick_api_key(exclude=tried_llm_keys)
                         if next_key != api_key:
                             api_key = next_key
@@ -2424,7 +2744,7 @@ def translate_query():
 
                     # Shared transient-error budget (both providers).
                     if transient_attempt >= MAX_TRANSLATION_ATTEMPTS:
-                        raise
+                        raise LlmCallFailed(format_llm_error_for_user(provider, llm_model, e, using_byok=bool(byok_key))) from e
                     logger.warning(
                         "%s call failed (attempt %d/%d), retrying in %ds: %s",
                         provider.name, transient_attempt, MAX_TRANSLATION_ATTEMPTS, retry_action["delay"], e

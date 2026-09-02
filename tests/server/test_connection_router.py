@@ -24,7 +24,10 @@ import threading
 import time
 import types as pytypes
 
-from helpers import login_as, parse_translate_stream, parse_translate_stream_events, write_database_presets_file
+from helpers import (
+    login_as, parse_translate_stream, parse_translate_stream_events, set_llm_byok_key,
+    write_database_presets_file,
+)
 
 
 class GenaiHarness:
@@ -411,8 +414,40 @@ def test_triage_reports_api_error_when_key_rotation_budget_is_exhausted():
     candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": []}]
     result = triage_all_mode_question(candidates, "q", provider, client=None, model="m")
 
-    assert result == {"outcome": "failed", "api_error": True}
+    assert result["outcome"] == "failed"
+    assert result["api_error"] is True
+    # The raw exception the call actually failed with - not just a bool -
+    # so the caller (translate_routes.py's router branch) can build an
+    # honest, categorized message from it (see format_llm_error_for_user).
+    assert isinstance(result["error"], RuntimeError)
+    assert str(result["error"]) == "resource exhausted"
     assert len(provider.calls) == 1
+
+
+def test_triage_using_byok_forces_key_rotation_budget_to_one_even_with_multiple_keys():
+    from connection_router import triage_all_mode_question
+
+    # TWO configured keys - if using_byok didn't override
+    # get_key_pool_size() (see triage_all_mode_question's own docstring on
+    # the parameter), this would rotate and succeed exactly like
+    # test_triage_retries_a_retryable_error_and_succeeds_on_a_rotated_key
+    # above. A "Bring Your Own Key" call has no second key of the user's
+    # own to rotate to, so it must give up after the first attempt
+    # instead, regardless of how many keys this app itself has configured.
+    provider = _FakeProvider(
+        [RuntimeError("rejected")],
+        key_pool=["key-a", "key-b"],
+        classify_error=lambda exc: {"rotate_key": True, "delay": 0},
+    )
+    candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": []}]
+    result = triage_all_mode_question(
+        candidates, "q", provider, client=None, model="m", using_byok=True,
+    )
+
+    assert result["outcome"] == "failed"
+    assert result["api_error"] is True
+    assert len(provider.calls) == 1
+    assert provider.made_clients == []  # never even attempted a rotation
 
 
 def test_triage_reports_api_error_for_a_non_retryable_exception():
@@ -428,7 +463,10 @@ def test_triage_reports_api_error_for_a_non_retryable_exception():
     candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": []}]
     result = triage_all_mode_question(candidates, "q", provider, client=None, model="m")
 
-    assert result == {"outcome": "failed", "api_error": True}
+    assert result["outcome"] == "failed"
+    assert result["api_error"] is True
+    assert isinstance(result["error"], RuntimeError)
+    assert str(result["error"]) == "bad request"
     assert len(provider.calls) == 1
 
 
@@ -443,7 +481,10 @@ def test_triage_unparseable_response_is_not_reported_as_api_error():
     candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": []}]
     result = triage_all_mode_question(candidates, "q", provider, client=None, model="m")
 
-    assert result == {"outcome": "failed", "api_error": False}
+    assert result["outcome"] == "failed"
+    assert result["api_error"] is False
+    # Nothing genuinely went wrong at the API level - no exception to report.
+    assert result["error"] is None
     assert len(provider.calls) == 2
 
 
@@ -745,9 +786,17 @@ def test_all_mode_route_outcome_with_one_database_generation_failure_still_retur
     assert data['router_route'] is True
     assert "-- database: preset:pg-a (Sales Postgres)\nSELECT * FROM deals;" in data['sql']
     assert "preset:pg-b" not in data['sql']
-    assert data['generation_failures'] == [
-        {"kind": "preset", "id": "pg-b", "name": "Marketing Postgres", "error": "simulated Gemini failure"},
-    ]
+    assert len(data['generation_failures']) == 1
+    failure = data['generation_failures'][0]
+    assert failure["kind"] == "preset" and failure["id"] == "pg-b" and failure["name"] == "Marketing Postgres"
+    # A plain RuntimeError doesn't match any recognized "unavailable"/
+    # "exhausted" shape, so format_llm_error_for_user() falls back to its
+    # generic "other" wording - but still includes the real error text
+    # (see format_llm_error_for_user's docstring), not just a bare
+    # "simulated Gemini failure" like before this feature existed.
+    assert failure["error"].startswith("The selected model (")
+    assert "ran into an error" in failure["error"]
+    assert failure["error"].endswith("Actual error message received:\nsimulated Gemini failure")
     assert data['database_notes'] == []
 
 
@@ -779,9 +828,12 @@ def test_all_mode_route_outcome_all_databases_fail_or_note_returns_empty_sql_but
     assert data['database_notes'] == [
         {"kind": "preset", "id": "pg-a", "name": "Sales Postgres", "text": "Deals table has nothing relevant."},
     ]
-    assert data['generation_failures'] == [
-        {"kind": "preset", "id": "pg-b", "name": "Marketing Postgres", "error": "simulated failure"},
-    ]
+    assert len(data['generation_failures']) == 1
+    failure = data['generation_failures'][0]
+    assert failure["kind"] == "preset" and failure["id"] == "pg-b" and failure["name"] == "Marketing Postgres"
+    assert failure["error"].startswith("The selected model (")
+    assert "ran into an error" in failure["error"]
+    assert failure["error"].endswith("Actual error message received:\nsimulated failure")
 
 
 def test_all_mode_emits_phase_status_lines_for_schema_collection_and_routing_before_any_outcome(
@@ -979,10 +1031,11 @@ def test_all_mode_resource_exhausted_triage_shows_honest_message_not_generic_apo
     """End-to-end regression guard for the actual bug report this fixes:
     with a single configured Gemini key, a 429 (RESOURCE_EXHAUSTED) on the
     triage call has nowhere to rotate to and must give up immediately -
-    but the user-facing text must say so honestly (_TRIAGE_API_ERROR_TEXT),
-    NOT the generic "I am not able to respond to your prompt" apology
-    reserved for a genuinely unparseable response (see the test just
-    above, which must keep getting that exact text)."""
+    but the user-facing text must say so honestly, via
+    format_llm_error_for_user() (model name + category + the real error
+    text), NOT the generic "I am not able to respond to your prompt"
+    apology reserved for a genuinely unparseable response (see the test
+    just above, which must keep getting that exact text)."""
     env = _two_preset_env(app_factory, tmp_path)  # GEMINI_PRESET_KEYS: one key
     login_as(env.client, "alice@example.com")
     _set_all_mode(env.client)
@@ -997,7 +1050,10 @@ def test_all_mode_resource_exhausted_triage_shows_honest_message_not_generic_apo
     # No point retrying a second time against the same, already-exhausted
     # key - one call only, not triage's usual 2-attempt budget.
     assert len(harness.generate_calls) == 1
-    assert data['sql'].startswith('*** NO SQL *** I couldn\'t reach the AI model right now')
+    assert data['sql'].startswith(
+        "*** NO SQL *** Datalect's reserved capacity for this model"
+    )
+    assert 'Actual error message received:\nfake API error 429' in data['sql']
     assert data['sql'] != '*** NO SQL *** I am not able to respond to your prompt.'
     assert 'router_route' not in data
     assert 'connection_selection' not in data
@@ -1075,6 +1131,37 @@ def test_all_mode_phase_b_generation_recovers_by_rotating_to_a_second_configured
     assert data['router_route'] is True
     assert data['generation_failures'] == []
     assert "-- database: preset:pg-a (Sales Postgres)\nSELECT * FROM deals;" in data['sql']
+
+
+def test_all_mode_route_outcome_uses_byok_key_for_both_triage_and_phase_b(app_factory, tmp_path, monkeypatch):
+    """A saved "Bring Your Own Key" (see state_store.py's get_llm_byok_key)
+    is resolved ONCE in translate_query() and reused everywhere this
+    request calls the LLM - the triage call AND every Phase B per-
+    connection worker (see translate_routes.py's _run_phase_b_fanout,
+    which re-resolves it itself for its own worker threads) - never this
+    app's own env-configured key, even though one is configured here too."""
+    presets_path = write_database_presets_file(tmp_path, [
+        {"id": "pg-a", "name": "Sales Postgres", "type": "postgres", "url": "postgresql://u:p@host-a:5432/a"},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": presets_path, "GEMINI_PRESET_KEYS": "env-key-1"})
+    login_as(env.client, "alice@example.com")
+    _set_all_mode(env.client)
+    set_llm_byok_key(env, "google", "alices-own-key", user_identity="alice@example.com")
+
+    import db as db_module
+    monkeypatch.setattr(db_module, "_fetch_database_schema",
+                         _schema_fetch_by_url({"postgresql://u:p@host-a:5432/a": "Table: deals\nid INTEGER\n"}))
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(_gemini_ok('{"action": "route", "indices": [0], "message": "Checking Sales Postgres."}'))
+    harness.queue_response(_gemini_ok("SELECT * FROM deals;"))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'how many deals do we have'})
+    _, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    assert data['router_route'] is True
+    assert harness.client_api_keys == ["alices-own-key", "alices-own-key"]
 
 
 def test_all_mode_with_only_one_configured_connection_still_runs_triage_and_can_route(app_factory, tmp_path, monkeypatch):
@@ -1544,12 +1631,13 @@ def test_build_summary_prompt_caps_rows_the_same_way_past_turn_history_does(app_
 def test_summarize_all_mode_results_returns_stripped_text_and_usage_on_success(app_factory, tmp_path):
     env = _two_preset_env(app_factory, tmp_path)
     provider = _FakeProvider(["  Sales is up 10%, Marketing had no data.  "])
-    text, usage = env.translate_routes.summarize_all_mode_results(
+    text, usage, error = env.translate_routes.summarize_all_mode_results(
         "how is everything performing", [{"name": "Sales Postgres", "columns": [], "rows": []}],
         provider, client=None, model="m",
     )
     assert text == "Sales is up 10%, Marketing had no data."
     assert usage == {}
+    assert error is None
     assert len(provider.calls) == 1
 
 
@@ -1561,10 +1649,16 @@ def test_summarize_all_mode_results_gives_up_immediately_for_a_non_retryable_exc
     # already just proven it can't succeed right now.
     env = _two_preset_env(app_factory, tmp_path)
     provider = _FakeProvider([RuntimeError("boom"), RuntimeError("boom again")])
-    text, usage = env.translate_routes.summarize_all_mode_results(
+    text, usage, error = env.translate_routes.summarize_all_mode_results(
         "q", [{"name": "Sales Postgres", "columns": [], "rows": []}], provider, client=None, model="m",
     )
     assert (text, usage) == (None, None)
+    # The raw exception the call actually failed with - not just a bool or
+    # a generic string - so the caller (the /api/summarize-results route)
+    # can build an honest, categorized message from it (see
+    # format_llm_error_for_user).
+    assert isinstance(error, RuntimeError)
+    assert str(error) == "boom"
     assert len(provider.calls) == 1
 
 
@@ -1590,11 +1684,12 @@ def test_summarize_all_mode_results_retries_a_retryable_error_and_succeeds_on_a_
         key_pool=["key-a", "key-b"],
         classify_error=lambda exc: {"rotate_key": True, "delay": 0},
     )
-    text, usage = env.translate_routes.summarize_all_mode_results(
+    text, usage, error = env.translate_routes.summarize_all_mode_results(
         "how is everything performing", [{"name": "Sales Postgres", "columns": [], "rows": []}],
         provider, client="initial-client", model="m",
     )
     assert text == "Result Summary\n\nSales is up 10%."
+    assert error is None
     assert len(provider.calls) == 2
     # The retry rotated to a genuinely different key/client for the
     # second attempt, same as triage_all_mode_question's own retry does.
@@ -1614,11 +1709,37 @@ def test_summarize_all_mode_results_gives_up_immediately_when_key_rotation_budge
         key_pool=["only-key"],
         classify_error=lambda exc: {"rotate_key": True, "delay": 0},
     )
-    text, usage = env.translate_routes.summarize_all_mode_results(
+    text, usage, error = env.translate_routes.summarize_all_mode_results(
         "q", [{"name": "Sales Postgres", "columns": [], "rows": []}], provider, client=None, model="m",
     )
     assert (text, usage) == (None, None)
+    assert isinstance(error, RuntimeError)
+    assert str(error) == "resource exhausted"
     assert len(provider.calls) == 1
+
+
+def test_summarize_all_mode_results_using_byok_forces_key_rotation_budget_to_one_even_with_multiple_keys(
+    app_factory, tmp_path,
+):
+    # Mirrors test_triage_using_byok_forces_key_rotation_budget_to_one_
+    # even_with_multiple_keys above - TWO configured keys, but using_byok
+    # means there's no second key of the user's OWN to rotate to, so this
+    # must give up after the first attempt rather than rotating onto one
+    # of this app's own env-configured keys.
+    env = _two_preset_env(app_factory, tmp_path)
+    provider = _FakeProvider(
+        [RuntimeError("rejected")],
+        key_pool=["key-a", "key-b"],
+        classify_error=lambda exc: {"rotate_key": True, "delay": 0},
+    )
+    text, usage, error = env.translate_routes.summarize_all_mode_results(
+        "q", [{"name": "Sales Postgres", "columns": [], "rows": []}], provider, client=None, model="m",
+        using_byok=True,
+    )
+    assert (text, usage) == (None, None)
+    assert isinstance(error, RuntimeError)
+    assert len(provider.calls) == 1
+    assert provider.made_clients == []
 
 
 # A real model turned out to sometimes over-comply with
@@ -1641,18 +1762,26 @@ def test_summarize_all_mode_results_retries_a_response_that_is_just_the_results_
         "result summary\n\n", "Résumé des résultats\n\n",
     ):
         provider = _FakeProvider([label, "Results Summary\n\nSales is up 10%."])
-        text, usage = env.translate_routes.summarize_all_mode_results(
+        text, usage, error = env.translate_routes.summarize_all_mode_results(
             "how is everything performing", [{"name": "Sales Postgres", "columns": [], "rows": []}],
             provider, client=None, model="m",
         )
         assert text == "Results Summary\n\nSales is up 10%."
+        assert error is None
         assert len(provider.calls) == 2
 
     provider = _FakeProvider(["Results Summary\n\n", "Results Summary\n\n"])
-    text, usage = env.translate_routes.summarize_all_mode_results(
+    text, usage, error = env.translate_routes.summarize_all_mode_results(
         "q", [{"name": "Sales Postgres", "columns": [], "rows": []}], provider, client=None, model="m",
     )
     assert (text, usage) == (None, None)
+    # Content-invalid both times, not an API failure - nothing went wrong
+    # at the LLM-call level, so there's no exception to report (a plain
+    # descriptive string instead - see summarize_all_mode_results'
+    # docstring).
+    assert error == (
+        "response was only the label, or missing the label/blank-line shape, with no real content after it"
+    )
     assert len(provider.calls) == 2
 
 
@@ -1687,6 +1816,27 @@ def test_summarize_results_endpoint_returns_no_sql_prefixed_summary_and_logs_an_
     assert row['nl_prompt'] == 'how is everything performing across the board'
     assert row['sql_command'] == data['summary']
     assert (row['input_tokens'], row['output_tokens'], row['total_tokens']) == (10, 5, 15)
+
+
+def test_summarize_results_endpoint_uses_byok_key_instead_of_env_configured_key(
+    app_factory, tmp_path, monkeypatch,
+):
+    env = _two_preset_env(app_factory, tmp_path)  # GEMINI_PRESET_KEYS: fake-key-1 (the env key)
+    login_as(env.client, "alice@example.com")
+    set_llm_byok_key(env, "google", "alices-own-key", user_identity="alice@example.com")
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(_gemini_ok("Sales revenue is $500."))
+
+    resp = env.client.post('/api/summarize-results', json={
+        'prompt': 'how is everything performing',
+        'database_results': [{"kind": "preset", "id": "pg-a", "name": "Sales Postgres",
+                               "columns": ["total"], "rows": [{"total": 500}], "rowCount": 1}],
+    })
+    assert resp.status_code == 200
+    assert resp.get_json()['success'] is True
+    assert harness.client_api_keys == ["alices-own-key"]
 
 
 def test_summarize_results_endpoint_requires_prompt_and_database_results(app_factory, tmp_path):

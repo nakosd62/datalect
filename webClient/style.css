@@ -1244,6 +1244,14 @@ textarea:focus {
   overflow-y: auto;
 }
 
+/* Preferences dialog only - its 3 sections (Theme/Automatic SQL Execution/
+   Bring Your Own Key) read as more distinct, separate settings groups with
+   extra breathing room between them than the default .modal-body gap
+   gives every other modal that reuses that same class. */
+.modal-body-spacious {
+  gap: 2rem;
+}
+
 /* configModal's form needs its Save button pinned below a scrolling list
    of DB connections (which can grow arbitrarily tall as custom connections
    are added) rather than scrolling away with everything else - overrides
@@ -1335,6 +1343,47 @@ textarea:focus {
   color: var(--text-secondary);
 }
 
+/* Bring Your Own Key (Preferences dialog's third section) - one row per
+   provider, label and its text-input + small "remove" button pair laid
+   out side by side rather than stacked, so the three rows read as a
+   compact little form/table rather than six separate stacked blocks.
+   The label gets a fixed width (byok-row-label below) so all three
+   inputs line up in a column regardless of each provider name's length.
+   The input itself reuses .config-input's own look untouched;
+   .byok-clear-btn reuses .custom-db-remove-btn's "x" icon-button look
+   (see that class' comment) even though the two remove very different
+   things, purely for visual consistency of "small square x button next
+   to a field". */
+.byok-row {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.byok-row + .byok-row {
+  margin-top: 0.5rem;
+}
+
+.byok-row-label {
+  flex: 0 0 130px;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+}
+
+.byok-row-fields {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.byok-row-fields .byok-key-input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
 .config-input, .config-select {
   width: 100%;
   padding: 0.6rem 0.8rem;
@@ -1401,6 +1450,19 @@ textarea:focus {
   border: 1px solid var(--bg-card-border);
   border-radius: 6px;
   padding: 0.6rem 0.8rem;
+}
+
+/* Modifier for a short, mutually-exclusive option list (Preferences'
+   Theme radios - Dark/Light - are the only current use) that reads better
+   side by side than stacked - unlike .radio-group's other uses (model
+   selection, the DB connection list), which can hold many long options
+   and need the column flow. Kept as an additive modifier class rather
+   than changed on .radio-group itself so those other radio groups are
+   untouched. */
+.radio-group-row {
+  flex-direction: row;
+  align-items: center;
+  gap: 1.5rem;
 }
 
 /* Sub-group headings inside #modalDbRadioGroup ("Pre-configured Database
@@ -1727,17 +1789,35 @@ textarea:focus {
 /* Wraps the retry-status banner and the Cancel button as siblings -
    needed because showRetryStatus()/showPhaseStatus()/etc. fully
    overwrite #resultsRetryStatus's own innerHTML on every call, so the
-   Cancel button can't just live nested inside that div.
-   justify-content: flex-end keeps the button pinned to the right edge
-   even when #resultsRetryStatus is hidden (display: none via .hidden) -
-   without it, #stopBtn was the row's only flex item at that point and
-   fell back to flex-start, visibly jumping to the left every time the
-   status banner disappeared. */
+   Cancel button can't just live nested inside that div. The tinted
+   "progress banner" background/border is painted on THIS row rather than
+   on #resultsRetryStatus alone (see the :has() rule below), so the Cancel
+   button sitting beside the status text within this same row visually
+   reads as INSIDE the progress-reporting area, not as a separate control
+   floating next to it. */
 .results-status-row {
   flex-shrink: 0;
   display: flex;
-  align-items: stretch;
-  justify-content: flex-end;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+/* Only paint the banner look while there's actually something to show in
+   it - #resultsRetryStatus and #stopBtn each toggle their own .hidden
+   class independently (see showRetryStatus()/hideRetryStatus() and
+   setButtonsDisabled() in client.js: the Cancel button stays visible for
+   an in-flight request's entire duration, including brief moments before
+   any status text has arrived yet, which is exactly why it can't just be
+   nested inside #resultsRetryStatus's own hidden-toggling). Painting the
+   row unconditionally instead would leave a bare colored strip across the
+   results area even while nothing is happening. :has() is already used
+   elsewhere in this file (see .more-menu-auth-slot above) for the same
+   "style a container based on a child's state" need. */
+.results-status-row:has(#resultsRetryStatus:not(.hidden)),
+.results-status-row:has(#stopBtn:not(.hidden)) {
+  padding: 0.4rem 0.75rem;
+  background: rgba(var(--accent-cyan-rgb), 0.08);
+  border-bottom: 1px solid rgba(var(--accent-cyan-rgb), 0.3);
 }
 
 .results-retry-status {
@@ -1749,9 +1829,6 @@ textarea:focus {
   display: flex;
   align-items: center;
   gap: 0.5rem;
-  padding: 0.6rem 1rem;
-  background: rgba(var(--accent-cyan-rgb), 0.08);
-  border-bottom: 1px solid rgba(var(--accent-cyan-rgb), 0.3);
   color: var(--accent-cyan);
   font-size: 0.85rem;
 }
@@ -1762,15 +1839,39 @@ textarea:focus {
   line-height: 1;
 }
 
+/* Sized to match #runBtn.sql-overlay-btn (the Execute button overlaying
+   the SQL box) exactly - same padding/font-size/line-height/icon-gap/
+   border-radius - per design request, even though the two buttons live in
+   different parts of the layout and keep their own distinct colors (see
+   the color comment below). */
 #stopBtn.btn-stop {
+  flex-shrink: 0;
+  /* Pins this to the row's right edge regardless of whether
+     #resultsRetryStatus is present/visible next to it - relying on the
+     row's own justify-content to distribute space between the two only
+     works while BOTH are visible flex items; with the status text hidden
+     (display: none, so it's removed from flex layout entirely) this
+     button would otherwise be the row's only item and collapse to the
+     left edge instead of staying put on the right. */
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.2rem 0.45rem;
+  font-size: 0.65rem;
+  font-weight: 500;
+  line-height: 1;
+  border-radius: 6px;
+  /* Matches #runBtn.sql-overlay-btn's own 1px border exactly (same width,
+     same hue) purely so the two buttons come out the same overall height -
+     without a border here, this button rendered 2px shorter than Execute
+     despite every other sizing property already matching. */
+  border: 1px solid rgba(var(--accent-cyan-rgb), 0.4);
   /* The header/logo's own blue (--accent-cyan), matching .results-retry-
      status's own progress-banner color above - not --danger's bright red
      (too alarming for "cancel an in-progress query"), and not --warning's
      amber either (the light theme's particular shade of it read as
      aggressively red-orange rather than as a mild notice). */
-  flex-shrink: 0;
-  align-self: center;
-  margin: 0 0.75rem;
   background-color: var(--accent-cyan);
   color: var(--on-accent-cyan);
 }

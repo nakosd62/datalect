@@ -170,3 +170,124 @@ test.describe('preferences modal', () => {
     await expect(page.locator('#moreMenuDropdown')).toHaveClass(/hidden/);
   });
 });
+
+// --- Bring Your Own Key (the Preferences modal's third section) -------------
+// Same "real Flask server + real SqliteStateStore, nothing to mock" posture
+// as the rest of this file - saving a BYOK key never makes a live LLM call,
+// it just persists an (encrypted) string via /api/config. What actually
+// matters here is the "never redisplayed" contract: the saved key must
+// never come back out of GET /api/config, in the response JSON or anywhere
+// else in the page, and a blank box must not be mistaken for "clear this".
+
+test.describe('bring your own key', () => {
+  test('all three fields start blank with the "not set" placeholder', async ({ page }) => {
+    await gotoApp(page);
+    await openPreferencesModal(page);
+
+    for (const id of ['#byokKeyGoogle', '#byokKeyAnthropic', '#byokKeyOpenai']) {
+      await expect(page.locator(id)).toHaveValue('');
+      await expect(page.locator(id)).toHaveAttribute('placeholder', 'Paste your API key');
+    }
+  });
+
+  test('saving a key never echoes it back anywhere, and reopening shows it as saved without the value', async ({ page }) => {
+    await gotoApp(page);
+    await openPreferencesModal(page);
+
+    await page.locator('#byokKeyGoogle').fill('sk-my-secret-google-key');
+
+    const configResponse = page.waitForResponse(
+      (resp) => resp.url().includes('/api/config') && resp.request().method() === 'POST'
+    );
+    await page.locator('#preferencesSaveBtn').click();
+    const resp = await configResponse;
+    const bodyText = await resp.text();
+    expect(bodyText).not.toContain('sk-my-secret-google-key');
+
+    await openPreferencesModal(page);
+    await expect(page.locator('#byokKeyGoogle')).toHaveValue('');
+    await expect(page.locator('#byokKeyGoogle')).toHaveAttribute(
+      'placeholder', 'Key saved - leave blank to keep it, or paste a new one to replace it'
+    );
+    // Untouched providers are unaffected.
+    await expect(page.locator('#byokKeyAnthropic')).toHaveAttribute('placeholder', 'Paste your API key');
+
+    // Confirm the raw key never appears anywhere in a subsequent GET
+    // /api/config response either.
+    const getResponse = await page.request.get('/api/config');
+    const getBodyText = await getResponse.text();
+    expect(getBodyText).not.toContain('sk-my-secret-google-key');
+
+    // Clean up.
+    await page.locator('.byok-clear-btn[data-byok-provider="google"]').click();
+    await page.locator('#preferencesSaveBtn').click();
+  });
+
+  test('setting one provider does not disturb another already-saved provider', async ({ page }) => {
+    await gotoApp(page);
+    await openPreferencesModal(page);
+    await page.locator('#byokKeyGoogle').fill('google-key-1');
+    await page.locator('#preferencesSaveBtn').click();
+
+    await openPreferencesModal(page);
+    await page.locator('#byokKeyOpenai').fill('openai-key-1');
+    await page.locator('#preferencesSaveBtn').click();
+
+    await openPreferencesModal(page);
+    await expect(page.locator('#byokKeyGoogle')).toHaveAttribute(
+      'placeholder', 'Key saved - leave blank to keep it, or paste a new one to replace it'
+    );
+    await expect(page.locator('#byokKeyOpenai')).toHaveAttribute(
+      'placeholder', 'Key saved - leave blank to keep it, or paste a new one to replace it'
+    );
+    await expect(page.locator('#byokKeyAnthropic')).toHaveAttribute('placeholder', 'Paste your API key');
+
+    // Clean up both.
+    await page.locator('.byok-clear-btn[data-byok-provider="google"]').click();
+    await page.locator('.byok-clear-btn[data-byok-provider="openai"]').click();
+    await page.locator('#preferencesSaveBtn').click();
+  });
+
+  test('the "x" button clears a saved key back to "not set"', async ({ page }) => {
+    await gotoApp(page);
+    await openPreferencesModal(page);
+    await page.locator('#byokKeyAnthropic').fill('claude-key-1');
+    await page.locator('#preferencesSaveBtn').click();
+
+    await openPreferencesModal(page);
+    await expect(page.locator('#byokKeyAnthropic')).toHaveAttribute(
+      'placeholder', 'Key saved - leave blank to keep it, or paste a new one to replace it'
+    );
+
+    await page.locator('.byok-clear-btn[data-byok-provider="anthropic"]').click();
+    // Immediate feedback, before Save is even clicked.
+    await expect(page.locator('#byokKeyAnthropic')).toHaveAttribute('placeholder', 'Paste your API key');
+    await page.locator('#preferencesSaveBtn').click();
+
+    await openPreferencesModal(page);
+    await expect(page.locator('#byokKeyAnthropic')).toHaveAttribute('placeholder', 'Paste your API key');
+  });
+
+  test('leaving a saved key untouched while saving something else does not clear it', async ({ page }) => {
+    await gotoApp(page);
+    await openPreferencesModal(page);
+    await page.locator('#byokKeyOpenai').fill('openai-key-2');
+    await page.locator('#preferencesSaveBtn').click();
+
+    // A completely unrelated preferences save (theme only) - the untouched
+    // OpenAI box must not be sent as an explicit clear alongside it.
+    await openPreferencesModal(page);
+    await page.locator('#themeOptionLight').check();
+    await page.locator('#preferencesSaveBtn').click();
+
+    await openPreferencesModal(page);
+    await expect(page.locator('#byokKeyOpenai')).toHaveAttribute(
+      'placeholder', 'Key saved - leave blank to keep it, or paste a new one to replace it'
+    );
+
+    // Clean up.
+    await page.locator('.byok-clear-btn[data-byok-provider="openai"]').click();
+    await page.locator('#themeOptionDark').check();
+    await page.locator('#preferencesSaveBtn').click();
+  });
+});
