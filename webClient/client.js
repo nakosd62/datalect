@@ -103,6 +103,20 @@ document.addEventListener('DOMContentLoaded', async () => {
       // still technically work at history.length === 2.
       canUndo() { return history.length > 2; },
       canRedo() { return future.length >= 2; },
+      // Which turn is currently shown in the editor, relative to the newest
+      // one: 0 at the newest turn, -1 after stepping back once, -2 after
+      // twice, etc. Only for the goBackBtn/goForwardBtn nav buttons'
+      // history_nav_clicked analytics param (see their click handlers below)
+      // - every undo() moves one whole (user, model) turn - 2 entries - onto
+      // `future`, and every redo() moves one back off it, so the offset is
+      // just -(future.length / 2).
+      turnOffset() {
+        // Guards against -0 (0 / 2 negated) reaching GA as a distinct value
+        // from 0 - harmless in GA4 itself, but surprising to compare
+        // against in any test/report that expects a plain 0.
+        const stepsBack = future.length / 2;
+        return stepsBack === 0 ? 0 : -stepsBack;
+      },
       // What gets sent to /api/translate as `history`.
       toPayload() { return history; },
     };
@@ -447,9 +461,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   // in GA4 - see trackEvent()'s call sites throughout this file for the
   // full list: translate_submitted, sql_executed, error_shown,
   // report_submitted, database_selected, model_selected, help_viewed,
-  // history_viewed, preferences_viewed, login, logout, mic_used,
-  // quick_prompt_clicked. Custom, app-specific names throughout (not GA4's
-  // own recommended-event vocabulary) - per explicit request.
+  // history_viewed, history_nav_clicked, preferences_viewed, login, logout,
+  // mic_used, quick_prompt_clicked, tour_exited. Custom, app-specific names
+  // throughout (not GA4's own recommended-event vocabulary) - per explicit
+  // request.
   // ===========================================================================
 
   // GA4 silently truncates a custom event parameter's string value at 100
@@ -3781,12 +3796,18 @@ document.addEventListener('DOMContentLoaded', async () => {
     const authContainer = googleAuthEnabled ? document.getElementById('g_id_signin') : null;
     const quickPrompts = document.getElementById('examplePrompts');
     const quickPromptsVisible = quickPrompts && !quickPrompts.classList.contains('hidden');
-    // Under the narrow-header breakpoint, historyBtn/authContainer/helpBtn
-    // are CSS-hidden (collapsed into the triple-dot #moreMenuBtn - see the
-    // MORE MENU section above) - they'd still exist in the DOM, so
-    // pointing the tour at them directly would spotlight a zero-size rect.
-    // Point at the visible moreMenuBtn instead, with one combined step.
+    // Under the narrow-header breakpoint, historyBtn/authContainer/helpBtn/
+    // sendFeedbackBtn are CSS-hidden (collapsed into the triple-dot
+    // #moreMenuBtn - see the MORE MENU section above) - they'd still exist
+    // in the DOM, so pointing the tour at them directly would spotlight a
+    // zero-size rect. Point at the visible moreMenuBtn instead, with one
+    // combined step.
     const isNarrowHeader = !!(moreMenuWrapper && window.getComputedStyle(moreMenuWrapper).display !== 'none');
+    // Mirrors sendFeedbackBtn/moreMenuFeedbackBtn's own visibility gate
+    // (fetchBackendConfig() toggles both on ISSUE_REPORTING_ENABLED) -
+    // reused here so the tour never spotlights a feature-flagged-off button,
+    // wide header or narrow.
+    const feedbackMenuClause = ISSUE_REPORTING_ENABLED ? ', send feedback,' : ',';
 
     const steps = [
       {
@@ -3828,8 +3849,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         target: moreMenuBtn,
         title: 'Help, history, preferences & sign-in live here',
         body: isAnonymousUser
-          ? "Tap this menu for the full docs, your past translations, your preferences (color theme and auto-execute), and to sign in with Google so your connections and history follow you across devices."
-          : 'Tap this menu for the full docs, your past translations, your preferences (color theme and auto-execute), and to sign out.'
+          ? `Tap this menu for the full docs, your past translations, your preferences (color theme and auto-execute)${feedbackMenuClause} and to sign in with Google so your connections and history follow you across devices.`
+          : `Tap this menu for the full docs, your past translations, your preferences (color theme and auto-execute)${feedbackMenuClause} and to sign out.`
       }] : [
       {
         target: prefsBtn,
@@ -3852,6 +3873,11 @@ document.addEventListener('DOMContentLoaded', async () => {
         target: helpBtn,
         title: 'Stuck? Full docs are here',
         body: 'Come back to this Help button anytime for the full walkthrough, tips on multi-turn conversations, and more.'
+      },
+      {
+        target: ISSUE_REPORTING_ENABLED ? sendFeedbackBtn : null,
+        title: 'Something not right? Let us know',
+        body: 'Click this button anytime to send feedback, or report a translation, SQL query, or result that looks wrong.'
       }
       ])
     ];
@@ -3927,7 +3953,16 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function finishTour() {
-    if (!tourOverlay) return;
+    // Already hidden - a no-op call (e.g. finishTour() reached twice in a
+    // row) rather than a real exit, so skip re-tracking it. Every genuine
+    // exit path (Skip, clicking "Done" on the last step, and the
+    // zero-matching-steps edge case in showTourStep()) funnels through
+    // here, so this is the one place that needs the trackEvent() call
+    // rather than duplicating it at each button handler.
+    if (!tourOverlay || tourOverlay.classList.contains('hidden')) return;
+    // 1-based, matching the "Step X of Y" counter the user was just looking
+    // at (see showTourStep()) - not a 0-based array index.
+    trackEvent('tour_exited', { step: tourStepIndex + 1 });
     tourOverlay.classList.add('hidden');
     if (tourResizeHandler) {
       window.removeEventListener('resize', tourResizeHandler);
@@ -6992,6 +7027,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (chatStore.undo()) {
         updateHistoryTurnsSubtitle();
         restoreLatestTurn();
+        trackEvent('history_nav_clicked', { turn_offset: chatStore.turnOffset() });
       }
     });
   }
@@ -7001,6 +7037,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (chatStore.redo()) {
         updateHistoryTurnsSubtitle();
         restoreLatestTurn();
+        trackEvent('history_nav_clicked', { turn_offset: chatStore.turnOffset() });
       }
     });
   }

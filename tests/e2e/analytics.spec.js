@@ -4,8 +4,8 @@
 // around gtag('event', name, params) - see that function's own header
 // comment for the full list: translate_submitted, sql_executed,
 // error_shown, report_submitted, database_selected, model_selected,
-// help_viewed, history_viewed, preferences_viewed, login, logout,
-// mic_used, quick_prompt_clicked).
+// help_viewed, history_viewed, history_nav_clicked, preferences_viewed,
+// login, logout, mic_used, quick_prompt_clicked).
 //
 // Rather than stubbing/spying on window.gtag itself, these tests read
 // window.dataLayer directly - index.html's own inline snippet defines
@@ -271,6 +271,35 @@ test.describe('analytics: connection/model/nav', () => {
     await expect(page.locator('#historyModal')).not.toHaveClass(/hidden/);
 
     expect((await trackedEvents(page, 'history_viewed')).length).toBe(1);
+  });
+
+  test('history_nav_clicked fires with the turn offset when stepping back and forward', async ({ page }) => {
+    await mockTranslate(page, { sql: 'SELECT 1;' });
+    await gotoApp(page);
+
+    await page.locator('#aiPrompt').fill('first question');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect.poll(() => currentSql(page)).toContain('SELECT 1');
+
+    // A second turn - #goBackBtn/#goForwardBtn only enable with more than
+    // one turn in chatStore (see updateHistoryNavButtons()'s own comment on
+    // why one remaining turn already counts as "oldest").
+    await mockTranslate(page, { sql: 'SELECT 2;' });
+    await page.locator('#aiPrompt').fill('second question');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect.poll(() => currentSql(page)).toContain('SELECT 2');
+
+    // Current turn is 0; stepping back once lands on -1, forward again
+    // returns to 0 - see chatStore.turnOffset()'s own comment.
+    await page.locator('#goBackBtn').click();
+    await expect.poll(() => currentSql(page)).toContain('SELECT 1');
+    await page.locator('#goForwardBtn').click();
+    await expect.poll(() => currentSql(page)).toContain('SELECT 2');
+
+    const events = await trackedEvents(page, 'history_nav_clicked');
+    expect(events.length).toBe(2);
+    expect(events[0].turn_offset).toBe(-1);
+    expect(events[1].turn_offset).toBe(0);
   });
 
   test('preferences_viewed fires when the Preferences button is clicked', async ({ page }) => {

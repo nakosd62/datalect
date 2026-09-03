@@ -12,6 +12,30 @@
 
 const { isolatedTest: test, expect } = require('./fixtures');
 
+// Real local-dev servers never have ISSUE_REPORT_* env vars configured (see
+// playwright.config.js's webServer block), so sendFeedbackBtn/its tour step
+// are hidden by default - same "force the flag via GET /api/config" trick
+// report-issue.spec.js and analytics.spec.js already use.
+async function mockIssueReportingEnabled(page, enabled) {
+  await page.route('**/api/config', async (route) => {
+    if (route.request().method() !== 'GET') return route.fallback();
+    const response = await route.fetch();
+    const json = await response.json();
+    json.issue_reporting_enabled = enabled;
+    await route.fulfill({ response, json });
+  });
+}
+
+// Same window.dataLayer-reading approach as analytics.spec.js - see that
+// file's header comment for why gtag() itself is never stubbed.
+async function trackedEvents(page, name) {
+  return page.evaluate((eventName) => {
+    return (window.dataLayer || [])
+      .filter((entry) => entry && entry[0] === 'event' && entry[1] === eventName)
+      .map((entry) => entry[2] || {});
+  }, name);
+}
+
 test.describe('first-run onboarding', () => {
   test('a brand-new visitor sees the guided tour, and can skip it', async ({ page }) => {
     await page.goto('/');
@@ -119,5 +143,117 @@ test.describe('first-run onboarding', () => {
     }
     await expect(title).toContainText('preferences');
     await expect(page.locator('#tourTooltipBody')).toContainText('preferences (color theme and auto-execute)');
+  });
+
+  test('the tour includes a step spotlighting the Send Feedback button, only when the feature is configured', async ({ page }) => {
+    await mockIssueReportingEnabled(page, true);
+    await page.goto('/');
+    await expect(page.locator('#tourOverlay')).not.toHaveClass(/hidden/);
+    await expect(page.locator('#sendFeedbackBtn')).toBeVisible();
+
+    // getTourSteps() places this step last, right after the Help step - same
+    // "click Next until the title shows up" approach as the model-badge/gear
+    // tests above.
+    const title = page.locator('#tourTooltipTitle');
+    for (let i = 0; i < 10; i++) {
+      if ((await title.textContent())?.includes('Let us know')) break;
+      await page.locator('#tourNextBtn').click();
+    }
+    await expect(title).toHaveText('Something not right? Let us know');
+    await expect(page.locator('#tourTooltipBody')).toContainText('send feedback');
+    await expect(page.locator('#tourNextBtn')).toHaveText('Done');
+
+    // Regression guard against the step existing but pointing at the wrong
+    // target - same spotlight-position check the model-badge/gear tests use.
+    const feedbackBox = await page.locator('#sendFeedbackBtn').boundingBox();
+    await expect(async () => {
+      const spotlightBox = await page.locator('#tourSpotlight').boundingBox();
+      expect(Math.abs(spotlightBox.x - feedbackBox.x)).toBeLessThan(10);
+      expect(Math.abs(spotlightBox.y - feedbackBox.y)).toBeLessThan(10);
+    }).toPass({ timeout: 2000 });
+  });
+
+  test('the tour never spotlights Send Feedback, and never mentions it, when the feature is not configured', async ({ page }) => {
+    await mockIssueReportingEnabled(page, false);
+    await page.goto('/');
+    await expect(page.locator('#tourOverlay')).not.toHaveClass(/hidden/);
+    await expect(page.locator('#sendFeedbackBtn')).toBeHidden();
+
+    const title = page.locator('#tourTooltipTitle');
+    const seenTitles = [];
+    for (let i = 0; i < 10; i++) {
+      seenTitles.push(await title.textContent());
+      const nextBtn = page.locator('#tourNextBtn');
+      if ((await nextBtn.textContent()) === 'Done') break;
+      await nextBtn.click();
+    }
+    expect(seenTitles.some((t) => t?.includes('Let us know'))).toBe(false);
+  });
+
+  test('on a narrow (mobile) header, the combined more-menu tour step mentions Send Feedback only when the feature is configured', async ({ page }) => {
+    await mockIssueReportingEnabled(page, true);
+    await page.setViewportSize({ width: 420, height: 800 });
+    await page.goto('/');
+    await expect(page.locator('#tourOverlay')).not.toHaveClass(/hidden/);
+
+    const title = page.locator('#tourTooltipTitle');
+    for (let i = 0; i < 10; i++) {
+      if ((await title.textContent())?.includes('preferences')) break;
+      await page.locator('#tourNextBtn').click();
+    }
+    await expect(page.locator('#tourTooltipBody')).toContainText('send feedback');
+  });
+
+  test('tour_exited fires with step 1 when skipped immediately', async ({ page }) => {
+    await page.goto('/');
+    await expect(page.locator('#tourOverlay')).not.toHaveClass(/hidden/);
+    await expect(page.locator('#tourStepCounter')).toContainText('Step 1 of');
+
+    await page.locator('#tourSkipBtn').click();
+    await expect(page.locator('#tourOverlay')).toHaveClass(/hidden/);
+
+    const events = await trackedEvents(page, 'tour_exited');
+    expect(events.length).toBe(1);
+    expect(events[0].step).toBe(1);
+  });
+
+  test('tour_exited fires with the step the user had reached when skipped partway through', async ({ page }) => {
+    await page.goto('/');
+    await expect(page.locator('#tourOverlay')).not.toHaveClass(/hidden/);
+
+    // Step forward a few times before bailing out - whatever step is
+    // showing when Skip is clicked is what should be reported.
+    await page.locator('#tourNextBtn').click();
+    await page.locator('#tourNextBtn').click();
+    const stepText = await page.locator('#tourStepCounter').textContent();
+    const expectedStep = Number(stepText.match(/Step (\d+) of/)[1]);
+
+    await page.locator('#tourSkipBtn').click();
+    await expect(page.locator('#tourOverlay')).toHaveClass(/hidden/);
+
+    const events = await trackedEvents(page, 'tour_exited');
+    expect(events.length).toBe(1);
+    expect(events[0].step).toBe(expectedStep);
+  });
+
+  test('tour_exited fires with the final step number when the tour is completed via "Done"', async ({ page }) => {
+    await page.goto('/');
+    await expect(page.locator('#tourOverlay')).not.toHaveClass(/hidden/);
+
+    const nextBtn = page.locator('#tourNextBtn');
+    let totalSteps = null;
+    for (let i = 0; i < 20; i++) {
+      const stepText = await page.locator('#tourStepCounter').textContent();
+      totalSteps = Number(stepText.match(/Step \d+ of (\d+)/)[1]);
+      if ((await nextBtn.textContent()) === 'Done') break;
+      await nextBtn.click();
+    }
+    await expect(nextBtn).toHaveText('Done');
+    await nextBtn.click();
+    await expect(page.locator('#tourOverlay')).toHaveClass(/hidden/);
+
+    const events = await trackedEvents(page, 'tour_exited');
+    expect(events.length).toBe(1);
+    expect(events[0].step).toBe(totalSteps);
   });
 });
