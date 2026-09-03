@@ -1,15 +1,29 @@
 // tests/e2e/more-menu.spec.js
 //
 // Under a very narrow (mobile-portrait-width) viewport, the header's
-// Help/History/sign-in controls collapse into a single triple-dot "more"
-// menu (see the @media (max-width: 480px) block in style.css and the MORE
-// MENU section in client.js) so the connection/model status badges have
+// Help/History/Feedback/sign-in controls collapse into a single triple-dot
+// "more" menu (see the @media (max-width: 480px) block in style.css and the
+// MORE MENU section in client.js) so the connection/model status badges have
 // room to render without being squashed. This only tests the collapse
 // itself and that the menu's items forward to the real, existing
-// Help/History behavior - the individual modals' own contents are already
-// covered by app-shell.spec.js.
+// Help/History/Feedback behavior - the individual modals' own contents are
+// already covered by app-shell.spec.js (Help/History) and
+// report-issue.spec.js (the feedback modal).
 
 const { test, expect, gotoApp } = require('./fixtures');
+
+/** Same GET /api/config interception report-issue.spec.js uses to force a
+ * known 'issue_reporting_enabled' value - duplicated locally rather than
+ * imported, matching this file's existing no-shared-helpers convention. */
+async function mockIssueReportingEnabled(page, enabled) {
+  await page.route('**/api/config', async (route) => {
+    if (route.request().method() !== 'GET') return route.fallback();
+    const response = await route.fetch();
+    const json = await response.json();
+    json.issue_reporting_enabled = enabled;
+    await route.fulfill({ response, json });
+  });
+}
 
 test.describe('triple-dot more menu (narrow header)', () => {
   test.use({ viewport: { width: 375, height: 700 } });
@@ -62,6 +76,28 @@ test.describe('triple-dot more menu (narrow header)', () => {
     await page.locator('#moreMenuBtn').click();
     await page.locator('#moreMenuHistoryBtn').click();
     await expect(page.locator('#historyModal')).not.toHaveClass(/hidden/);
+    await expect(page.locator('#moreMenuDropdown')).toHaveClass(/hidden/);
+  });
+
+  test('the "Feedback" menu item is hidden when issue reporting is not configured', async ({ page }) => {
+    await mockIssueReportingEnabled(page, false);
+    await gotoApp(page);
+
+    await page.locator('#moreMenuBtn').click();
+    await expect(page.locator('#moreMenuFeedbackBtn')).toBeHidden();
+  });
+
+  test('the "Feedback" menu item forwards to the send-feedback modal', async ({ page }) => {
+    await mockIssueReportingEnabled(page, true);
+    await gotoApp(page);
+
+    await page.locator('#moreMenuBtn').click();
+    await expect(page.locator('#moreMenuFeedbackBtn')).toBeVisible();
+    await page.locator('#moreMenuFeedbackBtn').click();
+
+    await expect(page.locator('#reportIssueModal')).toBeVisible();
+    await expect(page.locator('#reportIssueModalTitle')).toHaveText('Send Feedback');
+    // Forwarding via the real header button's own click handler also closes the menu.
     await expect(page.locator('#moreMenuDropdown')).toHaveClass(/hidden/);
   });
 });

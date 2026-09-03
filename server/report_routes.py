@@ -1,7 +1,7 @@
 """
 report_routes.py
 
-POST /api/report-issue - lets a user flag either:
+POST /api/report-issue - lets a user flag one of three things:
   - an "error" report: a raw/uncategorized error execute_routes.py returned
     verbatim (see that module's docstring) - typically a database driver's
     own cryptic message for SQL the model generated incorrectly. Deliberately
@@ -12,12 +12,33 @@ POST /api/report-issue - lets a user flag either:
   - a "wrong_result" report: a SUCCESSFUL response (a table of rows, a
     plain-text reply, an all-databases summarization) the user believes is
     wrong or misleading.
+  - a "feedback" report: general free-text feedback about the app itself -
+    a suggestion, question, or comment - NOT tied to any specific query or
+    result. Triggered from the Help dialog's "Send Feedback" button (see
+    webClient/help.html, which used to point users at a mailto: link
+    instead - replaced so feedback doesn't depend on the visitor having a
+    configured mail client). Unlike the other two categories, there's no
+    structured content to preview beforehand: `prompt`/`sql`/`content` are
+    simply absent from the request body, and `details` (normally an
+    optional add-on for the other categories) IS the entire message.
+  - a "wrong_sql" report: the SQL currently sitting in the SQL box looks
+    wrong to the user, triggered from the thumbs-down button next to that
+    box's own Execute button - independent of whether it's ever been run
+    (unlike "error"/"wrong_result", which both react to something that
+    already executed). Unlike every other category, the client lets the
+    user freely rewrite the captured NL prompt + SQL text before it's ever
+    sent (see webClient/client.js's REPORT_CATEGORY_CONFIG.wrong_sql and
+    its previewEditable flag) - so what arrives here as `content` is
+    whatever the user settled on, not necessarily the prompt/SQL verbatim.
+    `prompt`/`sql` are absent from the request body the same way they are
+    for "feedback" - the edited text carries both.
 
-Both categories are reviewed by the user client-side BEFORE this endpoint is
-ever called - see webClient/index.html's #reportIssueModal, which shows
-exactly what will be emailed (and lets the user add free-text details)
-before Send is clicked. This route trusts that review already happened; it
-does no content moderation of its own beyond the length cap below.
+All three categories are reviewed by the user client-side BEFORE this
+endpoint is ever called - see webClient/index.html's #reportIssueModal,
+which shows exactly what will be emailed (and lets the user add free-text
+details) before Send is clicked. This route trusts that review already
+happened; it does no content moderation of its own beyond the length cap
+below.
 
 Delivery is real SMTP, sent by this app itself (not a mailto: link) - see
 app_config.py's ISSUE_REPORT_* env vars for the connection this uses, and
@@ -52,6 +73,8 @@ report_bp = Blueprint('report', __name__)
 _VALID_CATEGORIES = {
     'error': 'Execution Error',
     'wrong_result': 'Wrong Result',
+    'feedback': 'Feedback',
+    'wrong_sql': 'Wrong SQL',
 }
 
 # Hard cap on every free-text field this route embeds into an email body -
@@ -72,12 +95,16 @@ def _truncate(value):
     return text
 
 
-def _build_email(category_label, payload, reporter_identity):
+def _build_email(category, category_label, payload, reporter_identity):
     """Builds (subject, plain-text body) for one report. `payload` is the
     request's own JSON body (already validated to have a known `category`
     by the caller) - every other field is optional and simply omitted from
-    the body when blank, rather than printed as an empty section."""
-    subject = f"[Datalect] {category_label} report"
+    the body when blank, rather than printed as an empty section.
+
+    `category` (the short machine code, e.g. 'feedback') is only used to
+    pick the "details" section's own header below - everywhere else this
+    function already works off the human-readable `category_label`."""
+    subject = f"[Datalect] {category_label}" if category == 'feedback' else f"[Datalect] {category_label} report"
     database_name = (payload.get('database_name') or '').strip()
     if database_name:
         subject += f" - {database_name}"
@@ -108,13 +135,24 @@ def _build_email(category_label, payload, reporter_identity):
 
     content = _truncate(payload.get('content'))
     if content:
-        lines.append(f"--- {category_label} content (as shown to the user) ---")
+        if category == 'wrong_sql':
+            # Not "as shown to the user" like the other categories' content
+            # section - this one is the user's own edited text (see this
+            # module's docstring on 'wrong_sql'), so it gets a header that
+            # doesn't imply it's a verbatim, untouched capture.
+            lines.append("--- Prompt & SQL (as reviewed/edited by the user) ---")
+        else:
+            lines.append(f"--- {category_label} content (as shown to the user) ---")
         lines.append(content)
         lines.append("")
 
     details = _truncate(payload.get('details'))
     if details:
-        lines.append("--- User's additional details ---")
+        # For 'feedback', `details` IS the entire message (there's no
+        # preceding prompt/sql/content section it's "additional" to) - see
+        # this module's docstring - so it gets its own plain header instead
+        # of being framed as an add-on to something else.
+        lines.append("--- Feedback ---" if category == 'feedback' else "--- User's additional details ---")
         lines.append(details)
         lines.append("")
 
@@ -145,12 +183,12 @@ def report_issue():
     if category not in _VALID_CATEGORIES:
         resp = jsonify({
             'success': False,
-            'error': "Invalid or missing 'category' - expected 'error' or 'wrong_result'.",
+            'error': "Invalid or missing 'category' - expected 'error', 'wrong_result', 'feedback', or 'wrong_sql'.",
         })
         return apply_session_cookie(resp, session_id), 400
 
     category_label = _VALID_CATEGORIES[category]
-    subject, body = _build_email(category_label, data, user_identity)
+    subject, body = _build_email(category, category_label, data, user_identity)
 
     msg = EmailMessage()
     msg['Subject'] = subject

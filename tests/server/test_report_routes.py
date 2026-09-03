@@ -183,6 +183,77 @@ def test_report_issue_wrong_result_category_labels_subject_and_body(app_factory,
     assert "Sales grew 400%" in body
 
 
+def test_report_issue_feedback_category_sends_expected_email(app_factory, smtp_harness):
+    # Unlike 'error'/'wrong_result', a 'feedback' report has no prompt/sql/
+    # content of its own - see report_routes.py's module docstring - just
+    # `details`, which the Help dialog's "Send Feedback" button (see
+    # client.js's REPORT_CATEGORY_CONFIG.feedback) treats as the entire
+    # message rather than an optional add-on.
+    env = app_factory(env=ISSUE_REPORT_ENV)
+    instances = smtp_harness()
+
+    resp = env.client.post("/api/report-issue", json={
+        "category": "feedback",
+        "details": "It would be great if the SQL editor supported Vim keybindings.",
+    })
+
+    assert resp.status_code == 200
+    assert resp.get_json()["success"] is True
+
+    msg = instances[0].sent_messages[0]
+    assert "Feedback" in msg["Subject"]
+    # Not framed as a "report" the way error/wrong_result subjects are.
+    assert "report" not in msg["Subject"].lower()
+
+    body = msg.get_content()
+    assert "Category: Feedback" in body
+    # No prompt/sql/content sections should appear at all - none were sent.
+    assert "User's question" not in body
+    assert "Generated SQL" not in body
+    # `details` gets its own plain header, not "User's additional details".
+    assert "--- Feedback ---" in body
+    assert "User's additional details" not in body
+    assert "Vim keybindings" in body
+
+
+def test_report_issue_wrong_sql_category_sends_expected_email(app_factory, smtp_harness):
+    # Unlike 'error'/'wrong_result', 'wrong_sql' sends no separate prompt/sql
+    # fields - see report_routes.py's module docstring on why: the client
+    # lets the user freely edit the captured prompt+SQL text before it's
+    # ever sent, so it arrives here bundled into `content` alone, the same
+    # shape 'feedback' uses for its own single free-text field.
+    env = app_factory(env=ISSUE_REPORT_ENV)
+    instances = smtp_harness()
+
+    resp = env.client.post("/api/report-issue", json={
+        "category": "wrong_sql",
+        "database_name": "E-Commerce Store",
+        "provider": "openai",
+        "model": "gpt-5.3-codex",
+        "content": "NL prompt:\nHow many orders were placed last week?\n\nSQL:\nSELECT * FROM ordrs;",
+        "details": "I think the model misspelled the table name.",
+    })
+
+    assert resp.status_code == 200
+    assert resp.get_json()["success"] is True
+
+    msg = instances[0].sent_messages[0]
+    assert "Wrong SQL" in msg["Subject"]
+    assert "E-Commerce Store" in msg["Subject"]
+
+    body = msg.get_content()
+    assert "Category: Wrong SQL" in body
+    assert "openai / gpt-5.3-codex" in body
+    # No separate prompt/sql sections - only the bundled, user-edited content.
+    assert "User's question" not in body
+    assert "Generated SQL" not in body
+    assert "--- Prompt & SQL (as reviewed/edited by the user) ---" in body
+    assert "How many orders were placed last week?" in body
+    assert "SELECT * FROM ordrs;" in body
+    assert "--- User's additional details ---" in body
+    assert "I think the model misspelled the table name." in body
+
+
 def test_report_issue_sets_reply_to_for_authenticated_email_identity(app_factory, smtp_harness):
     env = app_factory(env=dict(ISSUE_REPORT_ENV, GOOGLE_CLIENT_ID="fake-client-id"))
     instances = smtp_harness()

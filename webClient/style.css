@@ -474,6 +474,22 @@ textarea:focus {
   background: rgba(var(--danger-rgb), 0.1);
 }
 
+/* client.js's setButtonsDisabled() already sets the `disabled` attribute
+   here while a translate/execute call is in flight, same as #runBtn/
+   #reportSqlBtn - but same gap #reportSqlBtn had (see .report-sql-btn:
+   disabled's own comment): no visual change went with it, so a disabled-
+   but-still-full-color icon read as clickable when it wasn't. Same dimmed/
+   not-allowed/hover-suppressed treatment applied there, applied here too. */
+.mic-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.mic-btn:disabled:hover {
+  color: var(--accent-cyan);
+  background: transparent;
+}
+
 .stat-label {
   font-size: 0.55rem;
   text-transform: uppercase;
@@ -662,7 +678,7 @@ textarea:focus {
   min-width: 0;
 }
 
-.gear-btn, .help-btn, .history-btn, .more-menu-btn {
+.gear-btn, .help-btn, .history-btn, .feedback-btn, .more-menu-btn {
   background: var(--overlay-2);
   border: 1px solid var(--bg-card-border);
   padding: 0.35rem;
@@ -677,22 +693,22 @@ textarea:focus {
   flex-shrink: 0;
 }
 
-/* Doc/History/Preferences icons pick up the app's brand blue (matches the
-   logo and progress-reporting UI - see --accent-cyan) instead of the plain
-   text color, so they read as intentional brand accents rather than
-   generic UI chrome. The triple-dot "more" menu button (folds these three
+/* Doc/History/Preferences/Feedback icons pick up the app's brand blue
+   (matches the logo and progress-reporting UI - see --accent-cyan) instead
+   of the plain text color, so they read as intentional brand accents rather
+   than generic UI chrome. The triple-dot "more" menu button (folds these
    into one menu on narrow screens) intentionally keeps the neutral
    --text-primary color - it wasn't part of this ask and isn't a
-   brand-level action the way Doc/History/Preferences are. */
+   brand-level action the way the others are. */
 .more-menu-btn {
   color: var(--text-primary);
 }
 
-.gear-btn, .help-btn, .history-btn {
+.gear-btn, .help-btn, .history-btn, .feedback-btn {
   color: var(--accent-cyan);
 }
 
-.gear-btn svg, .help-btn svg, .history-btn svg, .more-menu-btn svg {
+.gear-btn svg, .help-btn svg, .history-btn svg, .feedback-btn svg, .more-menu-btn svg {
   width: clamp(20px, 2.2vw, 29px);
   height: clamp(20px, 2.2vw, 29px);
 }
@@ -705,6 +721,7 @@ textarea:focus {
 
 .help-btn:hover,
 .history-btn:hover,
+.feedback-btn:hover,
 .more-menu-btn:hover {
   background: var(--overlay-4);
   color: var(--primary);
@@ -867,6 +884,7 @@ textarea:focus {
   .header-actions > .help-btn,
   .header-actions > .history-btn,
   .header-actions > .gear-btn,
+  .header-actions > .feedback-btn,
   .header-actions > .auth-container {
     display: none !important;
   }
@@ -986,11 +1004,25 @@ textarea:focus {
   box-sizing: border-box;
 }
 
-/* Position the Execute button in the top-right corner */
-#runBtn.sql-overlay-btn {
+/* Wraps the Execute button together with the "report wrong SQL" thumbs-
+   down button (#reportSqlBtn) so the two lay out as one unit in the SQL
+   box's top-right corner - #runBtn.sql-overlay-btn used to carry its own
+   `position: absolute; top/right` for this (see below) back when it was
+   the only overlay control; now this wrapper owns the positioning and
+   both buttons are just normal flex children inside it, Execute first so
+   the report button reads as sitting "to the right of Execute" per the
+   original design request. */
+.sql-overlay-actions {
   position: absolute;
   top: 6px;
   right: 6px;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+#runBtn.sql-overlay-btn {
   display: inline-flex;
   align-items: center;
   gap: 0.4rem;
@@ -1000,7 +1032,6 @@ textarea:focus {
   line-height: 1;
   gap: 0.25rem;          /* reduced spacing between icon and text */
   border-radius: 4px;    /* scaled down radius */
-  z-index: 2;
   /* z-index: 10; Ensures it renders on top of CodeMirror scroll/gutters */
   background: rgba(var(--accent-cyan-rgb), 0.85); /* Brand blue accent - matches logo/icons */
   color: #ffffff;
@@ -1021,6 +1052,53 @@ textarea:focus {
   cursor: not-allowed;
 }
 
+/* "Report wrong SQL" thumbs-down icon - sits beside Execute inside
+   .sql-overlay-actions above, opening the same #reportIssueModal used
+   everywhere else in the app (in 'wrong_sql' mode - see
+   REPORT_CATEGORY_CONFIG.wrong_sql in client.js). Sized and colored to
+   match #micBtn exactly - same 16x16 icon, same transparent/accent-cyan-
+   then-primary-on-hover treatment - per explicit request, rather than the
+   --danger red the error-tab Report button briefly used (see
+   .report-issue-inline-btn--error's own comment on why that one is now
+   --accent-cyan too, for the same "same blue everywhere" reason). Hidden
+   by default, same as #sendFeedbackBtn - shown once fetchBackendConfig()
+   confirms ISSUE_REPORTING_ENABLED. */
+.report-sql-btn {
+  background: transparent;
+  border: none;
+  color: var(--accent-cyan);
+  cursor: pointer;
+  padding: 6px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: var(--transition);
+  flex-shrink: 0;
+}
+
+.report-sql-btn:hover {
+  color: var(--primary);
+  background: var(--overlay-2);
+}
+
+/* client.js's setButtonsDisabled() already sets the `disabled` attribute
+   on this button while a translate/execute call is in flight, same as
+   #runBtn/#micBtn - but unlike #runBtn.sql-overlay-btn:disabled above,
+   there was no visual change to go with it, so a disabled-but-still-full-
+   color icon read as clickable when it wasn't. Dimmed + not-allowed cursor
+   here, and the hover rule suppressed while disabled so it doesn't still
+   light up on mouseover. */
+.report-sql-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.report-sql-btn:disabled:hover {
+  color: var(--accent-cyan);
+  background: transparent;
+}
+
 .speech-bubble-wrapper.sql-bubble .CodeMirror {
   height: 100% !important; 
   width: 100% !important;
@@ -1028,8 +1106,11 @@ textarea:focus {
   border-radius: 0;
 }
 
+/* Widened from 120px to make room for the second overlay button
+   (#reportSqlBtn, next to Execute - see .sql-overlay-actions above) so
+   long lines of SQL don't run underneath either of them. */
 .sql-bubble .CodeMirror-lines {
-  padding-right: 120px;
+  padding-right: 160px;
 }
 
 .speech-bubble-wrapper.sql-bubble .CodeMirror.cm-readonly {
@@ -1415,6 +1496,23 @@ textarea:focus {
   line-height: 1.4;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+/* The editable counterpart to the <pre> above (#reportIssuePreviewEditable,
+   'wrong_sql' category only - see client.js's openReportIssueModal()) -
+   shares .report-issue-preview's look but needs its own explicit height/
+   resize since a <textarea> doesn't grow to fit its content the way a
+   <pre> does. A visible focus ring (unlike the read-only <pre>, which
+   never receives one) is the one visual cue that this box - unlike every
+   other report preview in the app - is actually meant to be typed into. */
+textarea.report-issue-preview {
+  height: 160px;
+  resize: vertical;
+}
+
+textarea.report-issue-preview:focus {
+  outline: none;
+  border-color: var(--accent-cyan);
 }
 
 .config-input, .config-select {
@@ -1921,10 +2019,13 @@ textarea:focus {
    result - and therefore this one - ever appears). By explicit request,
    a "Report Wrong Result" button (for a successful/NO-SQL response, as
    opposed to an error) is no longer ever rendered at all - only this one
-   category remains, so there's no other variant to distinguish it from -
-   uses --danger/--on-danger, the SAME red already used for the title text
-   it sits beside (.error-details strong), since it reads as part of the
-   error callout rather than a separate, unrelated action. */
+   category remains, so there's no other variant to distinguish it from.
+   Was --danger/--on-danger (matching the red "Execution Error" title text
+   it sits beside) - changed to --accent-cyan/--on-accent-cyan per explicit
+   request, to match the same brand blue used everywhere else in the app
+   for this kind of reporting/feedback action (the mic button, the SQL
+   box's "report wrong SQL" thumbs-down icon, #stopBtn, etc.) rather than
+   reading as a second, alarm-colored action next to the error itself. */
 .report-issue-inline-btn {
   display: inline-flex;
   align-items: center;
@@ -1944,8 +2045,8 @@ textarea:focus {
 }
 
 .report-issue-inline-btn--error {
-  background-color: var(--danger);
-  color: var(--on-danger);
+  background-color: var(--accent-cyan);
+  color: var(--on-accent-cyan);
 }
 
 /* Wraps .report-issue-inline-btn when it has to be inserted as its own
@@ -1964,11 +2065,17 @@ tr.report-issue-row td {
 /* Wraps "Execution Error"/its title alongside the inline Report Error
    button - see the block comment above .report-issue-inline-btn. Overrides
    .error-details strong's own margin-bottom (below) since the row's own
-   `gap` provides the spacing instead once the button sits beside it. */
+   `gap` provides the spacing instead once the button sits beside it.
+   Deliberately NOT `justify-content: space-between` - this row's width
+   isn't fixed, it grows with the error message's own natural (unwrapped)
+   width (see .error-details p below, a sibling under the same flex parent),
+   so space-between would push the button that same variable distance away
+   from the title instead of keeping it right beside it. `flex-start` (the
+   default) plus the row's own `gap` is what keeps the button pinned
+   immediately next to the title regardless of how long the error text is. */
 .error-title-row {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 0.75rem;
   margin-bottom: 0.25rem;
 }

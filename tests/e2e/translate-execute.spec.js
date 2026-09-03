@@ -261,10 +261,14 @@ test.describe('translate + execute', () => {
     const dbBadge = page.locator('#configTriggerBadge');
     const modelBadge = page.locator('#modelTriggerBadge');
     const historyBtn = page.locator('#historyBtn');
+    const micBtn = page.locator('#micBtn');
+    const runBtn = page.locator('#runBtn');
 
     // Sanity check on the resting state, before anything is in flight.
     await expect(dbBadge).not.toHaveClass(/badge-disabled/);
     await expect(modelBadge).not.toHaveClass(/badge-disabled/);
+    await expect(micBtn).not.toBeDisabled();
+    await expect(runBtn).not.toBeDisabled();
 
     await page.locator('#aiPrompt').fill('anything');
     await page.locator('#aiPrompt').press('Enter');
@@ -281,11 +285,19 @@ test.describe('translate + execute', () => {
     // An unrelated icon (history) stays fully enabled the whole time - its
     // popup doesn't touch the active connection/model.
     await expect(historyBtn).not.toBeDisabled();
+    // The mic and Execute buttons are disabled too (see setButtonsDisabled()
+    // in client.js) - a real `disabled` attribute, not just a CSS look, per
+    // explicit request that the mic get the same treatment "like most other
+    // buttons".
+    await expect(micBtn).toBeDisabled();
+    await expect(runBtn).toBeDisabled();
 
     await expect.poll(() => normalizedSql(page), { timeout: 5000 }).toContain('SELECT 1');
 
     await expect(dbBadge).not.toHaveClass(/badge-disabled/);
     await expect(modelBadge).not.toHaveClass(/badge-disabled/);
+    await expect(micBtn).not.toBeDisabled();
+    await expect(runBtn).not.toBeDisabled();
   });
 
   test('directly entering and running SQL bypasses translate entirely', async ({ page }) => {

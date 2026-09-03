@@ -116,6 +116,16 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   let DEFAULT_DB_URL = "";
   let ACTIVE_DB_URL = "";
+  // The active connection's dialect when it's a custom (user-supplied)
+  // connection - sourced from /api/config's active_database_type field (see
+  // fetchBackendConfig() below). The server only populates that field for
+  // custom connections (config_routes.py deliberately leaves it "" for a
+  // preset, since a preset's identity is never disclosed beyond its id/name
+  // - see active_db_type_out's own comments there) - a preset's dialect is
+  // looked up separately, from CONFIGURED_DBS, by getActiveDatabaseType()
+  // below. Only used for analytics' database_type param (trackEvent() call
+  // sites throughout this file) - never for any connection logic.
+  let ACTIVE_DB_TYPE = "";
   // Whether the active connection was explicitly selected as a saved custom
   // connection, rather than a preset. Needed because a custom connection's
   // URL can collide with a preset's (same postgresql://... string) - in that
@@ -316,6 +326,22 @@ document.addEventListener('DOMContentLoaded', async () => {
   // site's own comment for why it passes what it does.
   let currentReportContext = null;
 
+  // Whichever report/feedback context the CURRENTLY-OPEN #reportIssueModal
+  // is actually for - set once, at openReportIssueModal() time, and read
+  // by buildReportPayload()/sendReportIssue() from then on, rather than
+  // those re-reading currentReportContext live. Two reasons this is a
+  // separate variable instead of just reusing currentReportContext
+  // directly: (1) the Help dialog's "Send Feedback" button (see
+  // REPORT_CATEGORY_CONFIG.feedback below) opens this same modal with a
+  // synthetic {category: 'feedback'} context that was never, and should
+  // never be, assigned to currentReportContext - that variable's whole
+  // purpose is tracking what's reportABLE about the currently-displayed
+  // results tab, which "feedback about the app in general" simply isn't.
+  // (2) it keeps the open modal stable against currentReportContext
+  // changing out from under it - e.g. a background render resetting it to
+  // null - while the user is still filling in the details textarea.
+  let activeReportContext = null;
+
   // "All databases" mode's "route" outcome (see translate_routes.py's
   // module docstring): tracks ONE streaming turn's progressive-render
   // state from the moment its "phase_a_route" NDJSON event arrives
@@ -414,6 +440,60 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   // ===========================================================================
+  // ANALYTICS (Google Analytics via gtag.js - see index.html's gtag.js
+  // snippet, which only ever configures the default page_view/enhanced-
+  // measurement events on its own). Beyond that, this app fires a small,
+  // fixed set of custom events for the interactions actually worth seeing
+  // in GA4 - see trackEvent()'s call sites throughout this file for the
+  // full list: translate_submitted, sql_executed, error_shown,
+  // report_submitted, database_selected, model_selected, help_viewed,
+  // history_viewed, preferences_viewed, login, logout, mic_used,
+  // quick_prompt_clicked. Custom, app-specific names throughout (not GA4's
+  // own recommended-event vocabulary) - per explicit request.
+  // ===========================================================================
+
+  // GA4 silently truncates a custom event parameter's string value at 100
+  // characters - truncating here instead makes that visible in the value
+  // itself (a trailing '…') rather than a value that just quietly stops
+  // mid-word in GA4's UI with no indication anything was cut. Used by every
+  // call site below that passes free text a user typed/received (prompts,
+  // SQL, error messages) - never needed for a short, bounded value (a
+  // provider name, a category string).
+  function truncateForAnalytics(value, maxLength = 100) {
+    const text = (value == null ? '' : String(value)).trim();
+    if (text.length <= maxLength) return text;
+    return text.slice(0, maxLength - 1) + '…';
+  }
+
+  // Thin wrapper around gtag('event', ...) - every call site just passes
+  // plain, already-computed params. Safe to call even if gtag.js hasn't
+  // loaded (or never loads at all - an ad/tracker blocker, offline dev,
+  // the script still downloading): window.gtag is defined synchronously by
+  // index.html's own inline snippet (it just queues into `dataLayer`,
+  // resolved later once/if the async script itself loads), so this is
+  // effectively always available by the time any of this file's event
+  // handlers can fire - the guard just keeps a missing/blocked gtag.js
+  // from ever throwing instead of silently no-op'ing.
+  function trackEvent(name, params) {
+    if (typeof window.gtag === 'function') {
+      window.gtag('event', name, params || {});
+    }
+  }
+
+  // The active connection's dialect, for pairing with database_name on
+  // analytics events. A preset's type never comes back on ACTIVE_DB_TYPE
+  // itself (see that variable's own comment - the server only sends
+  // active_database_type for a custom connection), so this looks a preset's
+  // type up from CONFIGURED_DBS by ACTIVE_PRESET_ID instead - the same
+  // "match by id, not URL" pattern updateConnectionDetails() already uses
+  // for the exact same preset-vs-custom distinction.
+  function getActiveDatabaseType() {
+    if (ACTIVE_IS_CUSTOM) return ACTIVE_DB_TYPE || '';
+    const preset = CONFIGURED_DBS.find((db) => db.id === ACTIVE_PRESET_ID);
+    return (preset && preset.type) || '';
+  }
+
+  // ===========================================================================
   // 2. DOM ELEMENT REFERENCES + SMALL MODAL WIRING
   //    (login-required modal, help modal fetch/open logic - full onboarding
   //    wiring for the help button lives further down, in section 6)
@@ -491,6 +571,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   const goForwardBtn = document.getElementById('goForwardBtn');
   updateHistoryNavButtons();
   const micBtn = document.getElementById('micBtn');
+  // Opens #reportIssueModal in 'wrong_sql' mode (see REPORT_CATEGORY_CONFIG
+  // below) - sits beside #runBtn inside the SQL box itself, so it's wired
+  // separately from both the resultsBody-delegated error/wrong_result
+  // triggers and the header's #sendFeedbackBtn.
+  const reportSqlBtn = document.getElementById('reportSqlBtn');
 
   // DOM Elements - Config Modal & Connection Status
   const configModal = document.getElementById('configModal');
@@ -661,11 +746,27 @@ document.addEventListener('DOMContentLoaded', async () => {
   const reportIssueModal = document.getElementById('reportIssueModal');
   const reportIssueModalTitle = document.getElementById('reportIssueModalTitle');
   const reportIssueModalCloseBtn = document.getElementById('reportIssueModalCloseBtn');
+  const reportIssueIntro = document.getElementById('reportIssueIntro');
+  const reportIssuePreviewSection = document.getElementById('reportIssuePreviewSection');
+  const reportIssuePreviewLabel = document.getElementById('reportIssuePreviewLabel');
   const reportIssuePreview = document.getElementById('reportIssuePreview');
+  // Editable counterpart to reportIssuePreview above - shown instead of it
+  // only for categories with previewEditable:true (currently just
+  // 'wrong_sql' - see REPORT_CATEGORY_CONFIG and openReportIssueModal()).
+  const reportIssuePreviewEditable = document.getElementById('reportIssuePreviewEditable');
+  const reportIssueDetailsLabel = document.getElementById('reportIssueDetailsLabel');
   const reportIssueDetails = document.getElementById('reportIssueDetails');
   const reportIssueStatus = document.getElementById('reportIssueStatus');
   const reportIssueSendBtn = document.getElementById('reportIssueSendBtn');
   const reportIssueCancelBtn = document.getElementById('reportIssueCancelBtn');
+  // Opens the same modal in 'feedback' mode (see REPORT_CATEGORY_CONFIG
+  // below) - lives in the app header (next to the Doc/#helpBtn button), not
+  // a results tab or the Help dialog, so it's wired separately from the
+  // resultsBody-delegated error/wrong_result triggers. Its narrow-screen
+  // twin, #moreMenuFeedbackBtn (see the MORE MENU section below), simply
+  // forwards to a click on this same button rather than duplicating any of
+  // this wiring.
+  const sendFeedbackBtn = document.getElementById('sendFeedbackBtn');
 
   // Chart.js Instances
   let chartCountInstance = null;
@@ -694,6 +795,8 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     recognition.onresult = (event) => {
       const transcript = event.results[0][0].transcript;
+      // Occurrence only - no recorded speech content is sent (privacy).
+      trackEvent('mic_used', {});
       if (activeTargetInput) {
         activeTargetInput.value = transcript;
         activeTargetInput.dispatchEvent(new Event('input'));
@@ -777,6 +880,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   let lastRenderedAuthState = null;
 
   function handleLogout() {
+    trackEvent('logout', {});
     googleIdToken = null;
     if (window.google && google.accounts && google.accounts.id) {
       google.accounts.id.disableAutoSelect();
@@ -885,6 +989,9 @@ document.addEventListener('DOMContentLoaded', async () => {
           callback: (response) => {
             if (response.credential) {
               googleIdToken = response.credential;
+              // No identity/PII in the params - GA is for usage counts, not
+              // a record of who signed in.
+              trackEvent('login', {});
               // A new user logging on takes over what was, until now, an
               // anonymous (or a different user's) session - whatever
               // prompt/SQL/results are on screen belong to that prior
@@ -939,6 +1046,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const moreMenuBtn = document.getElementById('moreMenuBtn');
   const moreMenuDropdown = document.getElementById('moreMenuDropdown');
   const moreMenuHelpBtn = document.getElementById('moreMenuHelpBtn');
+  const moreMenuFeedbackBtn = document.getElementById('moreMenuFeedbackBtn');
   const moreMenuHistoryBtn = document.getElementById('moreMenuHistoryBtn');
   const moreMenuPrefsBtn = document.getElementById('moreMenuPrefsBtn');
   const moreMenuAuthSlot = document.getElementById('moreMenuAuthSlot');
@@ -968,6 +1076,17 @@ document.addEventListener('DOMContentLoaded', async () => {
     moreMenuHelpBtn.addEventListener('click', () => {
       closeMoreMenu();
       helpBtn?.click();
+    });
+  }
+
+  // Forwards to the real header button rather than duplicating its
+  // ISSUE_REPORTING_ENABLED visibility gate or its click wiring - see
+  // fetchBackendConfig(), which toggles both this item and #sendFeedbackBtn
+  // together, and the comment on the sendFeedbackBtn const above.
+  if (moreMenuFeedbackBtn) {
+    moreMenuFeedbackBtn.addEventListener('click', () => {
+      closeMoreMenu();
+      sendFeedbackBtn?.click();
     });
   }
 
@@ -1023,6 +1142,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (translateBtn) translateBtn.disabled = disabled;
     if (runBtn) runBtn.disabled = disabled;
     if (micBtn) micBtn.disabled = disabled;
+    if (reportSqlBtn) reportSqlBtn.disabled = disabled;
     // Disable the NL prompt box itself while a translate/execute call is
     // in flight - previously only the trigger buttons were disabled, so
     // the box stayed editable (misleadingly implying a fresh edit could
@@ -1639,6 +1759,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         ACTIVE_DB_URL = DEFAULT_DB_URL;
       }
       ACTIVE_IS_CUSTOM = Boolean(data.active_is_custom);
+      ACTIVE_DB_TYPE = data.active_database_type || "";
       ACTIVE_CUSTOM_CONNECTION_KEY = data.active_custom_connection_key || "";
       ACTIVE_USES_CUSTOM_CREDENTIALS = Boolean(data.active_uses_custom_credentials);
       ACTIVE_PRESET_ID = data.active_preset_id ?? null;
@@ -1648,12 +1769,21 @@ document.addEventListener('DOMContentLoaded', async () => {
       ACTIVE_LLM_MODEL = data.active_llm_model || "";
       LLM_BYOK_KEY_SET = data.llm_byok_key_set || { google: false, anthropic: false, openai: false };
 
-      // No re-render needed here - reportButtonHtml() (called from inside
-      // renderTableResult()/renderNoSqlResponse()/executeSql()'s own
-      // per-tab rendering) reads this fresh at the moment each result is
-      // actually drawn, which always happens well after this initial
-      // config fetch resolves.
+      // No re-render needed here for the inline Report buttons -
+      // reportButtonHtml() (called from inside renderTableResult()/
+      // renderNoSqlResponse()/executeSql()'s own per-tab rendering) reads
+      // this fresh at the moment each result is actually drawn, which
+      // always happens well after this initial config fetch resolves. The
+      // The header's "Send Feedback" button (and its narrow-screen
+      // more-menu twin) IS a persistent element though (see sendFeedbackBtn's
+      // own comment on why it isn't rendered inline the way the others
+      // are), so it needs an explicit toggle here instead.
       ISSUE_REPORTING_ENABLED = Boolean(data.issue_reporting_enabled);
+      if (sendFeedbackBtn) sendFeedbackBtn.classList.toggle('hidden', !ISSUE_REPORTING_ENABLED);
+      if (moreMenuFeedbackBtn) moreMenuFeedbackBtn.classList.toggle('hidden', !ISSUE_REPORTING_ENABLED);
+      // Same gate for the SQL box's "report wrong SQL" thumbs-down button -
+      // it's just as persistent an element as the two above.
+      if (reportSqlBtn) reportSqlBtn.classList.toggle('hidden', !ISSUE_REPORTING_ENABLED);
 
       IN_SCOPE_PRESET_IDS = data.in_scope_preset_ids || [];
       IN_SCOPE_CUSTOM_KEYS = data.in_scope_custom_connection_keys || [];
@@ -2717,6 +2847,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         throw new Error(errData.error || 'Failed to save model selection.');
       }
       await fetchBackendConfig();
+      trackEvent('model_selected', { provider: llmProvider, model: llmModel });
       closeModelModal();
     } catch (err) {
       if (modelSaveErrorEl) {
@@ -2851,6 +2982,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   if (prefsBtn && preferencesModal) {
     prefsBtn.addEventListener('click', async () => {
+      trackEvent('preferences_viewed', {});
       await fetchBackendConfig();
       loadPreferencesIntoUI();
       const preferencesSaveErrorEl = document.getElementById('preferencesSaveError');
@@ -3542,6 +3674,20 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
 
         await updateConnectionDetails(data);
+        // Read from the badge (just refreshed by updateConnectionDetails()
+        // above) rather than any of this function's own dbNameValue-shaped
+        // locals - correct across every dialect/preset/custom-connection
+        // branch above without needing to know which one just ran.
+        trackEvent('database_selected', {
+          database_name: connDbName ? connDbName.textContent : '',
+          // dbType (this function's own local var, set per-dialect above)
+          // rather than the module-level ACTIVE_DB_TYPE - it's already
+          // computed for exactly this save and is correct immediately,
+          // without waiting on ACTIVE_DB_TYPE's next fetchBackendConfig()
+          // sync.
+          database_type: dbType,
+          is_custom: isCustomOption,
+        });
       } else {
         // e.g. a custom BigQuery connection missing its required billing
         // project ID / service-account key (see config_routes.py's
@@ -3854,6 +4000,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       helpBtn.classList.add('help-btn-attention');
     }
     helpBtn.addEventListener('click', () => {
+      trackEvent('help_viewed', {});
       openHelpModal();
       markOnboardingSeen();
       dismissHelpPulse();
@@ -4022,20 +4169,101 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   // ===========================================================================
-  // REPORT ISSUE MODAL (Report Error / Report Wrong Result - see
-  // report_routes.py's module docstring and setReportContext()/
+  // REPORT ISSUE MODAL (Report Error / Report Wrong Result / Send Feedback -
+  // see report_routes.py's module docstring and setReportContext()/
   // reportButtonHtml() above). This modal IS the "review exactly what
   // you're about to report before reporting" step the feature requires -
   // there's no separate confirmation on top of it, Send just submits
   // whatever the preview below is currently showing.
   // ===========================================================================
 
+  // Per-category copy for the modal - keeps openReportIssueModal()/
+  // sendReportIssue() from needing their own if/else ladder for every piece
+  // of text that differs between "reporting something about a specific
+  // result" (error/wrong_result) and "general feedback about the app,
+  // unrelated to any result" (feedback - see the Help dialog's "Send
+  // Feedback" button). `previewLabel` matches report_routes.py's
+  // _VALID_CATEGORIES value exactly, since it's echoed into both the email
+  // subject/body there and this preview here - keep the two in sync if
+  // either changes.
+  const REPORT_CATEGORY_CONFIG = {
+    error: {
+      modalTitle: 'Report Error',
+      previewLabel: 'Execution Error',
+      intro: 'Review what will be emailed below, add any extra details, then send. This does not fix or retry anything - it just lets the developer know something looks wrong.',
+      showPreview: true,
+      detailsLabel: 'Additional details (optional)',
+      detailsPlaceholder: 'Anything else that would help - what you expected instead, steps to reproduce, etc.',
+      detailsRequired: false,
+      sendLabel: 'Send Report',
+      sendingLabel: 'Sending…',
+    },
+    wrong_result: {
+      modalTitle: 'Report Wrong Result',
+      previewLabel: 'Wrong Result',
+      intro: 'Review what will be emailed below, add any extra details, then send. This does not fix or retry anything - it just lets the developer know something looks wrong.',
+      showPreview: true,
+      detailsLabel: 'Additional details (optional)',
+      detailsPlaceholder: 'Anything else that would help - what you expected instead, steps to reproduce, etc.',
+      detailsRequired: false,
+      sendLabel: 'Send Report',
+      sendingLabel: 'Sending…',
+    },
+    // No result/error to preview here at all (see report_routes.py's
+    // module docstring on why 'feedback' omits prompt/sql/content
+    // entirely) - showPreview:false hides that whole section, and the
+    // details textarea (normally an optional add-on) becomes the entire
+    // message, hence detailsRequired:true - an empty send would otherwise
+    // produce a blank email with nothing for a reviewer to act on.
+    feedback: {
+      modalTitle: 'Send Feedback',
+      previewLabel: 'Feedback',
+      intro: 'Have a suggestion, question, or comment about Datalect? Send it straight to the developer - no mail client required.',
+      showPreview: false,
+      detailsLabel: 'Your feedback',
+      detailsPlaceholder: "What's on your mind?",
+      detailsRequired: true,
+      sendLabel: 'Send Feedback',
+      sendingLabel: 'Sending…',
+    },
+    // Triggered from the SQL box's own thumbs-down button (#reportSqlBtn),
+    // not a results tab - independent of whether the SQL has ever been run.
+    // Unlike every other category, previewEditable:true means the preview
+    // itself is a plain <textarea> (#reportIssuePreviewEditable, seeded by
+    // renderWrongSqlPreviewSeed()) that the user can freely rewrite before
+    // sending - see report_routes.py's module docstring on 'wrong_sql' for
+    // why the server only ever sees the edited result, bundled into
+    // `content`, rather than separate prompt/sql fields. detailsLabel below
+    // is a genuinely separate, optional comment box underneath that
+    // editable text - contrast with 'feedback', where the details box IS
+    // the whole message.
+    wrong_sql: {
+      modalTitle: 'Report Wrong SQL',
+      previewLabel: 'Wrong SQL',
+      intro: 'Review and edit the prompt/SQL below as needed, add any comments, then send. This does not fix or retry anything - it just lets the developer know the generated SQL looks wrong.',
+      showPreview: true,
+      previewEditable: true,
+      previewSectionLabel: 'What will be sent (edit as needed)',
+      detailsLabel: 'Additional comments (optional)',
+      detailsPlaceholder: "What's wrong with this SQL, or what did you expect instead?",
+      detailsRequired: false,
+      sendLabel: 'Report Wrong SQL',
+      sendingLabel: 'Sending…',
+    },
+  };
+
+  function reportCategoryConfig(category) {
+    return REPORT_CATEGORY_CONFIG[category] || REPORT_CATEGORY_CONFIG.error;
+  }
+
   // The user's own question for this turn - preferring whatever's live in
   // the prompt box (covers direct-SQL-execution turns too, where there may
   // never have been a translate() call at all) and falling back to the
   // last completed turn's prompt (covers the common case: the user already
   // cleared/changed the prompt box after translating, but the result being
-  // reported is still from that earlier turn).
+  // reported is still from that earlier turn). Never called for 'feedback'
+  // (see buildReportPayload) - there's no "turn" a general comment about
+  // the app is attached to.
   function getReportPromptText() {
     if (aiPrompt && aiPrompt.value.trim()) return aiPrompt.value.trim();
     const turn = chatStore.lastTurn();
@@ -4043,21 +4271,49 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   // Builds the exact JSON body /api/report-issue expects (see that route's
-  // docstring) from currentReportContext plus whatever else is available
-  // module-wide at report time - null when there's nothing to report,
-  // which openReportIssueModal()/sendReportIssue() both treat as "the
-  // button shouldn't have been clickable in the first place, no-op".
-  function buildReportPayload(details) {
-    const context = currentReportContext;
-    if (!context) return null;
+  // docstring) from `context` (defaulting to activeReportContext - see its
+  // own docstring for why that, not currentReportContext, is read here)
+  // plus whatever else is available module-wide at report time - null when
+  // there's nothing to report, which openReportIssueModal()/
+  // sendReportIssue() both treat as "the button shouldn't have been
+  // clickable in the first place, no-op".
+  function buildReportPayload(details, context) {
+    const ctx = context || activeReportContext;
+    if (!ctx) return null;
+    if (ctx.category === 'feedback') {
+      // Deliberately just these two fields - see report_routes.py's module
+      // docstring on why prompt/sql/database_name/content don't apply to
+      // general app feedback the way they do for the other two categories.
+      return { category: 'feedback', details: details || '' };
+    }
+    if (ctx.category === 'wrong_sql') {
+      // Unlike error/wrong_result (prompt/sql captured automatically and
+      // shown read-only below), this category's whole point is that the
+      // user can rewrite the captured prompt+SQL text before it's sent -
+      // see REPORT_CATEGORY_CONFIG.wrong_sql's previewEditable flag - so
+      // `content` is read straight from the editable preview textarea's
+      // live value, not from ctx.sql/getReportPromptText() directly. Empty
+      // here the first time this runs, at modal-open (before
+      // openReportIssueModal() has seeded the textarea via
+      // renderWrongSqlPreviewSeed()) - harmless, since that call only uses
+      // this to confirm ctx is truthy.
+      return {
+        category: 'wrong_sql',
+        database_name: ctx.databaseName || (connDbName ? connDbName.textContent : ''),
+        provider: ACTIVE_LLM_PROVIDER || '',
+        model: ACTIVE_LLM_MODEL || '',
+        content: reportIssuePreviewEditable ? reportIssuePreviewEditable.value.trim() : '',
+        details: details || '',
+      };
+    }
     return {
-      category: context.category,
+      category: ctx.category,
       prompt: getReportPromptText(),
-      sql: context.sql || '',
-      database_name: context.databaseName || (connDbName ? connDbName.textContent : ''),
+      sql: ctx.sql || '',
+      database_name: ctx.databaseName || (connDbName ? connDbName.textContent : ''),
       provider: ACTIVE_LLM_PROVIDER || '',
       model: ACTIVE_LLM_MODEL || '',
-      content: context.content || '',
+      content: ctx.content || '',
       details: details || '',
     };
   }
@@ -4069,8 +4325,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   // preview shows the user everything THEY are contributing, not fields the
   // server derives independently) so what's previewed here reads as a
   // faithful preview of the real email body, not an approximation of it.
+  // Only ever called for error/wrong_result - 'feedback' hides this section
+  // entirely (see REPORT_CATEGORY_CONFIG.feedback.showPreview) since there's
+  // nothing structured to preview.
   function renderReportPreviewText(payload) {
-    const categoryLabel = payload.category === 'error' ? 'Execution Error' : 'Wrong Result';
+    const categoryLabel = reportCategoryConfig(payload.category).previewLabel;
     const lines = [`Category: ${categoryLabel}`];
     if (payload.provider || payload.model) lines.push(`LLM: ${payload.provider} / ${payload.model}`);
     if (payload.database_name) lines.push(`Database/connection: ${payload.database_name}`);
@@ -4081,31 +4340,85 @@ document.addEventListener('DOMContentLoaded', async () => {
     return lines.join('\n');
   }
 
+  // Seeds #reportIssuePreviewEditable for the 'wrong_sql' category - a
+  // plain, deliberately simpler layout than renderReportPreviewText()'s
+  // (no "Category:"/"LLM:" header lines, since those are metadata the
+  // server derives/sends separately, not part of the editable message
+  // itself) since the user is meant to treat this as a starting draft
+  // they'll likely trim down, not a fixed record they're just appending
+  // to. Called once, at modal-open time - never regenerated afterward, so
+  // edits the user makes are never clobbered by a later render.
+  function renderWrongSqlPreviewSeed(ctx) {
+    const lines = [];
+    const prompt = getReportPromptText();
+    if (prompt) lines.push('NL prompt:', prompt, '');
+    lines.push('SQL:', ctx.sql || '(no SQL entered)');
+    return lines.join('\n');
+  }
+
   function closeReportIssueModal() {
     if (reportIssueModal) reportIssueModal.classList.add('hidden');
   }
 
-  function openReportIssueModal() {
-    if (!reportIssueModal || !currentReportContext) return;
+  // `context` lets a caller open this modal for something OTHER than
+  // whatever's currently on screen in the results area - just the Help
+  // dialog's "Send Feedback" button today, passing a synthetic
+  // {category: 'feedback'} that was never assigned to currentReportContext
+  // (see activeReportContext's own docstring for why). Omitted (or falsy),
+  // this falls back to currentReportContext exactly as before - the
+  // resultsBody-delegated error/wrong_result trigger below relies on that
+  // default.
+  function openReportIssueModal(context) {
+    const ctx = context || currentReportContext;
+    if (!reportIssueModal || !ctx) return;
+    // Assigned before buildReportPayload() runs, and read by
+    // sendReportIssue() later - see activeReportContext's own docstring on
+    // why this indirection exists instead of both reading ctx/
+    // currentReportContext directly.
+    activeReportContext = ctx;
     // Built with an empty `details` value purely for the preview - the
     // user's actual textarea content is re-read fresh at Send time (see
     // sendReportIssue()) rather than captured here, so edits made after
     // opening the modal are never lost.
-    const payload = buildReportPayload('');
+    const payload = buildReportPayload('', ctx);
     if (!payload) return;
+    const config = reportCategoryConfig(payload.category);
 
-    if (reportIssueModalTitle) {
-      reportIssueModalTitle.textContent = payload.category === 'error' ? 'Report Error' : 'Report Wrong Result';
+    if (reportIssueModalTitle) reportIssueModalTitle.textContent = config.modalTitle;
+    if (reportIssueIntro) reportIssueIntro.textContent = config.intro;
+    if (reportIssuePreviewSection) reportIssuePreviewSection.classList.toggle('hidden', !config.showPreview);
+    if (reportIssuePreviewLabel) reportIssuePreviewLabel.textContent = config.previewSectionLabel || 'What will be sent';
+    // previewEditable (currently just 'wrong_sql') swaps in the plain
+    // <textarea> counterpart instead of the read-only <pre> - see
+    // #reportIssuePreviewEditable's own comment above and
+    // renderWrongSqlPreviewSeed(), which - unlike renderReportPreviewText()
+    // below - is only ever called here, once, so later edits are never
+    // overwritten by a re-render.
+    if (config.previewEditable) {
+      if (reportIssuePreview) reportIssuePreview.classList.add('hidden');
+      if (reportIssuePreviewEditable) {
+        reportIssuePreviewEditable.classList.remove('hidden');
+        reportIssuePreviewEditable.value = renderWrongSqlPreviewSeed(ctx);
+      }
+    } else {
+      if (reportIssuePreviewEditable) reportIssuePreviewEditable.classList.add('hidden');
+      if (reportIssuePreview) {
+        reportIssuePreview.classList.remove('hidden');
+        reportIssuePreview.textContent = config.showPreview ? renderReportPreviewText(payload) : '';
+      }
     }
-    if (reportIssuePreview) reportIssuePreview.textContent = renderReportPreviewText(payload);
-    if (reportIssueDetails) reportIssueDetails.value = '';
+    if (reportIssueDetailsLabel) reportIssueDetailsLabel.textContent = config.detailsLabel;
+    if (reportIssueDetails) {
+      reportIssueDetails.value = '';
+      reportIssueDetails.placeholder = config.detailsPlaceholder;
+    }
     if (reportIssueStatus) {
       reportIssueStatus.style.display = 'none';
       reportIssueStatus.textContent = '';
     }
     if (reportIssueSendBtn) {
       reportIssueSendBtn.disabled = false;
-      reportIssueSendBtn.textContent = 'Send Report';
+      reportIssueSendBtn.textContent = config.sendLabel;
     }
 
     reportIssueModal.classList.remove('hidden');
@@ -4113,12 +4426,36 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   async function sendReportIssue() {
-    const payload = buildReportPayload(reportIssueDetails ? reportIssueDetails.value.trim() : '');
+    const config = reportCategoryConfig(activeReportContext && activeReportContext.category);
+    const detailsValue = reportIssueDetails ? reportIssueDetails.value.trim() : '';
+    // Only 'feedback' sets this (see REPORT_CATEGORY_CONFIG.feedback) -
+    // error/wrong_result already have the preview content itself as the
+    // substantive part of the email, so an empty textarea there is fine.
+    if (config.detailsRequired && !detailsValue) {
+      if (reportIssueStatus) {
+        reportIssueStatus.textContent = 'Please enter your feedback before sending.';
+        reportIssueStatus.style.display = 'block';
+      }
+      return;
+    }
+    const payload = buildReportPayload(detailsValue, activeReportContext);
     if (!payload) return;
+    // previewEditable's whole message IS the (editable) preview content
+    // (see REPORT_CATEGORY_CONFIG.wrong_sql) - an empty send there, with no
+    // comment either, would produce a blank report with nothing for a
+    // reviewer to act on, the same concern detailsRequired guards against
+    // for 'feedback' above.
+    if (config.previewEditable && !payload.content && !detailsValue) {
+      if (reportIssueStatus) {
+        reportIssueStatus.textContent = 'Please include the SQL you want to report, or add a comment below.';
+        reportIssueStatus.style.display = 'block';
+      }
+      return;
+    }
 
     if (reportIssueSendBtn) {
       reportIssueSendBtn.disabled = true;
-      reportIssueSendBtn.textContent = 'Sending…';
+      reportIssueSendBtn.textContent = config.sendingLabel;
     }
     if (reportIssueStatus) reportIssueStatus.style.display = 'none';
 
@@ -4131,6 +4468,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       });
       const data = await response.json().catch(() => ({}));
       if (response.ok && data.success) {
+        trackEvent('report_submitted', { category: payload.category });
         closeReportIssueModal();
       } else if (reportIssueStatus) {
         reportIssueStatus.textContent = data.error || 'Failed to send report.';
@@ -4144,7 +4482,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     } finally {
       if (reportIssueSendBtn) {
         reportIssueSendBtn.disabled = false;
-        reportIssueSendBtn.textContent = 'Send Report';
+        reportIssueSendBtn.textContent = config.sendLabel;
       }
     }
   }
@@ -4154,11 +4492,36 @@ document.addEventListener('DOMContentLoaded', async () => {
   // element with its own listener, so a single delegated listener on the
   // never-replaced #resultsBody container (only its children are ever
   // replaced) is what makes every current/future instance of it clickable.
+  // No context passed - this is the "report something about the currently-
+  // displayed result" trigger, so it falls back to currentReportContext.
   if (resultsBody) {
     resultsBody.addEventListener('click', (e) => {
       const trigger = e.target.closest('[data-report-issue-trigger]');
       if (trigger) openReportIssueModal();
     });
+  }
+  // The header's "Send Feedback" button - a persistent element (unlike the
+  // inline Report buttons above), so it gets its own listener rather than
+  // delegation. Its narrow-screen more-menu twin (#moreMenuFeedbackBtn, see
+  // the MORE MENU section) just forwards a click here instead of opening
+  // the modal itself. Hidden/shown by fetchBackendConfig() based on
+  // ISSUE_REPORTING_ENABLED, same gate the inline Report buttons already
+  // use (see reportButtonHtml()) - sending feedback needs the same
+  // server-side SMTP config they do.
+  if (sendFeedbackBtn) {
+    sendFeedbackBtn.addEventListener('click', () => openReportIssueModal({ category: 'feedback' }));
+  }
+  // The SQL box's "report wrong SQL" thumbs-down button - also a persistent
+  // element, gated by the same ISSUE_REPORTING_ENABLED toggle above. Reads
+  // the SQL box and the active connection badge fresh at click time (not
+  // captured anywhere ahead of time), since the user may have been editing
+  // either right up until they click this.
+  if (reportSqlBtn) {
+    reportSqlBtn.addEventListener('click', () => openReportIssueModal({
+      category: 'wrong_sql',
+      sql: getSqlQuery(),
+      databaseName: connDbName ? connDbName.textContent : '',
+    }));
   }
   if (reportIssueModalCloseBtn) {
     reportIssueModalCloseBtn.addEventListener('click', closeReportIssueModal);
@@ -4256,6 +4619,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   if (historyBtn && historyModal) {
     historyBtn.addEventListener('click', () => {
+      trackEvent('history_viewed', {});
       updateHistoryTurnsSubtitle();
       const purgeTitleEl = document.querySelector('.btn-purge-title');
       if (purgeTitleEl) {
@@ -4504,6 +4868,18 @@ document.addEventListener('DOMContentLoaded', async () => {
         databaseName: result.database && result.database.name,
         sql: result.statement || result.query || result.sql || '',
         content: result.error || '',
+      });
+      trackEvent('error_shown', {
+        category: 'execution',
+        database_name: (result.database && result.database.name) || '',
+        // result.database (see its construction sites - object literals of
+        // {kind, id, name} only) never carries its own dialect, so this
+        // falls back to the currently-active connection's type. In "all
+        // databases" mode the erroring connection isn't always the active
+        // one - not perfectly precise there, but there's no per-connection
+        // type available from the server to do better.
+        database_type: getActiveDatabaseType(),
+        message: truncateForAnalytics(result.error || ''),
       });
       return;
     }
@@ -5680,6 +6056,21 @@ document.addEventListener('DOMContentLoaded', async () => {
     const promptText = aiPrompt ? aiPrompt.value.trim() : "";
     if (!promptText) return;
 
+    // Fired on submission, not completion - "Errors surfaced" (see
+    // trackEvent('error_shown', ...) below) is its own separate event, so
+    // this one doesn't need to thread a success/failure outcome back
+    // through this function's many branches (router-mode streaming,
+    // NO-SQL replies, plain SQL, every error shape) just to report it here
+    // too.
+    // No `prompt` field - the NL prompt text itself isn't sent to GA (privacy).
+    trackEvent('translate_submitted', {
+      mode: isAllConnectionsSelected() ? 'all' : 'single',
+      database_name: connDbName ? connDbName.textContent : '',
+      database_type: getActiveDatabaseType(),
+      provider: ACTIVE_LLM_PROVIDER || '',
+      model: ACTIVE_LLM_MODEL || '',
+    });
+
     // Not sending a database_url override here: fetchBackendConfig()
     // above already synced session state, and the server resolves the
     // active connection (Postgres or BigQuery, with its full descriptor)
@@ -5882,6 +6273,12 @@ document.addEventListener('DOMContentLoaded', async () => {
           ? "Authentication required. Please click 'Sign in with Google' in the top-right corner to log in."
           : (data?.error || "An error occurred during translation.");
         console.error("Translation Error:", errMsg);
+        trackEvent('error_shown', {
+          category: 'translation',
+          database_name: connDbName ? connDbName.textContent : '',
+          database_type: getActiveDatabaseType(),
+          message: truncateForAnalytics(errMsg),
+        });
 
         if (resultsTabsNav) resultsTabsNav.classList.add('hidden');
         if (resultsHeader) resultsHeader.innerHTML = '';
@@ -6026,6 +6423,16 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     const sql = customSql || getSqlQuery();
     if (!sql) return;
+
+    // Fired on submission, same reasoning as translate_submitted above -
+    // "Errors surfaced" is its own separate event, so this doesn't need to
+    // thread an outcome back through this function's own many branches.
+    // No `sql` field - the generated SQL text itself isn't sent to GA (privacy).
+    trackEvent('sql_executed', {
+      database_name: connDbName ? connDbName.textContent : '',
+      database_type: getActiveDatabaseType(),
+      trigger: internal ? 'auto' : 'manual',
+    });
 
     // Single-connection mode's own "fetching" indicator - see
     // showFetchingResultsStatus()'s own declaration comment. Neither "all
@@ -6248,6 +6655,15 @@ document.addEventListener('DOMContentLoaded', async () => {
                 </div>
               </td>
             </tr>`;
+          // Tracked regardless of `reportable` - a 401 auth failure is out
+          // of scope for the Report feature (see the comment above), but
+          // it's still an error the user actually saw.
+          trackEvent('error_shown', {
+            category: 'execution',
+            database_name: connDbName ? connDbName.textContent : '',
+            database_type: getActiveDatabaseType(),
+            message: truncateForAnalytics(errMsg),
+          });
           if (reportable) {
             setReportContext({
               category: 'error',
@@ -6470,6 +6886,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         const promptText = isAllConnectionsSelected()
           ? (btn.dataset.promptAll || btn.dataset.prompt || '')
           : (btn.dataset.prompt || '');
+        trackEvent('quick_prompt_clicked', {
+          chip_label: (btn.textContent || '').trim(),
+          prompt: truncateForAnalytics(promptText),
+        });
         aiPrompt.value = promptText;
         // Setting .value directly doesn't fire the 'input' event, so the
         // listener above (which clears stale SQL as the user types) never
