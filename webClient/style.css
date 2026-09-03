@@ -53,6 +53,13 @@
   --danger-glow: rgba(248, 113, 113, 0.15);
   --danger-rgb: 248, 113, 113;
   --danger-hover-rgb: 239, 68, 68;
+  /* Text color that sits ON TOP of a solid --danger-colored badge/button
+     (see .report-issue-inline-btn--error) - same reasoning as
+     --on-primary/--on-warning/--on-accent-cyan above, computed per-theme
+     since this dark theme's --danger is a bright, light-ish red (needs a
+     dark label) while the light theme's is a deep one (needs a light
+     label). */
+  --on-danger: #080b11;
 
   --warning: #f59e0b;
   --warning-rgb: 245, 158, 11;
@@ -161,6 +168,7 @@
   --danger-glow: rgba(220, 38, 38, 0.12);
   --danger-rgb: 220, 38, 38;
   --danger-hover-rgb: 185, 28, 28;
+  --on-danger: #ffffff;
 
   --warning: #b45309;
   --warning-rgb: 180, 83, 9;
@@ -1384,6 +1392,31 @@ textarea:focus {
   min-width: 0;
 }
 
+/* The read-only "here's exactly what will be emailed" preview inside
+   #reportIssueModal (see client.js's openReportIssueModal()) - a <pre>
+   rather than a plain <p> since the content is a plain-text email body
+   (SQL/error text included) that needs to keep its own line breaks and
+   spacing, same reasoning execute_routes.py's raw error passthrough itself
+   relies on being shown verbatim rather than reflowed. Reuses
+   .config-input's border/background look so it reads as part of the same
+   form, just non-editable and monospace. */
+.report-issue-preview {
+  width: 100%;
+  max-height: 260px;
+  overflow: auto;
+  margin: 0;
+  padding: 0.6rem 0.8rem;
+  border-radius: 6px;
+  border: 1px solid var(--bg-card-border);
+  background-color: var(--bg-input);
+  color: var(--text-primary);
+  font-family: var(--font-mono, monospace);
+  font-size: 0.78rem;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .config-input, .config-select {
   width: 100%;
   padding: 0.6rem 0.8rem;
@@ -1878,6 +1911,70 @@ textarea:focus {
 
 #stopBtn.btn-stop:hover {
   filter: brightness(1.1);
+}
+
+/* "Report Error" (see client.js's setReportContext()/reportButtonHtml()) -
+   rendered INLINE, directly beside the "Execution Error" title of
+   whichever tab is actually showing an error (see .error-title-row below),
+   never as a persistent control living outside the tab, so it's never in
+   the same row as #stopBtn above (that button is gone by the time a
+   result - and therefore this one - ever appears). By explicit request,
+   a "Report Wrong Result" button (for a successful/NO-SQL response, as
+   opposed to an error) is no longer ever rendered at all - only this one
+   category remains, so there's no other variant to distinguish it from -
+   uses --danger/--on-danger, the SAME red already used for the title text
+   it sits beside (.error-details strong), since it reads as part of the
+   error callout rather than a separate, unrelated action. */
+.report-issue-inline-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  flex-shrink: 0;
+  padding: 0.2rem 0.5rem;
+  font-size: 0.65rem;
+  font-weight: 500;
+  line-height: 1;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.report-issue-inline-btn:hover {
+  filter: brightness(1.1);
+}
+
+.report-issue-inline-btn--error {
+  background-color: var(--danger);
+  color: var(--on-danger);
+}
+
+/* Wraps .report-issue-inline-btn when it has to be inserted as its own
+   full-width table row (see client.js's reportButtonRowHtml()) - was for
+   the tabular-result "Report Wrong Result" branches, where the button
+   would have come after every data row rather than inside an existing
+   cell. Unused now that "Report Wrong Result" is never rendered (see the
+   block comment above .report-issue-inline-btn) - kept alongside
+   reportButtonRowHtml() itself in case that's ever reinstated. */
+tr.report-issue-row td {
+  padding-top: 0.5rem;
+  border-top: none;
+  text-align: left;
+}
+
+/* Wraps "Execution Error"/its title alongside the inline Report Error
+   button - see the block comment above .report-issue-inline-btn. Overrides
+   .error-details strong's own margin-bottom (below) since the row's own
+   `gap` provides the spacing instead once the button sits beside it. */
+.error-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.25rem;
+}
+
+.error-title-row strong {
+  margin-bottom: 0;
 }
 
 .results-tabs-nav {

@@ -937,6 +937,68 @@ MAX_IN_SCOPE_CONNECTIONS = int(os.environ.get("MAX_IN_SCOPE_CONNECTIONS", 20))
 MAX_TRANSLATION_ATTEMPTS = int(os.environ.get("MAX_TRANSLATION_ATTEMPTS", 5))
 TRANSLATION_RETRY_DELAY_SECONDS = float(os.environ.get("TRANSLATION_RETRY_DELAY_SECONDS", 1))
 
+# --- Issue reporting ("Report Error"/"Report Wrong Result", see
+# report_routes.py) ----------------------------------------------------------
+# Lets a user flag either a raw/uncategorized error execute_routes.py
+# returned verbatim (see that module's docstring - typically a database
+# driver's own cryptic message for SQL the model generated incorrectly) or
+# a "wrong result" (a successful response - a table, a plain-text reply, an
+# all-databases summarization - the user believes is wrong or misleading).
+# Deliberately NOT for LLM system errors (translate_routes.py's
+# format_llm_error_for_user() output) - those already carry an app-authored,
+# human-readable explanation, so there's nothing new for a report of one to
+# tell a reviewer that str(exc) itself wouldn't already have.
+#
+# Reports are emailed out via real SMTP, sent by this app itself
+# (report_routes.py) rather than a mailto: link, so reporting never depends
+# on the user having a local mail client configured - the user still always
+# reviews the exact email content client-side before Send is ever clicked
+# (see webClient/index.html's #reportIssueModal).
+#
+# ISSUE_REPORT_TO_EMAIL is the one field a deployer is REQUIRED to set for
+# the feature to activate at all. Left unset (the default - same "opt-in,
+# nothing loads silently" posture as DATABASE_PRESETS_FILE above), the
+# feature stays fully inert: ISSUE_REPORTING_ENABLED below is False,
+# config_routes.py's 'issue_reporting_enabled' field reports that to the
+# client, and client.js never shows a Report button to any user at all.
+ISSUE_REPORT_TO_EMAIL = os.environ.get("ISSUE_REPORT_TO_EMAIL", "").strip()
+
+# The outbound SMTP connection this app authenticates with to actually send
+# that email - no default host, since (unlike, say, a corporate LAN) there's
+# no "ambient" mail relay to assume inside a Cloud Run/Docker environment.
+# Port defaults to 587 (STARTTLS) - the common submission port for both
+# self-hosted mail servers and every major provider (Gmail, SendGrid, SES,
+# etc.). Username/password are optional (some internal relays allow
+# anonymous submission from trusted IPs) - report_routes.py only calls
+# smtp.login() when a username is actually configured.
+ISSUE_REPORT_SMTP_HOST = os.environ.get("ISSUE_REPORT_SMTP_HOST", "").strip()
+ISSUE_REPORT_SMTP_PORT = int(os.environ.get("ISSUE_REPORT_SMTP_PORT", "587"))
+ISSUE_REPORT_SMTP_USERNAME = os.environ.get("ISSUE_REPORT_SMTP_USERNAME", "").strip()
+ISSUE_REPORT_SMTP_PASSWORD = os.environ.get("ISSUE_REPORT_SMTP_PASSWORD", "")
+# Envelope/header From address - falls back to the SMTP username (the
+# common case: the account authenticated as IS the address mail is sent
+# from) so a deployer using a provider like that doesn't need to set this
+# separately, but can still override it explicitly (e.g. a provider where
+# the SMTP username is an opaque API-key-shaped string, not a real mailbox
+# address to send FROM).
+ISSUE_REPORT_SMTP_FROM = os.environ.get("ISSUE_REPORT_SMTP_FROM", "").strip() or ISSUE_REPORT_SMTP_USERNAME
+# STARTTLS (upgrade a plaintext connection) is the default and what port
+# 587 expects; set this to "0" only for a relay that expects a plaintext/
+# already-implicit-TLS connection instead (report_routes.py does not
+# separately implement implicit TLS via smtplib.SMTP_SSL - pair "0" with a
+# relay/port combination that doesn't require it).
+ISSUE_REPORT_SMTP_USE_TLS = os.environ.get("ISSUE_REPORT_SMTP_USE_TLS", "1") != "0"
+
+# The one thing config_routes.py's GET /api/config actually needs to expose
+# to the client - whether the feature is configured at ALL, never any of
+# the credential fields above. Requires a recipient AND enough to actually
+# open a connection and identify a sender (host + a from-address);
+# username/password are intentionally not required here (see the comment
+# above ISSUE_REPORT_SMTP_USERNAME).
+ISSUE_REPORTING_ENABLED = bool(
+    ISSUE_REPORT_TO_EMAIL and ISSUE_REPORT_SMTP_HOST and ISSUE_REPORT_SMTP_FROM
+)
+
 # Model configuration for all three LLM providers (Google included) lives
 # in translate_routes.py now, not here - each provider's own single
 # *_MODELS env var (GOOGLE_MODELS/ANTHROPIC_MODELS/OPENAI_MODELS) doubles as

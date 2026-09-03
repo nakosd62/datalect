@@ -296,6 +296,26 @@ document.addEventListener('DOMContentLoaded', async () => {
   let currentResultsList = [];
   let activeResultIndex = 0;
 
+  // Report Error / Report Wrong Result (see report_routes.py's module
+  // docstring, and setReportContext()/reportButtonHtml() below) - True
+  // once GET /api/config's 'issue_reporting_enabled' confirms a deployer
+  // has actually configured a recipient + SMTP connection server-side.
+  // reportButtonHtml() renders nothing at all while this is False, rather
+  // than showing a button that would just fail the moment it's clicked.
+  let ISSUE_REPORTING_ENABLED = false;
+
+  // Whatever's CURRENTLY on screen in the results area that's eligible to
+  // be reported, or null when nothing is (no result yet, a translation/
+  // network/history error - those are already-handled cases out of this
+  // feature's scope, see report_routes.py's module docstring - a cancelled
+  // query, or the initial empty state). Kept in sync by setReportContext(),
+  // called from every render path that shows something reportable
+  // (renderTableResult()'s isText/isError/success/no-dataset branches,
+  // renderNoSqlResponse(), and executeSql()'s own bare connect()-failure
+  // fallback that bypasses renderTableResult entirely) - see each call
+  // site's own comment for why it passes what it does.
+  let currentReportContext = null;
+
   // "All databases" mode's "route" outcome (see translate_routes.py's
   // module docstring): tracks ONE streaming turn's progressive-render
   // state from the moment its "phase_a_route" NDJSON event arrives
@@ -631,6 +651,21 @@ document.addEventListener('DOMContentLoaded', async () => {
   const resultsTabsNav = document.getElementById('resultsTabsNav');
   const resultsHeader = document.getElementById('resultsHeader');
   const resultsBody = document.getElementById('resultsBody');
+
+  // DOM Elements - Report Error / Report Wrong Result (see
+  // setReportContext()/reportButtonHtml() and openReportIssueModal()
+  // below). There's no static button element here any more - the button
+  // itself is rendered INLINE, inside whichever tab it's reporting on (see
+  // reportButtonHtml()'s own comment for why), so only the modal has fixed
+  // DOM elements to look up.
+  const reportIssueModal = document.getElementById('reportIssueModal');
+  const reportIssueModalTitle = document.getElementById('reportIssueModalTitle');
+  const reportIssueModalCloseBtn = document.getElementById('reportIssueModalCloseBtn');
+  const reportIssuePreview = document.getElementById('reportIssuePreview');
+  const reportIssueDetails = document.getElementById('reportIssueDetails');
+  const reportIssueStatus = document.getElementById('reportIssueStatus');
+  const reportIssueSendBtn = document.getElementById('reportIssueSendBtn');
+  const reportIssueCancelBtn = document.getElementById('reportIssueCancelBtn');
 
   // Chart.js Instances
   let chartCountInstance = null;
@@ -1105,6 +1140,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (resultsBody) resultsBody.innerHTML = '';
     currentResultsList = [];
     activeResultIndex = 0;
+    setReportContext(null);
   }
 
   // Shown at the top of the results area (above the tabs/table, see
@@ -1611,6 +1647,13 @@ document.addEventListener('DOMContentLoaded', async () => {
       ACTIVE_LLM_PROVIDER = data.active_llm_provider || "";
       ACTIVE_LLM_MODEL = data.active_llm_model || "";
       LLM_BYOK_KEY_SET = data.llm_byok_key_set || { google: false, anthropic: false, openai: false };
+
+      // No re-render needed here - reportButtonHtml() (called from inside
+      // renderTableResult()/renderNoSqlResponse()/executeSql()'s own
+      // per-tab rendering) reads this fresh at the moment each result is
+      // actually drawn, which always happens well after this initial
+      // config fetch resolves.
+      ISSUE_REPORTING_ENABLED = Boolean(data.issue_reporting_enabled);
 
       IN_SCOPE_PRESET_IDS = data.in_scope_preset_ids || [];
       IN_SCOPE_CUSTOM_KEYS = data.in_scope_custom_connection_keys || [];
@@ -3978,6 +4021,155 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
+  // ===========================================================================
+  // REPORT ISSUE MODAL (Report Error / Report Wrong Result - see
+  // report_routes.py's module docstring and setReportContext()/
+  // reportButtonHtml() above). This modal IS the "review exactly what
+  // you're about to report before reporting" step the feature requires -
+  // there's no separate confirmation on top of it, Send just submits
+  // whatever the preview below is currently showing.
+  // ===========================================================================
+
+  // The user's own question for this turn - preferring whatever's live in
+  // the prompt box (covers direct-SQL-execution turns too, where there may
+  // never have been a translate() call at all) and falling back to the
+  // last completed turn's prompt (covers the common case: the user already
+  // cleared/changed the prompt box after translating, but the result being
+  // reported is still from that earlier turn).
+  function getReportPromptText() {
+    if (aiPrompt && aiPrompt.value.trim()) return aiPrompt.value.trim();
+    const turn = chatStore.lastTurn();
+    return (turn && turn.userEntry && turn.userEntry.text) || '';
+  }
+
+  // Builds the exact JSON body /api/report-issue expects (see that route's
+  // docstring) from currentReportContext plus whatever else is available
+  // module-wide at report time - null when there's nothing to report,
+  // which openReportIssueModal()/sendReportIssue() both treat as "the
+  // button shouldn't have been clickable in the first place, no-op".
+  function buildReportPayload(details) {
+    const context = currentReportContext;
+    if (!context) return null;
+    return {
+      category: context.category,
+      prompt: getReportPromptText(),
+      sql: context.sql || '',
+      database_name: context.databaseName || (connDbName ? connDbName.textContent : ''),
+      provider: ACTIVE_LLM_PROVIDER || '',
+      model: ACTIVE_LLM_MODEL || '',
+      content: context.content || '',
+      details: details || '',
+    };
+  }
+
+  // Plain-text rendering of `payload` for #reportIssuePreview - deliberately
+  // mirrors report_routes.py's own _build_email() section-by-section shape
+  // (minus "Reported by"/"Additional details", which the server fills in
+  // from the authenticated session and the textarea respectively - the
+  // preview shows the user everything THEY are contributing, not fields the
+  // server derives independently) so what's previewed here reads as a
+  // faithful preview of the real email body, not an approximation of it.
+  function renderReportPreviewText(payload) {
+    const categoryLabel = payload.category === 'error' ? 'Execution Error' : 'Wrong Result';
+    const lines = [`Category: ${categoryLabel}`];
+    if (payload.provider || payload.model) lines.push(`LLM: ${payload.provider} / ${payload.model}`);
+    if (payload.database_name) lines.push(`Database/connection: ${payload.database_name}`);
+    lines.push('');
+    if (payload.prompt) lines.push("--- User's question ---", payload.prompt, '');
+    if (payload.sql) lines.push('--- Generated SQL ---', payload.sql, '');
+    if (payload.content) lines.push(`--- ${categoryLabel} content (as shown to you) ---`, payload.content, '');
+    return lines.join('\n');
+  }
+
+  function closeReportIssueModal() {
+    if (reportIssueModal) reportIssueModal.classList.add('hidden');
+  }
+
+  function openReportIssueModal() {
+    if (!reportIssueModal || !currentReportContext) return;
+    // Built with an empty `details` value purely for the preview - the
+    // user's actual textarea content is re-read fresh at Send time (see
+    // sendReportIssue()) rather than captured here, so edits made after
+    // opening the modal are never lost.
+    const payload = buildReportPayload('');
+    if (!payload) return;
+
+    if (reportIssueModalTitle) {
+      reportIssueModalTitle.textContent = payload.category === 'error' ? 'Report Error' : 'Report Wrong Result';
+    }
+    if (reportIssuePreview) reportIssuePreview.textContent = renderReportPreviewText(payload);
+    if (reportIssueDetails) reportIssueDetails.value = '';
+    if (reportIssueStatus) {
+      reportIssueStatus.style.display = 'none';
+      reportIssueStatus.textContent = '';
+    }
+    if (reportIssueSendBtn) {
+      reportIssueSendBtn.disabled = false;
+      reportIssueSendBtn.textContent = 'Send Report';
+    }
+
+    reportIssueModal.classList.remove('hidden');
+    bringModalToFront(reportIssueModal);
+  }
+
+  async function sendReportIssue() {
+    const payload = buildReportPayload(reportIssueDetails ? reportIssueDetails.value.trim() : '');
+    if (!payload) return;
+
+    if (reportIssueSendBtn) {
+      reportIssueSendBtn.disabled = true;
+      reportIssueSendBtn.textContent = 'Sending…';
+    }
+    if (reportIssueStatus) reportIssueStatus.style.display = 'none';
+
+    try {
+      const response = await fetch('/api/report-issue', {
+        method: 'POST',
+        headers: getApiHeaders(),
+        credentials: 'same-origin',
+        body: JSON.stringify(payload),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (response.ok && data.success) {
+        closeReportIssueModal();
+      } else if (reportIssueStatus) {
+        reportIssueStatus.textContent = data.error || 'Failed to send report.';
+        reportIssueStatus.style.display = 'block';
+      }
+    } catch (err) {
+      if (reportIssueStatus) {
+        reportIssueStatus.textContent = err.message || 'Failed to reach the backend server.';
+        reportIssueStatus.style.display = 'block';
+      }
+    } finally {
+      if (reportIssueSendBtn) {
+        reportIssueSendBtn.disabled = false;
+        reportIssueSendBtn.textContent = 'Send Report';
+      }
+    }
+  }
+
+  // The button itself is rendered fresh into #resultsBody on every render
+  // pass (see reportButtonHtml() above) rather than being a persistent
+  // element with its own listener, so a single delegated listener on the
+  // never-replaced #resultsBody container (only its children are ever
+  // replaced) is what makes every current/future instance of it clickable.
+  if (resultsBody) {
+    resultsBody.addEventListener('click', (e) => {
+      const trigger = e.target.closest('[data-report-issue-trigger]');
+      if (trigger) openReportIssueModal();
+    });
+  }
+  if (reportIssueModalCloseBtn) {
+    reportIssueModalCloseBtn.addEventListener('click', closeReportIssueModal);
+  }
+  if (reportIssueCancelBtn) {
+    reportIssueCancelBtn.addEventListener('click', closeReportIssueModal);
+  }
+  if (reportIssueSendBtn) {
+    reportIssueSendBtn.addEventListener('click', sendReportIssue);
+  }
+
   async function loadHistoryData() {
     if (!historyTableHeader || !historyTableBody) return;
   
@@ -4090,10 +4282,119 @@ document.addEventListener('DOMContentLoaded', async () => {
   // ===========================================================================
   // 8. RESULTS RENDERING HELPERS
   // ===========================================================================
+
+  // Report Error / Report Wrong Result (see report_routes.py's module
+  // docstring). `context` is either null (nothing reportable is currently
+  // showing) or { category: 'error'|'wrong_result', databaseName, sql,
+  // content } - `content` is the raw error text for an 'error' report, or a
+  // plain-text rendering of whatever the app/model actually showed the user
+  // for a 'wrong_result' one (see summarizeTabularResultForReport() below
+  // for the table case). Every render path that shows something reportable
+  // calls this at the point it knows that context, immediately before
+  // rendering that SAME context's own reportButtonHtml() into the tab (see
+  // renderTableResult()/renderNoSqlResponse() below and executeSql()'s own
+  // bare-error fallback) - callers that show something NOT in scope for
+  // this feature (a translation/network/history error - see
+  // report_routes.py's module docstring on why those are excluded) simply
+  // never call either one at all.
+  //
+  // Only one reportable tab's content is ever visible in #resultsBody at a
+  // time (switching tabs re-renders via this same renderTableResult()), so
+  // "whichever context was set most recently" is always the context that
+  // matches whatever report-issue-inline-btn is currently in the DOM for
+  // openReportIssueModal() (wired via a delegated click listener - see
+  // below) to read.
+  function setReportContext(context) {
+    currentReportContext = context;
+  }
+
+  // Renders the small inline "Report Error" button as an HTML string,
+  // meant to be inserted directly into the tab content that's being
+  // reported on - NOT as a persistent control living somewhere outside the
+  // tab. Returns '' (nothing rendered at all) both when the feature isn't
+  // configured server-side (so there's no dead/disabled button to explain
+  // to a user on a deployment that hasn't set this up) and for any
+  // category other than 'error' - by explicit request, a "Report Wrong
+  // Result" button is no longer ever shown: only a tab that's actually
+  // showing an execution error gets a Report button at all. `setReportContext()`
+  // callers still pass 'wrong_result' for a successful/NO-SQL tab (keeping
+  // report_routes.py's server-side category and email-review-modal support
+  // for it intact, in case a future UI wants it back), but with no button
+  // ever rendered for that category, openReportIssueModal() is simply never
+  // reached for it any more.
+  //
+  // A plain data attribute (not an inline onclick, and not a listener
+  // re-attached after every render) is what makes clicking it work - see
+  // the delegated 'click' listener on #resultsBody below, added once at
+  // setup time rather than per-render, since this button is recreated
+  // fresh on every renderTableResult() call.
+  function reportButtonHtml(category) {
+    if (!ISSUE_REPORTING_ENABLED || category !== 'error') return '';
+    // Red (--danger), matching the "Execution Error" title this button
+    // always sits next to (see .error-title-row/.report-issue-inline-btn--error
+    // in style.css) - there's no other variant to distinguish from any more.
+    return `<button type="button" class="report-issue-inline-btn report-issue-inline-btn--error" data-report-issue-trigger>🚩 Report Error</button>`;
+  }
+
+  // Same button, wrapped in its own full-width <tr><td> - for the branches
+  // that need to drop it directly into #resultsBody (a <tbody>) rather than
+  // into a <td> that's already open. A raw <button> string inserted straight
+  // into a <tbody> would get foster-parented out of the table entirely (per
+  // the HTML parsing spec's table-insertion-mode rules), so every tbody-level
+  // insertion goes through this instead. `colspan` should match however many
+  // columns the result actually has (1 when there's no column header at all)
+  // so the row spans the full table width instead of squeezing into the
+  // first column.
+  //
+  // In practice this is always called with category 'wrong_result' (the
+  // tabular-result branches below) - reportButtonHtml() now always returns
+  // '' for that category, so this resolves to '' too and no row is ever
+  // actually inserted. Left in place (rather than deleted at each call
+  // site) so those branches stay structurally ready if "Report Wrong
+  // Result" is ever reinstated.
+  function reportButtonRowHtml(category, colspan) {
+    const html = reportButtonHtml(category);
+    if (!html) return '';
+    return `<tr class="report-issue-row"><td colspan="${colspan || 1}">${html}</td></tr>`;
+  }
+
+  // Plain-text rendering of a successful tabular result, for the email
+  // preview/body of a 'wrong_result' report on that tab - capped at 25 rows
+  // so a large result set doesn't balloon the report (report_routes.py
+  // truncates every field server-side too, but there's no reason to make
+  // the client build/POST a huge payload in the first place when the point
+  // is just to show a reviewer what looked wrong).
+  function summarizeTabularResultForReport(result) {
+    if (!result || !result.columns || !result.columns.length) return '';
+    const cols = result.columns;
+    const allRows = Array.isArray(result.rows) ? result.rows : [];
+    const shown = allRows.slice(0, 25);
+    const lines = [cols.join(' | ')];
+    shown.forEach((row) => {
+      lines.push(cols.map((c) => {
+        const val = row[c];
+        return val === null || val === undefined ? 'NULL' : String(val);
+      }).join(' | '));
+    });
+    if (allRows.length > shown.length) {
+      lines.push(`... (${allRows.length - shown.length} more rows not shown)`);
+    }
+    return lines.join('\n');
+  }
+
   function renderTableResult(result) {
     if (!resultsHeader || !resultsBody) return;
     resultsHeader.innerHTML = '';
     resultsBody.innerHTML = '';
+
+    // Reset first, unconditionally - every branch below that actually shows
+    // something reportable calls setReportContext() again with its own
+    // context before returning, alongside inserting its own
+    // reportButtonHtml()/reportButtonRowHtml() markup; a branch that ISN'T
+    // in scope for this feature (isPending's "still fetching" placeholder)
+    // simply never does either, so this null is what sticks and no button
+    // is ever rendered for it.
+    setReportContext(null);
 
     // "All databases" mode's live-streaming placeholder tab (see
     // startAllModeStreaming()) - stands in for one selected connection
@@ -4155,9 +4456,16 @@ document.addEventListener('DOMContentLoaded', async () => {
         ? renderMarkdownLiteSummaryTab(result.text || '')
         : renderMarkdownLite(result.text || '');
       td.appendChild(p);
+      td.insertAdjacentHTML('beforeend', reportButtonHtml('wrong_result'));
 
       tr.appendChild(td);
       resultsBody.appendChild(tr);
+      setReportContext({
+        category: 'wrong_result',
+        databaseName: result.database && result.database.name,
+        sql: result.query || result.sql || result.statement || '',
+        content: stripNoSqlPrefix(result.text || ''),
+      });
       return;
     }
 
@@ -4181,13 +4489,22 @@ document.addEventListener('DOMContentLoaded', async () => {
             <div class="error-container">
               <span class="error-icon">⚠️</span>
               <div class="error-details">
-                <strong>Execution Error</strong>
+                <div class="error-title-row">
+                  <strong>Execution Error</strong>
+                  ${reportButtonHtml('error')}
+                </div>
                 ${dbNote}
                 <p>${result.error || 'An error occurred during SQL execution.'}</p>
               </div>
             </div>
           </td>
         </tr>`;
+      setReportContext({
+        category: 'error',
+        databaseName: result.database && result.database.name,
+        sql: result.statement || result.query || result.sql || '',
+        content: result.error || '',
+      });
       return;
     }
 
@@ -4214,9 +4531,28 @@ document.addEventListener('DOMContentLoaded', async () => {
       resultsBody.appendChild(tr);
     }
 
+    // Whatever's actually reportable about a successful result - notices
+    // (if any) plus either the tabular preview or the "no dataset"/"0 rows"
+    // message, whichever this call ends up showing below. Built once here
+    // (rather than duplicated at each of the three exit points) since a
+    // successful result is always reportable as 'wrong_result', unlike the
+    // isText/isError branches above which return before reaching this
+    // point at all.
+    const reportSql = (result && (result.query || result.sql || result.statement)) || getSqlQuery();
+    const reportDatabaseName = result && result.database && result.database.name;
+
     if (!result || (!result.columns && !result.rows)) {
       if (!hasNotices) {
         resultsBody.innerHTML = `<tr><td class="text-center text-muted py-8">Statement executed successfully. No dataset returned.</td></tr>`;
+      }
+      if (result) {
+        setReportContext({
+          category: 'wrong_result',
+          databaseName: reportDatabaseName,
+          sql: reportSql,
+          content: hasNotices ? result.notices.join('\n') : 'Statement executed successfully. No dataset returned.',
+        });
+        resultsBody.insertAdjacentHTML('beforeend', reportButtonRowHtml('wrong_result', result.columns ? result.columns.length : 1));
       }
       return;
     }
@@ -4236,15 +4572,29 @@ document.addEventListener('DOMContentLoaded', async () => {
           const td = document.createElement('td');
           const val = row[col];
           td.textContent = val !== null && val !== undefined ? val : 'NULL';
-          
+
           td.classList.add('cell-multiline');
           if (val === null || val === undefined) td.classList.add('text-null');
           tr.appendChild(td);
         });
         resultsBody.appendChild(tr);
       });
+      setReportContext({
+        category: 'wrong_result',
+        databaseName: reportDatabaseName,
+        sql: reportSql,
+        content: (hasNotices ? result.notices.join('\n') + '\n\n' : '') + summarizeTabularResultForReport(result),
+      });
+      resultsBody.insertAdjacentHTML('beforeend', reportButtonRowHtml('wrong_result', result.columns.length));
     } else {
       resultsBody.innerHTML = `<tr><td colspan="${result.columns ? result.columns.length : 1}" class="text-center text-muted py-8">0 rows returned.</td></tr>`;
+      setReportContext({
+        category: 'wrong_result',
+        databaseName: reportDatabaseName,
+        sql: reportSql,
+        content: (hasNotices ? result.notices.join('\n') + '\n\n' : '') + '0 rows returned.',
+      });
+      resultsBody.insertAdjacentHTML('beforeend', reportButtonRowHtml('wrong_result', result.columns ? result.columns.length : 1));
     }
   }
 
@@ -4527,9 +4877,23 @@ document.addEventListener('DOMContentLoaded', async () => {
         : renderMarkdownLite(cleanText);
 
       td.appendChild(p);
+      td.insertAdjacentHTML('beforeend', reportButtonHtml('wrong_result'));
       tr.appendChild(td);
       resultsBody.appendChild(tr);
     }
+
+    // Single-connection NO-SQL replies are always a direct model response
+    // to the user - exactly the "wrong or misleading summarization... or
+    // any other response given directly by the model" case this feature
+    // targets (see report_routes.py's module docstring) - so this is
+    // unconditionally reportable, unlike renderTableResult() above where
+    // only some branches are.
+    setReportContext({
+      category: 'wrong_result',
+      databaseName: '',
+      sql: getSqlQuery(),
+      content: cleanText,
+    });
   }
 
   // "All databases" mode's own combined renderer - used for history
@@ -5859,18 +6223,39 @@ document.addEventListener('DOMContentLoaded', async () => {
         } else if (Array.isArray(data.results) || data.failedStatement !== undefined) {
           renderResultsWithFailedStatement({ ...data, error: errMsg });
         } else if (resultsBody) {
+          // Bypasses renderTableResult() entirely (no per-tab result object
+          // exists here - e.g. a bare connect() failure with nothing else
+          // to show alongside it), so it needs its own setReportContext()
+          // call rather than getting one for free, AND its own inline
+          // button markup (reportButtonHtml() itself still gates on
+          // ISSUE_REPORTING_ENABLED). Both are excluded when the failure
+          // was actually an auth problem (401) - not a database error the
+          // model's SQL caused, so out of scope for this feature the same
+          // way a translation error is.
+          const reportable = response.status !== 401;
           resultsBody.innerHTML = `
             <tr>
               <td class="error-cell">
                 <div class="error-container">
                   <span class="error-icon">⚠️</span>
                   <div class="error-details">
-                    <strong>Execution Error</strong>
+                    <div class="error-title-row">
+                      <strong>Execution Error</strong>
+                      ${reportable ? reportButtonHtml('error') : ''}
+                    </div>
                     <p>${errMsg}</p>
                   </div>
                 </div>
               </td>
             </tr>`;
+          if (reportable) {
+            setReportContext({
+              category: 'error',
+              databaseName: connDbName ? connDbName.textContent : '',
+              sql: sql,
+              content: errMsg,
+            });
+          }
         }
       }
     } catch (err) {

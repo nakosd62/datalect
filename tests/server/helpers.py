@@ -44,8 +44,8 @@ if SERVER_DIR not in sys.path:
 # rather than returning the previous test's cached module object.
 _APP_MODULE_NAMES = [
     "app_config", "auth", "config_routes", "execute_routes",
-    "translate_routes", "history_routes", "db", "schema_cache", "state_store",
-    "connection_router", "cancel_registry",
+    "translate_routes", "history_routes", "report_routes", "db", "schema_cache",
+    "state_store", "connection_router", "cancel_registry",
 ]
 
 # Every env var any of the above modules reads at import or request time.
@@ -77,6 +77,12 @@ _ENV_VARS_TO_CLEAR = [
     # other secret-shaped var above: a developer's real shell/.env
     # plausibly has this set for their own local Cloud Run testing.
     "DB_CONFIG_ENCRYPTION_KEY",
+    # Issue reporting (report_routes.py) - cleared for the same reason as
+    # every other secret-shaped var above: a developer's real shell/.env
+    # plausibly has these set for their own local testing of the feature.
+    "ISSUE_REPORT_TO_EMAIL", "ISSUE_REPORT_SMTP_HOST", "ISSUE_REPORT_SMTP_PORT",
+    "ISSUE_REPORT_SMTP_USERNAME", "ISSUE_REPORT_SMTP_PASSWORD",
+    "ISSUE_REPORT_SMTP_FROM", "ISSUE_REPORT_SMTP_USE_TLS",
 ]
 
 # A syntactically valid (but obviously throwaway, fixed/shared) Fernet
@@ -176,12 +182,14 @@ def fresh_import(monkeypatch, tmp_path, env=None, register_blueprints=True, mock
         import execute_routes
         import translate_routes
         import history_routes
+        import report_routes
         import cancel_registry
 
         app_config.app.before_request(auth.enforce_authentication)
         for bp in (
             auth.auth_bp, config_routes.config_bp, execute_routes.execute_bp,
             translate_routes.translate_bp, history_routes.history_bp,
+            report_routes.report_bp,
         ):
             app_config.app.register_blueprint(bp)
 
@@ -190,6 +198,7 @@ def fresh_import(monkeypatch, tmp_path, env=None, register_blueprints=True, mock
         ns.execute_routes = execute_routes
         ns.translate_routes = translate_routes
         ns.history_routes = history_routes
+        ns.report_routes = report_routes
         ns.cancel_registry = cancel_registry
 
         # Mirrors server.py's own '/' route registration (serves the SPA

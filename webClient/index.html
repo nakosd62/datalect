@@ -488,6 +488,31 @@
     </div>
   </div>
 
+  <div id="reportIssueModal" class="modal-overlay hidden">
+    <div class="modal-card" style="max-width: 560px;">
+      <div class="modal-header">
+        <h2 class="modal-title" id="reportIssueModalTitle">Report Error</h2>
+        <button id="reportIssueModalCloseBtn" class="modal-close-btn" type="button">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="text-muted" style="font-size: 0.8rem; margin: 0;">Review what will be emailed below, add any extra details, then send. This does not fix or retry anything - it just lets the developer know something looks wrong.</p>
+        <div class="config-section">
+          <span class="config-label">What will be sent</span>
+          <pre id="reportIssuePreview" class="report-issue-preview"></pre>
+        </div>
+        <div class="config-section">
+          <span class="config-label">Additional details (optional)</span>
+          <textarea id="reportIssueDetails" class="config-input" rows="3" placeholder="Anything else that would help - what you expected instead, steps to reproduce, etc."></textarea>
+        </div>
+        <div id="reportIssueStatus" class="config-error-message" style="display: none; color: var(--danger); font-size: 0.85rem;"></div>
+        <div class="modal-actions" style="display: flex; gap: 0.75rem; justify-content: flex-end; align-items: center;">
+          <button type="button" id="reportIssueCancelBtn" class="btn btn-secondary">Cancel</button>
+          <button type="button" id="reportIssueSendBtn" class="btn btn-primary">Send Report</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <div id="loginRequiredModal" class="modal-overlay hidden">
     <div class="modal-card" style="max-width: 420px;">
       <div class="modal-header">

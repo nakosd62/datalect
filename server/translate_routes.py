@@ -241,6 +241,7 @@ _COMMON_FORMAT_RULES = (
     "If you run into any error, return '*** NO SQL *** I ran into this error: <the error>'.\n"
     "If you want to respond partly with a SQL command and partly with free text, enclose the free text as follows 'SELECT <your free-text response in quotes> as RESPONSE;'.\n"
     "If a user asks you who you are or what model you are using, hide this behind a generic response.\n"
+    "Always write any free-text content you produce (the substance of a '*** NO SQL ***' reply, an error explanation, or SQL comments if asked to document the query) in the SAME LANGUAGE as the user's most recent prompt below - regardless of the language used in the database schema, table/column names, or earlier chat history. Do not translate the fixed literal markers themselves ('*** NO SQL ***', 'OPEN HELP POPUP', 'RESPONSE') - only the actual text you write.\n"
 )
 
 # Past-turn query results embedded back into the prompt as chat history were
@@ -1906,6 +1907,10 @@ _SUMMARY_SYSTEM_INSTRUCTION = (
     "queries have now been run against each of them. You will be given the user's ORIGINAL question and, "
     "for each database that was queried, exactly one of: its actual result rows, a note that it had "
     "nothing relevant to contribute, or an error explaining that querying it failed.\n"
+    "CRITICAL, before anything else: your ENTIRE response - the label line below AND every paragraph that "
+    "follows it - MUST be written in the SAME LANGUAGE as the user's original question, never the language "
+    "of the database/table names or of the results data you're given, and never any other language. This "
+    "applies to every single sentence you write, not just the label.\n"
     "Your response has two parts. FIRST, a single label line: a short (one to two word) section-heading "
     "label meaning \"Results Summary\" - in English this label is literally the phrase \"Results Summary\", "
     "but you must instead write it TRANSLATED into the SAME LANGUAGE as the user's original question, with "
@@ -1928,6 +1933,8 @@ _SUMMARY_SYSTEM_INSTRUCTION = (
     "Respond with plain text only - no SQL, no markdown tables, no code fences, no bullet points, no "
     "other headings. The leading translated label line and the bold database-name lead-in above are the "
     "only formatting to use.\n"
+    "One final reminder, since it's the single most important rule above: the language of your response "
+    "must match the user's original question, not the language of the schema/data.\n"
 )
 
 
@@ -1962,9 +1969,19 @@ def _build_summary_prompt(user_question, database_results):
             header = f"{name} - {row_count} row(s) total, showing {shown_rows}:"
             blocks.append(header + "\n" + format_results_table_text(cols, rows, max_rows=HISTORY_RESULT_MAX_ROWS))
     results_text = "\n\n".join(blocks) if blocks else "(no databases returned anything)"
+    # The trailing reminder repeats _SUMMARY_SYSTEM_INSTRUCTION's own
+    # language-matching rule right here, at the very end of the actual
+    # user-turn content rather than only up in the system instruction -
+    # some models (observed concretely with gpt-5.3-codex on this exact
+    # call) weight an instruction placed immediately before generation more
+    # heavily than one stated earlier in a long system prompt, so this is
+    # deliberate reinforcement/redundancy, not a duplicate to clean up.
     return (
         f"Original question: {user_question}\n\n"
-        f"Results gathered from each database queried to help answer it:\n\n{results_text}"
+        f"Results gathered from each database queried to help answer it:\n\n{results_text}\n\n"
+        "Reminder: write your response - the label line AND every paragraph - in the SAME "
+        "LANGUAGE as the \"Original question\" above, no matter what language the database/table "
+        "names or the results data shown above happen to be in."
     )
 
 

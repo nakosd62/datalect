@@ -10,6 +10,7 @@ Thin entrypoint. All the actual logic lives in focused modules:
     execute_routes.py      - /api/execute (run SQL, return results)
     config_routes.py       - /api/config (session DB/model selection)
     history_routes.py      - /api/history, /api/history/purge
+    report_routes.py       - /api/report-issue (email an error/wrong-result report)
 
 This file just wires them together: create the app, attach the auth
 guard, register each blueprint, serve the SPA shell, and run.
@@ -25,12 +26,13 @@ from config_routes import config_bp
 from translate_routes import translate_bp
 from execute_routes import execute_bp
 from history_routes import history_bp
+from report_routes import report_bp
 
 # Auth guard runs before every request (see EXEMPT_ENDPOINTS in auth.py
 # for the routes that skip it).
 app.before_request(enforce_authentication)
 
-for bp in (auth_bp, config_bp, translate_bp, execute_bp, history_bp):
+for bp in (auth_bp, config_bp, translate_bp, execute_bp, history_bp, report_bp):
     app.register_blueprint(bp)
 
 

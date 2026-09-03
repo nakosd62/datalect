@@ -407,6 +407,30 @@ means previously-saved connections need to be re-saved to pick up the new
 key. See [`state_store.py`](./server/state_store.py)'s "Encryption at
 rest for database_config" comment for the full design.
 
+### Issue reporting ("Report Error" / "Report Wrong Result")
+
+Lets a user flag either a raw database error caused by SQL the model
+generated incorrectly (execute_routes.py's `/api/execute` intentionally
+shows those verbatim — see that module's docstring) or a "wrong result"
+(a successful response — a table, a summarization, any other reply given
+directly by the model — the user believes is wrong or misleading). The
+user always reviews the exact email content client-side before sending.
+Reports are emailed by the app itself over SMTP, not via a `mailto:` link.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ISSUE_REPORT_TO_EMAIL` | — | Recipient address for reports. **Required** to activate the feature at all — leave unset and the Report buttons never appear client-side (see `config_routes.py`'s `issue_reporting_enabled` field). |
+| `ISSUE_REPORT_SMTP_HOST` | — | SMTP host the app connects to send the report. Also required for the feature to activate. |
+| `ISSUE_REPORT_SMTP_PORT` | `587` | SMTP port (587 = STARTTLS submission, the common case for both self-hosted mail servers and providers like Gmail/SendGrid/SES). |
+| `ISSUE_REPORT_SMTP_USERNAME` | — | SMTP auth username. Optional — some internal relays allow anonymous submission from trusted IPs. |
+| `ISSUE_REPORT_SMTP_PASSWORD` | — | SMTP auth password. |
+| `ISSUE_REPORT_SMTP_FROM` | `ISSUE_REPORT_SMTP_USERNAME` | Envelope/header From address. Falls back to the SMTP username; set explicitly when the username isn't itself a real mailbox address (e.g. an API-key-shaped username). Required (directly or via the username fallback) for the feature to activate. |
+| `ISSUE_REPORT_SMTP_USE_TLS` | `1` | STARTTLS on connect. Set to `0` only for a relay that expects a plaintext/already-implicit-TLS connection instead. |
+
+See [`report_routes.py`](./server/report_routes.py) for the full design,
+including what gets included in a report's email body and the length cap
+applied to every free-text field.
+
 ### GCP / Cloud Run
 
 | Variable | Default | Purpose |
@@ -510,6 +534,7 @@ assets require authentication when running on Cloud Run or when
 | `POST /api/cancel` | Best-effort abandonment of whatever's currently in flight for this browser session (an `/api/translate` LLM call, or an `/api/execute` database call) — backs the header's **Cancel** button. Always returns `{ success: true, cancelled: <count> }`, even when nothing was registered (the work may have already finished on its own). See [`cancel_registry.py`](./server/cancel_registry.py) for the mechanism and its limits — it's a best-effort nudge (closing whatever connection/client the work is blocked on), not a guaranteed hard stop. |
 | `GET /api/history` | Returns recent translations plus per-day usage stats for the current identity — including anonymous Cloud Run visitors, whose history is isolated per browser session. |
 | `DELETE/POST /api/history/purge` | Deletes all translation history for the current identity (same per-session isolation for anonymous visitors as above). |
+| `POST /api/report-issue` | Body: `{ category: "error"\|"wrong_result", prompt?, sql?, database_name?, provider?, model?, content?, details? }` — emails a report to `ISSUE_REPORT_TO_EMAIL` (see [Issue reporting](#issue-reporting-report-error--report-wrong-result)). Returns `503` if the feature isn't configured, `400` for an invalid/missing `category`. |
 
 ---
 

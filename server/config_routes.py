@@ -221,6 +221,7 @@ from flask import Blueprint, request, jsonify
 from app_config import (
     CONFIGURED_DBS, DEFAULT_PRESET_ID, MAX_IN_SCOPE_CONNECTIONS,
     AUTH_ENABLED, IS_CLOUD_RUN, state_store,
+    ISSUE_REPORTING_ENABLED,
 )
 import os
 from auth import (
@@ -2010,6 +2011,12 @@ def handle_config():
         # above).
         'llm_byok_key_set': llm_byok_key_set,
         'auto_sql_execute': auto_sql_execute,
+        # Report Error / Report Wrong Result (see report_routes.py's module
+        # docstring) - True only once a deployer has actually configured a
+        # recipient + SMTP connection (app_config.py's ISSUE_REPORT_* env
+        # vars). client.js's Report buttons stay hidden entirely while this
+        # is False, rather than being shown and failing on click.
+        'issue_reporting_enabled': ISSUE_REPORTING_ENABLED,
         # "" means "nothing explicitly saved server-side yet" - client.js's
         # fetchBackendConfig() is what decides what to do with that (see
         # this file's own comment above saved_theme's assignment).
