@@ -32,8 +32,20 @@ POST /api/report-issue - lets a user flag one of three things:
     whatever the user settled on, not necessarily the prompt/SQL verbatim.
     `prompt`/`sql` are absent from the request body the same way they are
     for "feedback" - the edited text carries both.
+  - "summary_thumbs_up"/"summary_thumbs_down" reports: a thumbs-up/thumbs-
+    down reaction to the Summary tab (see webClient/client.js's
+    summaryFeedbackButtonsHtml()) - shown on both "all databases" mode's own
+    Summary tab (triage's routing message + Phase C's answer) and single-
+    connection mode's equivalent (see translate_routes.py's
+    summarize_single_connection_results). By explicit request, these two
+    categories carry NO prompt/sql/database_name/content at all, even
+    though (unlike plain "feedback") there IS a specific summary this
+    reaction is about - the prompt and the model's own summary text were
+    both judged too sensitive to leave the browser this way. `details` (a
+    REQUIRED free-text box here, same as "feedback") is the entire message,
+    same shape as "feedback" - see _DETAILS_ONLY_CATEGORIES below.
 
-All three categories are reviewed by the user client-side BEFORE this
+All six categories are reviewed by the user client-side BEFORE this
 endpoint is ever called - see webClient/index.html's #reportIssueModal,
 which shows exactly what will be emailed (and lets the user add free-text
 details) before Send is clicked. This route trusts that review already
@@ -75,7 +87,17 @@ _VALID_CATEGORIES = {
     'wrong_result': 'Wrong Result',
     'feedback': 'Feedback',
     'wrong_sql': 'Wrong SQL',
+    'summary_thumbs_up': 'Summary Feedback (Helpful)',
+    'summary_thumbs_down': 'Summary Feedback (Not Helpful)',
 }
+
+# Categories whose ENTIRE email body is just `details` - no prompt/sql/
+# database_name/content section at all (see this module's docstring on
+# "feedback" and "summary_thumbs_up"/"summary_thumbs_down" for why each one
+# qualifies). Checked in _build_email() below in place of a hardcoded
+# `category == 'feedback'` so all three get the same "no 'report' suffix in
+# the subject, 'details' gets its own plain header" treatment.
+_DETAILS_ONLY_CATEGORIES = {'feedback', 'summary_thumbs_up', 'summary_thumbs_down'}
 
 # Hard cap on every free-text field this route embeds into an email body -
 # this endpoint is reachable by any authenticated/anonymous session (same
@@ -104,7 +126,10 @@ def _build_email(category, category_label, payload, reporter_identity):
     `category` (the short machine code, e.g. 'feedback') is only used to
     pick the "details" section's own header below - everywhere else this
     function already works off the human-readable `category_label`."""
-    subject = f"[Datalect] {category_label}" if category == 'feedback' else f"[Datalect] {category_label} report"
+    subject = (
+        f"[Datalect] {category_label}" if category in _DETAILS_ONLY_CATEGORIES
+        else f"[Datalect] {category_label} report"
+    )
     database_name = (payload.get('database_name') or '').strip()
     if database_name:
         subject += f" - {database_name}"
@@ -148,11 +173,12 @@ def _build_email(category, category_label, payload, reporter_identity):
 
     details = _truncate(payload.get('details'))
     if details:
-        # For 'feedback', `details` IS the entire message (there's no
-        # preceding prompt/sql/content section it's "additional" to) - see
-        # this module's docstring - so it gets its own plain header instead
-        # of being framed as an add-on to something else.
-        lines.append("--- Feedback ---" if category == 'feedback' else "--- User's additional details ---")
+        # For every _DETAILS_ONLY_CATEGORIES member, `details` IS the entire
+        # message (there's no preceding prompt/sql/content section it's
+        # "additional" to) - see this module's docstring - so it gets its
+        # own plain header instead of being framed as an add-on to
+        # something else.
+        lines.append(f"--- {category_label} ---" if category in _DETAILS_ONLY_CATEGORIES else "--- User's additional details ---")
         lines.append(details)
         lines.append("")
 
@@ -181,9 +207,13 @@ def report_issue():
     data = request.get_json(silent=True) or {}
     category = data.get('category')
     if category not in _VALID_CATEGORIES:
+        # Generated from _VALID_CATEGORIES' own keys rather than hardcoded,
+        # so adding a category here never means this message quietly goes
+        # stale again.
+        valid_list = ", ".join(f"'{c}'" for c in _VALID_CATEGORIES)
         resp = jsonify({
             'success': False,
-            'error': "Invalid or missing 'category' - expected 'error', 'wrong_result', 'feedback', or 'wrong_sql'.",
+            'error': f"Invalid or missing 'category' - expected one of: {valid_list}.",
         })
         return apply_session_cookie(resp, session_id), 400
 

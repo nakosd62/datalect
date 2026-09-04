@@ -200,8 +200,9 @@ under the labels `google` (Gemini under the hood - the default), `anthropic`
 env var - each signed-in/anonymous session picks its own provider and model
 via the model-selection badge in the app's header (see "Model selection UI"
 below); that per-session choice is what `/api/translate` actually uses once
-one has been saved, falling back to this app's one hardcoded default
-(`google` / `gemini-3.6-flash`) otherwise. See
+one has been saved, falling back to this app's one fleet-wide default
+(`google` / `gemini-3.6-flash`, unless `DEFAULT_MODEL` below points
+elsewhere) otherwise. See
 [`translate_routes.py`](./server/translate_routes.py)'s module docstring
 for how a new provider is added (one `LlmProvider` subclass); this section
 just covers the env vars for the three that exist today.
@@ -211,6 +212,7 @@ just covers the env vars for the three that exist today.
 | `MAX_TRANSLATION_ATTEMPTS` | `5` | Max attempts (initial call + retries) for a single translation request before giving up, for transient (rate-limit/server-error/connection) failures. Shared by all three providers — see [`translate_routes.py`](./server/translate_routes.py). (Formerly `MAX_GEMINI_ATTEMPTS`.) |
 | `TRANSLATION_RETRY_DELAY_SECONDS` | `1` | Seconds to wait between transient-error retry attempts. Shared by all three providers. (Formerly `GEMINI_RETRY_DELAY_SECONDS`.) |
 | `TRANSLATION_TIMEOUT_SECONDS` | `60` | How long one call to the configured LLM provider may take before it's treated as a timeout (a retryable transient failure, same as a 5xx — see `MAX_TRANSLATION_ATTEMPTS` above). Shared by all three providers. |
+| `DEFAULT_MODEL` | — | Names exactly one model (e.g. `claude-opus-5`) to use as the default, instead of whichever provider's `*_MODELS` list happens to list a model first. Only takes effect for whichever provider's own `*_MODELS` list actually contains that model name — every other provider is unaffected and keeps using its own first entry. When no session has picked a provider at all yet, this also decides which provider becomes the app's one fleet-wide default (e.g. setting it to a Claude model moves the whole fleet's default off Google, with no separate provider-name variable needed). Falls back to Google / `gemini-3.6-flash` when unset, blank, or naming a model nothing configured actually offers. |
 
 #### Google (Gemini)
 
@@ -218,7 +220,7 @@ just covers the env vars for the three that exist today.
 |---|---|---|
 | `GEMINI_API_KEY` / `GOOGLE_API_KEY` | — | A single Gemini API key. Either name works. |
 | `GEMINI_PRESET_KEYS` | — | Comma-separated list of additional Gemini API keys. The app picks one at random per request and, on a rate-limit (429) error, automatically retries with a different key from the pool — immediately, with no delay, for up to one attempt per configured key (this budget is independent of `MAX_TRANSLATION_ATTEMPTS` above and is a Gemini-only mechanism; no other provider rotates keys this way). See [`translate_routes.py`](./server/translate_routes.py) for the full retry policy. |
-| `GOOGLE_MODELS` | `gemini-3.6-flash` | Comma-separated list of models this provider can use. The **first** entry is the default used for translation (per-request override: `gemini_model` or the generic `model`; per-session override via the model-selection UI) - and, since this is also the app's default provider, this first entry doubles as the app's one fleet-wide default model when no session has picked anything at all yet. The full list is what the model-selection UI offers for Google. |
+| `GOOGLE_MODELS` | `gemini-3.6-flash` | Comma-separated list of models this provider can use. The **first** entry is the default used for translation (per-request override: `gemini_model` or the generic `model`; per-session override via the model-selection UI), unless `DEFAULT_MODEL` above names a different model from this same list. The full list is what the model-selection UI offers for Google. |
 
 At least one of `GEMINI_API_KEY`, `GOOGLE_API_KEY`, or
 `GEMINI_PRESET_KEYS` must be set, or `/api/translate` returns a 400
@@ -230,7 +232,7 @@ At least one of `GEMINI_API_KEY`, `GOOGLE_API_KEY`, or
 |---|---|---|
 | `ANTHROPIC_API_KEY` | — | A single Claude API key. |
 | `CLAUDE_PRESET_KEYS` | — | Comma-separated list of additional Claude API keys - same pool-of-keys idea as `GEMINI_PRESET_KEYS`, but a rate limit here never rotates keys, it just waits and retries the same key (see `_classify_claude_error` in [`translate_routes.py`](./server/translate_routes.py)). |
-| `ANTHROPIC_MODELS` | `claude-sonnet-5` | Comma-separated list of models this provider can use - same "first entry is the default" convention as `GOOGLE_MODELS`. |
+| `ANTHROPIC_MODELS` | `claude-sonnet-5` | Comma-separated list of models this provider can use - same "first entry is the default, unless overridden by `DEFAULT_MODEL`" convention as `GOOGLE_MODELS`. |
 
 At least one of `ANTHROPIC_API_KEY` or `CLAUDE_PRESET_KEYS` must be set to
 select Anthropic via the model-selection UI, or `/api/translate` returns a
@@ -246,7 +248,7 @@ Built on the [Responses API](https://developers.openai.com/api/docs/guides/migra
 |---|---|---|
 | `OPENAI_API_KEY` | — | A single OpenAI API key. |
 | `OPENAI_PRESET_KEYS` | — | Comma-separated list of additional OpenAI API keys - same pool-of-keys idea as `CLAUDE_PRESET_KEYS`; a rate limit here never rotates keys either, it just waits and retries the same key. |
-| `OPENAI_MODELS` | `gpt-5.6-luna` | Comma-separated list of models this provider can use - same "first entry is the default" convention as `GOOGLE_MODELS`. |
+| `OPENAI_MODELS` | `gpt-5.6-luna` | Comma-separated list of models this provider can use - same "first entry is the default, unless overridden by `DEFAULT_MODEL`" convention as `GOOGLE_MODELS`. |
 
 At least one of `OPENAI_API_KEY` or `OPENAI_PRESET_KEYS` must be set to
 select OpenAI via the model-selection UI, or `/api/translate` returns a 400

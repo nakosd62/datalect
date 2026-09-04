@@ -92,6 +92,27 @@ module.exports = {
       // Deliberately no GOOGLE_CLIENT_ID / K_SERVICE / GCP_PROJECT_ID /
       // DATABASE_PRESETS_FILE - local-dev defaults (SQLite state, single
       // synthetic "Default DB" preset, no auth gating).
+      //
+      // Playwright merges this object ON TOP OF process.env for the spawned
+      // server (it does not replace it) - so YDYL_SKIP_DOTENV above only
+      // stops a repo-root .env FILE from being loaded; it does nothing
+      // about these same-named variables already exported in whoever's
+      // shell runs `npx playwright test` (e.g. for their own everyday use
+      // of the app outside this suite). _default_fleet_provider()/
+      // LlmProvider.default_model (translate_routes.py) read DEFAULT_MODEL/
+      // GOOGLE_MODELS/ANTHROPIC_MODELS/OPENAI_MODELS live from the
+      // environment on every request, with no way for a test to override
+      // them at the browser layer the way /api/translate etc. are mocked -
+      // so model-selection.spec.js's "shows the default model on load"
+      // assertions (hardcoded to this app's own fallback, gemini-3.6-flash)
+      // would otherwise pass or fail depending on the developer's personal
+      // shell config, not on this app's actual code. Blanked here so the
+      // suite's declared default is what these vars actually resolve to,
+      // for every developer, regardless of what their own shell exports.
+      DEFAULT_MODEL: '',
+      GOOGLE_MODELS: '',
+      ANTHROPIC_MODELS: '',
+      OPENAI_MODELS: '',
     },
     url: `http://127.0.0.1:${PORT}/`,
     reuseExistingServer: !process.env.CI,

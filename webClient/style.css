@@ -1055,18 +1055,17 @@ textarea:focus {
 /* "Report wrong SQL" thumbs-down icon - sits beside Execute inside
    .sql-overlay-actions above, opening the same #reportIssueModal used
    everywhere else in the app (in 'wrong_sql' mode - see
-   REPORT_CATEGORY_CONFIG.wrong_sql in client.js). Sized and colored to
-   match #micBtn exactly - same 16x16 icon, same transparent/accent-cyan-
-   then-primary-on-hover treatment - per explicit request, rather than the
-   --danger red the error-tab Report button briefly used (see
-   .report-issue-inline-btn--error's own comment on why that one is now
-   --accent-cyan too, for the same "same blue everywhere" reason). Hidden
-   by default, same as #sendFeedbackBtn - shown once fetchBackendConfig()
-   confirms ISSUE_REPORTING_ENABLED. */
+   REPORT_CATEGORY_CONFIG.wrong_sql in client.js). Sized to match #micBtn
+   (same 16x16 icon, same transparent-background treatment), but colored
+   --danger red per explicit request - a thumbs-down icon reading as red
+   rather than the app's brand blue - matching the same red now used for
+   the error-tab "Report Error" button (see .report-issue-inline-btn--error
+   below). Hidden by default, same as #sendFeedbackBtn - shown once
+   fetchBackendConfig() confirms ISSUE_REPORTING_ENABLED. */
 .report-sql-btn {
   background: transparent;
   border: none;
-  color: var(--accent-cyan);
+  color: var(--danger);
   cursor: pointer;
   padding: 6px;
   border-radius: 50%;
@@ -1078,8 +1077,8 @@ textarea:focus {
 }
 
 .report-sql-btn:hover {
-  color: var(--primary);
-  background: var(--overlay-2);
+  color: var(--danger);
+  background: rgba(var(--danger-rgb), 0.12);
 }
 
 /* client.js's setButtonsDisabled() already sets the `disabled` attribute
@@ -1095,7 +1094,7 @@ textarea:focus {
 }
 
 .report-sql-btn:disabled:hover {
-  color: var(--accent-cyan);
+  color: var(--danger);
   background: transparent;
 }
 
@@ -2020,12 +2019,12 @@ textarea.report-issue-preview:focus {
    a "Report Wrong Result" button (for a successful/NO-SQL response, as
    opposed to an error) is no longer ever rendered at all - only this one
    category remains, so there's no other variant to distinguish it from.
-   Was --danger/--on-danger (matching the red "Execution Error" title text
-   it sits beside) - changed to --accent-cyan/--on-accent-cyan per explicit
-   request, to match the same brand blue used everywhere else in the app
-   for this kind of reporting/feedback action (the mic button, the SQL
-   box's "report wrong SQL" thumbs-down icon, #stopBtn, etc.) rather than
-   reading as a second, alarm-colored action next to the error itself. */
+   --danger/--on-danger (matching the red "Execution Error" title text it
+   sits beside, and the same red now used for the SQL box's own "report
+   wrong SQL" thumbs-down icon - see .report-sql-btn above) per explicit
+   request - this had briefly been --accent-cyan/--on-accent-cyan (the same
+   brand blue used elsewhere for reporting/feedback actions), reverted back
+   to red here. */
 .report-issue-inline-btn {
   display: inline-flex;
   align-items: center;
@@ -2045,8 +2044,72 @@ textarea.report-issue-preview:focus {
 }
 
 .report-issue-inline-btn--error {
-  background-color: var(--accent-cyan);
-  color: var(--on-accent-cyan);
+  background-color: var(--danger);
+  color: var(--on-danger);
+}
+
+/* Thumbs up/down feedback row on the Summary tab (see client.js's
+   summaryFeedbackButtonsHtml() - the only place this markup is rendered,
+   for both "all databases" and single-connection mode's own Summary tab).
+   Sits directly UNDER the summary text (client.js appends it right after
+   the .response-text <p>, not before it), and the icons sit snug beside
+   the "Was this summary helpful?" label rather than pinned to the row's
+   far edge - `flex-start` plus a small `gap` (not `space-between`, which
+   would stretch across the full-width cell) is what keeps them right next
+   to the text regardless of how wide the tab's own cell is. Unlike
+   .report-issue-inline-btn (a colored pill with emoji), these are plain
+   icon buttons whose SVGs use stroke="currentColor" specifically so
+   --primary (green)/--danger (red) - the two colors explicitly requested
+   for this feature - actually tint them; an emoji glyph can't be
+   recolored this way. */
+.summary-feedback-row {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}
+
+.summary-feedback-label {
+  font-size: 0.75rem;
+}
+
+.summary-feedback-btns {
+  display: inline-flex;
+  gap: 0.25rem;
+  flex-shrink: 0;
+}
+
+.summary-feedback-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.3rem;
+  border: none;
+  background: transparent;
+  border-radius: 6px;
+  cursor: pointer;
+  line-height: 1;
+}
+
+.summary-feedback-btn:hover {
+  filter: brightness(1.15);
+}
+
+.summary-feedback-btn--up {
+  color: var(--primary);
+}
+
+.summary-feedback-btn--up:hover {
+  background-color: rgba(var(--primary-rgb), 0.12);
+}
+
+.summary-feedback-btn--down {
+  color: var(--danger);
+}
+
+.summary-feedback-btn--down:hover {
+  background-color: rgba(var(--danger-rgb), 0.12);
 }
 
 /* Wraps .report-issue-inline-btn when it has to be inserted as its own

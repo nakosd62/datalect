@@ -39,7 +39,17 @@ function fakeServiceAccountKeyJson(projectId = 'fake-test-project') {
 
 async function openConfigModal(page) {
   await page.locator('#configTriggerBadge').click();
-  await expect(page.locator('#configModal')).not.toHaveClass(/hidden/);
+  // #configTriggerBadge's click handler awaits a real, unmocked
+  // fetch('/api/config') (fetchBackendConfig() in client.js) before it
+  // removes #configModal's hidden class - a genuine network round trip to
+  // the real Flask dev server this suite runs against, not something
+  // page.route() intercepts. The default 8s expect timeout is normally far
+  // more than that needs, but in a loaded/constrained environment a single
+  // request can occasionally take longer than that even though nothing is
+  // actually stuck - give this one specific wait more headroom rather than
+  // loosening the suite-wide default (a genuinely broken modal would still
+  // fail well within this).
+  await expect(page.locator('#configModal')).not.toHaveClass(/hidden/, { timeout: 15_000 });
 }
 
 /** Clicks "+ Add custom connection" and waits for the row to be genuinely
@@ -56,6 +66,24 @@ async function addCustomDbRow(page) {
   const nameInput = page.locator('.custom-db-name-input').last();
   await expect(nameInput).toBeFocused();
   return nameInput;
+}
+
+/** Intercept POST /api/summarize-result - single-connection mode's own
+ * post-execution results summarization call (see translate-execute.spec.js's
+ * own copy of this helper, and translate_routes.py's docstring on that
+ * route). Any test here that runs a real translate+execute turn and then
+ * reopens the config modal afterward needs this mocked: client.js fires
+ * this as a genuine follow-up LLM call once results land, and keeps
+ * #configTriggerBadge disabled (its click handler no-ops while disabled)
+ * until it settles - left unmocked, it's a real, slow/failing network call
+ * in this suite's sandboxed environment, and a click on the still-disabled
+ * badge right after execution silently does nothing, no matter how long a
+ * test then waits for the modal that click was supposed to open. */
+async function mockSummarizeResult(page) {
+  await page.route('**/api/summarize-result', async (route) => {
+    if (route.request().method() !== 'POST') return route.fallback();
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ success: true }) });
+  });
 }
 
 test.describe('config modal', () => {
@@ -565,8 +593,15 @@ test.describe('config modal', () => {
     await expect(page.locator('#configModal')).toHaveClass(/hidden/);
 
     await openConfigModal(page);
-    await expect(page.locator('.custom-db-card').last().locator('.custom-db-url-input')).toHaveCount(0);
-    await page.locator('.custom-db-remove-btn').last().click();
+    const card = page.locator('.custom-db-card').last();
+    await expect(card.locator('.custom-db-url-input')).toHaveCount(0);
+    // Scoped to this specific card, not `.custom-db-remove-btn` page-wide -
+    // the Preferences modal's 3 BYOK "Remove saved key" buttons (always in
+    // the DOM, just hidden behind that modal) share this exact same class
+    // name and sit later in the document than #configModal, so an
+    // unscoped `.last()` here silently resolves to the BYOK "openai"
+    // button instead of this card's own remove control.
+    await card.locator('.custom-db-remove-btn').click();
     await expect(page.locator('.custom-db-name-input')).toHaveCount(0);
   });
 
@@ -611,6 +646,7 @@ test.describe('config modal', () => {
     await mockExecute(page, {
       results: [{ columns: ['id', 'name'], rows: [{ id: 1, name: 'Ada' }], rowCount: 1 }],
     });
+    await mockSummarizeResult(page);
     await gotoApp(page);
 
     // Save a second custom connection to switch to later - the default
@@ -670,6 +706,7 @@ test.describe('config modal', () => {
     await mockExecute(page, {
       results: [{ columns: ['id', 'name'], rows: [{ id: 1, name: 'Ada' }], rowCount: 1 }],
     });
+    await mockSummarizeResult(page);
     await gotoApp(page);
 
     await page.locator('#aiPrompt').fill('list users');

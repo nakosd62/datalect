@@ -22,3 +22,4 @@ pandas
 python-dotenv
 pyarrow
 pyodbc  # backends/mongodb_sql.py - MongoDB Atlas SQL Interface is ODBC/JDBC-only, no pure-Python driver exists; requires unixODBC + MongoDB's own ODBC driver at the OS level (see Dockerfile)
+py3langid  # translate_routes.py's post-execution summarization language verification (_detect_language) - a maintained fork of langid.py/langdetect; the original langdetect's old distutils-based setup.py fails to build under modern setuptools, py3langid ships a normal wheel and needs no runtime network access (its language model is bundled package data)

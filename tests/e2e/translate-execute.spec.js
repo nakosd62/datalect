@@ -32,6 +32,31 @@ async function normalizedSql(page) {
   return (await currentSql(page) || '').replace(/\s+/g, ' ').trim();
 }
 
+/** Directly seeds the SQL box, bypassing translate entirely - mirrors
+ * currentSql()'s own CodeMirror-or-textarea fallback. Used where a test
+ * needs SOME non-empty SQL present (Execute/#reportSqlBtn are both
+ * disabled on an empty box - see client.js's applySqlActionButtonsContentState())
+ * but isn't itself testing translation. */
+async function setSqlBox(page, sql) {
+  await page.evaluate((value) => {
+    const wrapper = document.querySelector('.CodeMirror');
+    if (wrapper && wrapper.CodeMirror) {
+      wrapper.CodeMirror.setValue(value);
+    } else {
+      // Plain assignment never fires a DOM 'input' event on its own (only
+      // real keystrokes do) - client.js's own Execute/"report wrong SQL"
+      // disabled-state tracking (applySqlActionButtonsContentState()) is
+      // wired to that event for this exact fallback path, so it has to be
+      // dispatched explicitly here to mimic a real user typing/pasting.
+      const textarea = document.getElementById('sqlQuery');
+      if (textarea) {
+        textarea.value = value;
+        textarea.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+    }
+  }, sql);
+}
+
 test.describe('translate + execute', () => {
   test('translating a prompt fills in the generated SQL', async ({ page }) => {
     await mockTranslate(page, { sql: 'SELECT * FROM users LIMIT 10;' });
@@ -264,6 +289,12 @@ test.describe('translate + execute', () => {
     const micBtn = page.locator('#micBtn');
     const runBtn = page.locator('#runBtn');
 
+    // Execute is ALSO disabled on a genuinely empty SQL box (see
+    // client.js's applySqlActionButtonsContentState()) - a concern this
+    // test isn't about, so seed some placeholder SQL first to isolate the
+    // "in flight vs settled" behavior this test actually exercises.
+    await setSqlBox(page, 'SELECT 1;');
+
     // Sanity check on the resting state, before anything is in flight.
     await expect(dbBadge).not.toHaveClass(/badge-disabled/);
     await expect(modelBadge).not.toHaveClass(/badge-disabled/);
@@ -306,19 +337,254 @@ test.describe('translate + execute', () => {
     });
     await gotoApp(page);
 
-    await page.evaluate(() => {
-      const wrapper = document.querySelector('.CodeMirror');
-      if (wrapper && wrapper.CodeMirror) {
-        wrapper.CodeMirror.setValue('SELECT 42 AS n;');
-      } else {
-        const textarea = document.getElementById('sqlQuery');
-        if (textarea) textarea.value = 'SELECT 42 AS n;';
-      }
-    });
+    await setSqlBox(page, 'SELECT 42 AS n;');
     await page.locator('#runBtn').click();
 
     const rows = page.locator('#resultsBody tr');
     await expect(rows).toHaveCount(1);
     await expect(rows.first()).toContainText('42');
+  });
+});
+
+/** Intercept POST /api/summarize-result - single-connection mode's own
+ * post-execution results summarization endpoint (see this suite's own
+ * describe block below, and translate_routes.py's docstring on that
+ * route). Pass either `summary` (already carrying the server's own
+ * "*** NO SQL ***" convention prefix, mirroring the real route's response
+ * shape) for success, or `error` for a best-effort failure. */
+async function mockSummarizeResult(page, { summary, error } = {}) {
+  await page.route('**/api/summarize-result', async (route) => {
+    if (route.request().method() !== 'POST') return route.fallback();
+    const body = error !== undefined ? { success: false, error } : { success: true, summary };
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
+  });
+}
+
+test.describe('single-connection mode: post-execution results summarization', () => {
+  test('a leading Summary tab with actionable insight appears after running translated SQL', async ({ page }) => {
+    await mockTranslate(page, { sql: 'SELECT COUNT(*) AS n FROM signups;' });
+    await mockExecute(page, { results: [{ columns: ['n'], rows: [{ n: 42 }], rowCount: 1 }] });
+    await mockSummarizeResult(page, {
+      summary: '*** NO SQL *** Results Summary\n\nSignups are up sharply - worth investigating channel X.',
+    });
+    await gotoApp(page);
+
+    await page.locator('#aiPrompt').fill('how many signups this week');
+    await page.locator('#aiPrompt').press('Enter');
+    // auto_sql_execute defaults to on (state_store.py), so translatePrompt()
+    // itself runs the generated SQL - no separate #runBtn click needed (and
+    // clicking it anyway would fire a second, redundant execute+summarize
+    // round trip for this same turn).
+    await expect(page.locator('.response-text')).toContainText('Signups are up sharply', { timeout: 10000 });
+
+    // Two tabs now: the new leading "Summary" tab, plus the one real query
+    // result - a single result alone would never show tab-nav at all (see
+    // buildResultsTabsNav()'s own currentResultsList.length <= 1 guard), so
+    // this count is itself proof the Summary tab was actually prepended.
+    const tabs = page.locator('#resultsTabsNav .result-tab-btn');
+    await expect(tabs).toHaveCount(2);
+    await expect(tabs.nth(0)).toContainText('Summary');
+    await expect(tabs.nth(0)).toHaveClass(/active/);
+    await expect(page.locator('.response-text')).toContainText('Signups are up sharply');
+    // The server's internal "*** NO SQL ***" convention is stripped before
+    // display, same as every other consumer of it - never shown verbatim.
+    await expect(page.locator('.response-text')).not.toContainText('NO SQL');
+  });
+
+  test('no Summary tab, and no summarization call at all, for a direct SQL entry with no real question', async ({ page }) => {
+    let summarizeCalled = false;
+    await page.route('**/api/summarize-result', async (route) => {
+      summarizeCalled = true;
+      await route.fulfill({
+        status: 200, contentType: 'application/json',
+        body: JSON.stringify({ success: true, summary: '*** NO SQL *** should never be requested' }),
+      });
+    });
+    await mockExecute(page, { results: [{ columns: ['n'], rows: [{ n: 42 }], rowCount: 1 }] });
+    await gotoApp(page);
+
+    // Typed directly into the SQL editor, never translated from a prompt -
+    // client.js's own "[Direct SQL Execution]" convention (see executeSql()'s
+    // own aiPrompt fallback) is what this feature is deliberately gated on.
+    await setSqlBox(page, 'SELECT COUNT(*) AS n FROM signups;');
+    await page.locator('#runBtn').click();
+
+    const rows = page.locator('#resultsBody tr');
+    await expect(rows).toHaveCount(1);
+    // Single result, no Summary tab prepended - tab-nav never even shows.
+    await expect(page.locator('#resultsTabsNav')).toHaveClass(/hidden/);
+    expect(summarizeCalled).toBe(false);
+  });
+
+  test('an apology tab is shown, still leading, when summarization itself fails', async ({ page }) => {
+    await mockTranslate(page, { sql: 'SELECT 1;' });
+    await mockExecute(page, { results: [{ columns: ['n'], rows: [{ n: 1 }], rowCount: 1 }] });
+    await mockSummarizeResult(page, { error: 'Unable to summarize results right now.' });
+    await gotoApp(page);
+
+    await page.locator('#aiPrompt').fill('give me one');
+    await page.locator('#aiPrompt').press('Enter');
+    // auto_sql_execute defaults to on - see the previous test's comment.
+    await expect(page.locator('.response-text')).toContainText('Unable to summarize results right now.', { timeout: 10000 });
+
+    const tabs = page.locator('#resultsTabsNav .result-tab-btn');
+    await expect(tabs).toHaveCount(2);
+    await expect(tabs.nth(0)).toContainText('Summary');
+  });
+
+  // Regression coverage for a bug: this summarization step used to be
+  // skipped entirely whenever the SQL execution itself failed, unlike
+  // "all databases" mode's own Phase C, which already summarizes over
+  // whatever DID execute alongside any failures. Both single-connection
+  // failure shapes (execute_routes.py's module docstring: the bare
+  // {success:false, error} shape for a connect()/single-statement
+  // failure, and the {results, failedStatement, ...} shape for a
+  // multi-statement script that fails partway through) now also request
+  // a summary - but deliberately WITHOUT stealing the active tab away
+  // from the error the user needs to see (see client.js's
+  // prependSingleModeSummaryTabPreservingActiveTab docstring) - so these
+  // assert the Summary tab is present but NOT active/shown, rather than
+  // repeating the "leading, active Summary tab" shape the success-path
+  // tests above assert.
+  test('a bare execution failure also gets a Summary tab, without stealing focus from the error', async ({ page }) => {
+    await mockTranslate(page, { sql: 'SELECT * FROM does_not_exist;' });
+    await mockExecute(page, { error: 'relation "does_not_exist" does not exist', status: 400 });
+    await mockSummarizeResult(page, {
+      summary: '*** NO SQL *** Results Summary\n\nThat table does not exist in this schema.',
+    });
+    await gotoApp(page);
+
+    await page.locator('#aiPrompt').fill('query a table that does not exist');
+    await page.locator('#aiPrompt').press('Enter');
+
+    // The error is what's shown, and stays shown - not silently replaced
+    // by the summary the moment it arrives.
+    await expect(page.locator('#resultsBody')).toContainText('Execution Error');
+    const tabs = page.locator('#resultsTabsNav .result-tab-btn');
+    await expect(tabs).toHaveCount(2);
+    await expect(tabs.nth(0)).toContainText('Summary');
+    await expect(tabs.nth(0)).not.toHaveClass(/active/);
+    await expect(tabs.nth(1)).toHaveClass(/active/);
+    await expect(tabs.nth(1)).toContainText('Error');
+    // Still there once the summarization round trip actually settles.
+    await expect(page.locator('#resultsBody')).toContainText('Execution Error');
+
+    // Clicking into the Summary tab shows the real summary text.
+    await tabs.nth(0).click();
+    await expect(page.locator('.response-text')).toContainText('That table does not exist in this schema.');
+  });
+
+  test('a multi-statement script that fails partway through also gets a Summary tab', async ({ page }) => {
+    await mockTranslate(page, { sql: 'SELECT 1; SELECT * FROM does_not_exist;' });
+    await mockExecute(page, {
+      results: [{ columns: ['?column?'], rows: [{ '?column?': 1 }], rowCount: 1 }],
+      error: 'relation "does_not_exist" does not exist',
+      failedStatement: 'SELECT * FROM does_not_exist;',
+    });
+    await mockSummarizeResult(page, {
+      summary: '*** NO SQL *** Results Summary\n\nThe first statement ran fine; the second referenced a missing table.',
+    });
+    await gotoApp(page);
+
+    await page.locator('#aiPrompt').fill('run two statements, one of them bad');
+    await page.locator('#aiPrompt').press('Enter');
+
+    await expect(page.locator('#resultsBody')).toContainText('Execution Error');
+    const tabs = page.locator('#resultsTabsNav .result-tab-btn');
+    // Summary + the one succeeded statement + the one failed statement.
+    await expect(tabs).toHaveCount(3);
+    await expect(tabs.nth(0)).toContainText('Summary');
+    await expect(tabs.nth(0)).not.toHaveClass(/active/);
+    // The failed statement's own tab (last one) stays active - same "the
+    // user needs to see this" jump renderResultsWithFailedStatement()
+    // already did before Summary support was added.
+    await expect(tabs.last()).toHaveClass(/active/);
+    await expect(tabs.last()).toContainText('Error');
+  });
+
+  test('no summarization call at all for an execution failure with no real question (direct SQL entry)', async ({ page }) => {
+    let summarizeCalled = false;
+    await page.route('**/api/summarize-result', async (route) => {
+      summarizeCalled = true;
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ success: false }) });
+    });
+    await mockExecute(page, { error: 'relation "does_not_exist" does not exist', status: 400 });
+    await gotoApp(page);
+
+    await setSqlBox(page, 'SELECT * FROM does_not_exist;');
+    await page.locator('#runBtn').click();
+
+    await expect(page.locator('#resultsBody')).toContainText('Execution Error');
+    // No Summary tab, and no tab-nav at all - same "direct SQL entry never
+    // summarizes" guard the success-path test above covers, now also
+    // holding for a FAILED direct execution.
+    await expect(page.locator('#resultsTabsNav')).toHaveClass(/hidden/);
+    expect(summarizeCalled).toBe(false);
+  });
+
+  test('no summarization call for an execution failure that is really an auth requirement (401)', async ({ page }) => {
+    let summarizeCalled = false;
+    await page.route('**/api/summarize-result', async (route) => {
+      summarizeCalled = true;
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ success: false }) });
+    });
+    await mockTranslate(page, { sql: 'SELECT * FROM signups;' });
+    await mockExecute(page, { error: 'Authentication required.', status: 401 });
+    await gotoApp(page);
+
+    await page.locator('#aiPrompt').fill('how many signups');
+    await page.locator('#aiPrompt').press('Enter');
+
+    await expect(page.locator('#resultsBody')).toContainText('Authentication required');
+    // Same out-of-scope-for-the-Report-feature reasoning already applied
+    // to the Report button/context for a 401 (see renderTableResult()'s
+    // isError branch, result.notReportable) - nothing meaningful happened
+    // here for the model to reason over either, so no summarization call.
+    await expect(page.locator('#resultsTabsNav')).toHaveClass(/hidden/);
+    expect(summarizeCalled).toBe(false);
+  });
+
+  test('navigating back to a turn replays its saved summary without a new network call', async ({ page }) => {
+    await mockTranslate(page, { sql: 'SELECT COUNT(*) AS n FROM signups;' });
+    await mockExecute(page, { results: [{ columns: ['n'], rows: [{ n: 42 }], rowCount: 1 }] });
+    let summarizeCalls = 0;
+    await page.route('**/api/summarize-result', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      summarizeCalls += 1;
+      await route.fulfill({
+        status: 200, contentType: 'application/json',
+        body: JSON.stringify({ success: true, summary: '*** NO SQL *** Results Summary\n\nSignups are trending up.' }),
+      });
+    });
+    await gotoApp(page);
+
+    await page.locator('#aiPrompt').fill('how many signups this week');
+    await page.locator('#aiPrompt').press('Enter');
+    // auto_sql_execute defaults to on - see the first test's comment above.
+    await expect(page.locator('.response-text')).toContainText('Signups are trending up', { timeout: 10000 });
+    expect(summarizeCalls).toBe(1);
+
+    // A second, unrelated turn - somewhere to navigate back FROM. Its own
+    // real question also gets its own (distinctly-worded) summary.
+    await mockTranslate(page, { sql: 'SELECT 2 AS n;' });
+    await mockExecute(page, { results: [{ columns: ['n'], rows: [{ n: 2 }], rowCount: 1 }] });
+    await page.route('**/api/summarize-result', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      summarizeCalls += 1;
+      await route.fulfill({
+        status: 200, contentType: 'application/json',
+        body: JSON.stringify({ success: true, summary: '*** NO SQL *** Results Summary\n\nHere is two.' }),
+      });
+    });
+    await page.locator('#aiPrompt').fill('give me two');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect(page.locator('.response-text')).toContainText('Here is two', { timeout: 10000 });
+    expect(summarizeCalls).toBe(2);
+
+    await page.locator('#goBackBtn').click();
+    await expect(page.locator('.response-text')).toContainText('Signups are trending up');
+    // Replayed from the saved turn (chatStore's own history) - no third
+    // network call was made just to view it again.
+    expect(summarizeCalls).toBe(2);
   });
 });

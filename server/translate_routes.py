@@ -87,32 +87,43 @@ translate_bp = Blueprint('translate', __name__)
 
 # Which LLM provider a request actually uses is resolved per-session (see
 # translate_query()'s session_data.get('llm_provider') lookup below), never
-# a fleet-wide env var - "google"/"anthropic"/"openai" are the only valid
-# values, matching _LLM_PROVIDERS' keys below. A session that never
+# a provider-NAME env var - "google"/"anthropic"/"openai" are the only
+# valid values, matching _LLM_PROVIDERS' keys below. A session that never
 # explicitly picked one (via the model-selection UI) falls back to this
-# app's one hardcoded default: whichever provider get_llm_provider()
-# returns for an unrecognized/blank name - see that function's docstring.
-# This used to be independently configurable via an LLM_PROVIDER env var;
-# that's gone now, since there's no longer a separate provider-name knob
-# to keep in sync with the hardcoded default model below - one hardcoded
-# default (the model) fully implies the other (its provider).
+# app's one fleet-wide default: whichever provider get_llm_provider()
+# returns for an unrecognized/blank name - see that function's (and
+# _default_fleet_provider()'s) docstring. This used to be independently
+# configurable via an LLM_PROVIDER env var; that's gone now, replaced by
+# DEFAULT_MODEL below, which names a MODEL rather than a provider - the
+# provider that model belongs to is derived from it, so there's still only
+# one knob to set, not two that could drift out of sync with each other.
 
 # Each provider's own *_MODELS env var (GOOGLE_MODELS/ANTHROPIC_MODELS/
 # OPENAI_MODELS - see LlmProvider.models_env_var below) is a single
-# comma-separated list doing double duty: its FIRST entry is that
-# provider's default model (used when neither a request nor a saved
-# session choice picks one - see LlmProvider.default_model), and the full
-# list is what the model-selection modal offers for that provider (see
-# LlmProvider.preset_models). Left entirely unset, each provider falls
-# back to its own hardcoded single-model default (LlmProvider.
-# fallback_models) so this app works out of the box with zero model
-# configuration - claude-sonnet-5 for Anthropic (strong structured-output
-# reasoning at a much lower cost than the top-tier model), gpt-5.6-luna for
-# OpenAI (its cost-efficient tier - "gpt-5.6" alone, no suffix, is an alias
-# for the top "-sol" tier instead), gemini-3.6-flash for Google - this last
-# one doubles as the app's ONE fleet-wide default when a session hasn't
-# picked a provider at all yet (see get_llm_provider() below and the
-# comment above this one).
+# comma-separated list: the full list is what the model-selection modal
+# offers for that provider (see LlmProvider.preset_models). Left entirely
+# unset, each provider falls back to its own hardcoded single-model default
+# (LlmProvider.fallback_models) so this app works out of the box with zero
+# model configuration - claude-sonnet-5 for Anthropic (strong structured-
+# output reasoning at a much lower cost than the top-tier model),
+# gpt-5.6-luna for OpenAI (its cost-efficient tier - "gpt-5.6" alone, no
+# suffix, is an alias for the top "-sol" tier instead), gemini-3.6-flash for
+# Google.
+#
+# DEFAULT_MODEL (a single, app-wide env var naming exactly one model, e.g.
+# "claude-sonnet-5") is what actually picks each provider's default model
+# now, instead of that provider's own *_MODELS list's first entry always
+# winning by simply being first - see LlmProvider.default_model's
+# docstring. It only takes effect for whichever provider's own
+# preset_models actually contains that exact model name; every other
+# provider's default_model is unaffected and still falls back to its own
+# preset_models[0]. When a session hasn't picked a provider at all yet,
+# DEFAULT_MODEL also decides which provider becomes the app's ONE
+# fleet-wide default (see _default_fleet_provider() below) - so setting it
+# to an Anthropic or OpenAI model moves the whole fleet's default off
+# Google without any separate provider-name knob. Google/gemini-3.6-flash
+# remains the final fallback-of-last-resort when DEFAULT_MODEL is unset,
+# blank, or doesn't match any currently-configured model at all.
 
 # Per-dialect opening lines for the system instruction below - the rest of
 # the instruction (output format, NO SQL sentinels, etc.) is identical
@@ -125,6 +136,7 @@ _DIALECT_PROMPT_INTROS = {
         "You are an expert SQL generation assistant for PostgreSQL-compatible RDBMSs.\n"
         "Given the provided past chat interactions, the database schema and the user's natural language prompt, translate the request into valid SQL.\n"
         "You may return one or more independent SQL statements. You may use PL/pgSQL Functions or Procedures, if appropriate.\n"
+        "ROUND(...) with an explicit decimal-places argument (ROUND(x, n)) is ONLY defined for a numeric argument - there is NO round(double precision, integer) overload, only a separate 1-argument round(double precision) (rounds to the nearest integer, no precision control). Many common expressions actually evaluate to double precision, not numeric, even though they look like plain arithmetic - most often PERCENTILE_CONT/PERCENTILE_DISC, AVG()/SUM() over a float/double precision column, STDDEV/VARIANCE (and their _POP/_SAMP variants), and math functions like SQRT/LN/LOG/EXP/POWER/RANDOM. Calling ROUND(<any of these>, n) fails with \"function round(double precision, integer) does not exist\" unless the argument is cast first, e.g. ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY x)::numeric, 2). When it isn't certain an expression is already numeric, cast it to ::numeric before passing it to a 2-argument ROUND.\n"
         "If asked to document the SQL command, add comments at the top of the query using the supported convention (if there is any) for how to mark comments.\n"
     ),
     "BigQuery Standard SQL": (
@@ -1245,13 +1257,23 @@ class LlmProvider(ABC):
     @property
     def default_model(self):
         """The model used when neither a request override
-        (request_model_key/"model") nor a saved session choice picks one -
-        always preset_models' first entry, i.e. this provider's *_MODELS
-        env var's first entry, or fallback_models[0] when that env var is
-        unset. One env var doing double duty (see models_env_var's
-        docstring) rather than a separate *_MODEL var, so there's exactly
-        one place to look to know both "what does this provider use by
-        default" and "what else can it use"."""
+        (request_model_key/"model") nor a saved session choice picks one.
+
+        Checks the app-wide DEFAULT_MODEL env var first (parsed live, same
+        as preset_models above, so it's never stale relative to a test or
+        deployment that sets it): if that value is one of THIS provider's
+        own preset_models, it wins - letting an operator pin the default to
+        any specific model (not necessarily the first entry in this
+        provider's own *_MODELS list) via one env var, without reordering
+        that list. Otherwise falls back to preset_models' first entry, i.e.
+        this provider's *_MODELS env var's first entry, or
+        fallback_models[0] when that env var is unset - exactly the
+        behavior before DEFAULT_MODEL existed. See get_llm_provider()'s
+        docstring for how DEFAULT_MODEL also picks which provider is used
+        at all, for a session that hasn't chosen one either."""
+        override = os.environ.get("DEFAULT_MODEL", "").strip()
+        if override and override in self.preset_models:
+            return override
         return self.preset_models[0]
 
 
@@ -1441,18 +1463,42 @@ _LLM_PROVIDERS = {
 }
 
 
+def _default_fleet_provider():
+    """The provider used for a session that hasn't picked one at all - see
+    get_llm_provider()'s own docstring below, the only caller. Resolved
+    from DEFAULT_MODEL (see LlmProvider.default_model's docstring) when
+    that env var names a model belonging to one of the three registered
+    providers' own preset_models - whichever provider matches becomes the
+    app's fleet-wide default, so setting DEFAULT_MODEL alone can move it
+    onto Claude or OpenAI, not just Google. Falls back to Google - this
+    app's original, still-hardcoded fallback-of-last-resort - when
+    DEFAULT_MODEL is unset, blank, or doesn't match any currently-
+    configured model at all. Checked in _LLM_PROVIDERS' own definition
+    order (google, anthropic, openai), so a DEFAULT_MODEL value that
+    happened to collide across two providers' preset_models (unlikely in
+    practice - model names aren't shared across vendors) would
+    deterministically resolve to the earlier one rather than varying by
+    dict iteration order."""
+    override = os.environ.get("DEFAULT_MODEL", "").strip()
+    if override:
+        for provider in _LLM_PROVIDERS.values():
+            if override in provider.preset_models:
+                return provider
+    return _LLM_PROVIDERS["google"]
+
+
 def get_llm_provider(name):
     """Returns the LlmProvider for `name` (a session's saved llm_provider
     value - "google"/"anthropic"/"openai"). Unlike backends/__init__.py's
     get_backend() - which raises on an unrecognized "type" - an
-    unrecognized/blank provider name here falls back to Google rather than
-    erroring: this is this app's ONE hardcoded fleet-wide default (see this
-    module's docstring on why there's no separate LLM_PROVIDER-style env
-    var for it anymore), and the same graceful fallback also covers a
+    unrecognized/blank provider name here falls back to this app's ONE
+    fleet-wide default (see _default_fleet_provider() above - Google unless
+    DEFAULT_MODEL names a model that belongs to a different provider)
+    rather than erroring, and the same graceful fallback also covers a
     session whose saved value predates this app's provider labels being
     renamed from "gemini"/"claude" to "google"/"anthropic" - such a session
     just silently reverts to the default instead of erroring."""
-    return _LLM_PROVIDERS.get(name, _LLM_PROVIDERS["google"])
+    return _LLM_PROVIDERS.get(name) or _default_fleet_provider()
 
 
 def list_llm_providers_info():
@@ -1902,6 +1948,108 @@ def _run_phase_b_fanout(selected_entries, prompts, provider, model, user_identit
 # Summary tab exactly as it already is rather than showing an error for
 # what's genuinely just a nice-to-have layered on top.
 
+# --- Language verification for the summarization steps below -------------
+#
+# Both _SUMMARY_SYSTEM_INSTRUCTION and _SINGLE_SUMMARY_SYSTEM_INSTRUCTION
+# already tell the model (twice - once in the system instruction, once
+# again in the trailing reminder _build_summary_prompt/_build_single_
+# summary_prompt append to the actual user-turn text) to answer in the
+# SAME LANGUAGE as the user's original question, never the language of the
+# schema/table names or of the actual result data. That instruction alone
+# turned out not to be reliable enough in practice: a database whose
+# result rows/table content are themselves in some other language (e.g. a
+# customer table full of German city/product names) can pull a model's
+# output toward THAT language instead, regardless of how many times the
+# prompt says not to - this has been observed concretely, and reported as
+# happening consistently, with real production traffic. The two functions
+# below add a second, independent layer that doesn't rely on the model
+# choosing to comply: detect the question's actual language up front (so
+# the reminder can name it concretely, e.g. "Respond in German." instead
+# of the vaguer "same language as the question"), and, after the model
+# responds, verify the response is actually in that language - if it
+# isn't, _summarize_with_retry (below) discards the response and retries
+# with an even more forceful, explicit correction rather than silently
+# handing the user a summary in the wrong language.
+#
+# py3langid (a maintained fork of the older, now broken-on-modern-
+# setuptools langid.py/langdetect) is used for this - pure Python, no
+# network access needed at runtime (its language model ships as package
+# data), and fast enough (~0.2ms/call once its model is loaded) to run on
+# every summarization call with no perceptible latency added. Loading its
+# model takes a real ~1s, so it's done exactly ONCE, at import time, via
+# the module-level _LANGUAGE_IDENTIFIER below, not per-request.
+try:
+    from py3langid.langid import LanguageIdentifier as _LangIdentifier, MODEL_FILE as _LANGID_MODEL_FILE
+    # norm_probs=True turns py3langid's raw per-class scores into an
+    # actual normalized probability distribution across all languages it
+    # knows, so `_MIN_LANGUAGE_CONFIDENCE` below is a real, comparable
+    # threshold rather than an arbitrary raw-score cutoff - without this,
+    # a short/degenerate input (e.g. "1", or a bare "SELECT 1") can still
+    # report a "top" language with a raw score that looks confident but
+    # isn't, since the raw scores aren't on a 0-1 scale at all.
+    _LANGUAGE_IDENTIFIER = _LangIdentifier.from_model_file(_LANGID_MODEL_FILE, norm_probs=True)
+except Exception:  # pragma: no cover - defensive only; see _detect_language's docstring
+    logger.warning("py3langid failed to load - summarization language verification disabled", exc_info=True)
+    _LANGUAGE_IDENTIFIER = None
+
+# Deliberately non-exhaustive - just enough of py3langid's ~97 supported
+# codes to give the model a readable name for the languages this app's
+# users are actually likely to write questions in. _describe_language()
+# falls back to the bare code for anything not listed here, which is
+# still meaningful to a model even when it's not friendly to a human
+# skimming logs.
+_LANGUAGE_NAMES = {
+    "en": "English", "es": "Spanish", "de": "German", "fr": "French", "it": "Italian",
+    "pt": "Portuguese", "nl": "Dutch", "sv": "Swedish", "da": "Danish", "no": "Norwegian",
+    "fi": "Finnish", "pl": "Polish", "ru": "Russian", "uk": "Ukrainian", "cs": "Czech",
+    "sk": "Slovak", "ro": "Romanian", "hu": "Hungarian", "el": "Greek", "tr": "Turkish",
+    "ar": "Arabic", "he": "Hebrew", "hi": "Hindi", "bn": "Bengali", "ja": "Japanese",
+    "ko": "Korean", "zh": "Chinese", "vi": "Vietnamese", "th": "Thai", "id": "Indonesian",
+    "bg": "Bulgarian", "hr": "Croatian", "sr": "Serbian", "lt": "Lithuanian", "lv": "Latvian",
+    "et": "Estonian", "fa": "Persian",
+}
+
+# Below this confidence (on py3langid's normalized 0-1 scale), a
+# detection is treated as "unknown" rather than acted on - short or
+# ambiguous text (a two-word question, a bare "SELECT 1", an empty
+# string) genuinely can't be classified reliably, and guessing wrong here
+# would either steer generation toward the wrong language or reject a
+# perfectly correct response, so both call sites below skip the check
+# entirely rather than trust a low-confidence guess.
+_MIN_LANGUAGE_CONFIDENCE = 0.5
+
+
+def _detect_language(text):
+    """Best-effort language code for `text` (py3langid's own code space -
+    mostly ISO 639-1, a handful of 639-3 for languages with no 2-letter
+    code), or None when detection isn't possible: py3langid itself failed
+    to load (see the try/except above - degrades this whole feature to a
+    no-op rather than crashing summarization), `text` is empty/whitespace-
+    only, or the top result's confidence is below _MIN_LANGUAGE_CONFIDENCE."""
+    if _LANGUAGE_IDENTIFIER is None:
+        return None
+    text = (text or "").strip()
+    if not text:
+        return None
+    ranked = _LANGUAGE_IDENTIFIER.rank(text)
+    if not ranked:
+        return None
+    code, confidence = ranked[0]
+    return code if confidence >= _MIN_LANGUAGE_CONFIDENCE else None
+
+
+def _describe_language(code):
+    """Human-readable English name for a _detect_language() code, e.g.
+    "de" -> "German" - used to give the model a concrete, named target
+    ("Respond in German.") instead of only the indirect "same language as
+    the question" framing already in _SUMMARY_SYSTEM_INSTRUCTION/
+    _SINGLE_SUMMARY_SYSTEM_INSTRUCTION. Falls back to the raw code for
+    anything not in the (deliberately non-exhaustive) _LANGUAGE_NAMES map."""
+    if not code:
+        return None
+    return _LANGUAGE_NAMES.get(code.lower(), code)
+
+
 _SUMMARY_SYSTEM_INSTRUCTION = (
     "You previously helped route a user's natural-language question to one or more databases, and real "
     "queries have now been run against each of them. You will be given the user's ORIGINAL question and, "
@@ -1938,7 +2086,7 @@ _SUMMARY_SYSTEM_INSTRUCTION = (
 )
 
 
-def _build_summary_prompt(user_question, database_results):
+def _build_summary_prompt(user_question, database_results, expected_language_code=None):
     """Renders `database_results` - client-submitted
     [{"name", "columns", "rows", "rowCount"} | {"name", "note"} |
     {"name", "error"}, ...], one entry per statement result/note/failure
@@ -1951,7 +2099,16 @@ def _build_summary_prompt(user_question, database_results):
     results are fed back into a prompt as chat history (see
     build_gemini_history_contents's docstring): an oversized result set
     blowing the prompt's token budget is exactly the same risk here,
-    for exactly the same reason."""
+    for exactly the same reason.
+
+    `expected_language_code` is _detect_language(user_question)'s result,
+    computed once by the caller (summarize_all_mode_results) and threaded
+    through here so the trailing reminder can name the target language
+    concretely (e.g. "Respond in German.") instead of only the indirect
+    "same language as the question" framing - see the language-
+    verification section comment above _SUMMARY_SYSTEM_INSTRUCTION for
+    why. None (detection unavailable or too low-confidence to trust)
+    leaves the reminder exactly as it always was."""
     blocks = []
     for entry in (database_results or []):
         name = entry.get("name") or "Unknown database"
@@ -1976,12 +2133,26 @@ def _build_summary_prompt(user_question, database_results):
     # call) weight an instruction placed immediately before generation more
     # heavily than one stated earlier in a long system prompt, so this is
     # deliberate reinforcement/redundancy, not a duplicate to clean up.
+    # When a language was confidently detected, name it directly instead
+    # of (or rather, in addition to - the indirect framing stays as a
+    # fallback for whatever the name-based sentence doesn't cover) asking
+    # the model to infer it - a concrete target is harder for a model to
+    # drift away from under pressure from foreign-language data than an
+    # instruction that requires it to first correctly infer the question's
+    # language and then remember to match it several paragraphs later.
+    language_name = _describe_language(expected_language_code)
+    named_language_sentence = (
+        f" Concretely: the question above is in {language_name}, so your ENTIRE response - the "
+        f"label line and every paragraph - must be written in {language_name}, in full, not "
+        f"partially or with any other language mixed in."
+        if language_name else ""
+    )
     return (
         f"Original question: {user_question}\n\n"
         f"Results gathered from each database queried to help answer it:\n\n{results_text}\n\n"
         "Reminder: write your response - the label line AND every paragraph - in the SAME "
         "LANGUAGE as the \"Original question\" above, no matter what language the database/table "
-        "names or the results data shown above happen to be in."
+        "names or the results data shown above happen to be in." + named_language_sentence
     )
 
 
@@ -1996,15 +2167,16 @@ def _build_summary_prompt(user_question, database_results):
 # against a fixed English string like "Result Summary"/"Results Summary".
 
 
-def summarize_all_mode_results(user_question, database_results, provider, client, model,
-                                api_key=None, tried_keys=None, using_byok=False):
-    """"All databases" mode's Phase C - see the section comment above for
-    the fuller picture of when/why this runs. A brief, plain-text answer
-    to `user_question` - one short paragraph per database, over the
-    ACTUAL data gathered from every database Phase B was routed to,
-    rather than the routing message triage produced before any of it was
-    known (see _SUMMARY_SYSTEM_INSTRUCTION for the exact shape asked
-    for).
+def _summarize_with_retry(prompt_content, schema_block, system_instruction, provider, client, model,
+                           api_key=None, tried_keys=None, using_byok=False, log_label="Summarization",
+                           expected_language_code=None):
+    """Shared bounded-retry machinery behind BOTH summarize_all_mode_results
+    ("all databases" mode's Phase C, below) and summarize_single_
+    connection_results (single-connection mode's own equivalent, added
+    later in this file) - extracted so this retry/key-rotation policy is
+    written and tested in exactly ONE place rather than duplicated
+    verbatim across two callers that build different prompts/system
+    instructions but need identical failure handling.
 
     Bounded 2-attempt retry at getting usable CONTENT back (a response
     that comes back empty, or as JUST the label with no real paragraphs
@@ -2026,7 +2198,9 @@ def summarize_all_mode_results(user_question, database_results, provider, client
     those two functions' own parameters of the same name for the same
     reason: the caller's own already-picked key is the natural starting
     point, and an explicit (not closed-over) `tried_keys` set is safe to
-    thread through a fresh call each time this fires.
+    thread through a fresh call each time this fires. `log_label` only
+    changes what appears in the logger.warning() calls below, so log
+    lines stay distinguishable between callers.
 
     On total failure (LLM call retry/rotation budget exhausted, or 2
     consecutive content-invalid responses) returns (None, None, error) -
@@ -2039,21 +2213,40 @@ def summarize_all_mode_results(user_question, database_results, provider, client
     descriptive string when it was instead 2 consecutive content-invalid
     responses (nothing genuinely went wrong at the API level, so there's
     no exception to report - just isinstance-check `error` to tell the two
-    apart). The caller (the /api/summarize-results route below) uses
-    format_llm_error_for_user() to build an honest message from `error`
-    when it's a real exception, surfacing WHY Phase C didn't produce a
-    summary rather than just leaving the Summary tab silently as it
-    already was - it's the caller, not this function, that needs
-    `using_byok` for that (see generate_sql_for_connection's docstring
-    for the general reasoning); `using_byok` is accepted here only to
-    force the key-rotation budget down to 1 attempt, same as there.
+    apart). The caller uses format_llm_error_for_user() to build an honest
+    message from `error` when it's a real exception, surfacing WHY
+    summarization didn't produce anything rather than just leaving the
+    Summary tab silently as it already was - it's the caller, not this
+    function, that needs `using_byok` for that (see
+    generate_sql_for_connection's docstring for the general reasoning);
+    `using_byok` is accepted here only to force the key-rotation budget
+    down to 1 attempt, same as there.
+
+    Takes `prompt_content` (the plain new-user-turn text
+    _build_summary_prompt/_build_single_summary_prompt built) and
+    `schema_block` rather than an already-built `llm_input`, unlike
+    before language verification was added: on a language-mismatch retry
+    (see below) this function needs to rebuild `llm_input` itself from a
+    CORRECTED prompt_content via provider.build_llm_input(), which it
+    can't do starting from an opaque, already-provider-specific-shaped
+    llm_input value.
+
+    `expected_language_code` - _detect_language(user_question)'s result,
+    threaded through from the caller - adds a second content-validity
+    check alongside the existing empty/label-only one: if the response's
+    OWN detected language doesn't match, it's discarded exactly like an
+    empty/label-only response is (consuming one of the 2 attempts), and -
+    unlike the empty/label-only case, which just retries with the exact
+    same prompt - the next attempt's prompt gets an extra, blunt
+    correction line naming the required language, since simply asking
+    again with no change would likely just reproduce the same wrong-
+    language answer. None (detection unavailable or too low-confidence)
+    skips this check entirely - see _detect_language's own docstring.
 
     Returns (text, usage, None) on success - `text` is the model's own
     plain-text answer, NOT YET prefixed with the app's "*** NO SQL ***"
     convention (the caller adds that, exactly like triage's "answer"
     outcome does, so the prefix logic lives in exactly one place)."""
-    llm_input = provider.build_llm_input([], "", _build_summary_prompt(user_question, database_results))
-
     if api_key is None:
         api_key = provider.pick_api_key()
     if tried_keys is None:
@@ -2064,9 +2257,10 @@ def summarize_all_mode_results(user_question, database_results, provider, client
     for attempt in range(2):
         text = None
         transient_attempt = 1
+        llm_input = provider.build_llm_input([], schema_block, prompt_content)
         while True:
             try:
-                text, usage = provider.call(client, model, llm_input, _SUMMARY_SYSTEM_INSTRUCTION)
+                text, usage = provider.call(client, model, llm_input, system_instruction)
                 break
             except Exception as e:
                 last_error = e
@@ -2085,8 +2279,8 @@ def summarize_all_mode_results(user_question, database_results, provider, client
                         client = provider.make_client(api_key)
                     tried_keys.add(api_key)
                     logger.warning(
-                        "Phase C summarization call failed (%d/%d configured keys tried), rotating API key and retrying immediately: %s",
-                        len(tried_keys), key_pool_size, e,
+                        "%s call failed (%d/%d configured keys tried), rotating API key and retrying immediately: %s",
+                        log_label, len(tried_keys), key_pool_size, e,
                     )
                     continue
 
@@ -2094,8 +2288,8 @@ def summarize_all_mode_results(user_question, database_results, provider, client
                     text = None
                     break
                 logger.warning(
-                    "Phase C summarization call failed (attempt %d/%d), retrying in %ds: %s",
-                    transient_attempt, MAX_TRANSLATION_ATTEMPTS, retry_action["delay"], e,
+                    "%s call failed (attempt %d/%d), retrying in %ds: %s",
+                    log_label, transient_attempt, MAX_TRANSLATION_ATTEMPTS, retry_action["delay"], e,
                 )
                 transient_attempt += 1
                 if retry_action["delay"]:
@@ -2118,14 +2312,69 @@ def summarize_all_mode_results(user_question, database_results, provider, client
         # response with no label convention at all (see its docstring).
         stripped = (text or "").strip()
         if stripped and not is_label_only_response(text or ""):
+            if expected_language_code is not None:
+                actual_language_code = _detect_language(stripped)
+                if actual_language_code is not None and actual_language_code != expected_language_code:
+                    expected_name = _describe_language(expected_language_code)
+                    actual_name = _describe_language(actual_language_code)
+                    logger.warning(
+                        "%s came back in %s instead of the question's own %s (attempt %d/2) - discarding%s",
+                        log_label, actual_name, expected_name, attempt + 1,
+                        ", retrying with an explicit correction" if attempt + 1 < 2 else " (no attempts left)",
+                    )
+                    last_error = f"response was written in {actual_name} instead of {expected_name}"
+                    # Simply retrying with the SAME prompt would likely just
+                    # reproduce the same wrong-language answer, since
+                    # whatever pulled the model toward actual_name (usually
+                    # foreign-language data in the results) is still there -
+                    # so the next attempt's prompt gets an explicit,
+                    # unambiguous correction addendum on top of the
+                    # reminder _build_summary_prompt/_build_single_summary_
+                    # prompt already appended, naming both the mistake and
+                    # the fix directly rather than repeating the same
+                    # instruction that didn't work the first time.
+                    prompt_content = (
+                        f"{prompt_content}\n\nCORRECTION: your previous answer to this exact request was "
+                        f"written in {actual_name}, which is WRONG - the question was in {expected_name}, so "
+                        f"your response must be entirely in {expected_name}. Write your full response again, "
+                        f"from scratch, entirely in {expected_name} this time."
+                    )
+                    continue
             return stripped, usage, None
         last_error = (
             "response was only the label, or missing the label/blank-line shape, with no real content after it"
             if stripped else "empty summarization response"
         )
 
-    logger.warning("All-mode results summarization (Phase C) failed after retry: %s", last_error)
+    logger.warning("%s failed after retry: %s", log_label, last_error)
     return None, None, last_error
+
+
+def summarize_all_mode_results(user_question, database_results, provider, client, model,
+                                api_key=None, tried_keys=None, using_byok=False):
+    """"All databases" mode's Phase C - see the section comment above for
+    the fuller picture of when/why this runs. A brief, plain-text answer
+    to `user_question` - one short paragraph per database, over the
+    ACTUAL data gathered from every database Phase B was routed to,
+    rather than the routing message triage produced before any of it was
+    known (see _SUMMARY_SYSTEM_INSTRUCTION for the exact shape asked
+    for).
+
+    All the retry/key-rotation policy (bounded 2-attempt content-validity
+    retry, nested transient-error/key-rotation retry) now lives in the
+    shared _summarize_with_retry() above - see its docstring for the full
+    reasoning. This function's own job is just building the Phase-C-
+    specific prompt/system instruction and delegating to it.
+
+    Returns (text, usage, error) - see _summarize_with_retry's docstring
+    for the exact meaning of each on success/failure."""
+    expected_language_code = _detect_language(user_question)
+    prompt_content = _build_summary_prompt(user_question, database_results, expected_language_code)
+    return _summarize_with_retry(
+        prompt_content, "", _SUMMARY_SYSTEM_INSTRUCTION, provider, client, model,
+        api_key=api_key, tried_keys=tried_keys, using_byok=using_byok,
+        log_label="Phase C summarization", expected_language_code=expected_language_code,
+    )
 
 
 @translate_bp.route('/api/summarize-results', methods=['POST'])
@@ -2198,6 +2447,220 @@ def summarize_results():
     # is likewise never "about" just one specific database.
     record_all_databases_triage(
         user_identity, prompt, summary_text, llm_model, duration,
+        usage.get("input_tokens", 0), usage.get("output_tokens", 0),
+        usage.get("total_tokens", 0), usage.get("thinking_tokens", 0),
+        usage.get("cached_content_tokens", 0),
+    )
+
+    resp = jsonify({'success': True, 'summary': summary_text})
+    return apply_session_cookie(resp, session_id)
+
+
+# --- Single-connection mode's own post-execution results summarization --
+#
+# The single-connection equivalent of "all databases" mode's Phase C above
+# - see that section's own comment for the general shape/reasoning this
+# mirrors. Once a single-connection turn's generated SQL has actually been
+# executed (client.js's executeSql()), a SEPARATE LLM call is made with the
+# original question, the schema, the SQL that ran, and every row it
+# returned - untruncated, unlike Phase C's own HISTORY_RESULT_MAX_ROWS cap
+# (explicit product decision: a single connection's own result set is
+# exactly what this call exists to reason over in full) - and asked to
+# both answer the question and call out actionable insight, not just
+# restate the data. Skipped entirely by the client when the LLM instead
+# answered directly via the "*** NO SQL ***" convention (nothing was
+# executed, so nothing to summarize). Same best-effort posture as Phase C:
+# any failure here is reported back as {"success": false}, never a hard
+# error, so the client just leaves the Summary tab out rather than
+# treating a nice-to-have's failure as a turn failure.
+
+_SINGLE_SUMMARY_SYSTEM_INSTRUCTION = (
+    "You previously helped translate a user's natural-language question into a real SQL query, and that "
+    "query has now actually been run against the database. You will be given the user's ORIGINAL question, "
+    "the database schema, the SQL that was executed, and its actual result rows.\n"
+    "CRITICAL, before anything else: your ENTIRE response - the label line below AND every paragraph that "
+    "follows it - MUST be written in the SAME LANGUAGE as the user's original question, never the language "
+    "of the schema/table names or of the results data you're given, and never any other language. This "
+    "applies to every single sentence you write, not just the label.\n"
+    "Your response has two parts. FIRST, a single label line: a short (one to two word) section-heading "
+    "label meaning \"Results Summary\" - in English this label is literally the phrase \"Results Summary\", "
+    "but you must instead write it TRANSLATED into the SAME LANGUAGE as the user's original question, with "
+    "nothing else on that line, followed by a blank line. SECOND, immediately after that blank line, your "
+    "real, substantive answer, ALSO written in that same language. Example of the full shape, if the "
+    "question was in English: \"Results Summary\\n\\nRevenue is up 12% quarter over quarter, driven mostly "
+    "by the Enterprise segment - worth digging into why SMB slipped.\". Never stop after the label - the "
+    "label by itself, with no paragraphs following it, is not a valid response; the label is a UI section "
+    "heading prepended to your answer, not a substitute for writing one. The label itself is plain text "
+    "with no markdown emphasis of your own around it.\n"
+    "Directly answer the user's original question using the actual result rows, and go further: call out "
+    "whatever is genuinely notable in the data (trends, outliers, concentrations, anything surprising) and "
+    "derive concrete, actionable insight or next steps the user could reasonably take away from these "
+    "SPECIFIC results - not generic advice unrelated to what the data actually shows. Keep it concise - a "
+    "few short paragraphs - even if the result set is large: this is a summary with insight, not a report. "
+    "If the results are empty or don't actually answer the question, say so plainly rather than inventing "
+    "an answer.\n"
+    "Respond with plain text only - no SQL, no markdown tables, no code fences, no bullet points, no "
+    "other headings. The leading translated label line is the only formatting to use.\n"
+    "One final reminder, since it's the single most important rule above: the language of your response "
+    "must match the user's original question, not the language of the schema/SQL/data.\n"
+)
+
+
+def _build_single_summary_prompt(user_question, sql, statement_results, expected_language_code=None):
+    """Renders `statement_results` - client-submitted [{"columns", "rows",
+    "rowCount"} | {"note"} | {"error"}, ...], one entry per SQL statement
+    /api/execute actually ran for this turn - into one labeled text block
+    per statement for the single-connection summarization call above.
+
+    Deliberately UNTRUNCATED: every row of every statement's results is
+    included (format_results_table_text called with max_rows=None, whose
+    `rows[:None]` slice is the full list) - unlike _build_summary_prompt's
+    own HISTORY_RESULT_MAX_ROWS cap above, per this feature's explicit
+    product requirement that a single connection's own results are never
+    truncated here.
+
+    `expected_language_code` - see _build_summary_prompt's own docstring
+    for what this is and why it's threaded through from the caller rather
+    than detected here."""
+    blocks = []
+    for i, entry in enumerate(statement_results or []):
+        error = entry.get("error")
+        note = entry.get("note")
+        if error:
+            blocks.append(f"Query Result {i + 1}: query failed - {error}")
+        elif note:
+            blocks.append(f"Query Result {i + 1}: {note}")
+        else:
+            cols = entry.get("columns") or []
+            rows = entry.get("rows") or []
+            row_count = entry.get("rowCount", len(rows))
+            header = f"Query Result {i + 1} - {row_count} row(s):"
+            blocks.append(header + "\n" + format_results_table_text(cols, rows, max_rows=None))
+    results_text = "\n\n".join(blocks) if blocks else "(no rows returned)"
+    # Same reinforcement-at-the-end rationale as _build_summary_prompt's own
+    # trailing reminder above - see that function's comment, and see its
+    # named_language_sentence for why a confidently-detected language gets
+    # named concretely here too.
+    language_name = _describe_language(expected_language_code)
+    named_language_sentence = (
+        f" Concretely: the question above is in {language_name}, so your ENTIRE response - the "
+        f"label line and every paragraph - must be written in {language_name}, in full, not "
+        f"partially or with any other language mixed in."
+        if language_name else ""
+    )
+    return (
+        f"Original question: {user_question}\n\n"
+        f"SQL executed:\n{sql}\n\n"
+        f"Results:\n\n{results_text}\n\n"
+        "Reminder: write your response - the label line AND every paragraph - in the SAME "
+        "LANGUAGE as the \"Original question\" above, no matter what language the schema, SQL, "
+        "or results data shown above happen to be in." + named_language_sentence
+    )
+
+
+def summarize_single_connection_results(user_question, schema, sql, statement_results, provider, client, model,
+                                         api_key=None, tried_keys=None, using_byok=False):
+    """Single-connection mode's equivalent of summarize_all_mode_results
+    above - see this file's "Single-connection mode's own post-execution
+    results summarization" section comment for the fuller picture, and
+    _summarize_with_retry's docstring for the shared retry/key-rotation
+    policy both this and summarize_all_mode_results now go through.
+
+    Unlike Phase C (which has no schema at all, and no single SQL
+    statement to point to - it summarizes across possibly several
+    databases), this call has a real schema and a real, already-executed
+    SQL statement for exactly one connection, both of which are given to
+    the model: the schema via build_llm_input's own schema_block
+    parameter (same cache-friendly placement translate_query()'s single-
+    connection path already uses - schema ahead of the (empty, here)
+    history and the new prompt), and the SQL/results via
+    _build_single_summary_prompt.
+
+    Returns (text, usage, error) - see _summarize_with_retry's docstring
+    for the exact meaning of each on success/failure."""
+    expected_language_code = _detect_language(user_question)
+    prompt_content = _build_single_summary_prompt(user_question, sql, statement_results, expected_language_code)
+    return _summarize_with_retry(
+        prompt_content, f"Database Schema:\n{schema}\n\n", _SINGLE_SUMMARY_SYSTEM_INSTRUCTION, provider, client, model,
+        api_key=api_key, tried_keys=tried_keys, using_byok=using_byok,
+        log_label="Single-connection results summarization", expected_language_code=expected_language_code,
+    )
+
+
+@translate_bp.route('/api/summarize-result', methods=['POST'])
+def summarize_result():
+    """See this module's "Single-connection mode's own post-execution
+    results summarization" section comment above for the full picture.
+    Called by the client once per single-connection turn, after
+    /api/execute has actually run the generated SQL - never for a "route"
+    outcome turn (that already gets its own Phase C summary via
+    /api/summarize-results above) and never when the LLM answered
+    directly via the "*** NO SQL ***" convention (nothing was executed,
+    so nothing to summarize)."""
+    session_id = get_or_create_session_id()
+    user_identity = get_current_user_identity(session_id)
+    data = request.get_json() or {}
+
+    session_data = state_store.get_session(user_identity)
+    provider = get_llm_provider(session_data.get('llm_provider'))
+    llm_model = (
+        data.get(provider.request_model_key) or data.get('model')
+        or session_data.get('llm_model') or provider.default_model
+    )
+    byok_key = state_store.get_llm_byok_key(user_identity, provider.name)
+    api_key = byok_key or provider.pick_api_key()
+    if not api_key:
+        resp = jsonify({'success': False, 'error': provider.missing_key_error})
+        return apply_session_cookie(resp, session_id), 400
+
+    prompt = (data.get('prompt') or '').strip()
+    sql = (data.get('sql') or '').strip()
+    statement_results = data.get('results')
+    if not prompt or not sql or not isinstance(statement_results, list) or not statement_results:
+        resp = jsonify({'success': False, 'error': 'prompt, sql and results are required'})
+        return apply_session_cookie(resp, session_id), 400
+
+    # Same connection this turn's own /api/translate call itself resolved
+    # (no client-side override needed/sent - the session's current single
+    # connection, exactly like /api/translate's single-connection path).
+    conn_str = resolve_conn_str(data.get('database_url'), user_identity)
+    schema = get_database_schema(conn_str, user_identity)
+
+    start_time = time.perf_counter()
+    client = provider.make_client(api_key)
+    cancel_token = cancel_handle = None
+    close_fn = getattr(client, "close", None)
+    if callable(close_fn):
+        cancel_token, cancel_handle = cancel_registry.register(session_id, close_fn)
+    try:
+        text, usage, error = summarize_single_connection_results(
+            prompt, schema, sql, statement_results, provider, client, llm_model, api_key=api_key,
+            using_byok=bool(byok_key),
+        )
+    finally:
+        if cancel_token is not None:
+            cancel_registry.unregister(session_id, cancel_token)
+        if cancel_handle is not None:
+            cancel_handle.close()
+    duration = round(1000 * (time.perf_counter() - start_time))
+
+    if text is None:
+        error_message = (
+            format_llm_error_for_user(provider, llm_model, error, using_byok=bool(byok_key))
+            if isinstance(error, BaseException) else
+            'Unable to summarize results right now.'
+        )
+        resp = jsonify({'success': False, 'error': error_message})
+        return apply_session_cookie(resp, session_id)
+
+    summary_text = "*** NO SQL *** " + text
+    usage = usage or {}
+    # Logged as a real translations-table row against the actual connection
+    # this was run for (unlike Phase C's "All Databases"/"All Databases"
+    # special-case logging - there IS one real connection here), same call
+    # translate_query()'s own single-connection path already uses.
+    record_translation(
+        user_identity, conn_str, prompt, summary_text, llm_model, duration,
         usage.get("input_tokens", 0), usage.get("output_tokens", 0),
         usage.get("total_tokens", 0), usage.get("thinking_tokens", 0),
         usage.get("cached_content_tokens", 0),

@@ -32,7 +32,9 @@ methods on an LlmProvider object (get_llm_provider(session_data.get(
 'llm_provider')) - see that function's and the LlmProvider class's
 docstrings in translate_routes.py; there's no separate LLM_PROVIDER env
 var anymore - a fresh session with nothing saved falls back to the one
-hardcoded default, Google/gemini-3.6-flash). The tests below don't test
+fleet-wide default, Google/gemini-3.6-flash unless DEFAULT_MODEL names a
+model belonging to a different provider - see get_llm_provider()'s and
+_default_fleet_provider()'s docstrings). The tests below don't test
 that class directly except in a small dedicated section near the end;
 they exercise it the same way they always exercised the old if/elif
 branches - through /api/translate with the session's saved llm_provider
@@ -2127,6 +2129,111 @@ def test_list_llm_providers_info_returns_all_three_providers_in_order(app_env):
     assert gemini_info["preset_models"] == ["gemini-3.6-flash"]
 
 
+# --- DEFAULT_MODEL env var (overrides which model is "the default") --------
+#
+# A single, app-wide DEFAULT_MODEL env var picks which model each
+# provider's own default_model actually resolves to, instead of that
+# provider's own *_MODELS list's first entry always winning purely by being
+# first - see LlmProvider.default_model's docstring. It only takes effect
+# for whichever provider's own preset_models genuinely contains that exact
+# model name; every other provider is unaffected. When a session hasn't
+# picked a provider at all yet, it also decides which provider becomes the
+# app's ONE fleet-wide default (see get_llm_provider()/
+# _default_fleet_provider()) - Google/gemini-3.6-flash remains the final
+# fallback when DEFAULT_MODEL is unset, blank, or matches nothing
+# configured at all.
+
+def test_default_model_overrides_which_model_this_provider_uses_by_default(app_factory):
+    env = app_factory(env={
+        "ANTHROPIC_MODELS": "claude-sonnet-5,claude-opus-5",
+        "DEFAULT_MODEL": "claude-opus-5",
+    })
+    provider = env.translate_routes.get_llm_provider("anthropic")
+    # preset_models' own order (and therefore the model-selection modal's
+    # own listing) is untouched - only which one counts as "the default".
+    assert provider.preset_models == ["claude-sonnet-5", "claude-opus-5"]
+    assert provider.default_model == "claude-opus-5"
+
+
+def test_default_model_is_ignored_for_a_provider_it_does_not_belong_to(app_factory):
+    # DEFAULT_MODEL names an Anthropic model - Google's own default_model
+    # (a completely different provider's preset_models) must be unaffected
+    # and keep falling back to its own first entry.
+    env = app_factory(env={
+        "GOOGLE_MODELS": "gemini-3.6-flash,gemini-2.5-pro",
+        "DEFAULT_MODEL": "claude-opus-5",
+    })
+    provider = env.translate_routes.get_llm_provider("google")
+    assert provider.default_model == "gemini-3.6-flash"
+
+
+def test_default_model_blank_or_unset_falls_back_to_first_entry(app_factory):
+    for value in ("", "   "):
+        env = app_factory(env={"ANTHROPIC_MODELS": "claude-sonnet-5,claude-opus-5", "DEFAULT_MODEL": value})
+        assert env.translate_routes.get_llm_provider("anthropic").default_model == "claude-sonnet-5"
+
+
+def test_default_model_not_matching_any_configured_model_falls_back_to_first_entry(app_factory):
+    env = app_factory(env={
+        "ANTHROPIC_MODELS": "claude-sonnet-5,claude-opus-5",
+        "DEFAULT_MODEL": "not-a-real-model",
+    })
+    assert env.translate_routes.get_llm_provider("anthropic").default_model == "claude-sonnet-5"
+
+
+def test_default_model_picks_the_fleet_wide_default_provider_when_none_saved(app_factory):
+    # No session has picked a provider at all (get_llm_provider("") is
+    # exactly what a fresh/unset session resolves through) - DEFAULT_MODEL
+    # naming an Anthropic model moves the WHOLE fleet's default off Google.
+    env = app_factory(env={
+        "ANTHROPIC_MODELS": "claude-sonnet-5,claude-opus-5",
+        "DEFAULT_MODEL": "claude-opus-5",
+    })
+    provider = env.translate_routes.get_llm_provider("")
+    assert provider.name == "anthropic"
+    assert provider.default_model == "claude-opus-5"
+
+
+def test_default_model_not_matching_anything_still_falls_back_to_google_fleet_wide(app_factory):
+    env = app_factory(env={"DEFAULT_MODEL": "not-a-real-model-anywhere"})
+    provider = env.translate_routes.get_llm_provider("")
+    assert provider.name == "google"
+    assert provider.default_model == "gemini-3.6-flash"
+
+
+def test_list_llm_providers_info_reflects_default_model_override_for_matching_provider_only(app_factory):
+    env = app_factory(env={
+        "ANTHROPIC_MODELS": "claude-sonnet-5,claude-opus-5",
+        "DEFAULT_MODEL": "claude-opus-5",
+    })
+    info = env.translate_routes.list_llm_providers_info()
+    by_name = {p["name"]: p for p in info}
+    assert by_name["anthropic"]["default_model"] == "claude-opus-5"
+    # Google/OpenAI never had a matching model - unaffected.
+    assert by_name["google"]["default_model"] == "gemini-3.6-flash"
+    assert by_name["openai"]["default_model"] == "gpt-5.6-luna"
+
+
+def test_translate_uses_default_model_env_var_end_to_end_for_a_fresh_session(app_factory, monkeypatch):
+    """A session that never picked a provider or model at all (no saved
+    llm_provider/llm_model - the true "fresh install" case) actually
+    translates via Claude, on the model DEFAULT_MODEL names - not Google,
+    the old hardcoded fallback-of-last-resort."""
+    env = app_factory(env={
+        "ANTHROPIC_API_KEY": "fake-key-1",
+        "ANTHROPIC_MODELS": "claude-sonnet-5,claude-opus-5",
+        "DEFAULT_MODEL": "claude-opus-5",
+    })
+    harness = ClaudeHarness()
+    monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
+    harness.queue_response(FakeClaudeResponse("SELECT 1;"))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'hi'})
+    _, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    assert harness.create_calls[0]["model"] == "claude-opus-5"
+
+
 # --- Session-persisted model selection (model-selection UI) ------------------
 #
 # translate_query() resolves the effective provider/model from the current
@@ -2574,3 +2681,151 @@ def test_translate_byok_key_removed_falls_back_to_env_key_again(app_factory, mon
     _, data = parse_translate_stream(resp)
     assert data['success'] is True
     assert harness.client_api_keys == ["env-key-1"]
+
+
+# --- Single-connection mode's own post-execution results summarization --
+#
+# The single-connection equivalent of "all databases" mode's Phase C (see
+# test_connection_router.py's own "Phase C" section for that one) - mirrors
+# its test conventions closely, adjusted for: a real single connection/
+# schema instead of no schema at all, an explicit SQL statement, and -
+# critically - NO row-count cap (this feature's whole point per explicit
+# product decision), which is the one behavior the Phase C tests assert the
+# OPPOSITE of (test_build_summary_prompt_caps_rows_the_same_way_past_turn_
+# history_does).
+
+
+def test_build_single_summary_prompt_includes_the_question_sql_and_results(app_env):
+    prompt_text = app_env.translate_routes._build_single_summary_prompt(
+        "how many users signed up", "SELECT COUNT(*) AS n FROM users;",
+        [{"columns": ["n"], "rows": [{"n": 42}], "rowCount": 1}],
+    )
+    assert "Original question: how many users signed up" in prompt_text
+    assert "SELECT COUNT(*) AS n FROM users;" in prompt_text
+    assert "Query Result 1 - 1 row(s):" in prompt_text
+    assert "Columns: n" in prompt_text
+    assert "{'n': 42}" in prompt_text
+
+
+def test_build_single_summary_prompt_never_truncates_rows_unlike_phase_c(app_env):
+    # Regression guard for this feature's explicit "do not truncate the
+    # data - pass all records" requirement - deliberately the OPPOSITE
+    # assertion of test_build_summary_prompt_caps_rows_the_same_way_past_
+    # turn_history_does in test_connection_router.py, which asserts Phase C
+    # DOES cap at HISTORY_RESULT_MAX_ROWS.
+    many_rows = [{"n": i} for i in range(app_env.translate_routes.HISTORY_RESULT_MAX_ROWS + 25)]
+    prompt_text = app_env.translate_routes._build_single_summary_prompt(
+        "q", "SELECT n FROM t;", [{"columns": ["n"], "rows": many_rows, "rowCount": len(many_rows)}],
+    )
+    assert f"Query Result 1 - {len(many_rows)} row(s):" in prompt_text
+    assert f"Total Rows: {len(many_rows)}" in prompt_text
+    # Every single row serialized, not just HISTORY_RESULT_MAX_ROWS of them.
+    assert prompt_text.count("{'n':") == len(many_rows)
+
+
+def test_build_single_summary_prompt_formats_notes_and_errors_too(app_env):
+    prompt_text = app_env.translate_routes._build_single_summary_prompt(
+        "q", "SELECT 1; SELECT 2;",
+        [{"columns": [], "rows": [], "rowCount": 0}, {"error": "syntax error near SELECT"}],
+    )
+    assert "Query Result 2: query failed - syntax error near SELECT" in prompt_text
+
+
+def test_summarize_single_connection_results_returns_stripped_text_and_usage_on_success(app_env):
+    from test_connection_router import _FakeProvider
+
+    provider = _FakeProvider(["Results Summary\n\nSignups are up 20% this week - worth a closer look at channel X."])
+    text, usage, error = app_env.translate_routes.summarize_single_connection_results(
+        "how many signups this week", "Sales Schema", "SELECT COUNT(*) FROM signups;",
+        [{"columns": ["n"], "rows": [{"n": 42}], "rowCount": 1}],
+        provider, client=None, model="m",
+    )
+    assert text == "Results Summary\n\nSignups are up 20% this week - worth a closer look at channel X."
+    assert usage == {}
+    assert error is None
+    assert len(provider.calls) == 1
+
+
+def test_summarize_single_connection_results_gives_up_immediately_for_a_non_retryable_exception(app_env):
+    from test_connection_router import _FakeProvider
+
+    provider = _FakeProvider([RuntimeError("boom")])
+    text, usage, error = app_env.translate_routes.summarize_single_connection_results(
+        "q", "schema", "SELECT 1;", [{"columns": [], "rows": []}], provider, client=None, model="m",
+    )
+    assert (text, usage) == (None, None)
+    assert isinstance(error, RuntimeError)
+    assert len(provider.calls) == 1
+
+
+def test_summarize_result_endpoint_returns_no_sql_prefixed_summary_and_logs_a_real_connection_row(
+    app_factory, monkeypatch,
+):
+    env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
+    login_as(env.client, "alice@example.com")
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(FakeGenaiResponse("Signups are up 20% this week - worth digging into channel X."))
+
+    resp = env.client.post('/api/summarize-result', json={
+        'prompt': 'how many signups this week',
+        'sql': 'SELECT COUNT(*) AS n FROM signups;',
+        'results': [{"columns": ["n"], "rows": [{"n": 42}], "rowCount": 1}],
+    })
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data['success'] is True
+    assert data['summary'] == '*** NO SQL *** Signups are up 20% this week - worth digging into channel X.'
+
+    rows, _stats, total_count = env.app_config.state_store.get_translation_history("alice@example.com")
+    assert total_count == 1
+    assert rows[0]['nl_prompt'] == 'how many signups this week'
+    assert rows[0]['sql_command'] == data['summary']
+
+
+def test_summarize_result_endpoint_uses_byok_key_instead_of_env_configured_key(app_factory, monkeypatch):
+    env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
+    login_as(env.client, "alice@example.com")
+    set_llm_byok_key(env, "google", "alices-own-key", user_identity="alice@example.com")
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(FakeGenaiResponse("All good here."))
+
+    resp = env.client.post('/api/summarize-result', json={
+        'prompt': 'q', 'sql': 'SELECT 1;', 'results': [{"columns": [], "rows": [], "rowCount": 0}],
+    })
+    assert resp.status_code == 200
+    assert resp.get_json()['success'] is True
+    assert harness.client_api_keys == ["alices-own-key"]
+
+
+def test_summarize_result_endpoint_requires_prompt_sql_and_results(app_env):
+    resp = app_env.client.post('/api/summarize-result', json={'prompt': '', 'sql': '', 'results': []})
+    assert resp.status_code == 400
+
+    resp = app_env.client.post('/api/summarize-result', json={'prompt': 'q', 'sql': 'SELECT 1;'})
+    assert resp.status_code == 400
+
+    resp = app_env.client.post('/api/summarize-result', json={'prompt': 'q', 'results': [{"columns": [], "rows": []}]})
+    assert resp.status_code == 400
+
+
+def test_summarize_result_endpoint_returns_success_false_when_the_llm_call_fails(app_factory, monkeypatch):
+    env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
+    login_as(env.client, "alice@example.com")
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_error(FakeApiError(401))
+
+    resp = env.client.post('/api/summarize-result', json={
+        'prompt': 'q', 'sql': 'SELECT 1;', 'results': [{"columns": [], "rows": [], "rowCount": 0}],
+    })
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data['success'] is False
+
+    _rows, _stats, total_count = env.app_config.state_store.get_translation_history("alice@example.com")
+    assert total_count == 0

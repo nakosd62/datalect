@@ -1001,16 +1001,23 @@ ISSUE_REPORTING_ENABLED = bool(
 
 # Model configuration for all three LLM providers (Google included) lives
 # in translate_routes.py now, not here - each provider's own single
-# *_MODELS env var (GOOGLE_MODELS/ANTHROPIC_MODELS/OPENAI_MODELS) doubles as
-# both its default model (first entry) and the full list the
-# model-selection modal offers (see LlmProvider.default_model/
-# preset_models and list_llm_providers_info() in that module). This used
-# to be a Gemini-only DEFAULT_MODEL/PRESET_MODELS pair here - Gemini being
-# the original/only provider before the multi-provider refactor - with
+# *_MODELS env var (GOOGLE_MODELS/ANTHROPIC_MODELS/OPENAI_MODELS) is the
+# full list the model-selection modal offers for that provider (see
+# LlmProvider.preset_models in that module), and a separate, single
+# DEFAULT_MODEL env var (also read in translate_routes.py - see
+# LlmProvider.default_model/get_llm_provider()) picks which one model is
+# actually used by default, across all three providers, instead of
+# whichever *_MODELS list's first entry always winning. This used to be a
+# Gemini-only DEFAULT_MODEL/PRESET_MODELS pair here - Gemini being the
+# original/only provider before the multi-provider refactor - with
 # PRESET_MODELS hardcoded and never actually read from any env var despite
-# older docs claiming it was, and never wired into anything the client
-# used. Moved for symmetry with Claude/OpenAI's own model config, which
-# always lived in translate_routes.py.
+# older docs claiming it was, and DEFAULT_MODEL itself never wired into
+# anything the client used either. Both names have since been reintroduced
+# properly in translate_routes.py: PRESET_MODELS as each provider's own
+# *_MODELS var, DEFAULT_MODEL as the one fleet-wide, cross-provider model
+# override described above - this is not the same variable as the old
+# Gemini-only one, just the same name reused for a design that actually
+# works now.
 
 # --- State DB file in local mode ---------------------------------------------
 TRANSLATION_STATS_DB_PATH = "state/ydyl_state.db"

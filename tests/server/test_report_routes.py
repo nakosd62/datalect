@@ -216,6 +216,94 @@ def test_report_issue_feedback_category_sends_expected_email(app_factory, smtp_h
     assert "Vim keybindings" in body
 
 
+@pytest.mark.parametrize("category,expected_label", [
+    ("summary_thumbs_up", "Summary Feedback (Helpful)"),
+    ("summary_thumbs_down", "Summary Feedback (Not Helpful)"),
+])
+def test_report_issue_summary_thumbs_categories_send_details_only_email(
+    app_factory, smtp_harness, category, expected_label,
+):
+    # Thumbs up/down on the Summary tab (see webClient/client.js's
+    # summaryFeedbackButtonsHtml()) - same "details-only" shape as
+    # 'feedback' above, and for the same reason: by explicit request, the
+    # prompt and the summary text itself are never sent here at all, even
+    # though (unlike plain 'feedback') there IS a specific summary this
+    # reaction is about.
+    env = app_factory(env=ISSUE_REPORT_ENV)
+    instances = smtp_harness()
+
+    resp = env.client.post("/api/report-issue", json={
+        "category": category,
+        "details": "The insight about the Enterprise segment was spot on.",
+    })
+
+    assert resp.status_code == 200
+    assert resp.get_json()["success"] is True
+
+    msg = instances[0].sent_messages[0]
+    assert expected_label in msg["Subject"]
+    # Not framed as a "report" the way error/wrong_result subjects are -
+    # same posture as 'feedback'.
+    assert "report" not in msg["Subject"].lower()
+
+    body = msg.get_content()
+    assert f"Category: {expected_label}" in body
+    # No prompt/sql/content/database_name sections - none were sent, and
+    # none of this category's fields ever carry them (see buildReportPayload()
+    # client-side and this route's own docstring).
+    assert "User's question" not in body
+    assert "Generated SQL" not in body
+    assert "Database/connection" not in body
+    assert f"--- {expected_label} ---" in body
+    assert "User's additional details" not in body
+    assert "Enterprise segment" in body
+
+
+def test_report_issue_summary_thumbs_categories_have_no_server_side_privacy_enforcement_of_their_own(
+    app_factory, smtp_harness,
+):
+    # Documents a real, deliberate limit of this feature: the "prompt/summary
+    # are never sent" guarantee for summary_thumbs_up/summary_thumbs_down is
+    # ENTIRELY client-side (webClient/client.js's buildReportPayload() simply
+    # never puts those fields in the request body) - same as 'feedback'
+    # already works today. _build_email() below includes a prompt/sql/
+    # content section whenever the field is PRESENT, regardless of category -
+    # there's no category-based server-side stripping for either category -
+    # so a client that did send them (a bug, a direct API call) would still
+    # have them appear in the email. This test exists to make that limit
+    # explicit rather than implied, not to celebrate it as a safeguard.
+    env = app_factory(env=ISSUE_REPORT_ENV)
+    instances = smtp_harness()
+
+    resp = env.client.post("/api/report-issue", json={
+        "category": "summary_thumbs_down",
+        "prompt": "How many signups this week?",
+        "sql": "SELECT COUNT(*) FROM signups;",
+        "content": "Signups are up sharply.",
+        "database_name": "Sales Postgres",
+        "details": "This missed the point of my question.",
+    })
+
+    assert resp.status_code == 200
+    body = instances[0].sent_messages[0].get_content()
+    assert "How many signups this week?" in body
+    assert "SELECT COUNT(*) FROM signups;" in body
+    assert "Signups are up sharply." in body
+    assert "This missed the point of my question." in body
+
+
+def test_report_issue_rejects_unknown_category_lists_all_valid_ones(app_factory, smtp_harness):
+    env = app_factory(env=ISSUE_REPORT_ENV)
+    smtp_harness()
+
+    resp = env.client.post("/api/report-issue", json={"category": "something_else"})
+
+    assert resp.status_code == 400
+    error = resp.get_json()["error"]
+    for category in ("error", "wrong_result", "feedback", "wrong_sql", "summary_thumbs_up", "summary_thumbs_down"):
+        assert f"'{category}'" in error
+
+
 def test_report_issue_wrong_sql_category_sends_expected_email(app_factory, smtp_harness):
     # Unlike 'error'/'wrong_result', 'wrong_sql' sends no separate prompt/sql
     # fields - see report_routes.py's module docstring on why: the client

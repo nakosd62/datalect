@@ -35,6 +35,23 @@
 // dismissed - see onboarding.spec.js for a dedicated test of the tour
 // itself, which uses `isolatedTest` (isolation only, no onboarding-skip)
 // to get the real first-visit experience without losing state isolation.
+//
+// GA4 NETWORK ISOLATION: `isolatedTest` below also aborts every request to
+// googletagmanager.com/google-analytics.com, so gtag.js's real library
+// never actually loads in ANY spec (every other test variant/fixture in
+// this file builds on `isolatedTest`, so this is the one place this needs
+// to be wired). Playwright gives every test a fresh, cookie-less browser
+// context by default, so without this, gtag.js would mint a brand-new GA4
+// client ID on every single test that fires a trackEvent() call (no
+// persisted _ga cookie to reuse across tests/contexts) - meaning running
+// this suite anywhere with real internet access to Google's servers was
+// silently manufacturing one "new user" per test against the app's real
+// production GA4 property, bloating its Reports. analytics.spec.js's own
+// tests read window.dataLayer directly rather than depending on the real
+// library (see its module docstring) specifically because client.js's
+// trackEvent() always pushes onto dataLayer via the inline gtag() stub in
+// index.html regardless of whether the real script ever loads - so this
+// block costs the suite no coverage at all.
 
 const crypto = require('crypto');
 const base = require('@playwright/test');
@@ -51,6 +68,16 @@ const isolatedTest = base.test.extend({
     await page.context().addCookies([
       { name: 'crbot_user_id', value: userId, url: baseURL },
     ]);
+    // See the GA4 NETWORK ISOLATION note atop this file: abort the gtag.js
+    // script load itself (sufficient on its own - without the real library,
+    // index.html's inline gtag() stub only ever pushes onto window.dataLayer
+    // and never talks to the network) plus, belt-and-suspenders, any direct
+    // hit to google-analytics.com's collection endpoints in case a future
+    // change starts loading/calling GA some other way.
+    await page.route(
+      /^https:\/\/(www\.googletagmanager\.com|([a-z0-9-]+\.)?google-analytics\.com|analytics\.google\.com)\//,
+      (route) => route.abort()
+    );
     await use(page);
   },
 });

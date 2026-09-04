@@ -275,8 +275,16 @@ test.describe('report wrong SQL', () => {
       if (wrapper && wrapper.CodeMirror) {
         wrapper.CodeMirror.setValue(value);
       } else {
+        // Plain assignment never fires a DOM 'input' event on its own (only
+        // real keystrokes do) - client.js's own Execute/"report wrong SQL"
+        // disabled-state tracking (applySqlActionButtonsContentState()) is
+        // wired to that event for this exact fallback path, so it has to be
+        // dispatched explicitly here to mimic a real user typing/pasting.
         const textarea = document.getElementById('sqlQuery');
-        if (textarea) textarea.value = value;
+        if (textarea) {
+          textarea.value = value;
+          textarea.dispatchEvent(new Event('input', { bubbles: true }));
+        }
       }
     }, sql);
   }
@@ -336,6 +344,12 @@ test.describe('report wrong SQL', () => {
     const reportState = mockReportIssue(page);
     await gotoApp(page);
 
+    // #reportSqlBtn is disabled on a genuinely empty SQL box (see client.js's
+    // applySqlActionButtonsContentState()), so there's some SQL here purely
+    // to make the button clickable at all - this test is about the EDITABLE
+    // preview textarea ending up empty (cleared below, AFTER the modal
+    // opens), not the underlying SQL box itself.
+    await setSqlBox(page, 'SELECT 1;');
     await page.locator('#reportSqlBtn').click();
     await page.locator('#reportIssuePreviewEditable').fill('');
     await page.locator('#reportIssueSendBtn').click();
@@ -364,6 +378,12 @@ test.describe('report wrong SQL', () => {
     });
     await gotoApp(page);
 
+    // #reportSqlBtn is ALSO disabled on a genuinely empty SQL box (see
+    // client.js's applySqlActionButtonsContentState()) - a concern this
+    // test isn't about, so seed some placeholder SQL first to isolate the
+    // "in flight vs settled" behavior this test actually exercises.
+    await setSqlBox(page, 'SELECT 1;');
+
     const reportSqlBtn = page.locator('#reportSqlBtn');
     await expect(reportSqlBtn).toBeVisible();
     await expect(reportSqlBtn).not.toBeDisabled();
@@ -374,11 +394,196 @@ test.describe('report wrong SQL', () => {
 
     await expect(reportSqlBtn).toBeDisabled();
 
+    // Whitespace collapsed to single spaces before comparing - client.js's
+    // setSqlQuery() runs generated SQL through a real sql-formatter library
+    // (window.sqlFormatter, CDN-loaded) when available, which can reflow
+    // even trivial SQL like 'SELECT 1;' onto multiple lines. Whether that
+    // happens depends purely on whether that CDN script loaded in this
+    // particular environment, not anything this suite controls - see
+    // translate-execute.spec.js's normalizedSql() for the same reasoning.
     await expect.poll(() => page.evaluate(() => {
       const wrapper = document.querySelector('.CodeMirror');
-      return wrapper && wrapper.CodeMirror ? wrapper.CodeMirror.getValue() : document.getElementById('sqlQuery').value;
+      const raw = wrapper && wrapper.CodeMirror ? wrapper.CodeMirror.getValue() : document.getElementById('sqlQuery').value;
+      return (raw || '').replace(/\s+/g, ' ').trim();
     }), { timeout: 5000 }).toContain('SELECT 1');
 
     await expect(reportSqlBtn).not.toBeDisabled();
+  });
+});
+
+// Summary tab feedback (see server/report_routes.py's module docstring on
+// 'summary_thumbs_up'/'summary_thumbs_down', and client.js's
+// summaryFeedbackButtonsHtml()): a thumbs-up/thumbs-down pair rendered next
+// to the Summary tab's own heading, in BOTH single-connection mode's own
+// summarization (see translate_routes.py's summarize_single_connection_
+// results) and "all databases" mode's Phase C (see multi-database.spec.js
+// for that variant's own coverage of this same feature) - both build the
+// exact same {isText:true, tabLabel:'Summary'} shape client-side, so this
+// file only exercises the single-connection path. Same #reportIssueModal as
+// every other report category, opened with a synthetic context (never tied
+// to whatever's showing in the results area) carrying no prompt/sql/summary
+// content at all - just `category` and whatever the user types, mirroring
+// 'feedback's own privacy posture exactly (see REPORT_CATEGORY_CONFIG.
+// summary_thumbs_up/summary_thumbs_down).
+test.describe('Summary tab feedback (thumbs up/down)', () => {
+  async function mockSummarizeResult(page, { summary, error } = {}) {
+    await page.route('**/api/summarize-result', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      const body = error !== undefined ? { success: false, error } : { success: true, summary };
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
+    });
+  }
+
+  async function trackedEvents(page, name) {
+    return page.evaluate((eventName) => {
+      return (window.dataLayer || [])
+        .filter((entry) => entry && entry[0] === 'event' && entry[1] === eventName)
+        .map((entry) => entry[2] || {});
+    }, name);
+  }
+
+  test('the thumbs icons stay hidden when the feature is not configured', async ({ page }) => {
+    await mockIssueReportingEnabled(page, false);
+    await mockTranslate(page, { sql: 'SELECT COUNT(*) AS n FROM signups;' });
+    await mockExecute(page, { results: [{ columns: ['n'], rows: [{ n: 42 }], rowCount: 1 }] });
+    await mockSummarizeResult(page, { summary: '*** NO SQL *** Results Summary\n\nSignups are up.' });
+    await gotoApp(page);
+
+    await page.locator('#aiPrompt').fill('how many signups this week');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect(page.locator('.response-text')).toContainText('Signups are up', { timeout: 10000 });
+
+    await expect(page.locator('.summary-feedback-row')).toBeHidden();
+  });
+
+  test('the thumbs icons appear next to the Summary tab, colored green (up) and red (down)', async ({ page }) => {
+    await mockIssueReportingEnabled(page, true);
+    await mockTranslate(page, { sql: 'SELECT COUNT(*) AS n FROM signups;' });
+    await mockExecute(page, { results: [{ columns: ['n'], rows: [{ n: 42 }], rowCount: 1 }] });
+    await mockSummarizeResult(page, { summary: '*** NO SQL *** Results Summary\n\nSignups are up.' });
+    await gotoApp(page);
+
+    await page.locator('#aiPrompt').fill('how many signups this week');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect(page.locator('.response-text')).toContainText('Signups are up', { timeout: 10000 });
+
+    const up = page.locator('.summary-feedback-btn--up');
+    const down = page.locator('.summary-feedback-btn--down');
+    await expect(up).toBeVisible();
+    await expect(down).toBeVisible();
+
+    // Explicit request: green for up, red for down - checked via the CSS
+    // custom properties both classes resolve to (see style.css), not a
+    // hardcoded hex, so a theme-variable rename doesn't false-negative this.
+    const [upColor, downColor, primaryVar, dangerVar] = await page.evaluate(() => {
+      const root = getComputedStyle(document.documentElement);
+      const up = getComputedStyle(document.querySelector('.summary-feedback-btn--up'));
+      const down = getComputedStyle(document.querySelector('.summary-feedback-btn--down'));
+      return [up.color, down.color, root.getPropertyValue('--primary').trim(), root.getPropertyValue('--danger').trim()];
+    });
+    expect(upColor).not.toBe(downColor);
+    // --primary is this app's own green, --danger its red (see style.css's
+    // :root comment) - resolving both sides through the browser's own color
+    // parsing (rather than string-comparing a hex to an rgb() computed
+    // value) is what makes this comparison valid.
+    expect(await page.evaluate((c) => {
+      const d = document.createElement('div');
+      d.style.color = c;
+      document.body.appendChild(d);
+      const rgb = getComputedStyle(d).color;
+      d.remove();
+      return rgb;
+    }, primaryVar)).toBe(upColor);
+    expect(await page.evaluate((c) => {
+      const d = document.createElement('div');
+      d.style.color = c;
+      document.body.appendChild(d);
+      const rgb = getComputedStyle(d).color;
+      d.remove();
+      return rgb;
+    }, dangerVar)).toBe(downColor);
+  });
+
+  test('clicking thumbs-up opens the feedback modal with no prompt/summary content, and sends only the category and typed text', async ({ page }) => {
+    await mockIssueReportingEnabled(page, true);
+    const reportState = mockReportIssue(page);
+    await mockTranslate(page, { sql: 'SELECT COUNT(*) AS n FROM signups;' });
+    await mockExecute(page, { results: [{ columns: ['n'], rows: [{ n: 42 }], rowCount: 1 }] });
+    await mockSummarizeResult(page, { summary: '*** NO SQL *** Results Summary\n\nSignups are up sharply this week.' });
+    await gotoApp(page);
+
+    await page.locator('#aiPrompt').fill('how many signups this week');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect(page.locator('.response-text')).toContainText('Signups are up sharply', { timeout: 10000 });
+
+    await page.locator('.summary-feedback-btn--up').click();
+    await expect(page.locator('#reportIssueModal')).toBeVisible();
+    await expect(page.locator('#reportIssueModalTitle')).toHaveText('Summary Feedback');
+    // No preview section at all - same posture as 'feedback' (see
+    // REPORT_CATEGORY_CONFIG.summary_thumbs_up) - nothing structured to
+    // review since the summary/prompt are never captured for this category.
+    await expect(page.locator('#reportIssuePreviewSection')).toBeHidden();
+
+    await page.locator('#reportIssueDetails').fill('The insight about signups was genuinely useful.');
+    await page.locator('#reportIssueSendBtn').click();
+
+    await expect(page.locator('#reportIssueModal')).toBeHidden();
+    expect(reportState.lastBody).toEqual({
+      category: 'summary_thumbs_up',
+      details: 'The insight about signups was genuinely useful.',
+    });
+  });
+
+  test('clicking thumbs-down opens the feedback modal the same way, tagged with the down category', async ({ page }) => {
+    await mockIssueReportingEnabled(page, true);
+    const reportState = mockReportIssue(page);
+    await mockTranslate(page, { sql: 'SELECT COUNT(*) AS n FROM signups;' });
+    await mockExecute(page, { results: [{ columns: ['n'], rows: [{ n: 42 }], rowCount: 1 }] });
+    await mockSummarizeResult(page, { summary: '*** NO SQL *** Results Summary\n\nSignups are up sharply this week.' });
+    await gotoApp(page);
+
+    await page.locator('#aiPrompt').fill('how many signups this week');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect(page.locator('.response-text')).toContainText('Signups are up sharply', { timeout: 10000 });
+
+    await page.locator('.summary-feedback-btn--down').click();
+    await expect(page.locator('#reportIssueModal')).toBeVisible();
+    await expect(page.locator('#reportIssueModalTitle')).toHaveText('Summary Feedback');
+
+    await page.locator('#reportIssueDetails').fill('This missed the actual question I asked.');
+    await page.locator('#reportIssueSendBtn').click();
+
+    await expect(page.locator('#reportIssueModal')).toBeHidden();
+    expect(reportState.lastBody).toEqual({
+      category: 'summary_thumbs_down',
+      details: 'This missed the actual question I asked.',
+    });
+  });
+
+  test('both thumbs-up and thumbs-down sends fire their own report_submitted GA event with the right category', async ({ page }) => {
+    await mockIssueReportingEnabled(page, true);
+    mockReportIssue(page);
+    await mockTranslate(page, { sql: 'SELECT COUNT(*) AS n FROM signups;' });
+    await mockExecute(page, { results: [{ columns: ['n'], rows: [{ n: 42 }], rowCount: 1 }] });
+    await mockSummarizeResult(page, { summary: '*** NO SQL *** Results Summary\n\nSignups are up sharply this week.' });
+    await gotoApp(page);
+
+    await page.locator('#aiPrompt').fill('how many signups this week');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect(page.locator('.response-text')).toContainText('Signups are up sharply', { timeout: 10000 });
+
+    await page.locator('.summary-feedback-btn--up').click();
+    await page.locator('#reportIssueDetails').fill('Nice summary.');
+    await page.locator('#reportIssueSendBtn').click();
+    await expect(page.locator('#reportIssueModal')).toBeHidden();
+
+    await page.locator('.summary-feedback-btn--down').click();
+    await page.locator('#reportIssueDetails').fill('Not so nice this time.');
+    await page.locator('#reportIssueSendBtn').click();
+    await expect(page.locator('#reportIssueModal')).toBeHidden();
+
+    const events = await trackedEvents(page, 'report_submitted');
+    expect(events.length).toBe(2);
+    expect(events.map((e) => e.category).sort()).toEqual(['summary_thumbs_down', 'summary_thumbs_up']);
   });
 });

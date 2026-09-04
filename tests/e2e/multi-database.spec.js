@@ -110,7 +110,13 @@ async function mockConfig(page, initial) {
 
 async function openConfigModal(page) {
   await page.locator('#configTriggerBadge').click();
-  await expect(page.locator('#configModal')).not.toHaveClass(/hidden/);
+  // See config-modal.spec.js's own openConfigModal() for why this needs a
+  // longer-than-default timeout: the click handler awaits a real, unmocked
+  // fetch('/api/config') before revealing the modal, and the default 8s
+  // expect timeout can occasionally be too tight for that one real
+  // round trip under a loaded/constrained environment even though nothing
+  // is actually stuck.
+  await expect(page.locator('#configModal')).not.toHaveClass(/hidden/, { timeout: 15_000 });
 }
 
 function currentSql(page) {
@@ -453,6 +459,19 @@ test.describe('multi-database question answering', () => {
         }),
       });
     });
+    // The translate response above resolves to a single connection (p-b),
+    // not a genuine multi-connection fan-out - so post-execution, client.js
+    // takes single-connection mode's summarization path
+    // (POST /api/summarize-result, singular) rather than all-mode's Phase C
+    // (/api/summarize-results, plural, mocked elsewhere in this file for
+    // the genuinely-multi-connection tests). Left unmocked, that's a real,
+    // unmocked LLM call that keeps #configTriggerBadge disabled until it
+    // settles - the openConfigModal() click below would silently no-op if
+    // it lands while that's still in flight.
+    await page.route('**/api/summarize-result', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ success: true }) });
+    });
 
     await page.locator('#aiPrompt').fill('campaigns question');
     await page.locator('#aiPrompt').press('Enter');
@@ -633,6 +652,97 @@ test.describe('multi-database question answering', () => {
     const summaryText = page.locator('.response-text');
     await expect(summaryText).toContainText('Checking Sales Postgres and Marketing Postgres.');
     await expect(summaryText).toContainText('Combined revenue across both databases is $700.');
+  });
+
+  // Summary tab feedback (thumbs up/down) - see report-issue.spec.js's own
+  // "Summary tab feedback" describe block for the single-connection-mode
+  // coverage of this same feature (server/report_routes.py's
+  // 'summary_thumbs_up'/'summary_thumbs_down' categories, client.js's
+  // summaryFeedbackButtonsHtml()). Both modes render the exact same
+  // {isText:true, tabLabel:'Summary'} shape, so this is here purely to
+  // prove the SAME buttons show up on "all databases" mode's own Summary
+  // tab too, not to re-cover ground report-issue.spec.js already owns.
+  test('the Summary tab\'s thumbs up/down buttons also appear for an "all databases" mode turn, and post with no routing/summary content', async ({ page }) => {
+    await mockConfig(page, { ...buildConfigState(), issue_reporting_enabled: true });
+    await gotoApp(page);
+
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          router_route: true,
+          routing_message: 'Checking Sales Postgres and Marketing Postgres.',
+          sql:
+            '-- database: preset:p-a (Sales Postgres)\nSELECT * FROM deals;\n\n' +
+            '-- database: preset:p-b (Marketing Postgres)\nSELECT * FROM campaigns;',
+          database_notes: [],
+          generation_failures: [],
+          connection_selection: [
+            { kind: 'preset', id: 'p-a', name: 'Sales Postgres' },
+            { kind: 'preset', id: 'p-b', name: 'Marketing Postgres' },
+          ],
+        }),
+      });
+    });
+    await page.route('**/api/execute', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          results: [
+            { statement: 'SELECT * FROM deals', columns: ['total'], rows: [{ total: 500 }], rowCount: 1,
+              database: { kind: 'preset', id: 'p-a', name: 'Sales Postgres' } },
+            { statement: 'SELECT * FROM campaigns', columns: ['total'], rows: [{ total: 200 }], rowCount: 1,
+              database: { kind: 'preset', id: 'p-b', name: 'Marketing Postgres' } },
+          ],
+        }),
+      });
+    });
+    await page.route('**/api/summarize-results', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ success: true, summary: '*** NO SQL *** Combined revenue is $700.' }),
+      });
+    });
+    let reportBody = null;
+    await page.route('**/api/report-issue', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      reportBody = route.request().postDataJSON();
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ success: true }) });
+    });
+
+    await page.locator('#aiPrompt').fill('combined revenue across sales and marketing');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect.poll(() => currentSql(page)).toContain('SELECT');
+    await page.locator('#runBtn').click();
+
+    const summaryText = page.locator('.response-text');
+    await expect(summaryText).toContainText('Combined revenue is $700.');
+
+    await expect(page.locator('.summary-feedback-btn--up')).toBeVisible();
+    await expect(page.locator('.summary-feedback-btn--down')).toBeVisible();
+
+    await page.locator('.summary-feedback-btn--down').click();
+    await expect(page.locator('#reportIssueModal')).toBeVisible();
+    await expect(page.locator('#reportIssuePreviewSection')).toBeHidden();
+    await page.locator('#reportIssueDetails').fill('The combined total looked off.');
+    await page.locator('#reportIssueSendBtn').click();
+
+    await expect(page.locator('#reportIssueModal')).toBeHidden();
+    // Neither the routing message nor Phase C's own summary text (both
+    // currently on screen) ever reach the request body - same privacy
+    // posture as the single-connection variant.
+    expect(reportBody).toEqual({
+      category: 'summary_thumbs_down',
+      details: 'The combined total looked off.',
+    });
   });
 
   // Regression guard for the "Triage"/"Result Summary" section labels

@@ -72,6 +72,13 @@ _ENV_VARS_TO_CLEAR = [
     # OpenAI provider path (translate_routes.py's OpenAiProvider) - cleared
     # for the same reason as the Google/Anthropic vars above.
     "OPENAI_API_KEY", "OPENAI_PRESET_KEYS", "OPENAI_MODELS",
+    # The one fleet-wide, cross-provider default-model override (see
+    # LlmProvider.default_model/get_llm_provider() in translate_routes.py) -
+    # cleared for the same reason as every *_MODELS var above: a
+    # developer's real shell/.env plausibly has this set for their own
+    # local default-model override, which would otherwise silently leak
+    # into any test that doesn't explicitly pass its own `env`.
+    "DEFAULT_MODEL",
     # state_store.py's database_config encryption-at-rest key (see its
     # module docstring section) - cleared for the same reason as every
     # other secret-shaped var above: a developer's real shell/.env
@@ -236,8 +243,11 @@ def select_llm_provider(env, provider_name):
     choice, so a test can exercise a specific LLM provider's /api/translate
     code path without a per-fleet LLM_PROVIDER env var - there isn't one
     anymore (see translate_routes.py's module docstring): a fresh session
-    with nothing saved now falls back to the one hardcoded default,
-    Google/gemini-3.6-flash, rather than an env-configurable provider.
+    with nothing saved now falls back to the one fleet-wide default -
+    Google/gemini-3.6-flash unless DEFAULT_MODEL is set to a model
+    belonging to a different provider (see get_llm_provider()/
+    _default_fleet_provider()) - rather than an independent, provider-NAME
+    env var.
 
     Call this AFTER app_factory() (it needs `env.app_config.state_store`,
     initialized by fresh_import()) and BEFORE the first /api/translate

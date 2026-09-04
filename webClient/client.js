@@ -461,8 +461,9 @@ document.addEventListener('DOMContentLoaded', async () => {
   // in GA4 - see trackEvent()'s call sites throughout this file for the
   // full list: translate_submitted, sql_executed, error_shown,
   // report_submitted, database_selected, model_selected, help_viewed,
-  // history_viewed, history_nav_clicked, preferences_viewed, login, logout,
-  // mic_used, quick_prompt_clicked, tour_exited. Custom, app-specific names
+  // history_viewed, history_nav_clicked, history_purge_clicked,
+  // preferences_viewed, login, logout, mic_used, quick_prompt_clicked,
+  // tour_exited. Custom, app-specific names
   // throughout (not GA4's own recommended-event vocabulary) - per explicit
   // request.
   // ===========================================================================
@@ -858,6 +859,23 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
+  // Keeps Execute/"report wrong SQL" disabled whenever the box is empty -
+  // see onSqlContentMaybeChanged()/applySqlActionButtonsContentState()'s
+  // own comments further down for the full reasoning. CodeMirror's
+  // 'change' event covers typing, pasting, AND a programmatic setValue()
+  // call (setSqlQuery() uses exactly that) - the plain-textarea fallback
+  // (no CodeMirror loaded) only needs 'input' since nothing in this app
+  // calls .value = ... directly on that element. Called once immediately
+  // after too, so both buttons start out correctly disabled for the empty
+  // box a fresh page load always begins with - the HTML itself has no
+  // `disabled` attribute on either button, only relying on this.
+  if (sqlEditor) {
+    sqlEditor.on('change', onSqlContentMaybeChanged);
+  } else if (sqlQueryTextarea) {
+    sqlQueryTextarea.addEventListener('input', onSqlContentMaybeChanged);
+  }
+  applySqlActionButtonsContentState();
+
   const sqlContainer = document.querySelector('.speech-bubble-wrapper.sql-bubble');
 
   if (sqlContainer && sqlEditor && window.ResizeObserver) {
@@ -1004,9 +1022,13 @@ document.addEventListener('DOMContentLoaded', async () => {
           callback: (response) => {
             if (response.credential) {
               googleIdToken = response.credential;
-              // No identity/PII in the params - GA is for usage counts, not
-              // a record of who signed in.
-              trackEvent('login', {});
+              // GA4's own recommended "login" event shape (see
+              // https://developers.google.com/analytics/devguides/collection/ga4/reference/events)
+              // has exactly one optional parameter, "method" - always
+              // "Google" here, since Google Sign-In is the only method this
+              // app supports. Still no identity/PII in the params - GA is
+              // for usage counts, not a record of who signed in.
+              trackEvent('login', { method: 'Google' });
               // A new user logging on takes over what was, until now, an
               // anonymous (or a different user's) session - whatever
               // prompt/SQL/results are on screen belong to that prior
@@ -1155,9 +1177,19 @@ document.addEventListener('DOMContentLoaded', async () => {
   // ===========================================================================
   function setButtonsDisabled(disabled) {
     if (translateBtn) translateBtn.disabled = disabled;
-    if (runBtn) runBtn.disabled = disabled;
+    // Execute / "report wrong SQL" also depend on whether there's any SQL
+    // text at all - see applySqlActionButtonsContentState()'s own comment
+    // above - so, unlike every other control here, they're not simply set
+    // to `disabled`: forced off (regardless of content) while a turn
+    // starts, matching every other control here, but only turned back on -
+    // if the box isn't empty - once a turn ends.
+    if (disabled) {
+      if (runBtn) runBtn.disabled = true;
+      if (reportSqlBtn) reportSqlBtn.disabled = true;
+    } else {
+      applySqlActionButtonsContentState();
+    }
     if (micBtn) micBtn.disabled = disabled;
-    if (reportSqlBtn) reportSqlBtn.disabled = disabled;
     // Disable the NL prompt box itself while a translate/execute call is
     // in flight - previously only the trigger buttons were disabled, so
     // the box stayed editable (misleadingly implying a fresh edit could
@@ -1244,6 +1276,40 @@ document.addEventListener('DOMContentLoaded', async () => {
     return sqlEditor ? sqlEditor.getValue().trim() : (sqlQueryTextarea ? sqlQueryTextarea.value.trim() : '');
   }
 
+  // Execute (#runBtn) and the SQL box's own "report wrong SQL" thumbs-down
+  // button (#reportSqlBtn) are both meaningless with an empty box - nothing
+  // to execute, nothing to flag as wrong - so both stay disabled whenever
+  // getSqlQuery() is empty, on top of (never instead of) setButtonsDisabled()'s
+  // own "a turn is in flight" disabling (see that function's own call of
+  // this, in its `else` branch). Applied directly there for the turn-just-
+  // ended case, and separately via a live CodeMirror 'change' listener (see
+  // where sqlEditor is constructed, further up) for every other case -
+  // typing, pasting, clearing, or a mid-turn setSqlQuery() fill-in - so both
+  // buttons track the box's actual content at all times, not just at turn
+  // boundaries.
+  function applySqlActionButtonsContentState() {
+    const hasSql = !!getSqlQuery();
+    if (runBtn) runBtn.disabled = !hasSql;
+    if (reportSqlBtn) reportSqlBtn.disabled = !hasSql;
+  }
+
+  // Wired to the live CodeMirror 'change' event (and, in the no-CodeMirror
+  // fallback, the plain textarea's own 'input' event - see below) rather
+  // than called directly from applySqlActionButtonsContentState()'s own
+  // call sites, so it can add the ONE extra check those don't need: skip
+  // entirely while a turn is in flight (uiActionBusy). Without that check,
+  // a mid-turn setSqlQuery(data.sql) fill-in - which still fires this same
+  // 'change' event, since CodeMirror's readOnly option (set by
+  // setButtonsDisabled(true) for the whole turn) blocks USER typing, not a
+  // programmatic setValue() call - would prematurely re-enable both
+  // buttons before the turn's own setButtonsDisabled(false) call does, the
+  // exact "ground shifting under an in-flight turn" problem readOnly
+  // itself exists to prevent for typing.
+  function onSqlContentMaybeChanged() {
+    if (uiActionBusy) return;
+    applySqlActionButtonsContentState();
+  }
+
   function formatSql(sql) {
     if (window.sqlFormatter && typeof window.sqlFormatter.format === 'function') {
       try {
@@ -1266,6 +1332,18 @@ document.addEventListener('DOMContentLoaded', async () => {
     } else if (sqlQueryTextarea) {
       sqlQueryTextarea.value = formattedVal;
     }
+    // Belt-and-suspenders alongside the live 'change'/'input' listeners
+    // wired where sqlEditor is constructed further up: CodeMirror's
+    // setValue() above does fire 'change' on its own, but a plain
+    // `element.value = ...` assignment on the no-CodeMirror fallback
+    // textarea never fires a DOM 'input' event by itself (only real
+    // keystrokes do) - so without this explicit call, Execute/"report
+    // wrong SQL" would stay stuck disabled forever after a fallback-mode
+    // translation filled the box in. Still gated by uiActionBusy (see
+    // onSqlContentMaybeChanged()) so a mid-turn call here (translatePrompt()
+    // filling in generated SQL while its own executeSql() hasn't finished
+    // yet) still can't prematurely re-enable either button.
+    onSqlContentMaybeChanged();
   }
 
   function clearResultsDisplay() {
@@ -4285,6 +4363,35 @@ document.addEventListener('DOMContentLoaded', async () => {
       sendLabel: 'Report Wrong SQL',
       sendingLabel: 'Sending…',
     },
+    // Triggered from the Summary tab's own thumbs-up/thumbs-down buttons
+    // (see summaryFeedbackButtonsHtml()) - same "no preview, details box IS
+    // the message" shape as 'feedback' above, and for the same reason this
+    // one's more strict about: the prompt and the summary text itself are
+    // deliberately never captured or sent here at all (see
+    // buildReportPayload()), by explicit request, so there's nothing
+    // structured left to preview even if this category wanted to.
+    summary_thumbs_up: {
+      modalTitle: 'Summary Feedback',
+      previewLabel: 'Summary Feedback (Helpful)',
+      intro: "Glad the summary was useful. The prompt and summary text aren't included here (kept private) - just let the developer know what worked.",
+      showPreview: false,
+      detailsLabel: 'Your feedback',
+      detailsPlaceholder: 'What worked well about this summary?',
+      detailsRequired: true,
+      sendLabel: 'Send Feedback',
+      sendingLabel: 'Sending…',
+    },
+    summary_thumbs_down: {
+      modalTitle: 'Summary Feedback',
+      previewLabel: 'Summary Feedback (Not Helpful)',
+      intro: "Sorry the summary missed the mark. The prompt and summary text aren't included here (kept private) - just describe what was wrong or missing.",
+      showPreview: false,
+      detailsLabel: 'Your feedback',
+      detailsPlaceholder: 'What was wrong or missing?',
+      detailsRequired: true,
+      sendLabel: 'Send Feedback',
+      sendingLabel: 'Sending…',
+    },
   };
 
   function reportCategoryConfig(category) {
@@ -4315,11 +4422,16 @@ document.addEventListener('DOMContentLoaded', async () => {
   function buildReportPayload(details, context) {
     const ctx = context || activeReportContext;
     if (!ctx) return null;
-    if (ctx.category === 'feedback') {
+    if (ctx.category === 'feedback' || ctx.category === 'summary_thumbs_up' || ctx.category === 'summary_thumbs_down') {
       // Deliberately just these two fields - see report_routes.py's module
       // docstring on why prompt/sql/database_name/content don't apply to
-      // general app feedback the way they do for the other two categories.
-      return { category: 'feedback', details: details || '' };
+      // general app feedback the way they do for the other categories.
+      // summary_thumbs_up/summary_thumbs_down follow 'feedback's own lead
+      // here for the same reason, per explicit request: the prompt and
+      // summary text are considered too sensitive to send at all, even
+      // though (unlike 'feedback') there IS a specific result on screen
+      // this feedback is "about".
+      return { category: ctx.category, details: details || '' };
     }
     if (ctx.category === 'wrong_sql') {
       // Unlike error/wrong_result (prompt/sql captured automatically and
@@ -4533,6 +4645,18 @@ document.addEventListener('DOMContentLoaded', async () => {
     resultsBody.addEventListener('click', (e) => {
       const trigger = e.target.closest('[data-report-issue-trigger]');
       if (trigger) openReportIssueModal();
+      // The Summary tab's own thumbs-up/thumbs-down buttons (see
+      // summaryFeedbackButtonsHtml()) - same delegated-listener reasoning as
+      // the Report button above (rebuilt fresh on every render), but always
+      // passes an explicit, synthetic context rather than falling back to
+      // currentReportContext - this is deliberately NOT "report the current
+      // result" (that context carries the summary text as `.content`, which
+      // this feedback is never allowed to send - see buildReportPayload()).
+      const summaryFeedbackTrigger = e.target.closest('[data-summary-feedback-trigger]');
+      if (summaryFeedbackTrigger) {
+        const direction = summaryFeedbackTrigger.dataset.summaryFeedbackTrigger;
+        openReportIssueModal({ category: direction === 'up' ? 'summary_thumbs_up' : 'summary_thumbs_down' });
+      }
     });
   }
   // The header's "Send Feedback" button - a persistent element (unlike the
@@ -4757,6 +4881,42 @@ document.addEventListener('DOMContentLoaded', async () => {
     return `<tr class="report-issue-row"><td colspan="${colspan || 1}">${html}</td></tr>`;
   }
 
+  // Thumbs up/down feedback row for the Summary tab (see renderTableResult()'s
+  // own isText branch, the only call site) - both "all databases" mode's
+  // Summary tab (triage's routing message + Phase C's own answer) and
+  // single-connection mode's own equivalent (see prependSingleModeSummaryTab())
+  // render the exact same {isText:true, tabLabel:'Summary'} shape, so this
+  // one function covers both. Gated the same way reportButtonHtml() is -
+  // nothing rendered at all when the server has no SMTP config for
+  // /api/report-issue, since that's what actually delivers this feedback.
+  //
+  // Deliberately carries NO prompt/summary content of its own - by explicit
+  // request, the prompt and the summary text are considered too sensitive
+  // to ever leave the browser this way, so clicking either icon opens the
+  // report modal in the same "just a free-text box, nothing pre-filled"
+  // shape the header's own "Send Feedback" button already uses (see
+  // REPORT_CATEGORY_CONFIG.summary_thumbs_up/summary_thumbs_down) - only
+  // `category` and whatever the user types travel to the server.
+  // Thumbs-up uses --primary (this app's own green), thumbs-down --danger
+  // (red) - both SVGs use stroke="currentColor" specifically so that CSS
+  // color (see .summary-feedback-btn--up/--down in style.css) actually
+  // tints them, unlike an emoji glyph.
+  function summaryFeedbackButtonsHtml() {
+    if (!ISSUE_REPORTING_ENABLED) return '';
+    return `
+      <div class="summary-feedback-row">
+        <span class="summary-feedback-label text-muted">Was this summary helpful?</span>
+        <span class="summary-feedback-btns">
+          <button type="button" class="summary-feedback-btn summary-feedback-btn--up" data-summary-feedback-trigger="up" title="This summary was helpful">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.72a2 2 0 0 0 2-1.7l1.38-9a2 2 0 0 0-2-2.3zM7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3"></path></svg>
+          </button>
+          <button type="button" class="summary-feedback-btn summary-feedback-btn--down" data-summary-feedback-trigger="down" title="This summary was not helpful">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 15v4a3 3 0 0 0 3 3l4-9V2H5.72a2 2 0 0 0-2 1.7l-1.38 9a2 2 0 0 0 2 2.3zm7-13h2.67A2.31 2.31 0 0 1 22 4v7a2.31 2.31 0 0 1-2.33 2H17"></path></svg>
+          </button>
+        </span>
+      </div>`;
+  }
+
   // Plain-text rendering of a successful tabular result, for the email
   // preview/body of a 'wrong_result' report on that tab - capped at 25 rows
   // so a large result set doesn't balloon the report (report_routes.py
@@ -4855,6 +5015,19 @@ document.addEventListener('DOMContentLoaded', async () => {
         ? renderMarkdownLiteSummaryTab(result.text || '')
         : renderMarkdownLite(result.text || '');
       td.appendChild(p);
+
+      // Thumbs up/down feedback on the SUMMARY tab specifically (never a
+      // per-database "Note" tab) - see summaryFeedbackButtonsHtml()'s own
+      // docstring. Rendered directly UNDER the summary text (not as a
+      // heading above it), in both "all databases" mode (this tab's
+      // routing message + Phase C answer) and single-connection mode (see
+      // prependSingleModeSummaryTab()) - both build the exact same
+      // {isText:true, tabLabel:'Summary', ...} shape, so one check here
+      // covers both.
+      if (result.tabLabel === 'Summary') {
+        td.insertAdjacentHTML('beforeend', summaryFeedbackButtonsHtml());
+      }
+
       td.insertAdjacentHTML('beforeend', reportButtonHtml('wrong_result'));
 
       tr.appendChild(td);
@@ -4882,6 +5055,15 @@ document.addEventListener('DOMContentLoaded', async () => {
       // carries this field.
       const dbNote = result.database && result.database.name
         ? `<p class="text-muted">Database: ${result.database.name}</p>` : '';
+      // result.notReportable (set only by executeSql()'s own bare-failure
+      // branch, for a 401 - see that branch's comment) excludes the Report
+      // button and skips setReportContext below, same as that branch's own
+      // hand-rolled markup used to before it was unified onto this shared
+      // renderer: an auth-required failure is out of scope for the Report
+      // feature, the same way a translation error already is. Absent
+      // (falsy) for every other isError entry (renderResultsWithFailed
+      // Statement/renderResultsWithDatabaseFailures never set it), so this
+      // is a no-op change for them.
       resultsBody.innerHTML = `
         <tr>
           <td class="error-cell">
@@ -4890,7 +5072,7 @@ document.addEventListener('DOMContentLoaded', async () => {
               <div class="error-details">
                 <div class="error-title-row">
                   <strong>Execution Error</strong>
-                  ${reportButtonHtml('error')}
+                  ${result.notReportable ? '' : reportButtonHtml('error')}
                 </div>
                 ${dbNote}
                 <p>${result.error || 'An error occurred during SQL execution.'}</p>
@@ -4898,12 +5080,17 @@ document.addEventListener('DOMContentLoaded', async () => {
             </div>
           </td>
         </tr>`;
-      setReportContext({
-        category: 'error',
-        databaseName: result.database && result.database.name,
-        sql: result.statement || result.query || result.sql || '',
-        content: result.error || '',
-      });
+      if (!result.notReportable) {
+        setReportContext({
+          category: 'error',
+          databaseName: result.database && result.database.name,
+          sql: result.statement || result.query || result.sql || '',
+          content: result.error || '',
+        });
+      }
+      // Tracked regardless of notReportable - a 401 auth failure is out of
+      // scope for the Report feature (see above), but it's still an error
+      // the user actually saw.
       trackEvent('error_shown', {
         category: 'execution',
         database_name: (result.database && result.database.name) || '',
@@ -5511,6 +5698,91 @@ document.addEventListener('DOMContentLoaded', async () => {
   function getSummaryTabEntry() {
     if (!currentResultsList) return null;
     return currentResultsList.find((r) => r.isText && r.tabLabel === 'Summary') || null;
+  }
+
+  // --- Single-connection mode's own post-execution results summarization ---
+  //
+  // The single-connection equivalent of "all databases" mode's Phase C
+  // above (see requestAllModeResultsSummary/appendPhaseCSummaryToSummaryTab)
+  // - once a single-connection turn's generated SQL has actually been
+  // executed, a SEPARATE LLM call asks for a brief answer PLUS actionable
+  // insight over the real, untruncated results (server-side: /api/
+  // summarize-result, singular - see translate_routes.py's docstring on
+  // that route for why it's untruncated, unlike Phase C). Presented as a
+  // new LEADING "Summary" tab, same shape/label/marker convention as
+  // Phase C's own Summary tab, per this feature's own confirmed design
+  // (mirrors all-mode's Phase C presentation exactly).
+
+  // Fire-and-await (see executeSql()'s call site - already inside an
+  // async flow with buttons disabled). Best-effort, same posture as
+  // requestAllModeResultsSummary: a failure here never fails the turn
+  // itself. Returns the SUMMARY_TAB_BLOCK_MARKER-prefixed summary text on
+  // success (server's own "*** NO SQL ***" convention stripped first -
+  // see stripNoSqlPrefix), the server's own honest error text (also
+  // marked, so it reads the same way a real summary would) on failure, or
+  // null when there's nothing to show (abort, or no usable response).
+  async function requestSingleModeResultsSummary(prompt, sql, results) {
+    try {
+      const response = await fetch('/api/summarize-result', {
+        method: 'POST',
+        headers: getApiHeaders(),
+        credentials: 'same-origin',
+        signal: currentAbortController ? currentAbortController.signal : undefined,
+        body: JSON.stringify({ prompt: prompt, sql: sql, results: results }),
+      });
+      const data = await response.json();
+      if (response.ok && data && data.success && data.summary) {
+        return SUMMARY_TAB_BLOCK_MARKER + stripNoSqlPrefix(data.summary);
+      } else if (data && data.error) {
+        return SUMMARY_TAB_BLOCK_MARKER + data.error;
+      }
+      return null;
+    } catch (err) {
+      // See requestAllModeResultsSummary's identical guard - an aborted
+      // turn's UI has already moved on by the time this rejects.
+      if (err && err.name === 'AbortError') {
+        return null;
+      }
+      console.error('Failed to summarize single-connection results:', err);
+      return null;
+    }
+  }
+
+  // Prepends a leading "Summary" tab onto currentResultsList (already
+  // built by renderMultiTurnResults() just before this is called) and
+  // makes it the active tab - the "new leading Summary tab" placement
+  // this feature's design confirmed. Safe to call with a falsy
+  // `summaryText` (no-op), so callers don't need their own guard.
+  function prependSingleModeSummaryTab(summaryText) {
+    if (!summaryText || !currentResultsList) return;
+    currentResultsList = [{ isText: true, tabLabel: 'Summary', text: summaryText }, ...currentResultsList];
+    activeResultIndex = 0;
+    buildResultsTabsNav();
+    renderTableResult(currentResultsList[activeResultIndex]);
+  }
+
+  // Same idea as prependSingleModeSummaryTab just above, for a FAILED
+  // execution (see executeSql()'s two single-connection failure branches)
+  // - deliberately does NOT jump the active tab to the new Summary entry
+  // the way the success-path helper above does. All-mode's own equivalent
+  // (appendPhaseCSummaryToSummaryTab/appendPhaseCErrorToSummaryTab) never
+  // disturbs whatever tab the user is currently looking at either - it
+  // only re-renders if the Summary tab HAPPENS to already be active - and
+  // the same reasoning applies here even more strongly: the tab the user
+  // is looking at when this fires is the error itself, which is what
+  // needs their attention. Silently swapping that out for an LLM-written
+  // apology mid-read the moment the (often very fast, sometimes near-
+  // instant) summarization call resolves would be a jarring, timing-
+  // dependent surprise, not the helpful addition this feature is meant to
+  // be - so this only grows the tab strip with a new (inactive) "Summary"
+  // tab the user can click into if they want it, leaving the already-
+  // rendered error exactly as it is. Safe to call with a falsy
+  // `summaryText` (no-op), same as the function above.
+  function prependSingleModeSummaryTabPreservingActiveTab(summaryText) {
+    if (!summaryText || !currentResultsList) return;
+    currentResultsList = [{ isText: true, tabLabel: 'Summary', text: summaryText }, ...currentResultsList];
+    activeResultIndex += 1;
+    buildResultsTabsNav();
   }
 
   // Persists everything renderAllModeCombinedResults() needs to rebuild the
@@ -6558,6 +6830,23 @@ document.addEventListener('DOMContentLoaded', async () => {
           const promptText = aiPrompt && aiPrompt.value.trim() ? aiPrompt.value.trim() : "[Direct SQL Execution]";
           const summarizedResults = Array.isArray(data.results) ? data.results.map(summarizeResultForHistory) : [];
 
+          // Single-connection mode's own post-execution summarization (see
+          // requestSingleModeResultsSummary's own section comment above) -
+          // skipped for "all databases" mode (allModeNotes truthy - that
+          // already got its own Phase C summary above) and for direct SQL
+          // entry/re-run (no real NL question to summarize against - see
+          // aiPrompt's own fallback to "[Direct SQL Execution]" just above).
+          // Awaited, same as Phase C's own call sites, so buttons stay
+          // disabled for this extra round trip rather than re-enabling
+          // before the Summary tab is actually ready.
+          let singleModeSummary = null;
+          if (!allModeNotes && promptText !== "[Direct SQL Execution]" && Array.isArray(data.results) && data.results.length) {
+            showAllModeSummarizingStatus();
+            singleModeSummary = await requestSingleModeResultsSummary(promptText, sql, data.results);
+            hideAllModeStreamStatus();
+            if (singleModeSummary) prependSingleModeSummaryTab(singleModeSummary);
+          }
+
           if (chatStore.getPending() && !chatStore.isPendingCurrent()) {
             // Stale reference (e.g. left over from navigating through a no-SQL
             // turn) - drop it rather than risk mutating the wrong turn.
@@ -6571,12 +6860,14 @@ document.addEventListener('DOMContentLoaded', async () => {
             pending.entry.text = sql;
             pending.entry.results = summarizedResults;
             if (allModeNotes) captureAllModeHistory(pending.entry, allModeNotes, []);
+            if (singleModeSummary) pending.entry.summary = singleModeSummary;
             chatStore.clearPending();
           } else {
             // Any other execution (direct SQL entry, or re-running a query
             // that isn't the pending just-generated one) is its own turn.
             const modelEntry = { role: 'model', text: sql, results: summarizedResults };
             if (allModeNotes) captureAllModeHistory(modelEntry, allModeNotes, []);
+            if (singleModeSummary) modelEntry.summary = singleModeSummary;
             chatStore.pushTurn(promptText, modelEntry);
             updateHistoryTurnsSubtitle();
           }
@@ -6587,6 +6878,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         const errMsg = response.status === 401
           ? "Authentication required. Please click 'Sign in with Google' in the top-right corner to log in."
           : (data.error || "An error occurred during SQL execution.");
+        // Computed once here (mirrors the success branch's identical
+        // expression above) rather than per-branch below - both
+        // single-connection failure branches now need it for their own
+        // requestSingleModeResultsSummary() call (see each branch's own
+        // comment for why summarization now runs on a failed execution
+        // too, mirroring "all databases" mode's Phase C).
+        const promptText = aiPrompt && aiPrompt.value.trim() ? aiPrompt.value.trim() : "[Direct SQL Execution]";
 
         // "All databases" mode's "route" outcome (see above) takes
         // priority over both existing failure shapes below - it needs the
@@ -6664,48 +6962,74 @@ document.addEventListener('DOMContentLoaded', async () => {
         // original flat block.
         } else if (Array.isArray(data.results) || data.failedStatement !== undefined) {
           renderResultsWithFailedStatement({ ...data, error: errMsg });
+          // Single-connection mode's own post-execution summarization
+          // (see requestSingleModeResultsSummary's section comment above)
+          // now runs on a FAILED execution too, mirroring "all databases"
+          // mode's Phase C, which already summarizes over whatever DID
+          // execute alongside any failures (see e.g. the
+          // requestAllModeResultsSummary call a few lines up, made even
+          // when data.failures is non-empty). statement_results mirrors
+          // _build_single_summary_prompt's own {"columns","rows",
+          // "rowCount"}|{"note"}|{"error"} shape - every statement that
+          // succeeded before the failure (data.results), plus one final
+          // {error} entry for the one that didn't, so the model can
+          // reason over (and mention) both, same as it already does for
+          // an all-succeeded turn. Same "no real question to summarize
+          // against" guard the success branch uses.
+          if (promptText !== "[Direct SQL Execution]") {
+            const statementResults = [
+              ...(Array.isArray(data.results) ? data.results : []),
+              { error: errMsg },
+            ];
+            showAllModeSummarizingStatus();
+            const singleModeSummary = await requestSingleModeResultsSummary(promptText, sql, statementResults);
+            hideAllModeStreamStatus();
+            // Preserves the active tab (the just-rendered failure, which
+            // is what needs the user's attention) rather than stealing
+            // focus to the new Summary tab - see that helper's own
+            // docstring for why this differs from the success path's
+            // prependSingleModeSummaryTab.
+            if (singleModeSummary) prependSingleModeSummaryTabPreservingActiveTab(singleModeSummary);
+          }
         } else if (resultsBody) {
-          // Bypasses renderTableResult() entirely (no per-tab result object
-          // exists here - e.g. a bare connect() failure with nothing else
-          // to show alongside it), so it needs its own setReportContext()
-          // call rather than getting one for free, AND its own inline
-          // button markup (reportButtonHtml() itself still gates on
-          // ISSUE_REPORTING_ENABLED). Both are excluded when the failure
-          // was actually an auth problem (401) - not a database error the
-          // model's SQL caused, so out of scope for this feature the same
-          // way a translation error is.
+          // A bare execute failure with nothing else to show alongside it
+          // (a connect() failure, or a single-statement script's own
+          // error - see execute_routes.py's module docstring on when this
+          // flat shape, as opposed to the SqlExecutionError shape the
+          // branch above handles, is what comes back). Used to bypass
+          // renderTableResult()/the tab system entirely and hand-build
+          // this same markup inline - now goes through the same one-entry
+          // currentResultsList + renderTableResult() path every other
+          // failure shape already uses, so this can also grow a leading
+          // Summary tab below exactly the way a successful execution's
+          // single result tab does (via prependSingleModeSummaryTab), and
+          // so this markup isn't maintained in two places. The 401
+          // exclusion this branch has always had (an auth-required
+          // failure is out of scope for the Report feature, same as a
+          // translation error) is preserved via result.notReportable -
+          // see renderTableResult()'s isError branch for how that's used.
           const reportable = response.status !== 401;
-          resultsBody.innerHTML = `
-            <tr>
-              <td class="error-cell">
-                <div class="error-container">
-                  <span class="error-icon">⚠️</span>
-                  <div class="error-details">
-                    <div class="error-title-row">
-                      <strong>Execution Error</strong>
-                      ${reportable ? reportButtonHtml('error') : ''}
-                    </div>
-                    <p>${errMsg}</p>
-                  </div>
-                </div>
-              </td>
-            </tr>`;
-          // Tracked regardless of `reportable` - a 401 auth failure is out
-          // of scope for the Report feature (see the comment above), but
-          // it's still an error the user actually saw.
-          trackEvent('error_shown', {
-            category: 'execution',
-            database_name: connDbName ? connDbName.textContent : '',
-            database_type: getActiveDatabaseType(),
-            message: truncateForAnalytics(errMsg),
-          });
-          if (reportable) {
-            setReportContext({
-              category: 'error',
-              databaseName: connDbName ? connDbName.textContent : '',
-              sql: sql,
-              content: errMsg,
-            });
+          currentResultsList = [{ isError: true, error: errMsg, statement: sql, notReportable: !reportable }];
+          activeResultIndex = 0;
+          buildResultsTabsNav();
+          renderTableResult(currentResultsList[0]);
+
+          // Single-connection mode's own post-execution summarization
+          // (see requestSingleModeResultsSummary's section comment above)
+          // now runs here too, mirroring "all databases" mode's Phase C -
+          // see the SqlExecutionError branch above for the fuller
+          // reasoning. Skipped for the same reason the Report button/
+          // context are skipped just above (a 401 auth failure, nothing
+          // meaningful happened for the model to reason over), in
+          // addition to the existing "no real question" guard.
+          if (reportable && promptText !== "[Direct SQL Execution]") {
+            showAllModeSummarizingStatus();
+            const singleModeSummary = await requestSingleModeResultsSummary(promptText, sql, [{ error: errMsg }]);
+            hideAllModeStreamStatus();
+            // Preserves the active (error) tab - see that helper's own
+            // docstring for why this differs from the success path's
+            // prependSingleModeSummaryTab.
+            if (singleModeSummary) prependSingleModeSummaryTabPreservingActiveTab(singleModeSummary);
           }
         }
       }
@@ -7004,6 +7328,11 @@ document.addEventListener('DOMContentLoaded', async () => {
             // subsequent Run overwrite its stored results in place.
             chatStore.clearPending();
             renderMultiTurnResults(lastModelEntry.results);
+            // Replays a previously-computed single-connection summary (see
+            // executeSql()'s own `.summary` persist above) without a new
+            // network call - same "no re-fetch on back/forward" posture
+            // every other piece of a saved turn already has.
+            if (lastModelEntry.summary) prependSingleModeSummaryTab(lastModelEntry.summary);
           } else {
             // Genuinely still awaiting its first execution.
             chatStore.setPending(lastModelEntry, normalizeSqlForCompare(sqlText));
@@ -7042,8 +7371,29 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
+  /** The record count currently shown next to "Purge Translations"
+   * (`.btn-purge-title`, e.g. "(42)" - kept in sync by loadHistoryData()).
+   * Read fresh at click time so history_purge_clicked's `record_count`
+   * always reflects what's on screen right before the purge happens, not a
+   * stale earlier load. Returns null while the count hasn't loaded yet
+   * (shows "(...)" - see the historyBtn click handler above) rather than
+   * fabricating a number. */
+  function currentHistoryRecordCount() {
+    const purgeTitleEl = document.querySelector('.btn-purge-title');
+    if (!purgeTitleEl) return null;
+    const match = purgeTitleEl.textContent.match(/\d+/);
+    return match ? parseInt(match[0], 10) : null;
+  }
+
   if (purgeHistoryBtn) {
     purgeHistoryBtn.addEventListener('click', async () => {
+      // Fired on the click itself, before the confirm dialog - this is
+      // "the user clicked Purge", not "the user confirmed the purge" - and
+      // record_count is the count as of right now, before anything is
+      // actually deleted.
+      const recordCount = currentHistoryRecordCount();
+      trackEvent('history_purge_clicked', recordCount !== null ? { record_count: recordCount } : {});
+
       const confirmed = await showConfirmDialog('Are you sure you want to purge history records within the current scope? This action cannot be undone.');
       if (!confirmed) {
         return;

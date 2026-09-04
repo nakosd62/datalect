@@ -8,7 +8,18 @@
     window.dataLayer = window.dataLayer || [];
     function gtag(){dataLayer.push(arguments);}
     gtag('js', new Date());
-    gtag('config', 'G-1PMVBN5FHW');
+    // DebugView (GA4's real-time event inspector - see
+    // https://support.google.com/analytics/answer/7201382) only shows hits
+    // that carry debug_mode - without it, events land in standard reporting
+    // as usual but never show up there, which is why clicking around locally
+    // produced nothing to look at. Auto-enabled only when this page is
+    // being served from a local dev server: run_server.sh/server.py bind to
+    // "localhost"/"127.0.0.1" (see server.py's CRBOT_HOSTNAME), and Cloud
+    // Run traffic is never served from either hostname - so this never
+    // marks real production hits as debug ones, no manual toggling needed
+    // between environments.
+    const isLocalDev = ['localhost', '127.0.0.1'].includes(location.hostname);
+    gtag('config', 'G-1PMVBN5FHW', isLocalDev ? { debug_mode: true } : {});
   </script>
 
   <meta charset="UTF-8">
