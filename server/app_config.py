@@ -12,6 +12,7 @@ from it) - it has the side effects of creating the Flask app and, on
 Cloud Run, connecting to Firestore.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -143,6 +144,41 @@ if IS_CLOUD_RUN and not is_db_config_encryption_configured():
 app = Flask(__name__, static_folder='../webClient', static_url_path='')
 # Support credentials for authenticated CORS requests
 CORS(app, supports_credentials=True)
+
+# --- Client build id ---------------------------------------------------------
+# Lets the frontend detect "a reload would pick up new code" without nagging
+# on every server restart - see config_routes.py's GET /api/client-version
+# docstring for how client.js actually uses this. Hashes the CONTENT of the
+# static files that actually affect what the browser runs (index.html/
+# client.js/style.css), not their mtimes (a fresh `git checkout`/container
+# rebuild resets mtimes to "now" regardless of whether a file's own bytes
+# changed - see the earlier device-bridge git-lock/reload conversation this
+# feature grew out of) and not the server process's own start time either,
+# which would report "new version" after EVERY restart even when nothing
+# under webClient/ changed at all (a backend-only fix, an env var tweak, a
+# database credential rotation - exactly the "not every restart requires a
+# client reload" distinction this constant exists to make). Computed once,
+# at import time: these are a handful of small text files, so hashing them
+# costs nothing worth caching more cleverly than a plain module-level
+# constant re-read on every request.
+def _compute_client_build_id():
+    hasher = hashlib.sha256()
+    for filename in ("index.html", "client.js", "style.css"):
+        path = os.path.join(app.static_folder, filename)
+        try:
+            with open(path, "rb") as f:
+                hasher.update(f.read())
+        except OSError:
+            # Missing file (a stripped-down dev checkout, a build step that
+            # hasn't produced it yet) - still yields SOME id rather than
+            # crashing startup over what's ultimately just a "please
+            # reload" nicety; the fixed sentinel keeps a missing file from
+            # hashing identically to an empty one.
+            hasher.update(b"\0missing:" + filename.encode())
+    return hasher.hexdigest()[:12]
+
+
+CLIENT_BUILD_ID = _compute_client_build_id()
 
 DEFAULT_CONN = "postgresql://postgres:password@host:23456/defaultdb?sslmode=verify-full"
 

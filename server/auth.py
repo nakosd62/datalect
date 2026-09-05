@@ -135,6 +135,12 @@ EXEMPT_ENDPOINTS = {
     'auth.get_current_user_status',
     'static',
     'config.handle_config',
+    # Public, static-for-the-life-of-the-process build-id check (see
+    # config_routes.py's get_client_version docstring) - no session/user
+    # concept applies to it at all, same posture as 'static' above, and
+    # client.js polls it periodically in the background regardless of
+    # whether the visitor is signed in.
+    'config.get_client_version',
     'login',
     'google_login',
     'oauth_callback',

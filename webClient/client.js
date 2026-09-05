@@ -239,7 +239,49 @@ document.addEventListener('DOMContentLoaded', async () => {
   // llm_byok_key_set), so there is no client-side variable holding it.
   let LLM_BYOK_KEY_SET = { google: false, anthropic: false, openai: false };
   let currentGoogleClientId = null;
+  // Persists a signed-in user's Google ID token across a same-tab reload -
+  // see persistGoogleIdToken()/clearPersistedGoogleIdToken() below (the
+  // only two places that ever write this key) and the restore right below
+  // this declaration (the only place that ever reads it). Before this,
+  // googleIdToken was populated ONLY by the Google Sign-In callback (see
+  // renderAuthUI() below), which never fires again on its own after a
+  // reload - so every reload silently dropped back to signed-out/anonymous
+  // until the user clicked "Sign in" again, even though their actual
+  // Google session (and this token, until it expires) was still perfectly
+  // valid. sessionStorage (not localStorage) deliberately: this only needs
+  // to survive THIS tab's reloads, not follow the user into a new tab or a
+  // later browser session days from now - a real Google ID token is
+  // short-lived (about an hour) anyway, and renderAuthUI()'s existing
+  // isExpired check already discards/clears anything stale the moment
+  // it's actually used, so restoring the raw stored value here
+  // unconditionally (without re-checking `exp` a second time) is safe.
+  const GOOGLE_ID_TOKEN_STORAGE_KEY = 'datalectGoogleIdToken';
   let googleIdToken = null;
+  try {
+    googleIdToken = window.sessionStorage.getItem(GOOGLE_ID_TOKEN_STORAGE_KEY) || null;
+  } catch (e) {
+    // sessionStorage unavailable (private browsing, disabled storage, etc.)
+    // - same fallback posture as every other storage read in this file:
+    // just start signed out, exactly like every reload did before this fix.
+  }
+
+  function persistGoogleIdToken(token) {
+    try {
+      window.sessionStorage.setItem(GOOGLE_ID_TOKEN_STORAGE_KEY, token);
+    } catch (e) {
+      // Storage unavailable - the sign-in still works for this page view,
+      // it just won't survive a reload, same as before this fix.
+    }
+  }
+
+  function clearPersistedGoogleIdToken() {
+    try {
+      window.sessionStorage.removeItem(GOOGLE_ID_TOKEN_STORAGE_KEY);
+    } catch (e) {
+      // See persistGoogleIdToken()'s identical guard above.
+    }
+  }
+
   let customDbUrl = "";
   let customDbName = "";
   let customDatabases = [];
@@ -747,6 +789,12 @@ document.addEventListener('DOMContentLoaded', async () => {
   const historyTabTranslations = document.getElementById('historyTabTranslations');
   const historyTabStatistics = document.getElementById('historyTabStatistics');
 
+  // DOM Elements - New Version Banner (see fetchClientBuildId()/
+  // checkForNewClientVersion() below)
+  const newVersionBanner = document.getElementById('newVersionBanner');
+  const newVersionReloadBtn = document.getElementById('newVersionReloadBtn');
+  const newVersionDismissBtn = document.getElementById('newVersionDismissBtn');
+
   // DOM Elements - Results Table & Tabs
   const resultsRetryStatus = document.getElementById('resultsRetryStatus');
   const resultsTabsNav = document.getElementById('resultsTabsNav');
@@ -915,6 +963,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   function handleLogout() {
     trackEvent('logout', {});
     googleIdToken = null;
+    clearPersistedGoogleIdToken();
     if (window.google && google.accounts && google.accounts.id) {
       google.accounts.id.disableAutoSelect();
     }
@@ -1012,6 +1061,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       if (isExpired) {
         googleIdToken = null;
+        clearPersistedGoogleIdToken();
       }
 
       container.innerHTML = '';
@@ -1022,6 +1072,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           callback: (response) => {
             if (response.credential) {
               googleIdToken = response.credential;
+              persistGoogleIdToken(googleIdToken);
               // GA4's own recommended "login" event shape (see
               // https://developers.google.com/analytics/devguides/collection/ga4/reference/events)
               // has exactly one optional parameter, "method" - always
@@ -7548,6 +7599,67 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
     });
   }
+
+  // --- New version (reload nudge) -------------------------------------
+  // Lets the user know when the SERVER's client-facing code (index.html/
+  // client.js/style.css) has changed since this page loaded - see server/
+  // app_config.py's CLIENT_BUILD_ID and config_routes.py's GET /api/
+  // client-version for the backend half. Deliberately never forces a
+  // reload - restarting the server after a backend-only change (nothing
+  // under webClient/ touched) returns the SAME build id, so an already-
+  // open tab stays quiet; only a real frontend change trips this.
+  let startupClientBuildId = null;
+  let newVersionBannerDismissed = false;
+
+  async function fetchClientBuildId() {
+    try {
+      const response = await fetch('/api/client-version', { credentials: 'same-origin' });
+      if (!response.ok) return null;
+      const data = await response.json();
+      return data.client_build_id || null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function showNewVersionBanner() {
+    if (newVersionBannerDismissed || !newVersionBanner) return;
+    newVersionBanner.classList.remove('hidden');
+  }
+
+  function hideNewVersionBanner() {
+    if (newVersionBanner) newVersionBanner.classList.add('hidden');
+  }
+
+  async function checkForNewClientVersion() {
+    // Nothing to compare against yet (startup fetch hasn't resolved, or
+    // failed) - skip this tick rather than treating "unknown" as "changed".
+    if (!startupClientBuildId) return;
+    const currentId = await fetchClientBuildId();
+    if (currentId && currentId !== startupClientBuildId) {
+      showNewVersionBanner();
+    }
+  }
+
+  if (newVersionReloadBtn) {
+    newVersionReloadBtn.addEventListener('click', () => window.location.reload());
+  }
+  if (newVersionDismissBtn) {
+    newVersionDismissBtn.addEventListener('click', () => {
+      newVersionBannerDismissed = true;
+      hideNewVersionBanner();
+    });
+  }
+
+  // Captured once, in the background - deliberately NOT awaited here so it
+  // never delays startup (fetchBackendConfig() and everything else below
+  // proceeds regardless of whether/when this resolves).
+  fetchClientBuildId().then((id) => { startupClientBuildId = id; });
+
+  // 5 minutes: frequent enough to catch a deploy during a long-idle open
+  // tab, infrequent enough that it's not worth bothering with visibility-
+  // change-aware pausing.
+  setInterval(checkForNewClientVersion, 5 * 60 * 1000);
 
   await fetchBackendConfig();
 

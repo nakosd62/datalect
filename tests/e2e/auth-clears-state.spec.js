@@ -290,3 +290,126 @@ test.describe('auth-triggered state clearing (Cloud Run)', () => {
     expect(await isSigninHitTestable()).toBe(true);
   });
 });
+
+// Regression coverage for a real bug report: reloading the app (the exact
+// same tab, e.g. hitting the browser's refresh button) used to always drop
+// a signed-in user back to signed-out/anonymous - client.js's googleIdToken
+// was populated ONLY by the Google Sign-In callback (see
+// stubGoogleIdentityServices()'s __gisCallback above), which never fires
+// again on its own, so nothing survived past the reload even though the
+// user's real Google session (and the token itself, until it actually
+// expires) was still perfectly valid. Fixed by persisting the ID token to
+// sessionStorage on sign-in and restoring it before the app's first
+// /api/config call - see client.js's persistGoogleIdToken()/
+// clearPersistedGoogleIdToken() and the restore right next to
+// googleIdToken's own declaration.
+test.describe('sign-in survives a same-tab reload (Cloud Run)', () => {
+  test('a signed-in user is still shown as signed in after reloading the page', async ({ page }) => {
+    await stubGoogleIdentityServices(page);
+    await mockCloudRunConfig(page);
+    await gotoApp(page);
+
+    await page.evaluate(
+      (token) => window.__gisCallback({ credential: token }),
+      fakeIdToken('reload-user@example.com')
+    );
+    await expect(page.locator('#authAvatarBtn')).toBeVisible();
+
+    // Every route/init-script registered on `page` (stubGoogleIdentityServices,
+    // mockCloudRunConfig) survives a reload - only the page's own JS state
+    // (and, before this fix, googleIdToken along with it) gets torn down.
+    await page.reload();
+
+    // Still shows the avatar, not the "Sign in" button - proof the restored
+    // token was accepted as a real, unexpired sign-in rather than starting
+    // this reload back at signed-out.
+    await expect(page.locator('#authAvatarBtn')).toBeVisible();
+    await expect(page.locator('#fakeGsiButton')).toHaveCount(0);
+    await expect(page.locator('#authAvatarBtn')).toHaveAttribute('title', 'reload-user@example.com');
+  });
+
+  test('the very first request after a reload already carries the restored token, not just a later one', async ({ page }) => {
+    await stubGoogleIdentityServices(page);
+    await mockCloudRunConfig(page);
+    await gotoApp(page);
+
+    await page.evaluate(
+      (token) => window.__gisCallback({ credential: token }),
+      fakeIdToken('reload-user@example.com')
+    );
+    await expect(page.locator('#authAvatarBtn')).toBeVisible();
+
+    const configAuthHeaders = [];
+    await page.route('**/api/config', async (route) => {
+      if (route.request().method() !== 'GET') return route.fallback();
+      configAuthHeaders.push(route.request().headers()['authorization'] || null);
+      await route.fulfill({
+        status: 200, contentType: 'application/json',
+        body: JSON.stringify(CLOUD_RUN_CONFIG_PAYLOAD),
+      });
+    });
+
+    await page.reload();
+    await expect(page.locator('#authAvatarBtn')).toBeVisible();
+
+    // The page's OWN startup sequence (fetchBackendConfig() at the very
+    // bottom of the DOMContentLoaded handler) is what fires this GET - not
+    // something the test triggered - so a Bearer header on its very first
+    // call proves googleIdToken was restored before any network request
+    // went out, not patched in afterward by some later re-sync.
+    expect(configAuthHeaders.length).toBeGreaterThan(0);
+    expect(configAuthHeaders[0]).toMatch(/^Bearer /);
+  });
+
+  test('logging out clears the persisted token too, so a later reload does not resurrect the old session', async ({ page }) => {
+    await stubGoogleIdentityServices(page);
+    await mockCloudRunConfig(page);
+    await gotoApp(page);
+
+    await page.evaluate(
+      (token) => window.__gisCallback({ credential: token }),
+      fakeIdToken('reload-user@example.com')
+    );
+    await expect(page.locator('#authAvatarBtn')).toBeVisible();
+
+    await page.locator('#authAvatarBtn').click();
+    await page.locator('#logoutBtn').click();
+    await expect(page.locator('#authAvatarBtn')).toHaveCount(0);
+
+    await page.reload();
+
+    await expect(page.locator('#fakeGsiButton')).toBeVisible();
+    await expect(page.locator('#authAvatarBtn')).toHaveCount(0);
+  });
+
+  test('an expired stored token does not restore a signed-in state after reload', async ({ page }) => {
+    await stubGoogleIdentityServices(page);
+    await mockCloudRunConfig(page);
+    await gotoApp(page);
+
+    // Seed an ALREADY-EXPIRED token directly into sessionStorage - the
+    // shape a real signed-in session would leave behind if the tab stayed
+    // open long enough for it to actually expire before the next reload -
+    // rather than going through a real sign-in (which always mints a
+    // fresh, unexpired one via fakeIdToken()).
+    const expiredToken = (() => {
+      const header = Buffer.from(JSON.stringify({ alg: 'none', typ: 'JWT' })).toString('base64url');
+      const payload = Buffer.from(JSON.stringify({
+        email: 'stale-user@example.com',
+        exp: Math.floor(Date.now() / 1000) - 3600,
+        picture: '',
+      })).toString('base64url');
+      return `${header}.${payload}.fake-signature`;
+    })();
+    await page.evaluate((token) => {
+      window.sessionStorage.setItem('datalectGoogleIdToken', token);
+    }, expiredToken);
+
+    await page.reload();
+
+    // renderAuthUI()'s own isExpired check discards it the moment it's
+    // used - the sign-in button shows, not the stale user's avatar.
+    await expect(page.locator('#fakeGsiButton')).toBeVisible();
+    await expect(page.locator('#authAvatarBtn')).toHaveCount(0);
+  });
+});

@@ -225,7 +225,7 @@ from flask import Blueprint, request, jsonify
 from app_config import (
     CONFIGURED_DBS, DEFAULT_PRESET_ID, MAX_IN_SCOPE_CONNECTIONS,
     AUTH_ENABLED, IS_CLOUD_RUN, state_store,
-    ISSUE_REPORTING_ENABLED,
+    ISSUE_REPORTING_ENABLED, CLIENT_BUILD_ID,
 )
 import os
 from auth import (
@@ -2056,3 +2056,27 @@ def handle_config():
         'username': username
     })
     return apply_session_cookie(resp, session_id)
+
+
+@config_bp.route('/api/client-version', methods=['GET'])
+def get_client_version():
+    """Lets client.js detect "a reload would pick up new code" - deliberately
+    its OWN tiny endpoint rather than one more field folded into
+    handle_config()'s already-large response above: this needs no session/
+    auth/database-connection resolution at all (see EXEMPT_ENDPOINTS in
+    auth.py, which this route is added to for exactly that reason - it's
+    public, static-for-the-life-of-the-process information, same posture as
+    a plain static asset), and polling it periodically to notice a change
+    shouldn't also re-run everything handle_config() does on every tick.
+
+    CLIENT_BUILD_ID (app_config.py) is computed once, at process import
+    time, from the CONTENT of the static files that actually affect what
+    the browser runs - so restarting the server after a backend-only
+    change (nothing under webClient/ touched) returns the exact same id an
+    already-open tab already has, and client.js's own periodic check (see
+    its own comment on this endpoint) correctly stays quiet. Only a real
+    frontend change (client.js/index.html/style.css) changes the id, which
+    is the one case where an already-loaded page is actually running stale
+    code and a reload would matter.
+    """
+    return jsonify({'client_build_id': CLIENT_BUILD_ID})
