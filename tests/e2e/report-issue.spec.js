@@ -586,4 +586,54 @@ test.describe('Summary tab feedback (thumbs up/down)', () => {
     expect(events.length).toBe(2);
     expect(events.map((e) => e.category).sort()).toEqual(['summary_thumbs_down', 'summary_thumbs_up']);
   });
+
+  // Regression coverage for a real feature request: a "*** NO SQL ***"
+  // conversational reply (the model answering directly, with no query at
+  // all - see client.js's renderNoSqlResponse()) is just as much "a
+  // response the user might want to react to" as a Results Summary is, so
+  // it gets the exact same thumbs-up/down prompt underneath it - same
+  // summaryFeedbackButtonsHtml() call, same 'summary_thumbs_up'/
+  // 'summary_thumbs_down' categories, same privacy posture (no
+  // prompt/reply content ever sent). Unlike every other test in this
+  // describe block, there's no /api/execute or /api/summarize-results call
+  // at all here - /api/translate's own response IS the final answer.
+  test('a "*** NO SQL ***" conversational reply also gets the thumbs up/down feedback prompt', async ({ page }) => {
+    await mockIssueReportingEnabled(page, true);
+    const reportState = mockReportIssue(page);
+    await mockTranslate(page, { sql: '*** NO SQL *** Paris is the capital of France.' });
+    await gotoApp(page);
+
+    await page.locator('#aiPrompt').fill('what is the capital of france');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect(page.locator('.response-text')).toContainText('Paris is the capital of France.');
+
+    const up = page.locator('.summary-feedback-btn--up');
+    const down = page.locator('.summary-feedback-btn--down');
+    await expect(up).toBeVisible();
+    await expect(down).toBeVisible();
+
+    await down.click();
+    await expect(page.locator('#reportIssueModal')).toBeVisible();
+    await expect(page.locator('#reportIssuePreviewSection')).toBeHidden();
+    await page.locator('#reportIssueDetails').fill('That is not actually correct.');
+    await page.locator('#reportIssueSendBtn').click();
+
+    await expect(page.locator('#reportIssueModal')).toBeHidden();
+    expect(reportState.lastBody).toEqual({
+      category: 'summary_thumbs_down',
+      details: 'That is not actually correct.',
+    });
+  });
+
+  test('the feedback prompt stays hidden for a "*** NO SQL ***" reply when issue reporting is not configured', async ({ page }) => {
+    await mockIssueReportingEnabled(page, false);
+    await mockTranslate(page, { sql: '*** NO SQL *** Paris is the capital of France.' });
+    await gotoApp(page);
+
+    await page.locator('#aiPrompt').fill('what is the capital of france');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect(page.locator('.response-text')).toContainText('Paris is the capital of France.');
+
+    await expect(page.locator('.summary-feedback-row')).toBeHidden();
+  });
 });

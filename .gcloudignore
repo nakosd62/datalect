@@ -12,6 +12,7 @@ atlas-credentials.env
 
 # Leftovers
 _to_delete/
+Golf-Scores-main/
 
 # Ignore utility scripts
 *.sh

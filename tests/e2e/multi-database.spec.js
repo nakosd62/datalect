@@ -745,6 +745,145 @@ test.describe('multi-database question answering', () => {
     });
   });
 
+  // Regression test for a real bug report: the Summary tab's thumbs up/down
+  // feedback prompt was appearing the moment triage's own routing message
+  // rendered - well before Phase C's real Results Summary had rendered
+  // underneath it - instead of waiting for that summary to actually appear
+  // (see client.js's `summaryPending` flag on the Summary tab entry,
+  // renderAllModeCombinedResults'/startAllModeStreaming's own comments on
+  // it, and appendPhaseCSummaryToSummaryTab/settleSummaryTabPending, which
+  // clear it once Phase C has settled one way or another). Uses the live
+  // streaming path (auto-execute on) with a manually-gated
+  // /api/summarize-results route so the test can assert the "in between"
+  // state Playwright's atomic route.fulfill() can't otherwise expose - see
+  // this file's own "progressive/streaming redesign" section comment above
+  // for that limitation, and translate-execute.spec.js's identical
+  // manually-gated-route pattern for holding a response open on purpose.
+  test('the Summary tab\'s feedback buttons stay hidden until Phase C\'s Results Summary actually renders, not as soon as the Triage message does', async ({ page }) => {
+    await mockConfig(page, { ...buildConfigState(), issue_reporting_enabled: true, auto_sql_execute: true });
+    await gotoApp(page);
+
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      const ndjson = [
+        {
+          status: 'phase_a_route', routing_message: 'Checking Sales Postgres.',
+          connection_selection: [{ kind: 'preset', id: 'p-a', name: 'Sales Postgres' }],
+        },
+        {
+          status: 'phase_b_connection_done', kind: 'preset', id: 'p-a', name: 'Sales Postgres',
+          outcome: 'sql', sql: '-- database: preset:p-a (Sales Postgres)\nSELECT * FROM deals;',
+        },
+        {
+          status: 'done', success: true, router_route: true,
+          routing_message: 'Checking Sales Postgres.',
+          sql: '-- database: preset:p-a (Sales Postgres)\nSELECT * FROM deals;',
+          database_notes: [], generation_failures: [],
+          connection_selection: [{ kind: 'preset', id: 'p-a', name: 'Sales Postgres' }],
+        },
+      ].map((e) => JSON.stringify(e)).join('\n') + '\n';
+      await route.fulfill({ status: 200, contentType: 'application/x-ndjson', body: ndjson });
+    });
+    await page.route('**/api/execute', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200, contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          results: [{ statement: 'SELECT * FROM deals', columns: ['total'], rows: [{ total: 500 }], rowCount: 1,
+            database: { kind: 'preset', id: 'p-a', name: 'Sales Postgres' } }],
+        }),
+      });
+    });
+
+    // Held open until releaseSummarize() below - lets this test observe
+    // the real "triage rendered, Phase C still in flight" window instead of
+    // Phase C resolving before the test can even check.
+    let releaseSummarize;
+    const summarizeGate = new Promise((resolve) => { releaseSummarize = resolve; });
+    await page.route('**/api/summarize-results', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await summarizeGate;
+      await route.fulfill({
+        status: 200, contentType: 'application/json',
+        body: JSON.stringify({ success: true, summary: 'Sales Postgres shows total revenue of $500.' }),
+      });
+    });
+
+    await page.locator('#aiPrompt').fill('total revenue');
+    await page.locator('#aiPrompt').press('Enter');
+
+    // Triage's own routing message is up (the Summary tab has rendered),
+    // but Phase C hasn't resolved yet - the feedback prompt must NOT be
+    // showing at this point, which was exactly the bug.
+    const summaryText = page.locator('.response-text');
+    await expect(summaryText).toContainText('Checking Sales Postgres.');
+    await expect(page.locator('.summary-feedback-btn--up')).toBeHidden();
+    await expect(page.locator('.summary-feedback-btn--down')).toBeHidden();
+
+    // Let Phase C resolve - only now, once the Results Summary text has
+    // actually rendered, should the feedback prompt appear.
+    releaseSummarize();
+    await expect(summaryText).toContainText('Sales Postgres shows total revenue of $500.');
+    await expect(page.locator('.summary-feedback-btn--up')).toBeVisible();
+    await expect(page.locator('.summary-feedback-btn--down')).toBeVisible();
+  });
+
+  // "All databases" mode's own "answer" outcome (see translate_routes.py's
+  // module docstring): triage decided no database data was needed at all,
+  // so /api/translate's terminal response carries a "*** NO SQL ***" reply
+  // directly - no `router_route`, no /api/execute, no /api/summarize-
+  // results. Renders through the exact same renderNoSqlResponse() call as
+  // single-connection mode's own plain reply (report-issue.spec.js's
+  // "Summary tab feedback" describe block covers that variant) - this is
+  // here purely to prove the same thumbs-up/down prompt appears for THIS
+  // mode's own flavor too (with the leading-label convention active, since
+  // IN_SCOPE_MODE is 'all' here - see buildConfigState()).
+  test('an "all databases" mode "answer" outcome (a NO-SQL reply, not a routed query) also gets the thumbs up/down feedback prompt', async ({ page }) => {
+    await mockConfig(page, { ...buildConfigState(), issue_reporting_enabled: true });
+    await gotoApp(page);
+
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          sql: '*** NO SQL *** Neither Sales Postgres nor Marketing Postgres has data relevant to that question.',
+        }),
+      });
+    });
+    let reportBody = null;
+    await page.route('**/api/report-issue', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      reportBody = route.request().postDataJSON();
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ success: true }) });
+    });
+
+    await page.locator('#aiPrompt').fill('what is the weather today');
+    await page.locator('#aiPrompt').press('Enter');
+
+    const responseText = page.locator('.response-text');
+    await expect(responseText).toContainText('Neither Sales Postgres nor Marketing Postgres has data relevant to that question.');
+
+    const up = page.locator('.summary-feedback-btn--up');
+    const down = page.locator('.summary-feedback-btn--down');
+    await expect(up).toBeVisible();
+    await expect(down).toBeVisible();
+
+    await up.click();
+    await expect(page.locator('#reportIssueModal')).toBeVisible();
+    await page.locator('#reportIssueDetails').fill('Correctly declined to make something up.');
+    await page.locator('#reportIssueSendBtn').click();
+
+    await expect(page.locator('#reportIssueModal')).toBeHidden();
+    expect(reportBody).toEqual({
+      category: 'summary_thumbs_up',
+      details: 'Correctly declined to make something up.',
+    });
+  });
+
   // Regression guard for the "Triage"/"Result Summary" section labels
   // becoming language-agnostic (see connection_router.py's
   // is_label_only_response and client.js's renderMarkdownLiteSummaryTab):

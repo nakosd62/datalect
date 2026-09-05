@@ -41,6 +41,28 @@ def test_postgres_preset_missing_url_is_skipped(app_factory, tmp_path):
     assert env.app_config.CONFIGURED_DBS[0]["name"] == "Default DB"
 
 
+def test_postgres_preset_with_schema_parsed(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [
+        {"type": "postgres", "name": "Golf", "url": "postgresql://u:p@h/db", "schema": "golf"},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    assert len(env.app_config.CONFIGURED_DBS) == 1
+    db = env.app_config.CONFIGURED_DBS[0]
+    assert db == {
+        "id": "postgres+Golf", "name": "Golf", "type": "postgres",
+        "url": "postgresql://u:p@h/db", "schema": "golf",
+    }
+
+
+def test_postgres_preset_omits_optional_schema_when_blank(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [
+        {"type": "postgres", "name": "Shop", "url": "postgresql://u:p@h/db", "schema": "  "},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    db = env.app_config.CONFIGURED_DBS[0]
+    assert "schema" not in db
+
+
 def test_mysql_preset_parsed(app_factory, tmp_path):
     path = write_database_presets_file(tmp_path, [
         {"type": "mysql", "name": "Sales", "url": "mysql://u:p@h:3306/db"},

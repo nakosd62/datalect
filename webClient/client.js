@@ -1976,12 +1976,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     // actually selected rather than collapsing MySQL into Postgres. Any
     // other/unrecognized value (there shouldn't be one - the dropdown
     // only ever offers these nine types) also lands on Postgres, matching
-    // this function's original default.
+    // this function's original default. Postgres alone also gets an
+    // (optional) "schema" config field, same as Redshift/Oracle/MSSQL above
+    // - MySQL has no separate schema concept of its own (see backends/
+    // mysql.py's module docstring), so it keeps the empty config object.
+    const resolvedType = (type === 'mysql') ? type : 'postgres';
     return {
       name: '',
-      type: (type === 'mysql') ? type : 'postgres',
+      type: resolvedType,
       url: '',
-      config: {},
+      config: (resolvedType === 'mysql') ? {} : { schema: '' },
     };
   }
 
@@ -2347,6 +2351,14 @@ document.addEventListener('DOMContentLoaded', async () => {
               <input type="text" id="custom-db-url-${index}" class="config-input custom-db-url-input" data-index="${index}" placeholder="${isMySQL ? 'mysql://user:password@host:3306/dbname' : 'postgresql://user:password@host:5432/dbname'}" value="${maskConnectionUrl(db.url)}" autocomplete="off">
             </div>
           </div>
+          ${!isMySQL ? `
+          <div class="custom-db-field-row">
+            <div class="custom-db-field wide">
+              <label class="custom-db-field-label" for="custom-db-pg-schema-${index}">Schema: <span class="optional-hint">(optional)</span></label>
+              <input type="text" id="custom-db-pg-schema-${index}" class="config-input custom-db-pg-schema" data-index="${index}" placeholder="Defaults to the connecting user's search_path (usually public)" value="${cfg.schema || ''}" autocomplete="off">
+            </div>
+          </div>
+          ` : ''}
           <div class="custom-db-field-row align-start">
             <div class="custom-db-field wide">
               <label class="custom-db-field-label" for="custom-db-cacert-${index}">CA Certificate: <span class="optional-hint">(optional - only needed if your URL sets sslmode=verify-ca or verify-full; ignored for a unix_socket connection)</span></label>
@@ -2472,6 +2484,21 @@ document.addEventListener('DOMContentLoaded', async () => {
         // blank value here really does mean "no CA cert", clearing
         // whatever was saved before.
         customDatabases[index].config.ca_cert_pem = input.value.trim();
+      });
+    });
+
+    container.querySelectorAll('.custom-db-pg-schema').forEach(input => {
+      const index = parseInt(input.dataset.index);
+      const radio = container.querySelector(`input[value="custom-${index}"]`);
+      input.addEventListener('focus', () => { if (radio) selectDbConnectionRow(radio, index); });
+      input.addEventListener('input', () => {
+        if (radio) selectDbConnectionRow(radio, index);
+        if (!customDatabases[index].config) customDatabases[index].config = {};
+        // Optional, same treatment as Redshift's/Oracle's/SQL Server's own
+        // schema field above - blank means "use Postgres's own ordinary
+        // search_path default", not a credential so no masking/"leave
+        // blank to keep it" convention applies here.
+        customDatabases[index].config.schema = input.value.trim();
       });
     });
 
@@ -3409,6 +3436,9 @@ document.addEventListener('DOMContentLoaded', async () => {
           // Postgres/MySQL support ca_cert_pem (see backends/postgres.py's
           // and backends/mysql.py's module docstrings).
           dbCaCertPem = (chosen.config && chosen.config.ca_cert_pem) || null;
+          // schema is Postgres-only - MySQL has no separate schema concept
+          // of its own (see backends/mysql.py's module docstring).
+          dbSchema = (dbType === 'postgres' && chosen.config && chosen.config.schema) || null;
         } else {
           dbType = 'postgres';
           dbUrlValue = DEFAULT_DB_URL;
@@ -3567,6 +3597,12 @@ document.addEventListener('DOMContentLoaded', async () => {
           if (d.config && d.config.ca_cert_pem) {
             simpleUrlOut.ca_cert_pem = d.config.ca_cert_pem;
           }
+          // schema is Postgres-only (optional) - MySQL has no separate
+          // schema concept of its own (see backends/mysql.py's module
+          // docstring).
+          if (simpleUrlType === 'postgres' && d.config && d.config.schema) {
+            simpleUrlOut.schema = d.config.schema;
+          }
           return simpleUrlOut;
         }),
     };
@@ -3641,6 +3677,9 @@ document.addEventListener('DOMContentLoaded', async () => {
       // Both simple-URL dialects support ca_cert_pem (see
       // backends/postgres.py's and backends/mysql.py's module docstrings).
       if (dbCaCertPem) payload.ca_cert_pem = dbCaCertPem;
+      // schema is Postgres-only (optional) - MySQL has no separate schema
+      // concept of its own (see backends/mysql.py's module docstring).
+      if (dbSchema && dbType === 'postgres') payload.schema = dbSchema;
     }
 
     const configSaveErrorEl = document.getElementById('configSaveError');
@@ -4881,12 +4920,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     return `<tr class="report-issue-row"><td colspan="${colspan || 1}">${html}</td></tr>`;
   }
 
-  // Thumbs up/down feedback row for the Summary tab (see renderTableResult()'s
-  // own isText branch, the only call site) - both "all databases" mode's
-  // Summary tab (triage's routing message + Phase C's own answer) and
-  // single-connection mode's own equivalent (see prependSingleModeSummaryTab())
-  // render the exact same {isText:true, tabLabel:'Summary'} shape, so this
-  // one function covers both. Gated the same way reportButtonHtml() is -
+  // Thumbs up/down feedback row - shown under any direct, no-table model
+  // response: the Summary tab (see renderTableResult()'s own isText branch)
+  // - both "all databases" mode's own Summary tab (triage's routing message
+  // + Phase C's own answer) and single-connection mode's equivalent (see
+  // prependSingleModeSummaryTab()) render the exact same
+  // {isText:true, tabLabel:'Summary'} shape, so this one function covers
+  // both - and a "*** NO SQL ***" conversational reply (see
+  // renderNoSqlResponse() - the model's own direct answer instead of a
+  // query, in either mode). Gated the same way reportButtonHtml() is -
   // nothing rendered at all when the server has no SMTP config for
   // /api/report-issue, since that's what actually delivers this feedback.
   //
@@ -5023,8 +5065,19 @@ document.addEventListener('DOMContentLoaded', async () => {
       // routing message + Phase C answer) and single-connection mode (see
       // prependSingleModeSummaryTab()) - both build the exact same
       // {isText:true, tabLabel:'Summary', ...} shape, so one check here
-      // covers both.
-      if (result.tabLabel === 'Summary') {
+      // covers both. Gated on `!result.summaryPending`: "all databases"
+      // mode's Summary tab appears immediately with just triage's routing
+      // message, well before Phase C's real answer has actually rendered
+      // underneath it (see renderAllModeCombinedResults'/
+      // startAllModeStreaming's own `summaryPending` comments and
+      // appendPhaseCSummaryToSummaryTab/settleSummaryTabPending, which
+      // clear it once Phase C has settled one way or another) - asking
+      // "was this summary helpful" before there's even a Results Summary
+      // to react to would be premature. Single-connection mode's own
+      // Summary tab (prependSingleModeSummaryTab) is only ever created
+      // already fully formed, so it never sets this flag at all -
+      // `undefined` is falsy, so it's unaffected by this gate.
+      if (result.tabLabel === 'Summary' && !result.summaryPending) {
         td.insertAdjacentHTML('beforeend', summaryFeedbackButtonsHtml());
       }
 
@@ -5475,6 +5528,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         : renderMarkdownLite(cleanText);
 
       td.appendChild(p);
+      // Same thumbs-up/down feedback prompt the Summary tab shows once
+      // Phase C's real answer has rendered (see summaryFeedbackButtonsHtml()'s
+      // own docstring) - a "*** NO SQL ***" reply IS the model's complete,
+      // final answer the moment it renders (no later step patches it in
+      // the way Phase C does), so unlike the Summary tab there's no
+      // `summaryPending`-style gating needed here at all.
+      td.insertAdjacentHTML('beforeend', summaryFeedbackButtonsHtml());
       td.insertAdjacentHTML('beforeend', reportButtonHtml('wrong_result'));
       tr.appendChild(td);
       resultsBody.appendChild(tr);
@@ -5509,13 +5569,21 @@ document.addEventListener('DOMContentLoaded', async () => {
   // failures (`notes.generationFailures` - reuses that exact same error-
   // tab shape, just a second source feeding the same list) into one
   // `currentResultsList`.
-  function renderAllModeCombinedResults({ notes, executeResults, executeFailures }) {
+  function renderAllModeCombinedResults({ notes, executeResults, executeFailures, summaryPending }) {
     const routingMessage = notes && notes.routingMessage;
     const databaseNotes = (notes && notes.databaseNotes) || [];
     const generationFailures = (notes && notes.generationFailures) || [];
 
+    // `summaryPending` is true only when THIS call's caller is about to
+    // follow up with its own requestAllModeResultsSummary() call - i.e.
+    // the batched (non-streaming) flows, where this render happens BEFORE
+    // Phase C has run at all. It's left falsy (the default) for history
+    // restoration and for the "nothing to execute" case, both of which
+    // hand this function an already-final routingMessage/no-further-Phase-
+    // C-call-coming text - see summaryFeedbackButtonsHtml()'s own gating
+    // on `!result.summaryPending`.
     const summaryTab = routingMessage
-      ? [{ isText: true, tabLabel: 'Summary', text: SUMMARY_TAB_BLOCK_MARKER + routingMessage }]
+      ? [{ isText: true, tabLabel: 'Summary', text: SUMMARY_TAB_BLOCK_MARKER + routingMessage, summaryPending: !!summaryPending }]
       : [];
     const noteTabs = databaseNotes.map((n) => ({
       isText: true,
@@ -5616,6 +5684,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     summaryEntry.text = summaryEntry.text
       ? `${summaryEntry.text}\n\n${SUMMARY_TAB_BLOCK_MARKER}${summaryText}`
       : `${SUMMARY_TAB_BLOCK_MARKER}${summaryText}`;
+    // The Results Summary section has now actually rendered - see
+    // summaryFeedbackButtonsHtml()'s own gating on `!result.summaryPending`
+    // for why this must stay true (hiding the thumbs-up/down prompt) right
+    // up until this exact point, not from the moment the Summary tab first
+    // appeared with only triage's routing message.
+    summaryEntry.summaryPending = false;
     if (currentResultsList[activeResultIndex] === summaryEntry) {
       renderTableResult(summaryEntry);
     }
@@ -5638,6 +5712,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     summaryEntry.text = summaryEntry.text
       ? `${summaryEntry.text}\n\n${SUMMARY_TAB_BLOCK_MARKER}${errorText}`
       : `${SUMMARY_TAB_BLOCK_MARKER}${errorText}`;
+    // See appendPhaseCSummaryToSummaryTab's identical line just above -
+    // Phase C settled (with an apology instead of an answer, but settled
+    // all the same), so the feedback prompt can appear now.
+    summaryEntry.summaryPending = false;
     if (currentResultsList[activeResultIndex] === summaryEntry) {
       renderTableResult(summaryEntry);
     }
@@ -5698,6 +5776,27 @@ document.addEventListener('DOMContentLoaded', async () => {
   function getSummaryTabEntry() {
     if (!currentResultsList) return null;
     return currentResultsList.find((r) => r.isText && r.tabLabel === 'Summary') || null;
+  }
+
+  // Safety net for requestAllModeResultsSummary()'s own early-return cases
+  // (nothing worth summarizing - every database noted/failed - or the
+  // request itself errored/aborted) - none of those ever call
+  // appendPhaseCSummaryToSummaryTab/appendPhaseCErrorToSummaryTab, so
+  // without this the Summary tab's `summaryPending` flag would stay true
+  // forever even though triage's routing message IS this turn's final,
+  // unchanging Summary tab content at that point - permanently hiding the
+  // "Was this summary helpful?" prompt for a turn that will never get a
+  // real Phase C answer. Called after every requestAllModeResultsSummary()
+  // call site, right alongside where each already re-reads
+  // getSummaryTabEntry() to persist the (possibly unchanged) text into
+  // history. No-ops if Phase C already cleared the flag itself.
+  function settleSummaryTabPending() {
+    const summaryEntry = getSummaryTabEntry();
+    if (!summaryEntry || !summaryEntry.summaryPending) return;
+    summaryEntry.summaryPending = false;
+    if (currentResultsList[activeResultIndex] === summaryEntry) {
+      renderTableResult(summaryEntry);
+    }
   }
 
   // --- Single-connection mode's own post-execution results summarization ---
@@ -5891,8 +5990,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     // thing that ever touched this box for a "route" outcome) arrives.
     setSqlQuery('');
 
+    // Always pending here (unlike renderAllModeCombinedResults' own
+    // history-restoration/"nothing to execute" cases) - the live streaming
+    // path always eventually reaches maybeFinalize()'s own
+    // requestAllModeResultsSummary() call, and settleSummaryTabPending()
+    // there catches even the case where Phase C ends up with nothing to
+    // summarize - see that function's own docstring.
     const summaryTab = allModeStreamState.routingMessage
-      ? [{ isText: true, tabLabel: 'Summary', text: SUMMARY_TAB_BLOCK_MARKER + allModeStreamState.routingMessage }]
+      ? [{ isText: true, tabLabel: 'Summary', text: SUMMARY_TAB_BLOCK_MARKER + allModeStreamState.routingMessage, summaryPending: true }]
       : [];
     const placeholderTabs = connectionSelection.map((e) => ({
       isPending: true,
@@ -6302,6 +6407,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     showAllModeSummarizingStatus();
     await requestAllModeResultsSummary(notes, state.executeResults, state.executeFailures);
     hideAllModeStreamStatus();
+    settleSummaryTabPending();
     const summaryEntry = getSummaryTabEntry();
     if (summaryEntry) notes.routingMessage = summaryEntry.text;
 
@@ -6804,6 +6910,11 @@ document.addEventListener('DOMContentLoaded', async () => {
               notes: allModeNotes,
               executeResults: data.results,
               executeFailures: [],
+              // Phase C hasn't run yet at this point - see the awaited
+              // requestAllModeResultsSummary() call just below - so the
+              // feedback prompt must stay hidden until it (or
+              // settleSummaryTabPending()'s safety net) clears this.
+              summaryPending: true,
             });
             pendingAllModeNotes = null;
             // Phase C - see requestAllModeResultsSummary's docstring.
@@ -6821,6 +6932,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             showAllModeSummarizingStatus();
             await requestAllModeResultsSummary(allModeNotes, data.results, []);
             hideAllModeStreamStatus();
+            settleSummaryTabPending();
             const summaryEntry = getSummaryTabEntry();
             if (summaryEntry) allModeNotes.routingMessage = summaryEntry.text;
           } else {
@@ -6923,6 +7035,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             streamState.executeResults, streamState.executeFailures,
           );
           hideAllModeStreamStatus();
+          settleSummaryTabPending();
           allModeStreamState = null;
         // pendingAllModeNotes fallback (see its own declaration comment
         // above) - same "never persists history for a partial execute
@@ -6936,11 +7049,16 @@ document.addEventListener('DOMContentLoaded', async () => {
             notes: allModeNotes,
             executeResults: executeResults,
             executeFailures: executeFailures,
+            // See the identical comment on this same flag a few dozen
+            // lines above (the sibling non-partial-failure fallback
+            // branch) - Phase C hasn't run yet at this point.
+            summaryPending: true,
           });
           pendingAllModeNotes = null;
           showAllModeSummarizingStatus();
           await requestAllModeResultsSummary(allModeNotes, executeResults, executeFailures);
           hideAllModeStreamStatus();
+          settleSummaryTabPending();
         // Multi-database question-answering's own partial-failure shape
         // (see execute_routes.py's module docstring) - `failures` is a
         // LIST (one entry per connection that failed; the others keep

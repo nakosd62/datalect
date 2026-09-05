@@ -20,12 +20,23 @@ parameter is a filesystem path - not something a user pasting a connection
 string into a web form can supply directly unless they also happen to
 have filesystem access to wherever this app is actually running. See
 "ca_cert_pem" below for how that gap is closed.
+
+A descriptor's optional "schema" field, when present, scopes the connection
+to a non-public schema - the exact same mechanism backends/redshift.py's own
+"schema" field uses (Redshift IS Postgres, wire-protocol-wise): connect()
+runs `SET search_path TO <schema>, public` right after connecting, and
+get_schema() below is scoped via current_schema() rather than a hardcoded
+'public', so introspection follows wherever that SET actually pointed.
+Omitted (the overwhelming common case, and every preset that predates this
+field) behaves exactly as before - current_schema() then evaluates to
+'public', matching the old hardcoded literal.
 """
 
 import os
 from urllib.parse import urlparse, parse_qs
 
 import psycopg2
+from psycopg2 import sql
 import sqlparse
 
 from .base import (
@@ -60,6 +71,7 @@ class PostgresBackend(Backend):
         descriptor = descriptor or {}
         url = descriptor.get("url")
         ca_cert_pem = descriptor.get("ca_cert_pem")
+        schema = descriptor.get("schema") or None
 
         # connect_timeout bounds only TCP/handshake setup (libpq's own
         # definition of the parameter), never query execution afterwards -
@@ -84,7 +96,7 @@ class PostgresBackend(Backend):
             kwargs["sslrootcert"] = temp_ca_path
 
         try:
-            return psycopg2.connect(url, **kwargs)
+            connection = psycopg2.connect(url, **kwargs)
         finally:
             # Only needed for the handshake inside psycopg2.connect() above
             # - libpq doesn't keep the file open/re-read it for the life of
@@ -97,6 +109,31 @@ class PostgresBackend(Backend):
                     os.remove(temp_ca_path)
                 except OSError:
                     pass
+
+        if schema:
+            # Same optional "schema" descriptor field backends/redshift.py
+            # already supports (Redshift IS Postgres, so the identical
+            # trick applies): SET the session's search_path right after
+            # connecting, so every later query - both this connection's own
+            # execute() calls and get_schema()'s introspection below - sees
+            # `schema` as if it were the default, without the caller having
+            # to schema-qualify anything. "public" stays appended after it
+            # (not replaced) so objects that aren't in `schema` - e.g.
+            # built-in extensions many self-hosters install into public -
+            # still resolve. sql.Identifier does correct, driver-native
+            # quoting/escaping for an interpolated identifier - SET has no
+            # parameterized form, but this is still a safe, correct way to
+            # build one (mirrors backends/redshift.py's connect() exactly).
+            # Explicitly committed (this connection isn't necessarily in
+            # autocommit mode the way Redshift's is from connect() onward -
+            # see execute() below, which only turns autocommit on for its
+            # own DML/SELECT loop) so the SET survives regardless of
+            # whatever the caller does with the connection next.
+            with connection.cursor() as cursor:
+                cursor.execute(sql.SQL("SET search_path TO {}, public").format(sql.Identifier(schema)))
+            connection.commit()
+
+        return connection
 
     def close(self, connection):
         # hasattr-guarded like backends/mysql.py's, backends/bigquery.py's,
@@ -129,7 +166,15 @@ class PostgresBackend(Backend):
         Port defaults to Postgres's standard 5432 when the URL omits it
         (e.g. "postgresql://user@host/db") - same default psycopg2/libpq
         themselves fall back to - so an explicit ":5432" and an omitted
-        port are correctly treated as the same target, not two."""
+        port are correctly treated as the same target, not two.
+
+        The descriptor's optional "schema" field (see connect() above) is
+        appended too, but only when actually present - two presets that
+        share a host/port/dbname/user but point connect() at different
+        schemas must not collide on this cache the same way two different
+        servers mustn't, but every existing preset (from before "schema"
+        existed at all) has no such field, and this key must stay byte-
+        identical for those."""
         url = (descriptor or {}).get("url")
         if not url:
             return "unknown@unknown"
@@ -141,7 +186,11 @@ class PostgresBackend(Backend):
             dbname = parsed.path.lstrip('/')
             if '?' in dbname:
                 dbname = dbname.split('?')[0]
-            return f"{username}@{host}:{port}/{dbname or 'unknown'}"
+            key = f"{username}@{host}:{port}/{dbname or 'unknown'}"
+            schema = (descriptor or {}).get("schema") or ""
+            if schema:
+                key += f".{schema}"
+            return key
         except Exception:
             return "unknown@unknown"
 
@@ -174,7 +223,7 @@ class PostgresBackend(Backend):
                 FROM information_schema.columns c
                 JOIN information_schema.tables t
                   ON c.table_name = t.table_name AND c.table_schema = t.table_schema
-                WHERE c.table_schema = 'public'
+                WHERE c.table_schema = current_schema()
                   AND t.table_type = 'BASE TABLE'
                 ORDER BY c.table_name
                 LIMIT %s;
@@ -205,7 +254,7 @@ class PostgresBackend(Backend):
                     c.is_nullable,
                     c.column_default
                 FROM information_schema.columns c
-                WHERE c.table_schema = 'public'
+                WHERE c.table_schema = current_schema()
                   AND c.table_name = ANY(%s)
                 ORDER BY c.table_name, c.ordinal_position;
             """, (kept_names,))
@@ -259,7 +308,7 @@ class PostgresBackend(Backend):
                 LEFT JOIN information_schema.constraint_column_usage AS ccu
                   ON ccu.constraint_name = tc.constraint_name
                  AND ccu.table_schema = tc.table_schema
-                WHERE tc.table_schema = 'public'
+                WHERE tc.table_schema = current_schema()
                   AND tc.table_name = ANY(%s)
                 ORDER BY tc.table_name, tc.constraint_name;
             """, (kept_names,))
@@ -282,7 +331,7 @@ class PostgresBackend(Backend):
                     indexname,
                     indexdef
                 FROM pg_indexes
-                WHERE schemaname = 'public'
+                WHERE schemaname = current_schema()
                   AND tablename = ANY(%s)
                 ORDER BY tablename, indexname;
             """, (kept_names,))
@@ -306,7 +355,7 @@ class PostgresBackend(Backend):
                     table_name,
                     view_definition
                 FROM information_schema.views
-                WHERE table_schema = 'public';
+                WHERE table_schema = current_schema();
             """)
             views = cursor.fetchall()
             if views:
@@ -320,7 +369,7 @@ class PostgresBackend(Backend):
                     table_name,
                     privilege_type
                 FROM information_schema.role_table_grants
-                WHERE table_schema = 'public'
+                WHERE table_schema = current_schema()
                   AND table_name = ANY(%s)
                 ORDER BY table_name, grantee;
             """, (kept_names,))
@@ -337,7 +386,7 @@ class PostgresBackend(Backend):
                     event_manipulation,
                     action_statement
                 FROM information_schema.triggers
-                WHERE event_object_schema = 'public'
+                WHERE event_object_schema = current_schema()
                   AND event_object_table = ANY(%s);
             """, (kept_names,))
             triggers = cursor.fetchall()

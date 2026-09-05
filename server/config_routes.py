@@ -16,7 +16,11 @@ user's model choice survives page reloads and follows them the same way
 their DB connection does.
 
 Connections are represented as descriptors: {"type": "postgres", "url":
-"...", "ca_cert_pem": "..."} (MySQL is identical in shape, ca_cert_pem
+"...", "ca_cert_pem": "...", "schema": "..."} ("schema" optional - defaults
+to Postgres's own ordinary search_path/"public" behavior when omitted, same
+as the admin-preset side of this same feature in app_config.py - see
+backends/postgres.py's module docstring) (MySQL is identical in shape minus
+"schema", which MySQL has no separate concept of at all - ca_cert_pem
 included - {"type": "mysql", "url": "mysql://...", "ca_cert_pem": "..."} -
 see backends/mysql.py's module docstring), {"type":
 "bigquery", "url": None, "project_id": "...", "dataset": "...",
@@ -984,10 +988,22 @@ def _parse_incoming_connection(data, user_identity):
     # simple-URL dialect (predates multi-dialect support entirely - see
     # backends/__init__.py's get_backend() docstring for the equivalent
     # default at the dispatch layer).
+    #
+    # schema is optional, same treatment as Redshift/Oracle/MSSQL's own
+    # "schema" field above - left unset (not defaulted to the literal string
+    # "public" here) so backends/postgres.py's connect() only issues a "SET
+    # search_path" when the user actually asked for one; Postgres's own
+    # ordinary default search_path already resolves unqualified objects
+    # against "public" with no code-side default needed (see
+    # backends/postgres.py's module docstring and app_config.py's mirrored
+    # preset-side implementation of this same feature).
     db_config = {}
     ca_cert_pem = (data.get('ca_cert_pem') or '').strip()
     if ca_cert_pem:
         db_config["ca_cert_pem"] = ca_cert_pem
+    schema = (data.get('schema') or '').strip()
+    if schema:
+        db_config["schema"] = schema
     return 'postgres', data.get('database_url'), db_config, None
 
 
@@ -1319,6 +1335,16 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
             ca_cert_pem = (db.get('ca_cert_pem') or '').strip()
             if ca_cert_pem:
                 config["ca_cert_pem"] = ca_cert_pem
+            # schema is Postgres-only (MySQL has no separate schema concept
+            # of its own - see this module's docstring and the matching
+            # branch in _parse_incoming_connection above) - optional, left
+            # unset rather than defaulted to the literal string "public" so
+            # backends/postgres.py only issues a "SET search_path" when the
+            # user actually asked for one.
+            if resolved_type == "postgres":
+                schema = (db.get('schema') or '').strip()
+                if schema:
+                    config["schema"] = schema
             merged.append({
                 "connection_key": compute_connection_key(name, url, None),
                 "name": name,

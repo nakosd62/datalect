@@ -140,6 +140,52 @@ def test_connect_with_no_descriptor_url_still_works(monkeypatch):
     assert "sslrootcert" not in kwargs
 
 
+# --- connect(): optional "schema" field --------------------------------------
+# Mirrors backends/redshift.py's own "schema" descriptor field/test coverage -
+# see backends/postgres.py's connect() for the SET search_path mechanism.
+
+def test_connect_with_no_schema_runs_no_search_path_statement(monkeypatch):
+    """Regression guard: a descriptor with no "schema" at all (every preset
+    from before this feature existed, and the overwhelming common case)
+    must not touch connection.cursor()/commit() at all - byte-identical to
+    the old behavior."""
+    harness = install_fake_postgres_connect(monkeypatch)
+    backend = PostgresBackend()
+    backend.connect({"type": "postgres", "url": "postgresql://alice:secret@host:5432/mydb"})
+    connection = harness.connections[0]
+    assert connection.search_path_calls == []
+    assert connection.committed is False
+
+
+def test_connect_with_schema_sets_search_path_and_commits(monkeypatch):
+    harness = install_fake_postgres_connect(monkeypatch)
+    backend = PostgresBackend()
+    backend.connect({
+        "type": "postgres",
+        "url": "postgresql://alice:secret@host:5432/mydb",
+        "schema": "golf",
+    })
+    connection = harness.connections[0]
+    assert connection.search_path_calls == ['SET search_path TO "golf", public']
+    assert connection.committed is True
+
+
+def test_connect_with_blank_schema_runs_no_search_path_statement(monkeypatch):
+    """An explicit but empty "schema" (e.g. "" from a stripped, all-blank
+    admin-preset field) must behave the same as no "schema" key at all -
+    not attempt `SET search_path TO "", public`."""
+    harness = install_fake_postgres_connect(monkeypatch)
+    backend = PostgresBackend()
+    backend.connect({
+        "type": "postgres",
+        "url": "postgresql://alice:secret@host:5432/mydb",
+        "schema": "",
+    })
+    connection = harness.connections[0]
+    assert connection.search_path_calls == []
+    assert connection.committed is False
+
+
 def test_get_schema_returns_none_when_no_tables():
     conn, cursor = make_fake_pg_connection([([], None, -1)])
     backend = PostgresBackend()
@@ -242,6 +288,32 @@ def test_get_schema_scan_query_uses_configured_scan_cap():
     assert first_params[0] > 0  # SCHEMA_MAX_TABLE_NAMES_SCANNED
 
 
+def test_get_schema_every_query_is_scoped_via_current_schema_not_hardcoded_public():
+    """Regression guard for the "schema" descriptor feature (see
+    backends/postgres.py's connect()): every one of get_schema()'s seven
+    queries must follow current_schema() - which reflects wherever
+    connect()'s own `SET search_path` pointed, or plain 'public' when no
+    override was ever set - rather than a literal 'public' that could never
+    see a non-public schema regardless of what connect() did. A single
+    query still hardcoding 'public' would silently keep introspecting the
+    default schema even once search_path had been overridden."""
+    conn, cursor = make_fake_pg_connection(_schema_responses(
+        table_names=["orders"],
+        columns_rows=[("orders", "id", "integer", "NO", None)],
+        constraints=[("orders", "orders_pkey", "PRIMARY KEY", "id", None, None)],
+        indexes=[("orders", "orders_pkey", "CREATE UNIQUE INDEX orders_pkey ON orders(id)")],
+        views=[("v", "SELECT 1")],
+        grants=[("app_user", "orders", "SELECT")],
+        triggers=[("orders", "trg", "INSERT", "EXECUTE FUNCTION f()")],
+    ))
+    backend = PostgresBackend()
+    backend.get_schema(conn)
+    assert len(cursor.calls) == 7
+    for sql_text, _params in cursor.calls:
+        assert "current_schema()" in sql_text
+        assert "'public'" not in sql_text
+
+
 # --- cache_key ---------------------------------------------------------------
 
 def test_cache_key_parses_username_host_port_and_dbname():
@@ -303,6 +375,30 @@ def test_cache_key_handles_unparseable_url():
     # the except-Exception fallback path defensively.
     key = backend.cache_key({"url": None})
     assert key == "unknown@unknown"
+
+
+def test_cache_key_appends_schema_when_present():
+    # Two presets on the exact same host/port/dbname/user but pointed at
+    # different schemas must not collide on schema_cache.py - the same
+    # failure mode test_cache_key_differs_across_hosts_with_same_user_and_dbname
+    # covers for host, applied to the new "schema" descriptor field.
+    backend = PostgresBackend()
+    key_golf = backend.cache_key({"url": "postgresql://alice:secret@host:5432/mydb", "schema": "golf"})
+    key_public = backend.cache_key({"url": "postgresql://alice:secret@host:5432/mydb", "schema": "public"})
+    key_none = backend.cache_key({"url": "postgresql://alice:secret@host:5432/mydb"})
+    assert key_golf == "alice@host:5432/mydb.golf"
+    assert key_public == "alice@host:5432/mydb.public"
+    assert key_none == "alice@host:5432/mydb"
+    assert len({key_golf, key_public, key_none}) == 3
+
+
+def test_cache_key_with_no_schema_is_byte_identical_to_before_this_feature():
+    """Regression guard: every preset that predates the "schema" field must
+    keep producing the exact same key it always did - no ".public" or any
+    other suffix silently appended just because the field now exists."""
+    backend = PostgresBackend()
+    key = backend.cache_key({"url": "postgresql://alice:secret@host:5432/mydb"})
+    assert key == "alice@host:5432/mydb"
 
 
 # --- identity_label ------------------------------------------------------------

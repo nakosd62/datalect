@@ -178,7 +178,8 @@ DEFAULT_CONN = "postgresql://postgres:password@host:23456/defaultdb?sslmode=veri
 # ends up in CONFIGURED_DBS at all, rather than loading anyway and quietly
 # activating the WRONG connection whenever its (collided) radio is clicked.
 # The rest of each object's shape is dialect-specific:
-#   Postgres:  {"type": "postgres", "name": "...", "url": "postgresql://..."}
+#   Postgres:  {"type": "postgres", "name": "...", "url": "postgresql://...",
+#               "schema": "..."} ("schema" optional - see below)
 #   MySQL:     {"type": "mysql", "name": "...", "url": "mysql://..."}
 #   BigQuery:  {"type": "bigquery", "name": "...", "project_id": "...", "dataset": "..."}
 #   Snowflake: {"type": "snowflake", "name": "...", "account": "...", "user": "...",
@@ -332,6 +333,18 @@ DEFAULT_CONN = "postgresql://postgres:password@host:23456/defaultdb?sslmode=veri
 # "DPY-4011: the database or network closed the connection" rather than a
 # normal auth error).
 #
+# Postgres presets' optional "schema" field is the one exception to "the
+# rest of each object's shape is dialect-specific" above - it isn't packed
+# into the "url" connection string at all, but a separate field alongside
+# it. It works exactly like Redshift's own "schema" (Redshift IS Postgres,
+# wire-protocol-wise - see backends/redshift.py's module docstring): omitted
+# (every preset that predates this field, and the overwhelming common case)
+# behaves exactly as before - the connecting user's own default search_path,
+# ordinarily "public". Given, connect() runs `SET search_path TO <schema>,
+# public` right after connecting - see backends/postgres.py's module
+# docstring for why get_schema()'s introspection queries are scoped via
+# current_schema() rather than a hardcoded 'public' to make them follow it.
+#
 # Redshift presets are the same "no ambient identity" story as Databricks'/
 # Oracle's - a Redshift preset MUST carry its own explicit "password" right
 # here in the file (this first pass is plain username/password only, over
@@ -473,7 +486,16 @@ if raw_db_presets.strip():
             if not url:
                 logger.warning("Skipping Postgres preset '%s': missing 'url'.", name)
                 continue
-            CONFIGURED_DBS.append({"id": preset_id, "name": name, "type": "postgres", "url": url})
+            preset = {"id": preset_id, "name": name, "type": "postgres", "url": url}
+            # Optional, mirrors Redshift's/Oracle's/Snowflake's/Databricks'/
+            # SQL Server's own "schema" field - see backends/postgres.py's
+            # module docstring for the SET search_path mechanism this
+            # drives. Omitted the same way every other dialect's own
+            # optional "schema" is omitted here when blank.
+            schema = (entry.get("schema") or "").strip()
+            if schema:
+                preset["schema"] = schema
+            CONFIGURED_DBS.append(preset)
 
         elif db_type == "mysql":
             # Same shape as a Postgres preset - a single connection-string

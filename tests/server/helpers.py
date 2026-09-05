@@ -684,6 +684,66 @@ def make_fake_pg_connection(responses):
 # positional DSN string plus keyword args (see backends/postgres.py's
 # connect()) - so this fake records both instead of just a kwargs dict.
 
+def _render_composed_for_test(statement):
+    """Renders a psycopg2.sql.Composed/SQL/Identifier tree back to plain
+    text using only its public accessors (SQL.string, Identifier.strings) -
+    real psycopg2 quoting (Composed.as_string()) needs a live connection or
+    cursor to call PQescapeIdentifier against, which this fake has no real
+    one of. Good enough for a test to assert what identifier got SET;
+    quotes each Identifier part in double quotes the same way Postgres
+    itself would, which is all these tests need to check."""
+    if hasattr(statement, "seq"):  # Composed
+        return "".join(_render_composed_for_test(part) for part in statement.seq)
+    if hasattr(statement, "strings"):  # Identifier
+        return ".".join(f'"{s}"' for s in statement.strings)
+    if hasattr(statement, "string"):  # SQL
+        return statement.string
+    return statement  # a bare str, passed through as-is
+
+
+class _FakePostgresConnectCursor:
+    """Just enough of a cursor for backends/postgres.py's connect() own
+    optional "schema" handling (SET search_path) to run against - the
+    get_schema()/execute() query sequences are exercised separately via
+    make_fake_pg_connection()/FakePgCursor above, driven directly rather
+    than through connect(). Records every execute() call's rendered SQL
+    text (see _render_composed_for_test) so a test can assert exactly what
+    got SET."""
+
+    def __init__(self, calls):
+        self._calls = calls
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def execute(self, statement, params=None):
+        self._calls.append(_render_composed_for_test(statement))
+
+
+class FakePostgresConnection:
+    """Returned by FakePostgresConnectHarness.connect() in place of a bare
+    object() - needed once backends/postgres.py's connect() started
+    conditionally running a cursor().execute()/.commit() sequence for its
+    optional "schema" field (see that module's connect()). Every existing
+    test that never passes a "schema" descriptor key still never touches
+    .cursor()/.commit() at all (that whole block is gated behind `if
+    schema:`), so this is a strict superset of the old bare object() -
+    nothing about it can break a pre-existing test."""
+
+    def __init__(self):
+        self.search_path_calls = []
+        self.committed = False
+
+    def cursor(self):
+        return _FakePostgresConnectCursor(self.search_path_calls)
+
+    def commit(self):
+        self.committed = True
+
+
 class FakePostgresConnectHarness:
     def __init__(self):
         self.calls = []  # list of (dsn, kwargs) tuples, one per connect() call
@@ -695,6 +755,11 @@ class FakePostgresConnectHarness:
         # connect() call, in the same order as self.calls; None when that
         # call's kwargs had no "sslrootcert" at all.
         self.sslrootcert_contents = []
+        # The FakePostgresConnection returned by each connect() call, same
+        # order as self.calls - lets a test inspect what connect()'s own
+        # optional "schema" handling did (search_path_calls/committed)
+        # after the fact.
+        self.connections = []
 
     def connect(self, dsn, **kwargs):
         self.calls.append((dsn, kwargs))
@@ -704,7 +769,9 @@ class FakePostgresConnectHarness:
                 self.sslrootcert_contents.append(f.read())
         else:
             self.sslrootcert_contents.append(None)
-        return object()  # backend.connect() just returns this straight through
+        connection = FakePostgresConnection()
+        self.connections.append(connection)
+        return connection
 
 
 def install_fake_postgres_connect(monkeypatch):

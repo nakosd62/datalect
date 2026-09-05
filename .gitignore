@@ -17,6 +17,7 @@ presets_CR.json
 grand-cosmos-716-*.json
 cloudsql-ca.pem
 atlas-credentials.env
+.ipynb_checkpoints/
 
 # Leftovers
 _to_delete/
@@ -42,3 +43,6 @@ tests/e2e/.auth/
 
 # macOS system files
 .DS_Store
+
+# Golf download foles
+Golf-Scores-main/

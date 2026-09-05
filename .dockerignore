@@ -21,6 +21,7 @@ atlas-credentials.env
 
 # Leftovers
 _to_delete/
+Golf-Scores-main/
 
 # Ignore local state
 state/
