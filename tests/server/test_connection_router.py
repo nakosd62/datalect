@@ -30,6 +30,26 @@ from helpers import (
 )
 
 
+def _drain(gen):
+    """triage_all_mode_question/summarize_all_mode_results/summarize_
+    single_connection_results are now generators (see their own
+    docstrings) that yield live 'retrying' NDJSON progress lines whenever
+    their internal retry loop actually fires, and `return` their real
+    result via StopIteration.value - same idiom translate_routes.py's own
+    _drain_generation uses for generate_sql_for_connection. The direct
+    unit tests in this file call these functions on their own, outside
+    any NDJSON stream to forward progress lines into, so they drain the
+    generator here and only look at the final result - a bare `next()`
+    would just return the first progress line's JSON *string* (or raise
+    StopIteration immediately if there were none), not the dict/tuple
+    these tests actually want."""
+    try:
+        while True:
+            next(gen)
+    except StopIteration as stop:
+        return stop.value
+
+
 class GenaiHarness:
     """Local copy of test_translate_routes.py's GenaiHarness (same shape) -
     duplicated here rather than imported across test modules so this file
@@ -287,9 +307,9 @@ def test_triage_all_mode_question_route_outcome_includes_per_connection_database
     ])
     candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": ["x"]},
                   {"name": "B", "dialect": "MySQL", "table_names": ["y"]}]
-    result = triage_all_mode_question(
+    result = _drain(triage_all_mode_question(
         candidates, "give me data from 2 tables each from a different database", provider, client=None, model="m",
-    )
+    ))
     assert result["outcome"] == "route"
     assert result["indices"] == [0, 1]
     assert result["database_prompts"] == {
@@ -307,7 +327,7 @@ def test_triage_all_mode_question_route_outcome_defaults_to_empty_dict_when_mode
     # back to the original question for every selected connection.
     provider = _FakeProvider(['{"action": "route", "indices": [0], "message": "Checking A."}'])
     candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": ["x"]}]
-    result = triage_all_mode_question(candidates, "q", provider, client=None, model="m")
+    result = _drain(triage_all_mode_question(candidates, "q", provider, client=None, model="m"))
     assert result["outcome"] == "route"
     assert result["database_prompts"] == {}
     assert len(provider.calls) == 1  # no wasted retry
@@ -329,7 +349,7 @@ def test_triage_all_mode_question_route_outcome_drops_database_prompts_entries_f
     candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": []},
                   {"name": "B", "dialect": "MySQL", "table_names": []},
                   {"name": "C", "dialect": "MySQL", "table_names": []}]
-    result = triage_all_mode_question(candidates, "q", provider, client=None, model="m")
+    result = _drain(triage_all_mode_question(candidates, "q", provider, client=None, model="m"))
     assert result["indices"] == [0, 1]
     assert result["database_prompts"] == {0: "Rewritten for A.", 1: "Rewritten for B."}
 
@@ -350,7 +370,7 @@ def test_triage_all_mode_question_route_outcome_tolerates_malformed_database_pro
     candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": []},
                   {"name": "B", "dialect": "MySQL", "table_names": []},
                   {"name": "C", "dialect": "MySQL", "table_names": []}]
-    result = triage_all_mode_question(candidates, "q", provider, client=None, model="m")
+    result = _drain(triage_all_mode_question(candidates, "q", provider, client=None, model="m"))
     assert result["indices"] == [0, 1, 2]
     assert result["database_prompts"] == {0: "Valid rewrite for A."}
 
@@ -388,7 +408,7 @@ def test_triage_retries_a_retryable_error_and_succeeds_on_a_rotated_key():
         classify_error=lambda exc: {"rotate_key": True, "delay": 0},
     )
     candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": []}]
-    result = triage_all_mode_question(candidates, "q", provider, client="initial-client", model="m")
+    result = _drain(triage_all_mode_question(candidates, "q", provider, client="initial-client", model="m"))
 
     assert result["outcome"] == "answer"
     assert result["answer"] == "42"
@@ -397,6 +417,79 @@ def test_triage_retries_a_retryable_error_and_succeeds_on_a_rotated_key():
     # second attempt.
     assert provider.made_clients == ["key-b"]
     assert provider.calls[1]["client"] == "client-for-key-b"
+
+
+def test_triage_yields_a_retrying_line_for_key_rotation_before_the_final_result():
+    """Direct, unit-level companion to the end-to-end route test
+    test_all_mode_triage_recovers_by_rotating_to_a_second_configured_
+    gemini_key above - asserts the exact yielded NDJSON line's shape
+    without a real Gemini harness in the way. Regression guard for the
+    gap this whole feature closes: triage_all_mode_question's retry/
+    rotation POLICY already existed, but nothing about it was ever
+    surfaced to a caller - calling this directly used to just silently
+    pause (for the transient case) or immediately retry (for rotation)
+    with zero observable signal that anything had happened at all."""
+    from connection_router import triage_all_mode_question
+
+    provider = _FakeProvider(
+        [RuntimeError("rate limited"), '{"action": "answer", "answer": "42"}'],
+        key_pool=["key-a", "key-b"],
+        classify_error=lambda exc: {"rotate_key": True, "delay": 0},
+    )
+    candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": []}]
+    gen = triage_all_mode_question(candidates, "q", provider, client="initial-client", model="m")
+
+    # The generator yields the progress line BEFORE producing (or even
+    # attempting) the retried call's result - next() advances it exactly
+    # that far.
+    progress_line = next(gen)
+    event = json.loads(progress_line)
+    assert event == {
+        "status": "retrying", "attempt": 2, "maxAttempts": 2,
+        "delaySeconds": 0, "rotatedKey": True,
+    }
+
+    # _drain resumes the SAME generator (it doesn't restart it) and runs
+    # it to completion, capturing the final result via StopIteration.value.
+    result = _drain(gen)
+    assert result["outcome"] == "answer"
+    assert result["answer"] == "42"
+
+
+def test_triage_yields_a_retrying_line_for_a_transient_error_before_waiting(monkeypatch):
+    """Same idea as the key-rotation test just above, for the OTHER retry
+    branch (a same-key, wait-then-retry transient error) - both branches
+    have their own separate `yield` in triage_all_mode_question, so both
+    need their own regression guard."""
+    import connection_router as connection_router_module
+    from connection_router import triage_all_mode_question
+
+    sleep_calls = []
+    monkeypatch.setattr(connection_router_module.time, "sleep", lambda secs: sleep_calls.append(secs))
+
+    provider = _FakeProvider(
+        [RuntimeError("temporarily unavailable"), '{"action": "answer", "answer": "42"}'],
+        classify_error=lambda exc: {"rotate_key": False, "delay": 2.5},
+    )
+    candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": []}]
+    gen = triage_all_mode_question(candidates, "q", provider, client=None, model="m")
+
+    # Yielded BEFORE time.sleep() is called - see the "Told to the client
+    # before sleeping, not after" comment on this exact line in
+    # connection_router.py.
+    progress_line = next(gen)
+    event = json.loads(progress_line)
+    assert event["status"] == "retrying"
+    assert event["rotatedKey"] is False
+    assert event["delaySeconds"] == 2.5
+    assert event["attempt"] == 2
+    assert event["maxAttempts"] == connection_router_module.MAX_TRANSLATION_ATTEMPTS
+    assert sleep_calls == []  # not yet - only after the yield resumes
+
+    result = _drain(gen)
+    assert result["outcome"] == "answer"
+    assert result["answer"] == "42"
+    assert sleep_calls == [2.5]
 
 
 def test_triage_reports_api_error_when_key_rotation_budget_is_exhausted():
@@ -412,7 +505,7 @@ def test_triage_reports_api_error_when_key_rotation_budget_is_exhausted():
         classify_error=lambda exc: {"rotate_key": True, "delay": 0},
     )
     candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": []}]
-    result = triage_all_mode_question(candidates, "q", provider, client=None, model="m")
+    result = _drain(triage_all_mode_question(candidates, "q", provider, client=None, model="m"))
 
     assert result["outcome"] == "failed"
     assert result["api_error"] is True
@@ -440,9 +533,9 @@ def test_triage_using_byok_forces_key_rotation_budget_to_one_even_with_multiple_
         classify_error=lambda exc: {"rotate_key": True, "delay": 0},
     )
     candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": []}]
-    result = triage_all_mode_question(
+    result = _drain(triage_all_mode_question(
         candidates, "q", provider, client=None, model="m", using_byok=True,
-    )
+    ))
 
     assert result["outcome"] == "failed"
     assert result["api_error"] is True
@@ -461,7 +554,7 @@ def test_triage_reports_api_error_for_a_non_retryable_exception():
     # question."
     provider = _FakeProvider([RuntimeError("bad request")])
     candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": []}]
-    result = triage_all_mode_question(candidates, "q", provider, client=None, model="m")
+    result = _drain(triage_all_mode_question(candidates, "q", provider, client=None, model="m"))
 
     assert result["outcome"] == "failed"
     assert result["api_error"] is True
@@ -479,7 +572,7 @@ def test_triage_unparseable_response_is_not_reported_as_api_error():
     # so the caller shows _TRIAGE_FAILURE_TEXT, not _TRIAGE_API_ERROR_TEXT.
     provider = _FakeProvider(["not json", "still not json"])
     candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": []}]
-    result = triage_all_mode_question(candidates, "q", provider, client=None, model="m")
+    result = _drain(triage_all_mode_question(candidates, "q", provider, client=None, model="m"))
 
     assert result["outcome"] == "failed"
     assert result["api_error"] is False
@@ -646,6 +739,73 @@ def test_all_mode_triage_call_receives_conversation_history_so_a_followup_can_re
 
     assert data2['router_route'] is True
     assert "-- database: preset:pg-b (Marketing Postgres)\nSELECT COUNT(*) FROM campaigns;" in data2['sql']
+
+
+def test_all_mode_triage_candidate_summaries_precede_history_and_are_not_glued_to_the_new_prompt(
+    app_factory, tmp_path, monkeypatch,
+):
+    """Caching-efficiency fix (the design's own LLM-1 input ordering:
+    "<summary database schema of all databases> : <history vector> :
+    <new user prompt>"): the candidate-summaries block (names/dialects/
+    table names - see build_router_candidate_summaries) is now passed to
+    provider.build_llm_input() as its OWN schema_block, so it lands ahead
+    of the history vector (prepended to the first historical message),
+    the same place single-connection mode's real schema already goes -
+    see test_openai_schema_precedes_history_and_is_not_glued_to_the_new_
+    prompt in test_translate_routes.py for that mirrored regression guard.
+    Previously this text was concatenated directly onto the ever-changing
+    new-prompt string instead - functionally the model saw the same
+    information either way, but a block that's stable across an entire
+    session ended up re-sent every turn as part of the one thing that
+    changes every turn, defeating prompt caching for it specifically."""
+    env = _two_preset_env(app_factory, tmp_path)
+    login_as(env.client, "alice@example.com")
+    _set_all_mode(env.client)
+
+    import db as db_module
+    monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
+        "postgresql://u:p@host-a:5432/a": "Table: deals\nid INTEGER\n",
+        "postgresql://u:p@host-b:5432/b": "Table: campaigns\nid INTEGER\n",
+    }))
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+
+    # Turn 1: establishes some history to check ordering against.
+    harness.queue_response(_gemini_ok(
+        '{"action": "answer", "answer": "Marketing Postgres has campaign-related data."}'
+    ))
+    resp1 = env.client.post('/api/translate', json={'prompt': 'which database has campaign data'})
+    _, data1 = parse_translate_stream(resp1)
+
+    # Turn 2: the real assertion. The candidate-summaries block must be
+    # PREPENDED to the first historical content, not appended to the new
+    # prompt's own content.
+    harness.queue_response(_gemini_ok(
+        '{"action": "route", "indices": [1], "message": "Checking Marketing Postgres."}'
+    ))
+    harness.register_marker("campaigns", _gemini_ok("SELECT COUNT(*) FROM campaigns;"))
+    resp2 = env.client.post('/api/translate', json={
+        'prompt': 'how large is this database',
+        'history': [
+            {'role': 'user', 'text': 'which database has campaign data'},
+            {'role': 'model', 'text': data1['sql']},
+        ],
+    })
+    parse_translate_stream(resp2)
+
+    triage_contents = harness.generate_calls[1]["contents"]
+    first_text = triage_contents[0].parts[0].text
+    last_text = triage_contents[-1].parts[0].text
+    assert first_text.startswith("Candidate database connections:")
+    assert "deals" in first_text and "campaigns" in first_text
+    # The first historical turn's OWN text still follows the schema block
+    # on that same content, same as single-connection mode's pattern.
+    assert "which database has campaign data" in first_text
+    # And the new prompt's own content carries none of it - just the
+    # question itself.
+    assert "Candidate database connections:" not in last_text
+    assert "how large is this database" in last_text
 
 
 def test_all_mode_route_outcome_runs_phase_b_in_parallel_for_both_selected_connections(app_factory, tmp_path, monkeypatch):
@@ -1065,7 +1225,18 @@ def test_all_mode_triage_recovers_by_rotating_to_a_second_configured_gemini_key(
     """The other half of the fix: with a SECOND configured key actually
     available, a 429 on the first must not be given up on at all - it
     rotates and the turn succeeds normally, exactly as every other LLM
-    call in this app already does for a per-key capacity error."""
+    call in this app already does for a per-key capacity error.
+
+    Also the regression guard for triage_all_mode_question's own
+    'retrying' progress line (see its docstring): this used to be
+    genuinely invisible to the client - the retry/rotation POLICY existed,
+    but nothing about it was ever streamed, so a real capacity error mid-
+    triage looked identical to a plain hang until either the rotated
+    key's attempt landed or the whole call gave up. Asserted here rather
+    than in a new, separate test because this is already the exact
+    real end-to-end scenario (triage genuinely retries and recovers) -
+    same reasoning as test_429_rotates_key_and_retries_immediately_with_
+    no_delay's identical assertion for the single-connection path."""
     env = _two_preset_env(app_factory, tmp_path, extra_env={
         "GEMINI_PRESET_KEYS": "fake-key-1,fake-key-2",
     })
@@ -1078,11 +1249,20 @@ def test_all_mode_triage_recovers_by_rotating_to_a_second_configured_gemini_key(
     harness.queue_response(_gemini_ok('{"action": "answer", "answer": "There are 2 databases configured."}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'how many databases do I have'})
-    _, data = parse_translate_stream(resp)
+    retry_events, data = parse_translate_stream(resp)
     assert data['success'] is True
     assert len(harness.generate_calls) == 2
     assert harness.client_api_keys[0] != harness.client_api_keys[1]
     assert data['sql'] == '*** NO SQL *** There are 2 databases configured.'
+
+    # The live 'retrying' line - streamed BEFORE stream_translation() even
+    # reaches Phase B/Phase C, since triage is the very first LLM call in
+    # "all databases" mode.
+    assert len(retry_events) == 1
+    assert retry_events[0]["attempt"] == 2
+    assert retry_events[0]["maxAttempts"] == 2
+    assert retry_events[0]["rotatedKey"] is True
+    assert retry_events[0]["delaySeconds"] == 0
 
 
 def test_all_mode_phase_b_generation_recovers_by_rotating_to_a_second_configured_gemini_key(
@@ -1603,38 +1783,164 @@ def test_build_summary_prompt_formats_real_results_notes_and_errors_into_labeled
     prompt_text = env.translate_routes._build_summary_prompt(
         "how is everything performing",
         [
-            {"name": "Sales Postgres", "columns": ["total"], "rows": [{"total": 500}], "rowCount": 1},
+            {"name": "Sales Postgres", "sql": "SELECT total FROM deals;",
+             "columns": ["total"], "rows": [{"total": 500}], "rowCount": 1},
             {"name": "Marketing Postgres", "note": "No revenue data tracked here."},
             {"name": "Ops MySQL", "error": "connection refused"},
         ],
     )
     assert "Original question: how is everything performing" in prompt_text
-    assert "Sales Postgres - 1 row(s) total, showing 1:" in prompt_text
+    # Gap 4: the SQL that ran for each database is now its own section,
+    # ahead of the results - a note/error-with-no-sql entry contributes
+    # nothing to it (nothing was ever generated to run for them).
+    assert "SQL executed for each database:" in prompt_text
+    assert "Sales Postgres:\nSELECT total FROM deals;" in prompt_text
+    assert "Sales Postgres - 1 row(s):" in prompt_text
     assert "Columns: total" in prompt_text
     assert "Marketing Postgres: No revenue data tracked here." in prompt_text
     assert "Ops MySQL: query failed - connection refused" in prompt_text
 
 
-def test_build_summary_prompt_caps_rows_the_same_way_past_turn_history_does(app_factory, tmp_path):
+def test_build_summary_prompt_omits_the_sql_section_when_nothing_has_sql(app_factory, tmp_path):
+    # A turn where every database only noted/failed at generation (never
+    # even reached execution) has no SQL to show at all - the section
+    # itself should be omitted, not rendered empty.
     env = _two_preset_env(app_factory, tmp_path)
-    many_rows = [{"n": i} for i in range(env.translate_routes.HISTORY_RESULT_MAX_ROWS + 25)]
     prompt_text = env.translate_routes._build_summary_prompt(
-        "q", [{"name": "Sales Postgres", "columns": ["n"], "rows": many_rows, "rowCount": len(many_rows)}],
+        "q", [{"name": "Sales Postgres", "note": "Nothing relevant."}],
     )
-    max_rows = env.translate_routes.HISTORY_RESULT_MAX_ROWS
-    assert f"showing {max_rows}" in prompt_text
-    assert f"Total Rows: {len(many_rows)}" in prompt_text
-    # Exactly max_rows serialized row lines, not every row in `many_rows`.
-    assert prompt_text.count("{'n':") == max_rows
+    assert "SQL executed for each database:" not in prompt_text
+
+
+def test_build_summary_prompt_does_not_cap_rows_the_same_way_past_turn_history_does(app_factory, tmp_path):
+    # Regression guard for Gap 5 of "Turn History Handling in Datalect":
+    # Phase C used to cap at HISTORY_RESULT_MAX_ROWS, the same cap used
+    # when a PAST turn's results are replayed as chat history - but the
+    # design's own spec calls for "the complete results/errors from all
+    # tabs and databases" here, exactly like _build_single_summary_prompt's
+    # own equivalent behavior for single-connection mode. A row count that
+    # exceeds HISTORY_RESULT_MAX_ROWS but stays under SUMMARY_RESULTS_MAX_
+    # ROWS should still come through in full, unaffected by that unrelated,
+    # much stingier history-replay cap.
+    env = _two_preset_env(app_factory, tmp_path)
+    assert env.translate_routes.HISTORY_RESULT_MAX_ROWS < env.translate_routes.SUMMARY_RESULTS_MAX_ROWS
+    row_count = env.translate_routes.HISTORY_RESULT_MAX_ROWS + 25
+    many_rows = [{"n": i} for i in range(row_count)]
+    prompt_text = env.translate_routes._build_summary_prompt(
+        "q", [{"name": "Sales Postgres", "columns": ["n"], "rows": many_rows, "rowCount": row_count}],
+    )
+    assert f"Sales Postgres - {row_count} row(s):" in prompt_text
+    assert f"Total Rows: {row_count}" in prompt_text
+    # Every single row serialized, not just HISTORY_RESULT_MAX_ROWS of them.
+    assert prompt_text.count("{'n':") == row_count
+
+
+def test_build_summary_prompt_caps_rows_at_summary_results_max_rows(app_factory, tmp_path):
+    # New abuse/cost-protection guard: an adversarial (or just very wide)
+    # result set must still be capped somewhere, now at the dedicated
+    # SUMMARY_RESULTS_MAX_ROWS constant rather than being sent to the LLM
+    # in full no matter how large.
+    env = _two_preset_env(app_factory, tmp_path, extra_env={"SUMMARY_RESULTS_MAX_ROWS": "3"})
+    row_count = 10
+    many_rows = [{"n": i} for i in range(row_count)]
+    prompt_text = env.translate_routes._build_summary_prompt(
+        "q", [{"name": "Sales Postgres", "columns": ["n"], "rows": many_rows, "rowCount": row_count}],
+    )
+    # The real total row count is still reported honestly...
+    assert f"Sales Postgres - {row_count} row(s) total, showing the first 3:" in prompt_text
+    assert f"Total Rows: {row_count}" in prompt_text
+    # ...but only the capped number of rows is actually serialized.
+    assert prompt_text.count("{'n':") == 3
+
+
+class _SchemaCapturingFakeProvider(_FakeProvider):
+    """_FakeProvider variant that preserves schema_block instead of
+    discarding it (the shared _FakeProvider.build_llm_input returns just
+    new_prompt_content, which every OTHER Phase C test relies on staying
+    exactly that simple) - needed only for the Gap 4 tests below, which
+    check that a real schema_block (built by _build_all_mode_schema_block)
+    is what actually reaches the LLM call."""
+    def build_llm_input(self, history, schema_block, new_prompt_content):
+        return {"schema_block": schema_block, "prompt_content": new_prompt_content}
+
+
+def test_summarize_all_mode_results_includes_schema_for_each_in_scope_database(app_factory, tmp_path, monkeypatch):
+    # Gap 4 of "Turn History Handling in Datalect": previously
+    # summarize_all_mode_results always passed schema_block="" to the LLM
+    # call - Phase C had zero schema context at all. Now, given a real
+    # user_identity, it resolves and fetches each referenced database's
+    # schema (via _build_all_mode_schema_block) the same way Phase B
+    # already does for SQL generation.
+    env = _two_preset_env(app_factory, tmp_path)
+    import db as db_module
+    monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
+        "postgresql://u:p@host-a:5432/a": "Table: deals\nid INTEGER\n",
+        "postgresql://u:p@host-b:5432/b": "Table: campaigns\nid INTEGER\n",
+    }))
+    provider = _SchemaCapturingFakeProvider(["Sales is up 10%, Marketing had no data."])
+    text, usage, error = _drain(env.translate_routes.summarize_all_mode_results(
+        "how is everything performing",
+        [
+            {"kind": "preset", "id": "pg-a", "name": "Sales Postgres", "columns": [], "rows": []},
+            {"kind": "preset", "id": "pg-b", "name": "Marketing Postgres", "note": "Nothing relevant."},
+        ],
+        provider, client=None, model="m", user_identity="alice@example.com",
+    ))
+    assert text == "Sales is up 10%, Marketing had no data."
+    schema_block = provider.calls[0]["llm_input"]["schema_block"]
+    assert "Sales Postgres:\nTable: deals" in schema_block
+    assert "Marketing Postgres:\nTable: campaigns" in schema_block
+
+
+def test_summarize_all_mode_results_skips_a_reference_that_no_longer_resolves(app_factory, tmp_path, monkeypatch):
+    # A preset removed (or a custom connection deleted) in the moments
+    # between Phase B running and Phase C running -
+    # resolve_descriptor_by_reference returns None for it, so its schema
+    # is silently skipped rather than failing the whole summarization -
+    # same leniency resolve_in_scope_descriptors already applies
+    # elsewhere for exactly this situation.
+    env = _two_preset_env(app_factory, tmp_path)
+    import db as db_module
+    monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
+        "postgresql://u:p@host-a:5432/a": "Table: deals\nid INTEGER\n",
+    }))
+    provider = _SchemaCapturingFakeProvider(["Sales is up 10%."])
+    text, usage, error = _drain(env.translate_routes.summarize_all_mode_results(
+        "q",
+        [
+            {"kind": "preset", "id": "pg-a", "name": "Sales Postgres", "columns": [], "rows": []},
+            {"kind": "preset", "id": "pg-removed", "name": "Removed Preset", "error": "not found"},
+        ],
+        provider, client=None, model="m", user_identity="alice@example.com",
+    ))
+    assert text == "Sales is up 10%."
+    schema_block = provider.calls[0]["llm_input"]["schema_block"]
+    assert "Sales Postgres:\nTable: deals" in schema_block
+    assert "Removed Preset" not in schema_block
+
+
+def test_summarize_all_mode_results_with_no_user_identity_uses_empty_schema_block(app_factory, tmp_path):
+    # Backward-compatible default (every direct-call test throughout this
+    # section that predates Gap 4 relies on this): a caller with no real
+    # session to resolve against gets the exact schema-less prompt this
+    # call always sent before Gap 4, not an error.
+    env = _two_preset_env(app_factory, tmp_path)
+    provider = _SchemaCapturingFakeProvider(["Sales is up 10%."])
+    text, usage, error = _drain(env.translate_routes.summarize_all_mode_results(
+        "q", [{"kind": "preset", "id": "pg-a", "name": "Sales Postgres", "columns": [], "rows": []}],
+        provider, client=None, model="m",
+    ))
+    assert text == "Sales is up 10%."
+    assert provider.calls[0]["llm_input"]["schema_block"] == ""
 
 
 def test_summarize_all_mode_results_returns_stripped_text_and_usage_on_success(app_factory, tmp_path):
     env = _two_preset_env(app_factory, tmp_path)
     provider = _FakeProvider(["  Sales is up 10%, Marketing had no data.  "])
-    text, usage, error = env.translate_routes.summarize_all_mode_results(
+    text, usage, error = _drain(env.translate_routes.summarize_all_mode_results(
         "how is everything performing", [{"name": "Sales Postgres", "columns": [], "rows": []}],
         provider, client=None, model="m",
-    )
+    ))
     assert text == "Sales is up 10%, Marketing had no data."
     assert usage == {}
     assert error is None
@@ -1649,9 +1955,9 @@ def test_summarize_all_mode_results_gives_up_immediately_for_a_non_retryable_exc
     # already just proven it can't succeed right now.
     env = _two_preset_env(app_factory, tmp_path)
     provider = _FakeProvider([RuntimeError("boom"), RuntimeError("boom again")])
-    text, usage, error = env.translate_routes.summarize_all_mode_results(
+    text, usage, error = _drain(env.translate_routes.summarize_all_mode_results(
         "q", [{"name": "Sales Postgres", "columns": [], "rows": []}], provider, client=None, model="m",
-    )
+    ))
     assert (text, usage) == (None, None)
     # The raw exception the call actually failed with - not just a bool or
     # a generic string - so the caller (the /api/summarize-results route)
@@ -1684,10 +1990,10 @@ def test_summarize_all_mode_results_retries_a_retryable_error_and_succeeds_on_a_
         key_pool=["key-a", "key-b"],
         classify_error=lambda exc: {"rotate_key": True, "delay": 0},
     )
-    text, usage, error = env.translate_routes.summarize_all_mode_results(
+    text, usage, error = _drain(env.translate_routes.summarize_all_mode_results(
         "how is everything performing", [{"name": "Sales Postgres", "columns": [], "rows": []}],
         provider, client="initial-client", model="m",
-    )
+    ))
     assert text == "Result Summary\n\nSales is up 10%."
     assert error is None
     assert len(provider.calls) == 2
@@ -1695,6 +2001,64 @@ def test_summarize_all_mode_results_retries_a_retryable_error_and_succeeds_on_a_
     # second attempt, same as triage_all_mode_question's own retry does.
     assert provider.made_clients == ["key-b"]
     assert provider.calls[1]["client"] == "client-for-key-b"
+
+
+def test_summarize_all_mode_results_yields_a_retrying_line_for_key_rotation(app_factory, tmp_path):
+    """Direct, unit-level regression guard for the gap this feature
+    closes: _summarize_with_retry's retry/rotation POLICY (exercised by
+    the test just above) already existed, but nothing about it ever
+    reached a caller - Phase C's summarization call was the one LLM call
+    in the whole "all databases" pipeline whose own retry loop could take
+    several real seconds with zero observable signal, the "Summarizing
+    results…" banner just frozen in place. Same shape as triage_all_mode_
+    question's own identical test."""
+    env = _two_preset_env(app_factory, tmp_path)
+    provider = _FakeProvider(
+        [RuntimeError("rate limited"), "Result Summary\n\nSales is up 10%."],
+        key_pool=["key-a", "key-b"],
+        classify_error=lambda exc: {"rotate_key": True, "delay": 0},
+    )
+    gen = env.translate_routes.summarize_all_mode_results(
+        "how is everything performing", [{"name": "Sales Postgres", "columns": [], "rows": []}],
+        provider, client="initial-client", model="m",
+    )
+    event = json.loads(next(gen))
+    assert event == {
+        "status": "retrying", "attempt": 2, "maxAttempts": 2,
+        "delaySeconds": 0, "rotatedKey": True,
+    }
+    text, usage, error = _drain(gen)
+    assert text == "Result Summary\n\nSales is up 10%."
+    assert error is None
+
+
+def test_summarize_all_mode_results_yields_a_retrying_line_for_a_transient_error(
+    app_factory, tmp_path, monkeypatch,
+):
+    """Same idea, for the OTHER retry branch (same-key, wait-then-retry) -
+    both branches have their own separate `yield` in _summarize_with_
+    retry, so both need their own regression guard."""
+    env = _two_preset_env(app_factory, tmp_path)
+    sleep_calls = []
+    monkeypatch.setattr(env.translate_routes.time, "sleep", lambda secs: sleep_calls.append(secs))
+    provider = _FakeProvider(
+        [RuntimeError("temporarily unavailable"), "Result Summary\n\nSales is up 10%."],
+        classify_error=lambda exc: {"rotate_key": False, "delay": 2.5},
+    )
+    gen = env.translate_routes.summarize_all_mode_results(
+        "how is everything performing", [{"name": "Sales Postgres", "columns": [], "rows": []}],
+        provider, client=None, model="m",
+    )
+    event = json.loads(next(gen))
+    assert event["status"] == "retrying"
+    assert event["rotatedKey"] is False
+    assert event["delaySeconds"] == 2.5
+    assert event["maxAttempts"] == env.translate_routes.MAX_TRANSLATION_ATTEMPTS
+    assert sleep_calls == []  # not yet - only after the yield resumes
+
+    text, usage, error = _drain(gen)
+    assert text == "Result Summary\n\nSales is up 10%."
+    assert sleep_calls == [2.5]
 
 
 def test_summarize_all_mode_results_gives_up_immediately_when_key_rotation_budget_is_exhausted(
@@ -1709,9 +2073,9 @@ def test_summarize_all_mode_results_gives_up_immediately_when_key_rotation_budge
         key_pool=["only-key"],
         classify_error=lambda exc: {"rotate_key": True, "delay": 0},
     )
-    text, usage, error = env.translate_routes.summarize_all_mode_results(
+    text, usage, error = _drain(env.translate_routes.summarize_all_mode_results(
         "q", [{"name": "Sales Postgres", "columns": [], "rows": []}], provider, client=None, model="m",
-    )
+    ))
     assert (text, usage) == (None, None)
     assert isinstance(error, RuntimeError)
     assert str(error) == "resource exhausted"
@@ -1732,10 +2096,10 @@ def test_summarize_all_mode_results_using_byok_forces_key_rotation_budget_to_one
         key_pool=["key-a", "key-b"],
         classify_error=lambda exc: {"rotate_key": True, "delay": 0},
     )
-    text, usage, error = env.translate_routes.summarize_all_mode_results(
+    text, usage, error = _drain(env.translate_routes.summarize_all_mode_results(
         "q", [{"name": "Sales Postgres", "columns": [], "rows": []}], provider, client=None, model="m",
         using_byok=True,
-    )
+    ))
     assert (text, usage) == (None, None)
     assert isinstance(error, RuntimeError)
     assert len(provider.calls) == 1
@@ -1762,18 +2126,18 @@ def test_summarize_all_mode_results_retries_a_response_that_is_just_the_results_
         "result summary\n\n", "Résumé des résultats\n\n",
     ):
         provider = _FakeProvider([label, "Results Summary\n\nSales is up 10%."])
-        text, usage, error = env.translate_routes.summarize_all_mode_results(
+        text, usage, error = _drain(env.translate_routes.summarize_all_mode_results(
             "how is everything performing", [{"name": "Sales Postgres", "columns": [], "rows": []}],
             provider, client=None, model="m",
-        )
+        ))
         assert text == "Results Summary\n\nSales is up 10%."
         assert error is None
         assert len(provider.calls) == 2
 
     provider = _FakeProvider(["Results Summary\n\n", "Results Summary\n\n"])
-    text, usage, error = env.translate_routes.summarize_all_mode_results(
+    text, usage, error = _drain(env.translate_routes.summarize_all_mode_results(
         "q", [{"name": "Sales Postgres", "columns": [], "rows": []}], provider, client=None, model="m",
-    )
+    ))
     assert (text, usage) == (None, None)
     # Content-invalid both times, not an API failure - nothing went wrong
     # at the LLM-call level, so there's no exception to report (a plain
@@ -1790,6 +2154,15 @@ def test_summarize_results_endpoint_returns_no_sql_prefixed_summary_and_logs_an_
 ):
     env = _two_preset_env(app_factory, tmp_path)
     login_as(env.client, "alice@example.com")
+    # Phase C now resolves and fetches schema for each in-scope database
+    # (Gap 4) - monkeypatched here the same way Phase B's own per-
+    # connection schema fetch already is elsewhere in this file, so this
+    # never attempts a real connection to the presets' fake hosts.
+    import db as db_module
+    monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
+        "postgresql://u:p@host-a:5432/a": "Table: deals\nid INTEGER\n",
+        "postgresql://u:p@host-b:5432/b": "Table: campaigns\nid INTEGER\n",
+    }))
 
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
@@ -1799,12 +2172,17 @@ def test_summarize_results_endpoint_returns_no_sql_prefixed_summary_and_logs_an_
         'prompt': 'how is everything performing across the board',
         'database_results': [
             {"kind": "preset", "id": "pg-a", "name": "Sales Postgres",
+             "sql": "SELECT * FROM deals;",
              "columns": ["total"], "rows": [{"total": 500}], "rowCount": 1},
             {"kind": "preset", "id": "pg-b", "name": "Marketing Postgres", "note": "Nothing relevant."},
         ],
     })
     assert resp.status_code == 200
-    data = resp.get_json()
+    # /api/summarize-results now streams NDJSON (a live 'retrying' line per
+    # retry, then one terminal line) - resp.get_json() no longer applies
+    # here even in this no-retry case, since the mimetype is no longer
+    # application/json. See parse_translate_stream's own docstring.
+    _retry_events, data = parse_translate_stream(resp)
     assert data['success'] is True
     assert data['summary'] == '*** NO SQL *** Sales revenue is $500; Marketing had nothing relevant.'
 
@@ -1817,6 +2195,61 @@ def test_summarize_results_endpoint_returns_no_sql_prefixed_summary_and_logs_an_
     assert row['sql_command'] == data['summary']
     assert (row['input_tokens'], row['output_tokens'], row['total_tokens']) == (10, 5, 15)
 
+    # Gap 4: Phase C's actual LLM call now carries each in-scope database's
+    # schema (via schema_block) and the SQL that ran for it (via
+    # _build_summary_prompt's new SQL section) - previously neither ever
+    # reached this call at all.
+    assert len(harness.generate_calls) == 1
+    call_text = harness.generate_calls[0]["contents"][0].parts[0].text
+    assert "Table: deals" in call_text
+    assert "SELECT * FROM deals;" in call_text
+
+
+def test_summarize_results_endpoint_streams_a_retrying_line_before_the_terminal_line(
+    app_factory, tmp_path, monkeypatch,
+):
+    """End-to-end regression guard, through the real route (a real Gemini
+    429 exception, not _FakeProvider) - the client-visible half of the
+    gap this feature closes: a transient/capacity error mid-Phase-C used
+    to be entirely invisible over the wire, since /api/summarize-results
+    returned one plain JSON body only once the whole retry loop had
+    already finished. Mirrors test_all_mode_triage_recovers_by_rotating_
+    to_a_second_configured_gemini_key's identical structure for triage."""
+    env = _two_preset_env(app_factory, tmp_path, extra_env={
+        "GEMINI_PRESET_KEYS": "fake-key-1,fake-key-2",
+    })
+    login_as(env.client, "alice@example.com")
+    # See the schema-fetch monkeypatch comment on the test just above -
+    # same reasoning, needed here too now that Phase C resolves schema.
+    import db as db_module
+    monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
+        "postgresql://u:p@host-a:5432/a": "Table: deals\nid INTEGER\n",
+        "postgresql://u:p@host-b:5432/b": "Table: campaigns\nid INTEGER\n",
+    }))
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_error(FakeApiError(429))
+    harness.queue_response(_gemini_ok("Sales revenue is $500."))
+
+    resp = env.client.post('/api/summarize-results', json={
+        'prompt': 'how is everything performing',
+        'database_results': [{"kind": "preset", "id": "pg-a", "name": "Sales Postgres",
+                               "columns": ["total"], "rows": [{"total": 500}], "rowCount": 1}],
+    })
+    assert resp.status_code == 200
+    retry_events, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    assert data['summary'] == '*** NO SQL *** Sales revenue is $500.'
+    assert len(harness.client_api_keys) == 2
+    assert harness.client_api_keys[0] != harness.client_api_keys[1]
+
+    assert len(retry_events) == 1
+    assert retry_events[0]["attempt"] == 2
+    assert retry_events[0]["maxAttempts"] == 2
+    assert retry_events[0]["rotatedKey"] is True
+    assert retry_events[0]["delaySeconds"] == 0
+
 
 def test_summarize_results_endpoint_uses_byok_key_instead_of_env_configured_key(
     app_factory, tmp_path, monkeypatch,
@@ -1824,6 +2257,13 @@ def test_summarize_results_endpoint_uses_byok_key_instead_of_env_configured_key(
     env = _two_preset_env(app_factory, tmp_path)  # GEMINI_PRESET_KEYS: fake-key-1 (the env key)
     login_as(env.client, "alice@example.com")
     set_llm_byok_key(env, "google", "alices-own-key", user_identity="alice@example.com")
+    # See the schema-fetch monkeypatch comment further up in this section -
+    # same reasoning, needed here too now that Phase C resolves schema.
+    import db as db_module
+    monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
+        "postgresql://u:p@host-a:5432/a": "Table: deals\nid INTEGER\n",
+        "postgresql://u:p@host-b:5432/b": "Table: campaigns\nid INTEGER\n",
+    }))
 
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
@@ -1835,7 +2275,7 @@ def test_summarize_results_endpoint_uses_byok_key_instead_of_env_configured_key(
                                "columns": ["total"], "rows": [{"total": 500}], "rowCount": 1}],
     })
     assert resp.status_code == 200
-    assert resp.get_json()['success'] is True
+    assert parse_translate_stream(resp)[1]['success'] is True
     assert harness.client_api_keys == ["alices-own-key"]
 
 
@@ -1857,6 +2297,13 @@ def test_summarize_results_endpoint_returns_success_false_when_the_llm_call_fail
 ):
     env = _two_preset_env(app_factory, tmp_path)
     login_as(env.client, "alice@example.com")
+    # See the schema-fetch monkeypatch comment further up in this section -
+    # same reasoning, needed here too now that Phase C resolves schema.
+    import db as db_module
+    monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
+        "postgresql://u:p@host-a:5432/a": "Table: deals\nid INTEGER\n",
+        "postgresql://u:p@host-b:5432/b": "Table: campaigns\nid INTEGER\n",
+    }))
 
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
@@ -1868,7 +2315,7 @@ def test_summarize_results_endpoint_returns_success_false_when_the_llm_call_fail
         'database_results': [{"kind": "preset", "id": "pg-a", "name": "Sales Postgres", "columns": [], "rows": []}],
     })
     assert resp.status_code == 200
-    data = resp.get_json()
+    _retry_events, data = parse_translate_stream(resp)
     assert data['success'] is False
     # Best-effort - no translations-table row for a call that never
     # produced anything to log.

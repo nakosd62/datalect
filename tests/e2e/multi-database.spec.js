@@ -643,7 +643,16 @@ test.describe('multi-database question answering', () => {
     await expect.poll(() => summarizeRequestBody).not.toBeNull();
     expect(summarizeRequestBody.prompt).toBe('combined revenue across sales and marketing');
     expect(summarizeRequestBody.database_results).toHaveLength(2);
-    expect(summarizeRequestBody.database_results[0]).toMatchObject({ name: 'Sales Postgres', rowCount: 1 });
+    // Gap 4 of "Turn History Handling in Datalect": Phase C's request now
+    // carries each database's own executed SQL (`.statement` from
+    // /api/execute's response), not just its results - previously this
+    // field was never sent at all.
+    expect(summarizeRequestBody.database_results[0]).toMatchObject({
+      name: 'Sales Postgres', sql: 'SELECT * FROM deals', rowCount: 1,
+    });
+    expect(summarizeRequestBody.database_results[1]).toMatchObject({
+      name: 'Marketing Postgres', sql: 'SELECT * FROM campaigns', rowCount: 1,
+    });
 
     // The Summary tab (still the default active tab - no failures here)
     // shows BOTH the routing message and, once Phase C resolves, the new
@@ -652,6 +661,331 @@ test.describe('multi-database question answering', () => {
     const summaryText = page.locator('.response-text');
     await expect(summaryText).toContainText('Checking Sales Postgres and Marketing Postgres.');
     await expect(summaryText).toContainText('Combined revenue across both databases is $700.');
+  });
+
+  test('a failed database\'s attempted SQL is also sent to Phase C, not just its error', async ({ page }) => {
+    await mockConfig(page);
+    await gotoApp(page);
+
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          router_route: true,
+          routing_message: 'Checking Sales Postgres and Marketing Postgres.',
+          sql:
+            '-- database: preset:p-a (Sales Postgres)\nSELECT * FROM deals;\n\n' +
+            '-- database: preset:p-b (Marketing Postgres)\nSELECT * FROM campaigns;',
+          database_notes: [],
+          generation_failures: [],
+          connection_selection: [
+            { kind: 'preset', id: 'p-a', name: 'Sales Postgres' },
+            { kind: 'preset', id: 'p-b', name: 'Marketing Postgres' },
+          ],
+        }),
+      });
+    });
+    await page.route('**/api/execute', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          success: false,
+          results: [
+            { statement: 'SELECT * FROM deals', columns: ['total'], rows: [{ total: 500 }], rowCount: 1,
+              database: { kind: 'preset', id: 'p-a', name: 'Sales Postgres' } },
+          ],
+          failures: [
+            { failedStatement: 'SELECT * FROM campaigns', error: 'relation "campaigns" does not exist',
+              database: { kind: 'preset', id: 'p-b', name: 'Marketing Postgres' } },
+          ],
+        }),
+      });
+    });
+
+    let summarizeRequestBody = null;
+    await page.route('**/api/summarize-results', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      summarizeRequestBody = route.request().postDataJSON();
+      await route.fulfill({
+        status: 200, contentType: 'application/json',
+        body: JSON.stringify({ success: true, summary: '*** NO SQL *** Sales is $500; Marketing failed.' }),
+      });
+    });
+
+    await page.locator('#aiPrompt').fill('combined revenue across sales and marketing');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect.poll(() => currentSql(page)).toContain('SELECT');
+    await page.locator('#runBtn').click();
+
+    await expect.poll(() => summarizeRequestBody).not.toBeNull();
+    const marketingEntry = summarizeRequestBody.database_results.find((e) => e.name === 'Marketing Postgres');
+    expect(marketingEntry).toMatchObject({
+      sql: 'SELECT * FROM campaigns', error: 'relation "campaigns" does not exist',
+    });
+  });
+
+  // Regression guard for a real bug report: Phase C used to be skipped
+  // entirely whenever NO database in the turn came back with a real
+  // result - requestAllModeResultsSummary() only checked for a `columns`
+  // entry, so a turn where every single connection failed (no successes,
+  // no notes, only errors) never even asked the model to summarize,
+  // leaving the user with nothing but the bare error tabs and no attempt
+  // to explain what went wrong. Both connections fail here on purpose -
+  // this is the "everything errored" case specifically, not a mix of
+  // success and failure (already covered by the test below this one).
+  test('when every database fails to execute (no successes, no notes at all), Phase C still runs and explains the failures', async ({ page }) => {
+    await mockConfig(page);
+    await gotoApp(page);
+
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          router_route: true,
+          routing_message: 'Checking Sales Postgres and Marketing Postgres.',
+          sql:
+            '-- database: preset:p-a (Sales Postgres)\nSELECT * FROM deals;\n\n' +
+            '-- database: preset:p-b (Marketing Postgres)\nSELECT * FROM campaigns;',
+          database_notes: [],
+          generation_failures: [],
+          connection_selection: [
+            { kind: 'preset', id: 'p-a', name: 'Sales Postgres' },
+            { kind: 'preset', id: 'p-b', name: 'Marketing Postgres' },
+          ],
+        }),
+      });
+    });
+    await page.route('**/api/execute', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          success: false,
+          results: [],
+          failures: [
+            { failedStatement: 'SELECT * FROM deals', error: 'permission denied for table deals',
+              database: { kind: 'preset', id: 'p-a', name: 'Sales Postgres' } },
+            { failedStatement: 'SELECT * FROM campaigns', error: 'relation "campaigns" does not exist',
+              database: { kind: 'preset', id: 'p-b', name: 'Marketing Postgres' } },
+          ],
+        }),
+      });
+    });
+
+    let summarizeCallCount = 0;
+    let summarizeRequestBody = null;
+    await page.route('**/api/summarize-results', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      summarizeCallCount += 1;
+      summarizeRequestBody = route.request().postDataJSON();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          summary:
+            '*** NO SQL *** Results Summary\n\n**Sales Postgres:** The query failed due to a permissions problem - ' +
+            'the app\'s database user likely lacks SELECT access on the deals table.\n\n' +
+            '**Marketing Postgres:** The query failed because the campaigns table does not exist.',
+        }),
+      });
+    });
+
+    await page.locator('#aiPrompt').fill('combined revenue across sales and marketing');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect.poll(() => currentSql(page)).toContain('SELECT');
+
+    await page.locator('#runBtn').click();
+
+    // Phase C actually ran - both failures were sent as `error` entries,
+    // not silently dropped for lack of any successful result.
+    await expect.poll(() => summarizeRequestBody).not.toBeNull();
+    expect(summarizeCallCount).toBe(1);
+    expect(summarizeRequestBody.database_results).toHaveLength(2);
+    expect(summarizeRequestBody.database_results[0]).toMatchObject({
+      name: 'Sales Postgres', error: 'permission denied for table deals',
+    });
+    expect(summarizeRequestBody.database_results[1]).toMatchObject({
+      name: 'Marketing Postgres', error: 'relation "campaigns" does not exist',
+    });
+
+    // With two failures and nothing successful, the default active tab is
+    // the first failure (same "surface what needs attention" default the
+    // empty-sql test above already covers) rather than the Summary tab -
+    // switch to it explicitly to check triage's routing message plus
+    // Phase C's explanation of BOTH failures landed there.
+    await page.locator('.result-tab-btn').filter({ hasText: 'Summary' }).click();
+    const summaryText = page.locator('.response-text');
+    await expect(summaryText).toContainText('Checking Sales Postgres and Marketing Postgres.');
+    await expect(summaryText).toContainText('permissions problem');
+    await expect(summaryText).toContainText('campaigns table does not exist');
+  });
+
+  // Regression guard for "Turn History Handling in Datalect" Gap 1: a
+  // partial (or total) execute failure in "all databases" mode still gets
+  // added to chatStore's history - previously this non-streaming
+  // (pendingAllModeNotes) fallback branch of executeSql() never called
+  // chatStore.pushTurn()/captureAllModeHistory() at all on a failure, only
+  // on success. Same setup as the "every database fails to execute" test
+  // above; this one instead proves the turn survived into the NEXT
+  // question's `history` payload, with Phase C's explanation of the
+  // failures attached (Gap 2's fix - allMode.routingMessage is now read
+  // server-side too).
+  test('a turn where every database fails to execute is still added to history, with Phase C\'s explanation visible to the next question', async ({ page }) => {
+    await mockConfig(page);
+    await gotoApp(page);
+
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          router_route: true,
+          routing_message: 'Checking Sales Postgres and Marketing Postgres.',
+          sql:
+            '-- database: preset:p-a (Sales Postgres)\nSELECT * FROM deals;\n\n' +
+            '-- database: preset:p-b (Marketing Postgres)\nSELECT * FROM campaigns;',
+          database_notes: [],
+          generation_failures: [],
+          connection_selection: [
+            { kind: 'preset', id: 'p-a', name: 'Sales Postgres' },
+            { kind: 'preset', id: 'p-b', name: 'Marketing Postgres' },
+          ],
+        }),
+      });
+    });
+    await page.route('**/api/execute', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          success: false,
+          results: [],
+          failures: [
+            { failedStatement: 'SELECT * FROM deals', error: 'permission denied for table deals',
+              database: { kind: 'preset', id: 'p-a', name: 'Sales Postgres' } },
+            { failedStatement: 'SELECT * FROM campaigns', error: 'relation "campaigns" does not exist',
+              database: { kind: 'preset', id: 'p-b', name: 'Marketing Postgres' } },
+          ],
+        }),
+      });
+    });
+    await page.route('**/api/summarize-results', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          summary:
+            '*** NO SQL *** Results Summary\n\nBoth databases failed: Sales Postgres due to a permissions ' +
+            'problem, and Marketing Postgres because the campaigns table does not exist.',
+        }),
+      });
+    });
+
+    await page.locator('#aiPrompt').fill('combined revenue across sales and marketing');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect.poll(() => currentSql(page)).toContain('SELECT');
+    await page.locator('#runBtn').click();
+    await page.locator('.result-tab-btn').filter({ hasText: 'Summary' }).click();
+    await expect(page.locator('.response-text')).toContainText('Both databases failed');
+
+    let secondRequestBody = null;
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      secondRequestBody = route.request().postDataJSON();
+      await route.fulfill({
+        status: 200, contentType: 'application/json', body: JSON.stringify({ sql: 'SELECT 1;' }),
+      });
+    });
+    await page.locator('#aiPrompt').fill('what should we do about those failures');
+    await page.locator('#aiPrompt').press('Enter');
+
+    await expect.poll(() => secondRequestBody).not.toBeNull();
+    expect(Array.isArray(secondRequestBody.history)).toBe(true);
+    const failedTurn = secondRequestBody.history.find((m) => m.role === 'model' && m.allMode);
+    expect(failedTurn).toBeTruthy();
+    expect(failedTurn.allMode.routingMessage).toContain('Both databases failed');
+    expect(failedTurn.allMode.executeFailures).toHaveLength(2);
+  });
+
+  // Regression guard for the gap this closes: /api/summarize-results' own
+  // retry loop (Phase C) used to be entirely invisible to the client -
+  // one plain JSON body, returned only once the whole retry loop had
+  // already finished. It now streams NDJSON exactly like /api/translate
+  // already does (readNdjsonStream() is shared by both) - mirrors
+  // translate-execute.spec.js's own retry-line regression tests for
+  // /api/translate and /api/summarize-result.
+  test('a summarize-results response with a retry line ahead of the terminal line still resolves to the summary, with no lingering retry banner', async ({ page }) => {
+    await mockConfig(page);
+    await gotoApp(page);
+
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          router_route: true,
+          routing_message: 'Checking Sales Postgres and Marketing Postgres.',
+          sql:
+            '-- database: preset:p-a (Sales Postgres)\nSELECT * FROM deals;\n\n' +
+            '-- database: preset:p-b (Marketing Postgres)\nSELECT * FROM campaigns;',
+          database_notes: [],
+          generation_failures: [],
+          connection_selection: [
+            { kind: 'preset', id: 'p-a', name: 'Sales Postgres' },
+            { kind: 'preset', id: 'p-b', name: 'Marketing Postgres' },
+          ],
+        }),
+      });
+    });
+    await page.route('**/api/execute', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          results: [
+            { statement: 'SELECT * FROM deals', columns: ['total'], rows: [{ total: 500 }], rowCount: 1,
+              database: { kind: 'preset', id: 'p-a', name: 'Sales Postgres' } },
+            { statement: 'SELECT * FROM campaigns', columns: ['total'], rows: [{ total: 200 }], rowCount: 1,
+              database: { kind: 'preset', id: 'p-b', name: 'Marketing Postgres' } },
+          ],
+        }),
+      });
+    });
+    await page.route('**/api/summarize-results', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      const ndjson =
+        JSON.stringify({ status: 'retrying', attempt: 2, maxAttempts: 5, delaySeconds: 1, rotatedKey: false }) + '\n' +
+        JSON.stringify({ status: 'done', success: true, summary: '*** NO SQL *** Combined revenue is $700.' }) + '\n';
+      await route.fulfill({ status: 200, contentType: 'application/x-ndjson', body: ndjson });
+    });
+
+    await page.locator('#aiPrompt').fill('combined revenue across sales and marketing');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect.poll(() => currentSql(page)).toContain('SELECT');
+
+    await page.locator('#runBtn').click();
+
+    await expect(page.locator('.response-text')).toContainText('Combined revenue is $700.', { timeout: 10000 });
+    await expect(page.locator('#resultsRetryStatus')).toHaveClass(/hidden/);
   });
 
   // Summary tab feedback (thumbs up/down) - see report-issue.spec.js's own
@@ -884,6 +1218,49 @@ test.describe('multi-database question answering', () => {
     });
   });
 
+  // Regression guard for a real bug report: an "all databases" mode
+  // "answer" outcome whose text is just ONE sentence with nothing after it
+  // - exactly the shape of translate_routes.py's own _TRIAGE_FAILURE_TEXT
+  // ("*** NO SQL *** I am not able to respond to your prompt.", the fixed
+  // apology all-mode triage falls back to when its response couldn't be
+  // parsed at all, api_error=False - see that constant's own docstring) -
+  // used to leak the literal word "SUMMARY_BLOCK" glued onto the front of
+  // the visible text. renderNoSqlResponse() marks every all-mode "answer"
+  // outcome with SUMMARY_TAB_BLOCK_MARKER expecting the usual "<label>
+  // \n\nbody" shape, but renderMarkdownLiteSummaryTab()'s regex used to
+  // require that trailing blank line unconditionally to strip the marker -
+  // a label with no body at all (nothing follows it) never matched, so the
+  // marker's own NUL characters (invisible once rendered) were left behind
+  // with the literal text "SUMMARY_BLOCK" sitting right in front of the
+  // apology, no space in between. Uses the real fixed apology string
+  // verbatim, not a paraphrase, since the exact text (not just its shape)
+  // is what actually reached production.
+  test('an all-mode "answer" outcome that is a single sentence with no body never leaks the internal SUMMARY_BLOCK marker text', async ({ page }) => {
+    await mockConfig(page);
+    await gotoApp(page);
+
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          sql: '*** NO SQL *** I am not able to respond to your prompt.',
+        }),
+      });
+    });
+
+    await page.locator('#aiPrompt').fill('gibberish question');
+    await page.locator('#aiPrompt').press('Enter');
+
+    const responseText = page.locator('.response-text');
+    await expect(responseText).toHaveText('I am not able to respond to your prompt.');
+
+    const rawHtml = await responseText.evaluate((el) => el.innerHTML);
+    expect(rawHtml).not.toContain('SUMMARY_BLOCK');
+  });
+
   // Regression guard for the "Triage"/"Result Summary" section labels
   // becoming language-agnostic (see connection_router.py's
   // is_label_only_response and client.js's renderMarkdownLiteSummaryTab):
@@ -1053,7 +1430,7 @@ test.describe('multi-database question answering', () => {
     expect(rawText).toContain('Revenue was $500.\n\nMarketing Postgres:');
   });
 
-  test('a router_route response with empty sql (every database noted or failed) renders immediately with no /api/execute call', async ({ page }) => {
+  test('a router_route response with empty sql (every database noted or failed) renders immediately with no /api/execute call, but still runs Phase C over the generation failure', async ({ page }) => {
     await mockConfig(page);
     await gotoApp(page);
 
@@ -1085,6 +1462,26 @@ test.describe('multi-database question answering', () => {
       executeCallCount += 1;
       await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ success: true, results: [] }) });
     });
+    // Regression coverage (see requestAllModeResultsSummary's own
+    // docstring): this turn has no successful result at all - one note,
+    // one generation failure - which used to mean Phase C was never even
+    // attempted for this particular router_route shape (no /api/execute
+    // call happens at all when data.sql comes back empty). Phase C is
+    // still worth running here purely to explain the failure, so this
+    // must now actually be called.
+    let summarizeCallCount = 0;
+    await page.route('**/api/summarize-results', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      summarizeCallCount += 1;
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/x-ndjson',
+        body: JSON.stringify({
+          status: 'done', success: true,
+          summary: '*** NO SQL *** Results Summary\n\n**Marketing Postgres:** The query could not be generated because of a permissions problem.',
+        }) + '\n',
+      });
+    });
 
     await page.locator('#aiPrompt').fill('something neither database can answer');
     await page.locator('#aiPrompt').press('Enter');
@@ -1106,6 +1503,12 @@ test.describe('multi-database question answering', () => {
 
     expect(executeCallCount).toBe(0);
     expect(await currentSql(page)).toBe('');
+
+    // Phase C actually ran (not skipped) and its explanation landed on the
+    // Summary tab underneath triage's own routing message.
+    expect(summarizeCallCount).toBe(1);
+    await page.locator('.result-tab-btn').filter({ hasText: 'Summary' }).click();
+    await expect(page.locator('.response-text')).toContainText('The query could not be generated because of a permissions problem.');
   });
 
   test('a router_route response with a generation failure for one database still shows the other database\'s real result, in its own tab', async ({ page }) => {
@@ -1701,5 +2104,109 @@ test.describe('multi-database question answering', () => {
     expect(executeCalls[0].sql).toContain('preset:p-b');
     await expect(tabs.nth(1)).toContainText('Sales Postgres');
     await expect(tabs.nth(2)).toContainText('Marketing Postgres');
+  });
+
+  // Regression guard for "Turn History Handling in Datalect" Gap 1, on the
+  // STREAMING path this time: a router_route turn whose placeholders
+  // arrived via phase_a_route/phase_b_connection_done events (so
+  // allModeStreamState, not pendingAllModeNotes, is what executeSql()'s
+  // failure branch sees) must still persist history when the batched
+  // "Ready to execute" call comes back with a partial failure - previously
+  // this branch ran Phase C and threw the result away without ever
+  // reaching maybeFinalize()/chatStore.pushTurn() (see this branch's own,
+  // now-removed comment describing that as deliberate pre-streaming
+  // behavior).
+  test('with auto-execute off, a streamed router_route turn whose manual Execute click partially fails is still added to history', async ({ page }) => {
+    await mockConfig(page); // auto_sql_execute: false (buildConfigState()'s default)
+    await gotoApp(page);
+
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      const ndjson = [
+        {
+          status: 'phase_a_route', routing_message: 'Checking both.',
+          connection_selection: [
+            { kind: 'preset', id: 'p-a', name: 'Sales Postgres' },
+            { kind: 'preset', id: 'p-b', name: 'Marketing Postgres' },
+          ],
+        },
+        {
+          status: 'phase_b_connection_done', kind: 'preset', id: 'p-a', name: 'Sales Postgres',
+          outcome: 'sql', sql: '-- database: preset:p-a (Sales Postgres)\nSELECT * FROM deals;',
+        },
+        {
+          status: 'phase_b_connection_done', kind: 'preset', id: 'p-b', name: 'Marketing Postgres',
+          outcome: 'sql', sql: '-- database: preset:p-b (Marketing Postgres)\nSELECT * FROM campaigns;',
+        },
+        {
+          status: 'done', success: true, router_route: true, routing_message: 'Checking both.',
+          sql:
+            '-- database: preset:p-a (Sales Postgres)\nSELECT * FROM deals;\n\n' +
+            '-- database: preset:p-b (Marketing Postgres)\nSELECT * FROM campaigns;',
+          database_notes: [], generation_failures: [],
+          connection_selection: [
+            { kind: 'preset', id: 'p-a', name: 'Sales Postgres' },
+            { kind: 'preset', id: 'p-b', name: 'Marketing Postgres' },
+          ],
+        },
+      ].map((e) => JSON.stringify(e)).join('\n') + '\n';
+      await route.fulfill({ status: 200, contentType: 'application/x-ndjson', body: ndjson });
+    });
+    await page.route('**/api/execute', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200, contentType: 'application/json',
+        body: JSON.stringify({
+          success: false,
+          results: [
+            { statement: 'SELECT * FROM deals', columns: ['x'], rows: [{ x: 1 }], rowCount: 1,
+              database: { kind: 'preset', id: 'p-a', name: 'Sales Postgres' } },
+          ],
+          failures: [
+            { failedStatement: 'SELECT * FROM campaigns', error: 'relation "campaigns" does not exist',
+              database: { kind: 'preset', id: 'p-b', name: 'Marketing Postgres' } },
+          ],
+        }),
+      });
+    });
+    await page.route('**/api/summarize-results', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200, contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          summary: '*** NO SQL *** Results Summary\n\nSales Postgres has 1 deal; Marketing Postgres failed because campaigns is missing.',
+        }),
+      });
+    });
+
+    await page.locator('#aiPrompt').fill('deals and campaigns');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect.poll(() => currentSql(page)).toContain('SELECT');
+    await page.locator('#runBtn').click();
+    await page.locator('.result-tab-btn').filter({ hasText: 'Summary' }).click();
+    await expect(page.locator('.response-text')).toContainText('Sales Postgres has 1 deal');
+
+    let secondRequestBody = null;
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      secondRequestBody = route.request().postDataJSON();
+      await route.fulfill({
+        status: 200, contentType: 'application/json', body: JSON.stringify({ sql: 'SELECT 1;' }),
+      });
+    });
+    await page.locator('#aiPrompt').fill('what about marketing');
+    await page.locator('#aiPrompt').press('Enter');
+
+    await expect.poll(() => secondRequestBody).not.toBeNull();
+    const failedTurn = secondRequestBody.history.find((m) => m.role === 'model' && m.allMode);
+    expect(failedTurn).toBeTruthy();
+    expect(failedTurn.allMode.routingMessage).toContain('Marketing Postgres failed');
+    expect(failedTurn.allMode.executeFailures).toHaveLength(1);
+    // The one database that DID succeed is preserved too, not just the
+    // failure - same summarizeResultForHistory shape a fully successful
+    // turn already gets.
+    expect(failedTurn.results).toHaveLength(1);
+    expect(failedTurn.results[0].rows).toEqual([{ x: 1 }]);
   });
 });

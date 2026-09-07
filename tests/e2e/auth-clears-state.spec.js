@@ -299,10 +299,13 @@ test.describe('auth-triggered state clearing (Cloud Run)', () => {
 // again on its own, so nothing survived past the reload even though the
 // user's real Google session (and the token itself, until it actually
 // expires) was still perfectly valid. Fixed by persisting the ID token to
-// sessionStorage on sign-in and restoring it before the app's first
+// localStorage on sign-in and restoring it before the app's first
 // /api/config call - see client.js's persistGoogleIdToken()/
 // clearPersistedGoogleIdToken() and the restore right next to
-// googleIdToken's own declaration.
+// googleIdToken's own declaration. localStorage (rather than sessionStorage)
+// is a deliberate later choice too: it means a signed-in state also shows up
+// in any OTHER tab/window of the same browser, not just the one that signed
+// in - see the cross-tab describe block below for that behavior.
 test.describe('sign-in survives a same-tab reload (Cloud Run)', () => {
   test('a signed-in user is still shown as signed in after reloading the page', async ({ page }) => {
     await stubGoogleIdentityServices(page);
@@ -387,11 +390,11 @@ test.describe('sign-in survives a same-tab reload (Cloud Run)', () => {
     await mockCloudRunConfig(page);
     await gotoApp(page);
 
-    // Seed an ALREADY-EXPIRED token directly into sessionStorage - the
-    // shape a real signed-in session would leave behind if the tab stayed
-    // open long enough for it to actually expire before the next reload -
-    // rather than going through a real sign-in (which always mints a
-    // fresh, unexpired one via fakeIdToken()).
+    // Seed an ALREADY-EXPIRED token directly into localStorage - the shape
+    // a real signed-in session would leave behind if the tab (or browser)
+    // stayed around long enough for it to actually expire before the next
+    // reload - rather than going through a real sign-in (which always mints
+    // a fresh, unexpired one via fakeIdToken()).
     const expiredToken = (() => {
       const header = Buffer.from(JSON.stringify({ alg: 'none', typ: 'JWT' })).toString('base64url');
       const payload = Buffer.from(JSON.stringify({
@@ -402,7 +405,7 @@ test.describe('sign-in survives a same-tab reload (Cloud Run)', () => {
       return `${header}.${payload}.fake-signature`;
     })();
     await page.evaluate((token) => {
-      window.sessionStorage.setItem('datalectGoogleIdToken', token);
+      window.localStorage.setItem('datalectGoogleIdToken', token);
     }, expiredToken);
 
     await page.reload();
@@ -411,5 +414,87 @@ test.describe('sign-in survives a same-tab reload (Cloud Run)', () => {
     // used - the sign-in button shows, not the stale user's avatar.
     await expect(page.locator('#fakeGsiButton')).toBeVisible();
     await expect(page.locator('#authAvatarBtn')).toHaveCount(0);
+  });
+});
+
+// Regression coverage for the localStorage (not sessionStorage) choice
+// itself: signing in on one tab should make a DIFFERENT tab of the same
+// browser show signed-in too, as soon as that other tab loads/reloads -
+// this is the whole reason persistGoogleIdToken()/clearPersistedGoogleIdToken()
+// use localStorage rather than sessionStorage (see the comment on
+// googleIdToken's declaration in client.js). Two Playwright `page`s opened
+// from the SAME `context` share one browser-storage origin, exactly like two
+// tabs of one real browser window would - the default `page` fixture used
+// everywhere else in this file is its own fresh, isolated context per test,
+// so this describe block deliberately opens a second page itself rather than
+// relying on the fixture.
+test.describe('sign-in and sign-out propagate to other tabs of the same browser (Cloud Run)', () => {
+  test('signing in on one tab shows the other tab as signed in once it reloads', async ({ page, context }) => {
+    await stubGoogleIdentityServices(page);
+    await mockCloudRunConfig(page);
+    await gotoApp(page);
+
+    const otherPage = await context.newPage();
+    await stubGoogleIdentityServices(otherPage);
+    await mockCloudRunConfig(otherPage);
+    await gotoApp(otherPage);
+
+    // Before any sign-in, both tabs start out signed-out.
+    await expect(page.locator('#fakeGsiButton')).toBeVisible();
+    await expect(otherPage.locator('#fakeGsiButton')).toBeVisible();
+
+    await page.evaluate(
+      (token) => window.__gisCallback({ credential: token }),
+      fakeIdToken('cross-tab-user@example.com')
+    );
+    await expect(page.locator('#authAvatarBtn')).toBeVisible();
+
+    // The other tab doesn't know about this on its own - it only re-reads
+    // localStorage on its own load/reload (see the comment on
+    // googleIdToken's declaration in client.js) - so it still shows
+    // signed-out until it reloads.
+    await expect(otherPage.locator('#fakeGsiButton')).toBeVisible();
+
+    await otherPage.reload();
+
+    await expect(otherPage.locator('#authAvatarBtn')).toBeVisible();
+    await expect(otherPage.locator('#fakeGsiButton')).toHaveCount(0);
+    await expect(otherPage.locator('#authAvatarBtn')).toHaveAttribute('title', 'cross-tab-user@example.com');
+
+    await otherPage.close();
+  });
+
+  test('logging out on one tab signs the other tab out too, once it reloads', async ({ page, context }) => {
+    await stubGoogleIdentityServices(page);
+    await mockCloudRunConfig(page);
+    await gotoApp(page);
+
+    await page.evaluate(
+      (token) => window.__gisCallback({ credential: token }),
+      fakeIdToken('cross-tab-user@example.com')
+    );
+    await expect(page.locator('#authAvatarBtn')).toBeVisible();
+
+    const otherPage = await context.newPage();
+    await stubGoogleIdentityServices(otherPage);
+    await mockCloudRunConfig(otherPage);
+    await gotoApp(otherPage);
+    await expect(otherPage.locator('#authAvatarBtn')).toBeVisible();
+
+    await page.locator('#authAvatarBtn').click();
+    await page.locator('#logoutBtn').click();
+    await expect(page.locator('#authAvatarBtn')).toHaveCount(0);
+
+    // Same "only re-reads on its own load" caveat as the sign-in test above -
+    // the other tab still shows the (now stale) signed-in state until it
+    // reloads.
+    await expect(otherPage.locator('#authAvatarBtn')).toBeVisible();
+
+    await otherPage.reload();
+
+    await expect(otherPage.locator('#fakeGsiButton')).toBeVisible();
+    await expect(otherPage.locator('#authAvatarBtn')).toHaveCount(0);
+
+    await otherPage.close();
   });
 });

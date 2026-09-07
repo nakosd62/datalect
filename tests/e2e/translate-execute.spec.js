@@ -391,6 +391,32 @@ test.describe('single-connection mode: post-execution results summarization', ()
     await expect(page.locator('.response-text')).not.toContainText('NO SQL');
   });
 
+  // Regression guard for the gap this closes: /api/summarize-result's own
+  // retry loop used to be entirely invisible to the client - one plain
+  // JSON body, returned only once the whole retry loop had already
+  // finished. It now streams NDJSON exactly like /api/translate already
+  // does (readNdjsonStream() is shared by both) - this mirrors this
+  // file's own "a translate response with a retry line ahead of the
+  // terminal line..." test above, for this second endpoint.
+  test('a summarize-result response with a retry line ahead of the terminal line still resolves to the summary, with no lingering retry banner', async ({ page }) => {
+    await mockTranslate(page, { sql: 'SELECT COUNT(*) AS n FROM signups;' });
+    await mockExecute(page, { results: [{ columns: ['n'], rows: [{ n: 42 }], rowCount: 1 }] });
+    await page.route('**/api/summarize-result', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      const ndjson =
+        JSON.stringify({ status: 'retrying', attempt: 2, maxAttempts: 5, delaySeconds: 1, rotatedKey: false }) + '\n' +
+        JSON.stringify({ status: 'done', success: true, summary: '*** NO SQL *** Results Summary\n\nSignups are up sharply.' }) + '\n';
+      await route.fulfill({ status: 200, contentType: 'application/x-ndjson', body: ndjson });
+    });
+    await gotoApp(page);
+
+    await page.locator('#aiPrompt').fill('how many signups this week');
+    await page.locator('#aiPrompt').press('Enter');
+
+    await expect(page.locator('.response-text')).toContainText('Signups are up sharply', { timeout: 10000 });
+    await expect(page.locator('#resultsRetryStatus')).toHaveClass(/hidden/);
+  });
+
   test('no Summary tab, and no summarization call at all, for a direct SQL entry with no real question', async ({ page }) => {
     let summarizeCalled = false;
     await page.route('**/api/summarize-result', async (route) => {
@@ -502,6 +528,35 @@ test.describe('single-connection mode: post-execution results summarization', ()
     await expect(tabs.last()).toContainText('Error');
   });
 
+  // Regression guard: it's not enough for the summarization call to fire
+  // on a failure - the actual error text has to be WHAT gets sent, so the
+  // model has something concrete to explain (see _SINGLE_SUMMARY_SYSTEM_
+  // INSTRUCTION in translate_routes.py, which now explicitly asks it to
+  // explain an error rather than just directly answering the question).
+  // Covers both single-connection failure shapes: a bare execution failure
+  // (one statement, one error, nothing succeeded) and a multi-statement
+  // script where some statements succeeded before the failure.
+  test('the real error text (not a generic message) is what gets sent to /api/summarize-result', async ({ page }) => {
+    await mockTranslate(page, { sql: 'SELECT * FROM does_not_exist;' });
+    await mockExecute(page, { error: 'relation "does_not_exist" does not exist', status: 400 });
+    let requestBody = null;
+    await page.route('**/api/summarize-result', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      requestBody = route.request().postDataJSON();
+      await route.fulfill({
+        status: 200, contentType: 'application/json',
+        body: JSON.stringify({ success: true, summary: '*** NO SQL *** Results Summary\n\nThat table is missing.' }),
+      });
+    });
+    await gotoApp(page);
+
+    await page.locator('#aiPrompt').fill('query a table that does not exist');
+    await page.locator('#aiPrompt').press('Enter');
+
+    await expect.poll(() => requestBody).not.toBeNull();
+    expect(requestBody.results).toEqual([{ error: 'relation "does_not_exist" does not exist' }]);
+  });
+
   test('no summarization call at all for an execution failure with no real question (direct SQL entry)', async ({ page }) => {
     let summarizeCalled = false;
     await page.route('**/api/summarize-result', async (route) => {
@@ -586,5 +641,87 @@ test.describe('single-connection mode: post-execution results summarization', ()
     // Replayed from the saved turn (chatStore's own history) - no third
     // network call was made just to view it again.
     expect(summarizeCalls).toBe(2);
+  });
+
+  // Regression guard for "Turn History Handling in Datalect" Gap 1: a turn
+  // that concludes with an error still gets added to chatStore's history,
+  // same as a successful turn - previously executeSql()'s entire failure
+  // branch never called chatStore.pushTurn()/mutated the pending entry at
+  // all, so a failed turn simply vanished from history the instant the
+  // user asked anything else. Proven here by inspecting what the client
+  // actually sends as `history` on the NEXT /api/translate call, rather
+  // than via the UI (back/forward navigation only proves the turn is
+  // reachable again, not that its error reached the model).
+  test('a multi-statement script that fails partway through is added to history, with its error visible to the next question', async ({ page }) => {
+    await mockTranslate(page, { sql: 'SELECT 1; SELECT * FROM does_not_exist;' });
+    await mockExecute(page, {
+      results: [{ columns: ['?column?'], rows: [{ '?column?': 1 }], rowCount: 1 }],
+      error: 'relation "does_not_exist" does not exist',
+      failedStatement: 'SELECT * FROM does_not_exist;',
+    });
+    await mockSummarizeResult(page, {
+      summary: '*** NO SQL *** Results Summary\n\nThe first statement ran fine; the second referenced a missing table.',
+    });
+    await gotoApp(page);
+
+    await page.locator('#aiPrompt').fill('run two statements, one of them bad');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect(page.locator('#resultsBody')).toContainText('Execution Error');
+
+    let secondRequestBody = null;
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      secondRequestBody = route.request().postDataJSON();
+      await route.fulfill({
+        status: 200, contentType: 'application/json', body: JSON.stringify({ sql: 'SELECT 2;' }),
+      });
+    });
+    await page.locator('#aiPrompt').fill('what should we do about that error');
+    await page.locator('#aiPrompt').press('Enter');
+
+    await expect.poll(() => secondRequestBody).not.toBeNull();
+    expect(Array.isArray(secondRequestBody.history)).toBe(true);
+    const failedTurn = secondRequestBody.history.find(
+      (m) => m.role === 'model' && Array.isArray(m.results) && m.results.some((r) => r.error)
+    );
+    expect(failedTurn).toBeTruthy();
+    expect(failedTurn.results).toContainEqual({ error: 'relation "does_not_exist" does not exist' });
+    // The Summary tab's own explanation (Phase C's single-connection
+    // equivalent) is preserved on the turn too - see Gap 2's fix on the
+    // server side (build_gemini_history_contents et al. now append a
+    // turn's stored `summary`).
+    expect(failedTurn.summary).toContain('referenced a missing table');
+  });
+
+  test('a bare execution failure (connect() error) is added to history, with its error visible to the next question', async ({ page }) => {
+    await mockTranslate(page, { sql: 'SELECT * FROM does_not_exist;' });
+    await mockExecute(page, { error: 'relation "does_not_exist" does not exist', status: 400 });
+    await mockSummarizeResult(page, {
+      summary: '*** NO SQL *** Results Summary\n\nThat table is missing.',
+    });
+    await gotoApp(page);
+
+    await page.locator('#aiPrompt').fill('query a table that does not exist');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect(page.locator('#resultsBody')).toContainText('Execution Error');
+
+    let secondRequestBody = null;
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      secondRequestBody = route.request().postDataJSON();
+      await route.fulfill({
+        status: 200, contentType: 'application/json', body: JSON.stringify({ sql: 'SELECT 2;' }),
+      });
+    });
+    await page.locator('#aiPrompt').fill('what went wrong there');
+    await page.locator('#aiPrompt').press('Enter');
+
+    await expect.poll(() => secondRequestBody).not.toBeNull();
+    const failedTurn = secondRequestBody.history.find(
+      (m) => m.role === 'model' && Array.isArray(m.results) && m.results.some((r) => r.error)
+    );
+    expect(failedTurn).toBeTruthy();
+    expect(failedTurn.results).toContainEqual({ error: 'relation "does_not_exist" does not exist' });
+    expect(failedTurn.summary).toContain('That table is missing.');
   });
 });

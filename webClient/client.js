@@ -239,44 +239,53 @@ document.addEventListener('DOMContentLoaded', async () => {
   // llm_byok_key_set), so there is no client-side variable holding it.
   let LLM_BYOK_KEY_SET = { google: false, anthropic: false, openai: false };
   let currentGoogleClientId = null;
-  // Persists a signed-in user's Google ID token across a same-tab reload -
-  // see persistGoogleIdToken()/clearPersistedGoogleIdToken() below (the
-  // only two places that ever write this key) and the restore right below
-  // this declaration (the only place that ever reads it). Before this,
+  // Persists a signed-in user's Google ID token across reloads AND across
+  // every other tab/window open on this same browser - see
+  // persistGoogleIdToken()/clearPersistedGoogleIdToken() below (the only two
+  // places that ever write this key) and the restore right below this
+  // declaration (the only place that ever reads it). Before this,
   // googleIdToken was populated ONLY by the Google Sign-In callback (see
   // renderAuthUI() below), which never fires again on its own after a
   // reload - so every reload silently dropped back to signed-out/anonymous
   // until the user clicked "Sign in" again, even though their actual
   // Google session (and this token, until it expires) was still perfectly
-  // valid. sessionStorage (not localStorage) deliberately: this only needs
-  // to survive THIS tab's reloads, not follow the user into a new tab or a
-  // later browser session days from now - a real Google ID token is
-  // short-lived (about an hour) anyway, and renderAuthUI()'s existing
-  // isExpired check already discards/clears anything stale the moment
-  // it's actually used, so restoring the raw stored value here
-  // unconditionally (without re-checking `exp` a second time) is safe.
+  // valid. localStorage (not sessionStorage) deliberately: signing in on one
+  // tab should make every other open tab of the same browser show signed-in
+  // too, rather than each tab tracking its own independent sign-in state -
+  // localStorage is shared across all tabs/windows of the same origin,
+  // whereas sessionStorage is scoped to just the one tab that wrote it. A
+  // real Google ID token is still short-lived (about an hour) regardless of
+  // where it's stored, and renderAuthUI()'s existing isExpired check already
+  // discards/clears anything stale the moment it's actually used, so
+  // restoring the raw stored value here unconditionally (without
+  // re-checking `exp` a second time) remains safe. Note that storing the
+  // token here doesn't by itself keep every open tab's UI in sync the
+  // instant another tab signs in or out - each tab still only re-reads this
+  // key on its own load/reload - but it does mean any tab that reloads (or
+  // is opened fresh) after a sign-in elsewhere picks up the signed-in state
+  // immediately, instead of requiring a fresh sign-in in every tab.
   const GOOGLE_ID_TOKEN_STORAGE_KEY = 'datalectGoogleIdToken';
   let googleIdToken = null;
   try {
-    googleIdToken = window.sessionStorage.getItem(GOOGLE_ID_TOKEN_STORAGE_KEY) || null;
+    googleIdToken = window.localStorage.getItem(GOOGLE_ID_TOKEN_STORAGE_KEY) || null;
   } catch (e) {
-    // sessionStorage unavailable (private browsing, disabled storage, etc.)
-    // - same fallback posture as every other storage read in this file:
-    // just start signed out, exactly like every reload did before this fix.
+    // localStorage unavailable (private browsing, disabled storage, etc.) -
+    // same fallback posture as every other storage read in this file: just
+    // start signed out, exactly like every reload did before this fix.
   }
 
   function persistGoogleIdToken(token) {
     try {
-      window.sessionStorage.setItem(GOOGLE_ID_TOKEN_STORAGE_KEY, token);
+      window.localStorage.setItem(GOOGLE_ID_TOKEN_STORAGE_KEY, token);
     } catch (e) {
       // Storage unavailable - the sign-in still works for this page view,
-      // it just won't survive a reload, same as before this fix.
+      // it just won't survive a reload or show up in other tabs.
     }
   }
 
   function clearPersistedGoogleIdToken() {
     try {
-      window.sessionStorage.removeItem(GOOGLE_ID_TOKEN_STORAGE_KEY);
+      window.localStorage.removeItem(GOOGLE_ID_TOKEN_STORAGE_KEY);
     } catch (e) {
       // See persistGoogleIdToken()'s identical guard above.
     }
@@ -424,7 +433,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   // stream_translation() always emits phase_a_route before any "route"
   // outcome's terminal line), but a non-streamed single-JSON response
   // still needs to work correctly - the old-browser fallback in
-  // readTranslateStream() (no ReadableStream support), or a test double
+  // readNdjsonStream() (no ReadableStream support), or a test double
   // that mocks /api/translate as one flat body with no NDJSON framing at
   // all. Same shape/lifecycle this app used for EVERY router_route turn
   // before progressive streaming existed: set in translatePrompt()'s
@@ -1408,11 +1417,12 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   // Shown at the top of the results area (above the tabs/table, see
-  // index.html) while /api/translate is working through its one
-  // server-side retry loop (translate_routes.py's stream_translation() -
-  // see the comment above readTranslateStream() below for why this is the
-  // only retry loop left after removing the client-side one that used to
-  // duplicate it). Cleared by clearResultsDisplay() so it never lingers
+  // index.html) while /api/translate - or, via requestAllModeResultsSummary()/
+  // requestSingleModeResultsSummary() below, /api/summarize-results/
+  // /api/summarize-result - is working through its own server-side retry
+  // loop (see the comment above readNdjsonStream() below for why this is
+  // the only retry loop left after removing the client-side one that used
+  // to duplicate it). Cleared by clearResultsDisplay() so it never lingers
   // into a fresh translate/execute call or a connection switch.
   function showRetryStatus({ attempt, maxAttempts, rotatedKey }) {
     if (!resultsRetryStatus) return;
@@ -1477,9 +1487,19 @@ document.addEventListener('DOMContentLoaded', async () => {
     resultsRetryStatus.classList.remove('hidden');
   }
 
-  // /api/translate streams newline-delimited JSON (see
-  // translate_routes.py's module docstring): zero or more
-  // {"status": "retrying", ...} progress lines emitted live as the
+  // Reads a newline-delimited-JSON (NDJSON) response body, calling
+  // `onEvent` live for every progress line as it arrives. Originally
+  // written for /api/translate alone (hence still finding its home
+  // among this file's other /api/translate-specific helpers) but now
+  // shared by /api/summarize-results and /api/summarize-result too (see
+  // requestAllModeResultsSummary()/requestSingleModeResultsSummary()
+  // below) - those two routes' own retry loops used to be invisible to
+  // the client entirely (a plain, one-shot response, no progress of any
+  // kind), and streamed NDJSON the same way /api/translate always has is
+  // the same fix applied a second and third time, not a new mechanism.
+  //
+  // /api/translate (see translate_routes.py's module docstring): zero or
+  // more {"status": "retrying", ...} progress lines emitted live as the
   // server's one Gemini-call retry loop runs, plus - for the
   // single-connection path only - two {"status": "phase_status", "phase":
   // "schema"|"generating_sql", "message": ...} lines emitted once each,
@@ -1488,14 +1508,18 @@ document.addEventListener('DOMContentLoaded', async () => {
   // outcome only, one {"status": "phase_a_route", ...} line followed by
   // one {"status": "phase_b_connection_done", ...} line per selected
   // connection (see translate_routes.py's stream_translation() docstring).
+  // /api/summarize-results and /api/summarize-result (see their own
+  // docstrings) only ever emit {"status": "retrying", ...} progress lines
+  // ahead of their own terminal line - no phase_status/phase_a_route/
+  // phase_b_connection_done lines, those are /api/translate-specific.
   // Followed in every case by exactly one terminal {"status": "done",
-  // success, sql/error, ...token usage...} line - the same shape
-  // /api/translate used to return as its whole body before streaming
-  // existed. A request that never reaches that retry loop at all (missing
-  // prompt/API key, a 401 from the auth guard, or a mocked response in
-  // tests - see fixtures.js's mockTranslate()) isn't streamed - it's still
-  // a single plain JSON object, which this reads exactly the same way: one
-  // line, no "status" field, straight into finalData.
+  // success, ...} line - the same shape each of these three routes used
+  // to return as its whole body before streaming existed. A request that
+  // never reaches the retry loop at all (missing prompt/API key, a 401
+  // from the auth guard, or a mocked response in tests - see fixtures.js's
+  // mockTranslate()) isn't streamed - it's still a single plain JSON
+  // object, which this reads exactly the same way: one line, no "status"
+  // field, straight into finalData.
   //
   // `onEvent`, if given, is called for every line EXCEPT the terminal
   // 'done' one, in arrival order, as soon as each is parsed - this is
@@ -1503,7 +1527,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   // 'phase_b_connection_done' lines live rather than only after the
   // whole stream has finished (this function's own return value is
   // still just the terminal line, same as before onEvent existed).
-  async function readTranslateStream(response, onEvent) {
+  async function readNdjsonStream(response, onEvent) {
     if (!response.body || !response.body.getReader) {
       // No ReadableStream support (very old browser) - fall back to a
       // single json() read. No live progress/streaming events in that
@@ -1524,7 +1548,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       try {
         parsed = JSON.parse(trimmed);
       } catch (err) {
-        console.warn('Failed to parse a line of the /api/translate stream:', trimmed, err);
+        console.warn('Failed to parse a line of an NDJSON response stream:', trimmed, err);
         return;
       }
       const isProgressLine = parsed.status === 'retrying'
@@ -5543,11 +5567,34 @@ document.addEventListener('DOMContentLoaded', async () => {
   // marked; a plain single-connection reply or a per-database "Note" tab
   // never marks anything and is rendered plain via renderMarkdownLite()
   // instead.
+  //
+  // The marked line does NOT always have a body underneath it - a fixed,
+  // single-sentence apology (e.g. translate_routes.py's own
+  // _TRIAGE_FAILURE_TEXT, "I am not able to respond to your prompt.", used
+  // when all-mode triage's response couldn't be parsed at all) is marked
+  // by its caller exactly like any other block (see renderNoSqlResponse()),
+  // but is just one line with nothing after it - no "\n\n" for the "body
+  // follows" branch below to find. The regex used to require that blank
+  // line unconditionally, so a label-only block like this never matched at
+  // all: the marker's NUL characters (invisible once actually rendered in
+  // a browser) were left behind in the output, and the literal word
+  // "SUMMARY_BLOCK" showed up glued directly onto the apology text with no
+  // space - a real bug report ("SUMMARY_BLOCKI am not able to respond to
+  // your prompt."), root-caused and reproduced against this exact string
+  // before this fix. Matching `(\n[ \t]*\n|\n?$)` after the label - a real
+  // blank line (body follows), OR just running out of string (at most one
+  // trailing newline, no body) - covers both shapes with one regex; which
+  // alternative matched is what `hasBody` below distinguishes, so the
+  // blank-line separator is only re-inserted into the output when there
+  // is actually a body underneath it to separate from.
   function renderMarkdownLiteSummaryTab(rawText) {
     let html = escapeHtml(rawText || '');
     html = html.replace(
-      new RegExp(SUMMARY_TAB_BLOCK_MARKER + '[ \\t]*([^\\n]+)\\n[ \\t]*\\n', 'g'),
-      (_match, label) => `<strong><u>${unwrapLabelEmphasis(label)}</u></strong>\n\n`
+      new RegExp(SUMMARY_TAB_BLOCK_MARKER + '[ \\t]*([^\\n]+)(\\n[ \\t]*\\n|\\n?$)', 'g'),
+      (_match, label, sep) => {
+        const hasBody = /\n[ \t]*\n/.test(sep);
+        return `<strong><u>${unwrapLabelEmphasis(label)}</u></strong>` + (hasBody ? '\n\n' : '');
+      }
     );
     return applyInlineMarkdown(html);
   }
@@ -5692,10 +5739,22 @@ document.addEventListener('DOMContentLoaded', async () => {
   // before this is called.
   function buildAllModeSummaryPayload(notes, executeResults, executeFailures) {
     const entries = [];
+    // `sql` is included for the two shapes that actually had SQL generated
+    // and (attempted to be) run for them - execute_routes.py tags every
+    // real result with the exact statement that produced it (`.statement`)
+    // and every execute failure with the one that failed
+    // (`.failedStatement`) - so Phase C's prompt can show each database's
+    // own SQL alongside its results/error (see translate_routes.py's
+    // _build_summary_prompt: Gap 4 of "Turn History Handling in Datalect",
+    // which previously had no SQL in Phase C's prompt at all). A note or
+    // generation failure never had any SQL generated for it in the first
+    // place, so those two entry shapes below carry no `sql` field, same as
+    // they've never carried `columns`/`rows`.
     (Array.isArray(executeResults) ? executeResults : []).forEach((r) => {
       const db = r.database || {};
       entries.push({
         kind: db.kind, id: db.id, name: db.name || 'Unknown database',
+        sql: r.statement || '',
         columns: r.columns || [], rows: r.rows || [], rowCount: r.rowCount,
       });
     });
@@ -5712,6 +5771,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       const db = f.database || {};
       entries.push({
         kind: db.kind, id: db.id, name: db.name || 'Unknown database',
+        sql: f.failedStatement || f.statement || '',
         error: f.error || 'Query execution failed for this database.',
       });
     });
@@ -5774,18 +5834,36 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // Fire-and-await (not fire-and-forget - see the two call sites in
   // executeSql() below, both already inside an async flow with buttons
-  // disabled) request for Phase C's summary. Best-effort: skipped
-  // entirely when there's no real data to summarize (every database just
-  // noted or failed - nothing Phase C could add over what those tabs
-  // already show). A failure from the endpoint itself is appended to the
-  // Summary tab via appendPhaseCErrorToSummaryTab above (rather than
-  // left silent, as it originally was) so the user can see why Phase C
-  // didn't produce a summary - see /api/summarize-results' own docstring
-  // for the two shapes `data.error` can take.
+  // disabled) request for Phase C's summary. Best-effort: skipped only
+  // when there's truly nothing to summarize - every database just noted
+  // it had nothing relevant, with no real result AND no error from any of
+  // them. A database that failed outright still gets summarized, same as
+  // one that returned real data: _SUMMARY_SYSTEM_INSTRUCTION (translate_
+  // routes.py) is explicitly asked to explain an error when it sees one,
+  // not just acknowledge it, so skipping Phase C entirely whenever no
+  // database happened to succeed would throw away exactly the case where
+  // an explanation helps the user most - see the regression test covering
+  // an all-databases turn where every connection errored out. A failure
+  // from the endpoint itself is appended to the Summary tab via
+  // appendPhaseCErrorToSummaryTab above (rather than left silent, as it
+  // originally was) so the user can see why Phase C didn't produce a
+  // summary - see /api/summarize-results' own docstring for the two
+  // shapes `data.error` can take.
+  //
+  // /api/summarize-results streams NDJSON (readNdjsonStream(), same as
+  // /api/translate) rather than returning one plain JSON body - its own
+  // retry loop (_summarize_with_retry, see translate_routes.py) can take
+  // several real seconds, and this is what makes that visible instead of
+  // leaving the caller's "Summarizing results…" banner
+  // (showAllModeSummarizingStatus(), already shown by every call site
+  // before awaiting this) frozen with no indication anything is still
+  // happening. showRetryStatus() is reused as-is - it already renders
+  // generic "transient error, retrying" wording regardless of which
+  // server-side call produced the event.
   async function requestAllModeResultsSummary(notes, executeResults, executeFailures) {
     if (!notes || !notes.prompt) return;
     const databaseResults = buildAllModeSummaryPayload(notes, executeResults, executeFailures);
-    if (!databaseResults.some((e) => 'columns' in e)) return;
+    if (!databaseResults.some((e) => 'columns' in e || 'error' in e)) return;
 
     try {
       const response = await fetch('/api/summarize-results', {
@@ -5795,7 +5873,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         signal: currentAbortController ? currentAbortController.signal : undefined,
         body: JSON.stringify({ prompt: notes.prompt, database_results: databaseResults }),
       });
-      const data = await response.json();
+      const data = await readNdjsonStream(response, (evt) => {
+        if (evt.status === 'retrying') showRetryStatus(evt);
+      });
       if (response.ok && data && data.success && data.summary) {
         // The server prefixes this the same "*** NO SQL ***" way any
         // other non-SQL LLM reply is (see translate_routes.py's
@@ -5871,6 +5951,12 @@ document.addEventListener('DOMContentLoaded', async () => {
   // see stripNoSqlPrefix), the server's own honest error text (also
   // marked, so it reads the same way a real summary would) on failure, or
   // null when there's nothing to show (abort, or no usable response).
+  //
+  // /api/summarize-result streams NDJSON the same way /api/summarize-
+  // results does now (see that function's identical comment just above)
+  // - every call site already shows showAllModeSummarizingStatus() before
+  // awaiting this, so a live 'retrying' event just overwrites that same
+  // banner with showRetryStatus(), same precedent.
   async function requestSingleModeResultsSummary(prompt, sql, results) {
     try {
       const response = await fetch('/api/summarize-result', {
@@ -5880,7 +5966,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         signal: currentAbortController ? currentAbortController.signal : undefined,
         body: JSON.stringify({ prompt: prompt, sql: sql, results: results }),
       });
-      const data = await response.json();
+      const data = await readNdjsonStream(response, (evt) => {
+        if (evt.status === 'retrying') showRetryStatus(evt);
+      });
       if (response.ok && data && data.success && data.summary) {
         return SUMMARY_TAB_BLOCK_MARKER + stripNoSqlPrefix(data.summary);
       } else if (data && data.error) {
@@ -6022,7 +6110,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       // safely call maybeFinalize(), since by then every one of these has
       // necessarily already been created (they're only ever pushed here,
       // synchronously, while /api/translate's own NDJSON body is still
-      // being parsed - see readTranslateStream()'s docstring for why that
+      // being parsed - see readNdjsonStream()'s docstring for why that
       // happens strictly before the terminal line resolves this promise).
       pendingExecutions: [],
       terminalData: null,
@@ -6394,14 +6482,21 @@ document.addEventListener('DOMContentLoaded', async () => {
         const failureInfo = (Array.isArray(data.failures) && data.failures[0]) || null;
         const errMsg = (data && data.error) || (failureInfo && failureInfo.error)
           || 'An error occurred during SQL execution.';
+        // The one statement that actually failed when there's a specific
+        // one (a script that failed partway through); otherwise (a bare
+        // connect() failure - nothing ran at all) the whole marked SQL
+        // this call sent is the closest thing to "what failed" - either
+        // way, this is what buildAllModeSummaryPayload/_build_summary_
+        // prompt now show Phase C alongside this database's error (Gap 4).
+        const failedStatement = (failureInfo && failureInfo.failedStatement) || evt.sql || '';
         const errorTab = {
           isError: true, error: errMsg,
-          statement: (failureInfo && failureInfo.failedStatement) || '',
+          statement: failedStatement,
           database: dbRef,
         };
         replaceAllModePlaceholderWithMany(dbRef, [...succeeded, errorTab]);
         state.executeResults.push(...succeeded);
-        state.executeFailures.push({ database: dbRef, error: errMsg });
+        state.executeFailures.push({ database: dbRef, error: errMsg, failedStatement });
       }
     } catch (err) {
       // cancelInFlightQuery() may have already replaced `allModeStreamState`
@@ -6415,7 +6510,11 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
       const errMsg = err.message || 'Failed to reach the execution backend server.';
       replaceAllModePlaceholder(dbRef, { isError: true, error: errMsg, database: dbRef });
-      state.executeFailures.push({ database: dbRef, error: errMsg });
+      // Never even reached the server, so evt.sql (the marked SQL this
+      // call attempted to send) is the only "what failed" text available -
+      // still worth showing Phase C, same reasoning as the response-based
+      // failure branch above.
+      state.executeFailures.push({ database: dbRef, error: errMsg, failedStatement: evt.sql || '' });
     }
     state.settledCount += 1;
     rerenderAllModeStream();
@@ -6572,7 +6671,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         })
       });
 
-      data = await readTranslateStream(response, (evt) => {
+      data = await readNdjsonStream(response, (evt) => {
         if (evt.status === 'retrying') { showRetryStatus(evt); return; }
         // Single-connection mode: "reading the schema" / "writing the
         // right command for the database". "All databases" mode ALSO
@@ -6680,16 +6779,37 @@ document.addEventListener('DOMContentLoaded', async () => {
               await executeSql(null, { internal: true });
             }
           } else {
-            // Nothing to execute at all - render immediately, with no
-            // /api/execute call, straight from the notes/failures already
-            // stashed above.
-            captureAllModeHistory(modelEntry, pendingAllModeNotes, []);
+            // Nothing to execute at all - no /api/execute call. Phase C is
+            // still worth attempting here: a generation failure is real
+            // information it can help explain (see
+            // requestAllModeResultsSummary's own docstring - it now runs
+            // whenever at least one database has a real result OR an
+            // error to report, not only when one succeeded) - this used
+            // to be the one router_route shape that never even tried
+            // Phase C at all, leaving the Summary tab stuck at triage's
+            // bare routing message even when every selected database
+            // failed outright. Mirrors maybeFinalize()'s own ordering for
+            // the live-streaming path: run Phase C, let it patch the
+            // Summary tab in place, THEN capture history off the tab's
+            // own final text (routingMessage plus whatever Phase C added)
+            // rather than off the bare pre-Phase-C routing message.
+            const allModeNotes = pendingAllModeNotes;
             renderAllModeCombinedResults({
-              notes: pendingAllModeNotes,
+              notes: allModeNotes,
               executeResults: [],
               executeFailures: [],
+              // Phase C hasn't run yet at this point - see the identical
+              // flag on every other router_route render call site.
+              summaryPending: true,
             });
             pendingAllModeNotes = null;
+            showAllModeSummarizingStatus();
+            await requestAllModeResultsSummary(allModeNotes, [], []);
+            hideAllModeStreamStatus();
+            settleSummaryTabPending();
+            const summaryEntry = getSummaryTabEntry();
+            if (summaryEntry) allModeNotes.routingMessage = summaryEntry.text;
+            captureAllModeHistory(modelEntry, allModeNotes, []);
           }
         }
       } else if (response && response.ok && data && data.sql) {
@@ -6793,7 +6913,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
     }
     } finally {
-      // Safety net for the network-error path (readTranslateStream()
+      // Safety net for the network-error path (readNdjsonStream()
       // itself throwing, e.g. the connection dropping mid-stream) - the
       // explicit hideRetryStatus() call above only runs once the stream
       // actually finished parsing. Also the single place that clears
@@ -6826,6 +6946,20 @@ document.addEventListener('DOMContentLoaded', async () => {
   // smarter truncation (e.g. size-based cap with an explicit "...N more rows"
   // marker) if that becomes a problem in practice.
   function summarizeResultForHistory(result) {
+    // A failed statement/connection is shaped {error, ...} rather than
+    // {columns, rows, rowCount}. Previously this function ignored that and
+    // always built the columns/rows/rowCount shape regardless, which
+    // silently collapsed a real error into a fake "0-row success" (empty
+    // columns, 0 rows) once it reached history - the error text itself was
+    // just dropped. Preserve the error shape instead so a failed turn's
+    // history entry actually carries what went wrong; build_gemini_history_
+    // contents et al. (server/translate_routes.py) now render an `error`
+    // key as real error text instead of a blank block.
+    if (result && result.error !== undefined) {
+      const summarizedError = { error: result.error };
+      if (result.database) summarizedError.database = result.database;
+      return summarizedError;
+    }
     const rows = result.rows || [];
     const summarized = {
       columns: result.columns || [],
@@ -6837,8 +6971,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     // - preserve that tag so a later history restore can still label each
     // tab by database name instead of a bare "Query N". Server-side history
     // formatting (build_gemini_history_contents et al.) only ever reads
-    // columns/rows/rowCount and ignores unknown keys, so this is harmless
-    // for what actually reaches the LLM.
+    // columns/rows/rowCount/error and ignores unknown keys, so this is
+    // harmless for what actually reaches the LLM.
     if (result.database) summarized.database = result.database;
     return summarized;
   }
@@ -7063,35 +7197,28 @@ document.addEventListener('DOMContentLoaded', async () => {
           // appended right after them, instead of being discarded.
           settleAllModeBatchedResults(streamState, data.results, data.failures);
           rerenderAllModeStream();
-          // Phase C - see requestAllModeResultsSummary's docstring. Still
-          // worth attempting even on a partial failure: whatever DID
-          // execute successfully is real data worth summarizing, and the
-          // failed connection(s) are already fed in as their own entries
-          // (see buildAllModeSummaryPayload) so the summary can note that
-          // too if it affects the answer. Deliberately NOT routed through
-          // maybeFinalize() here, matching this branch's pre-existing
-          // behavior (from before this streaming redesign) of never
-          // persisting history for a partial execute failure - only the
-          // success branch above ever reaches maybeFinalize(). Same
-          // "Summarizing…" indicator maybeFinalize() shows for this call -
-          // previously this branch left the stale "N of N done" banner
-          // (from rerenderAllModeStream() just above) sitting unchanged
-          // through this entire extra network round trip.
-          showAllModeSummarizingStatus();
-          await requestAllModeResultsSummary(
-            {
-              prompt: streamState.prompt, routingMessage: streamState.routingMessage,
-              databaseNotes: streamState.databaseNotes, generationFailures: streamState.generationFailures,
-            },
-            streamState.executeResults, streamState.executeFailures,
-          );
-          hideAllModeStreamStatus();
-          settleSummaryTabPending();
-          allModeStreamState = null;
+          // Previously this branch ran Phase C inline and then discarded
+          // the result without ever persisting history (see this
+          // function's now-removed comment explaining that as deliberate,
+          // pre-streaming behavior) - a turn that failed partway through
+          // was simply never recorded, so a later turn's LLM-1 call had no
+          // idea it had even been asked. settleAllModeBatchedResults above
+          // already brought state.settledCount up to state.expectedTotal
+          // (a failed connection settles exactly like a succeeded one -
+          // see its own docstring), and state.terminalData/.modelEntry
+          // were already attached by translatePrompt() before this
+          // internal executeSql() call was even made - so simply routing
+          // through the same maybeFinalize() the success branch above
+          // uses is enough to run Phase C AND persist history, with the
+          // failure(s) visible to it via state.executeFailures exactly as
+          // before, instead of hand-duplicating that logic here.
+          await maybeFinalize();
         // pendingAllModeNotes fallback (see its own declaration comment
-        // above) - same "never persists history for a partial execute
-        // failure" behavior the live-streaming branch just above
-        // preserves, from before this streaming redesign.
+        // above) - mirrors the success branch's identical fallback a few
+        // dozen lines above: Phase C still runs, and (unlike before) the
+        // turn is now persisted to history afterward too, since a partial
+        // execute failure here is exactly the kind of "turn concluded with
+        // an error" the design doc says must still be recorded.
         } else if (pendingAllModeNotes) {
           const allModeNotes = pendingAllModeNotes;
           const executeResults = Array.isArray(data.results) ? data.results : [];
@@ -7110,6 +7237,31 @@ document.addEventListener('DOMContentLoaded', async () => {
           await requestAllModeResultsSummary(allModeNotes, executeResults, executeFailures);
           hideAllModeStreamStatus();
           settleSummaryTabPending();
+          const summaryEntry = getSummaryTabEntry();
+          if (summaryEntry) allModeNotes.routingMessage = summaryEntry.text;
+
+          // Persist history - mirrors the success branch's identical
+          // pending-entry-vs-new-turn logic further up in this same
+          // function (see its own comments for why each check exists).
+          // The modelEntry/pending entry for this turn was already
+          // created and (if data.sql was non-empty) marked pending by
+          // translatePrompt() before this internal executeSql() call was
+          // even made.
+          const summarizedResults = executeResults.map(summarizeResultForHistory);
+          if (chatStore.getPending() && !chatStore.isPendingCurrent()) {
+            chatStore.clearPending();
+          }
+          if (chatStore.isPendingCurrent()) {
+            const pending = chatStore.getPending();
+            pending.entry.results = summarizedResults;
+            captureAllModeHistory(pending.entry, allModeNotes, executeFailures);
+            chatStore.clearPending();
+          } else {
+            const modelEntry = { role: 'model', text: sql, results: summarizedResults };
+            captureAllModeHistory(modelEntry, allModeNotes, executeFailures);
+            chatStore.pushTurn(promptText, modelEntry);
+            updateHistoryTurnsSubtitle();
+          }
         // Multi-database question-answering's own partial-failure shape
         // (see execute_routes.py's module docstring) - `failures` is a
         // LIST (one entry per connection that failed; the others keep
@@ -7137,21 +7289,26 @@ document.addEventListener('DOMContentLoaded', async () => {
           // mode's Phase C, which already summarizes over whatever DID
           // execute alongside any failures (see e.g. the
           // requestAllModeResultsSummary call a few lines up, made even
-          // when data.failures is non-empty). statement_results mirrors
+          // when data.failures is non-empty). statementResults mirrors
           // _build_single_summary_prompt's own {"columns","rows",
           // "rowCount"}|{"note"}|{"error"} shape - every statement that
           // succeeded before the failure (data.results), plus one final
           // {error} entry for the one that didn't, so the model can
           // reason over (and mention) both, same as it already does for
-          // an all-succeeded turn. Same "no real question to summarize
-          // against" guard the success branch uses.
+          // an all-succeeded turn. Computed unconditionally (not just
+          // inside the summarization guard below) since history
+          // persistence below needs it too, regardless of whether a
+          // summary was requested.
+          const statementResults = [
+            ...(Array.isArray(data.results) ? data.results : []),
+            { error: errMsg },
+          ];
+          // Same "no real question to summarize against" guard the
+          // success branch uses.
+          let singleModeSummary = null;
           if (promptText !== "[Direct SQL Execution]") {
-            const statementResults = [
-              ...(Array.isArray(data.results) ? data.results : []),
-              { error: errMsg },
-            ];
             showAllModeSummarizingStatus();
-            const singleModeSummary = await requestSingleModeResultsSummary(promptText, sql, statementResults);
+            singleModeSummary = await requestSingleModeResultsSummary(promptText, sql, statementResults);
             hideAllModeStreamStatus();
             // Preserves the active tab (the just-rendered failure, which
             // is what needs the user's attention) rather than stealing
@@ -7159,6 +7316,31 @@ document.addEventListener('DOMContentLoaded', async () => {
             // docstring for why this differs from the success path's
             // prependSingleModeSummaryTab.
             if (singleModeSummary) prependSingleModeSummaryTabPreservingActiveTab(singleModeSummary);
+          }
+
+          // Persist history - previously this entire branch never called
+          // chatStore.pushTurn()/mutated the pending entry at all, so a
+          // multi-statement script that failed partway through was simply
+          // never recorded (see translate_routes.py's history-builder
+          // functions and the design doc: a concluded turn's "results or
+          // errors" must be added to history, and this is exactly such a
+          // turn). Mirrors the success branch's identical pending-entry-
+          // vs-new-turn logic further up this same function.
+          const summarizedResults = statementResults.map(summarizeResultForHistory);
+          if (chatStore.getPending() && !chatStore.isPendingCurrent()) {
+            chatStore.clearPending();
+          }
+          if (chatStore.isPendingCurrent()) {
+            const pending = chatStore.getPending();
+            pending.entry.text = sql;
+            pending.entry.results = summarizedResults;
+            if (singleModeSummary) pending.entry.summary = singleModeSummary;
+            chatStore.clearPending();
+          } else {
+            const modelEntry = { role: 'model', text: sql, results: summarizedResults };
+            if (singleModeSummary) modelEntry.summary = singleModeSummary;
+            chatStore.pushTurn(promptText, modelEntry);
+            updateHistoryTurnsSubtitle();
           }
         } else if (resultsBody) {
           // A bare execute failure with nothing else to show alongside it
@@ -7191,14 +7373,43 @@ document.addEventListener('DOMContentLoaded', async () => {
           // context are skipped just above (a 401 auth failure, nothing
           // meaningful happened for the model to reason over), in
           // addition to the existing "no real question" guard.
+          let singleModeSummary = null;
           if (reportable && promptText !== "[Direct SQL Execution]") {
             showAllModeSummarizingStatus();
-            const singleModeSummary = await requestSingleModeResultsSummary(promptText, sql, [{ error: errMsg }]);
+            singleModeSummary = await requestSingleModeResultsSummary(promptText, sql, [{ error: errMsg }]);
             hideAllModeStreamStatus();
             // Preserves the active (error) tab - see that helper's own
             // docstring for why this differs from the success path's
             // prependSingleModeSummaryTab.
             if (singleModeSummary) prependSingleModeSummaryTabPreservingActiveTab(singleModeSummary);
+          }
+
+          // Persist history - previously this bare-failure branch never
+          // called chatStore.pushTurn()/mutated the pending entry at all
+          // (see the multi-statement partial-failure branch above for the
+          // fuller reasoning on why a failed turn still needs to be
+          // recorded). Skipped only for a 401 (nothing real was attempted -
+          // matches the summarization/Report-button guards above), NOT
+          // for "[Direct SQL Execution]" (direct SQL re-runs still get
+          // their own history turn elsewhere in this function, just
+          // without a summary - same convention here).
+          if (reportable) {
+            const summarizedResults = [summarizeResultForHistory({ error: errMsg })];
+            if (chatStore.getPending() && !chatStore.isPendingCurrent()) {
+              chatStore.clearPending();
+            }
+            if (chatStore.isPendingCurrent()) {
+              const pending = chatStore.getPending();
+              pending.entry.text = sql;
+              pending.entry.results = summarizedResults;
+              if (singleModeSummary) pending.entry.summary = singleModeSummary;
+              chatStore.clearPending();
+            } else {
+              const modelEntry = { role: 'model', text: sql, results: summarizedResults };
+              if (singleModeSummary) modelEntry.summary = singleModeSummary;
+              chatStore.pushTurn(promptText, modelEntry);
+              updateHistoryTurnsSubtitle();
+            }
           }
         }
       }

@@ -760,6 +760,144 @@ def test_history_result_truncation_reaches_the_real_claude_call(app_factory, mon
     assert "[3]" not in history_text
 
 
+# --- History entries carrying an error, or a stored summary --------------------
+# Gap 1/2/3 of "Turn History Handling in Datalect": a turn that concluded with
+# an error is still added to history (client.js's executeSql() failure
+# branches now call chatStore.pushTurn()/mutate the pending entry, where
+# previously they never persisted anything at all), with the error text
+# preserved (client.js's summarizeResultForHistory() now returns {error, ...}
+# instead of collapsing it to a fake 0-row success). This section proves the
+# SERVER side of that: a `results` entry shaped {error: "..."} renders as real
+# error text instead of a blank "Columns: \nTotal Rows: 0" block, and a
+# turn's own stored summary (`summary` for single-connection turns,
+# `allMode.routingMessage` for all-mode turns - which client.js overwrites
+# with the real Phase C summary text before persisting, not the earlier
+# triage routing message) is appended too, so a later turn's LLM call sees
+# what the user was actually told, not just the raw data/errors.
+
+
+def _make_history_with_error_result(error_text, database=None):
+    result = {"error": error_text}
+    if database:
+        result["database"] = database
+    return [{
+        "role": "model",
+        "text": "SELECT * FROM does_not_exist;",
+        "results": [result],
+    }]
+
+
+def test_gemini_history_renders_an_error_result_as_real_text(app_env):
+    history = _make_history_with_error_result('relation "does_not_exist" does not exist')
+
+    contents = app_env.translate_routes.build_gemini_history_contents(history)
+    text = contents[0].parts[0].text
+    assert "[Query Result 1 - failed]" in text
+    assert 'relation "does_not_exist" does not exist' in text
+    # Not the old blank-block shape this used to silently fall back to.
+    assert "Total Rows: 0" not in text
+
+
+def test_claude_history_renders_an_error_result_as_real_text(app_env):
+    history = _make_history_with_error_result("permission denied for table users")
+
+    messages = app_env.translate_routes.build_claude_history_messages(history)
+    content = messages[0]["content"]
+    assert "[Query Result 1 - failed]" in content
+    assert "permission denied for table users" in content
+    assert "Total Rows: 0" not in content
+
+
+def test_openai_history_renders_an_error_result_as_real_text(app_env):
+    history = _make_history_with_error_result("statement timeout")
+
+    messages = app_env.translate_routes.build_openai_history_messages(history)
+    content = messages[0]["content"]
+    assert "[Query Result 1 - failed]" in content
+    assert "statement timeout" in content
+    assert "Total Rows: 0" not in content
+
+
+def test_gemini_history_with_mixed_success_and_error_results_renders_both(app_env):
+    """A multi-statement turn that partly succeeded before failing (see
+    executeSql()'s multi-statement partial-failure branch) carries both
+    shapes in the same `results` list - both must render, in order."""
+    history = [{
+        "role": "model",
+        "text": "SELECT 1; SELECT * FROM nope;",
+        "results": [
+            {"columns": ["n"], "rows": [[1]], "rowCount": 1},
+            {"error": "relation \"nope\" does not exist"},
+        ],
+    }]
+
+    contents = app_env.translate_routes.build_gemini_history_contents(history)
+    text = contents[0].parts[0].text
+    assert "[Query Result 1 - 1 row(s) total, showing 1]" in text
+    assert "[Query Result 2 - failed]" in text
+    assert 'relation "nope" does not exist' in text
+
+
+def test_gemini_history_appends_a_turn_own_stored_summary(app_env):
+    """Single-connection turns carry their summary directly as `summary`."""
+    history = [{
+        "role": "model",
+        "text": "SELECT * FROM orders;",
+        "results": [{"columns": ["id"], "rows": [[1]], "rowCount": 1}],
+        "summary": "There is one order in the system, with id 1.",
+    }]
+
+    contents = app_env.translate_routes.build_gemini_history_contents(history)
+    text = contents[0].parts[0].text
+    assert "There is one order in the system, with id 1." in text
+
+
+def test_claude_history_appends_an_all_mode_turn_stored_summary(app_env):
+    """All-mode turns carry their (final, Phase-C) summary nested under
+    `allMode.routingMessage` - see captureAllModeHistory in client.js."""
+    history = [{
+        "role": "model",
+        "text": "-- database: db1\nSELECT 1;",
+        "results": [{"columns": ["n"], "rows": [[1]], "rowCount": 1, "database": {"kind": "connection", "id": "db1", "name": "db1"}}],
+        "allMode": {
+            "routingMessage": "Only db1 had relevant data, which shows a single row.",
+            "databaseNotes": [],
+            "generationFailures": [],
+            "executeFailures": [],
+        },
+    }]
+
+    messages = app_env.translate_routes.build_claude_history_messages(history)
+    assert "Only db1 had relevant data, which shows a single row." in messages[0]["content"]
+
+
+def test_history_summary_not_duplicated_when_both_summary_and_all_mode_present(app_env):
+    """`summary` takes priority over `allMode.routingMessage` when (for
+    whatever reason) both are set, rather than appending both - there is
+    only ever one real summary for a given turn."""
+    history = [{
+        "role": "model",
+        "text": "SELECT 1;",
+        "summary": "The real summary.",
+        "allMode": {"routingMessage": "A stale routing message that should not appear."},
+    }]
+
+    contents = app_env.translate_routes.build_gemini_history_contents(history)
+    text = contents[0].parts[0].text
+    assert "The real summary." in text
+    assert "A stale routing message that should not appear." not in text
+
+
+def test_history_entry_with_no_summary_or_results_is_unaffected(app_env):
+    """A plain {role, text} turn (no `results`, no `summary`, no `allMode`)
+    still renders as just its own text - the new summary/error handling
+    must not add anything when there's nothing to add."""
+    history = [{"role": "user", "text": "how many orders are there?"}]
+
+    contents = app_env.translate_routes.build_gemini_history_contents(history)
+    assert contents[0].parts[0].text == "how many orders are there?"
+
+
 # --- Google Sheets (GViz) dialect intro: comments stay forbidden ---------------
 # GViz has no comment syntax at all (see backends/sheets.py's module
 # docstring), so this dialect's intro tells the model to never add one,
@@ -813,6 +951,28 @@ def test_summary_prompt_requires_a_leading_translated_results_summary_line(app_e
     assert "meaning \"Results Summary\"" in instruction
     assert "TRANSLATED into the SAME LANGUAGE as the user's original question" in instruction
     assert "is not a valid response" in instruction
+
+
+# --- Phase C summary prompt: explain an error, don't just acknowledge it ---
+# Regression coverage for a real product request: a database that failed
+# used to only get a bare "say so" acknowledgment from this prompt - the
+# same treatment as a database that had nothing relevant, even though an
+# error carries a real, actionable diagnosis (a permissions problem, a
+# timeout, a malformed query) a "no relevant data" note never does. The
+# client-side gap this closes (requestAllModeResultsSummary used to skip
+# Phase C entirely whenever no database succeeded, even with real errors
+# to explain) is covered by multi-database.spec.js's own e2e regression
+# test - this one guards the prompt TEXT the model actually gets, the only
+# place this instruction is ever expressed.
+def test_summary_prompt_instructs_explaining_an_error_not_just_acknowledging_it(app_env):
+    instruction = app_env.translate_routes._SUMMARY_SYSTEM_INSTRUCTION
+    assert "briefly explain" in instruction.lower()
+    assert "what the error suggests" in instruction.lower()
+    assert "what could fix it" in instruction.lower()
+    # Still keeps the plain-note case distinct from the error case - a
+    # database with nothing relevant isn't asked to be "explained" the
+    # same way an actual failure is.
+    assert "database noted it had nothing relevant" in instruction
 
 
 # --- History turn-count cap (HISTORY_MAX_TURNS) ---
@@ -2688,11 +2848,17 @@ def test_translate_byok_key_removed_falls_back_to_env_key_again(app_factory, mon
 # The single-connection equivalent of "all databases" mode's Phase C (see
 # test_connection_router.py's own "Phase C" section for that one) - mirrors
 # its test conventions closely, adjusted for: a real single connection/
-# schema instead of no schema at all, an explicit SQL statement, and -
-# critically - NO row-count cap (this feature's whole point per explicit
-# product decision), which is the one behavior the Phase C tests assert the
-# OPPOSITE of (test_build_summary_prompt_caps_rows_the_same_way_past_turn_
-# history_does).
+# schema (Phase C now resolves a real schema per in-scope database too -
+# see _build_all_mode_schema_block/Gap 4) and an explicit SQL statement
+# rather than one per database. Both this call and Phase C's now share the
+# same SUMMARY_RESULTS_MAX_ROWS cap (a dedicated, generous abuse/cost-
+# protection cap, distinct from HISTORY_RESULT_MAX_ROWS's past-turn-replay
+# purpose - see SUMMARY_RESULTS_MAX_ROWS's own definition comment - and
+# distinct from Gap 5 of "Turn History Handling in Datalect", which is
+# what made Phase C stop using HISTORY_RESULT_MAX_ROWS here in the first
+# place - see test_build_summary_prompt_does_not_cap_rows_the_same_way_
+# past_turn_history_does in test_connection_router.py, this test's Phase C
+# equivalent).
 
 
 def test_build_single_summary_prompt_includes_the_question_sql_and_results(app_env):
@@ -2707,20 +2873,41 @@ def test_build_single_summary_prompt_includes_the_question_sql_and_results(app_e
     assert "{'n': 42}" in prompt_text
 
 
-def test_build_single_summary_prompt_never_truncates_rows_unlike_phase_c(app_env):
-    # Regression guard for this feature's explicit "do not truncate the
-    # data - pass all records" requirement - deliberately the OPPOSITE
-    # assertion of test_build_summary_prompt_caps_rows_the_same_way_past_
-    # turn_history_does in test_connection_router.py, which asserts Phase C
-    # DOES cap at HISTORY_RESULT_MAX_ROWS.
-    many_rows = [{"n": i} for i in range(app_env.translate_routes.HISTORY_RESULT_MAX_ROWS + 25)]
+def test_build_single_summary_prompt_does_not_cap_rows_the_same_way_past_turn_history_does(app_env):
+    # A row count that exceeds HISTORY_RESULT_MAX_ROWS but stays under
+    # SUMMARY_RESULTS_MAX_ROWS should still come through in full,
+    # unaffected by that unrelated, much stingier history-replay cap.
+    # Phase C's own equivalent test
+    # (test_build_summary_prompt_does_not_cap_rows_the_same_way_past_turn_
+    # history_does in test_connection_router.py) asserts the same thing.
+    assert app_env.translate_routes.HISTORY_RESULT_MAX_ROWS < app_env.translate_routes.SUMMARY_RESULTS_MAX_ROWS
+    row_count = app_env.translate_routes.HISTORY_RESULT_MAX_ROWS + 25
+    many_rows = [{"n": i} for i in range(row_count)]
     prompt_text = app_env.translate_routes._build_single_summary_prompt(
-        "q", "SELECT n FROM t;", [{"columns": ["n"], "rows": many_rows, "rowCount": len(many_rows)}],
+        "q", "SELECT n FROM t;", [{"columns": ["n"], "rows": many_rows, "rowCount": row_count}],
     )
-    assert f"Query Result 1 - {len(many_rows)} row(s):" in prompt_text
-    assert f"Total Rows: {len(many_rows)}" in prompt_text
+    assert f"Query Result 1 - {row_count} row(s):" in prompt_text
+    assert f"Total Rows: {row_count}" in prompt_text
     # Every single row serialized, not just HISTORY_RESULT_MAX_ROWS of them.
-    assert prompt_text.count("{'n':") == len(many_rows)
+    assert prompt_text.count("{'n':") == row_count
+
+
+def test_build_single_summary_prompt_caps_rows_at_summary_results_max_rows(app_factory):
+    # New abuse/cost-protection guard: an adversarial (or just very wide)
+    # result set must still be capped somewhere, now at the dedicated
+    # SUMMARY_RESULTS_MAX_ROWS constant rather than being sent to the LLM
+    # in full no matter how large.
+    env = app_factory(env={"SUMMARY_RESULTS_MAX_ROWS": "3"})
+    row_count = 10
+    many_rows = [{"n": i} for i in range(row_count)]
+    prompt_text = env.translate_routes._build_single_summary_prompt(
+        "q", "SELECT n FROM t;", [{"columns": ["n"], "rows": many_rows, "rowCount": row_count}],
+    )
+    # The real total row count is still reported honestly...
+    assert f"Query Result 1 - {row_count} row(s) total, showing the first 3:" in prompt_text
+    assert f"Total Rows: {row_count}" in prompt_text
+    # ...but only the capped number of rows is actually serialized.
+    assert prompt_text.count("{'n':") == 3
 
 
 def test_build_single_summary_prompt_formats_notes_and_errors_too(app_env):
@@ -2731,14 +2918,41 @@ def test_build_single_summary_prompt_formats_notes_and_errors_too(app_env):
     assert "Query Result 2: query failed - syntax error near SELECT" in prompt_text
 
 
+# --- Single-connection summary prompt: explain an error, don't just report it ---
+# Regression coverage for the same product request as the all-databases
+# equivalent above (test_summary_prompt_instructs_explaining_an_error_not_
+# just_acknowledging_it): this instruction used to describe its input as
+# only ever "the actual result rows", with no mention that a statement
+# result might instead be a note or an error at all - even though _build_
+# single_summary_prompt() has always been able to send exactly that shape
+# (see test_build_single_summary_prompt_formats_notes_and_errors_too just
+# above). The model was never actually told what to do when it saw one.
+def test_single_summary_prompt_instructs_explaining_an_error_not_just_reporting_it(app_env):
+    instruction = app_env.translate_routes._SINGLE_SUMMARY_SYSTEM_INSTRUCTION
+    assert "an error explaining that it failed to execute" in instruction.lower()
+    assert "briefly explain" in instruction.lower()
+    assert "what the error suggests" in instruction.lower()
+    assert "what could fix it" in instruction.lower()
+    # A multi-statement script where some succeeded and others failed must
+    # get BOTH covered, not just whichever the model happens to notice
+    # first.
+    assert "address both" in instruction.lower()
+
+
 def test_summarize_single_connection_results_returns_stripped_text_and_usage_on_success(app_env):
     from test_connection_router import _FakeProvider
 
     provider = _FakeProvider(["Results Summary\n\nSignups are up 20% this week - worth a closer look at channel X."])
-    text, usage, error = app_env.translate_routes.summarize_single_connection_results(
-        "how many signups this week", "Sales Schema", "SELECT COUNT(*) FROM signups;",
-        [{"columns": ["n"], "rows": [{"n": 42}], "rowCount": 1}],
-        provider, client=None, model="m",
+    # summarize_single_connection_results is now a generator (yields live
+    # 'retrying' progress lines - see its docstring); drain it to get the
+    # final (text, usage, error) result, same idiom used for
+    # generate_sql_for_connection elsewhere.
+    text, usage, error = app_env.translate_routes._drain_generation(
+        app_env.translate_routes.summarize_single_connection_results(
+            "how many signups this week", "Sales Schema", "SELECT COUNT(*) FROM signups;",
+            [{"columns": ["n"], "rows": [{"n": 42}], "rowCount": 1}],
+            provider, client=None, model="m",
+        )
     )
     assert text == "Results Summary\n\nSignups are up 20% this week - worth a closer look at channel X."
     assert usage == {}
@@ -2750,8 +2964,10 @@ def test_summarize_single_connection_results_gives_up_immediately_for_a_non_retr
     from test_connection_router import _FakeProvider
 
     provider = _FakeProvider([RuntimeError("boom")])
-    text, usage, error = app_env.translate_routes.summarize_single_connection_results(
-        "q", "schema", "SELECT 1;", [{"columns": [], "rows": []}], provider, client=None, model="m",
+    text, usage, error = app_env.translate_routes._drain_generation(
+        app_env.translate_routes.summarize_single_connection_results(
+            "q", "schema", "SELECT 1;", [{"columns": [], "rows": []}], provider, client=None, model="m",
+        )
     )
     assert (text, usage) == (None, None)
     assert isinstance(error, RuntimeError)
@@ -2774,7 +2990,11 @@ def test_summarize_result_endpoint_returns_no_sql_prefixed_summary_and_logs_a_re
         'results': [{"columns": ["n"], "rows": [{"n": 42}], "rowCount": 1}],
     })
     assert resp.status_code == 200
-    data = resp.get_json()
+    # /api/summarize-result now streams NDJSON (a live 'retrying' line per
+    # retry, then one terminal line) - resp.get_json() no longer applies
+    # here even in this no-retry case, since the mimetype is no longer
+    # application/json. See parse_translate_stream's own docstring.
+    _retry_events, data = parse_translate_stream(resp)
     assert data['success'] is True
     assert data['summary'] == '*** NO SQL *** Signups are up 20% this week - worth digging into channel X.'
 
@@ -2782,6 +3002,45 @@ def test_summarize_result_endpoint_returns_no_sql_prefixed_summary_and_logs_a_re
     assert total_count == 1
     assert rows[0]['nl_prompt'] == 'how many signups this week'
     assert rows[0]['sql_command'] == data['summary']
+
+
+def test_summarize_result_endpoint_streams_a_retrying_line_before_the_terminal_line(
+    app_factory, monkeypatch,
+):
+    """End-to-end regression guard for single-connection mode's own
+    summarization call - the client-visible half of the gap this feature
+    closes: a transient/capacity error mid-summarization used to be
+    entirely invisible over the wire, since /api/summarize-result
+    returned one plain JSON body only once the whole retry loop had
+    already finished. Mirrors test_429_rotates_key_and_retries_
+    immediately_with_no_delay's identical structure for /api/translate,
+    and test_summarize_results_endpoint_streams_a_retrying_line_before_
+    the_terminal_line (test_connection_router.py) for Phase C."""
+    env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1,fake-key-2"})
+    login_as(env.client, "alice@example.com")
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_error(FakeApiError(429))
+    harness.queue_response(FakeGenaiResponse("Signups are up 20% this week."))
+
+    resp = env.client.post('/api/summarize-result', json={
+        'prompt': 'how many signups this week',
+        'sql': 'SELECT COUNT(*) AS n FROM signups;',
+        'results': [{"columns": ["n"], "rows": [{"n": 42}], "rowCount": 1}],
+    })
+    assert resp.status_code == 200
+    retry_events, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    assert data['summary'] == '*** NO SQL *** Signups are up 20% this week.'
+    assert len(harness.client_api_keys) == 2
+    assert harness.client_api_keys[0] != harness.client_api_keys[1]
+
+    assert len(retry_events) == 1
+    assert retry_events[0]["attempt"] == 2
+    assert retry_events[0]["maxAttempts"] == 2
+    assert retry_events[0]["rotatedKey"] is True
+    assert retry_events[0]["delaySeconds"] == 0
 
 
 def test_summarize_result_endpoint_uses_byok_key_instead_of_env_configured_key(app_factory, monkeypatch):
@@ -2797,7 +3056,7 @@ def test_summarize_result_endpoint_uses_byok_key_instead_of_env_configured_key(a
         'prompt': 'q', 'sql': 'SELECT 1;', 'results': [{"columns": [], "rows": [], "rowCount": 0}],
     })
     assert resp.status_code == 200
-    assert resp.get_json()['success'] is True
+    assert parse_translate_stream(resp)[1]['success'] is True
     assert harness.client_api_keys == ["alices-own-key"]
 
 
@@ -2824,7 +3083,7 @@ def test_summarize_result_endpoint_returns_success_false_when_the_llm_call_fails
         'prompt': 'q', 'sql': 'SELECT 1;', 'results': [{"columns": [], "rows": [], "rowCount": 0}],
     })
     assert resp.status_code == 200
-    data = resp.get_json()
+    _retry_events, data = parse_translate_stream(resp)
     assert data['success'] is False
 
     _rows, _stats, total_count = env.app_config.state_store.get_translation_history("alice@example.com")

@@ -78,6 +78,7 @@ from db import (
     resolve_conn_str, get_database_schema, record_translation,
     record_all_databases_triage,
     resolve_in_scope_descriptors, build_router_candidate_summaries,
+    resolve_descriptor_by_reference,
 )
 from backends import get_backend
 from connection_router import triage_all_mode_question, is_label_only_response
@@ -274,6 +275,20 @@ HISTORY_RESULT_MAX_ROWS = int(os.environ.get("HISTORY_RESULT_MAX_ROWS", 50))
 # provider's token limit (see HISTORY_RESULT_MAX_ROWS above for the other
 # lever on that same problem).
 HISTORY_MAX_TURNS = int(os.environ.get("HISTORY_MAX_TURNS", 10))
+
+# The CURRENT turn's own results, fed to the results-summarization LLM
+# calls (_build_summary_prompt for "all databases" mode's Phase C,
+# _build_single_summary_prompt for single-connection mode) - deliberately
+# a SEPARATE, much more generous cap from HISTORY_RESULT_MAX_ROWS above:
+# this is real, current data the summarization call exists to reason over
+# in full, not old history being replayed turn after turn, so the default
+# here is far higher. It still needs a real ceiling, though, now that both
+# of those calls send every row rather than none - an adversarial (or just
+# very wide) query (e.g. a bare `SELECT * FROM huge_table`) could otherwise
+# blow the prompt out to an enormous token count on a single turn, with no
+# history multiplier even needed to get there. Override via env var if
+# 1000 is too aggressive/lenient for your data.
+SUMMARY_RESULTS_MAX_ROWS = int(os.environ.get("SUMMARY_RESULTS_MAX_ROWS", 1000))
 
 # There are two, INDEPENDENT retry mechanisms below, each with its own
 # budget - they used to share one counter (MAX_GEMINI_ATTEMPTS), which
@@ -809,11 +824,13 @@ class LlmCallFailed(Exception):
 
     Deliberately NOT used by triage_all_mode_question (connection_router.py)
     or summarize_all_mode_results below - neither of those loops ever runs
-    anything else ambiguous in their scope (no schema fetch, nothing else
-    that could raise) between capturing the LLM exception and returning
-    it, so their callers (translate_routes.py's router_only_all_mode
-    branch, and the /api/summarize-results route) call
-    format_llm_error_for_user() directly on the raw exception instead -
+    anything else ambiguous in their scope between capturing the LLM
+    exception and returning it (summarize_all_mode_results' own schema
+    fetch, via _build_all_mode_schema_block, happens BEFORE this retry
+    loop even starts, and get_database_schema() never raises regardless -
+    see its own docstring), so their callers (translate_routes.py's
+    router_only_all_mode branch, and the /api/summarize-results route)
+    call format_llm_error_for_user() directly on the raw exception instead -
     one fewer layer of indirection where it isn't needed."""
     pass
 
@@ -827,14 +844,76 @@ def format_results_table_text(columns, rows, max_rows=500):
     return text
 
 
+def _render_history_result_block(index, res):
+    """Render one turn's per-statement history-results entry as text. A
+    failed statement/connection is shaped {error, ...} (see client.js's
+    summarizeResultForHistory) rather than {columns, rows, rowCount} -
+    previously that shape fell through this code silently as a blank
+    "Columns: \nTotal Rows: 0" block, losing the error text entirely. Now
+    an error entry renders its actual error message instead."""
+    if 'error' in res:
+        header = f"[Query Result {index + 1} - failed]"
+        return header + "\n" + f"Error: {res.get('error')}"
+    cols = res.get('columns') or []
+    rws = res.get('rows') or []
+    row_count = res.get('rowCount', len(rws))
+    shown_rows = min(len(rws), HISTORY_RESULT_MAX_ROWS)
+    header = f"[Query Result {index + 1} - {row_count} row(s) total, showing {shown_rows}]"
+    return header + "\n" + format_results_table_text(cols, rws, max_rows=HISTORY_RESULT_MAX_ROWS)
+
+
+def _build_history_combined_text(msg):
+    """Build the full text for one client-supplied history turn: the base
+    {role, text} text, any per-statement `results` (or errors - see
+    _render_history_result_block above) from that turn's execution, and
+    finally that turn's own stored summary, so a later turn's LLM call sees
+    not just the raw data/errors but what was actually told to the user
+    about them.
+
+    The summary comes from one of two places depending on which mode the
+    turn was: single-connection turns carry it directly as `summary`
+    (mirroring pending.entry.summary / modelEntry.summary in client.js);
+    all-mode turns carry it nested under `allMode.routingMessage` - that
+    field starts out (in captureAllModeHistory's caller) as the triage
+    routing message, but is overwritten with the real Phase C summary text
+    before the turn is persisted to history (see the
+    `notes.routingMessage = summaryEntry.text` assignment in client.js just
+    before captureAllModeHistory() is called), so by the time it reaches
+    here it IS the summary, not the routing message.
+
+    Without this, build_gemini_history_contents/build_claude_history_
+    messages/build_openai_history_messages below only ever read the raw
+    columns/rows/rowCount/error data for a past turn - the explanation the
+    user actually saw (which may highlight things not obvious from the raw
+    data/error alone) was silently unavailable to later turns."""
+    text = msg.get("text") or ""
+    combined_text = text
+
+    hist_results = msg.get("results")
+    if hist_results:
+        result_blocks = [_render_history_result_block(i, res) for i, res in enumerate(hist_results)]
+        combined_text = combined_text + "\n\n" + "\n\n".join(result_blocks)
+
+    summary_text = msg.get("summary")
+    if not summary_text:
+        all_mode = msg.get("allMode")
+        if all_mode:
+            summary_text = all_mode.get("routingMessage")
+    if summary_text:
+        combined_text = combined_text + "\n\n[Summary given to the user]\n" + summary_text
+
+    return combined_text
+
+
 def build_gemini_history_contents(history):
     """
     Turn the client-supplied chat history into Gemini `types.Content` objects.
     Each history message is {role, text} and may optionally carry a `results`
     list - one entry per SQL statement that was executed for that turn, each
-    shaped like {columns, rows, rowCount}. When present, the actual query
-    results are appended to that turn's text so later turns retain context
-    on what data was actually returned, not just what SQL/text was said.
+    shaped like {columns, rows, rowCount} or {error} - and/or a stored
+    summary (`summary`, or `allMode.routingMessage` for all-mode turns). See
+    _build_history_combined_text above for exactly how these are combined
+    into that turn's text.
     """
     contents = []
     for msg in history:
@@ -843,18 +922,7 @@ def build_gemini_history_contents(history):
         if not (role and text):
             continue
 
-        combined_text = text
-        hist_results = msg.get("results")
-        if hist_results:
-            result_blocks = []
-            for i, res in enumerate(hist_results):
-                cols = res.get('columns') or []
-                rws = res.get('rows') or []
-                row_count = res.get('rowCount', len(rws))
-                shown_rows = min(len(rws), HISTORY_RESULT_MAX_ROWS)
-                header = f"[Query Result {i + 1} - {row_count} row(s) total, showing {shown_rows}]"
-                result_blocks.append(header + "\n" + format_results_table_text(cols, rws, max_rows=HISTORY_RESULT_MAX_ROWS))
-            combined_text = combined_text + "\n\n" + "\n\n".join(result_blocks)
+        combined_text = _build_history_combined_text(msg)
 
         contents.append(
             types.Content(
@@ -869,8 +937,9 @@ def build_claude_history_messages(history):
     """Same purpose as build_gemini_history_contents above, targeting
     Claude's message shape instead: a plain list of {"role", "content"}
     dicts. Gemini's "model" role becomes Claude's "assistant"; "user" is
-    unchanged. The results-appending logic is identical to the Gemini
-    version - only the returned container shape differs."""
+    unchanged. The results/error/summary-appending logic is identical to
+    the Gemini version (see _build_history_combined_text) - only the
+    returned container shape differs."""
     messages = []
     for msg in history:
         role = msg.get("role")
@@ -878,18 +947,7 @@ def build_claude_history_messages(history):
         if not (role and text):
             continue
 
-        combined_text = text
-        hist_results = msg.get("results")
-        if hist_results:
-            result_blocks = []
-            for i, res in enumerate(hist_results):
-                cols = res.get('columns') or []
-                rws = res.get('rows') or []
-                row_count = res.get('rowCount', len(rws))
-                shown_rows = min(len(rws), HISTORY_RESULT_MAX_ROWS)
-                header = f"[Query Result {i + 1} - {row_count} row(s) total, showing {shown_rows}]"
-                result_blocks.append(header + "\n" + format_results_table_text(cols, rws, max_rows=HISTORY_RESULT_MAX_ROWS))
-            combined_text = combined_text + "\n\n" + "\n\n".join(result_blocks)
+        combined_text = _build_history_combined_text(msg)
 
         messages.append({
             "role": "assistant" if role == "model" else role,
@@ -906,9 +964,10 @@ def build_openai_history_messages(history):
     plain string for `content` (EasyInputMessageParam) rather than
     requiring Chat-Completions-style message objects. Gemini's "model" role
     becomes "assistant" (same mapping as Claude's); "user" is unchanged.
-    The results-appending logic is identical to the other two providers'
-    versions - only the returned container shape (a plain dict, not a
-    types.Content) differs from Gemini's."""
+    The results/error/summary-appending logic is identical to the other two
+    providers' versions (see _build_history_combined_text) - only the
+    returned container shape (a plain dict, not a types.Content) differs
+    from Gemini's."""
     messages = []
     for msg in history:
         role = msg.get("role")
@@ -916,18 +975,7 @@ def build_openai_history_messages(history):
         if not (role and text):
             continue
 
-        combined_text = text
-        hist_results = msg.get("results")
-        if hist_results:
-            result_blocks = []
-            for i, res in enumerate(hist_results):
-                cols = res.get('columns') or []
-                rws = res.get('rows') or []
-                row_count = res.get('rowCount', len(rws))
-                shown_rows = min(len(rws), HISTORY_RESULT_MAX_ROWS)
-                header = f"[Query Result {i + 1} - {row_count} row(s) total, showing {shown_rows}]"
-                result_blocks.append(header + "\n" + format_results_table_text(cols, rws, max_rows=HISTORY_RESULT_MAX_ROWS))
-            combined_text = combined_text + "\n\n" + "\n\n".join(result_blocks)
+        combined_text = _build_history_combined_text(msg)
 
         messages.append({
             "role": "assistant" if role == "model" else role,
@@ -2073,11 +2121,15 @@ _SUMMARY_SYSTEM_INSTRUCTION = (
     "below - never an index or a label like \"Database 1\" - followed by a colon, e.g. \"**Sales "
     "Postgres:** ...\". Separate paragraphs with a single blank line. Keep every paragraph brief - one or "
     "two sentences - even if the underlying result set is large: this is a summary, not a report. If a "
-    "database noted it had nothing relevant or failed, say so in one short sentence rather than skipping "
-    "it silently, so the user can see every database was actually considered. Only if the question "
-    "genuinely asks for a single figure or conclusion combined across databases (e.g. a grand total), add "
-    "ONE final short paragraph with that combined answer after the per-database ones - otherwise leave it "
-    "out entirely; do not restate or recap the per-database paragraphs a second time.\n"
+    "database noted it had nothing relevant, say so in one short sentence rather than skipping it "
+    "silently, so the user can see every database was actually considered. If a database's query instead "
+    "failed with an error, don't just note that it failed - briefly explain, in plain language, what the "
+    "error suggests actually went wrong (e.g. a permissions problem, a timeout, an ambiguous or "
+    "unsupported request) and, if it's apparent from the error text, what could fix it, so the user "
+    "understands the failure instead of only knowing that one occurred. Only if the question genuinely "
+    "asks for a single figure or conclusion combined across databases (e.g. a grand total), add ONE final "
+    "short paragraph with that combined answer after the per-database ones - otherwise leave it out "
+    "entirely; do not restate or recap the per-database paragraphs a second time.\n"
     "Respond with plain text only - no SQL, no markdown tables, no code fences, no bullet points, no "
     "other headings. The leading translated label line and the bold database-name lead-in above are the "
     "only formatting to use.\n"
@@ -2088,18 +2140,39 @@ _SUMMARY_SYSTEM_INSTRUCTION = (
 
 def _build_summary_prompt(user_question, database_results, expected_language_code=None):
     """Renders `database_results` - client-submitted
-    [{"name", "columns", "rows", "rowCount"} | {"name", "note"} |
-    {"name", "error"}, ...], one entry per statement result/note/failure
-    Phase B + the client's own /api/execute call produced for a "route"
-    outcome turn - into one labeled text block per entry for Phase C's
-    summarization call above.
+    [{"name", "sql", "columns", "rows", "rowCount"} | {"name", "note"} |
+    {"name", "error"} | {"name", "sql", "error"}, ...], one entry per
+    statement result/note/failure Phase B + the client's own /api/execute
+    call produced for a "route" outcome turn - into the prompt for Phase
+    C's summarization call above: a "SQL executed for each database"
+    section (Gap 4 of "Turn History Handling in Datalect" - previously
+    Phase C had no SQL in its prompt at all, only the raw results/errors,
+    despite the design's own LLM-3 input spec calling for "generated SQL
+    for all in-scope databases"), followed by one labeled results block
+    per entry, same as before. A note/generation-failure entry has no
+    `sql` (nothing was ever generated to run for it) and is simply
+    skipped in the SQL section, same as it's already skipped from having
+    a results block below.
 
-    Real result rows reuse format_results_table_text/HISTORY_RESULT_
-    MAX_ROWS - the exact same cap already applied when a PAST turn's
-    results are fed back into a prompt as chat history (see
-    build_gemini_history_contents's docstring): an oversized result set
-    blowing the prompt's token budget is exactly the same risk here,
-    for exactly the same reason.
+    Real result rows are capped at SUMMARY_RESULTS_MAX_ROWS (Gap 5's fix
+    made this call reason over "the complete results/errors from all tabs
+    and databases" per the design doc, matching _build_single_summary_
+    prompt's own equivalent cap below - but "complete" with no ceiling at
+    all is an abuse/cost vector once every row is actually being sent to
+    an LLM call: a single wide `SELECT *` against a huge table would blow
+    the prompt out to an enormous token count on this ONE turn alone, no
+    history multiplier even needed. SUMMARY_RESULTS_MAX_ROWS is
+    deliberately a SEPARATE, far more generous constant than
+    HISTORY_RESULT_MAX_ROWS above (see its own definition/comment) - that
+    one bounds how much of old, already-summarized history gets replayed
+    turn after turn; this one bounds the CURRENT turn's own data, being
+    reasoned over exactly once, for exactly the purpose of producing the
+    summary that (once persisted - see captureAllModeHistory in client.js)
+    is what future turns actually see instead. When a result set is
+    actually truncated, the header names both the real total row count and
+    how many are shown, so the model - and, since the header text ends up
+    in the summary that's replayed as history, later turns too - isn't
+    misled into thinking it saw everything.
 
     `expected_language_code` is _detect_language(user_question)'s result,
     computed once by the caller (summarize_all_mode_results) and threaded
@@ -2109,6 +2182,15 @@ def _build_summary_prompt(user_question, database_results, expected_language_cod
     verification section comment above _SUMMARY_SYSTEM_INSTRUCTION for
     why. None (detection unavailable or too low-confidence to trust)
     leaves the reminder exactly as it always was."""
+    sql_blocks = []
+    for entry in (database_results or []):
+        sql = entry.get("sql")
+        if sql:
+            name = entry.get("name") or "Unknown database"
+            sql_blocks.append(f"{name}:\n{sql}")
+    sql_joiner = "\n\n"
+    sql_section = f"SQL executed for each database:\n\n{sql_joiner.join(sql_blocks)}\n\n" if sql_blocks else ""
+
     blocks = []
     for entry in (database_results or []):
         name = entry.get("name") or "Unknown database"
@@ -2122,9 +2204,13 @@ def _build_summary_prompt(user_question, database_results, expected_language_cod
             cols = entry.get("columns") or []
             rows = entry.get("rows") or []
             row_count = entry.get("rowCount", len(rows))
-            shown_rows = min(len(rows), HISTORY_RESULT_MAX_ROWS)
-            header = f"{name} - {row_count} row(s) total, showing {shown_rows}:"
-            blocks.append(header + "\n" + format_results_table_text(cols, rows, max_rows=HISTORY_RESULT_MAX_ROWS))
+            shown_rows = min(len(rows), SUMMARY_RESULTS_MAX_ROWS)
+            header = (
+                f"{name} - {row_count} row(s):"
+                if shown_rows >= row_count
+                else f"{name} - {row_count} row(s) total, showing the first {shown_rows}:"
+            )
+            blocks.append(header + "\n" + format_results_table_text(cols, rows, max_rows=SUMMARY_RESULTS_MAX_ROWS))
     results_text = "\n\n".join(blocks) if blocks else "(no databases returned anything)"
     # The trailing reminder repeats _SUMMARY_SYSTEM_INSTRUCTION's own
     # language-matching rule right here, at the very end of the actual
@@ -2149,6 +2235,7 @@ def _build_summary_prompt(user_question, database_results, expected_language_cod
     )
     return (
         f"Original question: {user_question}\n\n"
+        f"{sql_section}"
         f"Results gathered from each database queried to help answer it:\n\n{results_text}\n\n"
         "Reminder: write your response - the label line AND every paragraph - in the SAME "
         "LANGUAGE as the \"Original question\" above, no matter what language the database/table "
@@ -2201,6 +2288,25 @@ def _summarize_with_retry(prompt_content, schema_block, system_instruction, prov
     thread through a fresh call each time this fires. `log_label` only
     changes what appears in the logger.warning() calls below, so log
     lines stay distinguishable between callers.
+
+    GENERATOR, same idiom as generate_sql_for_connection/triage_all_mode_
+    question: every time the retry loop below actually rotates a key or
+    waits out a transient error, this yields a fully wire-encoded NDJSON
+    progress line (`json.dumps({"status": "retrying", ...}) + "\\n"`).
+    This is newer than the retry/rotation POLICY itself (see the previous
+    paragraph) - the policy was added first, purely server-side, with
+    nothing surfaced to the client; a slow/rate-limited summarization call
+    could silently sit in a multi-second TRANSLATION_RETRY_DELAY_SECONDS
+    wait with the "Summarizing results…" banner frozen, indistinguishable
+    from a hang. Both direct callers (summarize_all_mode_results,
+    summarize_single_connection_results) forward these via `return (yield
+    from _summarize_with_retry(...))`, and both routes that call THEM
+    (/api/summarize-results, /api/summarize-result) forward them again the
+    same way, all the way out to the client's existing generic 'retrying'
+    handling - no new client-side event kind, just a new source for the
+    same one. A caller with nowhere live to forward into (e.g. a unit test
+    calling this directly) drains it with the same _drain_generation
+    helper generate_sql_for_connection's own direct callers already use.
 
     On total failure (LLM call retry/rotation budget exhausted, or 2
     consecutive content-invalid responses) returns (None, None, error) -
@@ -2282,6 +2388,20 @@ def _summarize_with_retry(prompt_content, schema_block, system_instruction, prov
                         "%s call failed (%d/%d configured keys tried), rotating API key and retrying immediately: %s",
                         log_label, len(tried_keys), key_pool_size, e,
                     )
+                    # Told to the client before continuing - see this
+                    # function's own module-level neighbor
+                    # generate_sql_for_connection's identical line, and this
+                    # function's docstring below on why this loop now yields
+                    # at all (it didn't used to: this call had no live
+                    # progress reporting even after retry/key-rotation was
+                    # added to its policy).
+                    yield json.dumps({
+                        "status": "retrying",
+                        "attempt": len(tried_keys),
+                        "maxAttempts": key_pool_size,
+                        "delaySeconds": 0,
+                        "rotatedKey": True,
+                    }) + "\n"
                     continue
 
                 if transient_attempt >= MAX_TRANSLATION_ATTEMPTS:
@@ -2291,6 +2411,15 @@ def _summarize_with_retry(prompt_content, schema_block, system_instruction, prov
                     "%s call failed (attempt %d/%d), retrying in %ds: %s",
                     log_label, transient_attempt, MAX_TRANSLATION_ATTEMPTS, retry_action["delay"], e,
                 )
+                # Told to the client before sleeping, not after - same
+                # reasoning as generate_sql_for_connection's identical line.
+                yield json.dumps({
+                    "status": "retrying",
+                    "attempt": transient_attempt + 1,
+                    "maxAttempts": MAX_TRANSLATION_ATTEMPTS,
+                    "delaySeconds": retry_action["delay"],
+                    "rotatedKey": False,
+                }) + "\n"
                 transient_attempt += 1
                 if retry_action["delay"]:
                     time.sleep(retry_action["delay"])
@@ -2350,7 +2479,61 @@ def _summarize_with_retry(prompt_content, schema_block, system_instruction, prov
     return None, None, last_error
 
 
-def summarize_all_mode_results(user_question, database_results, provider, client, model,
+def _build_all_mode_schema_block(database_results, user_identity):
+    """Resolves and renders each unique in-scope database referenced in
+    `database_results` (one entry per statement result/note/failure - see
+    _build_summary_prompt's own docstring for the exact shape) into a
+    single schema_block for Phase C's LLM call. Gap 4 of "Turn History
+    Handling in Datalect": previously Phase C always ran with
+    schema_block="" - literally no schema at all - even though the
+    design's own LLM-3 input spec calls for "detailed database schema for
+    all in-scope databases".
+
+    Each unique (kind, id) pair is resolved via resolve_descriptor_by_
+    reference - the same {kind, id}-only trust boundary translate_routes.py/
+    execute_routes.py already use everywhere else (never raw descriptors/
+    credentials sent by the client) - then its schema is fetched via the
+    same cached get_database_schema() Phase B/single-connection mode
+    already use, so this costs nothing beyond a cache lookup for a
+    connection Phase B just fetched moments earlier in this same turn. A
+    reference that no longer resolves (a preset removed, or a custom
+    connection deleted, in the moments since triage/Phase B ran) is
+    silently skipped, same leniency resolve_in_scope_descriptors already
+    applies elsewhere - one missing schema shouldn't block summarizing the
+    other databases that did resolve.
+
+    `user_identity` falsy (a caller with no real session to resolve
+    against - e.g. a unit test exercising summarize_all_mode_results()
+    directly) returns "" - the exact schema-less prompt this call always
+    sent before Gap 4, rather than raising."""
+    if not user_identity:
+        return ""
+    names_by_key = {}
+    order = []
+    for entry in (database_results or []):
+        kind = entry.get("kind")
+        ref_id = entry.get("id")
+        if not kind or ref_id is None:
+            continue
+        key = (kind, ref_id)
+        if key not in names_by_key:
+            names_by_key[key] = entry.get("name") or "Unknown database"
+            order.append(key)
+
+    blocks = []
+    for key in order:
+        kind, ref_id = key
+        descriptor, _resolved_name = resolve_descriptor_by_reference(kind, ref_id, user_identity)
+        if descriptor is None:
+            continue
+        schema = get_database_schema(descriptor, user_identity)
+        blocks.append(f"{names_by_key[key]}:\n{schema}")
+    if not blocks:
+        return ""
+    return "Database schema for each database queried:\n\n" + "\n\n".join(blocks) + "\n\n"
+
+
+def summarize_all_mode_results(user_question, database_results, provider, client, model, user_identity=None,
                                 api_key=None, tried_keys=None, using_byok=False):
     """"All databases" mode's Phase C - see the section comment above for
     the fuller picture of when/why this runs. A brief, plain-text answer
@@ -2364,17 +2547,30 @@ def summarize_all_mode_results(user_question, database_results, provider, client
     retry, nested transient-error/key-rotation retry) now lives in the
     shared _summarize_with_retry() above - see its docstring for the full
     reasoning. This function's own job is just building the Phase-C-
-    specific prompt/system instruction and delegating to it.
+    specific prompt/schema_block/system instruction and delegating to it.
+
+    `user_identity` (new - Gap 4) is what lets this build a real
+    schema_block via _build_all_mode_schema_block above instead of the
+    permanently-empty "" every call used to pass; defaults to None (and
+    therefore an empty schema_block, unchanged from before Gap 4) for a
+    caller with no real session to resolve connections against.
+
+    GENERATOR (see _summarize_with_retry's own docstring): `yield from`s
+    that function directly, so its live 'retrying' progress lines pass
+    straight through unchanged - this function adds none of its own, it
+    just builds the Phase-C-specific prompt/schema_block ahead of
+    delegating.
 
     Returns (text, usage, error) - see _summarize_with_retry's docstring
     for the exact meaning of each on success/failure."""
     expected_language_code = _detect_language(user_question)
     prompt_content = _build_summary_prompt(user_question, database_results, expected_language_code)
-    return _summarize_with_retry(
-        prompt_content, "", _SUMMARY_SYSTEM_INSTRUCTION, provider, client, model,
+    schema_block = _build_all_mode_schema_block(database_results, user_identity)
+    return (yield from _summarize_with_retry(
+        prompt_content, schema_block, _SUMMARY_SYSTEM_INSTRUCTION, provider, client, model,
         api_key=api_key, tried_keys=tried_keys, using_byok=using_byok,
         log_label="Phase C summarization", expected_language_code=expected_language_code,
-    )
+    ))
 
 
 @translate_bp.route('/api/summarize-results', methods=['POST'])
@@ -2383,7 +2579,32 @@ def summarize_results():
     full picture. Called by the client exactly once per "route" outcome
     turn, only after /api/execute has actually run every database Phase B
     selected (never for a single-connection session - client.js only ever
-    calls this from executeSql()'s router_route handling)."""
+    calls this from executeSql()'s router_route handling).
+
+    Streams newline-delimited JSON (NDJSON), same contract as /api/
+    translate (see that route's module docstring) and for the same
+    reason: summarize_all_mode_results()'s own retry loop
+    (_summarize_with_retry, see its docstring) can now genuinely take
+    several real seconds - a transient-error wait, possibly a key
+    rotation first - and previously nothing reached the client during
+    that wait at all; the "Summarizing results…" banner just sat there
+    frozen, indistinguishable from a hang. Zero or more
+    {"status": "retrying", "attempt": <next attempt #>, "maxAttempts": N,
+     "delaySeconds": <float>, "rotatedKey": <bool>} lines are emitted live
+    as that retry loop runs - client.js needs no changes to show these,
+    since 'retrying' is already handled generically by its existing
+    dispatcher, regardless of which server-side call produced the line -
+    followed by exactly one terminal line:
+      {"status": "done", "success": true, "summary": "..."}
+      or, on failure (retry/rotation budget exhausted, or 2 consecutive
+      content-invalid responses):
+      {"status": "done", "success": false, "error": "..."}
+    The two early-validation returns below (missing API key, missing
+    prompt/database_results) happen before any of this and keep their
+    real plain-JSON 400 responses, exactly as /api/translate's own two
+    early-validation cases do - nothing has streamed yet at that point,
+    so there's no reason to pay the NDJSON/chunked-response cost for a
+    request that never even reaches the retry loop."""
     session_id = get_or_create_session_id()
     user_identity = get_current_user_identity(session_id)
     data = request.get_json() or {}
@@ -2406,53 +2627,56 @@ def summarize_results():
         resp = jsonify({'success': False, 'error': 'prompt and database_results are required'})
         return apply_session_cookie(resp, session_id), 400
 
-    start_time = time.perf_counter()
-    client = provider.make_client(api_key)
-    cancel_token = cancel_handle = None
-    close_fn = getattr(client, "close", None)
-    if callable(close_fn):
-        cancel_token, cancel_handle = cancel_registry.register(session_id, close_fn)
-    try:
-        text, usage, error = summarize_all_mode_results(
-            prompt, database_results, provider, client, llm_model, api_key=api_key,
-            using_byok=bool(byok_key),
+    def stream_summarize_results():
+        start_time = time.perf_counter()
+        client = provider.make_client(api_key)
+        cancel_token = cancel_handle = None
+        close_fn = getattr(client, "close", None)
+        if callable(close_fn):
+            cancel_token, cancel_handle = cancel_registry.register(session_id, close_fn)
+        try:
+            text, usage, error = yield from summarize_all_mode_results(
+                prompt, database_results, provider, client, llm_model, user_identity=user_identity,
+                api_key=api_key, using_byok=bool(byok_key),
+            )
+        finally:
+            if cancel_token is not None:
+                cancel_registry.unregister(session_id, cancel_token)
+            if cancel_handle is not None:
+                cancel_handle.close()
+        duration = round(1000 * (time.perf_counter() - start_time))
+
+        if text is None:
+            # `error` is the raw exception when the LLM call itself is what
+            # failed (see summarize_all_mode_results' docstring) - format that
+            # honestly, same as every other LLM-call failure in this app now
+            # does. The other case (2 consecutive content-invalid responses,
+            # nothing wrong at the API level) has no exception to report, so
+            # it keeps the original generic message instead.
+            error_message = (
+                format_llm_error_for_user(provider, llm_model, error, using_byok=bool(byok_key))
+                if isinstance(error, BaseException) else
+                'Unable to summarize results right now.'
+            )
+            yield json.dumps({'status': 'done', 'success': False, 'error': error_message}) + "\n"
+            return
+
+        summary_text = "*** NO SQL *** " + text
+        usage_dict = usage or {}
+        # Logged the same way Phase A's own triage call is (see
+        # record_all_databases_triage's docstring) - "All Databases"/
+        # "All Databases" rather than any one real connection, since this call
+        # is likewise never "about" just one specific database.
+        record_all_databases_triage(
+            user_identity, prompt, summary_text, llm_model, duration,
+            usage_dict.get("input_tokens", 0), usage_dict.get("output_tokens", 0),
+            usage_dict.get("total_tokens", 0), usage_dict.get("thinking_tokens", 0),
+            usage_dict.get("cached_content_tokens", 0),
         )
-    finally:
-        if cancel_token is not None:
-            cancel_registry.unregister(session_id, cancel_token)
-        if cancel_handle is not None:
-            cancel_handle.close()
-    duration = round(1000 * (time.perf_counter() - start_time))
 
-    if text is None:
-        # `error` is the raw exception when the LLM call itself is what
-        # failed (see summarize_all_mode_results' docstring) - format that
-        # honestly, same as every other LLM-call failure in this app now
-        # does. The other case (2 consecutive content-invalid responses,
-        # nothing wrong at the API level) has no exception to report, so
-        # it keeps the original generic message instead.
-        error_message = (
-            format_llm_error_for_user(provider, llm_model, error, using_byok=bool(byok_key))
-            if isinstance(error, BaseException) else
-            'Unable to summarize results right now.'
-        )
-        resp = jsonify({'success': False, 'error': error_message})
-        return apply_session_cookie(resp, session_id)
+        yield json.dumps({'status': 'done', 'success': True, 'summary': summary_text}) + "\n"
 
-    summary_text = "*** NO SQL *** " + text
-    usage = usage or {}
-    # Logged the same way Phase A's own triage call is (see
-    # record_all_databases_triage's docstring) - "All Databases"/
-    # "All Databases" rather than any one real connection, since this call
-    # is likewise never "about" just one specific database.
-    record_all_databases_triage(
-        user_identity, prompt, summary_text, llm_model, duration,
-        usage.get("input_tokens", 0), usage.get("output_tokens", 0),
-        usage.get("total_tokens", 0), usage.get("thinking_tokens", 0),
-        usage.get("cached_content_tokens", 0),
-    )
-
-    resp = jsonify({'success': True, 'summary': summary_text})
+    resp = Response(stream_with_context(stream_summarize_results()), mimetype='application/x-ndjson')
     return apply_session_cookie(resp, session_id)
 
 
@@ -2462,11 +2686,15 @@ def summarize_results():
 # - see that section's own comment for the general shape/reasoning this
 # mirrors. Once a single-connection turn's generated SQL has actually been
 # executed (client.js's executeSql()), a SEPARATE LLM call is made with the
-# original question, the schema, the SQL that ran, and every row it
-# returned - untruncated, unlike Phase C's own HISTORY_RESULT_MAX_ROWS cap
-# (explicit product decision: a single connection's own result set is
-# exactly what this call exists to reason over in full) - and asked to
-# both answer the question and call out actionable insight, not just
+# original question, the schema, the SQL that ran, and up to
+# SUMMARY_RESULTS_MAX_ROWS rows of what it returned (explicit product
+# decision: this call exists to reason over the current turn's own result
+# set, exactly like Phase C now does too - see _build_summary_prompt's own
+# docstring for why that's a separate, far more generous cap than
+# HISTORY_RESULT_MAX_ROWS, and SUMMARY_RESULTS_MAX_ROWS's own definition
+# comment above for why a real ceiling is needed at all now that every row
+# is actually sent to this call) - and asked to both answer the question and
+# call out actionable insight, not just
 # restate the data. Skipped entirely by the client when the LLM instead
 # answered directly via the "*** NO SQL ***" convention (nothing was
 # executed, so nothing to summarize). Same best-effort posture as Phase C:
@@ -2475,9 +2703,11 @@ def summarize_results():
 # treating a nice-to-have's failure as a turn failure.
 
 _SINGLE_SUMMARY_SYSTEM_INSTRUCTION = (
-    "You previously helped translate a user's natural-language question into a real SQL query, and that "
-    "query has now actually been run against the database. You will be given the user's ORIGINAL question, "
-    "the database schema, the SQL that was executed, and its actual result rows.\n"
+    "You previously helped translate a user's natural-language question into a real SQL query - possibly "
+    "more than one statement - and it has now actually been run against the database. You will be given "
+    "the user's ORIGINAL question, the database schema, the SQL that was executed, and the outcome of "
+    "each statement that ran: exactly one of its actual result rows, a note that it returned nothing "
+    "useful, or an error explaining that it failed to execute.\n"
     "CRITICAL, before anything else: your ENTIRE response - the label line below AND every paragraph that "
     "follows it - MUST be written in the SAME LANGUAGE as the user's original question, never the language "
     "of the schema/table names or of the results data you're given, and never any other language. This "
@@ -2498,7 +2728,12 @@ _SINGLE_SUMMARY_SYSTEM_INSTRUCTION = (
     "SPECIFIC results - not generic advice unrelated to what the data actually shows. Keep it concise - a "
     "few short paragraphs - even if the result set is large: this is a summary with insight, not a report. "
     "If the results are empty or don't actually answer the question, say so plainly rather than inventing "
-    "an answer.\n"
+    "an answer. If a statement instead failed with an error, don't just report that it failed - briefly "
+    "explain, in plain language, what the error suggests actually went wrong (e.g. a permissions problem, "
+    "a timeout, an ambiguous or unsupported request) and, if it's apparent from the error text, what could "
+    "fix it, so the user understands the failure instead of only knowing that one occurred. When some "
+    "statements succeeded and others failed, address both: summarize what the successful ones show, and "
+    "explain the failure(s) alongside that, rather than covering only one or the other.\n"
     "Respond with plain text only - no SQL, no markdown tables, no code fences, no bullet points, no "
     "other headings. The leading translated label line is the only formatting to use.\n"
     "One final reminder, since it's the single most important rule above: the language of your response "
@@ -2512,12 +2747,14 @@ def _build_single_summary_prompt(user_question, sql, statement_results, expected
     /api/execute actually ran for this turn - into one labeled text block
     per statement for the single-connection summarization call above.
 
-    Deliberately UNTRUNCATED: every row of every statement's results is
-    included (format_results_table_text called with max_rows=None, whose
-    `rows[:None]` slice is the full list) - unlike _build_summary_prompt's
-    own HISTORY_RESULT_MAX_ROWS cap above, per this feature's explicit
-    product requirement that a single connection's own results are never
-    truncated here.
+    Real result rows are capped at SUMMARY_RESULTS_MAX_ROWS, the same
+    abuse/cost-protection cap _build_summary_prompt's own docstring
+    explains above (a SEPARATE, far more generous constant than
+    HISTORY_RESULT_MAX_ROWS - see SUMMARY_RESULTS_MAX_ROWS's own
+    definition comment). When a statement's results are actually
+    truncated, the header names both the real total row count and how
+    many are shown, so the model isn't misled into thinking it saw
+    everything.
 
     `expected_language_code` - see _build_summary_prompt's own docstring
     for what this is and why it's threaded through from the caller rather
@@ -2534,8 +2771,13 @@ def _build_single_summary_prompt(user_question, sql, statement_results, expected
             cols = entry.get("columns") or []
             rows = entry.get("rows") or []
             row_count = entry.get("rowCount", len(rows))
-            header = f"Query Result {i + 1} - {row_count} row(s):"
-            blocks.append(header + "\n" + format_results_table_text(cols, rows, max_rows=None))
+            shown_rows = min(len(rows), SUMMARY_RESULTS_MAX_ROWS)
+            header = (
+                f"Query Result {i + 1} - {row_count} row(s):"
+                if shown_rows >= row_count
+                else f"Query Result {i + 1} - {row_count} row(s) total, showing the first {shown_rows}:"
+            )
+            blocks.append(header + "\n" + format_results_table_text(cols, rows, max_rows=SUMMARY_RESULTS_MAX_ROWS))
     results_text = "\n\n".join(blocks) if blocks else "(no rows returned)"
     # Same reinforcement-at-the-end rationale as _build_summary_prompt's own
     # trailing reminder above - see that function's comment, and see its
@@ -2566,25 +2808,30 @@ def summarize_single_connection_results(user_question, schema, sql, statement_re
     _summarize_with_retry's docstring for the shared retry/key-rotation
     policy both this and summarize_all_mode_results now go through.
 
-    Unlike Phase C (which has no schema at all, and no single SQL
-    statement to point to - it summarizes across possibly several
-    databases), this call has a real schema and a real, already-executed
-    SQL statement for exactly one connection, both of which are given to
-    the model: the schema via build_llm_input's own schema_block
-    parameter (same cache-friendly placement translate_query()'s single-
-    connection path already uses - schema ahead of the (empty, here)
-    history and the new prompt), and the SQL/results via
-    _build_single_summary_prompt.
+    Unlike Phase C (which has no single SQL statement to point to - it
+    summarizes across possibly several databases, each with its own
+    schema and its own generated SQL - see _build_all_mode_schema_block/
+    _build_summary_prompt's SQL section), this call has a real schema and
+    a real, already-executed SQL statement for exactly one connection,
+    both of which are given to the model: the schema via build_llm_input's
+    own schema_block parameter (same cache-friendly placement
+    translate_query()'s single-connection path already uses - schema
+    ahead of the (empty, here) history and the new prompt), and the SQL/
+    results via _build_single_summary_prompt.
+
+    GENERATOR (see _summarize_with_retry's own docstring): `yield from`s
+    that function directly, so its live 'retrying' progress lines pass
+    straight through unchanged - this function adds none of its own.
 
     Returns (text, usage, error) - see _summarize_with_retry's docstring
     for the exact meaning of each on success/failure."""
     expected_language_code = _detect_language(user_question)
     prompt_content = _build_single_summary_prompt(user_question, sql, statement_results, expected_language_code)
-    return _summarize_with_retry(
+    return (yield from _summarize_with_retry(
         prompt_content, f"Database Schema:\n{schema}\n\n", _SINGLE_SUMMARY_SYSTEM_INSTRUCTION, provider, client, model,
         api_key=api_key, tried_keys=tried_keys, using_byok=using_byok,
         log_label="Single-connection results summarization", expected_language_code=expected_language_code,
-    )
+    ))
 
 
 @translate_bp.route('/api/summarize-result', methods=['POST'])
@@ -2596,7 +2843,17 @@ def summarize_result():
     outcome turn (that already gets its own Phase C summary via
     /api/summarize-results above) and never when the LLM answered
     directly via the "*** NO SQL ***" convention (nothing was executed,
-    so nothing to summarize)."""
+    so nothing to summarize).
+
+    Streams NDJSON, same contract/reasoning as /api/summarize-results
+    above (see that route's docstring) - summarize_single_connection_
+    results shares the exact same underlying retry machinery
+    (_summarize_with_retry), so it needed the exact same fix: zero or
+    more live {"status": "retrying", ...} lines while that retry loop
+    runs, then exactly one terminal {"status": "done", "success": ...,
+    "summary"/"error": ...} line. The two early-validation returns below
+    (missing API key, missing prompt/sql/results) keep their real plain-
+    JSON 400 responses, same as above."""
     session_id = get_or_create_session_id()
     user_identity = get_current_user_identity(session_id)
     data = request.get_json() or {}
@@ -2626,47 +2883,50 @@ def summarize_result():
     conn_str = resolve_conn_str(data.get('database_url'), user_identity)
     schema = get_database_schema(conn_str, user_identity)
 
-    start_time = time.perf_counter()
-    client = provider.make_client(api_key)
-    cancel_token = cancel_handle = None
-    close_fn = getattr(client, "close", None)
-    if callable(close_fn):
-        cancel_token, cancel_handle = cancel_registry.register(session_id, close_fn)
-    try:
-        text, usage, error = summarize_single_connection_results(
-            prompt, schema, sql, statement_results, provider, client, llm_model, api_key=api_key,
-            using_byok=bool(byok_key),
+    def stream_summarize_result():
+        start_time = time.perf_counter()
+        client = provider.make_client(api_key)
+        cancel_token = cancel_handle = None
+        close_fn = getattr(client, "close", None)
+        if callable(close_fn):
+            cancel_token, cancel_handle = cancel_registry.register(session_id, close_fn)
+        try:
+            text, usage, error = yield from summarize_single_connection_results(
+                prompt, schema, sql, statement_results, provider, client, llm_model, api_key=api_key,
+                using_byok=bool(byok_key),
+            )
+        finally:
+            if cancel_token is not None:
+                cancel_registry.unregister(session_id, cancel_token)
+            if cancel_handle is not None:
+                cancel_handle.close()
+        duration = round(1000 * (time.perf_counter() - start_time))
+
+        if text is None:
+            error_message = (
+                format_llm_error_for_user(provider, llm_model, error, using_byok=bool(byok_key))
+                if isinstance(error, BaseException) else
+                'Unable to summarize results right now.'
+            )
+            yield json.dumps({'status': 'done', 'success': False, 'error': error_message}) + "\n"
+            return
+
+        summary_text = "*** NO SQL *** " + text
+        usage_dict = usage or {}
+        # Logged as a real translations-table row against the actual connection
+        # this was run for (unlike Phase C's "All Databases"/"All Databases"
+        # special-case logging - there IS one real connection here), same call
+        # translate_query()'s own single-connection path already uses.
+        record_translation(
+            user_identity, conn_str, prompt, summary_text, llm_model, duration,
+            usage_dict.get("input_tokens", 0), usage_dict.get("output_tokens", 0),
+            usage_dict.get("total_tokens", 0), usage_dict.get("thinking_tokens", 0),
+            usage_dict.get("cached_content_tokens", 0),
         )
-    finally:
-        if cancel_token is not None:
-            cancel_registry.unregister(session_id, cancel_token)
-        if cancel_handle is not None:
-            cancel_handle.close()
-    duration = round(1000 * (time.perf_counter() - start_time))
 
-    if text is None:
-        error_message = (
-            format_llm_error_for_user(provider, llm_model, error, using_byok=bool(byok_key))
-            if isinstance(error, BaseException) else
-            'Unable to summarize results right now.'
-        )
-        resp = jsonify({'success': False, 'error': error_message})
-        return apply_session_cookie(resp, session_id)
+        yield json.dumps({'status': 'done', 'success': True, 'summary': summary_text}) + "\n"
 
-    summary_text = "*** NO SQL *** " + text
-    usage = usage or {}
-    # Logged as a real translations-table row against the actual connection
-    # this was run for (unlike Phase C's "All Databases"/"All Databases"
-    # special-case logging - there IS one real connection here), same call
-    # translate_query()'s own single-connection path already uses.
-    record_translation(
-        user_identity, conn_str, prompt, summary_text, llm_model, duration,
-        usage.get("input_tokens", 0), usage.get("output_tokens", 0),
-        usage.get("total_tokens", 0), usage.get("thinking_tokens", 0),
-        usage.get("cached_content_tokens", 0),
-    )
-
-    resp = jsonify({'success': True, 'summary': summary_text})
+    resp = Response(stream_with_context(stream_summarize_result()), mimetype='application/x-ndjson')
     return apply_session_cookie(resp, session_id)
 
 
@@ -2870,7 +3130,17 @@ def translate_query():
                     "phase": "routing",
                     "message": "Deciding which databases to contact…",
                 }) + "\n"
-                triage_result = triage_all_mode_question(
+                # yield from (not a plain call) - triage_all_mode_question is
+                # now a generator that yields live "retrying" NDJSON lines
+                # whenever its own internal retry loop actually fires (key
+                # rotation or a transient-error wait - see its docstring for
+                # why this used to be invisible to the client). Forwarding
+                # them here means a slow/rate-limited triage call gets the
+                # exact same live feedback the single-connection generate-SQL
+                # retry loop already gives - client.js needs no changes for
+                # this, since 'retrying' is already handled generically
+                # regardless of which server-side call produced it.
+                triage_result = yield from triage_all_mode_question(
                     candidate_summaries, prompt, provider, client, llm_model, history=history,
                     api_key=api_key, using_byok=bool(byok_key),
                 )

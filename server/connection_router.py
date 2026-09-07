@@ -51,7 +51,32 @@ from app_config import logger, MAX_IN_SCOPE_CONNECTIONS, MAX_TRANSLATION_ATTEMPT
 # MAX_DATABASES_PER_QUERY, defaulting to 5) - now there is exactly one
 # "how many databases" knob, used everywhere the concept comes up.
 
-def _build_candidate_prompt(candidate_summaries, user_question):
+def _build_candidate_schema_block(candidate_summaries):
+    """Renders `candidate_summaries` (name/dialect/table-list per in-scope
+    connection - see triage_all_mode_question's own docstring for exactly
+    what this is: names/dialects/table names only, no column-level detail)
+    into its own stable block - analogous to single-connection mode's
+    schema_block (translate_routes.py's generate_sql_for_connection builds
+    the identically-shaped f"Database Schema:\n{schema}\n\n") - meant to be
+    passed to provider.build_llm_input() as ITS schema_block parameter
+    rather than folded into the ever-changing new-prompt text (see
+    _build_candidate_question_prompt below for that).
+
+    This is what lets build_llm_input() place this block ahead of the
+    history vector (see that function's own docstring on exactly where
+    schema_block attaches - prepended to the first historical turn when
+    there is history, folded into the new prompt only when there isn't),
+    matching the design's own LLM-1 input ordering: "<triage system
+    instructions> : <summary database schema of all databases> : <history
+    vector> : <new user prompt>". Previously this text was concatenated
+    directly onto the new user prompt instead (see _build_candidate_
+    question_prompt's own docstring) - functionally the model saw the
+    exact same information either way, but a block that's genuinely
+    stable across a whole session (the same candidates' names/dialects/
+    tables, unchanged turn after turn) ended up re-sent every time as part
+    of the ONE string that changes on every single turn, instead of being
+    its own reusable, cache-friendly prefix - purely a caching-efficiency
+    fix, not a behavior change."""
     lines = ["Candidate database connections:"]
     for i, c in enumerate(candidate_summaries):
         table_names = c.get("table_names") or []
@@ -60,10 +85,15 @@ def _build_candidate_prompt(candidate_summaries, user_question):
             f"[{i}] name={c.get('name')!r} dialect={c.get('dialect')!r} tables={shown}"
         )
     lines.append("")
-    lines.append(f"User question: {user_question}")
-    lines.append("")
-    lines.append("JSON array of relevant candidate indices:")
-    return "\n".join(lines)
+    return "\n".join(lines) + "\n\n"
+
+
+def _build_candidate_question_prompt(user_question):
+    """The ever-changing half of triage's prompt - just the new question
+    itself, now that the stable candidate-summaries block above is built
+    (and placed) separately by _build_candidate_schema_block. See that
+    function's own docstring for why this split exists."""
+    return f"User question: {user_question}\n\nJSON array of relevant candidate indices:"
 
 
 def _strip_markdown_fence(text):
@@ -446,6 +476,37 @@ def triage_all_mode_question(candidate_summaries, user_question, provider, clien
     Gemini key was out of capacity) or the model just replied with
     something unparseable - masking a resource-exhaustion/API condition
     as if the model had simply been unable to understand the question.
+
+    GENERATOR, exactly like generate_sql_for_connection: every time either
+    retry branch below actually fires, this yields a fully wire-encoded
+    NDJSON progress line (`json.dumps({"status": "retrying", ...}) +
+    "\\n"`), in the identical shape stream_translation()'s own inline
+    single-connection retry loop and generate_sql_for_connection already
+    emit. The caller (stream_translation()'s router_only_all_mode branch)
+    forwards these live via `triage_result = yield from
+    triage_all_mode_question(...)` - the exact same idiom
+    _run_phase_b_fanout's `yield from generate_sql_for_connection(...)`
+    uses - so a transient error or key rotation DURING triage is no
+    longer invisible to the user the way it used to be: previously this
+    was the one LLM call in the whole "all databases" pipeline whose own
+    retry loop (below) could genuinely take several real seconds (a
+    TRANSLATION_RETRY_DELAY_SECONDS wait, possibly more than once) with
+    nothing on screen beyond the static "Deciding which databases to
+    contact…" phase_status line emitted once, before this call even
+    started - indistinguishable from a hang. client.js needs no changes
+    to already show this: 'retrying' is handled generically by its
+    existing dispatcher (the same showRetryStatus() the single-connection
+    generate-SQL path's own retry lines already trigger), regardless of
+    which server-side call actually produced the line. A caller with no
+    NDJSON stream to forward into (e.g. a unit test calling this function
+    directly) drains it via _drain_generation below, same as
+    _run_phase_b_fanout does for generate_sql_for_connection's own
+    progress lines when it has nowhere live to forward them either.
+    Returns (via `return`, capturable by `yield from`/_drain_generation)
+    the exact same result shape described above - converting this to a
+    generator changes nothing about what it ultimately produces, only
+    adds the ability to observe progress before that final value arrives.
+
     The two are now distinguished via the "api_error" flag on a "failed"
     outcome:
       api_error=True: the LLM call's own retry budget (key rotation
@@ -489,7 +550,11 @@ def triage_all_mode_question(candidate_summaries, user_question, provider, clien
     calls format_llm_error_for_user() itself (it returns the raw
     exception via "error" instead - see above), so unlike that function
     it has nothing else to do with the flag."""
-    llm_input = provider.build_llm_input(history or [], "", _build_candidate_prompt(candidate_summaries, user_question))
+    llm_input = provider.build_llm_input(
+        history or [],
+        _build_candidate_schema_block(candidate_summaries),
+        _build_candidate_question_prompt(user_question),
+    )
 
     if api_key is None:
         api_key = provider.pick_api_key()
@@ -527,6 +592,17 @@ def triage_all_mode_question(candidate_summaries, user_question, provider, clien
                         "Connection triage call failed (%d/%d configured keys tried), rotating API key and retrying immediately: %s",
                         len(tried_keys), key_pool_size, e,
                     )
+                    # Told to the client before continuing, same as
+                    # generate_sql_for_connection's identical line - see
+                    # this function's docstring for why this loop yields
+                    # at all now.
+                    yield json.dumps({
+                        "status": "retrying",
+                        "attempt": len(tried_keys),
+                        "maxAttempts": key_pool_size,
+                        "delaySeconds": 0,
+                        "rotatedKey": True,
+                    }) + "\n"
                     continue
 
                 if transient_attempt >= MAX_TRANSLATION_ATTEMPTS:
@@ -536,6 +612,15 @@ def triage_all_mode_question(candidate_summaries, user_question, provider, clien
                     "Connection triage call failed (attempt %d/%d), retrying in %ds: %s",
                     transient_attempt, MAX_TRANSLATION_ATTEMPTS, retry_action["delay"], e,
                 )
+                # Told to the client before sleeping, not after - same
+                # reasoning as generate_sql_for_connection's identical line.
+                yield json.dumps({
+                    "status": "retrying",
+                    "attempt": transient_attempt + 1,
+                    "maxAttempts": MAX_TRANSLATION_ATTEMPTS,
+                    "delaySeconds": retry_action["delay"],
+                    "rotatedKey": False,
+                }) + "\n"
                 transient_attempt += 1
                 if retry_action["delay"]:
                     time.sleep(retry_action["delay"])
@@ -562,3 +647,22 @@ def triage_all_mode_question(candidate_summaries, user_question, provider, clien
         "api_error": api_error,
         "error": last_error if api_error else None,
     }
+
+
+def _drain_generation(gen):
+    """Runs a triage_all_mode_question() generator to completion from a
+    plain (non-streaming) context, discarding every yielded 'retrying'
+    progress line and returning the final `return`ed result dict -
+    identical in shape and purpose to translate_routes.py's own
+    _drain_generation (which does the same thing for generate_sql_for_
+    connection/summarize_all_mode_results/summarize_single_connection_
+    results) - kept as a separate copy here rather than a shared import
+    since translate_routes.py already imports FROM this module and the
+    reverse import would be circular. Used by tests that call
+    triage_all_mode_question directly and want its plain result dict, not
+    a generator object to iterate themselves."""
+    try:
+        while True:
+            next(gen)
+    except StopIteration as stop:
+        return stop.value
