@@ -679,6 +679,7 @@ def test_all_mode_answer_outcome_returns_no_sql_text_and_never_calls_phase_b(app
     assert 'connection_selection' not in data
     assert 'database_notes' not in data
     assert 'generation_failures' not in data
+    assert 'sql_blocks' not in data
 
 
 def test_all_mode_triage_call_receives_conversation_history_so_a_followup_can_resolve_which_database(app_factory, tmp_path, monkeypatch):
@@ -847,12 +848,33 @@ def test_all_mode_route_outcome_runs_phase_b_in_parallel_for_both_selected_conne
     # The server injected these markers mechanically - the model never saw
     # more than one connection per call, so it had nothing to mislabel.
     assert "DB1" not in data['sql'] and "DB2" not in data['sql']
+    # "prompt" (new - Chunk 4 of "splitting SQL/summary per in-scope
+    # database"): each entry's own triage-rewritten question - the model's
+    # triage response here has no "database_prompts" field at all, so
+    # entry_prompts falls back to the ORIGINAL question, unchanged, for
+    # both connections (see entry_prompts' own comment in translate_
+    # routes.py).
     assert data['connection_selection'] == [
-        {"kind": "preset", "id": "pg-a", "name": "Sales Postgres"},
-        {"kind": "preset", "id": "pg-b", "name": "Marketing Postgres"},
+        {"kind": "preset", "id": "pg-a", "name": "Sales Postgres",
+         "prompt": "how is everything performing across the board"},
+        {"kind": "preset", "id": "pg-b", "name": "Marketing Postgres",
+         "prompt": "how is everything performing across the board"},
     ]
     assert data['database_notes'] == []
     assert data['generation_failures'] == []
+
+    # Structured, per-database equivalent of the joined `sql` string above
+    # (see translate_routes.py's stream_translation "route" branch,
+    # `sql_by_database`) - a future per-database-history feature's whole
+    # reason for existing: each database's own SQL, already split apart,
+    # no re-parsing of the combined marked string's own comments required.
+    # In selected_entries' original order, same as `connection_selection`.
+    assert data['sql_blocks'] == [
+        {"kind": "preset", "id": "pg-a", "name": "Sales Postgres",
+         "sql": "-- database: preset:pg-a (Sales Postgres)\nSELECT * FROM deals;"},
+        {"kind": "preset", "id": "pg-b", "name": "Marketing Postgres",
+         "sql": "-- database: preset:pg-b (Marketing Postgres)\nSELECT * FROM campaigns;"},
+    ]
 
 
 def test_all_mode_route_outcome_falls_back_to_a_triage_labeled_message_when_the_model_omits_one(
@@ -916,6 +938,14 @@ def test_all_mode_route_outcome_with_one_database_returning_no_sql_note(app_fact
     assert data['database_notes'] == [
         {"kind": "preset", "id": "pg-b", "name": "Marketing Postgres",
          "text": "Campaigns data doesn't cover this question."},
+    ]
+    # sql_blocks only ever covers databases that returned REAL SQL - the
+    # noted database (pg-b) has no entry here, same as it has none in the
+    # underlying sql_blocks tuple list itself (database_notes above is the
+    # source of truth for it instead).
+    assert data['sql_blocks'] == [
+        {"kind": "preset", "id": "pg-a", "name": "Sales Postgres",
+         "sql": "-- database: preset:pg-a (Sales Postgres)\nSELECT * FROM deals;"},
     ]
     assert data['generation_failures'] == []
 
@@ -985,6 +1015,11 @@ def test_all_mode_route_outcome_all_databases_fail_or_note_returns_empty_sql_but
     assert data['success'] is True
     assert data['router_route'] is True
     assert data['sql'] == ''
+    # Structured equivalent stays an empty list, not absent - "route" always
+    # carries this field once triage resolves to it, same convention as
+    # database_notes/generation_failures - it's just empty when neither
+    # selected database produced real SQL.
+    assert data['sql_blocks'] == []
     assert data['database_notes'] == [
         {"kind": "preset", "id": "pg-a", "name": "Sales Postgres", "text": "Deals table has nothing relevant."},
     ]
@@ -1071,9 +1106,13 @@ def test_all_mode_route_outcome_streams_phase_a_route_then_phase_b_connection_do
 
     route_event = next(e for e in events if e['status'] == 'phase_a_route')
     assert route_event['routing_message'] == 'Checking both.'
+    # "prompt" (new - Chunk 4): no "database_prompts" in this test's triage
+    # response either, so both fall back to the original question.
     assert route_event['connection_selection'] == [
-        {"kind": "preset", "id": "pg-a", "name": "Sales Postgres"},
-        {"kind": "preset", "id": "pg-b", "name": "Marketing Postgres"},
+        {"kind": "preset", "id": "pg-a", "name": "Sales Postgres",
+         "prompt": "first database question, plus something else"},
+        {"kind": "preset", "id": "pg-b", "name": "Marketing Postgres",
+         "prompt": "first database question, plus something else"},
     ]
 
     connection_done_events = [e for e in events if e['status'] == 'phase_b_connection_done']
@@ -1374,7 +1413,9 @@ def test_all_mode_with_only_one_configured_connection_still_runs_triage_and_can_
     assert len(harness.generate_calls) == 2  # triage + 1 Phase B call - no longer skipped
     assert data['router_route'] is True
     assert "-- database: preset:pg-a (Sales Postgres)\nSELECT * FROM deals;" in data['sql']
-    assert data['connection_selection'] == [{"kind": "preset", "id": "pg-a", "name": "Sales Postgres"}]
+    assert data['connection_selection'] == [
+        {"kind": "preset", "id": "pg-a", "name": "Sales Postgres", "prompt": "how many deals do we have"},
+    ]
 
 
 def test_all_mode_dynamically_includes_a_newly_saved_custom_connection(app_factory, tmp_path, monkeypatch):
@@ -1477,7 +1518,16 @@ def test_all_mode_fetches_schema_for_every_candidate_regardless_of_cache_state(a
     assert "campaigns" in triage_prompt_text
 
 
-def test_all_mode_route_phase_b_uses_empty_history_and_full_schema_per_connection(app_factory, tmp_path, monkeypatch):
+def test_all_mode_route_phase_b_ignores_the_shared_history_and_uses_full_schema_per_connection(
+        app_factory, tmp_path, monkeypatch):
+    # The top-level `history` field is triage's own conversation thread
+    # (see stream_translation()'s own comment on this) - Phase B's
+    # per-connection calls below get THAT CONNECTION's own history from
+    # `connection_histories` instead (see the tests further below), never
+    # this shared field. An older client that never sends
+    # connection_histories at all (as here) must still work exactly as it
+    # always has: empty history for Phase B, not a crash or an accidental
+    # leak of the shared field.
     env = _two_preset_env(app_factory, tmp_path)
     login_as(env.client, "alice@example.com")
     _set_all_mode(env.client)
@@ -1502,13 +1552,190 @@ def test_all_mode_route_phase_b_uses_empty_history_and_full_schema_per_connectio
 
     # generate_calls[0] is triage (table names only); generate_calls[1] is
     # the Phase B call, which must carry pg-a's FULL schema (column-level
-    # detail triage never saw) and EMPTY history - never this request's
-    # actual past turns, regardless of what was sent (per-database history
-    # is explicitly deferred to later work).
+    # detail triage never saw) and NO history - the shared `history` field
+    # above is never what feeds Phase B.
     assert len(harness.generate_calls) == 2
     phase_b_contents = str(harness.generate_calls[1]["contents"])
     assert "amount" in phase_b_contents
     assert "some earlier unrelated turn" not in phase_b_contents
+
+
+def test_all_mode_route_phase_b_uses_that_connections_own_history_from_connection_histories(
+        app_factory, tmp_path, monkeypatch):
+    # Chunk 5 of "splitting SQL/summary per in-scope database" (see
+    # client.js's captureAllModeHistory()/fanOutAllModeHistoryPerDatabase()/
+    # buildInScopeConnectionHistories() docstrings for the earlier chunks):
+    # a connection's own merged history - keyed by client.js's
+    # connectionBucketKey() scheme, "preset:<id>"/"custom:<key>" - now DOES
+    # reach that same connection's own Phase B SQL-generation call.
+    env = _two_preset_env(app_factory, tmp_path)
+    login_as(env.client, "alice@example.com")
+    _set_all_mode(env.client)
+
+    import db as db_module
+    monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
+        "postgresql://u:p@host-a:5432/a": "Table: deals\nid INTEGER\namount NUMERIC\n",
+        "postgresql://u:p@host-b:5432/b": "Table: campaigns\nid INTEGER\nspend NUMERIC\n",
+    }))
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(_gemini_ok('{"action": "route", "indices": [0], "message": "Checking Sales Postgres."}'))
+    harness.register_marker("deals", _gemini_ok("SELECT * FROM deals;"))
+
+    resp = env.client.post('/api/translate', json={
+        'prompt': 'how many deals this month',
+        'connection_histories': {
+            'preset:pg-a': [
+                {"role": "user", "text": "how many deals last month"},
+                {"role": "model", "text": "SELECT COUNT(*) FROM deals WHERE month = 'last';"},
+            ],
+        },
+    })
+    _, data = parse_translate_stream(resp)
+    assert data['success'] is True
+
+    phase_b_contents = str(harness.generate_calls[1]["contents"])
+    assert "how many deals last month" in phase_b_contents
+
+
+def test_all_mode_route_phase_b_each_connection_gets_only_its_own_connection_history(
+        app_factory, tmp_path, monkeypatch):
+    # Two connections selected at once, each with a DIFFERENT
+    # connection_histories entry - proves the lookup is keyed per
+    # connection (kind:id), not e.g. the first entry reused for every
+    # connection or every history concatenated together.
+    env = _two_preset_env(app_factory, tmp_path)
+    login_as(env.client, "alice@example.com")
+    _set_all_mode(env.client)
+
+    import db as db_module
+    monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
+        "postgresql://u:p@host-a:5432/a": "Table: deals\nid INTEGER\n",
+        "postgresql://u:p@host-b:5432/b": "Table: campaigns\nid INTEGER\n",
+    }))
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(_gemini_ok(
+        '{"action": "route", "indices": [0, 1], "message": "Checking both."}'
+    ))
+    # Marked by each connection's own SCHEMA heading, not by the prompt -
+    # triage supplies no per-connection "database_prompts" rewrite here
+    # (see below), so both calls share the exact same "User Request: deals
+    # and campaigns" prompt text, which itself contains both "deals" and
+    # "campaigns" and would make a prompt-substring marker match either
+    # call ambiguously.
+    harness.register_marker("Table: deals", _gemini_ok("SELECT * FROM deals;"))
+    harness.register_marker("Table: campaigns", _gemini_ok("SELECT * FROM campaigns;"))
+
+    resp = env.client.post('/api/translate', json={
+        'prompt': 'deals and campaigns',
+        'connection_histories': {
+            'preset:pg-a': [
+                {"role": "user", "text": "sales-only past turn"},
+                {"role": "model", "text": "SELECT 1;"},
+            ],
+            'preset:pg-b': [
+                {"role": "user", "text": "marketing-only past turn"},
+                {"role": "model", "text": "SELECT 2;"},
+            ],
+        },
+    })
+    _, data = parse_translate_stream(resp)
+    assert data['success'] is True
+
+    # generate_calls[0] is triage; [1]/[2] are the two Phase B calls (order
+    # not guaranteed under real concurrency - match by which schema/marker
+    # each call's contents carry, not by index).
+    # Matched by each connection's own SCHEMA heading ("Table: deals" /
+    # "Table: campaigns"), not by the user prompt text - triage supplied
+    # no per-connection "database_prompts" rewrite here, so both calls'
+    # "User Request: ..." line is the SAME original, unrewritten prompt
+    # ("deals and campaigns"), which itself contains both substrings and
+    # would make a prompt-text-based match ambiguous.
+    phase_b_calls = harness.generate_calls[1:]
+    deals_call = next(c for c in phase_b_calls if "Table: deals" in str(c["contents"]))
+    campaigns_call = next(c for c in phase_b_calls if "Table: campaigns" in str(c["contents"]))
+
+    deals_text = str(deals_call["contents"])
+    campaigns_text = str(campaigns_call["contents"])
+    assert "sales-only past turn" in deals_text
+    assert "marketing-only past turn" not in deals_text
+    assert "marketing-only past turn" in campaigns_text
+    assert "sales-only past turn" not in campaigns_text
+
+
+def test_all_mode_route_phase_b_falls_back_to_empty_history_when_connection_histories_omits_this_connection(
+        app_factory, tmp_path, monkeypatch):
+    # connection_histories is present (not the old-client-never-sent-it
+    # case above) but simply has no entry for the one connection actually
+    # selected - e.g. a database that's never been visited in either mode
+    # yet. Must fall back to empty history for it, not KeyError.
+    env = _two_preset_env(app_factory, tmp_path)
+    login_as(env.client, "alice@example.com")
+    _set_all_mode(env.client)
+
+    import db as db_module
+    monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
+        "postgresql://u:p@host-a:5432/a": "Table: deals\nid INTEGER\n",
+        "postgresql://u:p@host-b:5432/b": "Table: campaigns\nid INTEGER\n",
+    }))
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(_gemini_ok('{"action": "route", "indices": [0], "message": "Checking Sales Postgres."}'))
+    harness.register_marker("deals", _gemini_ok("SELECT * FROM deals;"))
+
+    resp = env.client.post('/api/translate', json={
+        'prompt': 'how many deals',
+        'connection_histories': {
+            'preset:pg-b': [{"role": "user", "text": "an unrelated database's own past turn"}],
+        },
+    })
+    _, data = parse_translate_stream(resp)
+    assert data['success'] is True
+
+    phase_b_contents = str(harness.generate_calls[1]["contents"])
+    assert "an unrelated database's own past turn" not in phase_b_contents
+
+
+def test_all_mode_route_phase_b_connection_history_is_capped_to_history_max_turns(
+        app_factory, tmp_path, monkeypatch):
+    # Same HISTORY_MAX_TURNS cap the shared `history` field has always had
+    # (see test_translate_routes.py's own turn-count-cap tests) now also
+    # applies to each connection's own connection_histories entry.
+    env = _two_preset_env(app_factory, tmp_path, extra_env={"HISTORY_MAX_TURNS": "2"})
+    login_as(env.client, "alice@example.com")
+    _set_all_mode(env.client)
+
+    import db as db_module
+    monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
+        "postgresql://u:p@host-a:5432/a": "Table: deals\nid INTEGER\n",
+        "postgresql://u:p@host-b:5432/b": "Table: campaigns\nid INTEGER\n",
+    }))
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(_gemini_ok('{"action": "route", "indices": [0], "message": "Checking Sales Postgres."}'))
+    harness.register_marker("deals", _gemini_ok("SELECT * FROM deals;"))
+
+    history = []
+    for i in range(3):  # 3 turns offered, cap is 2 - the oldest must be dropped entirely
+        history.append({"role": "user", "text": f"pg-a prompt {i}"})
+        history.append({"role": "model", "text": f"SELECT {i};"})
+
+    resp = env.client.post('/api/translate', json={
+        'prompt': 'newest prompt',
+        'connection_histories': {'preset:pg-a': history},
+    })
+    _, data = parse_translate_stream(resp)
+    assert data['success'] is True
+
+    phase_b_contents = str(harness.generate_calls[1]["contents"])
+    assert "pg-a prompt 0" not in phase_b_contents
+    assert "pg-a prompt 1" in phase_b_contents
+    assert "pg-a prompt 2" in phase_b_contents
 
 
 def test_all_mode_route_phase_b_uses_triages_per_connection_rewrite_not_the_original_cross_database_prompt(
@@ -1558,6 +1785,18 @@ def test_all_mode_route_phase_b_uses_triages_per_connection_rewrite_not_the_orig
     # The original, cross-database-phrased question never reached either
     # Phase B call - only its per-connection rewrite did.
     assert not any("2 tables each from a different database" in c for c in phase_b_contents)
+
+    # "prompt" (new - Chunk 4 of "splitting SQL/summary per in-scope
+    # database"): connection_selection's own per-database "prompt" field
+    # carries this SAME per-connection rewrite - not the original,
+    # cross-database-phrased question - since it's this database's own
+    # entry from entry_prompts, the very same list Phase B's calls above
+    # were built from. This is what lets a later per-database history
+    # fan-out record each database's OWN question, not the original
+    # multi-database one, as that database's turn.
+    by_id = {e["id"]: e["prompt"] for e in data["connection_selection"]}
+    assert by_id["pg-a"] == "Give me data from one table in this database."
+    assert by_id["pg-b"] == "Give me data from a different table in this database."
 
 
 def test_all_mode_route_phase_b_falls_back_to_the_original_prompt_when_triage_omits_database_prompts(
@@ -1877,8 +2116,10 @@ def test_summarize_all_mode_results_includes_schema_for_each_in_scope_database(a
         "postgresql://u:p@host-a:5432/a": "Table: deals\nid INTEGER\n",
         "postgresql://u:p@host-b:5432/b": "Table: campaigns\nid INTEGER\n",
     }))
-    provider = _SchemaCapturingFakeProvider(["Sales is up 10%, Marketing had no data."])
-    text, usage, error = _drain(env.translate_routes.summarize_all_mode_results(
+    provider = _SchemaCapturingFakeProvider([
+        _summary_json({0: "Sales is up 10%.", 1: "Marketing had no data."}),
+    ])
+    parsed, usage, error = _drain(env.translate_routes.summarize_all_mode_results(
         "how is everything performing",
         [
             {"kind": "preset", "id": "pg-a", "name": "Sales Postgres", "columns": [], "rows": []},
@@ -1886,7 +2127,11 @@ def test_summarize_all_mode_results_includes_schema_for_each_in_scope_database(a
         ],
         provider, client=None, model="m", user_identity="alice@example.com",
     ))
-    assert text == "Sales is up 10%, Marketing had no data."
+    assert parsed == {
+        "label": "Results Summary",
+        "per_database": {0: "Sales is up 10%.", 1: "Marketing had no data."},
+        "cross_database": None,
+    }
     schema_block = provider.calls[0]["llm_input"]["schema_block"]
     assert "Sales Postgres:\nTable: deals" in schema_block
     assert "Marketing Postgres:\nTable: campaigns" in schema_block
@@ -1904,8 +2149,8 @@ def test_summarize_all_mode_results_skips_a_reference_that_no_longer_resolves(ap
     monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
         "postgresql://u:p@host-a:5432/a": "Table: deals\nid INTEGER\n",
     }))
-    provider = _SchemaCapturingFakeProvider(["Sales is up 10%."])
-    text, usage, error = _drain(env.translate_routes.summarize_all_mode_results(
+    provider = _SchemaCapturingFakeProvider([_summary_json({0: "Sales is up 10%.", 1: "not found"})])
+    parsed, usage, error = _drain(env.translate_routes.summarize_all_mode_results(
         "q",
         [
             {"kind": "preset", "id": "pg-a", "name": "Sales Postgres", "columns": [], "rows": []},
@@ -1913,7 +2158,7 @@ def test_summarize_all_mode_results_skips_a_reference_that_no_longer_resolves(ap
         ],
         provider, client=None, model="m", user_identity="alice@example.com",
     ))
-    assert text == "Sales is up 10%."
+    assert parsed["per_database"][0] == "Sales is up 10%."
     schema_block = provider.calls[0]["llm_input"]["schema_block"]
     assert "Sales Postgres:\nTable: deals" in schema_block
     assert "Removed Preset" not in schema_block
@@ -1925,23 +2170,40 @@ def test_summarize_all_mode_results_with_no_user_identity_uses_empty_schema_bloc
     # session to resolve against gets the exact schema-less prompt this
     # call always sent before Gap 4, not an error.
     env = _two_preset_env(app_factory, tmp_path)
-    provider = _SchemaCapturingFakeProvider(["Sales is up 10%."])
-    text, usage, error = _drain(env.translate_routes.summarize_all_mode_results(
+    provider = _SchemaCapturingFakeProvider([_summary_json({0: "Sales is up 10%."})])
+    parsed, usage, error = _drain(env.translate_routes.summarize_all_mode_results(
         "q", [{"kind": "preset", "id": "pg-a", "name": "Sales Postgres", "columns": [], "rows": []}],
         provider, client=None, model="m",
     ))
-    assert text == "Sales is up 10%."
+    assert parsed["per_database"][0] == "Sales is up 10%."
     assert provider.calls[0]["llm_input"]["schema_block"] == ""
+
+
+def _summary_json(per_database, label="Results Summary", cross_database=None):
+    """Builds a valid Phase C JSON response string (see _SUMMARY_SYSTEM_
+    INSTRUCTION/_clean_summary_response) for _FakeProvider/_gemini_ok to
+    queue in place of the free-text prose this section's tests used to
+    queue before Phase C moved to a structured JSON contract.
+    `per_database` is a plain {int_index: paragraph} dict, JSON-encoded
+    here with string keys the same way the real model is asked to key it."""
+    payload = {"label": label, "per_database": {str(k): v for k, v in per_database.items()}}
+    if cross_database is not None:
+        payload["cross_database"] = cross_database
+    return json.dumps(payload)
 
 
 def test_summarize_all_mode_results_returns_stripped_text_and_usage_on_success(app_factory, tmp_path):
     env = _two_preset_env(app_factory, tmp_path)
-    provider = _FakeProvider(["  Sales is up 10%, Marketing had no data.  "])
-    text, usage, error = _drain(env.translate_routes.summarize_all_mode_results(
+    provider = _FakeProvider([_summary_json({0: "Sales is up 10%, Marketing had no data."})])
+    parsed, usage, error = _drain(env.translate_routes.summarize_all_mode_results(
         "how is everything performing", [{"name": "Sales Postgres", "columns": [], "rows": []}],
         provider, client=None, model="m",
     ))
-    assert text == "Sales is up 10%, Marketing had no data."
+    assert parsed == {
+        "label": "Results Summary",
+        "per_database": {0: "Sales is up 10%, Marketing had no data."},
+        "cross_database": None,
+    }
     assert usage == {}
     assert error is None
     assert len(provider.calls) == 1
@@ -1986,15 +2248,15 @@ def test_summarize_all_mode_results_retries_a_retryable_error_and_succeeds_on_a_
 ):
     env = _two_preset_env(app_factory, tmp_path)
     provider = _FakeProvider(
-        [RuntimeError("rate limited"), "Result Summary\n\nSales is up 10%."],
+        [RuntimeError("rate limited"), _summary_json({0: "Sales is up 10%."})],
         key_pool=["key-a", "key-b"],
         classify_error=lambda exc: {"rotate_key": True, "delay": 0},
     )
-    text, usage, error = _drain(env.translate_routes.summarize_all_mode_results(
+    parsed, usage, error = _drain(env.translate_routes.summarize_all_mode_results(
         "how is everything performing", [{"name": "Sales Postgres", "columns": [], "rows": []}],
         provider, client="initial-client", model="m",
     ))
-    assert text == "Result Summary\n\nSales is up 10%."
+    assert parsed == {"label": "Results Summary", "per_database": {0: "Sales is up 10%."}, "cross_database": None}
     assert error is None
     assert len(provider.calls) == 2
     # The retry rotated to a genuinely different key/client for the
@@ -2014,7 +2276,7 @@ def test_summarize_all_mode_results_yields_a_retrying_line_for_key_rotation(app_
     question's own identical test."""
     env = _two_preset_env(app_factory, tmp_path)
     provider = _FakeProvider(
-        [RuntimeError("rate limited"), "Result Summary\n\nSales is up 10%."],
+        [RuntimeError("rate limited"), _summary_json({0: "Sales is up 10%."})],
         key_pool=["key-a", "key-b"],
         classify_error=lambda exc: {"rotate_key": True, "delay": 0},
     )
@@ -2027,8 +2289,8 @@ def test_summarize_all_mode_results_yields_a_retrying_line_for_key_rotation(app_
         "status": "retrying", "attempt": 2, "maxAttempts": 2,
         "delaySeconds": 0, "rotatedKey": True,
     }
-    text, usage, error = _drain(gen)
-    assert text == "Result Summary\n\nSales is up 10%."
+    parsed, usage, error = _drain(gen)
+    assert parsed == {"label": "Results Summary", "per_database": {0: "Sales is up 10%."}, "cross_database": None}
     assert error is None
 
 
@@ -2042,7 +2304,7 @@ def test_summarize_all_mode_results_yields_a_retrying_line_for_a_transient_error
     sleep_calls = []
     monkeypatch.setattr(env.translate_routes.time, "sleep", lambda secs: sleep_calls.append(secs))
     provider = _FakeProvider(
-        [RuntimeError("temporarily unavailable"), "Result Summary\n\nSales is up 10%."],
+        [RuntimeError("temporarily unavailable"), _summary_json({0: "Sales is up 10%."})],
         classify_error=lambda exc: {"rotate_key": False, "delay": 2.5},
     )
     gen = env.translate_routes.summarize_all_mode_results(
@@ -2056,8 +2318,8 @@ def test_summarize_all_mode_results_yields_a_retrying_line_for_a_transient_error
     assert event["maxAttempts"] == env.translate_routes.MAX_TRANSLATION_ATTEMPTS
     assert sleep_calls == []  # not yet - only after the yield resumes
 
-    text, usage, error = _drain(gen)
-    assert text == "Result Summary\n\nSales is up 10%."
+    parsed, usage, error = _drain(gen)
+    assert parsed == {"label": "Results Summary", "per_database": {0: "Sales is up 10%."}, "cross_database": None}
     assert sleep_calls == [2.5]
 
 
@@ -2106,46 +2368,58 @@ def test_summarize_all_mode_results_using_byok_forces_key_rotation_budget_to_one
     assert provider.made_clients == []
 
 
-# A real model turned out to sometimes over-comply with
-# _SUMMARY_SYSTEM_INSTRUCTION's "alone on its own first line" wording and
-# respond with JUST the "Result Summary" label, nothing else - which used
-# to sail straight through the `if stripped:` check (a non-empty string)
-# and get shown to the user as a bare heading with no summary under it.
-# Treated the same as a genuinely empty response: retried once, and if the
-# second attempt is no better, (None, None) - same as any other
-# unrecoverable Phase C failure (the Summary tab is just left as-is).
-def test_summarize_all_mode_results_retries_a_response_that_is_just_the_results_summary_label(app_factory, tmp_path):
+# A real model can fail Phase C's JSON contract in several different ways
+# - not valid JSON at all, a JSON value that isn't an object, a missing or
+# blank "label", an empty "per_database", or a "per_database" missing an
+# entry for one of the given indices (see _clean_summary_response's own
+# docstring for why a missing entry invalidates the WHOLE response, unlike
+# triage's more tolerant database_prompts). All of these are treated
+# identically to a genuinely empty/unparseable response has always been
+# for every other "all databases" mode LLM call: discarded and retried
+# once, and if the second attempt is no better, (None, None) - the Summary
+# tab is just left as-is, same as any other unrecoverable Phase C failure.
+def test_summarize_all_mode_results_retries_an_invalid_or_incomplete_json_response(app_factory, tmp_path):
     env = _two_preset_env(app_factory, tmp_path)
-    # A label line (any language - "Result(s) Summary"/"Résumé des
-    # résultats" are just examples) followed by a blank line and nothing
-    # else is unparseable, regardless of what the label word actually is -
-    # see is_label_only_response's docstring for why this is POSITION-
-    # based, not a match against a fixed English string.
-    for label in (
-        "Results Summary\n\n", "  Results Summary  \n\n  ", "**Results Summary**\n\n",
-        "result summary\n\n", "Résumé des résultats\n\n",
+    for bad_response in (
+        "not json at all",
+        json.dumps(["not", "an", "object"]),
+        json.dumps({"per_database": {"0": "Sales is up 10%."}}),  # missing "label"
+        json.dumps({"label": "   ", "per_database": {"0": "Sales is up 10%."}}),  # blank "label"
+        json.dumps({"label": "Results Summary", "per_database": {}}),  # no entries at all
+        json.dumps({"label": "Results Summary", "per_database": {"1": "wrong index only"}}),
     ):
-        provider = _FakeProvider([label, "Results Summary\n\nSales is up 10%."])
-        text, usage, error = _drain(env.translate_routes.summarize_all_mode_results(
+        provider = _FakeProvider([bad_response, _summary_json({0: "Sales is up 10%."})])
+        parsed, usage, error = _drain(env.translate_routes.summarize_all_mode_results(
             "how is everything performing", [{"name": "Sales Postgres", "columns": [], "rows": []}],
             provider, client=None, model="m",
         ))
-        assert text == "Results Summary\n\nSales is up 10%."
+        assert parsed == {"label": "Results Summary", "per_database": {0: "Sales is up 10%."}, "cross_database": None}
         assert error is None
         assert len(provider.calls) == 2
 
-    provider = _FakeProvider(["Results Summary\n\n", "Results Summary\n\n"])
-    text, usage, error = _drain(env.translate_routes.summarize_all_mode_results(
+    # A markdown-fenced response is NOT one of the invalid shapes above -
+    # strip_markdown_fence tolerates it, same as triage - so it succeeds
+    # on the very first attempt.
+    provider = _FakeProvider(["```json\n" + _summary_json({0: "fenced, but otherwise valid"}) + "\n```"])
+    parsed, usage, error = _drain(env.translate_routes.summarize_all_mode_results(
+        "how is everything performing", [{"name": "Sales Postgres", "columns": [], "rows": []}],
+        provider, client=None, model="m",
+    ))
+    assert parsed == {
+        "label": "Results Summary", "per_database": {0: "fenced, but otherwise valid"}, "cross_database": None,
+    }
+    assert len(provider.calls) == 1
+
+    provider = _FakeProvider(["not json", "still not json"])
+    parsed, usage, error = _drain(env.translate_routes.summarize_all_mode_results(
         "q", [{"name": "Sales Postgres", "columns": [], "rows": []}], provider, client=None, model="m",
     ))
-    assert (text, usage) == (None, None)
+    assert (parsed, usage) == (None, None)
     # Content-invalid both times, not an API failure - nothing went wrong
     # at the LLM-call level, so there's no exception to report (a plain
-    # descriptive string instead - see summarize_all_mode_results'
-    # docstring).
-    assert error == (
-        "response was only the label, or missing the label/blank-line shape, with no real content after it"
-    )
+    # descriptive string instead - see _summarize_with_retry's
+    # invalid_content_error/summarize_all_mode_results' own docstring).
+    assert error == "response was not valid, complete per-database summary JSON"
     assert len(provider.calls) == 2
 
 
@@ -2166,7 +2440,9 @@ def test_summarize_results_endpoint_returns_no_sql_prefixed_summary_and_logs_an_
 
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(_gemini_ok("Sales revenue is $500; Marketing had nothing relevant."))
+    harness.queue_response(_gemini_ok(_summary_json(
+        {0: "Sales revenue is $500.", 1: "Marketing had nothing relevant."},
+    )))
 
     resp = env.client.post('/api/summarize-results', json={
         'prompt': 'how is everything performing across the board',
@@ -2184,7 +2460,23 @@ def test_summarize_results_endpoint_returns_no_sql_prefixed_summary_and_logs_an_
     # application/json. See parse_translate_stream's own docstring.
     _retry_events, data = parse_translate_stream(resp)
     assert data['success'] is True
-    assert data['summary'] == '*** NO SQL *** Sales revenue is $500; Marketing had nothing relevant.'
+    # "summary" is server-RECONSTRUCTED from Phase C's structured JSON
+    # response (see /api/summarize-results' own docstring) - the bold
+    # "**Name:**" lead-in comes from database_results' own real name, not
+    # the model's copy of it.
+    assert data['summary'] == (
+        "*** NO SQL *** Results Summary\n\n"
+        "**Sales Postgres:** Sales revenue is $500.\n\n"
+        "**Marketing Postgres:** Marketing had nothing relevant."
+    )
+    # New, purely additive structured fields alongside "summary" (Chunk 1's
+    # own sql_blocks precedent) - what lets a later chunk record each
+    # in-scope database's own tuple into its own history bucket.
+    assert data['database_summaries'] == [
+        {"kind": "preset", "id": "pg-a", "name": "Sales Postgres", "text": "Sales revenue is $500."},
+        {"kind": "preset", "id": "pg-b", "name": "Marketing Postgres", "text": "Marketing had nothing relevant."},
+    ]
+    assert data['cross_database_summary'] is None
 
     rows = _translation_rows(env)
     assert len(rows) == 1
@@ -2230,7 +2522,7 @@ def test_summarize_results_endpoint_streams_a_retrying_line_before_the_terminal_
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     harness.queue_error(FakeApiError(429))
-    harness.queue_response(_gemini_ok("Sales revenue is $500."))
+    harness.queue_response(_gemini_ok(_summary_json({0: "Sales revenue is $500."})))
 
     resp = env.client.post('/api/summarize-results', json={
         'prompt': 'how is everything performing',
@@ -2240,7 +2532,7 @@ def test_summarize_results_endpoint_streams_a_retrying_line_before_the_terminal_
     assert resp.status_code == 200
     retry_events, data = parse_translate_stream(resp)
     assert data['success'] is True
-    assert data['summary'] == '*** NO SQL *** Sales revenue is $500.'
+    assert data['summary'] == '*** NO SQL *** Results Summary\n\n**Sales Postgres:** Sales revenue is $500.'
     assert len(harness.client_api_keys) == 2
     assert harness.client_api_keys[0] != harness.client_api_keys[1]
 
@@ -2267,7 +2559,7 @@ def test_summarize_results_endpoint_uses_byok_key_instead_of_env_configured_key(
 
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(_gemini_ok("Sales revenue is $500."))
+    harness.queue_response(_gemini_ok(_summary_json({0: "Sales revenue is $500."})))
 
     resp = env.client.post('/api/summarize-results', json={
         'prompt': 'how is everything performing',

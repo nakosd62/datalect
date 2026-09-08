@@ -922,6 +922,229 @@ test.describe('multi-database question answering', () => {
     expect(failedTurn.allMode.executeFailures).toHaveLength(2);
   });
 
+  // Chunk 3 of "splitting SQL/summary per in-scope database": the server
+  // now sends two additional structured shapes alongside the plain,
+  // already-joined `sql`/`summary` text this suite's other tests exercise -
+  // translate_routes.py's terminal-line `sql_blocks` (one {kind, id, name,
+  // sql} entry per database that got real SQL - see stream_translation()'s
+  // "route" branch) and /api/summarize-results' own `database_summaries`/
+  // `cross_database_summary` (see that route's docstring). This chunk is
+  // recording-only (per the confirmed scope) - nothing renders differently
+  // yet, so this test's only job is to prove client.js actually captures
+  // both structured shapes onto the turn's history entry (`allMode.
+  // databaseSql`/`.databaseSummaries`/`.crossDatabaseSummary`), the same
+  // way the test just above proves `executeFailures` survives onto history.
+  // Exercises the LIVE STREAMING path (auto-execute on, real NDJSON
+  // "phase_a_route"/"phase_b_connection_done" events - see maybeFinalize()
+  // in client.js) since that's this app's main-line "all databases" mode
+  // flow today.
+  test('the structured per-database SQL and summaries (sql_blocks/database_summaries/cross_database_summary) are recorded onto the turn\'s history entry', async ({ page }) => {
+    await mockConfig(page, { ...buildConfigState(), auto_sql_execute: true });
+    await gotoApp(page);
+
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      const ndjson = [
+        {
+          status: 'phase_a_route', routing_message: 'Checking both.',
+          connection_selection: [
+            { kind: 'preset', id: 'p-a', name: 'Sales Postgres' },
+            { kind: 'preset', id: 'p-b', name: 'Marketing Postgres' },
+          ],
+        },
+        {
+          status: 'phase_b_connection_done', kind: 'preset', id: 'p-a', name: 'Sales Postgres',
+          outcome: 'sql', sql: '-- database: preset:p-a (Sales Postgres)\nSELECT * FROM deals;',
+        },
+        {
+          status: 'phase_b_connection_done', kind: 'preset', id: 'p-b', name: 'Marketing Postgres',
+          outcome: 'sql', sql: '-- database: preset:p-b (Marketing Postgres)\nSELECT * FROM campaigns;',
+        },
+        {
+          status: 'done', success: true, router_route: true, routing_message: 'Checking both.',
+          sql:
+            '-- database: preset:p-a (Sales Postgres)\nSELECT * FROM deals;\n\n' +
+            '-- database: preset:p-b (Marketing Postgres)\nSELECT * FROM campaigns;',
+          database_notes: [], generation_failures: [],
+          connection_selection: [
+            { kind: 'preset', id: 'p-a', name: 'Sales Postgres' },
+            { kind: 'preset', id: 'p-b', name: 'Marketing Postgres' },
+          ],
+          sql_blocks: [
+            { kind: 'preset', id: 'p-a', name: 'Sales Postgres',
+              sql: '-- database: preset:p-a (Sales Postgres)\nSELECT * FROM deals;' },
+            { kind: 'preset', id: 'p-b', name: 'Marketing Postgres',
+              sql: '-- database: preset:p-b (Marketing Postgres)\nSELECT * FROM campaigns;' },
+          ],
+        },
+      ].map((e) => JSON.stringify(e)).join('\n') + '\n';
+      await route.fulfill({ status: 200, contentType: 'application/x-ndjson', body: ndjson });
+    });
+    await page.route('**/api/execute', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      const body = route.request().postDataJSON();
+      const isA = body.sql.includes('preset:p-a');
+      await route.fulfill({
+        status: 200, contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          results: [
+            isA
+              ? { statement: 'SELECT * FROM deals', columns: ['total'], rows: [{ total: 500 }], rowCount: 1,
+                  database: { kind: 'preset', id: 'p-a', name: 'Sales Postgres' } }
+              : { statement: 'SELECT * FROM campaigns', columns: ['total'], rows: [{ total: 100 }], rowCount: 1,
+                  database: { kind: 'preset', id: 'p-b', name: 'Marketing Postgres' } },
+          ],
+        }),
+      });
+    });
+    await page.route('**/api/summarize-results', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200, contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          summary:
+            '*** NO SQL *** Results Summary\n\n**Sales Postgres:** Revenue is $500.\n\n' +
+            '**Marketing Postgres:** Campaign spend is $100.\n\nCombined, total activity is $600.',
+          database_summaries: [
+            { kind: 'preset', id: 'p-a', name: 'Sales Postgres', text: 'Revenue is $500.' },
+            { kind: 'preset', id: 'p-b', name: 'Marketing Postgres', text: 'Campaign spend is $100.' },
+          ],
+          cross_database_summary: 'Combined, total activity is $600.',
+        }),
+      });
+    });
+
+    await page.locator('#aiPrompt').fill('deals and campaigns');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect(page.locator('#resultsTabsNav .result-tab-btn')).toHaveCount(3);
+    await expect.poll(() => currentSql(page)).toContain('SELECT');
+
+    let secondRequestBody = null;
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      secondRequestBody = route.request().postDataJSON();
+      await route.fulfill({
+        status: 200, contentType: 'application/json', body: JSON.stringify({ sql: 'SELECT 1;' }),
+      });
+    });
+    await page.locator('#aiPrompt').fill('a follow-up question');
+    await page.locator('#aiPrompt').press('Enter');
+
+    await expect.poll(() => secondRequestBody).not.toBeNull();
+    const turn = secondRequestBody.history.find((m) => m.role === 'model' && m.allMode);
+    expect(turn).toBeTruthy();
+    expect(turn.allMode.databaseSql).toEqual([
+      { kind: 'preset', id: 'p-a', name: 'Sales Postgres',
+        sql: '-- database: preset:p-a (Sales Postgres)\nSELECT * FROM deals;' },
+      { kind: 'preset', id: 'p-b', name: 'Marketing Postgres',
+        sql: '-- database: preset:p-b (Marketing Postgres)\nSELECT * FROM campaigns;' },
+    ]);
+    expect(turn.allMode.databaseSummaries).toEqual([
+      { kind: 'preset', id: 'p-a', name: 'Sales Postgres', text: 'Revenue is $500.' },
+      { kind: 'preset', id: 'p-b', name: 'Marketing Postgres', text: 'Campaign spend is $100.' },
+    ]);
+    expect(turn.allMode.crossDatabaseSummary).toBe('Combined, total activity is $600.');
+  });
+
+  // Same idea as the streaming test just above, for the OTHER path that
+  // records history: the "pendingAllModeNotes" batched fallback
+  // (translatePrompt() never received any live "phase_a_route"/
+  // "phase_b_connection_done" events - see that path's own declaration
+  // comment in client.js) that this whole file's other tests already
+  // exercise, since they mock /api/translate with one plain JSON body
+  // rather than a real NDJSON stream. Only `crossDatabaseSummary` is
+  // exercised as null here (no cross-database field returned) - the
+  // streaming test above already covers a non-null one - so together these
+  // two tests cover both paths AND both cross_database_summary shapes.
+  test('the batched (non-streaming) fallback also records structured per-database SQL and summaries onto history', async ({ page }) => {
+    await mockConfig(page);
+    await gotoApp(page);
+
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          router_route: true,
+          routing_message: 'Checking Sales Postgres and Marketing Postgres.',
+          sql: '-- database: preset:p-a (Sales Postgres)\nSELECT * FROM deals;',
+          database_notes: [{ kind: 'preset', id: 'p-b', name: 'Marketing Postgres', text: 'Nothing relevant.' }],
+          generation_failures: [],
+          connection_selection: [
+            { kind: 'preset', id: 'p-a', name: 'Sales Postgres' },
+            { kind: 'preset', id: 'p-b', name: 'Marketing Postgres' },
+          ],
+          sql_blocks: [
+            { kind: 'preset', id: 'p-a', name: 'Sales Postgres',
+              sql: '-- database: preset:p-a (Sales Postgres)\nSELECT * FROM deals;' },
+          ],
+        }),
+      });
+    });
+    await page.route('**/api/execute', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200, contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          results: [{ statement: 'SELECT * FROM deals', columns: ['total'], rows: [{ total: 500 }], rowCount: 1,
+                      database: { kind: 'preset', id: 'p-a', name: 'Sales Postgres' } }],
+        }),
+      });
+    });
+    await page.route('**/api/summarize-results', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200, contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          summary: '*** NO SQL *** Results Summary\n\n**Sales Postgres:** Revenue is $500.\n\n' +
+            '**Marketing Postgres:** Nothing relevant.',
+          database_summaries: [
+            { kind: 'preset', id: 'p-a', name: 'Sales Postgres', text: 'Revenue is $500.' },
+            { kind: 'preset', id: 'p-b', name: 'Marketing Postgres', text: 'Nothing relevant.' },
+          ],
+          cross_database_summary: null,
+        }),
+      });
+    });
+
+    await page.locator('#aiPrompt').fill('deals and campaigns');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect.poll(() => currentSql(page)).toContain('SELECT');
+    await page.locator('#runBtn').click();
+    await page.locator('.result-tab-btn').filter({ hasText: 'Summary' }).click();
+    await expect(page.locator('.response-text')).toContainText('Revenue is $500');
+
+    let secondRequestBody = null;
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      secondRequestBody = route.request().postDataJSON();
+      await route.fulfill({
+        status: 200, contentType: 'application/json', body: JSON.stringify({ sql: 'SELECT 1;' }),
+      });
+    });
+    await page.locator('#aiPrompt').fill('a follow-up question');
+    await page.locator('#aiPrompt').press('Enter');
+
+    await expect.poll(() => secondRequestBody).not.toBeNull();
+    const turn = secondRequestBody.history.find((m) => m.role === 'model' && m.allMode);
+    expect(turn).toBeTruthy();
+    expect(turn.allMode.databaseSql).toEqual([
+      { kind: 'preset', id: 'p-a', name: 'Sales Postgres',
+        sql: '-- database: preset:p-a (Sales Postgres)\nSELECT * FROM deals;' },
+    ]);
+    expect(turn.allMode.databaseSummaries).toEqual([
+      { kind: 'preset', id: 'p-a', name: 'Sales Postgres', text: 'Revenue is $500.' },
+      { kind: 'preset', id: 'p-b', name: 'Marketing Postgres', text: 'Nothing relevant.' },
+    ]);
+    expect(turn.allMode.crossDatabaseSummary).toBeNull();
+  });
+
   // Regression guard for the gap this closes: /api/summarize-results' own
   // retry loop (Phase C) used to be entirely invisible to the client -
   // one plain JSON body, returned only once the whole retry loop had
@@ -2208,5 +2431,326 @@ test.describe('multi-database question answering', () => {
     // turn already gets.
     expect(failedTurn.results).toHaveLength(1);
     expect(failedTurn.results[0].rows).toEqual([{ x: 1 }]);
+  });
+
+  // Chunk 4 of "splitting SQL/summary per in-scope database" (see
+  // client.js's captureAllModeHistory()/fanOutAllModeHistoryPerDatabase()
+  // docstrings for the full multi-window design history): an all-mode
+  // turn's own shared history entry (asserted by the two tests above) is
+  // ALSO fanned out, per in-scope database, into that database's own
+  // single-connection-mode history bucket - identical to the one reached
+  // by switching directly to it (computeBucketKey()'s (kind,id)-based
+  // scheme - see that function's own docstring for why this now matches
+  // regardless of which mode reaches the database). Covers all three
+  // outcome shapes end to end: p-a got real SQL, executed, and its own
+  // Phase C paragraph (the "sql" outcome); p-b only ever got a note (the
+  // "note" outcome, no SQL/results/summary at all).
+  test('switching to a specific database in single-connection mode after an all-mode turn shows that turn merged into its own back/forward history', async ({ page }) => {
+    await mockConfig(page);
+    await gotoApp(page);
+
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          router_route: true,
+          routing_message: 'Checking both.',
+          sql: '-- database: preset:p-a (Sales Postgres)\nSELECT * FROM deals;',
+          database_notes: [
+            { kind: 'preset', id: 'p-b', name: 'Marketing Postgres', text: 'Nothing relevant to marketing here.' },
+          ],
+          generation_failures: [],
+          // Each entry's own "prompt" (Chunk 4's new connection_selection
+          // field - see translate_routes.py's entry_prompts docstring) is
+          // deliberately DIFFERENT from both the original question below
+          // and from each other, so a fanned-out turn showing the wrong
+          // one (e.g. the original cross-database question, or the other
+          // database's own rewrite) would be caught.
+          connection_selection: [
+            { kind: 'preset', id: 'p-a', name: 'Sales Postgres', prompt: 'How are sales performing?' },
+            { kind: 'preset', id: 'p-b', name: 'Marketing Postgres', prompt: 'How is marketing performing?' },
+          ],
+          sql_blocks: [
+            { kind: 'preset', id: 'p-a', name: 'Sales Postgres',
+              sql: '-- database: preset:p-a (Sales Postgres)\nSELECT * FROM deals;' },
+          ],
+        }),
+      });
+    });
+    await page.route('**/api/execute', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200, contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          results: [{ statement: 'SELECT * FROM deals', columns: ['total'], rows: [{ total: 500 }], rowCount: 1,
+                      database: { kind: 'preset', id: 'p-a', name: 'Sales Postgres' } }],
+        }),
+      });
+    });
+    await page.route('**/api/summarize-results', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200, contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          summary: '*** NO SQL *** Results Summary\n\n**Sales Postgres:** Revenue is $500.\n\n' +
+            '**Marketing Postgres:** Nothing relevant to marketing here.',
+          database_summaries: [
+            { kind: 'preset', id: 'p-a', name: 'Sales Postgres', text: 'Revenue is $500.' },
+            { kind: 'preset', id: 'p-b', name: 'Marketing Postgres', text: 'Nothing relevant to marketing here.' },
+          ],
+          cross_database_summary: null,
+        }),
+      });
+    });
+
+    await page.locator('#aiPrompt').fill("how's business doing");
+    await page.locator('#aiPrompt').press('Enter');
+    await expect.poll(() => currentSql(page)).toContain('SELECT');
+    await page.locator('#runBtn').click();
+    await page.locator('.result-tab-btn').filter({ hasText: 'Summary' }).click();
+    await expect(page.locator('.response-text')).toContainText('Revenue is $500');
+
+    // Switch to Sales Postgres (p-a) specifically - the "sql" (executed)
+    // outcome. reconcileActiveHistoryBucket() (triggered by saving) both
+    // creates/finds that database's own bucket AND immediately restores
+    // its latest turn - no back/forward click needed to SEE it land there
+    // in the first place, only to prove it's really turn history (below).
+    await openConfigModal(page);
+    await page.locator('input[name="db_connection_option"][value="preset:p-a"]').check();
+    await page.locator('#configSaveBtn').click();
+    await expect(page.locator('#configModal')).toHaveClass(/hidden/);
+
+    // The prompt shown is p-a's OWN triage-rewritten question, not the
+    // original cross-database one and not p-b's rewrite either.
+    await expect(page.locator('#aiPrompt')).toHaveValue('How are sales performing?');
+    await expect.poll(() => currentSql(page)).toContain('FROM deals');
+    // Summary tab (p-a's own Phase C paragraph) prepended and made active,
+    // plus the one real result tab.
+    await expect(page.locator('#resultsTabsNav .result-tab-btn')).toHaveCount(2);
+    await expect(page.locator('.response-text')).toContainText('Revenue is $500.');
+
+    // A second, genuinely single-connection turn asked directly against
+    // p-a - this is what back/forward will actually be exercised against.
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200, contentType: 'application/json', body: JSON.stringify({ sql: 'SELECT COUNT(*) FROM reps;' }),
+      });
+    });
+    await page.route('**/api/execute', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200, contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          results: [{ statement: 'SELECT COUNT(*) FROM reps', columns: ['count'], rows: [{ count: 5 }], rowCount: 1 }],
+        }),
+      });
+    });
+    // Single-connection mode's own post-execution summarization (see
+    // requestSingleModeResultsSummary) fires unconditionally on a real
+    // question's execution - stubbed out to a no-summary response so this
+    // turn stays a clean, single-tab baseline to navigate back to.
+    await page.route('**/api/summarize-result', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ success: false }) });
+    });
+
+    await page.locator('#aiPrompt').fill('how many reps do we have');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect.poll(() => currentSql(page)).toContain('COUNT');
+    await page.locator('#runBtn').click();
+    // Exactly one result tab - buildResultsTabsNav() hides the tab strip
+    // entirely rather than showing a single-tab nav (see its own
+    // length <= 1 guard), so the tab count is asserted via the table body
+    // itself, not the (deliberately absent) nav.
+    await expect(page.locator('#resultsTabsNav')).toHaveClass(/hidden/);
+    await expect(page.locator('#resultsBody')).toContainText('5');
+
+    // Back to the fanned-out all-mode turn - "merged into its own
+    // back/forward history", not just visible on first switch-to.
+    await page.locator('#goBackBtn').click();
+    await expect(page.locator('#aiPrompt')).toHaveValue('How are sales performing?');
+    await expect.poll(() => currentSql(page)).toContain('FROM deals');
+    await expect(page.locator('#resultsTabsNav .result-tab-btn')).toHaveCount(2);
+    await expect(page.locator('.response-text')).toContainText('Revenue is $500.');
+
+    // ...and forward again, back to the direct single-connection turn.
+    await page.locator('#goForwardBtn').click();
+    await expect(page.locator('#aiPrompt')).toHaveValue('how many reps do we have');
+    await expect.poll(() => currentSql(page)).toContain('COUNT');
+    await expect(page.locator('#resultsTabsNav')).toHaveClass(/hidden/);
+    await expect(page.locator('#resultsBody')).toContainText('5');
+
+    // Now switch to Marketing Postgres (p-b) - the "note" outcome (no SQL
+    // ever generated/run for it at all). Its own bucket independently
+    // carries the SAME all-mode turn, fanned out as a plain
+    // '*** NO SQL ***' reply - restoreLatestTurn()'s single-connection
+    // no-SQL branch, not the tabbed-results branch p-a took above.
+    await openConfigModal(page);
+    await page.locator('input[name="db_connection_option"][value="preset:p-b"]').check();
+    await page.locator('#configSaveBtn').click();
+    await expect(page.locator('#configModal')).toHaveClass(/hidden/);
+
+    await expect(page.locator('#aiPrompt')).toHaveValue('How is marketing performing?');
+    await expect(page.locator('.response-text')).toContainText('Nothing relevant to marketing here.');
+    expect(await currentSql(page)).toBe('');
+  });
+
+  // Chunk 5 of "splitting SQL/summary per in-scope database" (see
+  // client.js's captureAllModeHistory()/fanOutAllModeHistoryPerDatabase()/
+  // buildInScopeConnectionHistories() docstrings for the earlier chunks):
+  // a connection's history is now COMPLETELY MERGED regardless of which
+  // mode each past turn came from, and that merged history is what an
+  // "all databases" mode request sends (as connection_histories, keyed by
+  // "preset:<id>"/"custom:<key>") for THAT SAME connection's own Phase B
+  // SQL-generation call. Covers both directions: an all-mode turn's own
+  // per-database fan-out (Chunk 4) feeding a LATER all-mode turn, and a
+  // genuinely direct single-connection-mode turn ALSO feeding a later
+  // all-mode turn for that same database.
+  test('a database\'s merged history (from both all-mode fan-out and direct single-connection turns) is sent as connection_histories on the next all-mode request', async ({ page }) => {
+    await mockConfig(page);
+    await gotoApp(page);
+
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          router_route: true,
+          routing_message: 'Checking both.',
+          sql: '-- database: preset:p-a (Sales Postgres)\nSELECT * FROM deals;',
+          database_notes: [
+            { kind: 'preset', id: 'p-b', name: 'Marketing Postgres', text: 'Nothing relevant to marketing here.' },
+          ],
+          generation_failures: [],
+          connection_selection: [
+            { kind: 'preset', id: 'p-a', name: 'Sales Postgres', prompt: 'How are sales performing?' },
+            { kind: 'preset', id: 'p-b', name: 'Marketing Postgres', prompt: 'How is marketing performing?' },
+          ],
+          sql_blocks: [
+            { kind: 'preset', id: 'p-a', name: 'Sales Postgres',
+              sql: '-- database: preset:p-a (Sales Postgres)\nSELECT * FROM deals;' },
+          ],
+        }),
+      });
+    });
+    await page.route('**/api/execute', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200, contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          results: [{ statement: 'SELECT * FROM deals', columns: ['total'], rows: [{ total: 500 }], rowCount: 1,
+                      database: { kind: 'preset', id: 'p-a', name: 'Sales Postgres' } }],
+        }),
+      });
+    });
+    await page.route('**/api/summarize-results', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200, contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          summary: '*** NO SQL *** Results Summary\n\n**Sales Postgres:** Revenue is $500.\n\n' +
+            '**Marketing Postgres:** Nothing relevant to marketing here.',
+          database_summaries: [
+            { kind: 'preset', id: 'p-a', name: 'Sales Postgres', text: 'Revenue is $500.' },
+            { kind: 'preset', id: 'p-b', name: 'Marketing Postgres', text: 'Nothing relevant to marketing here.' },
+          ],
+          cross_database_summary: null,
+        }),
+      });
+    });
+
+    // Turn 1 - an "all databases" mode turn that fans out into both p-a's
+    // and p-b's own buckets (Chunk 4).
+    await page.locator('#aiPrompt').fill("how's business doing");
+    await page.locator('#aiPrompt').press('Enter');
+    await expect.poll(() => currentSql(page)).toContain('SELECT');
+    await page.locator('#runBtn').click();
+    await page.locator('.result-tab-btn').filter({ hasText: 'Summary' }).click();
+    await expect(page.locator('.response-text')).toContainText('Revenue is $500');
+
+    // Switch to Sales Postgres (p-a) directly and ask it a genuinely
+    // single-connection-mode question - turn 2 in that SAME bucket.
+    await openConfigModal(page);
+    await page.locator('input[name="db_connection_option"][value="preset:p-a"]').check();
+    await page.locator('#configSaveBtn').click();
+    await expect(page.locator('#configModal')).toHaveClass(/hidden/);
+
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200, contentType: 'application/json', body: JSON.stringify({ sql: 'SELECT COUNT(*) FROM reps;' }),
+      });
+    });
+    await page.route('**/api/execute', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200, contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          results: [{ statement: 'SELECT COUNT(*) FROM reps', columns: ['count'], rows: [{ count: 5 }], rowCount: 1 }],
+        }),
+      });
+    });
+    await page.route('**/api/summarize-result', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ success: false }) });
+    });
+
+    await page.locator('#aiPrompt').fill('how many reps do we have');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect.poll(() => currentSql(page)).toContain('COUNT');
+    await page.locator('#runBtn').click();
+    await expect(page.locator('#resultsBody')).toContainText('5');
+
+    // Switch back to "All configured databases" and ask a third, new
+    // combined question - capture exactly what THIS request sends.
+    await openConfigModal(page);
+    await page.locator('input[name="db_connection_option"][value="all"]').check();
+    await page.locator('#configSaveBtn').click();
+    await expect(page.locator('#configModal')).toHaveClass(/hidden/);
+
+    let thirdRequestBody = null;
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      thirdRequestBody = route.request().postDataJSON();
+      await route.fulfill({
+        status: 200, contentType: 'application/json', body: JSON.stringify({ sql: 'SELECT 3;' }),
+      });
+    });
+    await page.locator('#aiPrompt').fill('another combined question');
+    await page.locator('#aiPrompt').press('Enter');
+
+    await expect.poll(() => thirdRequestBody).not.toBeNull();
+    const histories = thirdRequestBody.connection_histories;
+    expect(histories).toBeTruthy();
+
+    // p-a's own bucket: turn 1 (fanned out from all-mode) THEN turn 2 (the
+    // direct single-connection question) - both, merged, in that order.
+    const pa = histories['preset:p-a'];
+    expect(pa).toHaveLength(4);
+    expect(pa[0]).toMatchObject({ role: 'user', text: 'How are sales performing?' });
+    expect(pa[1].text).toContain('FROM deals');
+    expect(pa[1].results[0].rows).toEqual([{ total: 500 }]);
+    expect(pa[2]).toMatchObject({ role: 'user', text: 'how many reps do we have' });
+    expect(pa[3].text).toContain('COUNT');
+    expect(pa[3].results[0].rows).toEqual([{ count: 5 }]);
+
+    // p-b's own bucket: only turn 1's note outcome - it was never visited
+    // in single-connection mode at all.
+    const pb = histories['preset:p-b'];
+    expect(pb).toHaveLength(2);
+    expect(pb[0]).toMatchObject({ role: 'user', text: 'How is marketing performing?' });
+    expect(pb[1].text).toContain('Nothing relevant to marketing here.');
   });
 });

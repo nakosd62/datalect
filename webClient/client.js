@@ -180,6 +180,23 @@ document.addEventListener('DOMContentLoaded', async () => {
   // ONLY to key chatStoresByBucket; nothing else in this file needs it.
   let CURRENT_USER_IDENTITY = 'global';
 
+  // A single connection's own stable identity for bucketing purposes -
+  // "preset:<id>"/"custom:<key>", matching the exact {kind, id} pair
+  // resolve_descriptor_by_reference uses server-side, and therefore the
+  // exact same pair every all-mode fan-out entry is tagged with (see
+  // captureAllModeHistory's databaseSql/notes.connectionPrompts entries,
+  // each {kind, id, ...}). Used by computeBucketKey() below for the
+  // currently-active single connection, and by pushTurnIntoBucket() below
+  // for fanning an all-mode turn out into each of ITS in-scope databases'
+  // own buckets - the whole point of Chunk 4 (see that function's own
+  // docstring): a database reached either way now lands in the identical
+  // bucket, so switching to it directly in single-connection mode picks up
+  // history recorded on its behalf while chatting in "all databases" mode,
+  // and vice versa.
+  function connectionBucketKey(kind, id) {
+    return `${kind}:${id}`;
+  }
+
   // What actually identifies "a conversation" for bucketing purposes -
   // called after anything that could change the answer (see
   // reconcileActiveHistoryBucket()'s own call sites: fetchBackendConfig()
@@ -191,16 +208,52 @@ document.addEventListener('DOMContentLoaded', async () => {
     // specific presets/custom connections are currently checked into
     // scope - checking one more database in or out mid-conversation
     // changes who might answer the NEXT question, not which conversation
-    // this is. Everything else (a single active connection) is identified
-    // the same way a real connection change has always been detected
-    // elsewhere in this file - url/is_custom/connection_key/preset_id
-    // together, since no single one of those four is guaranteed to
-    // uniquely identify "the" active connection on its own (e.g. an
-    // unsaved ad hoc custom URL has no connection_key at all).
-    const connection = IN_SCOPE_MODE === 'all'
-      ? 'all'
-      : `${ACTIVE_DB_URL}|${ACTIVE_IS_CUSTOM}|${ACTIVE_CUSTOM_CONNECTION_KEY}|${ACTIVE_PRESET_ID}`;
+    // this is. Everything else (a single active connection) is now
+    // identified by its own stable (kind, id) pair - see
+    // connectionBucketKey's own docstring for why this replaced the old
+    // url|is_custom|customKey|presetId tuple: that tuple went stale
+    // whenever ACTIVE_DB_URL wasn't reset on a preset switch (see
+    // triggerConfigSave()'s own fix earlier this session) and, more
+    // fundamentally, could never match the {kind, id} pair an all-mode
+    // fan-out entry for the SAME database is tagged with, since a URL
+    // alone says nothing about which specific preset/custom connection
+    // that URL belongs to. A saved custom connection is identified by its
+    // own connection_key, same as resolve_descriptor_by_reference's own
+    // "custom" branch; an UNSAVED ad hoc custom URL (typed directly, never
+    // given a name/saved - see ACTIVE_CUSTOM_CONNECTION_KEY's own
+    // declaration comment) has no connection_key or other server-side
+    // identity at all, so this falls back to the raw URL for that one
+    // case, same as every bucket key did before this refactor - all-mode's
+    // own fan-out never visits an unsaved connection in the first place
+    // (resolve_in_scope_descriptors only ever resolves saved presets/
+    // custom connections), so there's no fan-out entry this fallback could
+    // ever fail to match anyway.
+    let connection;
+    if (IN_SCOPE_MODE === 'all') {
+      connection = 'all';
+    } else if (ACTIVE_IS_CUSTOM) {
+      connection = ACTIVE_CUSTOM_CONNECTION_KEY
+        ? connectionBucketKey('custom', ACTIVE_CUSTOM_CONNECTION_KEY)
+        : `custom-adhoc:${ACTIVE_DB_URL}`;
+    } else {
+      connection = connectionBucketKey('preset', ACTIVE_PRESET_ID);
+    }
     return `${identity}::${connection}`;
+  }
+
+  // Finds (or creates, starting empty) the chat history store for `key` -
+  // shared by reconcileActiveHistoryBucket() below (switching the
+  // CURRENTLY ACTIVE bucket) and pushTurnIntoBucket() further down (an
+  // all-mode turn's own per-database fan-out, appending to a bucket that
+  // may or may not be the active one) so bucket-creation is written in
+  // exactly one place for both.
+  function getOrCreateBucketStore(key) {
+    let store = chatStoresByBucket.get(key);
+    if (!store) {
+      store = createChatHistoryStore(currentHistoryMaxTurns);
+      chatStoresByBucket.set(key, store);
+    }
+    return store;
   }
 
   // Switches `chatStore` to whichever bucket computeBucketKey() currently
@@ -216,12 +269,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const key = computeBucketKey();
     if (key === activeBucketKey) return;
     activeBucketKey = key;
-    let store = chatStoresByBucket.get(key);
-    if (!store) {
-      store = createChatHistoryStore(currentHistoryMaxTurns);
-      chatStoresByBucket.set(key, store);
-    }
-    chatStore = store;
+    chatStore = getOrCreateBucketStore(key);
     // restoreLatestTurn() (defined far below, in section 12 - a plain
     // function declaration, so it's already hoisted and callable from up
     // here) already does exactly the right thing for both an empty bucket
@@ -231,6 +279,76 @@ document.addEventListener('DOMContentLoaded', async () => {
     // history you left", not just making it reachable via the back arrow.
     restoreLatestTurn();
     updateHistoryTurnsSubtitle();
+  }
+
+  // Appends one (user, model) turn directly into a SPECIFIC database's own
+  // bucket - identity + that database's own connectionBucketKey(kind, id) -
+  // WITHOUT switching `chatStore`/`activeBucketKey` to it and without any
+  // re-render of any kind, even if this happens to be the bucket currently
+  // shown on screen (see fanOutAllModeHistoryPerDatabase's own docstring
+  // for why that's the deliberate, "never disturb the active view" design
+  // for this feature - the turn is simply there, waiting, the next time
+  // the user navigates that bucket's own history).
+  function pushTurnIntoBucket(kind, id, userText, modelEntry) {
+    const identity = CURRENT_USER_IDENTITY || 'global';
+    const key = `${identity}::${connectionBucketKey(kind, id)}`;
+    getOrCreateBucketStore(key).pushTurn(userText, modelEntry);
+  }
+
+  // Chunk 5 of "splitting SQL/summary per in-scope database" (see
+  // captureAllModeHistory()/fanOutAllModeHistoryPerDatabase()'s own
+  // docstrings for the earlier chunks): builds the per-connection history
+  // payload an "all databases" mode /api/translate request sends alongside
+  // its own shared `history` field, so Phase B's per-connection SQL-
+  // generation call for a given database can be fed THAT SAME database's
+  // own FULLY MERGED history - single-connection-mode turns and every
+  // prior all-mode turn already fanned out to it, indistinguishably (see
+  // connectionBucketKey()'s own docstring for why the two are now one and
+  // the same bucket) - instead of no history at all.
+  //
+  // One entry per connection "all databases" mode could ever actually
+  // route Phase B to - EVERY currently configured preset (CONFIGURED_DBS)
+  // plus every one of this user's own SAVED custom connections (a row
+  // with a real `connection_key` - see ACTIVE_CUSTOM_CONNECTION_KEY's own
+  // declaration comment for what distinguishes a saved connection from an
+  // unsaved ad hoc one). Deliberately NOT IN_SCOPE_PRESET_IDS/
+  // IN_SCOPE_CUSTOM_KEYS - those are the explicit-list arrays "single"
+  // mode's own scope uses, but "all" mode's real routing candidate pool
+  // ignores them entirely in favor of every configured/saved connection
+  // (see db.py's resolve_in_scope_descriptors/_resolve_all_configured_
+  // descriptors docstrings) - those two arrays can also simply be stale
+  // leftovers from the last time this session was in "single" mode (see
+  // config_routes.py's "'all' mode ignores them, leaves the existing
+  // scope alone" behavior), so filtering by them here would silently
+  // starve Phase B of history for a database "all" mode can plainly still
+  // reach. Keyed by the exact same "preset:<id>"/"custom:<key>" string
+  // connectionBucketKey() builds, so translate_routes.py's
+  // stream_translation() can look each one up by `f"{kind}:{id}"` with
+  // zero string-format guessing on the server side.
+  //
+  // Read-only against chatStoresByBucket - deliberately does NOT call
+  // getOrCreateBucketStore() - a connection with no bucket yet (never
+  // visited, directly or via fan-out) simply contributes no key at all,
+  // rather than a request-build side effect creating an empty bucket
+  // nothing will ever populate. Built fresh on every all-mode request
+  // (see translatePrompt()'s own call site) rather than kept as standing
+  // state, since which connections are even configured/saved can change
+  // between turns.
+  function buildInScopeConnectionHistories() {
+    const identity = CURRENT_USER_IDENTITY || 'global';
+    const out = {};
+    (CONFIGURED_DBS || []).forEach((db) => {
+      const bucketKeySuffix = connectionBucketKey('preset', db.id);
+      const store = chatStoresByBucket.get(`${identity}::${bucketKeySuffix}`);
+      if (store) out[bucketKeySuffix] = store.toPayload();
+    });
+    (customDatabases || []).forEach((db) => {
+      if (!db.connection_key) return; // unsaved ad hoc row - never part of "all" mode's real candidate pool
+      const bucketKeySuffix = connectionBucketKey('custom', db.connection_key);
+      const store = chatStoresByBucket.get(`${identity}::${bucketKeySuffix}`);
+      if (store) out[bucketKeySuffix] = store.toPayload();
+    });
+    return out;
   }
 
   let DEFAULT_DB_URL = "";
@@ -6169,10 +6287,24 @@ document.addEventListener('DOMContentLoaded', async () => {
   // happening. showRetryStatus() is reused as-is - it already renders
   // generic "transient error, retrying" wording regardless of which
   // server-side call produced the event.
+  //
+  // Returns { databaseSummaries, crossDatabaseSummary } on success -
+  // translate_routes.py's /api/summarize-results now additionally returns
+  // these two structured fields alongside the plain joined `summary` this
+  // function has always patched into the Summary tab (see that route's own
+  // docstring: `database_summaries` is one {kind, id, name, text} entry per
+  // in-scope database, `cross_database_summary` is the separate paragraph
+  // spanning more than one database, or null). Every call site forwards
+  // this straight into captureAllModeHistory() so it's recorded onto the
+  // turn's history entry for a later chunk's per-database fan-out to use -
+  // this chunk only records it, nothing here (or in captureAllModeHistory)
+  // reads it back yet. Returns null for every case that already returned
+  // nothing before this (skipped, aborted, or the request/LLM call itself
+  // failed) - there's no structured summary to record in any of those.
   async function requestAllModeResultsSummary(notes, executeResults, executeFailures) {
-    if (!notes || !notes.prompt) return;
+    if (!notes || !notes.prompt) return null;
     const databaseResults = buildAllModeSummaryPayload(notes, executeResults, executeFailures);
-    if (!databaseResults.some((e) => 'columns' in e || 'error' in e)) return;
+    if (!databaseResults.some((e) => 'columns' in e || 'error' in e)) return null;
 
     try {
       const response = await fetch('/api/summarize-results', {
@@ -6191,6 +6323,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         // /api/summarize-results docstring) - an internal convention,
         // never meant to reach the user verbatim.
         appendPhaseCSummaryToSummaryTab(stripNoSqlPrefix(data.summary));
+        return {
+          databaseSummaries: Array.isArray(data.database_summaries) ? data.database_summaries : [],
+          crossDatabaseSummary: data.cross_database_summary || null,
+        };
       } else if (data && data.error) {
         appendPhaseCErrorToSummaryTab(data.error);
       }
@@ -6201,10 +6337,11 @@ document.addEventListener('DOMContentLoaded', async () => {
       // belong to a stale, already-cleared turn) on top of that would be
       // wrong.
       if (err && err.name === 'AbortError') {
-        return;
+        return null;
       }
       console.error('Failed to summarize all-mode results:', err);
     }
+    return null;
   }
 
   // The Summary tab's CURRENT text - i.e. triage's routing message, plus
@@ -6345,12 +6482,33 @@ document.addEventListener('DOMContentLoaded', async () => {
   // unlabeled) set of per-statement result tabs - or, when every database
   // just noted/failed instead of returning real SQL, nothing at all (see
   // the empty-`.text` guard below).
-  function captureAllModeHistory(modelEntry, notes, executeFailures) {
+  //
+  // `notes.databaseSql` and `summaryResult` (new - see each call site) are
+  // recorded here purely for a LATER chunk's use: splitting the SQL text
+  // and the summary text per in-scope database, so a per-database turn can
+  // eventually be pushed into each database's own single-connection-mode
+  // history bucket. `notes.databaseSql` is translate_routes.py's own
+  // `sql_blocks` (Chunk 1 - one {kind, id, name, sql} entry per database
+  // that actually got real SQL, already threaded through onto `notes`
+  // wherever it's built - see startAllModeStreaming()/maybeFinalize() and
+  // translatePrompt()/executeSql()'s pendingAllModeNotes construction).
+  // `summaryResult` is requestAllModeResultsSummary()'s own returned
+  // {databaseSummaries, crossDatabaseSummary} (Chunk 2's structured Phase C
+  // response), passed straight through by every call site right after
+  // awaiting that call. Nothing in THIS chunk ever reads these three
+  // fields back - restoreLatestTurn() still rebuilds the combined view
+  // purely from routingMessage/databaseNotes/generationFailures/
+  // executeFailures/results, exactly as before - so recording them here has
+  // no effect on anything the user sees yet.
+  function captureAllModeHistory(modelEntry, notes, executeFailures, summaryResult) {
     modelEntry.allMode = {
       routingMessage: (notes && notes.routingMessage) || null,
       databaseNotes: (notes && notes.databaseNotes) || [],
       generationFailures: (notes && notes.generationFailures) || [],
       executeFailures: executeFailures || [],
+      databaseSql: (notes && notes.databaseSql) || [],
+      databaseSummaries: (summaryResult && summaryResult.databaseSummaries) || [],
+      crossDatabaseSummary: (summaryResult && summaryResult.crossDatabaseSummary) || null,
     };
     // Every database just noted/failed - translatePrompt()'s router_route
     // branch never sets modelEntry.text to anything but '' for this
@@ -6364,6 +6522,106 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (!modelEntry.text) {
       modelEntry.text = `*** NO SQL *** ${(notes && notes.routingMessage) || 'No database returned any data for this question.'}`;
     }
+  }
+
+  // Looks up a specific database's own triage-rewritten question -
+  // notes.connectionPrompts (new - see maybeFinalize()'s/translatePrompt()'s
+  // pendingAllModeNotes' own construction) mirrors connection_selection's
+  // own per-entry "prompt" field (translate_routes.py's entry_prompts -
+  // that database's own rewrite when triage supplied one, else the
+  // original cross-database question unchanged). Falls back to `notes.prompt`
+  // (the turn's original question) for a `notes` object that predates this
+  // field, or if this database somehow has no matching entry - the same
+  // "never worse than what single-connection mode already had" fallback
+  // entry_prompts itself uses server-side.
+  function findDatabasePrompt(notes, kind, id) {
+    const entries = (notes && notes.connectionPrompts) || [];
+    const match = entries.find((e) => e.kind === kind && e.id === id);
+    return (match && match.prompt) || (notes && notes.prompt) || '';
+  }
+
+  // Chunk 4 of "splitting SQL/summary per in-scope database" (see this
+  // file's own multi-window design history - Chunks 1-3 recorded this same
+  // structured per-database data onto the all-mode turn's OWN shared
+  // history entry via captureAllModeHistory() above; this is what actually
+  // fans it back OUT). For every in-scope database this turn produced a
+  // real outcome for (sql+executed, note, or failed - a database that
+  // still sits in an un-executed "Ready to execute" placeholder has no
+  // outcome yet and is simply not in any of `notes`' three lists below),
+  // reconstructs the exact single-connection-shaped
+  // {prompt, text, results, summary} tuple that database would have
+  // produced had the user asked it directly in single-connection mode
+  // (see restoreLatestTurn()'s own three shapes - '*** NO SQL ***'-prefixed
+  // text with no results/summary for note/failed, {text: sql, results:
+  // [...], summary?} for a real execution, verified against that
+  // function's actual reading behavior), and pushes it into that
+  // database's own bucket via pushTurnIntoBucket() - which never touches
+  // `chatStore`/`activeBucketKey` or re-renders anything, so this has zero
+  // effect on whichever bucket is currently on screen (the all-mode shared
+  // one very much included - that bucket already got its OWN turn from
+  // captureAllModeHistory() above, unaffected by this).
+  //
+  // `notes` is the same shape every captureAllModeHistory() call site
+  // already builds (routingMessage/databaseNotes/generationFailures/
+  // databaseSql/connectionPrompts). `executeResults`/`executeFailures` are
+  // this turn's raw (pre-summarizeResultForHistory) execute rows/failures,
+  // each tagged with its own `.database` (see execute_routes.py/
+  // settleAllModeBatchedResults) - summarizeResultForHistory (below in
+  // this file, already hoisted - see this function's own placement
+  // comment) is reused here unchanged to build each database's own
+  // `results` entries, exactly as maybeFinalize()/executeSql() already use
+  // it for the combined all-mode turn. `summaryResult` is
+  // requestAllModeResultsSummary()'s own {databaseSummaries,
+  // crossDatabaseSummary} (Chunk 2), or null when Phase C never ran (e.g.
+  // a request that failed outright) - every per-database summary lookup
+  // below already tolerates that.
+  function fanOutAllModeHistoryPerDatabase(notes, executeResults, executeFailures, summaryResult) {
+    const databaseNotes = (notes && notes.databaseNotes) || [];
+    const generationFailures = (notes && notes.generationFailures) || [];
+    const databaseSql = (notes && notes.databaseSql) || [];
+    const databaseSummaries = (summaryResult && summaryResult.databaseSummaries) || [];
+    const results = Array.isArray(executeResults) ? executeResults : [];
+    const failures = Array.isArray(executeFailures) ? executeFailures : [];
+
+    function findSummaryText(kind, id) {
+      const match = databaseSummaries.find((s) => s.kind === kind && s.id === id);
+      return (match && match.text) || undefined;
+    }
+
+    // "note" outcome - triage decided this database needed no SQL at all.
+    databaseNotes.forEach((n) => {
+      pushTurnIntoBucket(n.kind, n.id, findDatabasePrompt(notes, n.kind, n.id), {
+        role: 'model',
+        text: `*** NO SQL *** ${n.text || ''}`,
+      });
+    });
+
+    // "failed" outcome - Phase B's own SQL generation call errored for
+    // this database, so (like "note" above) nothing ever executed.
+    generationFailures.forEach((f) => {
+      pushTurnIntoBucket(f.kind, f.id, findDatabasePrompt(notes, f.kind, f.id), {
+        role: 'model',
+        text: `*** NO SQL *** ${f.error || 'Failed to generate SQL for this database.'}`,
+      });
+    });
+
+    // "sql" (executed) outcome - one turn per database that actually got
+    // real SQL, joining that database's own generated text (databaseSql)
+    // with whichever of its own rows/errors came back (matched by the
+    // same `.database` tag every other consumer in this file already
+    // relies on) and its own Phase C paragraph, if Phase C ran.
+    databaseSql.forEach((entry) => {
+      const ownResults = results
+        .filter((r) => r.database && r.database.kind === entry.kind && r.database.id === entry.id)
+        .map(summarizeResultForHistory);
+      const ownFailures = failures
+        .filter((f) => f.database && f.database.kind === entry.kind && f.database.id === entry.id)
+        .map(summarizeResultForHistory);
+      const modelEntry = { role: 'model', text: entry.sql || '', results: [...ownResults, ...ownFailures] };
+      const summaryText = findSummaryText(entry.kind, entry.id);
+      if (summaryText) modelEntry.summary = summaryText;
+      pushTurnIntoBucket(entry.kind, entry.id, findDatabasePrompt(notes, entry.kind, entry.id), modelEntry);
+    });
   }
 
   // "All databases" mode's PROGRESSIVE render path - the streaming
@@ -6853,6 +7111,22 @@ document.addEventListener('DOMContentLoaded', async () => {
       routingMessage: state.routingMessage,
       databaseNotes: state.databaseNotes,
       generationFailures: state.generationFailures,
+      // Chunk 1's per-database sql_blocks, threaded through onto `notes` so
+      // captureAllModeHistory() below can record it - see that function's
+      // own docstring for why (a later chunk's per-database history
+      // fan-out). state.terminalData is /api/translate's own terminal
+      // line, already stashed here by translatePrompt()'s router_route
+      // branch before this function could ever run.
+      databaseSql: (state.terminalData && state.terminalData.sql_blocks) || [],
+      // Chunk 4's per-database triage-rewritten questions - the SAME
+      // connection_selection array startAllModeStreaming() stashed as
+      // state.connectionOrder, now additionally carrying each entry's own
+      // "prompt" field (see translate_routes.py's connection_selection/
+      // entry_prompts docstrings) - threaded through so
+      // fanOutAllModeHistoryPerDatabase() below (via findDatabasePrompt())
+      // can record each database's OWN question onto its own fanned-out
+      // turn, not the original cross-database one.
+      connectionPrompts: state.connectionOrder || [],
     };
 
     // Phase C - see requestAllModeResultsSummary's docstring. Awaited so
@@ -6864,7 +7138,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     // can take a moment, and previously nothing on screen indicated the
     // app was still working during it.
     showAllModeSummarizingStatus();
-    await requestAllModeResultsSummary(notes, state.executeResults, state.executeFailures);
+    const summaryResult = await requestAllModeResultsSummary(notes, state.executeResults, state.executeFailures);
     hideAllModeStreamStatus();
     settleSummaryTabPending();
     const summaryEntry = getSummaryTabEntry();
@@ -6884,12 +7158,16 @@ document.addEventListener('DOMContentLoaded', async () => {
         // duplicate turn.
         const pending = chatStore.getPending();
         pending.entry.results = summarizedResults;
-        captureAllModeHistory(pending.entry, notes, state.executeFailures);
+        captureAllModeHistory(pending.entry, notes, state.executeFailures, summaryResult);
         chatStore.clearPending();
       } else {
         modelEntry.results = summarizedResults;
-        captureAllModeHistory(modelEntry, notes, state.executeFailures);
+        captureAllModeHistory(modelEntry, notes, state.executeFailures, summaryResult);
       }
+      // Chunk 4 - see fanOutAllModeHistoryPerDatabase's own docstring: does
+      // NOT touch chatStore/activeBucketKey, so this runs regardless of
+      // which branch above just fired.
+      fanOutAllModeHistoryPerDatabase(notes, state.executeResults, state.executeFailures, summaryResult);
     }
 
     allModeStreamState = null;
@@ -6970,6 +7248,17 @@ document.addEventListener('DOMContentLoaded', async () => {
         body: JSON.stringify({
           prompt: promptText,
           history: chatStore.toPayload(),
+          // Chunk 5 (see buildInScopeConnectionHistories()'s own
+          // docstring) - "all databases" mode only; JSON.stringify simply
+          // omits an `undefined`-valued key, so a single-connection-mode
+          // request's body carries no connection_histories field at all,
+          // same as before this existed. isAllConnectionsSelected() is
+          // exactly IN_SCOPE_MODE === 'all', matching
+          // stream_translation()'s own router_only_all_mode condition
+          // (this function never sends a database_url override - see the
+          // comment above - so IN_SCOPE_MODE alone decides this the same
+          // way server-side).
+          connection_histories: isAllConnectionsSelected() ? buildInScopeConnectionHistories() : undefined,
           // translate_routes.py's /api/translate handler doesn't read this
           // key at all - the only server-side consumer of a client-echoed
           // pinned_connections entry today is execute_routes.py's
@@ -7081,6 +7370,25 @@ document.addEventListener('DOMContentLoaded', async () => {
             routingMessage: data.routing_message || null,
             databaseNotes: data.database_notes || [],
             generationFailures: data.generation_failures || [],
+            // Chunk 1's per-database sql_blocks, threaded through so
+            // executeSql()'s own pendingAllModeNotes fallback branches
+            // (below in this file) can pass it on to captureAllModeHistory
+            // too - see that function's own docstring for why (a later
+            // chunk's per-database history fan-out). Necessarily empty
+            // here whenever `data.sql` itself is (see the `else` branch
+            // just below, the only place this object is used with no SQL
+            // at all) - server-side, sql_blocks only ever contains entries
+            // that actually got real SQL.
+            databaseSql: data.sql_blocks || [],
+            // Chunk 4's per-database triage-rewritten questions - this
+            // fallback's own terminal line already carries
+            // connection_selection (same field phase_a_route's live event
+            // would have, for a turn that never emitted one - see this
+            // object's own declaration comment above) with each entry's
+            // own "prompt" field. Threaded through for
+            // fanOutAllModeHistoryPerDatabase()/findDatabasePrompt()'s use
+            // below, same as databaseSql just above.
+            connectionPrompts: data.connection_selection || [],
           };
 
           if (data.sql) {
@@ -7113,12 +7421,18 @@ document.addEventListener('DOMContentLoaded', async () => {
             });
             pendingAllModeNotes = null;
             showAllModeSummarizingStatus();
-            await requestAllModeResultsSummary(allModeNotes, [], []);
+            const summaryResult = await requestAllModeResultsSummary(allModeNotes, [], []);
             hideAllModeStreamStatus();
             settleSummaryTabPending();
             const summaryEntry = getSummaryTabEntry();
             if (summaryEntry) allModeNotes.routingMessage = summaryEntry.text;
-            captureAllModeHistory(modelEntry, allModeNotes, []);
+            captureAllModeHistory(modelEntry, allModeNotes, [], summaryResult);
+            // Chunk 4 - see fanOutAllModeHistoryPerDatabase's own
+            // docstring. Nothing was executed at all here (this whole
+            // branch is guarded on `!data.sql`), so only the note/failed
+            // outcomes in `allModeNotes` can ever produce a fanned-out
+            // turn.
+            fanOutAllModeHistoryPerDatabase(allModeNotes, [], [], summaryResult);
           }
         }
       } else if (response && response.ok && data && data.sql) {
@@ -7399,6 +7713,12 @@ document.addEventListener('DOMContentLoaded', async () => {
           // still the ORIGINAL fully-batched render this app used for
           // every router_route turn before progressive streaming existed.
           const allModeNotes = pendingAllModeNotes;
+          // Set only inside the `if (allModeNotes)` branch below - read
+          // further down by both captureAllModeHistory() calls, which are
+          // themselves already gated on `allModeNotes` being truthy, so
+          // staying null here for the `else` (plain single-connection)
+          // branch is never actually read.
+          let allModeSummaryResult = null;
           if (allModeNotes) {
             renderAllModeCombinedResults({
               notes: allModeNotes,
@@ -7424,7 +7744,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             // gives this real network round trip a visible indicator -
             // previously there was none at all on this fallback path.
             showAllModeSummarizingStatus();
-            await requestAllModeResultsSummary(allModeNotes, data.results, []);
+            allModeSummaryResult = await requestAllModeResultsSummary(allModeNotes, data.results, []);
             hideAllModeStreamStatus();
             settleSummaryTabPending();
             const summaryEntry = getSummaryTabEntry();
@@ -7465,18 +7785,25 @@ document.addEventListener('DOMContentLoaded', async () => {
             const pending = chatStore.getPending();
             pending.entry.text = sql;
             pending.entry.results = summarizedResults;
-            if (allModeNotes) captureAllModeHistory(pending.entry, allModeNotes, []);
+            if (allModeNotes) captureAllModeHistory(pending.entry, allModeNotes, [], allModeSummaryResult);
             if (singleModeSummary) pending.entry.summary = singleModeSummary;
             chatStore.clearPending();
           } else {
             // Any other execution (direct SQL entry, or re-running a query
             // that isn't the pending just-generated one) is its own turn.
             const modelEntry = { role: 'model', text: sql, results: summarizedResults };
-            if (allModeNotes) captureAllModeHistory(modelEntry, allModeNotes, []);
+            if (allModeNotes) captureAllModeHistory(modelEntry, allModeNotes, [], allModeSummaryResult);
             if (singleModeSummary) modelEntry.summary = singleModeSummary;
             chatStore.pushTurn(promptText, modelEntry);
             updateHistoryTurnsSubtitle();
           }
+          // Chunk 4 - see fanOutAllModeHistoryPerDatabase's own docstring.
+          // Runs regardless of which pending/new-turn branch above just
+          // fired, same as maybeFinalize()'s identical call - a no-op
+          // (undefined notes/executeResults, both defaulted inside) for a
+          // plain single-connection execution, where `allModeNotes` is
+          // null.
+          if (allModeNotes) fanOutAllModeHistoryPerDatabase(allModeNotes, data.results, [], allModeSummaryResult);
         }
 
         if (connDbDot) connDbDot.className = 'status-dot connected';
@@ -7543,7 +7870,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           });
           pendingAllModeNotes = null;
           showAllModeSummarizingStatus();
-          await requestAllModeResultsSummary(allModeNotes, executeResults, executeFailures);
+          const summaryResult = await requestAllModeResultsSummary(allModeNotes, executeResults, executeFailures);
           hideAllModeStreamStatus();
           settleSummaryTabPending();
           const summaryEntry = getSummaryTabEntry();
@@ -7563,14 +7890,16 @@ document.addEventListener('DOMContentLoaded', async () => {
           if (chatStore.isPendingCurrent()) {
             const pending = chatStore.getPending();
             pending.entry.results = summarizedResults;
-            captureAllModeHistory(pending.entry, allModeNotes, executeFailures);
+            captureAllModeHistory(pending.entry, allModeNotes, executeFailures, summaryResult);
             chatStore.clearPending();
           } else {
             const modelEntry = { role: 'model', text: sql, results: summarizedResults };
-            captureAllModeHistory(modelEntry, allModeNotes, executeFailures);
+            captureAllModeHistory(modelEntry, allModeNotes, executeFailures, summaryResult);
             chatStore.pushTurn(promptText, modelEntry);
             updateHistoryTurnsSubtitle();
           }
+          // Chunk 4 - see fanOutAllModeHistoryPerDatabase's own docstring.
+          fanOutAllModeHistoryPerDatabase(allModeNotes, executeResults, executeFailures, summaryResult);
         // Multi-database question-answering's own partial-failure shape
         // (see execute_routes.py's module docstring) - `failures` is a
         // LIST (one entry per connection that failed; the others keep

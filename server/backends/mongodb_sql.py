@@ -112,7 +112,22 @@ from .base import (
 # line comments ("--...") and block comments ("/*...*/") first so a
 # statement like "-- get sales\nDELETE FROM orders" can't slip the read-only
 # check by hiding its real first keyword behind a comment.
-_LEADING_COMMENT_RE = re.compile(r'^\s*(--[^\n]*\n|/\*.*?\*/\s*)*', re.DOTALL)
+#
+# The trailing `\s*` sits INSIDE each alternative's own repetition (not just
+# once, up front) so a blank line between two leading comment lines doesn't
+# stop the match partway through a real multi-line comment block - e.g.
+# "-- line 1\n\n-- line 2\nSELECT 1" (the model frequently writes exactly
+# this: a paragraph of documentation comments with a blank line for
+# readability before the actual query). A previous version of this regex
+# only consumed leading whitespace ONCE, before the loop
+# (r'^\s*(--[^\n]*\n|/\*.*?\*/\s*)*'), so it stopped at the first blank line
+# and left everything after it (still starting with "--") unstripped -
+# _FIRST_KEYWORD_RE's `\w+` then failed to match "--" at all, so `keyword`
+# came back empty, the query was rejected as not read-only, and the error
+# message echoed back stmt_clean's own unstripped, comment-laden prefix
+# (see _reject_if_not_read_only's `stmt_clean[:20]` fallback) instead of
+# ever reaching the real SELECT.
+_LEADING_COMMENT_RE = re.compile(r'^\s*(?:(?:--[^\n]*|/\*.*?\*/)\s*)*', re.DOTALL)
 _FIRST_KEYWORD_RE = re.compile(r'^\s*(\w+)', re.IGNORECASE)
 
 # The only statement shapes MongoDB's SQL Interface actually supports (see

@@ -356,6 +356,49 @@ def test_execute_allows_with_cte_select():
     assert results[0]["rows"] == [{"n": 1}]
 
 
+def test_execute_allows_select_preceded_by_a_multi_line_comment_block_with_a_blank_line():
+    # Regression guard for a real user-reported bug: _LEADING_COMMENT_RE
+    # used to only strip leading whitespace ONCE, before its comment-
+    # matching loop started, so a blank line partway through a multi-line
+    # comment block (exactly the shape the model frequently writes - a
+    # paragraph of documentation comments, a blank line for readability,
+    # then the query) stopped the strip early and left the remaining
+    # comment lines - still starting with "--" - in front of the real
+    # SELECT. The read-only check's keyword regex can't match "--" as a
+    # word, so `keyword` came back empty and this real, perfectly valid
+    # SELECT was wrongly rejected as not read-only.
+    conn = _FakeConnection(statement_responses=[(["n"], [(1,)])])
+    sql = (
+        "-- MongoDB \"mflix\" Sample Dataset Exploration\n"
+        "-- The following queries explore the collections.\n"
+        "-- Each query is documented with a comment.\n"
+        "\n"
+        "-- 1. Total document counts per collection\n"
+        "-- Reveals: the relative size of each collection.\n"
+        "SELECT 1 AS n"
+    )
+    results = MongoSqlBackend().execute(conn, sql)
+    assert results[0]["rows"] == [{"n": 1}]
+
+
+def test_execute_rejects_write_hidden_behind_a_multi_line_comment_block_with_a_blank_line():
+    # Sibling of the regression guard above: the SAME tricky comment shape
+    # (multiple comment lines, a blank line partway through) must still
+    # correctly reject a write - the fix widens what gets stripped, but
+    # must not widen what counts as "read-only" underneath it.
+    conn = _FakeConnection(statement_responses=[])
+    sql = (
+        "-- Cleans up stale rows\n"
+        "-- from the orders collection.\n"
+        "\n"
+        "-- Runs once, on demand.\n"
+        "DELETE FROM orders WHERE 1=1"
+    )
+    with pytest.raises(SqlExecutionError) as exc_info:
+        MongoSqlBackend().execute(conn, sql)
+    assert "read-only" in str(exc_info.value)
+
+
 def test_execute_read_only_rejection_preserves_prior_results():
     # First statement (a real SELECT) succeeds and should still be reported
     # even though the second statement in the same script is rejected - same

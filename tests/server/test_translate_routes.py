@@ -913,21 +913,39 @@ def test_sheets_dialect_intro_still_forbids_comments_generally(app_env):
     assert "NEVER add any comments" in intro
 
 
+# --- PostgreSQL dialect intro: FILTER clause only attaches to one aggregate ----
+# Regression guard for a real user-reported failure: the model generated
+# "(MAX(total_score) - MIN(total_score)) FILTER (WHERE total_score IS NOT
+# NULL)" - Postgres's FILTER clause is only valid immediately after a single
+# aggregate function call (including an ordered-set aggregate's WITHIN GROUP
+# form), never after a parenthesized expression combining two or more
+# aggregates, so this failed with "syntax error at or near FILTER". Guards
+# that the dialect intro keeps warning about exactly this mistake.
+
+def test_postgres_dialect_intro_warns_against_filter_on_combined_aggregate_expressions(app_env):
+    intro = app_env.translate_routes._DIALECT_PROMPT_INTROS["PostgreSQL"]
+    assert "FILTER" in intro
+    assert "(MAX(x) - MIN(x)) FILTER (WHERE ...)" in intro
+
+
 # --- "All databases" mode, Phase C summary prompt: one paragraph per database ---
 # The real per-database paragraph breaks (and the brevity of each one) are
-# entirely down to what this prompt asks the LLM for - nothing client-side
-# enforces the shape (renderMarkdownLite() just honors whatever blank
-# lines/bold the model produced, same as any other free-text reply) - so
-# this guards the prompt text itself, the only place this behavior is
-# actually specified.
+# entirely down to what this prompt asks the LLM for. Phase C's response is
+# structured JSON now (see _clean_summary_response) rather than free-text
+# prose with blank-line-separated paragraphs, so this guards the JSON
+# contract itself - the "per_database" object keyed by index, plus the
+# separate "cross_database" field for a paragraph spanning multiple
+# databases - the only place this behavior is actually specified.
 def test_summary_prompt_asks_for_one_paragraph_per_database(app_env):
     instruction = app_env.translate_routes._SUMMARY_SYSTEM_INSTRUCTION
     assert "PER DATABASE" in instruction
     assert "brief" in instruction.lower()
-    assert "blank line" in instruction.lower()
-    # Still allows a single combined figure for a question that genuinely
-    # needs one (e.g. a grand total) - just not as the default shape.
-    assert "combined" in instruction.lower()
+    assert '"per_database"' in instruction
+    # The separate cross_database field, not a paragraph folded into
+    # per_database - covers a question that genuinely needs something
+    # spanning multiple databases (e.g. a grand total) without making that
+    # the default shape for every response.
+    assert '"cross_database"' in instruction
 
 
 # --- Phase C summary prompt: must lead with a "Result Summary" line ------

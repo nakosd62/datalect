@@ -81,7 +81,7 @@ from db import (
     resolve_descriptor_by_reference,
 )
 from backends import get_backend
-from connection_router import triage_all_mode_question, is_label_only_response
+from connection_router import triage_all_mode_question, is_label_only_response, strip_markdown_fence
 import cancel_registry
 
 translate_bp = Blueprint('translate', __name__)
@@ -138,6 +138,7 @@ _DIALECT_PROMPT_INTROS = {
         "Given the provided past chat interactions, the database schema and the user's natural language prompt, translate the request into valid SQL.\n"
         "You may return one or more independent SQL statements. You may use PL/pgSQL Functions or Procedures, if appropriate.\n"
         "ROUND(...) with an explicit decimal-places argument (ROUND(x, n)) is ONLY defined for a numeric argument - there is NO round(double precision, integer) overload, only a separate 1-argument round(double precision) (rounds to the nearest integer, no precision control). Many common expressions actually evaluate to double precision, not numeric, even though they look like plain arithmetic - most often PERCENTILE_CONT/PERCENTILE_DISC, AVG()/SUM() over a float/double precision column, STDDEV/VARIANCE (and their _POP/_SAMP variants), and math functions like SQRT/LN/LOG/EXP/POWER/RANDOM. Calling ROUND(<any of these>, n) fails with \"function round(double precision, integer) does not exist\" unless the argument is cast first, e.g. ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY x)::numeric, 2). When it isn't certain an expression is already numeric, cast it to ::numeric before passing it to a 2-argument ROUND.\n"
+        "The FILTER (WHERE <condition>) clause can ONLY be attached directly to a single aggregate function call immediately to its left - either a plain one (e.g. COUNT(*) FILTER (WHERE ...), SUM(x) FILTER (WHERE ...)) or an ordered-set aggregate's WITHIN GROUP form (e.g. PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY x) FILTER (WHERE ...)). It can NEVER be attached to a parenthesized expression that combines two or more aggregate calls, or to any other non-aggregate expression - e.g. (MAX(x) - MIN(x)) FILTER (WHERE ...) is a syntax error (\"syntax error at or near FILTER\"), even though each individual MAX(x)/MIN(x) call could validly carry its own FILTER. When a computed combination of aggregates needs to be filtered, apply FILTER separately to each aggregate call inside the expression instead (e.g. MAX(x) FILTER (WHERE ...) - MIN(x) FILTER (WHERE ...)), rather than wrapping the whole combined expression in one outer FILTER.\n"
         "If asked to document the SQL command, add comments at the top of the query using the supported convention (if there is any) for how to mark comments.\n"
     ),
     "BigQuery Standard SQL": (
@@ -1781,7 +1782,7 @@ def _classify_generation_outcome(entry, outcome):
     return {"outcome": "sql", "sql": marked}
 
 
-def _run_phase_b_fanout(selected_entries, prompts, provider, model, user_identity, force_schema_refresh):
+def _run_phase_b_fanout(selected_entries, prompts, histories, provider, model, user_identity, force_schema_refresh):
     """"All databases" mode's Phase B: runs generate_sql_for_connection()
     once per entry in `selected_entries`, in PARALLEL via a
     ThreadPoolExecutor (same pre-allocate-results-array +
@@ -1816,15 +1817,24 @@ def _run_phase_b_fanout(selected_entries, prompts, provider, model, user_identit
     itself stays oblivious to where each prompt came from, it just sends
     prompts[i] to selected_entries[i].
 
+    `histories` is likewise a list the same length/order as
+    `selected_entries` - each connection's own FULLY MERGED chat history
+    (see stream_translation()'s `connection_histories` declaration comment
+    for where this comes from and why it's already merged across single-
+    connection mode and every prior all-mode turn by the time it reaches
+    here). Same obliviousness as `prompts`: this function just sends
+    histories[i] to selected_entries[i], already truncated/shaped by the
+    caller.
+
     Each call is fully independent: its OWN freshly-picked api_key AND a
     client built from that exact key (never a shared tried-keys set - N
     threads racing on one shared mutable set would corrupt it - see
-    generate_sql_for_connection's docstring), EMPTY history (per-database
-    chat history is explicitly deferred to later work), and that
-    connection's own full schema/dialect intro - i.e. exactly as if the
-    user had selected just that one connection and submitted its own
-    `prompts[i]` directly. There is deliberately no shared `client`
-    parameter here (unlike triage_all_mode_question/
+    generate_sql_for_connection's docstring), that connection's OWN
+    history (histories[i] above), and that connection's own full schema/
+    dialect intro - i.e. exactly as if the user had selected just that one
+    connection and submitted its own `prompts[i]` directly. There is
+    deliberately no shared `client` parameter here (unlike
+    triage_all_mode_question/
     summarize_all_mode_results, which reuse the caller's already-picked
     key/client as their starting point) - every worker's key is picked
     independently at fan-out time, so a single client handed in from
@@ -1864,7 +1874,7 @@ def _run_phase_b_fanout(selected_entries, prompts, provider, model, user_identit
     """
     byok_key = state_store.get_llm_byok_key(user_identity, provider.name)
 
-    def _run_one(entry, entry_prompt):
+    def _run_one(entry, entry_prompt, entry_history):
         # BUG FIXED HERE: this used to pick a fresh `worker_api_key` but
         # then pass it alongside the OUTER, closed-over `client` - which
         # was built (once, at the top of stream_translation()) for
@@ -1892,7 +1902,7 @@ def _run_phase_b_fanout(selected_entries, prompts, provider, model, user_identit
         worker_api_key = byok_key or provider.pick_api_key()
         worker_client = provider.make_client(worker_api_key)
         gen = generate_sql_for_connection(
-            entry["descriptor"], entry_prompt, [], provider, worker_client, model, user_identity,
+            entry["descriptor"], entry_prompt, entry_history, provider, worker_client, model, user_identity,
             force_schema_refresh=force_schema_refresh,
             api_key=worker_api_key, tried_keys={worker_api_key}, using_byok=bool(byok_key),
         )
@@ -1901,7 +1911,7 @@ def _run_phase_b_fanout(selected_entries, prompts, provider, model, user_identit
     outcomes = [None] * len(selected_entries)
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(selected_entries)) as pool:
         future_to_index = {
-            pool.submit(_run_one, entry, prompts[i]): i for i, entry in enumerate(selected_entries)
+            pool.submit(_run_one, entry, prompts[i], histories[i]): i for i, entry in enumerate(selected_entries)
         }
         for future in concurrent.futures.as_completed(future_to_index):
             index = future_to_index[future]
@@ -2102,39 +2112,41 @@ _SUMMARY_SYSTEM_INSTRUCTION = (
     "You previously helped route a user's natural-language question to one or more databases, and real "
     "queries have now been run against each of them. You will be given the user's ORIGINAL question and, "
     "for each database that was queried, exactly one of: its actual result rows, a note that it had "
-    "nothing relevant to contribute, or an error explaining that querying it failed.\n"
-    "CRITICAL, before anything else: your ENTIRE response - the label line below AND every paragraph that "
-    "follows it - MUST be written in the SAME LANGUAGE as the user's original question, never the language "
-    "of the database/table names or of the results data you're given, and never any other language. This "
-    "applies to every single sentence you write, not just the label.\n"
-    "Your response has two parts. FIRST, a single label line: a short (one to two word) section-heading "
-    "label meaning \"Results Summary\" - in English this label is literally the phrase \"Results Summary\", "
-    "but you must instead write it TRANSLATED into the SAME LANGUAGE as the user's original question, with "
-    "nothing else on that line, followed by a blank line. SECOND, immediately after that blank line, your "
-    "real, substantive answer - the per-database paragraphs described below, ALSO written in that same "
-    "language. Example of the full shape, if the question was in English: \"Results Summary\\n\\n**Sales "
-    "Postgres:** ...\". Never stop after the label - the label by itself, with no paragraphs following it, "
-    "is not a valid response; the label is a UI section heading prepended to your answer, not a substitute "
-    "for writing one. The label itself is plain text with no markdown emphasis of your own around it.\n"
-    "Write ONE separate short paragraph PER DATABASE, answering the original question using just that "
-    "database's own results. Start each paragraph with the database's real name in bold, exactly as given "
-    "below - never an index or a label like \"Database 1\" - followed by a colon, e.g. \"**Sales "
-    "Postgres:** ...\". Separate paragraphs with a single blank line. Keep every paragraph brief - one or "
-    "two sentences - even if the underlying result set is large: this is a summary, not a report. If a "
-    "database noted it had nothing relevant, say so in one short sentence rather than skipping it "
-    "silently, so the user can see every database was actually considered. If a database's query instead "
-    "failed with an error, don't just note that it failed - briefly explain, in plain language, what the "
-    "error suggests actually went wrong (e.g. a permissions problem, a timeout, an ambiguous or "
-    "unsupported request) and, if it's apparent from the error text, what could fix it, so the user "
-    "understands the failure instead of only knowing that one occurred. Only if the question genuinely "
-    "asks for a single figure or conclusion combined across databases (e.g. a grand total), add ONE final "
-    "short paragraph with that combined answer after the per-database ones - otherwise leave it out "
-    "entirely; do not restate or recap the per-database paragraphs a second time.\n"
-    "Respond with plain text only - no SQL, no markdown tables, no code fences, no bullet points, no "
-    "other headings. The leading translated label line and the bold database-name lead-in above are the "
-    "only formatting to use.\n"
-    "One final reminder, since it's the single most important rule above: the language of your response "
-    "must match the user's original question, not the language of the schema/data.\n"
+    "nothing relevant to contribute, or an error explaining that querying it failed. Each database's "
+    "results block below is labeled with its own [index], starting at [0] - use these SAME indices, as "
+    "strings, to key your response.\n"
+    "Respond with ONLY a single JSON object - no markdown code fences, no other text before or after it - "
+    "shaped exactly like this:\n"
+    "{\"label\": \"...\", \"per_database\": {\"0\": \"...\", \"1\": \"...\", ...}, \"cross_database\": "
+    "\"...\" or null}\n"
+    "CRITICAL, before anything else: every string value in this JSON - the label, AND every per-database "
+    "paragraph, AND the cross_database paragraph if you write one - MUST be written in the SAME LANGUAGE "
+    "as the user's original question, never the language of the database/table names or of the results "
+    "data you're given, and never any other language. This applies to every single string you write, not "
+    "just the label.\n"
+    "\"label\" is a short (one to two word) section-heading label meaning \"Results Summary\" - in English "
+    "this label is literally the phrase \"Results Summary\", but you must instead write it TRANSLATED into "
+    "the SAME LANGUAGE as the user's original question. A response whose \"per_database\" is empty, or "
+    "missing an entry for one of the indices given a results block above, is not a valid response - every "
+    "such index must get its own entry.\n"
+    "\"per_database\" must have ONE separate short paragraph PER DATABASE, keyed by that database's own "
+    "[index] (as a string, e.g. \"0\"), answering the original question using just that database's own "
+    "results. Keep every paragraph brief - one or two sentences - even if the underlying result set is "
+    "large: this is a summary, not a report. If a database noted it had nothing relevant, say so in one "
+    "short sentence rather than skipping it silently, so the user can see every database was actually "
+    "considered. If a database's query instead failed with an error, don't just note that it failed - "
+    "briefly explain, in plain language, what the error suggests actually went wrong (e.g. a permissions "
+    "problem, a timeout, an ambiguous or unsupported request) and, if it's apparent from the error text, "
+    "what could fix it, so the user understands the failure instead of only knowing that one occurred.\n"
+    "\"cross_database\" is a SEPARATE field for a short paragraph that spans MULTIPLE databases at once "
+    "(e.g. comparing two of them, or a single figure combined across all of them) - only set it to a "
+    "non-null string when the question genuinely asks for something like that; otherwise set it to JSON "
+    "null. Never use this field to restate or recap the per-database paragraphs a second time - it is "
+    "only for content that couldn't be attributed to any single database's own paragraph.\n"
+    "Respond with the JSON object only - no markdown tables, no bullet points, no headings, no commentary "
+    "outside the JSON's own string values.\n"
+    "One final reminder, since it's the single most important rule above: the language of every string "
+    "you write must match the user's original question, not the language of the schema/data.\n"
 )
 
 
@@ -2181,7 +2193,17 @@ def _build_summary_prompt(user_question, database_results, expected_language_cod
     "same language as the question" framing - see the language-
     verification section comment above _SUMMARY_SYSTEM_INSTRUCTION for
     why. None (detection unavailable or too low-confidence to trust)
-    leaves the reminder exactly as it always was."""
+    leaves the reminder exactly as it always was.
+
+    Each per-database results/note/error block is prefixed with its own
+    "[i]" (0-based index into `database_results`, matching this project's
+    established convention for numbering candidates in a model prompt -
+    see connection_router.py's _build_candidate_schema_block's own
+    "[{i}] name=..." - so _SUMMARY_SYSTEM_INSTRUCTION's JSON contract can
+    key its "per_database" object by that same index and the caller
+    (summarize_all_mode_results/_clean_summary_response) can zip the
+    parsed response straight back against `database_results` by position,
+    with no name-matching or extra bookkeeping needed."""
     sql_blocks = []
     for entry in (database_results or []):
         sql = entry.get("sql")
@@ -2192,23 +2214,23 @@ def _build_summary_prompt(user_question, database_results, expected_language_cod
     sql_section = f"SQL executed for each database:\n\n{sql_joiner.join(sql_blocks)}\n\n" if sql_blocks else ""
 
     blocks = []
-    for entry in (database_results or []):
+    for i, entry in enumerate(database_results or []):
         name = entry.get("name") or "Unknown database"
         error = entry.get("error")
         note = entry.get("note")
         if error:
-            blocks.append(f"{name}: query failed - {error}")
+            blocks.append(f"[{i}] {name}: query failed - {error}")
         elif note:
-            blocks.append(f"{name}: {note}")
+            blocks.append(f"[{i}] {name}: {note}")
         else:
             cols = entry.get("columns") or []
             rows = entry.get("rows") or []
             row_count = entry.get("rowCount", len(rows))
             shown_rows = min(len(rows), SUMMARY_RESULTS_MAX_ROWS)
             header = (
-                f"{name} - {row_count} row(s):"
+                f"[{i}] {name} - {row_count} row(s):"
                 if shown_rows >= row_count
-                else f"{name} - {row_count} row(s) total, showing the first {shown_rows}:"
+                else f"[{i}] {name} - {row_count} row(s) total, showing the first {shown_rows}:"
             )
             blocks.append(header + "\n" + format_results_table_text(cols, rows, max_rows=SUMMARY_RESULTS_MAX_ROWS))
     results_text = "\n\n".join(blocks) if blocks else "(no databases returned anything)"
@@ -2244,19 +2266,51 @@ def _build_summary_prompt(user_question, database_results, expected_language_cod
 
 
 # is_label_only_response (imported from connection_router.py, shared with
-# triage_all_mode_question there) detects a response that's just the
-# leading label (see _SUMMARY_SYSTEM_INSTRUCTION) with no real paragraphs
-# after it, so it can be retried exactly like a genuinely empty response,
-# instead of silently showing the user a bare heading with nothing usable
-# underneath it - see its own docstring for why this is POSITION-based
-# rather than matching a specific word: the label is now translated into
-# the user's own question's language, so it can no longer be matched
-# against a fixed English string like "Result Summary"/"Results Summary".
+# triage_all_mode_question there) detects a response that's just a leading
+# label with no real paragraphs after it, so it can be retried exactly
+# like a genuinely empty response, instead of silently showing the user a
+# bare heading with nothing usable underneath it - see its own docstring
+# for why this is POSITION-based rather than matching a specific word: the
+# label is translated into the user's own question's language, so it can
+# no longer be matched against a fixed English string like "Result
+# Summary"/"Results Summary". "All databases" mode's own Phase C
+# summarization (_SUMMARY_SYSTEM_INSTRUCTION/summarize_all_mode_results
+# below) no longer uses this function at all - it moved from the free-text
+# label+blank-line convention to a structured JSON response, and
+# _clean_summary_response (below) validates that shape directly instead.
+# Single-connection mode's own equivalent (_SINGLE_SUMMARY_SYSTEM_
+# INSTRUCTION/summarize_single_connection_results, later in this file)
+# still uses the original prose convention unchanged, and so still uses
+# this function - via _summarize_with_retry's own default content_parser,
+# see below.
+
+
+def _default_content_parser(text):
+    """Default `content_parser` for _summarize_with_retry (below) - single-
+    connection mode's own original prose contract: a non-empty, non-
+    label-only stripped string, or None. is_label_only_response runs on
+    the RAW `text` (before stripping), same reasoning as everywhere else
+    it's used - see its own docstring. Preserves the exact validity check
+    this function always ran, before content_parser existed, for
+    summarize_single_connection_results' unchanged call."""
+    stripped = (text or "").strip()
+    if stripped and not is_label_only_response(text or ""):
+        return stripped
+    return None
+
+
+def _default_language_text_extractor(parsed):
+    """Default `language_text_extractor` for _summarize_with_retry (below):
+    `parsed` (from _default_content_parser above) already IS the text to
+    run _detect_language over - single-connection mode's own prose
+    contract has only ever had one string to check."""
+    return parsed
 
 
 def _summarize_with_retry(prompt_content, schema_block, system_instruction, provider, client, model,
                            api_key=None, tried_keys=None, using_byok=False, log_label="Summarization",
-                           expected_language_code=None):
+                           expected_language_code=None, content_parser=None, language_text_extractor=None,
+                           invalid_content_error=None):
     """Shared bounded-retry machinery behind BOTH summarize_all_mode_results
     ("all databases" mode's Phase C, below) and summarize_single_
     connection_results (single-connection mode's own equivalent, added
@@ -2265,9 +2319,33 @@ def _summarize_with_retry(prompt_content, schema_block, system_instruction, prov
     verbatim across two callers that build different prompts/system
     instructions but need identical failure handling.
 
+    `content_parser` and `language_text_extractor` are what let this one
+    retry loop serve two callers whose notion of "valid content" is no
+    longer the same shape: single-connection mode's own caller
+    (summarize_single_connection_results) still needs the original
+    free-text label+blank-line convention (a non-empty, non-label-only
+    stripped string - see is_label_only_response), while "all databases"
+    mode's own Phase C (summarize_all_mode_results, below) now needs a
+    structured per-database JSON object instead (see
+    _SUMMARY_SYSTEM_INSTRUCTION/_clean_summary_response). Rather than
+    duplicate this whole ~140-line retry/rotation/language-check loop a
+    third time for the JSON shape, both `content_parser` (raw model text ->
+    parsed content, or None if invalid - replaces the old inline
+    stripped-and-not-label-only check) and `language_text_extractor`
+    (parsed content -> the text _detect_language should actually check,
+    since the JSON shape has several separate strings, not one) default to
+    closures reproducing EXACTLY the original prose behavior
+    (_default_content_parser/_default_language_text_extractor, just below)
+    when omitted, so summarize_single_connection_results' existing call
+    needs no changes at all. `invalid_content_error` is the log_label-
+    adjacent last_error text to use when `content_parser` rejects a
+    response; left None, the original empty-vs-label-only-specific message
+    is used (again, exactly reproducing prior behavior for the default
+    caller) - a JSON-mode caller instead supplies one description covering
+    every way its own parser can reject a response.
+
     Bounded 2-attempt retry at getting usable CONTENT back (a response
-    that comes back empty, or as JUST the label with no real paragraphs
-    after it - see is_label_only_response - counts as a failed attempt,
+    `content_parser` rejects - see above - counts as a failed attempt,
     same as connection_router.py's triage_all_mode_question treats an
     unparseable response). Nested
     inside each of those 2 attempts is the SAME transient-error/key-
@@ -2339,20 +2417,27 @@ def _summarize_with_retry(prompt_content, schema_block, system_instruction, prov
 
     `expected_language_code` - _detect_language(user_question)'s result,
     threaded through from the caller - adds a second content-validity
-    check alongside the existing empty/label-only one: if the response's
-    OWN detected language doesn't match, it's discarded exactly like an
-    empty/label-only response is (consuming one of the 2 attempts), and -
-    unlike the empty/label-only case, which just retries with the exact
-    same prompt - the next attempt's prompt gets an extra, blunt
-    correction line naming the required language, since simply asking
-    again with no change would likely just reproduce the same wrong-
-    language answer. None (detection unavailable or too low-confidence)
-    skips this check entirely - see _detect_language's own docstring.
+    check alongside `content_parser`'s own: once content is accepted,
+    `language_text_extractor(parsed)` is run through _detect_language, and
+    if that doesn't match, the response is discarded exactly like invalid
+    content is (consuming one of the 2 attempts), and - unlike the
+    invalid-content case, which just retries with the exact same prompt -
+    the next attempt's prompt gets an extra, blunt correction line naming
+    the required language, since simply asking again with no change would
+    likely just reproduce the same wrong-language answer. None (detection
+    unavailable or too low-confidence) skips this check entirely - see
+    _detect_language's own docstring.
 
-    Returns (text, usage, None) on success - `text` is the model's own
-    plain-text answer, NOT YET prefixed with the app's "*** NO SQL ***"
-    convention (the caller adds that, exactly like triage's "answer"
-    outcome does, so the prefix logic lives in exactly one place)."""
+    Returns (parsed, usage, None) on success - `parsed` is exactly what
+    `content_parser` returned (a plain stripped string for the default
+    prose caller, or _clean_summary_response's dict for the JSON caller),
+    NOT YET wrapped in whatever presentation the caller adds on top (e.g.
+    the app's "*** NO SQL ***" convention, or the "**Name:**" per-database
+    tagging reconstructed by /api/summarize-results below) - that stays
+    the caller's job, exactly as it always has, so it lives in exactly one
+    place per caller."""
+    content_parser = content_parser or _default_content_parser
+    language_text_extractor = language_text_extractor or _default_language_text_extractor
     if api_key is None:
         api_key = provider.pick_api_key()
     if tried_keys is None:
@@ -2434,15 +2519,19 @@ def _summarize_with_retry(prompt_content, schema_block, system_instruction, prov
             # early break).
             break
 
-        # is_label_only_response runs on the RAW `text` (before .strip()
-        # below collapses a "label line, then a blank line, then nothing"
-        # response down to just the label) - it needs that blank line
-        # intact to tell "just the label" apart from a plain single-line
-        # response with no label convention at all (see its docstring).
-        stripped = (text or "").strip()
-        if stripped and not is_label_only_response(text or ""):
+        # content_parser runs on the RAW `text` - the default parser needs
+        # it un-stripped for the same reason is_label_only_response always
+        # has (see its own docstring: a "label line, then a blank line,
+        # then nothing" response needs that blank line intact to be told
+        # apart from a plain single-line response with no label convention
+        # at all); a JSON-mode parser like _clean_summary_response just
+        # ignores incidental leading/trailing whitespace itself via its own
+        # json.loads.
+        parsed = content_parser(text)
+        if parsed is not None:
             if expected_language_code is not None:
-                actual_language_code = _detect_language(stripped)
+                language_text = language_text_extractor(parsed)
+                actual_language_code = _detect_language(language_text) if language_text else None
                 if actual_language_code is not None and actual_language_code != expected_language_code:
                     expected_name = _describe_language(expected_language_code)
                     actual_name = _describe_language(actual_language_code)
@@ -2469,11 +2558,15 @@ def _summarize_with_retry(prompt_content, schema_block, system_instruction, prov
                         f"from scratch, entirely in {expected_name} this time."
                     )
                     continue
-            return stripped, usage, None
-        last_error = (
-            "response was only the label, or missing the label/blank-line shape, with no real content after it"
-            if stripped else "empty summarization response"
-        )
+            return parsed, usage, None
+        if invalid_content_error is not None:
+            last_error = invalid_content_error
+        else:
+            stripped = (text or "").strip()
+            last_error = (
+                "response was only the label, or missing the label/blank-line shape, with no real content after it"
+                if stripped else "empty summarization response"
+            )
 
     logger.warning("%s failed after retry: %s", log_label, last_error)
     return None, None, last_error
@@ -2533,21 +2626,117 @@ def _build_all_mode_schema_block(database_results, user_identity):
     return "Database schema for each database queried:\n\n" + "\n\n".join(blocks) + "\n\n"
 
 
+def _clean_summary_response(raw_text, num_databases):
+    """Parses Phase C's structured JSON response (see
+    _SUMMARY_SYSTEM_INSTRUCTION) into
+      {"label": <non-empty str>, "per_database": {int_index: <non-empty str>, ...},
+       "cross_database": <non-empty str> | None}
+    or None (unparseable, or missing/incomplete required content) - the
+    caller's bounded retry (_summarize_with_retry, via the content_parser
+    it's given) treats None exactly like an empty/invalid response used to
+    be treated before Phase C moved off free-text prose.
+
+    Mirrors connection_router.py's _parse_triage_response/_clean_database_
+    prompts shape closely (JSON via strip_markdown_fence + json.loads, a
+    dict keyed by string-int index) but is intentionally STRICTER than
+    that sibling: _clean_database_prompts tolerates a missing per-
+    connection rewrite for triage (Phase B just falls back to the user's
+    own original question for that one connection), but there is no
+    equivalent fallback text for a missing per-database summary paragraph
+    here - nothing sensible to show the user in its place - so unlike
+    triage, a gap for ANY index in range(num_databases) invalidates the
+    WHOLE response, giving the bounded retry loop another attempt instead
+    of silently showing a summary with one database's paragraph missing.
+
+    `num_databases` is the caller's own len(database_results) - see
+    _build_summary_prompt's docstring for why its "[i]" indices already
+    match this same 0-based numbering.
+
+    "cross_database" is optional (see _SUMMARY_SYSTEM_INSTRUCTION - only
+    meant to be written when the question genuinely asks for something
+    spanning multiple databases): a missing, non-string, or blank value
+    simply becomes None, never a reason to invalidate the rest of a
+    response that otherwise checks out."""
+    if not raw_text:
+        return None
+    cleaned = strip_markdown_fence(raw_text)
+    try:
+        parsed = json.loads(cleaned)
+    except Exception:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+
+    label = parsed.get("label")
+    if not (isinstance(label, str) and label.strip()):
+        return None
+    label = label.strip()
+
+    raw_per_database = parsed.get("per_database")
+    if not isinstance(raw_per_database, dict):
+        return None
+    per_database = {}
+    for key, value in raw_per_database.items():
+        try:
+            index = int(key)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(value, str) and value.strip():
+            per_database[index] = value.strip()
+    for index in range(num_databases):
+        if index not in per_database:
+            return None
+
+    cross_database = parsed.get("cross_database")
+    cross_database = cross_database.strip() if isinstance(cross_database, str) and cross_database.strip() else None
+
+    return {"label": label, "per_database": per_database, "cross_database": cross_database}
+
+
+def _make_summary_content_parser(num_databases):
+    """Binds `num_databases` into a content_parser closure for
+    _summarize_with_retry - see _clean_summary_response above for the
+    actual validation. A small wrapper rather than a lambda so it's
+    consistent with, and greppable alongside, _default_content_parser."""
+    def _parser(text):
+        return _clean_summary_response(text, num_databases)
+    return _parser
+
+
+def _summary_language_text(parsed):
+    """language_text_extractor for Phase C's JSON-mode content_parser (see
+    _make_summary_content_parser/_clean_summary_response above): since
+    `parsed` is now a dict of several separate strings rather than one, this
+    concatenates every actual paragraph the model wrote - the label, each
+    per-database paragraph, and the cross-database paragraph if present -
+    into one blob for _detect_language to run over. Mirrors single-
+    connection mode's own _default_language_text_extractor, which simply
+    returns its one parsed prose string directly - adapted here to a
+    parsed shape with more than one."""
+    parts = [parsed.get("label") or ""]
+    parts.extend((parsed.get("per_database") or {}).values())
+    cross_database = parsed.get("cross_database")
+    if cross_database:
+        parts.append(cross_database)
+    return "\n\n".join(part for part in parts if part)
+
+
 def summarize_all_mode_results(user_question, database_results, provider, client, model, user_identity=None,
                                 api_key=None, tried_keys=None, using_byok=False):
     """"All databases" mode's Phase C - see the section comment above for
-    the fuller picture of when/why this runs. A brief, plain-text answer
+    the fuller picture of when/why this runs. A brief, structured answer
     to `user_question` - one short paragraph per database, over the
     ACTUAL data gathered from every database Phase B was routed to,
     rather than the routing message triage produced before any of it was
-    known (see _SUMMARY_SYSTEM_INSTRUCTION for the exact shape asked
-    for).
+    known, plus an optional separate cross-database paragraph (see
+    _SUMMARY_SYSTEM_INSTRUCTION for the exact JSON shape asked for).
 
     All the retry/key-rotation policy (bounded 2-attempt content-validity
     retry, nested transient-error/key-rotation retry) now lives in the
     shared _summarize_with_retry() above - see its docstring for the full
     reasoning. This function's own job is just building the Phase-C-
-    specific prompt/schema_block/system instruction and delegating to it.
+    specific prompt/schema_block/system instruction and JSON parser/
+    language-extractor, and delegating to it.
 
     `user_identity` (new - Gap 4) is what lets this build a real
     schema_block via _build_all_mode_schema_block above instead of the
@@ -2561,15 +2750,22 @@ def summarize_all_mode_results(user_question, database_results, provider, client
     just builds the Phase-C-specific prompt/schema_block ahead of
     delegating.
 
-    Returns (text, usage, error) - see _summarize_with_retry's docstring
-    for the exact meaning of each on success/failure."""
+    Returns (parsed, usage, error) on success/failure - `parsed`, when not
+    None, is exactly _clean_summary_response's own returned shape
+    ({"label", "per_database", "cross_database"} - see its docstring),
+    never the model's raw JSON text. See _summarize_with_retry's docstring
+    for the exact meaning of `error` on failure."""
     expected_language_code = _detect_language(user_question)
     prompt_content = _build_summary_prompt(user_question, database_results, expected_language_code)
     schema_block = _build_all_mode_schema_block(database_results, user_identity)
+    num_databases = len(database_results or [])
     return (yield from _summarize_with_retry(
         prompt_content, schema_block, _SUMMARY_SYSTEM_INSTRUCTION, provider, client, model,
         api_key=api_key, tried_keys=tried_keys, using_byok=using_byok,
         log_label="Phase C summarization", expected_language_code=expected_language_code,
+        content_parser=_make_summary_content_parser(num_databases),
+        language_text_extractor=_summary_language_text,
+        invalid_content_error="response was not valid, complete per-database summary JSON",
     ))
 
 
@@ -2595,10 +2791,29 @@ def summarize_results():
     since 'retrying' is already handled generically by its existing
     dispatcher, regardless of which server-side call produced the line -
     followed by exactly one terminal line:
-      {"status": "done", "success": true, "summary": "..."}
+      {"status": "done", "success": true, "summary": "...",
+       "database_summaries": [{"kind", "id", "name", "text"}, ...],
+       "cross_database_summary": "..." | null}
       or, on failure (retry/rotation budget exhausted, or 2 consecutive
       content-invalid responses):
       {"status": "done", "success": false, "error": "..."}
+    "summary" stays the single joined, "**Name:** paragraph" string this
+    route has always returned - untouched consumers (history persistence,
+    the Summary tab's existing rendering) keep working unmodified - but it
+    is now RECONSTRUCTED here from summarize_all_mode_results' own
+    structured `parsed` return value rather than trusted verbatim from the
+    model: Phase C's own response is JSON now (see _SUMMARY_SYSTEM_
+    INSTRUCTION/_clean_summary_response), so the bold "**Name:**" lead-in
+    for each paragraph is built from `database_results`' own real name,
+    zipped back against `parsed["per_database"]` by the same 0-based index
+    _build_summary_prompt's "[i]" labels used - a reliability improvement
+    over the old free-text convention, which trusted the model to copy a
+    database's name into its own prose verbatim. "database_summaries" and
+    "cross_database_summary" are purely ADDITIVE new fields alongside that
+    unchanged "summary" string (Chunk 1's own sql_blocks precedent) - the
+    per-database split callers need to record separate per-database turns
+    later, and the cross-database paragraph split out on its own, distinct
+    from any one database's paragraph.
     The two early-validation returns below (missing API key, missing
     prompt/database_results) happen before any of this and keep their
     real plain-JSON 400 responses, exactly as /api/translate's own two
@@ -2635,7 +2850,7 @@ def summarize_results():
         if callable(close_fn):
             cancel_token, cancel_handle = cancel_registry.register(session_id, close_fn)
         try:
-            text, usage, error = yield from summarize_all_mode_results(
+            parsed, usage, error = yield from summarize_all_mode_results(
                 prompt, database_results, provider, client, llm_model, user_identity=user_identity,
                 api_key=api_key, using_byok=bool(byok_key),
             )
@@ -2646,7 +2861,7 @@ def summarize_results():
                 cancel_handle.close()
         duration = round(1000 * (time.perf_counter() - start_time))
 
-        if text is None:
+        if parsed is None:
             # `error` is the raw exception when the LLM call itself is what
             # failed (see summarize_all_mode_results' docstring) - format that
             # honestly, same as every other LLM-call failure in this app now
@@ -2661,7 +2876,29 @@ def summarize_results():
             yield json.dumps({'status': 'done', 'success': False, 'error': error_message}) + "\n"
             return
 
-        summary_text = "*** NO SQL *** " + text
+        # Zip parsed["per_database"] (keyed by the same 0-based index
+        # _build_summary_prompt's own "[i]" results-block labels used)
+        # back against `database_results` by position, so each paragraph
+        # is reunited with its database's real kind/id/name - see this
+        # route's own docstring above for why this reconstruction (rather
+        # than trusting the model's own name copy) is now a reliability
+        # improvement, not just a format change.
+        per_database = parsed["per_database"]
+        database_summaries = []
+        summary_paragraphs = []
+        for i, entry in enumerate(database_results):
+            name = entry.get("name") or "Unknown database"
+            paragraph = per_database.get(i, "")
+            database_summaries.append({
+                "kind": entry.get("kind"), "id": entry.get("id"), "name": name, "text": paragraph,
+            })
+            summary_paragraphs.append(f"**{name}:** {paragraph}")
+
+        cross_database_summary = parsed.get("cross_database")
+        if cross_database_summary:
+            summary_paragraphs.append(cross_database_summary)
+
+        summary_text = "*** NO SQL *** " + parsed["label"] + "\n\n" + "\n\n".join(summary_paragraphs)
         usage_dict = usage or {}
         # Logged the same way Phase A's own triage call is (see
         # record_all_databases_triage's docstring) - "All Databases"/
@@ -2674,7 +2911,11 @@ def summarize_results():
             usage_dict.get("cached_content_tokens", 0),
         )
 
-        yield json.dumps({'status': 'done', 'success': True, 'summary': summary_text}) + "\n"
+        yield json.dumps({
+            'status': 'done', 'success': True, 'summary': summary_text,
+            'database_summaries': database_summaries,
+            'cross_database_summary': cross_database_summary,
+        }) + "\n"
 
     resp = Response(stream_with_context(stream_summarize_results()), mimetype='application/x-ndjson')
     return apply_session_cookie(resp, session_id)
@@ -3000,16 +3241,38 @@ def translate_query():
     in_scope_entries = resolve_in_scope_descriptors(session_data, user_identity)
     router_only_all_mode = session_data.get('in_scope_mode') == 'all' and not explicit_db_override
     #
-    # The triage call itself DOES get this turn's ordinary conversation
-    # history (see triage_all_mode_question's docstring) - it's a single,
-    # non-per-database step, so there's exactly one shared thread for it to
-    # consult (e.g. resolving "how large is THIS database" against a prior
-    # turn's answer). Phase B's per-connection calls still each get an
-    # empty history, deliberately - threading distinct per-database history
-    # through those remains deferred, genuinely more complex follow-up
-    # work.
+    # The triage call itself gets this turn's ordinary conversation history
+    # (see triage_all_mode_question's docstring) - it's a single, non-per-
+    # database step, so there's exactly one shared thread for it to consult
+    # (e.g. resolving "how large is THIS database" against a prior turn's
+    # answer). Phase B's per-connection calls below are different: each one
+    # gets THAT SPECIFIC connection's own history instead (see
+    # connection_histories just below) - completely merged across however
+    # the user has ever reached it, single-connection mode and "all
+    # databases" mode alike (see client.js's connectionBucketKey()/
+    # buildInScopeConnectionHistories() docstrings for the client-side half
+    # of this).
 
     history = data.get('history', [])[-(HISTORY_MAX_TURNS * 2):]
+    # Chunk 5 of "splitting SQL/summary per in-scope database" (see
+    # client.js's captureAllModeHistory()/fanOutAllModeHistoryPerDatabase()/
+    # buildInScopeConnectionHistories() docstrings for the full, multi-
+    # window design history of this feature): one entry per in-scope
+    # connection the client currently has a bucket for, keyed exactly like
+    # client.js's connectionBucketKey() builds its bucket keys -
+    # "preset:<id>" / "custom:<key>" - each value that connection's own
+    # FULLY MERGED history array (every single-connection-mode turn AND
+    # every all-mode turn ever fanned out to it, indistinguishably - see
+    # fanOutAllModeHistoryPerDatabase()'s own docstring for why that merge
+    # is already real by the time this ever reaches the server). Consulted
+    # below, per selected connection, ONLY for Phase B's real SQL-generation
+    # calls - triage above keeps using the ordinary shared `history`, since
+    # routing is not itself an NL-to-SQL translation. Defaults to `{}` for
+    # an older client that never sends this field at all, or a connection
+    # this dict simply has no entry for (never visited, directly or via
+    # fan-out) - both cases fall back to the same empty-history behavior
+    # generate_sql_for_connection has always had, not an error.
+    connection_histories = data.get('connection_histories') or {}
     force_schema_refresh = bool(data.get('refresh_schema'))
 
     # Everything past this point - the schema fetch, the Gemini retry loop,
@@ -3210,6 +3473,23 @@ def translate_query():
                     entry_prompts = [
                         database_prompts_by_index.get(i) or prompt for i in triage_result["indices"]
                     ]
+                    # Each connection's OWN merged history (Chunk 5 - see
+                    # connection_histories' own declaration comment above)
+                    # looked up by the exact same "kind:id" string
+                    # client.js's connectionBucketKey() builds - `.get(...)
+                    # or []` covers both an old client that never sent this
+                    # field at all and a connection this dict simply has no
+                    # entry for yet, falling back to empty history either
+                    # way rather than erroring. Re-truncated here with the
+                    # same HISTORY_MAX_TURNS bound `history` above already
+                    # got - a per-connection bucket is capped client-side
+                    # too (createChatHistoryStore's own maxTurns), but this
+                    # is the same defensive belt-and-suspenders re-slice
+                    # every other history value in this module gets.
+                    entry_histories = [
+                        (connection_histories.get(f"{e['kind']}:{e['id']}") or [])[-(HISTORY_MAX_TURNS * 2):]
+                        for e in selected_entries
+                    ]
                     # Both computed BEFORE Phase B even starts (unlike
                     # before this streaming redesign, when routing_message
                     # was only computed once Phase B had already fully
@@ -3232,8 +3512,26 @@ def translate_query():
                     routing_message = triage_result.get("message") or (
                         "Triage\n\nChecking " + ", ".join(e["name"] for e in selected_entries) + " for your question."
                     )
+                    # `prompt` (new - Chunk 4 of "splitting SQL/summary per
+                    # in-scope database") is this database's own entry from
+                    # `entry_prompts` above - triage's per-connection
+                    # rewrite of the user's original question when it
+                    # supplied one, else that original question unchanged
+                    # (see entry_prompts' own comment just above). Every
+                    # OTHER consumer of connection_selection (PINNED_
+                    # CONNECTIONS' kind/id-only mapping in client.js, every
+                    # existing test) only ever reads .kind/.id/.name, so
+                    # this is purely additive - added here (rather than a
+                    # separate field) so a later per-database history
+                    # fan-out has, in one place, everything it needs to
+                    # record that database's own {prompt, SQL, results,
+                    # summary} tuple: the same list already threaded
+                    # through to client.js's allModeStreamState.
+                    # connectionOrder (see startAllModeStreaming()) and
+                    # pendingAllModeNotes.
                     connection_selection = [
-                        {"kind": e["kind"], "id": e["id"], "name": e["name"]} for e in selected_entries
+                        {"kind": e["kind"], "id": e["id"], "name": e["name"], "prompt": p}
+                        for e, p in zip(selected_entries, entry_prompts)
                     ]
                     yield json.dumps({
                         "status": "phase_a_route",
@@ -3253,7 +3551,8 @@ def translate_query():
                     # StopIteration.value, the same idiom _drain_generation
                     # uses.
                     phase_b_gen = _run_phase_b_fanout(
-                        selected_entries, entry_prompts, provider, llm_model, user_identity, force_schema_refresh,
+                        selected_entries, entry_prompts, entry_histories,
+                        provider, llm_model, user_identity, force_schema_refresh,
                     )
                     try:
                         while True:
@@ -3267,6 +3566,31 @@ def translate_query():
                         sql_blocks, database_notes, generation_failures, phase_b_usage = stop.value
 
                     generated_sql = "\n\n".join(marked for _, marked in sql_blocks)
+                    # Per-database structured equivalent of the joined
+                    # `generated_sql` string above - the whole reason
+                    # sql_blocks (from _run_phase_b_fanout) is a list of
+                    # (entry, marked_sql) pairs in the first place, rather
+                    # than already-joined text, is so a per-database view
+                    # of "what SQL did THIS database get" doesn't need to
+                    # be reconstructed later by re-parsing the combined
+                    # string's own '-- database: ...' markers. `sql`
+                    # above stays exactly as it's always been (joined,
+                    # marker-tagged) for every existing consumer (history
+                    # logging via record_translation below, the SQL
+                    # editor box, existing tests) - this is purely
+                    # additive, feeding a future per-database-history
+                    # feature (and any other future per-database
+                    # consumer) without touching anything that already
+                    # depends on the flattened shape. Only ever present
+                    # for databases that actually returned real SQL - a
+                    # database that noted or failed instead has no entry
+                    # here, same as it has no entry in `sql_blocks`
+                    # itself; database_notes/generation_failures below
+                    # remain the source of truth for those two cases.
+                    sql_by_database = [
+                        {"kind": entry["kind"], "id": entry["id"], "name": entry["name"], "sql": marked}
+                        for entry, marked in sql_blocks
+                    ]
                     for k in phase_b_usage:
                         # `or 0` on both sides - same None-vs-missing-key
                         # defensive reasoning as _run_phase_b_fanout's own
@@ -3293,6 +3617,7 @@ def translate_query():
                         "routing_message": routing_message,
                         "database_notes": database_notes,
                         "generation_failures": generation_failures,
+                        "sql_blocks": sql_by_database,
                     }
                     record_entry = selected_entries[0]
                     # Phase A's own text isn't real SQL - "route" just

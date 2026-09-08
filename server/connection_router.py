@@ -96,12 +96,15 @@ def _build_candidate_question_prompt(user_question):
     return f"User question: {user_question}\n\nJSON array of relevant candidate indices:"
 
 
-def _strip_markdown_fence(text):
+def strip_markdown_fence(text):
     """Strips a leading/trailing markdown code fence (```/```json/etc.)
     from `text` if present, tolerating models that wrap their JSON despite
     being told not to. Returns the (possibly unchanged) stripped string.
-    Used by _parse_triage_response so this tolerance only needs to be
-    right in one place."""
+    Used by _parse_triage_response here, and by translate_routes.py's own
+    _clean_summary_response (Phase C's structured per-database summary
+    response) - public (no leading underscore) specifically so this
+    tolerance stays written in exactly one place across both callers
+    rather than being copied."""
     cleaned = (text or "").strip()
     if cleaned.startswith("```"):
         lines = cleaned.splitlines()
@@ -350,7 +353,7 @@ def _parse_triage_response(text, num_candidates, max_connections):
     botched the per-connection rewrites."""
     if not text:
         return None
-    cleaned = _strip_markdown_fence(text)
+    cleaned = strip_markdown_fence(text)
     try:
         parsed = json.loads(cleaned)
     except Exception:
