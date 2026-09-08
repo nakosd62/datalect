@@ -1,12 +1,24 @@
 // tests/e2e/auth-clears-state.spec.js
 //
 // Cloud Run's Google Sign-In login/logout flow, purely at the client
-// layer: client.js's renderAuthUI() sign-in callback and handleLogout()
-// both call clearActiveQueryState() (see config-modal.spec.js's
-// "switching the active db connection..." test for the sibling behavior
-// this mirrors) - a new user logging on, or the current one logging off,
-// invalidates whatever NL prompt/SQL/results were on screen just as
-// surely as switching DB connections does.
+// layer. client.js used to call clearActiveQueryState() directly from
+// both the sign-in callback and handleLogout() - a new user logging on,
+// or the current one logging off, unconditionally wiped whatever NL
+// prompt/SQL/results were on screen.
+//
+// That's no longer true: turn history is now bucketed by
+// (identity, active connection) - see chatStoresByBucket/
+// computeBucketKey()/reconcileActiveHistoryBucket() in client.js. Signing
+// in or out changes CURRENT_USER_IDENTITY, which fetchBackendConfig()
+// picks up from the server's own resolved identity (data.user_id) and
+// feeds into reconcileActiveHistoryBucket() - that's what actually
+// decides what appears on screen now: a BLANK slate if this identity has
+// no bucket yet on this page load, or that identity's own last turn,
+// restored, if it does. Neither sign-in nor sign-out clears anything
+// directly any more. (See config-modal.spec.js's
+// "switching the active db connection..." and "switching away from a
+// connection and back restores..." tests for the sibling behavior on the
+// connection-change axis rather than the identity axis.)
 //
 // This never drives a real Google OAuth flow or a real Cloud Run /
 // Firestore backend (both impractical to run hermetically here - see
@@ -23,15 +35,21 @@
 //     google.accounts.id.initialize() so the test can invoke it directly,
 //     simulating a completed sign-in.
 // What IS real: client.js's own event wiring (the sign-in callback,
-// #logoutBtn's click handler) and clearActiveQueryState() itself.
+// #logoutBtn's click handler) and the history-bucket switch itself
+// (reconcileActiveHistoryBucket(), driven by fetchBackendConfig()'s own
+// GET /api/config call - so the mocked /api/config response below has to
+// actually reflect the signed-in identity via the request's Authorization
+// header, the same way the real server's get_current_user_identity()
+// does, or every sign-in/sign-out in these tests would resolve to the
+// same identity and never actually switch buckets at all).
 
 const { test, expect, gotoApp, mockTranslate, mockExecute } = require('./fixtures');
 
-function fakeIdToken(email) {
+function fakeIdToken(email, expiresInSeconds = 3600) {
   const header = Buffer.from(JSON.stringify({ alg: 'none', typ: 'JWT' })).toString('base64url');
   const payload = Buffer.from(JSON.stringify({
     email,
-    exp: Math.floor(Date.now() / 1000) + 3600,
+    exp: Math.floor(Date.now() / 1000) + expiresInSeconds,
     picture: '',
   })).toString('base64url');
   return `${header}.${payload}.fake-signature`;
@@ -63,7 +81,13 @@ const CLOUD_RUN_CONFIG_PAYLOAD = {
  * handler runs, and blocks the real GSI script (index.html loads it from
  * accounts.google.com) so it never overwrites the stub. initialize()
  * stashes its callback on window.__gisCallback for the test to invoke
- * directly; renderButton() just needs to not throw. */
+ * directly; renderButton() just needs to not throw. prompt() (used by
+ * client.js's silent token-refresh path - see attemptSilentTokenRefresh()
+ * there) just records each call's moment-listener on window.__gisPromptCalls
+ * rather than invoking it - a test decides for itself whether a given
+ * attempt "succeeds" (call window.__gisCallback with a fresh token, exactly
+ * like a real completed sign-in) or "fails" (invoke the recorded listener
+ * with a stub PromptMomentNotification reporting skipped/dismissed). */
 async function stubGoogleIdentityServices(page) {
   await page.route('**/gsi/client**', (route) => route.fulfill({
     status: 200,
@@ -71,6 +95,7 @@ async function stubGoogleIdentityServices(page) {
     body: '/* stubbed for e2e - see auth-clears-state.spec.js */',
   }));
   await page.addInitScript(() => {
+    window.__gisPromptCalls = [];
     window.google = {
       accounts: {
         id: {
@@ -79,9 +104,28 @@ async function stubGoogleIdentityServices(page) {
             if (container) container.innerHTML = '<button id="fakeGsiButton">Sign in</button>';
           },
           disableAutoSelect() {},
+          prompt(momentListener) { window.__gisPromptCalls.push(momentListener || null); },
         },
       },
     };
+  });
+}
+
+/** Stubs /api/summarize-result with a plain success/no-summary response,
+ * same convention config-modal.spec.js's own connection-switch test uses.
+ * Without this, populatePromptSqlAndResults()'s real (un-mocked) POST to
+ * this endpoint actually reaches this test environment's outbound network
+ * and comes back a real error - which still gets saved onto the turn as
+ * its `.summary` and, once restored via a later bucket switch, would
+ * legitimately switch focus to that Summary/error tab (exactly the way
+ * navigating back to any turn with a saved summary always has - see
+ * translate-execute.spec.js's "navigating back to a turn replays its
+ * saved summary" test) instead of leaving the results tab active. Nothing
+ * to do with the history-bucket feature itself - just determinism. */
+async function mockSummarizeResult(page) {
+  await page.route('**/api/summarize-result', async (route) => {
+    if (route.request().method() !== 'POST') return route.fallback();
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ success: true }) });
   });
 }
 
@@ -95,6 +139,10 @@ async function currentSql(page) {
 }
 
 async function populatePromptSqlAndResults(page) {
+  // See mockSummarizeResult's own docstring for why this matters now that
+  // a turn's saved `.summary` can resurface later via a history-bucket
+  // switch, not just via back/forward navigation.
+  await mockSummarizeResult(page);
   await page.locator('#aiPrompt').fill('list users');
   await page.locator('#aiPrompt').press('Enter');
   await expect.poll(() => currentSql(page)).toContain('SELECT');
@@ -109,13 +157,42 @@ async function assertPromptSqlAndResultsCleared(page) {
   await expect(page.locator('#resultsTabsNav')).toHaveClass(/hidden/);
 }
 
+/** Decodes the fake JWT's payload the same way fakeIdToken() built it, so
+ * mockCloudRunConfig can hand back the email as `user_id` - mirroring
+ * server/auth.py's get_current_user_identity(), which resolves a Bearer
+ * token to the verified email. Returns null for a missing/malformed
+ * header rather than throwing, so a request with no token at all (the
+ * signed-out/anonymous case) falls through to the anonymous default. */
+function decodeFakeTokenEmail(authHeader) {
+  if (!authHeader || !authHeader.startsWith('Bearer ')) return null;
+  try {
+    const token = authHeader.slice('Bearer '.length);
+    const payloadB64 = token.split('.')[1];
+    const payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
+    return payload.email || null;
+  } catch {
+    return null;
+  }
+}
+
 async function mockCloudRunConfig(page) {
   await page.route('**/api/config', async (route) => {
     if (route.request().method() !== 'GET') return route.fallback();
+    // Real Cloud Run resolves user_id from the request's own Authorization
+    // header (see server/auth.py's get_current_user_identity) rather than
+    // a fixed value - reflecting that here is what lets these tests
+    // actually exercise reconcileActiveHistoryBucket()'s identity-based
+    // bucket switch instead of every sign-in/sign-out landing on the same
+    // bucket (see the module comment up top for why this matters).
+    const email = decodeFakeTokenEmail(route.request().headers()['authorization']);
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
-      body: JSON.stringify(CLOUD_RUN_CONFIG_PAYLOAD),
+      body: JSON.stringify({
+        ...CLOUD_RUN_CONFIG_PAYLOAD,
+        user_id: email || CLOUD_RUN_CONFIG_PAYLOAD.user_id,
+        authenticated: Boolean(email),
+      }),
     });
   });
 }
@@ -187,8 +264,8 @@ test.describe('logging out from the narrow-screen "more" menu', () => {
   });
 });
 
-test.describe('auth-triggered state clearing (Cloud Run)', () => {
-  test('logging in via Google Sign-In clears the NL prompt, SQL, and results', async ({ page }) => {
+test.describe('auth-triggered history bucket switching (Cloud Run)', () => {
+  test('logging in as an identity with no prior conversation on this page load starts with a blank slate', async ({ page }) => {
     await stubGoogleIdentityServices(page);
     await mockCloudRunConfig(page);
     await mockTranslate(page, { sql: 'SELECT id, name FROM users;' });
@@ -202,7 +279,11 @@ test.describe('auth-triggered state clearing (Cloud Run)', () => {
     // Simulate Google Identity Services completing a real sign-in by
     // invoking the callback client.js registered via
     // google.accounts.id.initialize() - exactly what the real SDK would
-    // call after the user picks an account.
+    // call after the user picks an account. newuser@example.com has never
+    // been seen this page load, so its own bucket doesn't exist yet -
+    // reconcileActiveHistoryBucket() creates it fresh, which is why this
+    // still looks blank (NOT because signing in force-clears anything -
+    // see the "same identity" test below, which proves the opposite).
     await page.evaluate(
       (token) => window.__gisCallback({ credential: token }),
       fakeIdToken('newuser@example.com')
@@ -211,7 +292,7 @@ test.describe('auth-triggered state clearing (Cloud Run)', () => {
     await assertPromptSqlAndResultsCleared(page);
   });
 
-  test('logging out clears the NL prompt, SQL, and results', async ({ page }) => {
+  test('logging back in as the same identity restores that identity\'s own prior conversation', async ({ page }) => {
     await stubGoogleIdentityServices(page);
     await mockCloudRunConfig(page);
     await mockTranslate(page, { sql: 'SELECT id, name FROM users;' });
@@ -221,9 +302,6 @@ test.describe('auth-triggered state clearing (Cloud Run)', () => {
 
     await gotoApp(page);
 
-    // Sign in first, so there's an avatar/logout button to click - this
-    // itself clears state (covered by the test above), so populate the
-    // prompt/SQL/results AFTER signing in, not before.
     await page.evaluate(
       (token) => window.__gisCallback({ credential: token }),
       fakeIdToken('user@example.com')
@@ -233,7 +311,92 @@ test.describe('auth-triggered state clearing (Cloud Run)', () => {
 
     await page.locator('#authAvatarBtn').click();
     await page.locator('#logoutBtn').click();
+    // Signing out drops to the anonymous session's own (separate, still
+    // untouched) bucket - blank, same as the module-level assertion below
+    // covers on its own.
+    await assertPromptSqlAndResultsCleared(page);
 
+    // Signing back in as the SAME email should find the conversation
+    // exactly where it was left, not a second blank slate.
+    await page.evaluate(
+      (token) => window.__gisCallback({ credential: token }),
+      fakeIdToken('user@example.com')
+    );
+    await expect(page.locator('#aiPrompt')).toHaveValue('list users');
+    expect(await currentSql(page)).toContain('SELECT');
+    await expect(page.locator('#resultsHeader th')).toHaveText(['id', 'name']);
+  });
+
+  test('logging out restores the anonymous session\'s own prior conversation, not a blank slate', async ({ page }) => {
+    await stubGoogleIdentityServices(page);
+    await mockCloudRunConfig(page);
+    await mockTranslate(page, { sql: 'SELECT id, name FROM users;' });
+    await mockExecute(page, {
+      results: [{ columns: ['id', 'name'], rows: [{ id: 1, name: 'Ada' }], rowCount: 1 }],
+    });
+
+    await gotoApp(page);
+
+    // Start a conversation while still anonymous...
+    await populatePromptSqlAndResults(page);
+
+    // ...then sign in, which lands on a fresh (blank) bucket for this
+    // never-before-seen identity, and start a DIFFERENT conversation there.
+    await page.evaluate(
+      (token) => window.__gisCallback({ credential: token }),
+      fakeIdToken('user@example.com')
+    );
+    await expect(page.locator('#authAvatarBtn')).toBeVisible();
+    await assertPromptSqlAndResultsCleared(page);
+    await mockTranslate(page, { sql: 'SELECT * FROM orders;' });
+    await mockExecute(page, {
+      results: [{ columns: ['order_id'], rows: [{ order_id: 7 }], rowCount: 1 }],
+    });
+    await page.locator('#aiPrompt').fill('list orders');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect.poll(() => currentSql(page)).toContain('orders');
+    await page.locator('#runBtn').click();
+    await expect(page.locator('#resultsHeader th')).toHaveText(['order_id']);
+
+    await page.locator('#authAvatarBtn').click();
+    await page.locator('#logoutBtn').click();
+
+    // Back to the anonymous session's own bucket - the ORIGINAL "list
+    // users" conversation, left alone this whole time, not blank and not
+    // bleeding in the signed-in user's "list orders" turn.
+    await expect(page.locator('#aiPrompt')).toHaveValue('list users');
+    expect(await currentSql(page)).toContain('users');
+    await expect(page.locator('#resultsHeader th')).toHaveText(['id', 'name']);
+  });
+
+  test('two different signed-in identities never see each other\'s conversation', async ({ page }) => {
+    await stubGoogleIdentityServices(page);
+    await mockCloudRunConfig(page);
+    await mockTranslate(page, { sql: 'SELECT id, name FROM users;' });
+    await mockExecute(page, {
+      results: [{ columns: ['id', 'name'], rows: [{ id: 1, name: 'Ada' }], rowCount: 1 }],
+    });
+
+    await gotoApp(page);
+
+    await page.evaluate(
+      (token) => window.__gisCallback({ credential: token }),
+      fakeIdToken('alice@example.com')
+    );
+    await expect(page.locator('#authAvatarBtn')).toBeVisible();
+    await populatePromptSqlAndResults(page);
+
+    await page.locator('#authAvatarBtn').click();
+    await page.locator('#logoutBtn').click();
+
+    await page.evaluate(
+      (token) => window.__gisCallback({ credential: token }),
+      fakeIdToken('bob@example.com')
+    );
+    await expect(page.locator('#authAvatarBtn')).toBeVisible();
+
+    // bob has never been seen before - his own bucket is blank, not
+    // alice's conversation.
     await assertPromptSqlAndResultsCleared(page);
   });
 
@@ -395,15 +558,7 @@ test.describe('sign-in survives a same-tab reload (Cloud Run)', () => {
     // stayed around long enough for it to actually expire before the next
     // reload - rather than going through a real sign-in (which always mints
     // a fresh, unexpired one via fakeIdToken()).
-    const expiredToken = (() => {
-      const header = Buffer.from(JSON.stringify({ alg: 'none', typ: 'JWT' })).toString('base64url');
-      const payload = Buffer.from(JSON.stringify({
-        email: 'stale-user@example.com',
-        exp: Math.floor(Date.now() / 1000) - 3600,
-        picture: '',
-      })).toString('base64url');
-      return `${header}.${payload}.fake-signature`;
-    })();
+    const expiredToken = fakeIdToken('stale-user@example.com', -3600);
     await page.evaluate((token) => {
       window.localStorage.setItem('datalectGoogleIdToken', token);
     }, expiredToken);
@@ -414,6 +569,132 @@ test.describe('sign-in survives a same-tab reload (Cloud Run)', () => {
     // used - the sign-in button shows, not the stale user's avatar.
     await expect(page.locator('#fakeGsiButton')).toBeVisible();
     await expect(page.locator('#authAvatarBtn')).toHaveCount(0);
+
+    // It doesn't JUST give up, though - attemptSilentTokenRefresh() fires
+    // right there in the same renderAuthUI() pass, on the chance the
+    // browser's own Google session is still good even though our locally
+    // cached token has lapsed (see the recovery test right below, which
+    // carries this same attempt through to a successful outcome).
+    expect(await page.evaluate(() => window.__gisPromptCalls.length)).toBeGreaterThan(0);
+  });
+
+  test('an expired stored token recovers automatically, with no click, if the browser still has a live Google session', async ({ page }) => {
+    await stubGoogleIdentityServices(page);
+    await mockCloudRunConfig(page);
+    await gotoApp(page);
+
+    const expiredToken = fakeIdToken('stale-user@example.com', -3600);
+    await page.evaluate((token) => {
+      window.localStorage.setItem('datalectGoogleIdToken', token);
+    }, expiredToken);
+
+    await page.reload();
+
+    // Same starting point as the test above: the stale token is discarded
+    // and the sign-in button shows first...
+    await expect(page.locator('#fakeGsiButton')).toBeVisible();
+    await expect.poll(() => page.evaluate(() => window.__gisPromptCalls.length)).toBeGreaterThan(0);
+
+    // ...but Google's own session is still live and silently hands back a
+    // fresh credential for the same user - exactly what a real successful
+    // One Tap silent re-auth looks like from client.js's point of view
+    // (handleGoogleCredentialResponse doesn't distinguish "the scheduled
+    // pre-expiry timer fired" from "the isExpired fallback attempt did" -
+    // both just call google.accounts.id.prompt() and react to whatever
+    // credential comes back). The user never clicked anything.
+    await page.evaluate(
+      (token) => window.__gisCallback({ credential: token }),
+      fakeIdToken('stale-user@example.com')
+    );
+
+    await expect(page.locator('#authAvatarBtn')).toBeVisible();
+    await expect(page.locator('#authAvatarBtn')).toHaveAttribute('title', 'stale-user@example.com');
+    await expect(page.locator('#fakeGsiButton')).toHaveCount(0);
+  });
+});
+
+test.describe('silent token refresh ahead of expiry (Cloud Run)', () => {
+  // Unlike every test above (which drives client.js's sign-in/expiry
+  // handling directly via window.__gisCallback), this exercises the actual
+  // TIMING client.js schedules on its own: scheduleTokenRefresh() sets a
+  // real setTimeout ~5 minutes before the token's real exp - see
+  // TOKEN_REFRESH_BUFFER_MS in client.js. Playwright's virtual clock lets
+  // this test fast-forward through that ~55-minute wait deterministically
+  // instead of actually waiting on it.
+  test('a background refresh shortly before expiry swaps in a new token without disturbing the current prompt/SQL/results', async ({ page }) => {
+    await stubGoogleIdentityServices(page);
+    await mockCloudRunConfig(page);
+    await mockTranslate(page, { sql: 'SELECT id, name FROM users;' });
+    await mockExecute(page, {
+      results: [{ columns: ['id', 'name'], rows: [{ id: 1, name: 'Ada' }], rowCount: 1 }],
+    });
+
+    // Installed before navigation so client.js's own Date.now()/setTimeout
+    // calls run against the virtual clock from the very start.
+    await page.clock.install();
+    await gotoApp(page);
+
+    await page.evaluate(
+      (token) => window.__gisCallback({ credential: token }),
+      fakeIdToken('refresh-user@example.com')
+    );
+    await expect(page.locator('#authAvatarBtn')).toBeVisible();
+
+    await populatePromptSqlAndResults(page);
+
+    // 56 minutes in: past the scheduled refresh point (60 - 5 = 55 minutes)
+    // but comfortably before the token's own 60-minute expiry.
+    await page.clock.fastForward(56 * 60 * 1000);
+
+    await expect.poll(() => page.evaluate(() => window.__gisPromptCalls.length)).toBeGreaterThan(0);
+
+    // The browser's own Google session is still live, so this silent
+    // attempt succeeds - same email, fresh token.
+    await page.evaluate(
+      (token) => window.__gisCallback({ credential: token }),
+      fakeIdToken('refresh-user@example.com')
+    );
+
+    // Still signed in as the same user - and, crucially, unlike a REAL new
+    // sign-in (see "logging in via Google Sign-In clears..." above), the
+    // turn already on screen was left completely alone: this was
+    // recognized as a background refresh of the SAME session, not a new
+    // user taking over.
+    await expect(page.locator('#authAvatarBtn')).toBeVisible();
+    await expect(page.locator('#authAvatarBtn')).toHaveAttribute('title', 'refresh-user@example.com');
+    expect(await currentSql(page)).toContain('SELECT');
+    await expect(page.locator('#resultsHeader th')).toHaveText(['id', 'name']);
+  });
+
+  test('a failed background refresh attempt leaves the current session alone until the token actually expires', async ({ page }) => {
+    await stubGoogleIdentityServices(page);
+    await mockCloudRunConfig(page);
+
+    await page.clock.install();
+    await gotoApp(page);
+
+    await page.evaluate(
+      (token) => window.__gisCallback({ credential: token }),
+      fakeIdToken('refresh-user@example.com')
+    );
+    await expect(page.locator('#authAvatarBtn')).toBeVisible();
+
+    await page.clock.fastForward(56 * 60 * 1000);
+    await expect.poll(() => page.evaluate(() => window.__gisPromptCalls.length)).toBeGreaterThan(0);
+
+    // This time the attempt can't complete silently (e.g. third-party
+    // storage blocked, or the user dismissed a One Tap prompt recently) -
+    // report it the way FedCM's own moment notification would.
+    await page.evaluate(() => {
+      const listener = window.__gisPromptCalls[window.__gisPromptCalls.length - 1];
+      if (listener) listener({ isSkippedMoment: () => true, isDismissedMoment: () => false });
+    });
+
+    // Nothing changes yet - the user is still shown as signed in with
+    // their existing (not-yet-actually-expired) token, exactly as before
+    // this feature existed. Only once the real token later expires would
+    // renderAuthUI()'s own isExpired check drop them to signed-out.
+    await expect(page.locator('#authAvatarBtn')).toBeVisible();
   });
 });
 

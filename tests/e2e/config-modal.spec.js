@@ -641,7 +641,17 @@ test.describe('config modal', () => {
     await expect(fieldRowsAfter.nth(3).locator('.custom-db-field-label')).toHaveText(['Private Key:', 'Passphrase: (if key is encrypted)']);
   });
 
-  test('switching the active db connection clears the NL prompt, SQL, and results', async ({ page }) => {
+  // Turn history is now bucketed by (identity, active connection) - see
+  // client.js's chatStoresByBucket/computeBucketKey()/
+  // reconcileActiveHistoryBucket(). Switching the active connection no
+  // longer force-clears the on-screen prompt/SQL/results the way it used
+  // to (clearActiveQueryState() isn't called on a connection switch any
+  // more); it switches to that connection's OWN bucket instead - blank if
+  // this page load has never visited it before (which is what this test
+  // below actually exercises, and still coincidentally looks identical to
+  // the old "clears" behavior for that reason), or that connection's own
+  // last turn, restored, if it has (see the test right after this one).
+  test('switching to a connection not yet visited this page load starts with a blank NL prompt, SQL, and results', async ({ page }) => {
     await mockTranslate(page, { sql: 'SELECT id, name FROM users;' });
     await mockExecute(page, {
       results: [{ columns: ['id', 'name'], rows: [{ id: 1, name: 'Ada' }], rowCount: 1 }],
@@ -699,6 +709,86 @@ test.describe('config modal', () => {
     ).toBe('');
     await expect(page.locator('#resultsBody')).toBeEmpty();
     await expect(page.locator('#resultsTabsNav')).toHaveClass(/hidden/);
+  });
+
+  test('switching away from a connection and back restores that connection\'s own prior turn', async ({ page }) => {
+    await mockTranslate(page, { sql: 'SELECT id, name FROM users;' });
+    await mockExecute(page, {
+      results: [{ columns: ['id', 'name'], rows: [{ id: 1, name: 'Ada' }], rowCount: 1 }],
+    });
+    await mockSummarizeResult(page);
+    await gotoApp(page);
+
+    // Populate a turn on the default preset - the connection this test
+    // switches away from and back to.
+    await page.locator('#aiPrompt').fill('list users');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect.poll(() =>
+      page.evaluate(() => {
+        const wrapper = document.querySelector('.CodeMirror');
+        if (wrapper && wrapper.CodeMirror) return wrapper.CodeMirror.getValue();
+        const textarea = document.getElementById('sqlQuery');
+        return textarea ? textarea.value : null;
+      })
+    ).toContain('SELECT');
+    await page.locator('#runBtn').click();
+    await expect(page.locator('#resultsHeader th')).toHaveText(['id', 'name']);
+
+    // Switch to a second, different connection and give it its own turn.
+    await openConfigModal(page);
+    const nameInput = await addCustomDbRow(page);
+    await nameInput.fill('Other DB');
+    await page.locator('.custom-db-url-input').last().fill('postgresql://user:pass@localhost:5432/other');
+    await page.locator('#configSaveBtn').click();
+    await expect(page.locator('#configModal')).toHaveClass(/hidden/);
+    await expect(page.locator('#connDbName')).toHaveText('Other DB');
+    await expect(page.locator('#aiPrompt')).toHaveValue('');
+
+    await mockTranslate(page, { sql: 'SELECT * FROM orders;' });
+    await mockExecute(page, {
+      results: [{ columns: ['order_id'], rows: [{ order_id: 7 }], rowCount: 1 }],
+    });
+    await page.locator('#aiPrompt').fill('list orders');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect.poll(() =>
+      page.evaluate(() => {
+        const wrapper = document.querySelector('.CodeMirror');
+        if (wrapper && wrapper.CodeMirror) return wrapper.CodeMirror.getValue();
+        const textarea = document.getElementById('sqlQuery');
+        return textarea ? textarea.value : null;
+      })
+    ).toContain('orders');
+    await page.locator('#runBtn').click();
+    await expect(page.locator('#resultsHeader th')).toHaveText(['order_id']);
+
+    // Switch back to the default preset - its own earlier turn should
+    // reappear exactly as it was left, not blank and not "Other DB"'s turn.
+    await openConfigModal(page);
+    await page.locator('#modalDbRadioGroup input[name="db_connection_option"][value^="preset:"]').first().check();
+    await page.locator('#configSaveBtn').click();
+    await expect(page.locator('#configModal')).toHaveClass(/hidden/);
+    await expect(page.locator('#connDbName')).toHaveText('Default DB');
+
+    await expect(page.locator('#aiPrompt')).toHaveValue('list users');
+    expect(
+      await page.evaluate(() => {
+        const wrapper = document.querySelector('.CodeMirror');
+        if (wrapper && wrapper.CodeMirror) return wrapper.CodeMirror.getValue();
+        const textarea = document.getElementById('sqlQuery');
+        return textarea ? textarea.value : null;
+      })
+    ).toContain('users');
+    await expect(page.locator('#resultsHeader th')).toHaveText(['id', 'name']);
+
+    // And switching back to "Other DB" once more should restore ITS turn.
+    await openConfigModal(page);
+    await page.locator('#modalDbRadioGroup input[name="db_connection_option"][data-dbname="Other DB"]').check();
+    await page.locator('#configSaveBtn').click();
+    await expect(page.locator('#configModal')).toHaveClass(/hidden/);
+    await expect(page.locator('#connDbName')).toHaveText('Other DB');
+
+    await expect(page.locator('#aiPrompt')).toHaveValue('list orders');
+    await expect(page.locator('#resultsHeader th')).toHaveText(['order_id']);
   });
 
   test('re-saving the same active connection does not clear the NL prompt, SQL, or results', async ({ page }) => {

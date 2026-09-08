@@ -126,7 +126,112 @@ document.addEventListener('DOMContentLoaded', async () => {
   // just a fallback until the first fetchBackendConfig() call reconciles
   // it via chatStore.setMaxTurns(), see createChatHistoryStore() above.
   const FALLBACK_HISTORY_TURNS = 10;
-  const chatStore = createChatHistoryStore(FALLBACK_HISTORY_TURNS);
+  // Bootstrap value only - reconcileActiveHistoryBucket() below replaces
+  // this with the real bucket for the current identity/connection the
+  // moment the first /api/config response is in, so nothing meaningful
+  // can ever actually accumulate in this particular instance (nothing in
+  // this file calls chatStore.pushTurn() before that first fetch resolves
+  // and the UI finishes wiring up). `let`, not `const`, precisely because
+  // reconcileActiveHistoryBucket() reassigns it - every closure elsewhere
+  // in this file that reads `chatStore` does so BY NAME at call time, not
+  // by a value captured when it was defined, so they all transparently
+  // follow along to whichever bucket is currently active.
+  let chatStore = createChatHistoryStore(FALLBACK_HISTORY_TURNS);
+
+  // --- Per-bucket history registry ---------------------------------------
+  //
+  // One conversation used to mean one chatStore, full stop - switching the
+  // active DB connection (or logging in/out) reset it via
+  // clearActiveQueryState() below, on the theory that "the conversation"
+  // and "the connection" were the same thing. They're not: asking three
+  // follow-up questions about the Sales database, checking Marketing for a
+  // minute, then coming back to Sales should mean picking the Sales
+  // conversation back up, not starting over - and the same identity (this
+  // browser's session, or this signed-in user) can reasonably be running a
+  // handful of separate conversations at once, one per connection, plus
+  // one more for "all databases" mode.
+  //
+  // So instead of one chatStore, this is a registry of them, keyed by
+  // (identity, connection-or-"all") - see computeBucketKey(). Switching to
+  // a bucket that already exists (same identity, same connection) picks
+  // its chatStore back up exactly where it was left, pending SQL included;
+  // switching to one never visited this page-load creates it fresh, same
+  // as chatStore always started out. Everything here is plain in-memory JS
+  // state (a Map, same as chatStore itself always was) - deliberately NOT
+  // localStorage or anything else that would survive a reload - so a page
+  // reload still starts every bucket over from empty, exactly as before.
+  // Only login/logout/connection-switch no longer wipe it out from under
+  // you.
+  const chatStoresByBucket = new Map();
+  let activeBucketKey = null;
+  // Mirrors whatever the last real /api/config response's history_max_turns
+  // said (see fetchBackendConfig()'s own chatStore.setMaxTurns() call) - so
+  // a bucket created well after startup (the first time a given connection
+  // is ever visited this page-load) starts with the right cap immediately
+  // instead of FALLBACK_HISTORY_TURNS.
+  let currentHistoryMaxTurns = FALLBACK_HISTORY_TURNS;
+  // The resolved identity this browser is currently making requests as -
+  // mirrors auth.py's get_current_user_identity() exactly ("global" when
+  // running locally with no auth, "anonymous:<session_id>" for an
+  // unauthenticated Cloud Run visitor, the real email once signed in),
+  // sourced verbatim from /api/config's own `user_id` field (see
+  // fetchBackendConfig()) rather than re-derived here - the server is the
+  // one source of truth for what identity a request resolves to. Used
+  // ONLY to key chatStoresByBucket; nothing else in this file needs it.
+  let CURRENT_USER_IDENTITY = 'global';
+
+  // What actually identifies "a conversation" for bucketing purposes -
+  // called after anything that could change the answer (see
+  // reconcileActiveHistoryBucket()'s own call sites: fetchBackendConfig()
+  // for identity changes, triggerConfigSave() for connection/in-scope-mode
+  // changes).
+  function computeBucketKey() {
+    const identity = CURRENT_USER_IDENTITY || 'global';
+    // "All databases" mode is ONE shared conversation regardless of which
+    // specific presets/custom connections are currently checked into
+    // scope - checking one more database in or out mid-conversation
+    // changes who might answer the NEXT question, not which conversation
+    // this is. Everything else (a single active connection) is identified
+    // the same way a real connection change has always been detected
+    // elsewhere in this file - url/is_custom/connection_key/preset_id
+    // together, since no single one of those four is guaranteed to
+    // uniquely identify "the" active connection on its own (e.g. an
+    // unsaved ad hoc custom URL has no connection_key at all).
+    const connection = IN_SCOPE_MODE === 'all'
+      ? 'all'
+      : `${ACTIVE_DB_URL}|${ACTIVE_IS_CUSTOM}|${ACTIVE_CUSTOM_CONNECTION_KEY}|${ACTIVE_PRESET_ID}`;
+    return `${identity}::${connection}`;
+  }
+
+  // Switches `chatStore` to whichever bucket computeBucketKey() currently
+  // names, creating it fresh the first time this page-load visits it. A
+  // no-op whenever the key hasn't actually changed - this runs after
+  // EVERY config fetch/save, not just ones that changed anything relevant
+  // to bucketing, so that has to be cheap and is: no more hand-rolled
+  // "did the connection actually change" comparison at each call site the
+  // way this used to work (see the old previousConnectionIdentity/
+  // nextConnectionIdentity check this replaced in triggerConfigSave) -
+  // just compare the one computed key.
+  function reconcileActiveHistoryBucket() {
+    const key = computeBucketKey();
+    if (key === activeBucketKey) return;
+    activeBucketKey = key;
+    let store = chatStoresByBucket.get(key);
+    if (!store) {
+      store = createChatHistoryStore(currentHistoryMaxTurns);
+      chatStoresByBucket.set(key, store);
+    }
+    chatStore = store;
+    // restoreLatestTurn() (defined far below, in section 12 - a plain
+    // function declaration, so it's already hoisted and callable from up
+    // here) already does exactly the right thing for both an empty bucket
+    // (blanks the prompt/SQL/results, same as this used to do
+    // unconditionally via clearActiveQueryState()) and a previously-
+    // visited one (re-shows its last turn's SQL/results) - "finding the
+    // history you left", not just making it reachable via the back arrow.
+    restoreLatestTurn();
+    updateHistoryTurnsSubtitle();
+  }
 
   let DEFAULT_DB_URL = "";
   let ACTIVE_DB_URL = "";
@@ -218,9 +323,19 @@ document.addEventListener('DOMContentLoaded', async () => {
   // in scope) and echoed back on every subsequent /api/translate/
   // /api/execute call in the same conversation as `pinned_connections`, so
   // a follow-up question reuses the same connection(s) rather than
-  // re-deciding from scratch. Reset by clearActiveQueryState() - the same
-  // single reset point new-chat/logout/sign-in/connection-switch already
-  // funnel through - so it never outlives the conversation it was set for.
+  // re-deciding from scratch.
+  //
+  // Deliberately NOT part of the per-bucket history registry above (see
+  // reconcileActiveHistoryBucket()) - it stays this one single, currently-
+  // active-view variable, reset only when a pinned connection is actually
+  // unchecked from scope (triggerConfigSave()'s in-scope-set branch) the
+  // same way it always has been. In practice that means switching away
+  // from the "all databases" bucket and back no longer clears a pin the
+  // way it used to (clearActiveQueryState() isn't called on a bucket
+  // switch any more) - a small, deliberate inconsistency with this
+  // variable's own "never outlives the conversation it was set for" framing
+  // above, accepted for now rather than making pins part of the bucket
+  // registry too (a bigger change than asked for).
   let PINNED_CONNECTIONS = [];
   // Model-selection state (see fetchBackendConfig()/updateModelBadge()/
   // renderModelRadioButtons()) - mirrors CONFIGURED_DBS/ACTIVE_DB_URL's own
@@ -969,30 +1084,197 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   let lastRenderedAuthState = null;
 
+  // --- Silent token refresh ---------------------------------------------
+  //
+  // A Google ID token is short-lived (about an hour - exp minus iat, a
+  // fixed value set by Google, not something this app controls). Until
+  // now the ONLY thing that ever happened with that expiry was
+  // renderAuthUI()'s isExpired check below, which just discards the stale
+  // token and drops back to signed-out the next time it happens to run -
+  // meaning anyone who left the app open (or even just backgrounded the
+  // tab) for longer than that got silently logged out, even though their
+  // underlying Google session was still perfectly fine.
+  //
+  // This proactively asks Google for a fresh credential shortly BEFORE the
+  // current one expires (TOKEN_REFRESH_BUFFER_MS), via
+  // google.accounts.id.prompt() - the exact same "One Tap" mechanism the
+  // rendered sign-in button itself relies on, just invoked programmatically
+  // instead of by a click. When the browser still has a live Google
+  // session (the common case - nothing about using Datalect, or even
+  // logging out of it, signs the user out of Google itself), this
+  // succeeds silently with no visible UI at all, and
+  // handleGoogleCredentialResponse below swaps in the new token without
+  // disturbing anything on screen. When it can't succeed silently
+  // (third-party storage/cookies blocked, the browser's own Google session
+  // is gone, etc.) nothing happens here and the existing isExpired handling
+  // takes over exactly as before once the old token actually lapses - this
+  // is pure upside, never a new failure mode.
+  const TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000; // ask for a new one 5 min before the old one expires
+  const SILENT_REFRESH_MIN_INTERVAL_MS = 60 * 1000; // never call prompt() more than once a minute
+  let tokenRefreshTimerId = null;
+  let pendingSilentRefresh = false;
+  let lastSilentRefreshAttemptAt = 0;
+  let googleIdentityInitializedClientId = null;
+
+  function clearScheduledTokenRefresh() {
+    if (tokenRefreshTimerId) {
+      clearTimeout(tokenRefreshTimerId);
+      tokenRefreshTimerId = null;
+    }
+  }
+
+  function attemptSilentTokenRefresh() {
+    // The `typeof ... === 'function'` check (rather than just truthiness)
+    // matters for more than paranoia: the real GSI SDK always has prompt(),
+    // but a stubbed-out google.accounts.id (see e.g. tests/e2e/
+    // auth-clears-state.spec.js's stubGoogleIdentityServices(), which only
+    // defines initialize()/renderButton()/disableAutoSelect()) legitimately
+    // won't - and this function gets reached from a plain expired-token
+    // page load, not just from a scheduled refresh, so it has to degrade
+    // to a no-op rather than throwing when that's the case.
+    if (!window.google || !google.accounts || !google.accounts.id
+      || typeof google.accounts.id.prompt !== 'function' || !currentGoogleClientId) return;
+    // Already in flight, or attempted too recently (e.g. renderAuthUI
+    // firing again and again while a stalled/failing attempt sits inside
+    // the refresh-buffer window) - skip rather than piling another
+    // prompt() call on top of it.
+    if (pendingSilentRefresh || (Date.now() - lastSilentRefreshAttemptAt) < SILENT_REFRESH_MIN_INTERVAL_MS) {
+      return;
+    }
+    pendingSilentRefresh = true;
+    lastSilentRefreshAttemptAt = Date.now();
+    google.accounts.id.prompt((notification) => {
+      // isDisplayMoment()/isDisplayed()/isNotDisplayed() are deprecated
+      // under Google's FedCM-based flow (what most browsers use now) and
+      // shouldn't be relied on any more - isSkippedMoment()/
+      // isDismissedMoment() are what's still meaningful there. Either one
+      // means no fresh credential is coming out of this attempt, so stop
+      // treating one as in flight.
+      if (notification?.isSkippedMoment?.() || notification?.isDismissedMoment?.()) {
+        pendingSilentRefresh = false;
+      }
+      // If a credential DOES arrive, handleGoogleCredentialResponse below
+      // is what clears pendingSilentRefresh - nothing else to do here then.
+    });
+  }
+
+  function scheduleTokenRefresh(token) {
+    clearScheduledTokenRefresh();
+    const payload = token ? parseJwt(token) : null;
+    if (!payload || !payload.exp) return;
+    const msUntilRefresh = payload.exp * 1000 - Date.now() - TOKEN_REFRESH_BUFFER_MS;
+    // Already inside (or even past) the buffer window - fire almost right
+    // away rather than scheduling a zero/negative delay every time this
+    // gets called again on the next re-render.
+    tokenRefreshTimerId = setTimeout(attemptSilentTokenRefresh, Math.max(msUntilRefresh, 1000));
+  }
+
+  function ensureGoogleIdentityInitialized(clientId) {
+    if (!clientId || !window.google || !google.accounts || !google.accounts.id) return;
+    // initialize() REPLACES (doesn't merge with) any prior configuration -
+    // per Google's own JS reference, it "should be called only once" - so
+    // this only actually calls it the first time a given clientId is seen,
+    // rather than on every renderAuthUI() render. This also has to run
+    // regardless of which branch below is taken: a page reload while
+    // already signed in (token restored from localStorage) takes the
+    // "signed in" branch and never used to call initialize() at all this
+    // session, which meant prompt()-based refresh had no config to work
+    // from - calling this unconditionally up top fixes that gap.
+    if (googleIdentityInitializedClientId === clientId) return;
+    google.accounts.id.initialize({ client_id: clientId, callback: handleGoogleCredentialResponse });
+    googleIdentityInitializedClientId = clientId;
+  }
+
+  function handleGoogleCredentialResponse(response) {
+    if (!response.credential) return;
+    const wasSilentRefresh = pendingSilentRefresh;
+    pendingSilentRefresh = false;
+    googleIdToken = response.credential;
+    persistGoogleIdToken(googleIdToken);
+    scheduleTokenRefresh(googleIdToken);
+    if (wasSilentRefresh) {
+      // A background/recovery refresh of the SAME session's token - unlike
+      // a real new sign-in below, this never clears in-progress work or
+      // re-fetches config. It still has to re-render, though: this covers
+      // BOTH "already showing the avatar, just topped up ahead of expiry"
+      // (renderAuthUI()'s own authStateKey dedupe makes that a no-op, since
+      // nothing visibly changed) AND "was showing the sign-in button
+      // because the old token had already lapsed, and this recovered it
+      // silently" - which DOES need the avatar to actually appear.
+      renderAuthUI(currentGoogleClientId);
+      return;
+    }
+    // GA4's own recommended "login" event shape (see
+    // https://developers.google.com/analytics/devguides/collection/ga4/reference/events)
+    // has exactly one optional parameter, "method" - always
+    // "Google" here, since Google Sign-In is the only method this
+    // app supports. Still no identity/PII in the params - GA is
+    // for usage counts, not a record of who signed in.
+    trackEvent('login', { method: 'Google' });
+    // A new user logging on takes over what was, until now, an anonymous
+    // (or a different user's) identity - the prompt/SQL/results on screen
+    // belong to THAT identity's own conversation, not this one. This used
+    // to force-clear them (clearActiveQueryState()); now fetchBackendConfig()
+    // below picks up the new identity (data.user_id) and calls
+    // reconcileActiveHistoryBucket() itself, which switches to (or creates)
+    // THIS identity's own bucket for whatever connection is active and
+    // restores it - showing this identity's own last turn if it's been
+    // seen before this page-load, or a blank slate if not. Nothing to do
+    // here directly any more.
+    renderAuthUI(currentGoogleClientId);
+    fetchBackendConfig();
+  }
+
   function handleLogout() {
     trackEvent('logout', {});
     googleIdToken = null;
     clearPersistedGoogleIdToken();
+    clearScheduledTokenRefresh();
+    pendingSilentRefresh = false;
     if (window.google && google.accounts && google.accounts.id) {
       google.accounts.id.disableAutoSelect();
     }
-    // Logging out drops back to a (new, distinct) anonymous session - the
-    // prompt/SQL/results on screen belonged to the just-logged-out user's
-    // identity and connection, so they're cleared the same way a DB
-    // connection change clears them (see clearActiveQueryState()).
-    clearActiveQueryState();
+    // Logging out drops back to a (new, distinct) anonymous session - see
+    // the sign-in callback's own comment just above for why
+    // fetchBackendConfig() below is what actually switches the active
+    // history bucket now (via reconcileActiveHistoryBucket()), not a
+    // direct clearActiveQueryState() call here.
     renderAuthUI(currentGoogleClientId);
     fetchBackendConfig();
   }
 
   function renderAuthUI(clientId) {
     if (clientId) currentGoogleClientId = clientId;
+    // Unconditional (not just in the "not signed in" branch below) - see
+    // ensureGoogleIdentityInitialized's own docstring for why a signed-in
+    // page reload must still reach this.
+    ensureGoogleIdentityInitialized(currentGoogleClientId);
     const container = document.getElementById('g_id_signin');
     if (!container) return;
 
     const existingToken = googleIdToken;
     const payload = existingToken ? parseJwt(existingToken) : null;
     const isExpired = payload && payload.exp && (payload.exp * 1000 < Date.now());
+
+    // Keep the scheduled refresh in sync with reality on every call (cheap -
+    // just a clearTimeout+setTimeout pair), independent of the
+    // authStateKey dedupe below which only guards the DOM-rendering work.
+    if (existingToken && payload && !isExpired) {
+      scheduleTokenRefresh(existingToken);
+    } else {
+      clearScheduledTokenRefresh();
+      if (isExpired) {
+        // Backgrounded/inactive long enough that the token expired outright
+        // before its scheduled early refresh could fire (background tabs'
+        // timers get throttled, sometimes to the point of never firing over
+        // several hours - exactly the scenario this feature exists for) -
+        // try once, right now, before conceding to the sign-in screen
+        // below. If the browser's own Google session is still valid this
+        // often recovers silently; if not, nothing else happens here and
+        // sign-in renders as usual.
+        attemptSilentTokenRefresh();
+      }
+    }
 
     // renderAuthUI() runs on every fetchBackendConfig() call - including
     // once per prompt/execute, since translatePrompt() re-syncs config
@@ -1076,31 +1358,9 @@ document.addEventListener('DOMContentLoaded', async () => {
       container.innerHTML = '';
       const targetClientId = clientId || currentGoogleClientId;
       if (window.google && google.accounts && targetClientId) {
-        google.accounts.id.initialize({
-          client_id: targetClientId,
-          callback: (response) => {
-            if (response.credential) {
-              googleIdToken = response.credential;
-              persistGoogleIdToken(googleIdToken);
-              // GA4's own recommended "login" event shape (see
-              // https://developers.google.com/analytics/devguides/collection/ga4/reference/events)
-              // has exactly one optional parameter, "method" - always
-              // "Google" here, since Google Sign-In is the only method this
-              // app supports. Still no identity/PII in the params - GA is
-              // for usage counts, not a record of who signed in.
-              trackEvent('login', { method: 'Google' });
-              // A new user logging on takes over what was, until now, an
-              // anonymous (or a different user's) session - whatever
-              // prompt/SQL/results are on screen belong to that prior
-              // identity, not this one, so clear them the same way a DB
-              // connection change does (see clearActiveQueryState()).
-              clearActiveQueryState();
-              renderAuthUI(targetClientId);
-              fetchBackendConfig();
-            }
-          }
-        });
-
+        // initialize() itself already happened up top via
+        // ensureGoogleIdentityInitialized(), shared with the silent-refresh
+        // path above - only the visible button is rendered here.
         google.accounts.id.renderButton(container, {
           theme: 'filled_black',
           size: 'medium',
@@ -1110,10 +1370,14 @@ document.addEventListener('DOMContentLoaded', async () => {
           logo_alignment: 'left'
         });
 
-        // Deliberately no google.accounts.id.prompt() here - on Cloud Run
-        // the app supports anonymous use, so we don't want the One Tap
-        // sign-in prompt popping up unasked on every load. The rendered
-        // button above is always available for anyone who wants to log in.
+        // Deliberately no google.accounts.id.prompt() call HERE - on Cloud
+        // Run the app supports anonymous use, so we don't want the One Tap
+        // sign-in prompt popping up unasked on every load for a visitor who
+        // was never signed in to begin with. The rendered button above is
+        // always available for anyone who wants to log in. (The one place
+        // this file DOES call prompt() is attemptSilentTokenRefresh() above
+        // - and only for someone who was already signed in and is nearing
+        // or past their token's expiry, never for a fresh anonymous visitor.)
       }
     }
   }
@@ -1121,6 +1385,19 @@ document.addEventListener('DOMContentLoaded', async () => {
   function initGoogleAuth(clientId) {
     renderAuthUI(clientId);
   }
+
+  // Background tabs get their timers throttled - sometimes to the point of
+  // never firing at all over several hours, which is exactly the scenario
+  // scheduleTokenRefresh()/attemptSilentTokenRefresh() above exist for. On
+  // regaining visibility, just re-run renderAuthUI(): it recomputes
+  // isExpired/signedIn against the real current time, reschedules (or
+  // immediately re-attempts) the refresh against however much time actually
+  // elapsed while hidden, and updates the UI if anything changed.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      renderAuthUI(currentGoogleClientId);
+    }
+  });
 
   // ===========================================================================
   // MORE MENU (triple-dot mobile header menu)
@@ -1592,25 +1869,26 @@ document.addEventListener('DOMContentLoaded', async () => {
     return finalData || {};
   }
 
-  // Wipes everything tied to the connection that was just switched away
-  // from: the NL prompt, the generated SQL, the results grid, and the
-  // turn-navigation history (chatStore) - without clearing chatStore too,
-  // clicking "go back" after a connection change would silently restore
-  // the previous connection's prompt/SQL/results, defeating the point of
-  // clearing them here. Called from triggerConfigSave() only when the
-  // active connection identity actually changed (not on every save, e.g.
-  // re-saving the same connection or toggling auto-execute).
+  // Wipes the NL prompt, the generated SQL, the results grid, and the
+  // CURRENTLY ACTIVE bucket's own turn-navigation history (chatStore) -
+  // i.e. actually destroys a conversation, not just navigates away from
+  // it. Login, logout, and switching the active connection used to funnel
+  // through here (on the theory that "the conversation" and "the
+  // connection" were the same thing, so switching one meant discarding the
+  // other) - they no longer do; see reconcileActiveHistoryBucket() above,
+  // which switches `chatStore` to that identity/connection's OWN bucket
+  // and restores it instead of wiping anything. This function is currently
+  // unreferenced as a result - kept around rather than deleted, since an
+  // explicit "start a new conversation" affordance (distinct from merely
+  // switching to a connection that already has one) seems like a very
+  // likely next step for this feature, and this is already exactly the
+  // right building block for it.
   function clearActiveQueryState() {
     if (aiPrompt) aiPrompt.value = '';
     setSqlQuery('');
     clearResultsDisplay();
     chatStore.clear();
     updateHistoryTurnsSubtitle();
-    // A pinned multi-database selection only ever makes sense for the
-    // conversation it was picked for - every existing trigger for this
-    // function (new chat, logout, sign-in, connection-identity change) is
-    // already exactly the boundary a pin should reset at, so this rides
-    // along with zero new call sites.
     PINNED_CONNECTIONS = [];
   }
 
@@ -1868,6 +2146,10 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       isAnonymousUser = Boolean(data && data.is_cloud_run && !data.authenticated);
       updateAnonymousRestrictions();
+      // See CURRENT_USER_IDENTITY's own declaration comment - this is the
+      // one place it's ever set, straight from the server's own resolved
+      // identity, never re-derived here.
+      CURRENT_USER_IDENTITY = data.user_id || 'global';
 
       CONFIGURED_DBS = data.configured_databases || [];
       DEFAULT_DB_URL = data.default_database_url || "";
@@ -1914,6 +2196,13 @@ document.addEventListener('DOMContentLoaded', async () => {
       // the same env var /api/translate uses to decide how many past
       // turns actually reach the LLM (see createChatHistoryStore's
       // setMaxTurns() for why this can't just be a hardcoded constant).
+      // Remembered in currentHistoryMaxTurns too (not just applied to
+      // today's chatStore) so a bucket created later - the first time a
+      // different connection is ever visited this page-load - starts with
+      // this same real cap instead of FALLBACK_HISTORY_TURNS.
+      if (data.history_max_turns) {
+        currentHistoryMaxTurns = data.history_max_turns;
+      }
       chatStore.setMaxTurns(data.history_max_turns);
 
       if (data.auth_enabled && data.google_client_id) {
@@ -1959,6 +2248,14 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (data.max_in_scope_connections) {
         MAX_IN_SCOPE_CONNECTIONS = data.max_in_scope_connections;
       }
+
+      // Now that CURRENT_USER_IDENTITY/ACTIVE_*/IN_SCOPE_MODE all reflect
+      // this response, switch to whichever bucket they now name - covers
+      // login/logout (identity changed) and, on a fresh page load, the
+      // very first real bucket (see reconcileActiveHistoryBucket()'s own
+      // docstring; a no-op the rest of the time, e.g. every other call
+      // this makes before/after each translate/execute).
+      reconcileActiveHistoryBucket();
 
       renderDbRadioButtons();
       loadConfigIntoUI();
@@ -3808,19 +4105,23 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       if (response.ok) {
         const data = await response.json();
-        // Captured BEFORE the ACTIVE_* globals below get overwritten, so
-        // this reflects the connection that was active going into this
-        // save. Compared against the same tuple after the update to detect
-        // an actual connection change (see clearActiveQueryState() below) -
-        // url/is_custom/connection_key/preset_id together are what uniquely
-        // identify "the" active connection (custom connections:
-        // connection_key; presets: preset_id, which now works the same way
-        // for anonymous and signed-in users alike - see "what makes a db
-        // connection unique" discussion).
-        const previousConnectionIdentity = `${ACTIVE_DB_URL}|${ACTIVE_IS_CUSTOM}|${ACTIVE_CUSTOM_CONNECTION_KEY}|${ACTIVE_PRESET_ID}`;
-        if (data.active_database_url) {
-          ACTIVE_DB_URL = data.active_database_url;
-        }
+        // Unconditional, mirroring fetchBackendConfig()'s own
+        // `data.active_database_url || DEFAULT_DB_URL` (config_routes.py
+        // always sends this field, coalesced to '' rather than omitted -
+        // see its own docstring). This USED to be an `if (data.active_
+        // database_url)` guard that only ever overwrote ACTIVE_DB_URL,
+        // never reset it - harmless before computeBucketKey() existed
+        // (nothing else depended on ACTIVE_DB_URL staying in sync after a
+        // save), but a real bug for it: switching FROM a custom connection
+        // (a real, disclosed URL) TO a preset whose own URL isn't sent to
+        // the client left ACTIVE_DB_URL stuck on the custom connection's
+        // URL, so computeBucketKey() computed a DIFFERENT key for that
+        // preset than the one its very first visit used - "switch away and
+        // back" would land in a fresh, blank bucket instead of the
+        // preset's real one. Falling back to DEFAULT_DB_URL (not "") keeps
+        // this consistent with fetchBackendConfig()'s own convention for
+        // "a preset with no separately-disclosed URL of its own".
+        ACTIVE_DB_URL = data.active_database_url || DEFAULT_DB_URL;
         if (data.active_is_custom !== undefined) {
           ACTIVE_IS_CUSTOM = Boolean(data.active_is_custom);
         }
@@ -3855,24 +4156,32 @@ document.addEventListener('DOMContentLoaded', async () => {
           IN_SCOPE_MODE = data.in_scope_mode === 'all' ? 'all' : 'single';
         }
 
-        const nextConnectionIdentity = `${ACTIVE_DB_URL}|${ACTIVE_IS_CUSTOM}|${ACTIVE_CUSTOM_CONNECTION_KEY}|${ACTIVE_PRESET_ID}`;
-        if (nextConnectionIdentity !== previousConnectionIdentity) {
-          clearActiveQueryState();
-        } else if (PINNED_CONNECTIONS.some(p => (
+        // Switches to (or creates) whichever bucket the now-current
+        // ACTIVE_*/IN_SCOPE_MODE actually names - a real connection change,
+        // or flipping between single/all mode, both land here; re-saving
+        // the same connection or toggling an unrelated preference (e.g.
+        // auto-execute) computes the same key as before and is a no-op
+        // (see reconcileActiveHistoryBucket()'s own docstring).
+        reconcileActiveHistoryBucket();
+
+        if (PINNED_CONNECTIONS.some(p => (
           p.kind === 'preset' ? !IN_SCOPE_PRESET_IDS.includes(p.id) : !IN_SCOPE_CUSTOM_KEYS.includes(p.id)
         ))) {
-          // The primary connection didn't change, but a connection this
-          // conversation had pinned (see PINNED_CONNECTIONS' docstring) was
-          // just unchecked from scope - the pin no longer describes a set
-          // the user actually wants questions routed to, so it's cleared
-          // the same way a real connection-identity change would be. The
-          // server independently guards against a stale pin too (see
-          // execute_routes.py's resolve_descriptor_by_reference fallback,
-          // which is the only place a client-echoed pinned_connections
-          // entry is still read at all), this just keeps the UI's own
-          // prompt/SQL/results in sync immediately rather than waiting for
-          // the next execute call to discover it server-side.
-          clearActiveQueryState();
+          // A connection this "all databases" conversation had pinned (see
+          // PINNED_CONNECTIONS' own docstring) was just unchecked from
+          // scope - the pin no longer describes a set the user actually
+          // wants questions routed to. Unlike a real connection-identity
+          // change, this does NOT touch the history bucket or the on-
+          // screen prompt/SQL/results any more: "all databases" is one
+          // shared conversation regardless of exactly which connections
+          // are in scope (see computeBucketKey()), so excluding one from
+          // scope doesn't invalidate it. The server independently guards
+          // against a stale pin too (see execute_routes.py's
+          // resolve_descriptor_by_reference fallback, which is the only
+          // place a client-echoed pinned_connections entry is still read
+          // at all) - this just keeps PINNED_CONNECTIONS itself from
+          // silently pointing at a connection no longer in scope.
+          PINNED_CONNECTIONS = [];
         }
 
         if (configSaveErrorEl) {
