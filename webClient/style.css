@@ -1695,12 +1695,22 @@ textarea.report-issue-preview:focus {
   text-overflow: ellipsis;
 }
 
-/* "All configured databases" (see renderDbRadioButtons() in client.js) -
-   the first option in the group, ahead of the "Pre-configured Database
-   Playgrounds" heading, since it applies across both presets and custom
-   connections rather than belonging to either list. Bolded like a heading
-   would be, to read as a distinct top-level choice rather than just
-   another item in the preset list right below it. */
+/* Wraps "All configured databases" (see renderDbRadioButtons() in
+   client.js) - the LAST section in the group, below every preset and
+   custom connection, since it applies across both lists rather than
+   belonging to either one. The top border is the separator between it
+   and #customDbsContainer right above it - drawn here (on this wrapper),
+   not on .custom-dbs-list itself, so the line still appears even when
+   there are zero custom connections (.custom-dbs-list:not(:empty) below
+   draws no border of its own in that case). */
+.all-databases-section {
+  border-top: 1px solid var(--bg-card-border);
+  margin-top: 0.6rem;
+  padding-top: 1rem;
+}
+
+/* Bolded like a heading would be, to read as a distinct top-level choice
+   rather than just another item in the list right above it. */
 .all-databases-option {
   font-weight: 600;
   white-space: normal;
@@ -1710,12 +1720,12 @@ textarea.report-issue-preview:focus {
 /* Short explanation directly under the "All configured databases" option
    (see renderDbRadioButtons() in client.js) - quieter/smaller than the
    option's own label, same relationship .custom-db-security-note has to
-   the "Custom Database Connections" heading above. */
+   the "Custom Database Connections" heading above it. */
 .all-databases-hint {
   font-size: 0.72rem;
   line-height: 1.35;
   color: var(--text-muted);
-  margin: 0 0 0.9rem;
+  margin: 0;
 }
 
 .checkbox-option {

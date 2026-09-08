@@ -3273,18 +3273,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const activeUrl = currentDbUrl || ACTIVE_DB_URL || DEFAULT_DB_URL;
     const allSelected = isAllConnectionsSelected();
 
-    let html = `
-      <label class="radio-option all-databases-option">
-        <input type="radio" name="db_connection_option" value="all" ${allSelected ? 'checked' : ''}>
-        <span class="radio-label">All configured databases</span>
-      </label>
-      <p class="all-databases-hint">
-        Ask a question without picking a database first - the app figures out which connection(s) it applies to,
-        and can query more than one at once when a question genuinely needs it.
-      </p>
-    `;
-
-    html += `<div class="radio-group-heading">Pre-configured Database Playgrounds</div>`;
+    let html = `<div class="radio-group-heading">Pre-configured Database Playgrounds</div>`;
 
     // Two visual columns, purely a layout grouping (no change to what's
     // selectable or how - db_connection_option/preset:<id> works exactly
@@ -3354,6 +3343,25 @@ document.addEventListener('DOMContentLoaded', async () => {
       </p>
     `;
     html += `<div id="customDbsContainer" class="custom-dbs-list"></div>`;
+
+    // "All configured databases" - moved to the bottom of the group,
+    // below every preset and custom connection, since it applies across
+    // both lists rather than belonging to either one; a separator
+    // (.all-databases-section's own top border) marks it as its own
+    // section rather than one more item tacked onto the custom
+    // connections list right above it.
+    html += `
+      <div class="all-databases-section">
+        <label class="radio-option all-databases-option">
+          <input type="radio" name="db_connection_option" value="all" ${allSelected ? 'checked' : ''}>
+          <span class="radio-label">All configured databases</span>
+        </label>
+        <p class="all-databases-hint">
+          Ask a question without picking a database first - the app figures out which connection(s) it applies to,
+          and can query more than one at once when a question genuinely needs it.
+        </p>
+      </div>
+    `;
 
     radioGroup.innerHTML = html;
 

@@ -150,19 +150,22 @@ test.describe('multi-database question answering', () => {
     await gotoApp(page);
     await openConfigModal(page);
 
-    // "All" (index 0) + the two presets (p-a, p-b) - a true single-select
-    // radio group again (see renderDbRadioButtons() in client.js), not the
-    // checkbox picker this replaced.
+    // "All" (rendered last, below the custom connections - see
+    // renderDbRadioButtons() in client.js) + the two presets (p-a, p-b) - a
+    // true single-select radio group again, not the checkbox picker this
+    // replaced.
     const allRadio = page.locator('input[name="db_connection_option"][value="all"]');
     const boxes = page.locator('input[name="db_connection_option"]');
+    const presetA = page.locator('input[name="db_connection_option"][value="preset:p-a"]');
+    const presetB = page.locator('input[name="db_connection_option"][value="preset:p-b"]');
     await expect(boxes).toHaveCount(3);
     await expect(allRadio).not.toBeChecked();
-    await expect(boxes.nth(1)).toBeChecked(); // p-a, today's only in-scope preset
+    await expect(presetA).toBeChecked(); // p-a, today's only in-scope preset
 
     // Picking "All" unchecks whichever specific preset was selected -
     // plain native radio exclusivity, no client bookkeeping involved.
     await allRadio.check();
-    await expect(boxes.nth(1)).not.toBeChecked();
+    await expect(presetA).not.toBeChecked();
     await page.locator('#configSaveBtn').click();
     await expect(page.locator('#configModal')).toHaveClass(/hidden/);
     expect(state._lastPostBody.in_scope_mode).toBe('all');
@@ -171,7 +174,7 @@ test.describe('multi-database question answering', () => {
     // that one - in_scope_mode flips back to 'single' and the in-scope
     // arrays are sent as exactly that one connection.
     await openConfigModal(page);
-    await boxes.nth(2).check(); // p-b
+    await presetB.check();
     await page.locator('#configSaveBtn').click();
     await expect(page.locator('#configModal')).toHaveClass(/hidden/);
     expect(state._lastPostBody.in_scope_mode).toBe('single');
@@ -192,12 +195,10 @@ test.describe('multi-database question answering', () => {
     await expect(page.locator('#configTriggerBadge')).toHaveAttribute(
       'title', 'In scope: Sales Postgres, Marketing Postgres (Click to configure)');
 
-    // Picking a specific preset (p-b, index 2 - "All" is index 0, p-a is
-    // index 1) narrows scope back down to just that one connection and
-    // reverts the badge to its actual name.
+    // Picking a specific preset (p-b) narrows scope back down to just that
+    // one connection and reverts the badge to its actual name.
     await openConfigModal(page);
-    const boxes = page.locator('input[name="db_connection_option"]');
-    await boxes.nth(2).check();
+    await page.locator('input[name="db_connection_option"][value="preset:p-b"]').check();
     await page.locator('#configSaveBtn').click();
     await expect(page.locator('#configModal')).toHaveClass(/hidden/);
     expect(state.in_scope_preset_ids).toEqual(['p-b']);
@@ -480,12 +481,11 @@ test.describe('multi-database question answering', () => {
     await expect(page.locator('#resultsHeader th')).toHaveText(['x']);
     await expect(page.locator('#aiPrompt')).toHaveValue('campaigns question');
 
-    // Now pick p-a specifically (index 1 - "All" is index 0, p-b is index
-    // 2), narrowing scope away from "All" down to just p-a - the pin from
-    // above (p-b) no longer describes an in-scope connection.
+    // Now pick p-a specifically, narrowing scope away from "All" down to
+    // just p-a - the pin from above (p-b) no longer describes an in-scope
+    // connection.
     await openConfigModal(page);
-    const boxes = page.locator('input[name="db_connection_option"]');
-    await boxes.nth(1).check();
+    await page.locator('input[name="db_connection_option"][value="preset:p-a"]').check();
     await page.locator('#configSaveBtn').click();
     await expect(page.locator('#configModal')).toHaveClass(/hidden/);
     expect(state.in_scope_preset_ids).toEqual(['p-a']);
