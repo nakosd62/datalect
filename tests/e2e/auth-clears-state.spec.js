@@ -81,13 +81,10 @@ const CLOUD_RUN_CONFIG_PAYLOAD = {
  * handler runs, and blocks the real GSI script (index.html loads it from
  * accounts.google.com) so it never overwrites the stub. initialize()
  * stashes its callback on window.__gisCallback for the test to invoke
- * directly; renderButton() just needs to not throw. prompt() (used by
- * client.js's silent token-refresh path - see attemptSilentTokenRefresh()
- * there) just records each call's moment-listener on window.__gisPromptCalls
- * rather than invoking it - a test decides for itself whether a given
- * attempt "succeeds" (call window.__gisCallback with a fresh token, exactly
- * like a real completed sign-in) or "fails" (invoke the recorded listener
- * with a stub PromptMomentNotification reporting skipped/dismissed). */
+ * directly, simulating a completed sign-in; renderButton() just needs to
+ * not throw. client.js never calls prompt() itself (see renderAuthUI()'s
+ * own comment on that) - a stale/expired token just reverts to showing
+ * the ordinary sign-in button below, no silent-refresh attempt involved. */
 async function stubGoogleIdentityServices(page) {
   await page.route('**/gsi/client**', (route) => route.fulfill({
     status: 200,
@@ -95,7 +92,6 @@ async function stubGoogleIdentityServices(page) {
     body: '/* stubbed for e2e - see auth-clears-state.spec.js */',
   }));
   await page.addInitScript(() => {
-    window.__gisPromptCalls = [];
     window.google = {
       accounts: {
         id: {
@@ -104,7 +100,6 @@ async function stubGoogleIdentityServices(page) {
             if (container) container.innerHTML = '<button id="fakeGsiButton">Sign in</button>';
           },
           disableAutoSelect() {},
-          prompt(momentListener) { window.__gisPromptCalls.push(momentListener || null); },
         },
       },
     };
@@ -566,135 +561,12 @@ test.describe('sign-in survives a same-tab reload (Cloud Run)', () => {
     await page.reload();
 
     // renderAuthUI()'s own isExpired check discards it the moment it's
-    // used - the sign-in button shows, not the stale user's avatar.
+    // used - the sign-in button shows, not the stale user's avatar. No
+    // silent-refresh attempt follows (see renderAuthUI()'s own comment on
+    // why client.js never calls google.accounts.id.prompt() at all) -
+    // signing back in takes an explicit click on this same button.
     await expect(page.locator('#fakeGsiButton')).toBeVisible();
     await expect(page.locator('#authAvatarBtn')).toHaveCount(0);
-
-    // It doesn't JUST give up, though - attemptSilentTokenRefresh() fires
-    // right there in the same renderAuthUI() pass, on the chance the
-    // browser's own Google session is still good even though our locally
-    // cached token has lapsed (see the recovery test right below, which
-    // carries this same attempt through to a successful outcome).
-    expect(await page.evaluate(() => window.__gisPromptCalls.length)).toBeGreaterThan(0);
-  });
-
-  test('an expired stored token recovers automatically, with no click, if the browser still has a live Google session', async ({ page }) => {
-    await stubGoogleIdentityServices(page);
-    await mockCloudRunConfig(page);
-    await gotoApp(page);
-
-    const expiredToken = fakeIdToken('stale-user@example.com', -3600);
-    await page.evaluate((token) => {
-      window.localStorage.setItem('datalectGoogleIdToken', token);
-    }, expiredToken);
-
-    await page.reload();
-
-    // Same starting point as the test above: the stale token is discarded
-    // and the sign-in button shows first...
-    await expect(page.locator('#fakeGsiButton')).toBeVisible();
-    await expect.poll(() => page.evaluate(() => window.__gisPromptCalls.length)).toBeGreaterThan(0);
-
-    // ...but Google's own session is still live and silently hands back a
-    // fresh credential for the same user - exactly what a real successful
-    // One Tap silent re-auth looks like from client.js's point of view
-    // (handleGoogleCredentialResponse doesn't distinguish "the scheduled
-    // pre-expiry timer fired" from "the isExpired fallback attempt did" -
-    // both just call google.accounts.id.prompt() and react to whatever
-    // credential comes back). The user never clicked anything.
-    await page.evaluate(
-      (token) => window.__gisCallback({ credential: token }),
-      fakeIdToken('stale-user@example.com')
-    );
-
-    await expect(page.locator('#authAvatarBtn')).toBeVisible();
-    await expect(page.locator('#authAvatarBtn')).toHaveAttribute('title', 'stale-user@example.com');
-    await expect(page.locator('#fakeGsiButton')).toHaveCount(0);
-  });
-});
-
-test.describe('silent token refresh ahead of expiry (Cloud Run)', () => {
-  // Unlike every test above (which drives client.js's sign-in/expiry
-  // handling directly via window.__gisCallback), this exercises the actual
-  // TIMING client.js schedules on its own: scheduleTokenRefresh() sets a
-  // real setTimeout ~5 minutes before the token's real exp - see
-  // TOKEN_REFRESH_BUFFER_MS in client.js. Playwright's virtual clock lets
-  // this test fast-forward through that ~55-minute wait deterministically
-  // instead of actually waiting on it.
-  test('a background refresh shortly before expiry swaps in a new token without disturbing the current prompt/SQL/results', async ({ page }) => {
-    await stubGoogleIdentityServices(page);
-    await mockCloudRunConfig(page);
-    await mockTranslate(page, { sql: 'SELECT id, name FROM users;' });
-    await mockExecute(page, {
-      results: [{ columns: ['id', 'name'], rows: [{ id: 1, name: 'Ada' }], rowCount: 1 }],
-    });
-
-    // Installed before navigation so client.js's own Date.now()/setTimeout
-    // calls run against the virtual clock from the very start.
-    await page.clock.install();
-    await gotoApp(page);
-
-    await page.evaluate(
-      (token) => window.__gisCallback({ credential: token }),
-      fakeIdToken('refresh-user@example.com')
-    );
-    await expect(page.locator('#authAvatarBtn')).toBeVisible();
-
-    await populatePromptSqlAndResults(page);
-
-    // 56 minutes in: past the scheduled refresh point (60 - 5 = 55 minutes)
-    // but comfortably before the token's own 60-minute expiry.
-    await page.clock.fastForward(56 * 60 * 1000);
-
-    await expect.poll(() => page.evaluate(() => window.__gisPromptCalls.length)).toBeGreaterThan(0);
-
-    // The browser's own Google session is still live, so this silent
-    // attempt succeeds - same email, fresh token.
-    await page.evaluate(
-      (token) => window.__gisCallback({ credential: token }),
-      fakeIdToken('refresh-user@example.com')
-    );
-
-    // Still signed in as the same user - and, crucially, unlike a REAL new
-    // sign-in (see "logging in via Google Sign-In clears..." above), the
-    // turn already on screen was left completely alone: this was
-    // recognized as a background refresh of the SAME session, not a new
-    // user taking over.
-    await expect(page.locator('#authAvatarBtn')).toBeVisible();
-    await expect(page.locator('#authAvatarBtn')).toHaveAttribute('title', 'refresh-user@example.com');
-    expect(await currentSql(page)).toContain('SELECT');
-    await expect(page.locator('#resultsHeader th')).toHaveText(['id', 'name']);
-  });
-
-  test('a failed background refresh attempt leaves the current session alone until the token actually expires', async ({ page }) => {
-    await stubGoogleIdentityServices(page);
-    await mockCloudRunConfig(page);
-
-    await page.clock.install();
-    await gotoApp(page);
-
-    await page.evaluate(
-      (token) => window.__gisCallback({ credential: token }),
-      fakeIdToken('refresh-user@example.com')
-    );
-    await expect(page.locator('#authAvatarBtn')).toBeVisible();
-
-    await page.clock.fastForward(56 * 60 * 1000);
-    await expect.poll(() => page.evaluate(() => window.__gisPromptCalls.length)).toBeGreaterThan(0);
-
-    // This time the attempt can't complete silently (e.g. third-party
-    // storage blocked, or the user dismissed a One Tap prompt recently) -
-    // report it the way FedCM's own moment notification would.
-    await page.evaluate(() => {
-      const listener = window.__gisPromptCalls[window.__gisPromptCalls.length - 1];
-      if (listener) listener({ isSkippedMoment: () => true, isDismissedMoment: () => false });
-    });
-
-    // Nothing changes yet - the user is still shown as signed in with
-    // their existing (not-yet-actually-expired) token, exactly as before
-    // this feature existed. Only once the real token later expires would
-    // renderAuthUI()'s own isExpired check drop them to signed-out.
-    await expect(page.locator('#authAvatarBtn')).toBeVisible();
   });
 });
 

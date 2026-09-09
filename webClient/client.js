@@ -1201,103 +1201,14 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   let lastRenderedAuthState = null;
-
-  // --- Silent token refresh ---------------------------------------------
-  //
-  // A Google ID token is short-lived (about an hour - exp minus iat, a
-  // fixed value set by Google, not something this app controls). Until
-  // now the ONLY thing that ever happened with that expiry was
-  // renderAuthUI()'s isExpired check below, which just discards the stale
-  // token and drops back to signed-out the next time it happens to run -
-  // meaning anyone who left the app open (or even just backgrounded the
-  // tab) for longer than that got silently logged out, even though their
-  // underlying Google session was still perfectly fine.
-  //
-  // This proactively asks Google for a fresh credential shortly BEFORE the
-  // current one expires (TOKEN_REFRESH_BUFFER_MS), via
-  // google.accounts.id.prompt() - the exact same "One Tap" mechanism the
-  // rendered sign-in button itself relies on, just invoked programmatically
-  // instead of by a click. When the browser still has a live Google
-  // session (the common case - nothing about using Datalect, or even
-  // logging out of it, signs the user out of Google itself), this
-  // succeeds silently with no visible UI at all, and
-  // handleGoogleCredentialResponse below swaps in the new token without
-  // disturbing anything on screen. When it can't succeed silently
-  // (third-party storage/cookies blocked, the browser's own Google session
-  // is gone, etc.) nothing happens here and the existing isExpired handling
-  // takes over exactly as before once the old token actually lapses - this
-  // is pure upside, never a new failure mode.
-  const TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000; // ask for a new one 5 min before the old one expires
-  const SILENT_REFRESH_MIN_INTERVAL_MS = 60 * 1000; // never call prompt() more than once a minute
-  let tokenRefreshTimerId = null;
-  let pendingSilentRefresh = false;
-  let lastSilentRefreshAttemptAt = 0;
   let googleIdentityInitializedClientId = null;
-
-  function clearScheduledTokenRefresh() {
-    if (tokenRefreshTimerId) {
-      clearTimeout(tokenRefreshTimerId);
-      tokenRefreshTimerId = null;
-    }
-  }
-
-  function attemptSilentTokenRefresh() {
-    // The `typeof ... === 'function'` check (rather than just truthiness)
-    // matters for more than paranoia: the real GSI SDK always has prompt(),
-    // but a stubbed-out google.accounts.id (see e.g. tests/e2e/
-    // auth-clears-state.spec.js's stubGoogleIdentityServices(), which only
-    // defines initialize()/renderButton()/disableAutoSelect()) legitimately
-    // won't - and this function gets reached from a plain expired-token
-    // page load, not just from a scheduled refresh, so it has to degrade
-    // to a no-op rather than throwing when that's the case.
-    if (!window.google || !google.accounts || !google.accounts.id
-      || typeof google.accounts.id.prompt !== 'function' || !currentGoogleClientId) return;
-    // Already in flight, or attempted too recently (e.g. renderAuthUI
-    // firing again and again while a stalled/failing attempt sits inside
-    // the refresh-buffer window) - skip rather than piling another
-    // prompt() call on top of it.
-    if (pendingSilentRefresh || (Date.now() - lastSilentRefreshAttemptAt) < SILENT_REFRESH_MIN_INTERVAL_MS) {
-      return;
-    }
-    pendingSilentRefresh = true;
-    lastSilentRefreshAttemptAt = Date.now();
-    google.accounts.id.prompt((notification) => {
-      // isDisplayMoment()/isDisplayed()/isNotDisplayed() are deprecated
-      // under Google's FedCM-based flow (what most browsers use now) and
-      // shouldn't be relied on any more - isSkippedMoment()/
-      // isDismissedMoment() are what's still meaningful there. Either one
-      // means no fresh credential is coming out of this attempt, so stop
-      // treating one as in flight.
-      if (notification?.isSkippedMoment?.() || notification?.isDismissedMoment?.()) {
-        pendingSilentRefresh = false;
-      }
-      // If a credential DOES arrive, handleGoogleCredentialResponse below
-      // is what clears pendingSilentRefresh - nothing else to do here then.
-    });
-  }
-
-  function scheduleTokenRefresh(token) {
-    clearScheduledTokenRefresh();
-    const payload = token ? parseJwt(token) : null;
-    if (!payload || !payload.exp) return;
-    const msUntilRefresh = payload.exp * 1000 - Date.now() - TOKEN_REFRESH_BUFFER_MS;
-    // Already inside (or even past) the buffer window - fire almost right
-    // away rather than scheduling a zero/negative delay every time this
-    // gets called again on the next re-render.
-    tokenRefreshTimerId = setTimeout(attemptSilentTokenRefresh, Math.max(msUntilRefresh, 1000));
-  }
 
   function ensureGoogleIdentityInitialized(clientId) {
     if (!clientId || !window.google || !google.accounts || !google.accounts.id) return;
     // initialize() REPLACES (doesn't merge with) any prior configuration -
     // per Google's own JS reference, it "should be called only once" - so
     // this only actually calls it the first time a given clientId is seen,
-    // rather than on every renderAuthUI() render. This also has to run
-    // regardless of which branch below is taken: a page reload while
-    // already signed in (token restored from localStorage) takes the
-    // "signed in" branch and never used to call initialize() at all this
-    // session, which meant prompt()-based refresh had no config to work
-    // from - calling this unconditionally up top fixes that gap.
+    // rather than on every renderAuthUI() render.
     if (googleIdentityInitializedClientId === clientId) return;
     google.accounts.id.initialize({ client_id: clientId, callback: handleGoogleCredentialResponse });
     googleIdentityInitializedClientId = clientId;
@@ -1305,23 +1216,8 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   function handleGoogleCredentialResponse(response) {
     if (!response.credential) return;
-    const wasSilentRefresh = pendingSilentRefresh;
-    pendingSilentRefresh = false;
     googleIdToken = response.credential;
     persistGoogleIdToken(googleIdToken);
-    scheduleTokenRefresh(googleIdToken);
-    if (wasSilentRefresh) {
-      // A background/recovery refresh of the SAME session's token - unlike
-      // a real new sign-in below, this never clears in-progress work or
-      // re-fetches config. It still has to re-render, though: this covers
-      // BOTH "already showing the avatar, just topped up ahead of expiry"
-      // (renderAuthUI()'s own authStateKey dedupe makes that a no-op, since
-      // nothing visibly changed) AND "was showing the sign-in button
-      // because the old token had already lapsed, and this recovered it
-      // silently" - which DOES need the avatar to actually appear.
-      renderAuthUI(currentGoogleClientId);
-      return;
-    }
     // GA4's own recommended "login" event shape (see
     // https://developers.google.com/analytics/devguides/collection/ga4/reference/events)
     // has exactly one optional parameter, "method" - always
@@ -1347,8 +1243,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     trackEvent('logout', {});
     googleIdToken = null;
     clearPersistedGoogleIdToken();
-    clearScheduledTokenRefresh();
-    pendingSilentRefresh = false;
     if (window.google && google.accounts && google.accounts.id) {
       google.accounts.id.disableAutoSelect();
     }
@@ -1363,9 +1257,6 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   function renderAuthUI(clientId) {
     if (clientId) currentGoogleClientId = clientId;
-    // Unconditional (not just in the "not signed in" branch below) - see
-    // ensureGoogleIdentityInitialized's own docstring for why a signed-in
-    // page reload must still reach this.
     ensureGoogleIdentityInitialized(currentGoogleClientId);
     const container = document.getElementById('g_id_signin');
     if (!container) return;
@@ -1373,26 +1264,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     const existingToken = googleIdToken;
     const payload = existingToken ? parseJwt(existingToken) : null;
     const isExpired = payload && payload.exp && (payload.exp * 1000 < Date.now());
-
-    // Keep the scheduled refresh in sync with reality on every call (cheap -
-    // just a clearTimeout+setTimeout pair), independent of the
-    // authStateKey dedupe below which only guards the DOM-rendering work.
-    if (existingToken && payload && !isExpired) {
-      scheduleTokenRefresh(existingToken);
-    } else {
-      clearScheduledTokenRefresh();
-      if (isExpired) {
-        // Backgrounded/inactive long enough that the token expired outright
-        // before its scheduled early refresh could fire (background tabs'
-        // timers get throttled, sometimes to the point of never firing over
-        // several hours - exactly the scenario this feature exists for) -
-        // try once, right now, before conceding to the sign-in screen
-        // below. If the browser's own Google session is still valid this
-        // often recovers silently; if not, nothing else happens here and
-        // sign-in renders as usual.
-        attemptSilentTokenRefresh();
-      }
-    }
 
     // renderAuthUI() runs on every fetchBackendConfig() call - including
     // once per prompt/execute, since translatePrompt() re-syncs config
@@ -1477,8 +1348,8 @@ document.addEventListener('DOMContentLoaded', async () => {
       const targetClientId = clientId || currentGoogleClientId;
       if (window.google && google.accounts && targetClientId) {
         // initialize() itself already happened up top via
-        // ensureGoogleIdentityInitialized(), shared with the silent-refresh
-        // path above - only the visible button is rendered here.
+        // ensureGoogleIdentityInitialized() - only the visible button is
+        // rendered here.
         google.accounts.id.renderButton(container, {
           theme: 'filled_black',
           size: 'medium',
@@ -1488,14 +1359,17 @@ document.addEventListener('DOMContentLoaded', async () => {
           logo_alignment: 'left'
         });
 
-        // Deliberately no google.accounts.id.prompt() call HERE - on Cloud
-        // Run the app supports anonymous use, so we don't want the One Tap
-        // sign-in prompt popping up unasked on every load for a visitor who
-        // was never signed in to begin with. The rendered button above is
-        // always available for anyone who wants to log in. (The one place
-        // this file DOES call prompt() is attemptSilentTokenRefresh() above
-        // - and only for someone who was already signed in and is nearing
-        // or past their token's expiry, never for a fresh anonymous visitor.)
+        // Deliberately no google.accounts.id.prompt() call HERE (or
+        // anywhere else in this file) - on Cloud Run the app supports
+        // anonymous use, so we don't want the One Tap sign-in prompt
+        // popping up unasked on every load for a visitor who was never
+        // signed in to begin with. The rendered button above is always
+        // available for anyone who wants to log in. A signed-in user's
+        // token simply lapses after about an hour of inactivity like any
+        // other short-lived session token - renderAuthUI()'s isExpired
+        // check above just reverts to showing this same button, no popup
+        // involved; clicking it (or the browser's own live Google session
+        // cooperating with a fresh click) is what signs them back in.
       }
     }
   }
@@ -1503,19 +1377,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   function initGoogleAuth(clientId) {
     renderAuthUI(clientId);
   }
-
-  // Background tabs get their timers throttled - sometimes to the point of
-  // never firing at all over several hours, which is exactly the scenario
-  // scheduleTokenRefresh()/attemptSilentTokenRefresh() above exist for. On
-  // regaining visibility, just re-run renderAuthUI(): it recomputes
-  // isExpired/signedIn against the real current time, reschedules (or
-  // immediately re-attempts) the refresh against however much time actually
-  // elapsed while hidden, and updates the UI if anything changed.
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') {
-      renderAuthUI(currentGoogleClientId);
-    }
-  });
 
   // ===========================================================================
   // MORE MENU (triple-dot mobile header menu)
@@ -3277,26 +3138,20 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // Two visual columns, purely a layout grouping (no change to what's
     // selectable or how - db_connection_option/preset:<id> works exactly
-    // the same either way): the 4 "simple credential" dialects that speak
-    // a single connection-string/user+password (Postgres, MySQL, Oracle,
-    // SQL Server) on the left, the other 5 structured/cloud dialects
-    // (BigQuery, Snowflake, Databricks, Redshift, Google Sheets) on the
-    // right. LEFT_COLUMN_TYPES is exhaustive over every dialect this app
-    // supports today (see this file's isComplete*/config_routes.py's
-    // module docstring for the full list) - a future new dialect type not
-    // in either set falls into the right column by default, below.
-    // MongoDB Atlas SQL added to the left ("simple credential") column
-    // too - like Postgres/MySQL/Oracle/SQL Server, it's a single-server
-    // connection a user types in directly, not a structured/cloud
-    // dialect - see backends/mongodb_sql.py. (It does have its own
-    // database/user/password fields like Oracle/SQL Server do, just no
-    // separate identity/display-url concept.)
-    const LEFT_COLUMN_TYPES = new Set(['postgres', 'mysql', 'oracle', 'mssql', 'MongoDB']);
-    const leftPresets = [];
-    const rightPresets = [];
-    CONFIGURED_DBS.forEach((db) => {
-      (LEFT_COLUMN_TYPES.has(db.type) ? leftPresets : rightPresets).push(db);
-    });
+    // the same either way) - split straight down the middle by COUNT, not
+    // by dialect type: an earlier version grouped the 4 "simple
+    // credential" dialects (Postgres/MySQL/Oracle/SQL Server/MongoDB) on
+    // the left and the structured/cloud ones (BigQuery/Snowflake/
+    // Databricks/Redshift/Sheets) on the right, but that left a whole
+    // column empty whenever an admin's presets happened to cluster on one
+    // side (e.g. two Postgres presets and nothing else - exactly what
+    // "balanced, half on the left and half on the right" was reported
+    // against). The first (ceil half) of CONFIGURED_DBS's own order goes
+    // left, the rest go right, so an odd count leans left by one rather
+    // than leaving a column short by more than that.
+    const leftCount = Math.ceil(CONFIGURED_DBS.length / 2);
+    const leftPresets = CONFIGURED_DBS.slice(0, leftCount);
+    const rightPresets = CONFIGURED_DBS.slice(leftCount);
 
     const renderPresetOption = (db) => {
       // Encodes the preset's stable id (never a secret, unlike the real

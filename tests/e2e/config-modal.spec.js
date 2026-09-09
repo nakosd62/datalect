@@ -128,24 +128,20 @@ test.describe('config modal', () => {
     await expect(radioGroup.locator('.preset-columns .radio-option').first()).toBeVisible();
   });
 
-  test('preset playgrounds split into two columns by dialect', async ({ page }) => {
-    // Left column: the 5 "simple credential" dialects (single connection
-    // string or plain user/password) - Postgres, MySQL, Oracle, SQL
-    // Server, MongoDB Atlas SQL. Right column: the other 5 structured/cloud
-    // dialects - BigQuery, Snowflake, Databricks, Redshift, Google Sheets.
-    // Mirrors LEFT_COLUMN_TYPES in renderDbRadioButtons() (client.js).
-    const configuredDatabases = [
-      { id: 'p-pg', name: 'PG Playground', type: 'postgres' },
-      { id: 'p-my', name: 'MySQL Playground', type: 'mysql' },
-      { id: 'p-ora', name: 'Oracle Playground', type: 'oracle' },
-      { id: 'p-ms', name: 'SQL Server Playground', type: 'mssql' },
-      { id: 'p-mo', name: 'Mongo Playground', type: 'MongoDB' },
-      { id: 'p-bq', name: 'BigQuery Playground', type: 'bigquery' },
-      { id: 'p-sf', name: 'Snowflake Playground', type: 'snowflake' },
-      { id: 'p-db', name: 'Databricks Playground', type: 'databricks' },
-      { id: 'p-rs', name: 'Redshift Playground', type: 'redshift' },
-      { id: 'p-sh', name: 'Sheets Playground', type: 'sheets' },
-    ];
+  test('preset playgrounds split into two columns balanced by count, not by dialect', async ({ page }) => {
+    // An earlier version grouped presets by dialect (simple-credential
+    // types on the left, structured/cloud types on the right) - dropped
+    // because that left a whole column empty whenever an admin's presets
+    // happened to cluster on one side (e.g. two Postgres presets and
+    // nothing else). Now it's a straight count-based split down the
+    // middle of CONFIGURED_DBS's own order (see renderDbRadioButtons() in
+    // client.js) - an odd total leans left by one rather than the right
+    // column coming up short by more than that. All 10 rows here are the
+    // same dialect (postgres) specifically to prove the split no longer
+    // depends on type at all.
+    const configuredDatabases = Array.from({ length: 10 }, (_, i) => ({
+      id: `p-${i}`, name: `Playground ${i}`, type: 'postgres',
+    }));
     await page.route('**/api/config', async (route) => {
       if (route.request().method() !== 'GET') return route.fallback();
       await route.fulfill({
@@ -158,14 +154,14 @@ test.describe('config modal', () => {
           authenticated: false,
           is_cloud_run: false,
           configured_databases: configuredDatabases,
-          active_preset_id: 'p-pg',
+          active_preset_id: 'p-0',
           default_database_url: '',
           active_database_url: '',
           active_database_type: 'postgres',
           active_is_custom: false,
           active_custom_connection_key: '',
           active_uses_custom_credentials: false,
-          database_name: 'PG Playground',
+          database_name: 'Playground 0',
           custom_database_name: '',
           custom_database_url: '',
           custom_databases: [],
@@ -180,13 +176,97 @@ test.describe('config modal', () => {
     const columns = page.locator('.preset-column');
     await expect(columns).toHaveCount(2);
     await expect(columns.nth(0).locator('.radio-label')).toHaveText([
-      'PG Playground', 'MySQL Playground', 'Oracle Playground', 'SQL Server Playground',
-      'Mongo Playground',
+      'Playground 0', 'Playground 1', 'Playground 2', 'Playground 3', 'Playground 4',
     ]);
     await expect(columns.nth(1).locator('.radio-label')).toHaveText([
-      'BigQuery Playground', 'Snowflake Playground', 'Databricks Playground',
-      'Redshift Playground', 'Sheets Playground',
+      'Playground 5', 'Playground 6', 'Playground 7', 'Playground 8', 'Playground 9',
     ]);
+  });
+
+  test('an odd number of presets leans the extra one into the left column', async ({ page }) => {
+    const configuredDatabases = [
+      { id: 'p-0', name: 'One', type: 'postgres' },
+      { id: 'p-1', name: 'Two', type: 'mysql' },
+      { id: 'p-2', name: 'Three', type: 'bigquery' },
+    ];
+    await page.route('**/api/config', async (route) => {
+      if (route.request().method() !== 'GET') return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          auth_enabled: false,
+          session_id: 'e2e-session',
+          user_id: 'global',
+          authenticated: false,
+          is_cloud_run: false,
+          configured_databases: configuredDatabases,
+          active_preset_id: 'p-0',
+          default_database_url: '',
+          active_database_url: '',
+          active_database_type: 'postgres',
+          active_is_custom: false,
+          active_custom_connection_key: '',
+          active_uses_custom_credentials: false,
+          database_name: 'One',
+          custom_database_name: '',
+          custom_database_url: '',
+          custom_databases: [],
+          auto_sql_execute: false,
+        }),
+      });
+    });
+
+    await gotoApp(page);
+    await openConfigModal(page);
+
+    const columns = page.locator('.preset-column');
+    await expect(columns.nth(0).locator('.radio-label')).toHaveText(['One', 'Two']);
+    await expect(columns.nth(1).locator('.radio-label')).toHaveText(['Three']);
+  });
+
+  test('two presets of the same dialect split one-per-column instead of both landing on one side', async ({ page }) => {
+    // The exact real-world shape this fix targets: two Postgres presets
+    // used to both land in the same (left) column under the old
+    // dialect-based grouping, leaving the right column empty.
+    const configuredDatabases = [
+      { id: 'p-a', name: 'Sales Postgres', type: 'postgres' },
+      { id: 'p-b', name: 'Marketing Postgres', type: 'postgres' },
+    ];
+    await page.route('**/api/config', async (route) => {
+      if (route.request().method() !== 'GET') return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          auth_enabled: false,
+          session_id: 'e2e-session',
+          user_id: 'global',
+          authenticated: false,
+          is_cloud_run: false,
+          configured_databases: configuredDatabases,
+          active_preset_id: 'p-a',
+          default_database_url: '',
+          active_database_url: '',
+          active_database_type: 'postgres',
+          active_is_custom: false,
+          active_custom_connection_key: '',
+          active_uses_custom_credentials: false,
+          database_name: 'Sales Postgres',
+          custom_database_name: '',
+          custom_database_url: '',
+          custom_databases: [],
+          auto_sql_execute: false,
+        }),
+      });
+    });
+
+    await gotoApp(page);
+    await openConfigModal(page);
+
+    const columns = page.locator('.preset-column');
+    await expect(columns.nth(0).locator('.radio-label')).toHaveText(['Sales Postgres']);
+    await expect(columns.nth(1).locator('.radio-label')).toHaveText(['Marketing Postgres']);
   });
 
   test('custom connections heading has a security note that opens the Help modal', async ({ page }) => {
