@@ -300,7 +300,7 @@ def test_report_issue_rejects_unknown_category_lists_all_valid_ones(app_factory,
 
     assert resp.status_code == 400
     error = resp.get_json()["error"]
-    for category in ("error", "wrong_result", "feedback", "wrong_sql", "summary_thumbs_up", "summary_thumbs_down"):
+    for category in ("error", "wrong_result", "feedback", "wrong_sql", "correct_sql", "summary_thumbs_up", "summary_thumbs_down"):
         assert f"'{category}'" in error
 
 
@@ -340,6 +340,45 @@ def test_report_issue_wrong_sql_category_sends_expected_email(app_factory, smtp_
     assert "SELECT * FROM ordrs;" in body
     assert "--- User's additional details ---" in body
     assert "I think the model misspelled the table name." in body
+
+
+def test_report_issue_correct_sql_category_sends_expected_email(app_factory, smtp_harness):
+    # The positive counterpart to 'wrong_sql' above - same request shape
+    # (no separate prompt/sql fields, bundled into `content` instead), just
+    # a different category/label and, from a real client, different copy
+    # shown to the user beforehand (see REPORT_CATEGORY_CONFIG.correct_sql
+    # in webClient/client.js). Mirrors the 'wrong_sql' test above closely on
+    # purpose, as a regression guard that the two stay in lockstep.
+    env = app_factory(env=ISSUE_REPORT_ENV)
+    instances = smtp_harness()
+
+    resp = env.client.post("/api/report-issue", json={
+        "category": "correct_sql",
+        "database_name": "E-Commerce Store",
+        "provider": "openai",
+        "model": "gpt-5.3-codex",
+        "content": "NL prompt:\nHow many orders were placed last week?\n\nSQL:\nSELECT COUNT(*) FROM orders WHERE placed_at >= now() - interval '7 days';",
+        "details": "This got the date filter exactly right.",
+    })
+
+    assert resp.status_code == 200
+    assert resp.get_json()["success"] is True
+
+    msg = instances[0].sent_messages[0]
+    assert "Accurate SQL" in msg["Subject"]
+    assert "E-Commerce Store" in msg["Subject"]
+
+    body = msg.get_content()
+    assert "Category: Accurate SQL" in body
+    assert "openai / gpt-5.3-codex" in body
+    # No separate prompt/sql sections - only the bundled, user-edited content.
+    assert "User's question" not in body
+    assert "Generated SQL" not in body
+    assert "--- Prompt & SQL (as reviewed/edited by the user) ---" in body
+    assert "How many orders were placed last week?" in body
+    assert "SELECT COUNT(*) FROM orders" in body
+    assert "--- User's additional details ---" in body
+    assert "This got the date filter exactly right." in body
 
 
 def test_report_issue_sets_reply_to_for_authenticated_email_identity(app_factory, smtp_harness):

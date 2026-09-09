@@ -979,8 +979,54 @@ if _postgres_presets:
 # connection actually resolves to - see db.py's resolve_active_descriptor
 # and config_routes.py's handle_config, both of which fall back to this
 # id, not to a bare "nothing selected" null, whenever connection_id is
-# blank.
+# blank. May be overridden below by DATABASE_DEFAULT.
 DEFAULT_PRESET_ID = _postgres_presets[0]["id"] if _postgres_presets else None
+
+# DATABASE_DEFAULT overrides which preset a brand-new session (connection_id
+# == "", nothing ever explicitly selected) resolves to - set it to one of
+# CONFIGURED_DBS' own "id" values (see the DATABASE_PRESETS_FILE comment
+# above for what "id" is and where it comes from - explicit, or the
+# "{type}+{name}" fallback for a preset that never got one). Unlike the
+# plain "first Postgres preset" rule above, this can point at a preset of
+# ANY dialect - resolve_active_descriptor (db.py) consumes DEFAULT_DESCRIPTOR
+# below, a full descriptor dict, not the bare-URL-string DEFAULT_CONN, which
+# is what keeps that older fallback permanently Postgres-only (see its own
+# comment above) while this override isn't.
+#
+# Blank (the default) leaves everything above completely unchanged: the
+# first Postgres preset, or the hardcoded DEFAULT_CONN if none exists.
+# A value that doesn't match any configured preset's "id" is treated as a
+# misconfiguration - logged, then ignored (same "malformed config falls
+# back rather than crashes the app" posture as a bad DATABASE_PRESETS_FILE
+# entry above), not silently swapped for some other guess.
+DATABASE_DEFAULT = os.environ.get("DATABASE_DEFAULT", "").strip()
+
+_database_default_preset = None
+if DATABASE_DEFAULT:
+    _database_default_preset = next(
+        (db for db in CONFIGURED_DBS if db.get("id") == DATABASE_DEFAULT), None
+    )
+    if _database_default_preset is None:
+        logger.error(
+            "DATABASE_DEFAULT=%r does not match any configured preset's 'id' - "
+            "ignoring it (new sessions keep defaulting to %s). Configured "
+            "preset ids: %s",
+            DATABASE_DEFAULT,
+            f"'{DEFAULT_PRESET_ID}'" if DEFAULT_PRESET_ID else "the hardcoded fallback connection",
+            ", ".join(repr(db.get("id")) for db in CONFIGURED_DBS) or "(none)",
+        )
+
+if _database_default_preset is not None:
+    DEFAULT_PRESET_ID = _database_default_preset["id"]
+    DEFAULT_DESCRIPTOR = {k: v for k, v in _database_default_preset.items() if k not in ("id", "name")}
+else:
+    # Unchanged from today's behavior either way: a real Postgres preset's
+    # descriptor if one exists, else the hardcoded DEFAULT_CONN wrapped into
+    # the same descriptor shape db.py's _to_descriptor() would have built
+    # for it anyway - see db.py's own comment on DEFAULT_DESCRIPTOR for why
+    # every caller there was moved onto this instead of DEFAULT_CONN
+    # directly.
+    DEFAULT_DESCRIPTOR = {"type": "postgres", "url": DEFAULT_CONN}
 
 # Multi-database question-answering (see translate_routes.py's module
 # docstring): the ONE cap on how many database connections are involved in

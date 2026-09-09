@@ -275,6 +275,7 @@ UI existed.
 | Variable | Default | Purpose |
 |---|---|---|
 | `DATABASE_PRESETS_FILE` | — (no presets) | Path to a JSON file listing the admin-configured preset connections shown in the UI. Supports Postgres, MySQL, and BigQuery presets — see the shape below. If unset, the app falls back to a single synthetic "Default DB" Postgres preset pointing at `postgresql://postgres:password@host:23456/defaultdb?sslmode=verify-full`. |
+| `DATABASE_DEFAULT` | — (first Postgres preset, or the synthetic "Default DB" above) | The `id` of one of `DATABASE_PRESETS_FILE`'s own presets (any dialect, not just Postgres) to use as the connection for a brand-new visitor who hasn't picked one explicitly yet. Unset means "first Postgres preset in the file" as before. A value that doesn't match any configured preset's `id` is logged as an error and ignored. |
 | `DB_CONNECT_TIMEOUT_SECONDS` | `10` | Bounds how long establishing a new database connection may take, so a wrong/unreachable host fails fast instead of hanging indefinitely. Covers every dialect except Databricks (no connect-only timeout knob in its driver) and BigQuery (doesn't dial out synchronously). See [`backends/base.py`](./server/backends/base.py). |
 | `SQL_EXECUTE_TIMEOUT_SECONDS` | `30` | Bounds how long running a query may take once the connection is already open — the execute-time counterpart to `DB_CONNECT_TIMEOUT_SECONDS` above. Applies to `/api/execute` and the `/api/ping` liveness check. Set to `0` to disable. See [`execute_routes.py`](./server/execute_routes.py). |
 
@@ -307,7 +308,9 @@ array of preset objects, one per preset; every object needs `type` and
 ```
 
 The first Postgres preset in the file is the default connection for new
-sessions. A MySQL preset is just a connection-string URL, the same as
+sessions, unless `DATABASE_DEFAULT` (see the table above) names a different
+preset's `id` explicitly — which, unlike this implicit rule, can point at a
+preset of any dialect. A MySQL preset is just a connection-string URL, the same as
 Postgres — no dialect-specific fields, ambient identity, or always-explicit
 credential to worry about. BigQuery presets authenticate as the app's own
 ambient identity

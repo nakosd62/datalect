@@ -397,8 +397,10 @@ class StateStore(ABC):
     (connection_id/is_custom, see get_session's docstring), never a
     connection's actual details, so there's nothing here that would need a
     fallback URL to seed a blank row with. db.py's resolve_active_descriptor
-    is what applies DEFAULT_CONN (imported directly from app_config.py) when
-    a session's connection_id is blank."""
+    is what applies DEFAULT_DESCRIPTOR (imported directly from
+    app_config.py - normally derived from DEFAULT_CONN, or overridden via
+    the DATABASE_DEFAULT env var, see that module's own comment) when a
+    session's connection_id is blank."""
 
     @abstractmethod
     def init(self):

@@ -32,6 +32,14 @@ POST /api/report-issue - lets a user flag one of three things:
     whatever the user settled on, not necessarily the prompt/SQL verbatim.
     `prompt`/`sql` are absent from the request body the same way they are
     for "feedback" - the edited text carries both.
+  - a "correct_sql" report: the positive counterpart to "wrong_sql" above -
+    the SQL currently sitting in the SQL box looks RIGHT to the user,
+    triggered from the thumbs-up button right beside that same thumbs-down
+    one. Identical request shape to "wrong_sql" in every respect (same
+    editable prompt+SQL `content`, no separate `prompt`/`sql` fields) - the
+    only difference anywhere in this app is the copy shown to the user
+    beforehand (see REPORT_CATEGORY_CONFIG.correct_sql) and the label this
+    module attaches to the resulting email.
   - "summary_thumbs_up"/"summary_thumbs_down" reports: a thumbs-up/thumbs-
     down reaction to the Summary tab (see webClient/client.js's
     summaryFeedbackButtonsHtml()) - shown on both "all databases" mode's own
@@ -87,6 +95,7 @@ _VALID_CATEGORIES = {
     'wrong_result': 'Wrong Result',
     'feedback': 'Feedback',
     'wrong_sql': 'Wrong SQL',
+    'correct_sql': 'Accurate SQL',
     'summary_thumbs_up': 'Summary Feedback (Helpful)',
     'summary_thumbs_down': 'Summary Feedback (Not Helpful)',
 }
@@ -98,6 +107,13 @@ _VALID_CATEGORIES = {
 # `category == 'feedback'` so all three get the same "no 'report' suffix in
 # the subject, 'details' gets its own plain header" treatment.
 _DETAILS_ONLY_CATEGORIES = {'feedback', 'summary_thumbs_up', 'summary_thumbs_down'}
+
+# Categories whose `content` is the user's own EDITED prompt+SQL text (see
+# this module's docstring on "wrong_sql"/"correct_sql") rather than a
+# verbatim, untouched capture "as shown to the user" - checked in
+# _build_email() below so both share the one section header that says so,
+# instead of the one that implies an unedited snapshot.
+_EDITABLE_CONTENT_CATEGORIES = {'wrong_sql', 'correct_sql'}
 
 # Hard cap on every free-text field this route embeds into an email body -
 # this endpoint is reachable by any authenticated/anonymous session (same
@@ -160,11 +176,11 @@ def _build_email(category, category_label, payload, reporter_identity):
 
     content = _truncate(payload.get('content'))
     if content:
-        if category == 'wrong_sql':
+        if category in _EDITABLE_CONTENT_CATEGORIES:
             # Not "as shown to the user" like the other categories' content
             # section - this one is the user's own edited text (see this
-            # module's docstring on 'wrong_sql'), so it gets a header that
-            # doesn't imply it's a verbatim, untouched capture.
+            # module's docstring on 'wrong_sql'/'correct_sql'), so it gets a
+            # header that doesn't imply it's a verbatim, untouched capture.
             lines.append("--- Prompt & SQL (as reviewed/edited by the user) ---")
         else:
             lines.append(f"--- {category_label} content (as shown to the user) ---")

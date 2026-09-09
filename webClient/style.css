@@ -1004,22 +1004,35 @@ textarea:focus {
   box-sizing: border-box;
 }
 
-/* Wraps the Execute button together with the "report wrong SQL" thumbs-
-   down button (#reportSqlBtn) so the two lay out as one unit in the SQL
+/* Wraps the Execute button together with the "report accurate SQL"
+   thumbs-up (#reportSqlGoodBtn) and "report wrong SQL" thumbs-down
+   (#reportSqlBtn) buttons so all three lay out as one unit in the SQL
    box's top-right corner - #runBtn.sql-overlay-btn used to carry its own
    `position: absolute; top/right` for this (see below) back when it was
-   the only overlay control; now this wrapper owns the positioning and
-   both buttons are just normal flex children inside it, Execute first so
-   the report button reads as sitting "to the right of Execute" per the
-   original design request. */
+   the only overlay control; now this wrapper owns the positioning.
+   Stacked in a COLUMN (Execute on top, both report buttons in their own
+   row underneath - see .sql-overlay-report-btns below) per explicit
+   request, rather than all three sitting in a single row beside Execute;
+   `align-items: flex-end` keeps both rows pinned to the same right edge
+   regardless of which row is wider. */
 .sql-overlay-actions {
   position: absolute;
   top: 6px;
   right: 6px;
   z-index: 2;
   display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.3rem;
+}
+
+/* The thumbs-up/thumbs-down pair's own row, directly under Execute (see
+   .sql-overlay-actions above) - a nested flex row so the two report
+   buttons sit side by side within that second row. */
+.sql-overlay-report-btns {
+  display: flex;
   align-items: center;
-  gap: 0.35rem;
+  gap: 0.15rem;
 }
 
 #runBtn.sql-overlay-btn {
@@ -1098,6 +1111,26 @@ textarea:focus {
   background: transparent;
 }
 
+/* "Report accurate SQL" thumbs-up icon - the positive counterpart to
+   .report-sql-btn above, same sizing/placement/hidden-until-enabled
+   treatment, but tinted --primary (this app's own green, matching
+   .summary-feedback-btn--up's own up/down green-vs-red convention) instead
+   of --danger red. Overrides only color, so every other .report-sql-btn
+   rule (padding, disabled state, etc.) still applies unmodified. */
+.report-sql-btn--positive {
+  color: var(--primary);
+}
+
+.report-sql-btn--positive:hover {
+  color: var(--primary);
+  background: rgba(var(--primary-rgb), 0.12);
+}
+
+.report-sql-btn--positive:disabled:hover {
+  color: var(--primary);
+  background: transparent;
+}
+
 .speech-bubble-wrapper.sql-bubble .CodeMirror {
   height: 100% !important; 
   width: 100% !important;
@@ -1105,11 +1138,14 @@ textarea:focus {
   border-radius: 0;
 }
 
-/* Widened from 120px to make room for the second overlay button
-   (#reportSqlBtn, next to Execute - see .sql-overlay-actions above) so
-   long lines of SQL don't run underneath either of them. */
+/* #reportSqlGoodBtn/#reportSqlBtn now stack in their own row UNDER
+   Execute (see .sql-overlay-actions/.sql-overlay-report-btns above)
+   rather than sitting beside it, so the widest row up here is Execute's
+   own - back down near the original single-button 120px, with a small
+   buffer, rather than the 160px this needed back when a report button
+   sat to Execute's right. */
 .sql-bubble .CodeMirror-lines {
-  padding-right: 160px;
+  padding-right: 130px;
 }
 
 .speech-bubble-wrapper.sql-bubble .CodeMirror.cm-readonly {

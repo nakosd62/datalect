@@ -653,6 +653,86 @@ def test_default_conn_falls_back_to_hardcoded_when_only_mysql_presets_exist(app_
     assert env.app_config.DEFAULT_CONN.startswith("postgresql://postgres:password@")
 
 
+# DATABASE_DEFAULT (see app_config.py's own comment above DEFAULT_DESCRIPTOR):
+# overrides which configured preset a brand-new session resolves to, by that
+# preset's own "id" - unlike the plain "first Postgres preset" rule the
+# tests above cover, this can point at ANY dialect.
+
+def test_database_default_picks_a_non_first_postgres_preset_by_id(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [
+        {"id": "pg-a", "type": "postgres", "name": "A", "url": "postgresql://u:p@h/a"},
+        {"id": "pg-b", "type": "postgres", "name": "B", "url": "postgresql://u:p@h/b"},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path, "DATABASE_DEFAULT": "pg-b"})
+    assert env.app_config.DEFAULT_PRESET_ID == "pg-b"
+    assert env.app_config.DEFAULT_DESCRIPTOR == {"type": "postgres", "url": "postgresql://u:p@h/b"}
+    # DEFAULT_CONN itself is untouched by DATABASE_DEFAULT - it keeps
+    # meaning "the first Postgres preset" exactly as it always has; only
+    # DEFAULT_DESCRIPTOR/DEFAULT_PRESET_ID (what a blank connection_id
+    # actually resolves to) are overridden.
+    assert env.app_config.DEFAULT_CONN == "postgresql://u:p@h/a"
+
+
+def test_database_default_can_point_at_a_non_postgres_preset(app_factory, tmp_path):
+    # The whole point of DEFAULT_DESCRIPTOR (a full descriptor dict) over
+    # the older DEFAULT_CONN (a bare Postgres URL string, permanently
+    # Postgres-only) - DATABASE_DEFAULT can select a BigQuery preset even
+    # though a Postgres one also exists and would otherwise win.
+    path = write_database_presets_file(tmp_path, [
+        {"id": "pg-a", "type": "postgres", "name": "A", "url": "postgresql://u:p@h/a"},
+        {"id": "bq-a", "type": "bigquery", "name": "BQ", "project_id": "p", "dataset": "d"},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path, "DATABASE_DEFAULT": "bq-a"})
+    assert env.app_config.DEFAULT_PRESET_ID == "bq-a"
+    assert env.app_config.DEFAULT_DESCRIPTOR["type"] == "bigquery"
+    assert env.app_config.DEFAULT_DESCRIPTOR["project_id"] == "p"
+    assert env.app_config.DEFAULT_DESCRIPTOR["dataset"] == "d"
+    # "id"/"name" are preset bookkeeping, not part of a connection
+    # descriptor - stripped the same way the plain preset-lookup path in
+    # db.py's resolve_active_descriptor already strips them.
+    assert "id" not in env.app_config.DEFAULT_DESCRIPTOR
+    assert "name" not in env.app_config.DEFAULT_DESCRIPTOR
+    # Still the first Postgres preset - DATABASE_DEFAULT overriding the
+    # EFFECTIVE default doesn't change what DEFAULT_CONN itself means.
+    assert env.app_config.DEFAULT_CONN == "postgresql://u:p@h/a"
+
+
+def test_database_default_with_unmatched_id_is_ignored_and_logged(app_factory, tmp_path, caplog):
+    path = write_database_presets_file(tmp_path, [
+        {"id": "pg-a", "type": "postgres", "name": "A", "url": "postgresql://u:p@h/a"},
+    ])
+    with caplog.at_level(logging.ERROR, logger="ydyl"):
+        env = app_factory(env={"DATABASE_PRESETS_FILE": path, "DATABASE_DEFAULT": "no-such-id"})
+    # Falls back to exactly today's pre-DATABASE_DEFAULT behavior - the
+    # first Postgres preset - rather than crashing or silently picking
+    # something else.
+    assert env.app_config.DEFAULT_PRESET_ID == "pg-a"
+    assert env.app_config.DEFAULT_DESCRIPTOR == {"type": "postgres", "url": "postgresql://u:p@h/a"}
+    assert any(
+        "DATABASE_DEFAULT" in rec.message and "no-such-id" in rec.message
+        for rec in caplog.records
+    )
+
+
+def test_database_default_blank_leaves_default_descriptor_matching_default_conn(app_factory, tmp_path):
+    # Regression guard: with DATABASE_DEFAULT unset (the default), the new
+    # DEFAULT_DESCRIPTOR must describe the exact same connection
+    # DEFAULT_CONN always has, just wrapped as a descriptor dict instead of
+    # a bare string - db.py's callers were switched from one to the other,
+    # so this is what guarantees that switch was behavior-preserving.
+    path = write_database_presets_file(tmp_path, [
+        {"id": "pg-a", "type": "postgres", "name": "A", "url": "postgresql://u:p@h/a"},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    assert env.app_config.DEFAULT_DESCRIPTOR == {"type": "postgres", "url": env.app_config.DEFAULT_CONN}
+
+
+def test_database_default_unset_falls_back_to_hardcoded_default_when_no_presets(app_factory):
+    env = app_factory(env={})
+    assert env.app_config.DEFAULT_DESCRIPTOR == {"type": "postgres", "url": env.app_config.DEFAULT_CONN}
+    assert env.app_config.DEFAULT_DESCRIPTOR["url"].startswith("postgresql://postgres:password@")
+
+
 def test_local_dev_uses_sqlite_state_store_by_default(app_factory):
     env = app_factory(env={})
     assert type(env.app_config.state_store).__name__ == "SqliteStateStore"

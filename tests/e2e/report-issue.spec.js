@@ -411,6 +411,122 @@ test.describe('report wrong SQL', () => {
   });
 });
 
+// "Report accurate SQL" (see report_routes.py's module docstring on the
+// 'correct_sql' category, and client.js's REPORT_CATEGORY_CONFIG.correct_sql):
+// the positive counterpart to "report wrong SQL" above - the thumbs-up
+// button (#reportSqlGoodBtn) right beside #reportSqlBtn, wired identically
+// in every respect (same editable preview, same disabled-state tracking)
+// except for the category it reports and the copy shown to the user. Kept
+// deliberately close in shape to the 'report wrong SQL' describe block
+// above as a regression guard that the two stay in lockstep.
+test.describe('report accurate SQL', () => {
+  async function setSqlBox(page, sql) {
+    await page.evaluate((value) => {
+      const wrapper = document.querySelector('.CodeMirror');
+      if (wrapper && wrapper.CodeMirror) {
+        wrapper.CodeMirror.setValue(value);
+      } else {
+        const textarea = document.getElementById('sqlQuery');
+        if (textarea) {
+          textarea.value = value;
+          textarea.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+      }
+    }, sql);
+  }
+
+  test('the thumbs-up button stays hidden when the feature is not configured', async ({ page }) => {
+    await mockIssueReportingEnabled(page, false);
+    await gotoApp(page);
+
+    await expect(page.locator('#reportSqlGoodBtn')).toBeHidden();
+  });
+
+  test('opens the report modal in correct_sql mode, preloaded with the prompt and SQL, editable, with positive copy', async ({ page }) => {
+    await mockIssueReportingEnabled(page, true);
+    await gotoApp(page);
+
+    await page.locator('#aiPrompt').fill('How many orders were placed last week?');
+    await setSqlBox(page, "SELECT COUNT(*) FROM orders WHERE placed_at >= now() - interval '7 days';");
+
+    await expect(page.locator('#reportSqlGoodBtn')).toBeVisible();
+    await page.locator('#reportSqlGoodBtn').click();
+
+    await expect(page.locator('#reportIssueModal')).toBeVisible();
+    await expect(page.locator('#reportIssueModalTitle')).toHaveText('Report Accurate SQL');
+    // Same editable-textarea treatment as 'wrong_sql' - the usual read-only
+    // preview stays out of the DOM's visible flow.
+    await expect(page.locator('#reportIssuePreview')).toBeHidden();
+    const editable = page.locator('#reportIssuePreviewEditable');
+    await expect(editable).toBeVisible();
+    await expect(editable).toHaveValue(/How many orders were placed last week\?/);
+    await expect(editable).toHaveValue(/SELECT COUNT\(\*\) FROM orders/);
+    await expect(page.locator('#reportIssueDetailsLabel')).toHaveText('Additional comments (optional)');
+    // The positive copy this whole feature is about - distinct from
+    // 'wrong_sql's "What's wrong with this SQL..." placeholder.
+    await expect(page.locator('#reportIssueDetails')).toHaveAttribute(
+      'placeholder', 'What did this SQL get right, or anything else worth noting?'
+    );
+    await expect(page.locator('#reportIssueSendBtn')).toHaveText('Report Accurate SQL');
+  });
+
+  test('the user can rewrite the preloaded text before sending, and it is sent under the correct_sql category', async ({ page }) => {
+    await mockIssueReportingEnabled(page, true);
+    const reportState = mockReportIssue(page);
+    await gotoApp(page);
+
+    await page.locator('#aiPrompt').fill('How many orders were placed last week?');
+    await setSqlBox(page, 'SELECT COUNT(*) FROM orders;');
+    await page.locator('#reportSqlGoodBtn').click();
+
+    await page.locator('#reportIssueDetails').fill('This is exactly the query I expected.');
+    await page.locator('#reportIssueSendBtn').click();
+
+    await expect(page.locator('#reportIssueModal')).toBeHidden();
+    expect(reportState.lastBody).toBeTruthy();
+    expect(reportState.lastBody.category).toBe('correct_sql');
+    expect(reportState.lastBody.content).toContain('SELECT COUNT(*) FROM orders;');
+    expect(reportState.lastBody.details).toBe('This is exactly the query I expected.');
+  });
+
+  test('the thumbs-up button is disabled while a query is in flight, alongside the thumbs-down one', async ({ page }) => {
+    await mockIssueReportingEnabled(page, true);
+    let resolveTranslate;
+    const translateStarted = new Promise((resolve) => { resolveTranslate = resolve; });
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      resolveTranslate();
+      await new Promise((r) => setTimeout(r, 1000));
+      await route.fulfill({
+        status: 200, contentType: 'application/x-ndjson',
+        body: JSON.stringify({ status: 'done', success: true, sql: 'SELECT 1;' }) + '\n',
+      });
+    });
+    await gotoApp(page);
+
+    await setSqlBox(page, 'SELECT 1;');
+
+    const reportSqlGoodBtn = page.locator('#reportSqlGoodBtn');
+    await expect(reportSqlGoodBtn).toBeVisible();
+    await expect(reportSqlGoodBtn).not.toBeDisabled();
+
+    await page.locator('#aiPrompt').fill('anything');
+    await page.locator('#aiPrompt').press('Enter');
+    await translateStarted;
+
+    await expect(reportSqlGoodBtn).toBeDisabled();
+    await expect(page.locator('#reportSqlBtn')).toBeDisabled();
+
+    await expect.poll(() => page.evaluate(() => {
+      const wrapper = document.querySelector('.CodeMirror');
+      const raw = wrapper && wrapper.CodeMirror ? wrapper.CodeMirror.getValue() : document.getElementById('sqlQuery').value;
+      return (raw || '').replace(/\s+/g, ' ').trim();
+    }), { timeout: 5000 }).toContain('SELECT 1');
+
+    await expect(reportSqlGoodBtn).not.toBeDisabled();
+  });
+});
+
 // Summary tab feedback (see server/report_routes.py's module docstring on
 // 'summary_thumbs_up'/'summary_thumbs_down', and client.js's
 // summaryFeedbackButtonsHtml()): a thumbs-up/thumbs-down pair rendered next

@@ -25,7 +25,7 @@ strings/credentials never end up in the translation-history table.
 
 import concurrent.futures
 
-from app_config import DEFAULT_CONN, CONFIGURED_DBS, state_store, logger
+from app_config import DEFAULT_DESCRIPTOR, CONFIGURED_DBS, state_store, logger
 from backends import get_backend
 from backends.base import extract_entry_names_from_schema_text
 import schema_cache
@@ -36,15 +36,21 @@ _SCHEMA_FETCH_FAILED = "No schema description available."
 def _to_descriptor(conn_str):
     """Normalizes a raw connection string (or an already-built descriptor)
     into a descriptor dict. Used for the explicit-override case - a caller
-    passing a bare string (e.g. a per-request database_url override, or
-    the module-level DEFAULT_CONN fallback) is always a plain Postgres URL,
-    so that's the only case handled here; this is the single place that
-    assumption lives. A caller that already has a richer descriptor (e.g.
-    a BigQuery {"type": "bigquery", ...} dict) can pass it straight through."""
+    passing a bare string (e.g. a per-request database_url override) is
+    always a plain Postgres URL, so that's the only case handled here; this
+    is the single place that assumption lives. A caller that already has a
+    richer descriptor (e.g. a BigQuery {"type": "bigquery", ...} dict, or
+    app_config.py's own module-level DEFAULT_DESCRIPTOR - see its callers
+    below) can pass it straight through - copied defensively (a fresh dict,
+    not the same reference) since DEFAULT_DESCRIPTOR in particular is a
+    single shared object handed to every blank-connection_id session; a
+    caller that ever mutated what it got back in place (none do today, but
+    nothing stops a future one) would otherwise corrupt the app-wide
+    default for every other session sharing it."""
     if conn_str is None:
         return None
     if isinstance(conn_str, dict):
-        return conn_str
+        return dict(conn_str)
     return {"type": "postgres", "url": conn_str}
 
 
@@ -70,18 +76,21 @@ def resolve_active_descriptor(session, user_id):
     connection_id == "" (nothing ever explicitly selected - a brand-new
     session) is NOT "missing" - that's the ordinary/expected state for a
     first-time visitor, so it silently resolves to the default connection
-    the same way, with missing=False."""
+    the same way, with missing=False. That default is DEFAULT_DESCRIPTOR
+    (app_config.py) - normally the first Postgres preset (or the hardcoded
+    DEFAULT_CONN fallback), but overridable to any configured preset via
+    the DATABASE_DEFAULT env var - see that module's own comment."""
     connection_id = session.get("connection_id") or ""
     is_custom = bool(session.get("is_custom"))
     if not connection_id:
-        return _to_descriptor(DEFAULT_CONN), False
+        return _to_descriptor(DEFAULT_DESCRIPTOR), False
     if is_custom:
         for db in state_store.get_db_connections(user_id, include_credentials=True):
             if db.get("connection_key") == connection_id:
                 descriptor = {"type": db.get("type") or "postgres", "url": db.get("url")}
                 descriptor.update(db.get("config") or {})
                 return descriptor, False
-        return _to_descriptor(DEFAULT_CONN), True
+        return _to_descriptor(DEFAULT_DESCRIPTOR), True
     for db in CONFIGURED_DBS:
         if db.get("id") == connection_id:
             # CONFIGURED_DBS entries already ARE full descriptors plus
@@ -91,7 +100,7 @@ def resolve_active_descriptor(session, user_id):
             # {"connection_key","name","type","url","config"} response
             # shape into a flat descriptor).
             return {k: v for k, v in db.items() if k not in ("id", "name")}, False
-    return _to_descriptor(DEFAULT_CONN), True
+    return _to_descriptor(DEFAULT_DESCRIPTOR), True
 
 
 def resolve_descriptor_by_reference(kind, ref_id, user_id):
@@ -171,7 +180,7 @@ def resolve_in_scope_descriptors(session, user_id):
     if not entries:
         return [{
             "kind": "preset", "id": "", "name": "Default connection",
-            "descriptor": _to_descriptor(DEFAULT_CONN),
+            "descriptor": _to_descriptor(DEFAULT_DESCRIPTOR),
         }]
     return entries
 
@@ -213,7 +222,7 @@ def _resolve_all_configured_descriptors(user_id):
     if not entries:
         return [{
             "kind": "preset", "id": "", "name": "Default connection",
-            "descriptor": _to_descriptor(DEFAULT_CONN),
+            "descriptor": _to_descriptor(DEFAULT_DESCRIPTOR),
         }]
     return entries
 
@@ -279,7 +288,7 @@ def resolve_conn_str(conn_str=None, user_id=None):
     if user_id:
         descriptor, _missing = resolve_active_descriptor(state_store.get_session(user_id), user_id)
         return descriptor
-    return _to_descriptor(DEFAULT_CONN)
+    return _to_descriptor(DEFAULT_DESCRIPTOR)
 
 
 def get_conn_identifier(conn_str):

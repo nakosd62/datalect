@@ -99,6 +99,44 @@ def test_never_touched_session_displays_the_resolved_default_as_in_scope(app_env
     assert data["in_scope_custom_connection_keys"] == []
 
 
+def test_never_touched_session_honors_database_default_override(app_factory, tmp_path):
+    # Same never-explicitly-selected scenario as the test above, but with
+    # DATABASE_DEFAULT pointing at the SECOND preset - end-to-end proof
+    # (through a real /api/config GET, not just app_config.py's own
+    # module-level constants) that a brand-new session actually resolves
+    # to the overridden default, not just "first preset in the file".
+    env = _two_preset_env(app_factory, tmp_path, extra_env={"DATABASE_DEFAULT": "pg-b"})
+    data = env.client.get('/api/config').get_json()
+    assert data["active_preset_id"] == "pg-b"
+    assert data["in_scope_preset_ids"] == ["pg-b"]
+    assert data["in_scope_custom_connection_keys"] == []
+
+
+def test_never_touched_session_honors_database_default_pointing_at_non_postgres_preset(app_factory, tmp_path):
+    # The scenario DATABASE_DEFAULT exists for - a brand-new session
+    # defaulting to a non-Postgres preset, which the older "first Postgres
+    # preset" rule could never do regardless of preset order (see
+    # app_config.py's test_default_conn_is_first_postgres_preset_even_if_
+    # bigquery_listed_first for that older, still-true-when-unset rule).
+    # Note: 'active_database_type' isn't checked here - for ANY preset
+    # (default or explicitly selected) it's always redacted to "" in the
+    # wire response, same as a preset's URL/credentials (see
+    # config_routes.py's handle_config comment on why - a preset's
+    # connection details are never sent to the visitor, only its opaque
+    # "id"). 'configured_databases' is where a preset's type IS exposed
+    # (redaction only strips credentials, not type/name), so that's what
+    # proves "bq-a" really is the BigQuery preset it claims to be.
+    presets_path = write_database_presets_file(tmp_path, [
+        {"id": "pg-a", "name": "Postgres A", "type": "postgres", "url": "postgresql://u:p@h/a"},
+        {"id": "bq-a", "name": "BigQuery A", "type": "bigquery", "project_id": "p", "dataset": "d"},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": presets_path, "DATABASE_DEFAULT": "bq-a"})
+    data = env.client.get('/api/config').get_json()
+    assert data["active_preset_id"] == "bq-a"
+    assert data["in_scope_preset_ids"] == ["bq-a"]
+    assert {"id": "bq-a", "name": "BigQuery A", "type": "bigquery"} in data["configured_databases"]
+
+
 def test_session_with_explicit_preset_selection_derives_single_entry_in_scope(app_factory, tmp_path):
     env = _two_preset_env(app_factory, tmp_path)
     login_as(env.client, "alice@example.com")

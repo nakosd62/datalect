@@ -319,6 +319,26 @@ test.describe('analytics: report/feedback', () => {
     expect(events[0].category).toBe('wrong_sql');
   });
 
+  test('report_submitted fires for a "correct_sql" report too', async ({ page }) => {
+    // The positive counterpart to the 'wrong_sql' test above - same
+    // reasoning (buildReportPayload() passes ctx.category through
+    // unchanged, so this needs no special-casing anywhere in
+    // sendReportIssue()/trackEvent() to already work).
+    await mockIssueReportingEnabled(page, true);
+    mockReportIssue(page);
+    await gotoApp(page);
+
+    await setSqlBox(page, 'SELECT 1;');
+    await page.locator('#reportSqlGoodBtn').click();
+    await page.locator('#reportIssueDetails').fill('This looks right.');
+    await page.locator('#reportIssueSendBtn').click();
+    await expect(page.locator('#reportIssueModal')).toBeHidden();
+
+    const events = await trackedEvents(page, 'report_submitted');
+    expect(events.length).toBe(1);
+    expect(events[0].category).toBe('correct_sql');
+  });
+
   test('report_submitted fires for a plain "feedback" send (the header\'s Send Feedback button) too', async ({ page }) => {
     // sendReportIssue() itself never branches on category before firing
     // this event (see client.js) - the tests above/below already cover

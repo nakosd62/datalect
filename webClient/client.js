@@ -892,6 +892,13 @@ document.addEventListener('DOMContentLoaded', async () => {
   // separately from both the resultsBody-delegated error/wrong_result
   // triggers and the header's #sendFeedbackBtn.
   const reportSqlBtn = document.getElementById('reportSqlBtn');
+  // Same idea, opposite verdict - opens #reportIssueModal in 'correct_sql'
+  // mode instead (see REPORT_CATEGORY_CONFIG below). Tracked as its own
+  // element throughout this file (disabled/hidden state, click handler)
+  // rather than inferred from reportSqlBtn, so the two stay independently
+  // wireable even though today they're always shown/hidden/enabled/disabled
+  // in lockstep.
+  const reportSqlGoodBtn = document.getElementById('reportSqlGoodBtn');
 
   // DOM Elements - Config Modal & Connection Status
   const configModal = document.getElementById('configModal');
@@ -1073,8 +1080,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   const reportIssuePreviewLabel = document.getElementById('reportIssuePreviewLabel');
   const reportIssuePreview = document.getElementById('reportIssuePreview');
   // Editable counterpart to reportIssuePreview above - shown instead of it
-  // only for categories with previewEditable:true (currently just
-  // 'wrong_sql' - see REPORT_CATEGORY_CONFIG and openReportIssueModal()).
+  // only for categories with previewEditable:true ('wrong_sql' and
+  // 'correct_sql' - see REPORT_CATEGORY_CONFIG and openReportIssueModal()).
   const reportIssuePreviewEditable = document.getElementById('reportIssuePreviewEditable');
   const reportIssueDetailsLabel = document.getElementById('reportIssueDetailsLabel');
   const reportIssueDetails = document.getElementById('reportIssueDetails');
@@ -1567,6 +1574,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (disabled) {
       if (runBtn) runBtn.disabled = true;
       if (reportSqlBtn) reportSqlBtn.disabled = true;
+      if (reportSqlGoodBtn) reportSqlGoodBtn.disabled = true;
     } else {
       applySqlActionButtonsContentState();
     }
@@ -1657,21 +1665,23 @@ document.addEventListener('DOMContentLoaded', async () => {
     return sqlEditor ? sqlEditor.getValue().trim() : (sqlQueryTextarea ? sqlQueryTextarea.value.trim() : '');
   }
 
-  // Execute (#runBtn) and the SQL box's own "report wrong SQL" thumbs-down
-  // button (#reportSqlBtn) are both meaningless with an empty box - nothing
-  // to execute, nothing to flag as wrong - so both stay disabled whenever
-  // getSqlQuery() is empty, on top of (never instead of) setButtonsDisabled()'s
-  // own "a turn is in flight" disabling (see that function's own call of
-  // this, in its `else` branch). Applied directly there for the turn-just-
-  // ended case, and separately via a live CodeMirror 'change' listener (see
-  // where sqlEditor is constructed, further up) for every other case -
-  // typing, pasting, clearing, or a mid-turn setSqlQuery() fill-in - so both
-  // buttons track the box's actual content at all times, not just at turn
-  // boundaries.
+  // Execute (#runBtn) and the SQL box's own "report wrong SQL"/"report
+  // accurate SQL" thumbs-down/thumbs-up buttons (#reportSqlBtn/
+  // #reportSqlGoodBtn) are all meaningless with an empty box - nothing to
+  // execute, nothing to flag either way - so all three stay disabled
+  // whenever getSqlQuery() is empty, on top of (never instead of)
+  // setButtonsDisabled()'s own "a turn is in flight" disabling (see that
+  // function's own call of this, in its `else` branch). Applied directly
+  // there for the turn-just-ended case, and separately via a live
+  // CodeMirror 'change' listener (see where sqlEditor is constructed,
+  // further up) for every other case - typing, pasting, clearing, or a
+  // mid-turn setSqlQuery() fill-in - so all three buttons track the box's
+  // actual content at all times, not just at turn boundaries.
   function applySqlActionButtonsContentState() {
     const hasSql = !!getSqlQuery();
     if (runBtn) runBtn.disabled = !hasSql;
     if (reportSqlBtn) reportSqlBtn.disabled = !hasSql;
+    if (reportSqlGoodBtn) reportSqlGoodBtn.disabled = !hasSql;
   }
 
   // Wired to the live CodeMirror 'change' event (and, in the no-CodeMirror
@@ -2289,9 +2299,11 @@ document.addEventListener('DOMContentLoaded', async () => {
       ISSUE_REPORTING_ENABLED = Boolean(data.issue_reporting_enabled);
       if (sendFeedbackBtn) sendFeedbackBtn.classList.toggle('hidden', !ISSUE_REPORTING_ENABLED);
       if (moreMenuFeedbackBtn) moreMenuFeedbackBtn.classList.toggle('hidden', !ISSUE_REPORTING_ENABLED);
-      // Same gate for the SQL box's "report wrong SQL" thumbs-down button -
-      // it's just as persistent an element as the two above.
+      // Same gate for the SQL box's "report wrong SQL"/"report accurate
+      // SQL" thumbs-down/thumbs-up buttons - both just as persistent an
+      // element as the two above.
       if (reportSqlBtn) reportSqlBtn.classList.toggle('hidden', !ISSUE_REPORTING_ENABLED);
+      if (reportSqlGoodBtn) reportSqlGoodBtn.classList.toggle('hidden', !ISSUE_REPORTING_ENABLED);
 
       IN_SCOPE_PRESET_IDS = data.in_scope_preset_ids || [];
       IN_SCOPE_CUSTOM_KEYS = data.in_scope_custom_connection_keys || [];
@@ -4839,6 +4851,26 @@ document.addEventListener('DOMContentLoaded', async () => {
       sendLabel: 'Report Wrong SQL',
       sendingLabel: 'Sending…',
     },
+    // The positive counterpart to 'wrong_sql' above, triggered from the SQL
+    // box's own thumbs-up button (#reportSqlGoodBtn) - same shape in every
+    // respect (previewEditable, same detailsLabel, same buildReportPayload()
+    // branch below, same server-side handling per report_routes.py's
+    // _EDITABLE_CONTENT_CATEGORIES), just positive copy throughout: the
+    // point is to tell the developer this SQL got it right, not to report a
+    // problem.
+    correct_sql: {
+      modalTitle: 'Report Accurate SQL',
+      previewLabel: 'Accurate SQL',
+      intro: "Review and edit the prompt/SQL below as needed, add any comments, then send. This lets the developer know the generated SQL looks correct - helpful for confirming what's working well.",
+      showPreview: true,
+      previewEditable: true,
+      previewSectionLabel: 'What will be sent (edit as needed)',
+      detailsLabel: 'Additional comments (optional)',
+      detailsPlaceholder: 'What did this SQL get right, or anything else worth noting?',
+      detailsRequired: false,
+      sendLabel: 'Report Accurate SQL',
+      sendingLabel: 'Sending…',
+    },
     // Triggered from the Summary tab's own thumbs-up/thumbs-down buttons
     // (see summaryFeedbackButtonsHtml()) - same "no preview, details box IS
     // the message" shape as 'feedback' above, and for the same reason this
@@ -4909,19 +4941,21 @@ document.addEventListener('DOMContentLoaded', async () => {
       // this feedback is "about".
       return { category: ctx.category, details: details || '' };
     }
-    if (ctx.category === 'wrong_sql') {
+    if (ctx.category === 'wrong_sql' || ctx.category === 'correct_sql') {
       // Unlike error/wrong_result (prompt/sql captured automatically and
-      // shown read-only below), this category's whole point is that the
-      // user can rewrite the captured prompt+SQL text before it's sent -
-      // see REPORT_CATEGORY_CONFIG.wrong_sql's previewEditable flag - so
-      // `content` is read straight from the editable preview textarea's
-      // live value, not from ctx.sql/getReportPromptText() directly. Empty
-      // here the first time this runs, at modal-open (before
-      // openReportIssueModal() has seeded the textarea via
-      // renderWrongSqlPreviewSeed()) - harmless, since that call only uses
-      // this to confirm ctx is truthy.
+      // shown read-only below), these two categories' whole point is that
+      // the user can rewrite the captured prompt+SQL text before it's sent
+      // - see REPORT_CATEGORY_CONFIG.wrong_sql/correct_sql's
+      // previewEditable flag - so `content` is read straight from the
+      // editable preview textarea's live value, not from
+      // ctx.sql/getReportPromptText() directly. Empty here the first time
+      // this runs, at modal-open (before openReportIssueModal() has seeded
+      // the textarea via renderWrongSqlPreviewSeed()) - harmless, since
+      // that call only uses this to confirm ctx is truthy. `category`
+      // passes through ctx.category (not hardcoded) so this one branch
+      // correctly serves both the "wrong" and "accurate" verdicts.
       return {
-        category: 'wrong_sql',
+        category: ctx.category,
         database_name: ctx.databaseName || (connDbName ? connDbName.textContent : ''),
         provider: ACTIVE_LLM_PROVIDER || '',
         model: ACTIVE_LLM_MODEL || '',
@@ -4963,14 +4997,17 @@ document.addEventListener('DOMContentLoaded', async () => {
     return lines.join('\n');
   }
 
-  // Seeds #reportIssuePreviewEditable for the 'wrong_sql' category - a
+  // Seeds #reportIssuePreviewEditable for the 'wrong_sql'/'correct_sql'
+  // categories (both previewEditable:true - see REPORT_CATEGORY_CONFIG) - a
   // plain, deliberately simpler layout than renderReportPreviewText()'s
   // (no "Category:"/"LLM:" header lines, since those are metadata the
   // server derives/sends separately, not part of the editable message
   // itself) since the user is meant to treat this as a starting draft
   // they'll likely trim down, not a fixed record they're just appending
   // to. Called once, at modal-open time - never regenerated afterward, so
-  // edits the user makes are never clobbered by a later render.
+  // edits the user makes are never clobbered by a later render. Identical
+  // for both categories - the SQL itself is the SQL, whichever verdict the
+  // user is reporting on it.
   function renderWrongSqlPreviewSeed(ctx) {
     const lines = [];
     const prompt = getReportPromptText();
@@ -5011,7 +5048,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (reportIssueIntro) reportIssueIntro.textContent = config.intro;
     if (reportIssuePreviewSection) reportIssuePreviewSection.classList.toggle('hidden', !config.showPreview);
     if (reportIssuePreviewLabel) reportIssuePreviewLabel.textContent = config.previewSectionLabel || 'What will be sent';
-    // previewEditable (currently just 'wrong_sql') swaps in the plain
+    // previewEditable ('wrong_sql'/'correct_sql') swaps in the plain
     // <textarea> counterpart instead of the read-only <pre> - see
     // #reportIssuePreviewEditable's own comment above and
     // renderWrongSqlPreviewSeed(), which - unlike renderReportPreviewText()
@@ -5154,6 +5191,18 @@ document.addEventListener('DOMContentLoaded', async () => {
   if (reportSqlBtn) {
     reportSqlBtn.addEventListener('click', () => openReportIssueModal({
       category: 'wrong_sql',
+      sql: getSqlQuery(),
+      databaseName: connDbName ? connDbName.textContent : '',
+    }));
+  }
+  // The SQL box's "report accurate SQL" thumbs-up button - the positive
+  // counterpart right beside it, wired identically (same persistent
+  // element/gating/fresh-read-at-click-time reasoning as reportSqlBtn
+  // above), differing only in `category` - openReportIssueModal() picks up
+  // REPORT_CATEGORY_CONFIG.correct_sql's copy from there.
+  if (reportSqlGoodBtn) {
+    reportSqlGoodBtn.addEventListener('click', () => openReportIssueModal({
+      category: 'correct_sql',
       sql: getSqlQuery(),
       databaseName: connDbName ? connDbName.textContent : '',
     }));
