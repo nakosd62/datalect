@@ -18,7 +18,7 @@ flow.
 """
 
 from helpers import (
-    install_fake_redshift_connect, login_as, write_database_presets_file, FAKE_DB_CONFIG_ENCRYPTION_KEY,
+    install_fake_redshift_connect, login_as, write_database_presets_file, FAKE_DB_CONFIG_ENCRYPTION_KEY, FAKE_SESSION_SIGNING_KEY,
 )
 
 
@@ -85,6 +85,7 @@ def test_anonymous_visitor_never_receives_the_presets_credential(app_factory, tm
     env = app_factory(env={
         "K_SERVICE": "ydyl-service",
         "DB_CONFIG_ENCRYPTION_KEY": FAKE_DB_CONFIG_ENCRYPTION_KEY,
+        "SESSION_SIGNING_KEY": FAKE_SESSION_SIGNING_KEY,
         "GOOGLE_CLIENT_ID": "fake.apps.googleusercontent.com",
         "GCP_PROJECT_ID": "fake-project",
         "DATABASE_PRESETS_FILE": path,

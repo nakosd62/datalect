@@ -15,6 +15,7 @@ oracledb
 python-tds
 pyOpenSSL
 cryptography
+itsdangerous==2.2.0  # auth_session.py's signed, long-lived session cookie - already a transitive dep of Flask, now explicit since we import it directly
 certifi
 requests  # gviz HTTP fetch (Google Sheets backend) - already a transitive dep, now explicit
 google-auth  # service-account bearer-token minting for private Sheets - already a transitive dep, now explicit

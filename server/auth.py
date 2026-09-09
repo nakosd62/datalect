@@ -13,9 +13,15 @@ into `app` directly so it stays easy to unit test in isolation.
 
 import uuid
 
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, g
 
 from app_config import GOOGLE_CLIENT_ID, AUTH_ENABLED, IS_CLOUD_RUN, logger
+from auth_session import (
+    SESSION_COOKIE_NAME,
+    SESSION_MAX_AGE_SECONDS,
+    issue_session_token,
+    read_session_email,
+)
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 
@@ -82,22 +88,49 @@ def get_current_user_identity(session_id=None):
     anonymous identities on its very first request. Callers that only need
     a truthy signal (e.g. the enforce_authentication guard) can omit it.
     """
-    # 1. Bearer Token in Authorization Header (Google ID Token)
+    # 1. Bearer Token in Authorization Header (Google ID Token) - the
+    # freshest, most authoritative signal when present and valid.
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
         token = auth_header.split(" ", 1)[1].strip()
         if token:
             if GOOGLE_CLIENT_ID:
+                email = None
                 try:
                     idinfo = id_token.verify_oauth2_token(
                         token, google_requests.Request(), GOOGLE_CLIENT_ID
                     )
-                    return idinfo.get("email")
+                    email = idinfo.get("email")
                 except Exception:
                     logger.warning("Google ID token verification failed", exc_info=True)
-                    return None
+                if email:
+                    # Signals refresh_auth_session_cookie() (this module's
+                    # own app.after_request hook, registered in server.py)
+                    # to (re)issue this app's own long-lived session cookie
+                    # for this email - see auth_session.py's module
+                    # docstring. Every ACTIVE request that resolves an
+                    # identity this way pushes that cookie's expiry back
+                    # out, which is what makes its window sliding rather
+                    # than a fixed 30 days from first sign-in.
+                    g.auth_session_refresh_email = email
+                    return email
+                # Falls through to 1b below rather than failing outright -
+                # an expired/invalid Google token no longer means "logged
+                # out" by itself; the app's own session cookie (if this
+                # browser still carries a valid one) is exactly what covers
+                # this gap. See auth_session.py's module docstring.
             else:
                 return f"token:{token[:32]}"
+
+    # 1b. This app's own long-lived, signed session cookie (see
+    # auth_session.py's module docstring) - what actually keeps a user
+    # logged in past the Bearer token's own ~1hr Google-imposed expiry.
+    # Only reached when the Bearer branch above didn't already resolve an
+    # identity: a fresh, still-valid Google token always wins when present.
+    session_email = read_session_email(request.cookies.get(SESSION_COOKIE_NAME))
+    if session_email:
+        g.auth_session_refresh_email = session_email
+        return session_email
 
     # 2. GCP / IAP / Custom Identity Headers
     iap_user = request.headers.get("X-Goog-Authenticated-User-Email") or request.headers.get("X-User-Email")
@@ -133,6 +166,7 @@ def get_current_user_identity(session_id=None):
 EXEMPT_ENDPOINTS = {
     'index',
     'auth.get_current_user_status',
+    'auth.logout',
     'static',
     'config.handle_config',
     # Public, static-for-the-life-of-the-process build-id check (see
@@ -180,6 +214,35 @@ def apply_session_cookie(response, session_id):
     return response
 
 
+def refresh_auth_session_cookie(response):
+    """Registered as `app.after_request` in server.py, right alongside
+    enforce_authentication's before_request registration. (Re-)issues the
+    app's own long-lived session cookie (see auth_session.py's module
+    docstring) whenever THIS request resolved an identity via a fresh
+    Bearer token or an already-valid session cookie -
+    get_current_user_identity() stashes the email on flask.g precisely so
+    this hook can find it after the fact, since a before_request/route
+    handler doesn't have the outgoing `response` object to set a cookie on
+    directly. This is what makes the session sliding: every active request
+    pushes the cookie's expiry back out another SESSION_MAX_AGE_SECONDS,
+    rather than counting down from the very first sign-in regardless of
+    activity. A request that never resolved an identity this way at all
+    (anonymous, IAP/legacy-cookie, local dev, or no signing key configured -
+    see issue_session_token()) leaves `g` unset and this is a no-op."""
+    email = getattr(g, 'auth_session_refresh_email', None)
+    if email:
+        token = issue_session_token(email)
+        if token:
+            response.set_cookie(
+                SESSION_COOKIE_NAME,
+                token,
+                httponly=True,
+                samesite='Lax',
+                max_age=SESSION_MAX_AGE_SECONDS,
+            )
+    return response
+
+
 # --- Auth Verification Endpoint ---
 @auth_bp.route('/api/auth/me', methods=['GET'])
 def get_current_user_status():
@@ -201,3 +264,24 @@ def get_current_user_status():
         'auth_required': AUTH_ENABLED
     })
     return apply_session_cookie(resp, session_id)
+
+
+@auth_bp.route('/api/auth/logout', methods=['POST'])
+def logout():
+    """Clears this app's own long-lived session cookie (see
+    auth_session.py's module docstring) - without this, a browser that
+    still carries that cookie would keep resolving to the same signed-in
+    identity via get_current_user_identity()'s session-cookie fallback even
+    after client.js has cleared its own locally-held Google ID token,
+    silently undoing the logout on the very next request. Deliberately
+    does NOT call get_current_user_identity() at all - "log me out" has to
+    work even when the credential being logged out of is already stale/
+    invalid, and there's nothing here that needs to know who was signed in
+    to begin with. Reachable regardless of auth state - see
+    enforce_authentication()'s own '/api/auth/' path-prefix exemption
+    (EXEMPT_ENDPOINTS below lists it too, for the same belt-and-suspenders
+    reason 'auth.get_current_user_status' is listed explicitly alongside
+    that same prefix rule)."""
+    resp = jsonify({'success': True})
+    resp.delete_cookie(SESSION_COOKIE_NAME)
+    return resp

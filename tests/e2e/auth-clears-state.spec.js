@@ -157,13 +157,25 @@ async function assertPromptSqlAndResultsCleared(page) {
  * server/auth.py's get_current_user_identity(), which resolves a Bearer
  * token to the verified email. Returns null for a missing/malformed
  * header rather than throwing, so a request with no token at all (the
- * signed-out/anonymous case) falls through to the anonymous default. */
+ * signed-out/anonymous case) falls through to the anonymous default.
+ *
+ * Also returns null for an EXPIRED token, mirroring the real server's
+ * id_token.verify_oauth2_token, which enforces `exp` strictly - client.js's
+ * getApiHeaders() sends whatever token is in localStorage regardless of its
+ * own expiry (see that function), so without this check here, a stale
+ * expired token would look "authenticated" to this mock even though the
+ * real Google verification (and, with no session cookie modeled by this
+ * lightweight header-only mock, no fallback identity either) would reject
+ * it - see "an expired stored token does not restore a signed-in state
+ * after reload" below, which depends on this expiry check actually
+ * happening. */
 function decodeFakeTokenEmail(authHeader) {
   if (!authHeader || !authHeader.startsWith('Bearer ')) return null;
   try {
     const token = authHeader.slice('Bearer '.length);
     const payloadB64 = token.split('.')[1];
     const payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
+    if (typeof payload.exp === 'number' && payload.exp <= Math.floor(Date.now() / 1000)) return null;
     return payload.email || null;
   } catch {
     return null;
@@ -256,6 +268,42 @@ test.describe('logging out from the narrow-screen "more" menu', () => {
     // control renders correctly in the same slot the avatar just vacated.
     await page.locator('#moreMenuBtn').click();
     await expect(page.locator('#moreMenuAuthSlot #fakeGsiButton')).toBeVisible();
+  });
+});
+
+test.describe('logging out clears the server-side session cookie', () => {
+  // See server/auth_session.py's module docstring: the app's own
+  // long-lived crbot_auth_session cookie is what actually keeps a user
+  // signed in past their Google ID token's ~1hr expiry. Without
+  // handleLogout() also telling the server to drop that cookie
+  // (POST /api/auth/logout - server/auth.py's logout()), clearing the
+  // client's own localStorage token would look like a logout but silently
+  // NOT be one: the next request would still resolve via that durable
+  // cookie and the user would appear signed back in. This test only
+  // proves the CLIENT half - that clicking "Log out" actually fires this
+  // request - since GOOGLE_CLIENT_ID isn't configured for this real local
+  // server (see fixtures.js's module docstring), so no real session
+  // cookie is ever minted here; the signing/verification mechanism itself
+  // is covered server-side in tests/server/test_auth.py.
+  test('clicking "Log out" POSTs to /api/auth/logout', async ({ page }) => {
+    await stubGoogleIdentityServices(page);
+    await mockCloudRunConfig(page);
+
+    await gotoApp(page);
+    await page.evaluate(
+      (token) => window.__gisCallback({ credential: token }),
+      fakeIdToken('logout-post-user@example.com')
+    );
+    await expect(page.locator('#authAvatarBtn')).toBeVisible();
+
+    const logoutRequest = page.waitForRequest(
+      (req) => req.url().includes('/api/auth/logout') && req.method() === 'POST'
+    );
+    await page.locator('#authAvatarBtn').click();
+    await page.locator('#logoutBtn').click();
+    await logoutRequest;
+
+    await expect(page.locator('#authAvatarBtn')).toHaveCount(0);
   });
 });
 

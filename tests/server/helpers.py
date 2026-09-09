@@ -43,7 +43,7 @@ if SERVER_DIR not in sys.path:
 # side effects (and everything downstream of it) under the new environment,
 # rather than returning the previous test's cached module object.
 _APP_MODULE_NAMES = [
-    "app_config", "auth", "config_routes", "execute_routes",
+    "app_config", "auth", "auth_session", "config_routes", "execute_routes",
     "translate_routes", "history_routes", "report_routes", "db", "schema_cache",
     "state_store", "connection_router", "cancel_registry",
 ]
@@ -90,6 +90,9 @@ _ENV_VARS_TO_CLEAR = [
     "ISSUE_REPORT_TO_EMAIL", "ISSUE_REPORT_SMTP_HOST", "ISSUE_REPORT_SMTP_PORT",
     "ISSUE_REPORT_SMTP_USERNAME", "ISSUE_REPORT_SMTP_PASSWORD",
     "ISSUE_REPORT_SMTP_FROM", "ISSUE_REPORT_SMTP_USE_TLS",
+    # auth_session.py's long-lived session-cookie signing key - cleared for
+    # the same reason as every other secret-shaped var above.
+    "SESSION_SIGNING_KEY",
 ]
 
 # A syntactically valid (but obviously throwaway, fixed/shared) Fernet
@@ -101,6 +104,13 @@ _ENV_VARS_TO_CLEAR = [
 # be read back under key B") should call make_fernet_key() below instead
 # to get a fresh, distinct key.
 FAKE_DB_CONFIG_ENCRYPTION_KEY = Fernet.generate_key().decode()
+
+# Same idea as FAKE_DB_CONFIG_ENCRYPTION_KEY above, but for
+# auth_session.py's SESSION_SIGNING_KEY - any non-empty string is a valid
+# itsdangerous signing key (unlike Fernet, there's no format to satisfy),
+# so this is just a fixed, obviously-throwaway value for tests that need
+# session-cookie signing configured but aren't testing key rotation itself.
+FAKE_SESSION_SIGNING_KEY = "test-session-signing-key-not-for-real-use"
 
 
 def make_fernet_key():
@@ -185,6 +195,7 @@ def fresh_import(monkeypatch, tmp_path, env=None, register_blueprints=True, mock
 
     if register_blueprints:
         import auth
+        import auth_session
         import config_routes
         import execute_routes
         import translate_routes
@@ -193,6 +204,12 @@ def fresh_import(monkeypatch, tmp_path, env=None, register_blueprints=True, mock
         import cancel_registry
 
         app_config.app.before_request(auth.enforce_authentication)
+        # Mirrors server.py's own after_request registration - see auth.py's
+        # refresh_auth_session_cookie()/auth_session.py. Without this, a
+        # test using the `client` fixture below would never see the
+        # session cookie actually get (re)issued on a response, even though
+        # get_current_user_identity() itself stashed the right signal on g.
+        app_config.app.after_request(auth.refresh_auth_session_cookie)
         for bp in (
             auth.auth_bp, config_routes.config_bp, execute_routes.execute_bp,
             translate_routes.translate_bp, history_routes.history_bp,
@@ -201,6 +218,7 @@ def fresh_import(monkeypatch, tmp_path, env=None, register_blueprints=True, mock
             app_config.app.register_blueprint(bp)
 
         ns.auth = auth
+        ns.auth_session = auth_session
         ns.config_routes = config_routes
         ns.execute_routes = execute_routes
         ns.translate_routes = translate_routes

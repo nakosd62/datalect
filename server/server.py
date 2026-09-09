@@ -21,7 +21,7 @@ import os
 from flask import send_from_directory
 
 from app_config import app, state_store
-from auth import auth_bp, enforce_authentication
+from auth import auth_bp, enforce_authentication, refresh_auth_session_cookie
 from config_routes import config_bp
 from translate_routes import translate_bp
 from execute_routes import execute_bp
@@ -31,6 +31,12 @@ from report_routes import report_bp
 # Auth guard runs before every request (see EXEMPT_ENDPOINTS in auth.py
 # for the routes that skip it).
 app.before_request(enforce_authentication)
+# Sliding renewal for the app's own long-lived session cookie - runs after
+# EVERY request (not just non-exempt ones; /api/config and /api/auth/me
+# both resolve identity themselves despite being exempt from the guard
+# above) so activity on any authenticated route keeps a user's session
+# alive. See auth.py's refresh_auth_session_cookie()/auth_session.py.
+app.after_request(refresh_auth_session_cookie)
 
 for bp in (auth_bp, config_bp, translate_bp, execute_bp, history_bp, report_bp):
     app.register_blueprint(bp)

@@ -507,6 +507,22 @@ document.addEventListener('DOMContentLoaded', async () => {
     // start signed out, exactly like every reload did before this fix.
   }
 
+  // The server's own last-known answer to "is this browser actually still
+  // signed in", straight from /api/config's authenticated/user_id fields
+  // (see fetchBackendConfig()) - NOT re-derived from googleIdToken's own
+  // parsed `exp` claim. The two can genuinely disagree now: the server's
+  // own long-lived session cookie (see auth.py's
+  // refresh_auth_session_cookie()/auth_session.py) can keep resolving this
+  // browser to a real signed-in identity for up to 30 days, well past the
+  // ~1hr the local Google ID token itself is valid for - without this,
+  // renderAuthUI() would flip back to showing a "Sign in" button the
+  // moment the LOCAL token's exp passed, even though every other request
+  // on the page is still succeeding as that same signed-in user. Reset to
+  // null on logout (see handleLogout()) so a stale value can't survive a
+  // sign-out and briefly redisplay the old identity before the next
+  // fetchBackendConfig() call lands.
+  let serverConfirmedAuthEmail = null;
+
   function persistGoogleIdToken(token) {
     try {
       window.localStorage.setItem(GOOGLE_ID_TOKEN_STORAGE_KEY, token);
@@ -1239,19 +1255,55 @@ document.addEventListener('DOMContentLoaded', async () => {
     fetchBackendConfig();
   }
 
-  function handleLogout() {
+  async function handleLogout() {
     trackEvent('logout', {});
     googleIdToken = null;
     clearPersistedGoogleIdToken();
+    // Reset eagerly (not just left to the next fetchBackendConfig() call
+    // below) so a render triggered in between - however unlikely - can't
+    // still see the old identity as "server confirmed" for a moment.
+    serverConfirmedAuthEmail = null;
     if (window.google && google.accounts && google.accounts.id) {
       google.accounts.id.disableAutoSelect();
     }
+    // Render the signed-out UI RIGHT AWAY, synchronously within this same
+    // click handler, rather than after the awaited /api/auth/logout call
+    // below - two reasons. (1) The obvious one: the user should see
+    // "signed out" the instant they click, not once a network round-trip
+    // completes. (2) Less obviously: this is what actually detaches
+    // #logoutBtn from the DOM before this same click event finishes
+    // bubbling up to document - the more-menu's own outside-click handler
+    // (see moreMenuBtn's click listener) checks
+    // `moreMenuWrapper.contains(e.target)` on every click, and relies on
+    // that detachment having already happened synchronously to correctly
+    // treat this click as "outside" and auto-close the menu. Deferring
+    // this render until after an `await` would let that synchronous
+    // bubbling phase finish first with logoutBtn still very much attached,
+    // leaving the more menu open when it should have closed.
+    renderAuthUI(currentGoogleClientId);
+    // Clears the app's OWN long-lived session cookie server-side (see
+    // auth.py's refresh_auth_session_cookie()/auth_session.py) - without
+    // this, a browser that still carries that cookie would keep resolving
+    // to the same signed-in identity via get_current_user_identity()'s
+    // session-cookie fallback even after the render above has cleared
+    // this tab's own local token, silently undoing the logout on the very
+    // next request (or in another tab that shares this same cookie).
+    // Awaited so it's guaranteed to land before fetchBackendConfig() below
+    // re-syncs config against the server; best-effort otherwise - a
+    // network hiccup here still leaves this tab's own local sign-out fully
+    // in effect, it just means the server-side cookie lingers until it
+    // naturally lapses (SESSION_MAX_AGE_SECONDS) rather than being cleared
+    // right away.
+    try {
+      await fetch('/api/auth/logout', { method: 'POST', credentials: 'same-origin' });
+    } catch (e) {
+      // Network error - see comment above; nothing else to do here.
+    }
     // Logging out drops back to a (new, distinct) anonymous session - see
     // the sign-in callback's own comment just above for why
-    // fetchBackendConfig() below is what actually switches the active
+    // fetchBackendConfig() here is what actually switches the active
     // history bucket now (via reconcileActiveHistoryBucket()), not a
     // direct clearActiveQueryState() call here.
-    renderAuthUI(currentGoogleClientId);
     fetchBackendConfig();
   }
 
@@ -1264,6 +1316,19 @@ document.addEventListener('DOMContentLoaded', async () => {
     const existingToken = googleIdToken;
     const payload = existingToken ? parseJwt(existingToken) : null;
     const isExpired = payload && payload.exp && (payload.exp * 1000 < Date.now());
+    const localSignedIn = !!(existingToken && payload && !isExpired);
+
+    // The local Google ID token's own `exp` is only ever an ahead-of-server
+    // best guess - the app's own long-lived session cookie (see auth.py's
+    // refresh_auth_session_cookie()/auth_session.py) can keep the SERVER
+    // resolving this browser to a real signed-in identity for up to 30
+    // days, well past that ~1hr local expiry. Trusting
+    // serverConfirmedAuthEmail here (see its own declaration comment) - not
+    // just the local JWT - is what stops the avatar from flipping back to
+    // a "Sign in" button while the user is actually still signed in as far
+    // as every other request on this page is concerned.
+    const signedIn = localSignedIn || Boolean(serverConfirmedAuthEmail);
+    const displayEmail = localSignedIn ? (payload.email || 'Authenticated') : (serverConfirmedAuthEmail || 'Authenticated');
 
     // renderAuthUI() runs on every fetchBackendConfig() call - including
     // once per prompt/execute, since translatePrompt() re-syncs config
@@ -1275,18 +1340,17 @@ document.addEventListener('DOMContentLoaded', async () => {
     // don't hit this because their branch renders a small static avatar
     // div, and local (no-auth) mode never calls this function at all -
     // which is why the jitter only showed up for anonymous Cloud Run use.
-    const signedIn = !!(existingToken && payload && !isExpired);
-    const authStateKey = signedIn ? `in:${payload.email || ''}` : `out:${currentGoogleClientId || ''}`;
+    const authStateKey = signedIn ? `in:${displayEmail}` : `out:${currentGoogleClientId || ''}`;
     if (authStateKey === lastRenderedAuthState) {
       return;
     }
     lastRenderedAuthState = authStateKey;
 
-    if (existingToken && payload && !isExpired) {
-      const userEmail = payload.email || 'Authenticated';
+    if (signedIn) {
+      const userEmail = displayEmail;
       const initial = userEmail.charAt(0).toUpperCase() || 'U';
-      const avatarContent = payload.picture 
-        ? `<img src="${payload.picture}" class="auth-avatar-img" alt="Avatar">` 
+      const avatarContent = (localSignedIn && payload.picture)
+        ? `<img src="${payload.picture}" class="auth-avatar-img" alt="Avatar">`
         : `<span class="auth-avatar-initial">${initial}</span>`;
 
       container.innerHTML = `
@@ -1364,12 +1428,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         // anonymous use, so we don't want the One Tap sign-in prompt
         // popping up unasked on every load for a visitor who was never
         // signed in to begin with. The rendered button above is always
-        // available for anyone who wants to log in. A signed-in user's
-        // token simply lapses after about an hour of inactivity like any
-        // other short-lived session token - renderAuthUI()'s isExpired
-        // check above just reverts to showing this same button, no popup
-        // involved; clicking it (or the browser's own live Google session
-        // cooperating with a fresh click) is what signs them back in.
+        // available for anyone who wants to log in. This branch (this same
+        // "not signedIn" button, no popup involved) is reached only once
+        // BOTH the local token has expired AND the server's own long-lived
+        // session cookie has too (or was never issued/has been logged out
+        // of) - see serverConfirmedAuthEmail's declaration comment. A
+        // signed-in user active at least once every 30 days never sees
+        // this again until they explicitly log out.
       }
     }
   }
@@ -2129,6 +2194,13 @@ document.addEventListener('DOMContentLoaded', async () => {
       // one place it's ever set, straight from the server's own resolved
       // identity, never re-derived here.
       CURRENT_USER_IDENTITY = data.user_id || 'global';
+      // See serverConfirmedAuthEmail's own declaration comment - this is
+      // the one place it's ever set, straight from the server's own
+      // resolved identity (which may now come from its long-lived session
+      // cookie rather than a live Bearer token), same as
+      // CURRENT_USER_IDENTITY just above. Set BEFORE initGoogleAuth()'s
+      // renderAuthUI() call below picks it up.
+      serverConfirmedAuthEmail = data.authenticated ? (data.user_id || null) : null;
 
       CONFIGURED_DBS = data.configured_databases || [];
       DEFAULT_DB_URL = data.default_database_url || "";

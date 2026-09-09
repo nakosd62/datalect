@@ -25,7 +25,10 @@ ephemeral SQLite fallback").
 
 import pytest
 
-from helpers import login_as, write_database_presets_file, FAKE_DB_CONFIG_ENCRYPTION_KEY
+from helpers import (
+    login_as, write_database_presets_file, FAKE_DB_CONFIG_ENCRYPTION_KEY,
+    FAKE_SESSION_SIGNING_KEY,
+)
 
 
 @pytest.fixture
@@ -38,13 +41,17 @@ def cloud_run_env(tmp_path):
     startup guard raises RuntimeError for Cloud Run (see state_store.py's
     encryption-at-rest comment); these tests aren't about that mechanism
     itself, so a fixed shared key is enough (see FAKE_DB_CONFIG_ENCRYPTION_KEY's
-    docstring)."""
+    docstring). SESSION_SIGNING_KEY is required for the exact same reason,
+    now that app_config.py's startup guard also hard-fails Cloud Run +
+    GOOGLE_CLIENT_ID without one (see auth_session.py) - these tests aren't
+    about that mechanism either, so FAKE_SESSION_SIGNING_KEY is enough."""
     path = write_database_presets_file(tmp_path, [
         {"type": "postgres", "name": "Demo", "url": "postgresql://realuser:realpass@realhost/realdb"},
     ])
     return {
         "K_SERVICE": "ydyl-service",
         "DB_CONFIG_ENCRYPTION_KEY": FAKE_DB_CONFIG_ENCRYPTION_KEY,
+        "SESSION_SIGNING_KEY": FAKE_SESSION_SIGNING_KEY,
         "GOOGLE_CLIENT_ID": "fake.apps.googleusercontent.com",
         "GCP_PROJECT_ID": "fake-project",
         "DATABASE_PRESETS_FILE": path,

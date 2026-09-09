@@ -22,6 +22,7 @@ from flask_cors import CORS
 from google.cloud import firestore
 
 from state_store import SqliteStateStore, FirestoreStateStore, is_db_config_encryption_configured
+from auth_session import is_session_signing_configured
 from sheets_util import extract_spreadsheet_id
 
 from dotenv import load_dotenv
@@ -138,6 +139,28 @@ if IS_CLOUD_RUN and not is_db_config_encryption_configured():
         "storing credentials unencrypted. Generate a key with: "
         'python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())" '
         "and set it as DB_CONFIG_ENCRYPTION_KEY."
+    )
+
+# The app's own long-lived session cookie (see auth_session.py's module
+# docstring) is what keeps a signed-in user logged in past the ~1hr Google
+# ID token expiry - without a signing key, that cookie is never issued and
+# every user gets logged out roughly once an hour, silently, with no error
+# anyone would notice until they complained about it (exactly the bug this
+# feature exists to fix). Same posture as the DB_CONFIG_ENCRYPTION_KEY guard
+# just above: gated on IS_CLOUD_RUN specifically (not AUTH_ENABLED alone) so
+# a developer testing the Google Sign-In UI locally isn't forced to
+# generate a key first - locally, a missing key just means this one feature
+# silently no-ops, same permissive posture as GOOGLE_CLIENT_ID itself being
+# unset.
+if IS_CLOUD_RUN and AUTH_ENABLED and not is_session_signing_configured():
+    raise RuntimeError(
+        f"CRITICAL: Service running on Cloud Run (K_SERVICE={os.environ.get('K_SERVICE')}) "
+        "with Google Sign-In enabled (GOOGLE_CLIENT_ID is set), but SESSION_SIGNING_KEY is "
+        "not set. Every signed-in user would get logged out roughly once an hour, when their "
+        "Google ID token expires, since there would be no long-lived app session to fall back "
+        "on. Halting startup rather than silently shipping that regression. Generate a key "
+        'with: python3 -c "import secrets; print(secrets.token_urlsafe(32))" '
+        "and set it as SESSION_SIGNING_KEY."
     )
 
 # --- Flask app ---------------------------------------------------------------
