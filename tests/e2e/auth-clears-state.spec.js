@@ -45,12 +45,13 @@
 
 const { test, expect, gotoApp, mockTranslate, mockExecute } = require('./fixtures');
 
-function fakeIdToken(email, expiresInSeconds = 3600) {
+function fakeIdToken(email, expiresInSeconds = 3600, extraClaims = {}) {
   const header = Buffer.from(JSON.stringify({ alg: 'none', typ: 'JWT' })).toString('base64url');
   const payload = Buffer.from(JSON.stringify({
     email,
     exp: Math.floor(Date.now() / 1000) + expiresInSeconds,
     picture: '',
+    ...extraClaims,
   })).toString('base64url');
   return `${header}.${payload}.fake-signature`;
 }
@@ -615,6 +616,107 @@ test.describe('sign-in survives a same-tab reload (Cloud Run)', () => {
     // signing back in takes an explicit click on this same button.
     await expect(page.locator('#fakeGsiButton')).toBeVisible();
     await expect(page.locator('#authAvatarBtn')).toHaveCount(0);
+  });
+});
+
+// Regression coverage for a real bug report: once the app's own long-lived
+// session cookie (server/auth.py's refresh_auth_session_cookie()) started
+// keeping a browser signed in for up to 30 days independent of the local
+// Google ID token's own ~1hr `exp`, the avatar started flipping from
+// Google's real profile photo (and the first letter of the user's actual
+// NAME) to a plain circle showing the first letter of their EMAIL instead -
+// surprising and faintly suspicious-looking for a user who never signed
+// out. Root cause: renderAuthUI() only ever read `payload.picture` when
+// `localSignedIn` (i.e. the token not yet expired) was also true, even
+// though the token's own cached `picture`/`given_name` claims are still
+// perfectly good for cosmetic display well past `exp` - expiry only means
+// the token can no longer be TRUSTED to assert identity for real requests
+// (which is exactly what serverConfirmedAuthEmail/the session cookie takes
+// over doing instead). Fixed by reading `payload` for the avatar whenever
+// it exists at all, regardless of isExpired.
+test.describe('avatar keeps showing the real Google photo/name past the local token\'s expiry', () => {
+  test('an expired-but-still-decodable token still renders the Google photo when the server confirms auth via the session cookie', async ({ page }) => {
+    await stubGoogleIdentityServices(page);
+
+    // Simulates the session-cookie fallback: /api/config reports
+    // authenticated:true UNCONDITIONALLY here (representing the server's
+    // own session-cookie check succeeding), independent of whatever this
+    // request's own Authorization header carries - unlike
+    // mockCloudRunConfig() above, which deliberately mirrors "the Bearer
+    // token itself must still be valid" and so isn't usable for this
+    // scenario.
+    await page.route('**/api/config', async (route) => {
+      if (route.request().method() !== 'GET') return route.fallback();
+      await route.fulfill({
+        status: 200, contentType: 'application/json',
+        body: JSON.stringify({
+          ...CLOUD_RUN_CONFIG_PAYLOAD,
+          user_id: 'stale-user@example.com',
+          authenticated: true,
+        }),
+      });
+    });
+
+    await gotoApp(page);
+
+    // Seed an ALREADY-EXPIRED token, same as the "does not restore a
+    // signed-in state" test above, but this one carries real
+    // picture/given_name claims - the shape a real Google sign-in from
+    // weeks ago would still leave sitting in localStorage.
+    const staleToken = fakeIdToken('stale-user@example.com', -3600, {
+      picture: 'https://example.com/stale-user-photo.jpg',
+      given_name: 'Stale',
+    });
+    await page.evaluate((token) => {
+      window.localStorage.setItem('datalectGoogleIdToken', token);
+    }, staleToken);
+
+    await page.reload();
+
+    // The avatar shows Google's real photo, not the plain
+    // first-letter-of-email fallback circle - proof the stale token's
+    // cached claims were used for display even though it's long expired.
+    await expect(page.locator('#authAvatarBtn')).toBeVisible();
+    const avatarImg = page.locator('#authAvatarBtn img.auth-avatar-img');
+    await expect(avatarImg).toBeVisible();
+    await expect(avatarImg).toHaveAttribute('src', 'https://example.com/stale-user-photo.jpg');
+    await expect(page.locator('#authAvatarBtn .auth-avatar-initial')).toHaveCount(0);
+  });
+
+  test('falls back to the given_name initial (not the email initial) when there is no picture at all', async ({ page }) => {
+    await stubGoogleIdentityServices(page);
+    await page.route('**/api/config', async (route) => {
+      if (route.request().method() !== 'GET') return route.fallback();
+      await route.fulfill({
+        status: 200, contentType: 'application/json',
+        body: JSON.stringify({
+          ...CLOUD_RUN_CONFIG_PAYLOAD,
+          user_id: 'stale-user@example.com',
+          authenticated: true,
+        }),
+      });
+    });
+
+    await gotoApp(page);
+
+    // No `picture` claim this time - only given_name - and still expired,
+    // to isolate the initial-letter fallback from the img-vs-no-img case
+    // the test above already covers.
+    const staleToken = fakeIdToken('stale-user@example.com', -3600, {
+      picture: '',
+      given_name: 'Zara',
+    });
+    await page.evaluate((token) => {
+      window.localStorage.setItem('datalectGoogleIdToken', token);
+    }, staleToken);
+
+    await page.reload();
+
+    await expect(page.locator('#authAvatarBtn')).toBeVisible();
+    await expect(page.locator('#authAvatarBtn img.auth-avatar-img')).toHaveCount(0);
+    // 'Z' (from given_name "Zara"), not 's' (from the email
+    // "stale-user@example.com") - the whole point of this fix.
+    await expect(page.locator('#authAvatarBtn .auth-avatar-initial')).toHaveText('Z');
   });
 });
 

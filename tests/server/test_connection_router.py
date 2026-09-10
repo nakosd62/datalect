@@ -855,9 +855,9 @@ def test_all_mode_route_outcome_runs_phase_b_in_parallel_for_both_selected_conne
     # both connections (see entry_prompts' own comment in translate_
     # routes.py).
     assert data['connection_selection'] == [
-        {"kind": "preset", "id": "pg-a", "name": "Sales Postgres",
+        {"kind": "preset", "id": "pg-a", "name": "Sales Postgres", "type": "postgres",
          "prompt": "how is everything performing across the board"},
-        {"kind": "preset", "id": "pg-b", "name": "Marketing Postgres",
+        {"kind": "preset", "id": "pg-b", "name": "Marketing Postgres", "type": "postgres",
          "prompt": "how is everything performing across the board"},
     ]
     assert data['database_notes'] == []
@@ -1109,9 +1109,9 @@ def test_all_mode_route_outcome_streams_phase_a_route_then_phase_b_connection_do
     # "prompt" (new - Chunk 4): no "database_prompts" in this test's triage
     # response either, so both fall back to the original question.
     assert route_event['connection_selection'] == [
-        {"kind": "preset", "id": "pg-a", "name": "Sales Postgres",
+        {"kind": "preset", "id": "pg-a", "name": "Sales Postgres", "type": "postgres",
          "prompt": "first database question, plus something else"},
-        {"kind": "preset", "id": "pg-b", "name": "Marketing Postgres",
+        {"kind": "preset", "id": "pg-b", "name": "Marketing Postgres", "type": "postgres",
          "prompt": "first database question, plus something else"},
     ]
 
@@ -1122,6 +1122,13 @@ def test_all_mode_route_outcome_streams_phase_a_route_then_phase_b_connection_do
     assert by_id['pg-a']['sql'] == "-- database: preset:pg-a (Sales Postgres)\nSELECT * FROM deals;"
     assert by_id['pg-b']['outcome'] == 'note'
     assert by_id['pg-b']['text'] == "Campaigns data doesn't cover this question."
+    # Same "type" field as connection_selection above (see
+    # translate_routes.py's stream_translation() docstring) - client.js's
+    # executeOneAllModeConnection() needs it to report a real per-database
+    # database_type on the sql_fanout_executed GA event without a second
+    # lookup.
+    assert by_id['pg-a']['type'] == 'postgres'
+    assert by_id['pg-b']['type'] == 'postgres'
 
     # Every phase_b_connection_done line comes strictly after the
     # phase_a_route line and strictly before the terminal 'done' line.
@@ -1414,7 +1421,8 @@ def test_all_mode_with_only_one_configured_connection_still_runs_triage_and_can_
     assert data['router_route'] is True
     assert "-- database: preset:pg-a (Sales Postgres)\nSELECT * FROM deals;" in data['sql']
     assert data['connection_selection'] == [
-        {"kind": "preset", "id": "pg-a", "name": "Sales Postgres", "prompt": "how many deals do we have"},
+        {"kind": "preset", "id": "pg-a", "name": "Sales Postgres", "type": "postgres",
+         "prompt": "how many deals do we have"},
     ]
 
 

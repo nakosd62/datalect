@@ -3529,8 +3529,24 @@ def translate_query():
                     # through to client.js's allModeStreamState.
                     # connectionOrder (see startAllModeStreaming()) and
                     # pendingAllModeNotes.
+                    #
+                    # `type` (new - GA4 fan-out tracking): each entry's own
+                    # dialect, pulled from its resolved descriptor
+                    # (resolve_in_scope_descriptors always sets "type" -
+                    # see db.py's _to_descriptor default) - client.js's
+                    # trackAllModeFanoutTranslate()/-Execute() need this to
+                    # report a real per-database `database_type` on the GA
+                    # events fired for each connection in this fan-out,
+                    # rather than the single active connection's type (or
+                    # none at all), which is all client.js could see before
+                    # this field existed. Purely additive, same reasoning
+                    # as `prompt` above.
                     connection_selection = [
-                        {"kind": e["kind"], "id": e["id"], "name": e["name"], "prompt": p}
+                        {
+                            "kind": e["kind"], "id": e["id"], "name": e["name"],
+                            "type": (e.get("descriptor") or {}).get("type", ""),
+                            "prompt": p,
+                        }
                         for e, p in zip(selected_entries, entry_prompts)
                     ]
                     yield json.dumps({
@@ -3560,6 +3576,14 @@ def translate_query():
                             yield json.dumps({
                                 "status": "phase_b_connection_done",
                                 "kind": done_entry["kind"], "id": done_entry["id"], "name": done_entry["name"],
+                                # Same "type" field/reasoning as
+                                # connection_selection above - lets
+                                # executeOneAllModeConnection() in client.js
+                                # report a real per-database database_type
+                                # on the sql_fanout_executed GA event it
+                                # fires for THIS connection's own streamed
+                                # auto-execute, without a second lookup.
+                                "type": (done_entry.get("descriptor") or {}).get("type", ""),
                                 **classified,
                             }) + "\n"
                     except StopIteration as stop:

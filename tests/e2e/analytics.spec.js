@@ -280,6 +280,304 @@ test.describe('analytics: query flow', () => {
   });
 });
 
+// "All databases" mode fans a single NL prompt out into one real translate
+// call per selected connection (server-side, translate_routes.py's
+// _run_phase_b_fanout) and, with auto-execute on, one real /api/execute
+// call per connection too (client-side, executeOneAllModeConnection() in
+// client.js) - before trackAllModeFanoutTranslate()/trackAllModeFanoutExecute()
+// existed, none of those individual fanned-out requests were visible in
+// GA at all, only the one top-level translate_submitted/sql_executed event
+// per user action, regardless of how many databases it actually touched.
+// Rather than invent new event names for this (per explicit request - "too
+// many different events already"), those two functions fire the SAME
+// translate_submitted/sql_executed events again, once per connection - so
+// a turn against 2 in-scope databases shows up as 3 translate_submitted
+// events (1 generic "the prompt was submitted" + 2 real per-database
+// calls), distinguishable by `database_name`: the generic one's is the
+// "All databases" badge text, each fan-out one's is that specific
+// database's own name. See trackEvent()'s own header comment in client.js
+// for the full reasoning. Config/NDJSON shapes here mirror
+// multi-database.spec.js's own "all databases" mode fixtures
+// (buildConfigState/mockConfig, the raw phase_a_route/
+// phase_b_connection_done NDJSON bodies) rather than importing them - kept
+// local, same convention that file's own helpers already use (not exported
+// from fixtures.js).
+test.describe('analytics: "all databases" mode fan-out', () => {
+  function buildAllModeConfigState(overrides) {
+    return {
+      auth_enabled: false,
+      session_id: 'e2e-session',
+      user_id: 'global',
+      authenticated: false,
+      is_cloud_run: false,
+      configured_databases: [
+        { id: 'p-a', name: 'Sales Postgres', type: 'postgres' },
+        { id: 'p-b', name: 'Marketing Postgres', type: 'postgres' },
+      ],
+      active_preset_id: 'p-a',
+      default_database_url: '',
+      active_database_url: '',
+      active_database_type: 'postgres',
+      active_is_custom: false,
+      active_custom_connection_key: '',
+      active_uses_custom_credentials: false,
+      database_name: 'Sales Postgres',
+      custom_database_name: '',
+      custom_database_url: '',
+      custom_databases: [],
+      auto_sql_execute: false,
+      in_scope_preset_ids: ['p-a', 'p-b'],
+      in_scope_custom_connection_keys: [],
+      in_scope_mode: 'all',
+      max_in_scope_connections: 20,
+      ...overrides,
+    };
+  }
+
+  async function mockAllModeConfig(page, overrides) {
+    const state = buildAllModeConfigState(overrides);
+    await page.route('**/api/config', async (route) => {
+      if (route.request().method() !== 'GET') return route.fallback();
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(state) });
+    });
+  }
+
+  function ndjsonBody(events) {
+    return events.map((e) => JSON.stringify(e)).join('\n') + '\n';
+  }
+
+  test('translate_submitted fires once per connection in the fan-out, in addition to (not instead of) the once-per-prompt call', async ({ page }) => {
+    await mockAllModeConfig(page); // auto_sql_execute: false - this test only cares about the translate side
+    await gotoApp(page);
+
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      const ndjson = ndjsonBody([
+        {
+          status: 'phase_a_route', routing_message: 'Checking both.',
+          connection_selection: [
+            { kind: 'preset', id: 'p-a', name: 'Sales Postgres', type: 'postgres', prompt: 'deals and campaigns' },
+            { kind: 'preset', id: 'p-b', name: 'Marketing Postgres', type: 'postgres', prompt: 'deals and campaigns' },
+          ],
+        },
+        {
+          status: 'phase_b_connection_done', kind: 'preset', id: 'p-a', name: 'Sales Postgres', type: 'postgres',
+          outcome: 'sql', sql: '-- database: preset:p-a (Sales Postgres)\nSELECT * FROM deals;',
+        },
+        {
+          status: 'phase_b_connection_done', kind: 'preset', id: 'p-b', name: 'Marketing Postgres', type: 'postgres',
+          outcome: 'note', text: 'Nothing relevant here.',
+        },
+        {
+          status: 'done', success: true, router_route: true, routing_message: 'Checking both.',
+          sql: '-- database: preset:p-a (Sales Postgres)\nSELECT * FROM deals;',
+          database_notes: [{ kind: 'preset', id: 'p-b', name: 'Marketing Postgres', text: 'Nothing relevant here.' }],
+          generation_failures: [],
+          connection_selection: [
+            { kind: 'preset', id: 'p-a', name: 'Sales Postgres', type: 'postgres', prompt: 'deals and campaigns' },
+            { kind: 'preset', id: 'p-b', name: 'Marketing Postgres', type: 'postgres', prompt: 'deals and campaigns' },
+          ],
+        },
+      ]);
+      await route.fulfill({ status: 200, contentType: 'application/x-ndjson', body: ndjson });
+    });
+
+    await page.locator('#aiPrompt').fill('deals and campaigns');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect.poll(() => currentSql(page)).toContain('SELECT');
+
+    // 1 generic "the prompt was submitted" call + 2 real per-database
+    // calls, ALL named 'translate_submitted' - see this describe block's
+    // own header comment for why they're not split into separate event
+    // names.
+    const events = await trackedEvents(page, 'translate_submitted');
+    expect(events.length).toBe(3);
+
+    // The generic, once-per-prompt call - same "All databases" badge text
+    // connDbName shows, and no way to know which specific database(s) will
+    // even be asked yet (translatePrompt() fires this before the request
+    // is even sent).
+    const genericEvent = events.find((e) => e.database_name === 'All databases');
+    expect(genericEvent).toBeTruthy();
+    expect(genericEvent.mode).toBe('all');
+
+    // The two real per-database calls, fired once phase_a_route reveals
+    // which connections the fan-out actually picked.
+    const perDatabase = events.filter((e) => e.database_name !== 'All databases');
+    expect(perDatabase.length).toBe(2);
+    expect(perDatabase.every((e) => e.mode === 'all')).toBe(true);
+    const byName = Object.fromEntries(perDatabase.map((e) => [e.database_name, e]));
+    expect(byName['Sales Postgres'].database_type).toBe('postgres');
+    expect(byName['Marketing Postgres'].database_type).toBe('postgres');
+
+    // No `prompt`/`sql` text on any of them - same GA privacy rule as
+    // every other translate/execute event in this file.
+    expect(events.every((e) => e.prompt === undefined && e.sql === undefined)).toBe(true);
+  });
+
+  test('sql_executed fires once per connection with trigger "auto" when auto-execute streams the fan-out - never once for the whole batch', async ({ page }) => {
+    await mockAllModeConfig(page, { auto_sql_execute: true });
+    await gotoApp(page);
+
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      const ndjson = ndjsonBody([
+        {
+          status: 'phase_a_route', routing_message: 'Checking both.',
+          connection_selection: [
+            { kind: 'preset', id: 'p-a', name: 'Sales Postgres', type: 'postgres' },
+            { kind: 'preset', id: 'p-b', name: 'Marketing Postgres', type: 'postgres' },
+          ],
+        },
+        {
+          status: 'phase_b_connection_done', kind: 'preset', id: 'p-a', name: 'Sales Postgres', type: 'postgres',
+          outcome: 'sql', sql: '-- database: preset:p-a (Sales Postgres)\nSELECT * FROM deals;',
+        },
+        {
+          status: 'phase_b_connection_done', kind: 'preset', id: 'p-b', name: 'Marketing Postgres', type: 'postgres',
+          outcome: 'sql', sql: '-- database: preset:p-b (Marketing Postgres)\nSELECT * FROM campaigns;',
+        },
+        {
+          status: 'done', success: true, router_route: true, routing_message: 'Checking both.',
+          sql:
+            '-- database: preset:p-a (Sales Postgres)\nSELECT * FROM deals;\n\n' +
+            '-- database: preset:p-b (Marketing Postgres)\nSELECT * FROM campaigns;',
+          database_notes: [], generation_failures: [],
+          connection_selection: [
+            { kind: 'preset', id: 'p-a', name: 'Sales Postgres', type: 'postgres' },
+            { kind: 'preset', id: 'p-b', name: 'Marketing Postgres', type: 'postgres' },
+          ],
+        },
+      ]);
+      await route.fulfill({ status: 200, contentType: 'application/x-ndjson', body: ndjson });
+    });
+    await page.route('**/api/execute', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      const body = route.request().postDataJSON();
+      const isA = body.sql.includes('preset:p-a');
+      await route.fulfill({
+        status: 200, contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          results: [
+            isA
+              ? { columns: ['total'], rows: [{ total: 500 }], rowCount: 1,
+                  database: { kind: 'preset', id: 'p-a', name: 'Sales Postgres' } }
+              : { columns: ['total'], rows: [{ total: 100 }], rowCount: 1,
+                  database: { kind: 'preset', id: 'p-b', name: 'Marketing Postgres' } },
+          ],
+        }),
+      });
+    });
+    await page.route('**/api/summarize-results', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ success: true, summary: '' }) });
+    });
+
+    await page.locator('#aiPrompt').fill('deals and campaigns');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect(page.locator('#resultsTabsNav .result-tab-btn')).toHaveCount(3);
+
+    // executeOneAllModeConnection() bypasses executeSql() (and its own
+    // once-per-click trackEvent('sql_executed', ...) call) entirely, so
+    // there's no third "generic" event here at all - only the two
+    // per-connection ones. Previously this meant NEITHER database's
+    // execution was tracked at all.
+    const events = await trackedEvents(page, 'sql_executed');
+    expect(events.length).toBe(2);
+    expect(events.every((e) => e.trigger === 'auto')).toBe(true);
+    const byName = Object.fromEntries(events.map((e) => [e.database_name, e]));
+    expect(byName['Sales Postgres'].database_type).toBe('postgres');
+    expect(byName['Marketing Postgres'].database_type).toBe('postgres');
+  });
+
+  test('sql_executed fires once per connection plus once for the whole click, for a single batched Execute (auto-execute off)', async ({ page }) => {
+    await mockAllModeConfig(page); // auto_sql_execute: false (default)
+    await gotoApp(page);
+
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      const ndjson = ndjsonBody([
+        {
+          status: 'phase_a_route', routing_message: 'Checking both.',
+          connection_selection: [
+            { kind: 'preset', id: 'p-a', name: 'Sales Postgres', type: 'postgres' },
+            { kind: 'preset', id: 'p-b', name: 'Marketing Postgres', type: 'postgres' },
+          ],
+        },
+        {
+          status: 'phase_b_connection_done', kind: 'preset', id: 'p-a', name: 'Sales Postgres', type: 'postgres',
+          outcome: 'sql', sql: '-- database: preset:p-a (Sales Postgres)\nSELECT * FROM deals;',
+        },
+        {
+          status: 'phase_b_connection_done', kind: 'preset', id: 'p-b', name: 'Marketing Postgres', type: 'postgres',
+          outcome: 'sql', sql: '-- database: preset:p-b (Marketing Postgres)\nSELECT * FROM campaigns;',
+        },
+        {
+          status: 'done', success: true, router_route: true, routing_message: 'Checking both.',
+          sql:
+            '-- database: preset:p-a (Sales Postgres)\nSELECT * FROM deals;\n\n' +
+            '-- database: preset:p-b (Marketing Postgres)\nSELECT * FROM campaigns;',
+          database_notes: [], generation_failures: [],
+          connection_selection: [
+            { kind: 'preset', id: 'p-a', name: 'Sales Postgres', type: 'postgres' },
+            { kind: 'preset', id: 'p-b', name: 'Marketing Postgres', type: 'postgres' },
+          ],
+        },
+      ]);
+      await route.fulfill({ status: 200, contentType: 'application/x-ndjson', body: ndjson });
+    });
+    await page.route('**/api/execute', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200, contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          results: [
+            { statement: 'SELECT * FROM deals', columns: ['x'], rows: [{ x: 1 }], rowCount: 1,
+              database: { kind: 'preset', id: 'p-a', name: 'Sales Postgres' } },
+            { statement: 'SELECT * FROM campaigns', columns: ['x'], rows: [{ x: 2 }], rowCount: 1,
+              database: { kind: 'preset', id: 'p-b', name: 'Marketing Postgres' } },
+          ],
+        }),
+      });
+    });
+    await page.route('**/api/summarize-results', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ success: true, summary: '' }) });
+    });
+
+    await page.locator('#aiPrompt').fill('deals and campaigns');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect.poll(() => currentSql(page)).toContain('SELECT');
+    // Nothing executed yet - auto-execute is off, so both connections still
+    // sit in their own "Ready to execute" placeholder (see
+    // multi-database.spec.js's identical test for this exact banner text).
+    expect((await trackedEvents(page, 'sql_executed')).length).toBe(0);
+
+    await page.locator('#runBtn').click();
+    await expect(page.locator('#resultsTabsNav .result-tab-btn').nth(1)).toContainText('Sales Postgres');
+
+    // One /api/execute round trip, but 1 generic click-level event + one
+    // real per-connection event underneath it, all named 'sql_executed' -
+    // same "additive under one name" reasoning as translate_submitted
+    // above, not a separate event name for the fan-out.
+    const events = await trackedEvents(page, 'sql_executed');
+    expect(events.length).toBe(3);
+
+    const genericEvent = events.find((e) => e.database_name === 'All databases');
+    expect(genericEvent).toBeTruthy();
+    expect(genericEvent.trigger).toBe('manual');
+
+    const perDatabase = events.filter((e) => e.database_name !== 'All databases');
+    expect(perDatabase.length).toBe(2);
+    expect(perDatabase.every((e) => e.trigger === 'manual')).toBe(true);
+    const byName = Object.fromEntries(perDatabase.map((e) => [e.database_name, e]));
+    expect(byName['Sales Postgres'].database_type).toBe('postgres');
+    expect(byName['Marketing Postgres'].database_type).toBe('postgres');
+  });
+});
+
 test.describe('analytics: report/feedback', () => {
   test('report_submitted fires with the report category on a successful send', async ({ page }) => {
     await mockIssueReportingEnabled(page, true);

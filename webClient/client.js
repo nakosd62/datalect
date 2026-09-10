@@ -765,7 +765,32 @@ document.addEventListener('DOMContentLoaded', async () => {
   // preferences_viewed, login, logout, mic_used, quick_prompt_clicked,
   // tour_exited. Custom, app-specific names
   // throughout (not GA4's own recommended-event vocabulary) - per explicit
-  // request.
+  // request. Deliberately kept to this small, fixed set of names, even
+  // where a new distinction was worth adding (see trackAllModeFanoutTranslate()/
+  // trackAllModeFanoutExecute() below) - one more differently-named event
+  // is one more row for anyone building a GA4 report/dashboard to know
+  // about, so a new *reason* to fire an existing event reuses its name
+  // rather than inventing another.
+  //
+  // "All databases" mode can fan a single user action out into several
+  // REAL per-database requests server/client-side - one LLM translate call
+  // per selected connection (translate_routes.py's _run_phase_b_fanout),
+  // and, with auto-execute on, one /api/execute call per connection too
+  // (client.js's executeOneAllModeConnection()/handlePhaseBConnectionDone()
+  // below) - so trackAllModeFanoutTranslate()/trackAllModeFanoutExecute()
+  // fire translate_submitted/sql_executed AGAIN, once per connection, right
+  // when THAT connection's own translate/execute request is actually
+  // dispatched (or, for translate, the moment the client learns the
+  // fan-out is starting - see trackAllModeFanoutTranslate()'s own comment).
+  // This is ADDITIVE to the existing once-per-user-action call each of
+  // these already had (one NL prompt submission, one Execute click/
+  // auto-execute) - both still fire under the same name, so a turn against
+  // 3 in-scope databases shows up as 4 total translate_submitted events
+  // (1 generic "the prompt was submitted" + 3 real per-database calls),
+  // not a brand-new event name to track separately. Distinguishable within
+  // GA4 by `database_name`/`database_type`: the once-per-action call's
+  // database_name is the generic "All databases" badge text (or blank),
+  // while each fan-out call's is that one specific database's own name.
   // ===========================================================================
 
   // GA4 silently truncates a custom event parameter's string value at 100
@@ -807,6 +832,67 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (ACTIVE_IS_CUSTOM) return ACTIVE_DB_TYPE || '';
     const preset = CONFIGURED_DBS.find((db) => db.id === ACTIVE_PRESET_ID);
     return (preset && preset.type) || '';
+  }
+
+  // Fires 'translate_submitted' AGAIN, once per connection in
+  // `connectionSelection` (the same {kind,id,name,type,prompt} list
+  // translate_routes.py's "phase_a_route" event and, for the rare
+  // no-live-stream fallback, its terminal line's own `connection_selection`
+  // both carry - see that field's own comment in translate_routes.py for
+  // the `type` addition this relies on) - additive to, not instead of,
+  // translatePrompt()'s own single top-level call for the whole prompt
+  // (see this section's header comment above for the full reasoning and
+  // the resulting per-turn event count). Called the moment the client
+  // learns Phase B's fan-out is happening at all - for the live-streaming
+  // path (startAllModeStreaming() below) that's as soon as "phase_a_route"
+  // arrives, which is BEFORE any individual connection's own generation
+  // call has actually finished, but the fan-out itself (translate_routes.py's
+  // _run_phase_b_fanout ThreadPoolExecutor submission) has already started
+  // server-side by the time that line is even written - so, same
+  // "submission, not completion" semantics the top-level call already
+  // uses, just one level down: one event per REAL translate call this
+  // turn is about to make. `mode: 'all'` is hardcoded (never 'single') -
+  // this only ever fires for "all databases" mode's own fan-out.
+  function trackAllModeFanoutTranslate(connectionSelection) {
+    (connectionSelection || []).forEach((entry) => {
+      trackEvent('translate_submitted', {
+        mode: 'all',
+        database_name: entry.name || '',
+        database_type: entry.type || '',
+        provider: ACTIVE_LLM_PROVIDER || '',
+        model: ACTIVE_LLM_MODEL || '',
+      });
+    });
+  }
+
+  // Fires 'sql_executed' AGAIN, for a single connection about to have (or
+  // already having had - see call sites below) its own SQL sent to
+  // /api/execute as part of "all databases" mode's fan-out - additive to,
+  // not instead of, executeSql()'s own single top-level call per Execute
+  // click/auto-execute (see this section's header comment above). `database`
+  // needs at least {name} and ideally {type}; call sites pass whatever they
+  // already have on hand (executeOneAllModeConnection()'s own `evt` carries
+  // `type` directly - see phase_b_connection_done's own comment in
+  // translate_routes.py - while the batched manual-Execute-click path looks
+  // it up from allModeStreamState.connectionOrder/
+  // pendingAllModeNotes.connectionPrompts, since execute_routes.py's own
+  // result/failure `.database` tags carry no dialect at all).
+  function trackAllModeFanoutExecute(database, trigger) {
+    trackEvent('sql_executed', {
+      database_name: (database && database.name) || '',
+      database_type: (database && database.type) || '',
+      trigger,
+    });
+  }
+
+  // Looks up a connection's own `type` (set server-side on both
+  // connection_selection and phase_b_connection_done - see
+  // translate_routes.py) from a {kind,id,...} list, by (kind, id) - shared
+  // by both trackAllModeFanoutExecute() call sites below that don't
+  // already have `type` sitting on the object they're tracking.
+  function findConnectionType(list, kind, id) {
+    const match = (list || []).find((e) => e.kind === kind && e.id === id);
+    return (match && match.type) || '';
   }
 
   // ===========================================================================
@@ -1355,8 +1441,30 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     if (signedIn) {
       const userEmail = displayEmail;
-      const initial = userEmail.charAt(0).toUpperCase() || 'U';
-      const avatarContent = (localSignedIn && payload.picture)
+      // Google's own `picture`/`given_name`/`name` claims inside the local
+      // JWT don't need this token to still be TRUSTED for authentication
+      // (that's `localSignedIn`/`isExpired` above, superseded by
+      // serverConfirmedAuthEmail once the ~1hr local token lapses) - they're
+      // just descriptive facts captured at sign-in time that don't become
+      // wrong the moment `exp` passes, and the browser never re-verifies
+      // the JWT's signature either way (that only ever happens server-side,
+      // when this token is sent as a Bearer credential - see
+      // getApiHeaders()). Reading `payload` here whenever it exists AT ALL
+      // - expired or not - rather than gating on `localSignedIn` the way
+      // this used to, is what keeps the avatar looking exactly like
+      // Google's own for the user's WHOLE session (up to 30 days, per the
+      // session-cookie feature above): without this, it fell back to a
+      // plain "first letter of email" circle within about an hour of
+      // signing in even though the user was still very much signed in -
+      // read as a surprising, faintly suspicious-looking downgrade rather
+      // than a normal, expected part of staying logged in. Only a
+      // payload-less signed-in state (no local token ever stored on this
+      // browser at all - just serverConfirmedAuthEmail on its own, e.g. a
+      // browser whose localStorage was cleared without also clearing the
+      // session cookie) still falls back to the plain email-initial circle.
+      const displayName = (payload && (payload.given_name || payload.name)) || '';
+      const initial = (displayName || userEmail).charAt(0).toUpperCase() || 'U';
+      const avatarContent = (payload && payload.picture)
         ? `<img src="${payload.picture}" class="auth-avatar-img" alt="Avatar">`
         : `<span class="auth-avatar-initial">${initial}</span>`;
 
@@ -6623,6 +6731,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   // updating those tabs live as the rest of this turn's events arrive.
   function startAllModeStreaming(evt, promptText) {
     const connectionSelection = evt.connection_selection || [];
+    // GA fan-out tracking (see trackAllModeFanoutTranslate's own comment) -
+    // one real translate call is about to happen (or has just been kicked
+    // off server-side) per connection here, regardless of how each one
+    // eventually turns out (sql/note/failed).
+    trackAllModeFanoutTranslate(connectionSelection);
     allModeStreamState = {
       prompt: promptText,
       routingMessage: evt.routing_message || null,
@@ -7000,6 +7113,13 @@ document.addEventListener('DOMContentLoaded', async () => {
   async function executeOneAllModeConnection(evt) {
     const state = allModeStreamState;
     const dbRef = { kind: evt.kind, id: evt.id, name: evt.name };
+    // GA fan-out tracking (see trackAllModeFanoutExecute's own comment) -
+    // fired on submission, same "not completion" reasoning as
+    // sql_executed's own top-level call, and evt.type (see
+    // phase_b_connection_done's own comment in translate_routes.py) means
+    // this needs no separate lookup the way the batched manual-click path
+    // below does.
+    trackAllModeFanoutExecute({ name: evt.name, type: evt.type }, 'auto');
     try {
       const response = await fetch('/api/execute', {
         method: 'POST',
@@ -7374,6 +7494,13 @@ document.addEventListener('DOMContentLoaded', async () => {
             // below, same as databaseSql just above.
             connectionPrompts: data.connection_selection || [],
           };
+          // GA fan-out tracking (see trackAllModeFanoutTranslate's own
+          // comment) - this is the rare no-live-stream fallback (never
+          // happens in real production traffic - see pendingAllModeNotes'
+          // own declaration comment), but the fan-out still genuinely
+          // happened server-side for this turn, so it still needs
+          // counting the same way the live-streaming branch above does.
+          trackAllModeFanoutTranslate(data.connection_selection || []);
 
           if (data.sql) {
             if (autoSqlExecuteEnabled) {
@@ -7638,6 +7765,36 @@ document.addEventListener('DOMContentLoaded', async () => {
       database_type: getActiveDatabaseType(),
       trigger: internal ? 'auto' : 'manual',
     });
+
+    // GA fan-out tracking (see trackAllModeFanoutExecute's own comment) -
+    // this is "all databases" mode's manual-Execute-button path (auto-
+    // execute streams its own per-connection events straight from
+    // executeOneAllModeConnection() instead, never through this shared
+    // function at all - see this function's own top comment), so `sql`
+    // above is really every still-pending connection's own marked SQL,
+    // joined into one string for a SINGLE batched /api/execute call - one
+    // real per-database execution is still about to happen per connection
+    // underneath that, so this fires one event per connection rather than
+    // one for the whole batch, mirroring trackAllModeFanoutTranslate's own
+    // "count the real requests, not the user action" reasoning.
+    if (allModeStreamState) {
+      currentResultsList
+        .filter((r) => r.isPending && r.database)
+        .forEach((r) => {
+          const type = findConnectionType(allModeStreamState.connectionOrder, r.database.kind, r.database.id);
+          trackAllModeFanoutExecute({ name: r.database.name, type }, 'manual');
+        });
+    } else if (pendingAllModeNotes) {
+      // Rare no-live-stream fallback (see pendingAllModeNotes' own
+      // declaration comment) - databaseSql is that turn's own per-database
+      // sql_blocks list; connectionPrompts (the fallback's own copy of
+      // connection_selection) is where `type` comes from, same lookup
+      // reasoning as the streaming branch above.
+      (pendingAllModeNotes.databaseSql || []).forEach((entry) => {
+        const type = findConnectionType(pendingAllModeNotes.connectionPrompts, entry.kind, entry.id);
+        trackAllModeFanoutExecute({ name: entry.name, type }, 'manual');
+      });
+    }
 
     // Single-connection mode's own "fetching" indicator - see
     // showFetchingResultsStatus()'s own declaration comment. Neither "all
