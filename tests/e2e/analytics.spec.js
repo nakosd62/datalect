@@ -613,9 +613,19 @@ test.describe('analytics: "all databases" mode fan-out', () => {
     // One /api/execute round trip, but 1 generic click-level event + one
     // real per-connection event underneath it, all named 'sql_executed' -
     // same "additive under one name" reasoning as translate_submitted
-    // above, not a separate event name for the fan-out.
+    // above, not a separate event name for the fan-out. executeSql()'s own
+    // trackEvent()/trackAllModeFanoutExecute() calls for this path fire
+    // synchronously in the click handler, before the /api/execute fetch is
+    // even sent, so in principle all 3 already exist by the time the tab
+    // assertion above resolves - but this exact line has been observed to
+    // read 0 events instead of 3 on an otherwise-identical run, which a
+    // page.evaluate() snapshot timed right off a UI assertion can't fully
+    // rule out (dataLayer lives in the page, snapshotting it is its own
+    // round trip). expect.poll() costs nothing when the count is already
+    // right (resolves on the first check) and removes the snapshot-timing
+    // risk entirely when it isn't.
+    await expect.poll(async () => (await trackedEvents(page, 'sql_executed')).length).toBe(3);
     const events = await trackedEvents(page, 'sql_executed');
-    expect(events.length).toBe(3);
 
     const genericEvent = events.find((e) => e.database_name === 'All databases');
     expect(genericEvent).toBeTruthy();

@@ -138,6 +138,43 @@ const test = isolatedTest.extend({
         body: JSON.stringify({ error: 'Translate was not mocked for this test.' }),
       });
     });
+    // client.js's bootstrap now awaits hydrateChatHistoryFromServer() -
+    // a real GET /api/chat-history call - as part of every single
+    // fetchBackendConfig() resolution, i.e. on every gotoApp() in this
+    // entire suite, whether or not a given spec has anything to do with
+    // chat history. Left unmocked, that's a real Flask + SQLite round
+    // trip added to the critical path of every test's page load. This
+    // default (an empty history, exactly what a fresh per-test identity -
+    // see the isolation note atop this file - would genuinely get back
+    // from the real endpoint anyway) removes that tax for the vast
+    // majority of specs that don't care. A spec that DOES need the real
+    // thing (chat-history-persistence.spec.js) calls page.unroute() on
+    // this pattern to restore pass-through to the real backend; every
+    // other spec that registers its own mock for this URL (e.g.
+    // auth-clears-state.spec.js) simply overrides this default the same
+    // way mockTranslate/mockExecute already do for their own routes.
+    await page.route('**/api/chat-history', async (route) => {
+      if (route.request().method() !== 'GET') return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ success: true, buckets: {}, active_bucket_key: '' }),
+      });
+    });
+    // Same reasoning as /api/chat-history above, for the History modal's
+    // own listing call (loadChatHistorySummary(), fired when #historyBtn
+    // is clicked) - only specs that open that modal ever hit this, but
+    // for those, an unmocked real summary call is an avoidable extra
+    // round trip too. Empty buckets renders as "No saved conversations
+    // yet." - a safe, valid default rather than an error state.
+    await page.route('**/api/chat-history/summary', async (route) => {
+      if (route.request().method() !== 'GET') return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ success: true, buckets: [] }),
+      });
+    });
     await use(page);
   },
 });

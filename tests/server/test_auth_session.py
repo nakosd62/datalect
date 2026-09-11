@@ -75,7 +75,16 @@ def test_read_session_email_returns_none_when_key_unset_even_with_a_token():
 def test_read_session_email_rejects_tampered_value(monkeypatch):
     monkeypatch.setenv(auth_session.SESSION_SIGNING_KEY_ENV_VAR, "some-key")
     token = auth_session.issue_session_token("alice@example.com")
-    tampered = token[:-1] + ("a" if token[-1] != "a" else "b")
+    # Flips the FIRST character, not the last: the token's final base64url
+    # character encodes the trailing 2 "don't-care" padding bits of a
+    # 20-byte HMAC signature (its length isn't a multiple of 3 bytes), so a
+    # single-character edit there can decode to the exact same signature
+    # bytes and leave a genuinely valid, unmodified token - itsdangerous
+    # would then correctly accept it, and this test would be wrong to
+    # expect rejection. Position 0 is always a byte-aligned start (of the
+    # payload segment), so mutating it is guaranteed to change the decoded
+    # bytes and trip real signature verification every time.
+    tampered = ("a" if token[0] != "a" else "b") + token[1:]
     assert auth_session.read_session_email(tampered) is None
 
 

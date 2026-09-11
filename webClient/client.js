@@ -1316,6 +1316,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   const newVersionReloadBtn = document.getElementById('newVersionReloadBtn');
   const newVersionDismissBtn = document.getElementById('newVersionDismissBtn');
 
+  // DOM Elements - Server Down Banner (see markServerUnreachable()/
+  // markServerReachable() below)
+  const serverDownBanner = document.getElementById('serverDownBanner');
+
   // DOM Elements - Results Table & Tabs
   const resultsRetryStatus = document.getElementById('resultsRetryStatus');
   const resultsTabsNav = document.getElementById('resultsTabsNav');
@@ -7407,6 +7411,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         body: JSON.stringify({ sql: evt.sql, pinned_connections: PINNED_CONNECTIONS }),
       });
       const data = await response.json();
+      // Got a real response back at all (whatever it says) - proves the
+      // server is reachable, so any lingering server-down banner (raised
+      // by the periodic poll, or by an earlier request that genuinely
+      // couldn't reach the server) is stale. See markServerReachable()'s
+      // own comment for why request successes clear it in addition to the
+      // periodic poll.
+      markServerReachable('execute_all_mode');
       const succeeded = Array.isArray(data.results) ? data.results : [];
       succeeded.forEach((r) => { if (!r.database) r.database = dbRef; });
 
@@ -7457,6 +7468,10 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (err && err.name === 'AbortError') {
         return;
       }
+      // A genuinely unreachable server, not this connection's SQL - see
+      // markServerUnreachable()'s own comment on why request failures (in
+      // addition to the periodic poll) raise the server-down banner.
+      markServerUnreachable('execute_all_mode');
       const errMsg = err.message || 'Failed to reach the execution backend server.';
       replaceAllModePlaceholder(dbRef, { isError: true, error: errMsg, database: dbRef });
       // Never even reached the server, so evt.sql (the marked SQL this
@@ -7674,6 +7689,11 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (evt.status === 'phase_b_connection_done') { handlePhaseBConnectionDone(evt); return; }
       });
       hideRetryStatus();
+      // The stream read to completion - the server is reachable, whatever
+      // this particular translation itself turned out to say. See
+      // executeOneAllModeConnection()'s identical call for why any real
+      // response clears the down banner, not just an outright success.
+      markServerReachable('translate');
 
       // connection_selection is only ever present when this session had
       // 2+ connections in scope for this turn (see translate_routes.py's
@@ -7902,6 +7922,10 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (err && err.name === 'AbortError') {
         return;
       }
+      // A genuinely unreachable server, not this prompt - see
+      // markServerUnreachable()'s own comment on why request failures (in
+      // addition to the periodic poll) raise the server-down banner.
+      markServerUnreachable('translate');
       setSqlQuery('');
 
       const errMsg = err.message || "Failed to reach the translation backend server.";
@@ -8105,6 +8129,9 @@ document.addEventListener('DOMContentLoaded', async () => {
       });
   
       const data = await response.json();
+      // See executeOneAllModeConnection()'s identical call for why any real
+      // response (not just a fully successful one) clears the down banner.
+      markServerReachable('execute');
       if (response.ok && data.success) {
         // A live "all databases" mode streaming turn (see this function's
         // top comment above) - this batched call only ever carries SQL
@@ -8477,6 +8504,10 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (err && err.name === 'AbortError') {
         return;
       }
+      // A genuinely unreachable server, not this query - see
+      // markServerUnreachable()'s own comment on why request failures (in
+      // addition to the periodic poll) raise the server-down banner.
+      markServerUnreachable('execute');
       const errMsg = err.message || "Failed to reach the execution backend server.";
       console.error("Failed to execute SQL:", err);
     }
@@ -8869,6 +8900,55 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
+  // --- Server-down banner ------------------------------------------------
+  // Before this existed, a genuinely unreachable server just surfaced as
+  // whatever generic "Network Error" text each individual call site (see
+  // translatePrompt()'s/executeSql()'s own catch blocks below) happened to
+  // render inline - accurate in isolation, but easy to misread as "my
+  // request/SQL is broken" rather than "the whole server is down", and
+  // gives no signal at all until the user actually tries something. This
+  // gives that specific situation one unmissable, unambiguous banner.
+  //
+  // Two independent things can raise it: the SAME periodic
+  // /api/client-version poll used for the new-version nudge below (so the
+  // banner can appear even before the user does anything - see that
+  // poll's own comment), and any of translatePrompt()'s/executeSql()'s/
+  // executeOneAllModeConnection()'s own request failures (so the user
+  // doesn't have to wait for the next poll tick to get an accurate
+  // explanation for a request that just failed in front of them).
+  //
+  // Symmetrically, it's cleared both by that same periodic poll succeeding
+  // AND by any translate/execute request succeeding (see those call sites'
+  // own markServerReachable() calls) - "succeeding" here means the request
+  // actually reached the server and got a real response back, whatever
+  // that response said, since that alone already proves the server (as
+  // opposed to this particular query/prompt) is fine. A user actively
+  // getting real responses is at least as strong a "the server is up"
+  // signal as the next scheduled poll tick, so there's no reason to make
+  // them wait for it once they've already seen one succeed.
+  // Also reported to GA as 'server_down'/'server_up' - fired only on the
+  // actual false->true/true->false EDGE, not on every call (markServerReachable()
+  // in particular is called from every successful translate/execute, which
+  // would otherwise fire an event on nearly every ordinary query). `source`
+  // identifies which of the several call sites made the detection (the
+  // periodic poll, or a specific request type) - not part of the ask, but
+  // cheap to include and useful if these ever need debugging.
+  let serverUnreachable = false;
+
+  function markServerUnreachable(source) {
+    const wasReachable = !serverUnreachable;
+    serverUnreachable = true;
+    if (serverDownBanner) serverDownBanner.classList.remove('hidden');
+    if (wasReachable) trackEvent('server_down', { source });
+  }
+
+  function markServerReachable(source) {
+    const wasUnreachable = serverUnreachable;
+    serverUnreachable = false;
+    if (serverDownBanner) serverDownBanner.classList.add('hidden');
+    if (wasUnreachable) trackEvent('server_up', { source });
+  }
+
   // --- New version (reload nudge) -------------------------------------
   // Lets the user know when the SERVER's client-facing code (index.html/
   // client.js/style.css) has changed since this page loaded - see server/
@@ -8877,16 +8957,28 @@ document.addEventListener('DOMContentLoaded', async () => {
   // reload - restarting the server after a backend-only change (nothing
   // under webClient/ touched) returns the SAME build id, so an already-
   // open tab stays quiet; only a real frontend change trips this.
+  //
+  // This same request doubles as the server-down liveness check above:
+  // /api/client-version needs no session/auth/database resolution at all
+  // (see its own docstring), so - unlike /api/translate or /api/execute -
+  // any non-2xx response from it (not just a thrown fetch exception) really
+  // does mean something is wrong at the infra level, not just "this
+  // particular request hit a normal, expected error".
   let startupClientBuildId = null;
   let newVersionBannerDismissed = false;
 
   async function fetchClientBuildId() {
     try {
       const response = await fetch('/api/client-version', { credentials: 'same-origin' });
-      if (!response.ok) return null;
+      if (!response.ok) {
+        markServerUnreachable('poll');
+        return null;
+      }
       const data = await response.json();
+      markServerReachable('poll');
       return data.client_build_id || null;
     } catch (e) {
+      markServerUnreachable('poll');
       return null;
     }
   }
@@ -8901,11 +8993,18 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   async function checkForNewClientVersion() {
-    // Nothing to compare against yet (startup fetch hasn't resolved, or
-    // failed) - skip this tick rather than treating "unknown" as "changed".
-    if (!startupClientBuildId) return;
     const currentId = await fetchClientBuildId();
-    if (currentId && currentId !== startupClientBuildId) {
+    if (!currentId) return;
+    if (!startupClientBuildId) {
+      // No baseline yet - most likely the server was down (or this poll's
+      // own startup fetch hadn't resolved yet) when the page first loaded,
+      // so there was nothing to compare against then. Adopt this as the
+      // baseline now instead of treating "we finally reached it" as "the
+      // version changed".
+      startupClientBuildId = currentId;
+      return;
+    }
+    if (currentId !== startupClientBuildId) {
       showNewVersionBanner();
     }
   }
@@ -8922,12 +9021,15 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // Captured once, in the background - deliberately NOT awaited here so it
   // never delays startup (fetchBackendConfig() and everything else below
-  // proceeds regardless of whether/when this resolves).
+  // proceeds regardless of whether/when this resolves). If the server is
+  // down right at page load, this same call already shows the server-down
+  // banner immediately, via fetchClientBuildId()'s own markServerUnreachable()
+  // call above - no need to wait for the first interval tick.
   fetchClientBuildId().then((id) => { startupClientBuildId = id; });
 
-  // 5 minutes: frequent enough to catch a deploy during a long-idle open
-  // tab, infrequent enough that it's not worth bothering with visibility-
-  // change-aware pausing.
+  // 5 minutes: frequent enough to catch a deploy (or an outage) during a
+  // long-idle open tab, infrequent enough that it's not worth bothering
+  // with visibility-change-aware pausing.
   setInterval(checkForNewClientVersion, 5 * 60 * 1000);
 
   await fetchBackendConfig();

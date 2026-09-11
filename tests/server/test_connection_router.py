@@ -1260,7 +1260,7 @@ def test_all_mode_failed_outcome_returns_fixed_apology_text_not_candidate_zero_f
     _, data = parse_translate_stream(resp)
     assert data['success'] is True
     assert len(harness.generate_calls) == 2  # triage's own bounded retry, then "failed"
-    assert data['sql'] == '*** NO SQL *** I am not able to respond to your prompt.'
+    assert data['sql'] == env.translate_routes._TRIAGE_FAILURE_TEXT
     # NOT a candidate-0 fallback guess - a wrong guess here would mean
     # actually running real SQL against a database the user never asked
     # about.
@@ -1277,9 +1277,9 @@ def test_all_mode_resource_exhausted_triage_shows_honest_message_not_generic_apo
     triage call has nowhere to rotate to and must give up immediately -
     but the user-facing text must say so honestly, via
     format_llm_error_for_user() (model name + category + the real error
-    text), NOT the generic "I am not able to respond to your prompt"
-    apology reserved for a genuinely unparseable response (see the test
-    just above, which must keep getting that exact text)."""
+    text), NOT the generic _TRIAGE_FAILURE_TEXT apology reserved for a
+    genuinely unparseable response (see the test just above, which must
+    keep getting that exact text)."""
     env = _two_preset_env(app_factory, tmp_path)  # GEMINI_PRESET_KEYS: one key
     login_as(env.client, "alice@example.com")
     _set_all_mode(env.client)
@@ -1298,7 +1298,7 @@ def test_all_mode_resource_exhausted_triage_shows_honest_message_not_generic_apo
         "*** NO SQL *** Datalect's reserved capacity for this model"
     )
     assert 'Actual error message received:\nfake API error 429' in data['sql']
-    assert data['sql'] != '*** NO SQL *** I am not able to respond to your prompt.'
+    assert data['sql'] != env.translate_routes._TRIAGE_FAILURE_TEXT
     assert 'router_route' not in data
     assert 'connection_selection' not in data
 

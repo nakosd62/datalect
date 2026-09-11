@@ -2084,6 +2084,32 @@ textarea.report-issue-preview:focus {
    --accent-cyan again, matching .results-retry-status/#stopBtn.btn-stop
    above - the same "mild notice, not alarming" precedent, since this too
    is only ever a suggestion, never a forced reload. */
+
+/* Server-down banner (see client.js's markServerUnreachable()/
+   markServerReachable()) - unlike .new-version-banner above, this reports
+   an actual ongoing problem rather than a friendly nudge, so it deliberately
+   uses --danger (matching .status-error/execution-error styling elsewhere
+   in this file) instead of the cyan "mild notice" tone, and has no dismiss
+   button: an outage shouldn't be hideable while it's still happening. It
+   clears itself automatically once the same check that raised it succeeds. */
+.server-down-banner {
+  display: flex;
+  align-items: center;
+  padding: 0.5rem 0.9rem;
+  margin: 0 0 0.75rem;
+  border-radius: 8px;
+  background: rgba(var(--danger-rgb), 0.1);
+  border: 1px solid rgba(var(--danger-rgb), 0.35);
+  color: var(--danger);
+  font-size: 0.85rem;
+  font-weight: 500;
+}
+
+.server-down-banner-text {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
 .new-version-banner {
   display: flex;
   align-items: center;
@@ -2991,7 +3017,22 @@ tr.report-issue-row td {
   white-space: nowrap;
 }
 
-.chat-history-bucket-delete-btn {
+/* #deleteAllChatHistoryBtn (index.html's modal-header "Delete All" button)
+   is styled identically here, by id - both it and each per-row button are
+   destructive/irreversible delete actions in the same modal, so they're
+   deliberately given the same look (danger-red outline, fills solid on
+   hover) rather than the header button using the ordinary .btn-primary
+   look. Deliberately NOT done by sharing this class name on that button
+   directly: .chat-history-bucket-delete-btn is also used as a functional
+   selector elsewhere (client.js's delegated per-row click handler, and
+   several e2e specs' `.chat-history-bucket-delete-btn` locators) to mean
+   specifically "one bucket row's own delete button" - putting the same
+   class on the unrelated header button would make every one of those
+   ambiguously match two elements instead of one. .history-action-btn
+   (also on that button) only contributes layout (min-width/alignment
+   inside the modal header) on top of this. */
+.chat-history-bucket-delete-btn,
+#deleteAllChatHistoryBtn {
   flex: 0 0 auto;
   padding: 0.3rem 0.75rem;
   font-size: 0.78rem;
@@ -3003,12 +3044,14 @@ tr.report-issue-row td {
   transition: var(--transition);
 }
 
-.chat-history-bucket-delete-btn:hover:not(:disabled) {
+.chat-history-bucket-delete-btn:hover:not(:disabled),
+#deleteAllChatHistoryBtn:hover:not(:disabled) {
   background: var(--danger, #f87171);
   color: var(--on-danger, #080b11);
 }
 
-.chat-history-bucket-delete-btn:disabled {
+.chat-history-bucket-delete-btn:disabled,
+#deleteAllChatHistoryBtn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }

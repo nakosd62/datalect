@@ -2527,7 +2527,12 @@ test.describe('multi-database question answering', () => {
     // The prompt shown is p-a's OWN triage-rewritten question, not the
     // original cross-database one and not p-b's rewrite either.
     await expect(page.locator('#aiPrompt')).toHaveValue('How are sales performing?');
-    await expect.poll(() => currentSql(page)).toContain('FROM deals');
+    // normalizedSql(), not currentSql() - CodeMirror's own SQL formatting
+    // can put "FROM" and "deals" on separate, indented lines (real
+    // pretty-printing, not a bug), so a raw two-word substring check
+    // against unnormalized text is flaky by construction. Same fix this
+    // file already applies at its 'SELECT 1'/'SELECT 2' checks above.
+    await expect.poll(() => normalizedSql(page)).toContain('FROM deals');
     // Summary tab (p-a's own Phase C paragraph) prepended and made active,
     // plus the one real result tab.
     await expect(page.locator('#resultsTabsNav .result-tab-btn')).toHaveCount(2);
@@ -2575,7 +2580,8 @@ test.describe('multi-database question answering', () => {
     // back/forward history", not just visible on first switch-to.
     await page.locator('#goBackBtn').click();
     await expect(page.locator('#aiPrompt')).toHaveValue('How are sales performing?');
-    await expect.poll(() => currentSql(page)).toContain('FROM deals');
+    // normalizedSql() - see the identical fix/comment earlier in this file.
+    await expect.poll(() => normalizedSql(page)).toContain('FROM deals');
     await expect(page.locator('#resultsTabsNav .result-tab-btn')).toHaveCount(2);
     await expect(page.locator('.response-text')).toContainText('Revenue is $500.');
 

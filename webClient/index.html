@@ -209,6 +209,10 @@
         </div>
       </div>
 
+      <div id="serverDownBanner" class="server-down-banner hidden" role="alert">
+        <span class="server-down-banner-text">Datalect server is currently not available. Please try again later. We apologize for the inconvenience.</span>
+      </div>
+
       <div id="newVersionBanner" class="new-version-banner hidden">
         <span class="new-version-banner-text">A new version of Datalect is available.</span>
         <button type="button" id="newVersionReloadBtn" class="new-version-banner-btn">Reload</button>
@@ -348,7 +352,7 @@
             <span>History</span>
           </h2>
           <div class="history-clear-wrapper">
-            <button type="button" id="deleteAllChatHistoryBtn" class="btn btn-primary history-action-btn">
+            <button type="button" id="deleteAllChatHistoryBtn" class="btn history-action-btn">
               <span>Delete All</span>
             </button>
             <div id="historyActionMsg" class="history-action-msg"></div>

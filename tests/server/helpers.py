@@ -120,6 +120,22 @@ def make_fernet_key():
     return Fernet.generate_key().decode()
 
 
+class FakeLanguageIdentifier:
+    """Stand-in for py3langid.langid.LanguageIdentifier - see
+    fresh_import()'s own comment on why this is patched in unconditionally
+    on every call, not opt-in like the install_fake_*_connect() harnesses
+    below. rank() always reports "nothing detected" (an empty list), which
+    translate_routes.py's _detect_language() already treats as a normal,
+    supported outcome (no test in this suite depends on a real detected
+    language, so there's nothing to make more realistic here)."""
+    @classmethod
+    def from_model_file(cls, *args, **kwargs):
+        return cls()
+
+    def rank(self, text):
+        return []
+
+
 def fresh_import(monkeypatch, tmp_path, env=None, register_blueprints=True, mock_firestore=False):
     """The one entry point every test file uses to get a clean, isolated
     instance of the app under a specific environment.
@@ -177,6 +193,24 @@ def fresh_import(monkeypatch, tmp_path, env=None, register_blueprints=True, mock
     for mod_name in list(sys.modules):
         if mod_name in _APP_MODULE_NAMES or mod_name.startswith("backends"):
             del sys.modules[mod_name]
+
+    # translate_routes.py loads a real py3langid language-detection model
+    # at module import time (its own comment explains why: ~1s of real
+    # LZMA-decompress-a-bundled-numpy-model work, deliberately paid ONCE
+    # per process rather than per-request). That's the right trade-off for
+    # a real running server, but this function re-executes translate_routes.py
+    # from scratch on every single test (see this module's docstring on why
+    # fresh imports are needed at all) - so left alone, every test in this
+    # whole suite would silently re-pay that ~1s of pure CPU-bound
+    # decompression, turning a fast suite into a very slow, CPU-pegged one
+    # for zero benefit (no test here exercises real language detection -
+    # see _detect_language()'s own no-op-on-failure design, which this
+    # leans on). Patching LanguageIdentifier itself (not just an instance)
+    # means translate_routes.py's own `from py3langid.langid import
+    # LanguageIdentifier as _LangIdentifier` picks up the fake automatically,
+    # whether or not that module actually gets re-imported this call.
+    import py3langid.langid as _py3langid_module
+    monkeypatch.setattr(_py3langid_module, "LanguageIdentifier", FakeLanguageIdentifier)
 
     fake_firestore_holder = {}
     if mock_firestore:

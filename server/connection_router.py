@@ -532,9 +532,9 @@ def triage_all_mode_question(candidate_summaries, user_question, provider, clien
     a different, honest message for the api_error=True case - built by
     format_llm_error_for_user() there from this result's "error" key (the
     raw exception the LLM call finally failed with - see that key's own
-    docstring just below) - instead of its fixed "I am not able to
-    respond to your prompt" apology (_TRIAGE_FAILURE_TEXT), which is
-    reserved for the genuinely-unparseable case.
+    docstring just below) - instead of its fixed "wasn't able to produce
+    a usable response" apology (_TRIAGE_FAILURE_TEXT), which is reserved
+    for the genuinely-unparseable case.
 
     `api_key`/`tried_keys` mirror generate_sql_for_connection's own
     parameters of the same name: both optional, defaulting to a freshly

@@ -17,6 +17,16 @@
 // and /api/execute are still mocked as usual (mockTranslate/mockExecute) -
 // this file has nothing to do with real LLM/DB behavior.
 //
+// fixtures.js's shared `test` fixture now installs a fast default mock for
+// GET /api/chat-history and GET /api/chat-history/summary (so the rest of
+// the suite doesn't pay for a real round trip it doesn't care about - see
+// that file's own comment). Both tests below call page.unroute() on those
+// two patterns before their first gotoApp(), which removes that default
+// and restores plain pass-through to the real backend for the whole test -
+// without it, hydrateChatHistoryFromServer() and loadChatHistorySummary()
+// would silently get the fixture's empty-history mock instead of what this
+// file actually saved, and every assertion below would fail.
+//
 // This runs under the shared "global" identity (no auth configured
 // locally), the same identity every other unmocked spec in this suite
 // runs under - so the turn pushed here is explicitly cleaned up (bucket
@@ -45,6 +55,12 @@ async function normalizedSql(page) {
 
 test.describe('chat history persistence', () => {
   test('a translated turn is saved to the real server and restored after a reload', async ({ page }) => {
+    // See the module comment above: opt this test out of the fixture's
+    // default chat-history mocks before the first gotoApp(), so both the
+    // initial and the post-save-reload hydrateChatHistoryFromServer()
+    // calls below hit the real server.
+    await page.unroute('**/api/chat-history');
+    await page.unroute('**/api/chat-history/summary');
     await mockTranslate(page, { sql: 'SELECT * FROM users LIMIT 5;' });
     await mockExecute(page, {
       results: [{ columns: ['id'], rows: [{ id: 1 }], rowCount: 1 }],
@@ -111,6 +127,8 @@ test.describe('chat history persistence', () => {
     // turns, delete one" feature actually works end to end, not just that
     // the right requests are fired (see analytics.spec.js's
     // chat_history_delete_clicked tests for that, with a mocked summary).
+    await page.unroute('**/api/chat-history');
+    await page.unroute('**/api/chat-history/summary');
     await mockTranslate(page, { sql: 'SELECT * FROM widgets;' });
     await mockExecute(page, {
       results: [{ columns: ['id'], rows: [{ id: 1 }], rowCount: 1 }],

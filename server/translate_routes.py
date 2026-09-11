@@ -251,7 +251,7 @@ _COMMON_FORMAT_RULES = (
     "If you can respond to the prompt succinctly based on your general-purpose training, return your response prepended by the string '*** NO SQL ***'\n"
     "If the prompt is about the data available in the database that is currently configured, return your response based on your knowledge of the schema and include an ER diagram using ascii art. Prepend the string '*** NO SQL ***' to your response\n"
     "If the prompt is about this app itself, respond as follows: '*** NO SQL *** OPEN HELP POPUP ***'.\n"
-    "If you cannot respond at all with reasonable confidence, return '*** NO SQL *** I am not able to respond to your prompt.'\n"
+    "If you cannot respond at all with reasonable confidence, return '*** NO SQL *** ' followed by a brief, specific explanation of WHY - e.g. the prompt is too ambiguous to act on, it references data/tables that aren't in the schema below, or it asks for something this database/dialect can't express. A bare, unexplained refusal (just 'I am not able to respond to your prompt.' with nothing else) is NOT acceptable - always give the user the actual reason, the same way you're required to explain your reasoning elsewhere in this app (e.g. when picking which database to check).\n"
     "If you run into any error, return '*** NO SQL *** I ran into this error: <the error>'.\n"
     "If you want to respond partly with a SQL command and partly with free text, enclose the free text as follows 'SELECT <your free-text response in quotes> as RESPONSE;'.\n"
     "If a user asks you who you are or what model you are using, hide this behind a generic response.\n"
@@ -1575,13 +1575,15 @@ def _strip_no_sql_prefix(text):
 
 
 # Fixed apology text for when "all databases" mode's triage call fails
-# outright (see triage_all_mode_question's "failed" outcome) - identical
-# to _COMMON_FORMAT_RULES' own "I cannot respond at all with reasonable
-# confidence" convention, reused verbatim rather than inventing new
-# copy, since the user-facing meaning is the same: the app has nothing
-# useful to say about this prompt. Reserved specifically for the
-# "api_error": False case - the model actually responded (twice), but
-# with something unparseable both times. The OTHER "failed" case
+# outright (see triage_all_mode_question's "failed" outcome). Reserved
+# specifically for the "api_error": False case - the model actually
+# responded (twice), but with something unparseable both times, so there's
+# no real per-call detail to surface (unlike _COMMON_FORMAT_RULES' own "I
+# cannot respond with reasonable confidence" case, which asks the MODEL
+# itself to explain why in its own words - there's no such text to draw on
+# here). Still names the one honest reason that IS known (two attempts,
+# neither produced a usable response) rather than a bare, unexplained "I
+# am not able to respond" with nothing behind it. The OTHER "failed" case
 # (api_error=True: the LLM call itself raised, and its own retry budget -
 # key rotation and/or transient-error retries - was fully used up without
 # ever getting a response at all) used to show a second fixed apology
@@ -1591,7 +1593,10 @@ def _strip_no_sql_prefix(text):
 # stream_translation()'s router branch below) - honest about WHY it
 # failed, and including the real error, rather than one more generic
 # "try again in a moment."
-_TRIAGE_FAILURE_TEXT = "*** NO SQL *** I am not able to respond to your prompt."
+_TRIAGE_FAILURE_TEXT = (
+    "*** NO SQL *** I wasn't able to produce a usable response to your "
+    "prompt, even after retrying. Try rephrasing your question."
+)
 
 
 def generate_sql_for_connection(descriptor, prompt, history, provider, client, model,
