@@ -47,6 +47,23 @@ auth_bp = Blueprint('auth', __name__)
 # logged in".
 ANONYMOUS_USER_ID_PREFIX = "anonymous:"
 
+# How long the crbot_session_id cookie (get_or_create_session_id/
+# apply_session_cookie below) lives - was a fixed 24h, which meant an
+# anonymous visitor's DB connection choice, auto-execute preference, and
+# (as of the persisted chat-history feature) entire conversation history
+# were all silently orphaned every single day, forcing a fresh identity on
+# their very next visit regardless of how recently they'd been active.
+# Set to 400 days - not a round number chosen for its own sake, but the
+# actual ceiling: Chrome (since 2023) and every other major browser now
+# hard-caps a cookie's Max-Age/Expires at 400 days regardless of what a
+# server asks for, so this is genuinely "as long-lived as a cookie can be
+# made", the closest thing to "forever" this mechanism allows. A visitor
+# who returns within this window keeps the exact same anonymous identity
+# (and therefore every bucket of history, every saved preference) they had
+# before; one who doesn't returns as a brand-new anonymous identity, same
+# as today, just after a much longer gap.
+ANONYMOUS_SESSION_COOKIE_MAX_AGE_SECONDS = 400 * 24 * 60 * 60
+
 
 def is_anonymous_user(user_identity):
     """True if `user_identity` represents an anonymous (unauthenticated)
@@ -209,7 +226,7 @@ def apply_session_cookie(response, session_id):
         session_id,
         httponly=True,
         samesite='Lax',
-        max_age=86400
+        max_age=ANONYMOUS_SESSION_COOKIE_MAX_AGE_SECONDS
     )
     return response
 

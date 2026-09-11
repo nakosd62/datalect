@@ -1752,12 +1752,13 @@ def _drain_generation(gen):
 
 def _classify_generation_outcome(entry, outcome):
     """Classifies one connection's raw Phase B outcome - either
-    ("ok", generated_sql, usage_info) or ("failed", error_str), the exact
-    tuple shapes _run_phase_b_fanout's ThreadPoolExecutor loop already
-    produces - into the one shape both that function's per-completion
-    streaming event AND its final original-order summary loop need, so
-    the marker-prepend/note-strip logic is written exactly once instead
-    of twice. Returns one of:
+    ("ok", generated_sql, usage_info, duration_ms) or
+    ("failed", error_str, duration_ms), the exact tuple shapes
+    _run_phase_b_fanout's ThreadPoolExecutor loop already produces - into
+    the one shape both that function's per-completion streaming event AND
+    its final original-order summary loop need, so the marker-prepend/
+    note-strip logic is written exactly once instead of twice. Returns one
+    of:
       {"outcome": "sql", "sql": <marker-prepended text>}
       {"outcome": "note", "text": <str, '*** NO SQL ***' prefix stripped -
         "" for the rare case where the model returned a blank response;
@@ -1768,11 +1769,15 @@ def _classify_generation_outcome(entry, outcome):
         note rather than silently vanishing from the stream too>
       {"outcome": "failed", "error": <str>}
     Never raises - a raised generation call is already represented as
-    outcome[0] == "failed" by the caller before this is invoked.
+    outcome[0] == "failed" by the caller before this is invoked. The
+    trailing duration_ms in both tuple shapes is irrelevant to
+    classification itself (it's what _run_phase_b_fanout's own final loop
+    uses to log each connection's own translations-table row) - unpacked
+    here only so this still works against the real tuple shape.
     """
     if outcome[0] == "failed":
         return {"outcome": "failed", "error": outcome[1]}
-    _, generated_sql, _usage_info = outcome
+    _, generated_sql, _usage_info, _duration = outcome
     stripped = (generated_sql or "").strip()
     if not stripped:
         return {"outcome": "note", "text": ""}
@@ -1846,7 +1851,8 @@ def _run_phase_b_fanout(selected_entries, prompts, histories, provider, model, u
     both by db.py's schema-summary fan-out and by execute_routes.py's
     per-connection execution.
 
-    Returns (sql_blocks, database_notes, generation_failures, usage_totals):
+    Returns (sql_blocks, database_notes, generation_failures, usage_totals,
+    phase_b_log_entries):
       sql_blocks: [(entry, marked_sql_text), ...] - one per entry that
         returned REAL SQL, marker-prepended here (mechanically, by this
         function - never by the model, which only ever sees ONE
@@ -1863,6 +1869,24 @@ def _run_phase_b_fanout(selected_entries, prompts, histories, provider, model, u
       usage_totals: the five usage_info keys, summed across every call
         that actually produced a billable response (a failed call
         contributes nothing).
+      phase_b_log_entries: [{"entry", "prompt", "duration", "sql_command",
+        "usage"}, ...] - ONE PER SELECTED CONNECTION, regardless of
+        outcome, same original order - what stream_translation()'s "route"
+        outcome branch needs to log each connection's OWN dedicated
+        translations-table row (see record_translation) rather than one
+        combined row for the whole batch attributed to only the first
+        connection, which is what this function used to force on every
+        caller. `duration` is this connection's own real measured elapsed
+        time (never a derived share of a shared total - these calls run in
+        parallel, so "correct" here means each call's own actual wall
+        time), `usage` is `{}` for a failed call (nothing billable was
+        ever returned) or that call's real usage_info dict otherwise, and
+        `sql_command` is the exact text to log - real marker-prepended
+        SQL, a "*** NO SQL ***"-prefixed note (or the bare prefix alone
+        for the rare blank-response case), or a "TRANSLATION_ERROR
+        (<error>)" sentinel - matching whichever of the three outcomes
+        this specific connection had, the same conventions used elsewhere
+        in this module for a non-SQL or failed translation.
 
     Resolves `user_identity`'s "Bring Your Own Key" value for `provider`
     (state_store.get_llm_byok_key) exactly ONCE here, up front - not
@@ -1908,23 +1932,47 @@ def _run_phase_b_fanout(selected_entries, prompts, histories, provider, model, u
         )
         return _drain_generation(gen)  # (generated_sql, usage_info, duration_ms, _key, _client)
 
+    def _run_one_timed(entry, entry_prompt, entry_history):
+        # Wraps _run_one with its OWN start_time, captured here rather than
+        # trusting generate_sql_for_connection's own returned duration_ms -
+        # that value only exists on the success path (it's computed right
+        # before that function's `return`, which a raised LlmCallFailed
+        # never reaches). Measuring here instead means every connection
+        # gets a real, honest duration whether it ultimately succeeds or
+        # fails - each per-connection translations-table row logged below
+        # (see stream_translation()'s "route" outcome branch) needs exactly
+        # this, the same way the single-connection /api/translate failure
+        # path and generate_sql_for_connection's own success path do.
+        start_time = time.perf_counter()
+        try:
+            generated_sql, usage_info, _duration, _key, _client = _run_one(entry, entry_prompt, entry_history)
+            duration = round(1000 * (time.perf_counter() - start_time))
+            return ("ok", generated_sql, usage_info, duration)
+        except Exception as e:
+            duration = round(1000 * (time.perf_counter() - start_time))
+            return ("failed", str(e), duration)
+
     outcomes = [None] * len(selected_entries)
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(selected_entries)) as pool:
         future_to_index = {
-            pool.submit(_run_one, entry, prompts[i], histories[i]): i for i, entry in enumerate(selected_entries)
+            pool.submit(_run_one_timed, entry, prompts[i], histories[i]): i
+            for i, entry in enumerate(selected_entries)
         }
         for future in concurrent.futures.as_completed(future_to_index):
             index = future_to_index[future]
             entry = selected_entries[index]
-            try:
-                generated_sql, usage_info, _duration, _key, _client = future.result()
-                outcomes[index] = ("ok", generated_sql, usage_info)
-            except Exception as e:
+            # _run_one_timed never raises (it catches its own exceptions
+            # to measure duration on both the success and failure path -
+            # see its own comment) - future.result() here can only ever
+            # raise for something truly unexpected (e.g. the worker thread
+            # itself being killed), which is deliberately NOT caught, same
+            # as any other unexpected crash in this module.
+            outcomes[index] = future.result()
+            if outcomes[index][0] == "failed":
                 logger.warning(
                     "Phase B generation failed for %s:%s: %s",
-                    entry["kind"], entry["id"], e,
+                    entry["kind"], entry["id"], outcomes[index][1],
                 )
-                outcomes[index] = ("failed", str(e))
             # Yielded in COMPLETION order (whatever order this loop
             # actually reaches each future in) - NOT `index` order. The
             # final, order-stable return value below is rebuilt from
@@ -1937,13 +1985,41 @@ def _run_phase_b_fanout(selected_entries, prompts, histories, provider, model, u
     sql_blocks, database_notes, generation_failures = [], [], []
     usage_totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
                      "thinking_tokens": 0, "cached_content_tokens": 0}
-    for entry, outcome in zip(selected_entries, outcomes):
+    # One entry per connection in `selected_entries` (ORIGINAL order, same
+    # as everything else this function returns) - everything
+    # stream_translation()'s "route" outcome branch needs to log this
+    # connection's OWN dedicated translations-table row, rather than the
+    # old single combined row attributed only to the first selected
+    # connection (see this function's own module-level history/audit
+    # notes above - this replaces that bundling entirely, one real row per
+    # connection instead of one for the whole batch): the descriptor to
+    # attribute it to, the actual per-connection instruction that was sent
+    # (prompts[i] - triage's own rewrite when it supplied one, else the
+    # user's original question, same resolution stream_translation()
+    # already does before calling this function), the real per-connection
+    # duration measured above (never a derived share of the total wall
+    # time - these calls run in parallel, so each one's own elapsed time
+    # is the honest number), that connection's own usage (zeroed for a
+    # failure, same convention the single-connection /api/translate
+    # failure path now uses), and the sql_command text to log - real SQL,
+    # a "*** NO SQL ***"-prefixed note, or a TRANSLATION_ERROR(...)
+    # sentinel, matching whichever of the three outcomes this connection
+    # actually had.
+    phase_b_log_entries = []
+    for i, (entry, outcome) in enumerate(zip(selected_entries, outcomes)):
+        entry_prompt = prompts[i]
         if outcome[0] == "failed":
+            _, error_str, duration = outcome
             generation_failures.append({
-                "kind": entry["kind"], "id": entry["id"], "name": entry["name"], "error": outcome[1],
+                "kind": entry["kind"], "id": entry["id"], "name": entry["name"], "error": error_str,
+            })
+            phase_b_log_entries.append({
+                "entry": entry, "prompt": entry_prompt, "duration": duration,
+                "sql_command": f"TRANSLATION_ERROR ({error_str})",
+                "usage": {},
             })
             continue
-        _, generated_sql, usage_info = outcome
+        _, generated_sql, usage_info, duration = outcome
         for k in usage_totals:
             # `or 0` guards against a provider returning this key present
             # but explicitly None (e.g. real Gemini responses report
@@ -1957,19 +2033,28 @@ def _run_phase_b_fanout(selected_entries, prompts, histories, provider, model, u
         classified = _classify_generation_outcome(entry, outcome)
         if classified["outcome"] == "sql":
             sql_blocks.append((entry, classified["sql"]))
-        elif classified["outcome"] == "note" and classified["text"]:
-            # The empty-text case (generated_sql was blank after
-            # stripping) is intentionally still dropped here - same
-            # behavior this function's inline code always had before the
-            # _classify_generation_outcome extraction - only the
-            # per-completion streaming event above surfaces it at all (as
-            # an empty note), so a client-side placeholder tab still has
-            # something to settle into.
-            database_notes.append({
-                "kind": entry["kind"], "id": entry["id"], "name": entry["name"],
-                "text": classified["text"],
-            })
-    return sql_blocks, database_notes, generation_failures, usage_totals
+            log_sql_command = classified["sql"]
+        else:
+            # "note" outcome - classified["text"] may legitimately be ""
+            # (the model's response was blank after stripping); the
+            # aggregate `database_notes` list still drops that empty case
+            # exactly as it always has (nothing useful to show in the
+            # Summary tab for it), but this connection still gets its own
+            # logged row below, using the same "*** NO SQL ***" convention
+            # as every other non-SQL reply in this table - an empty note
+            # logs as the bare prefix rather than silently having no
+            # sql_command text at all.
+            if classified["text"]:
+                database_notes.append({
+                    "kind": entry["kind"], "id": entry["id"], "name": entry["name"],
+                    "text": classified["text"],
+                })
+            log_sql_command = ("*** NO SQL *** " + classified["text"]) if classified["text"] else "*** NO SQL ***"
+        phase_b_log_entries.append({
+            "entry": entry, "prompt": entry_prompt, "duration": duration,
+            "sql_command": log_sql_command, "usage": usage_info or {},
+        })
+    return sql_blocks, database_notes, generation_failures, usage_totals, phase_b_log_entries
 
 
 # --- "All databases" mode, Phase C: post-execution results summarization ---
@@ -2808,7 +2893,16 @@ def summarize_results():
     zipped back against `parsed["per_database"]` by the same 0-based index
     _build_summary_prompt's "[i]" labels used - a reliability improvement
     over the old free-text convention, which trusted the model to copy a
-    database's name into its own prose verbatim. "database_summaries" and
+    database's name into its own prose verbatim. Grouped by (kind, id)
+    before that heading is built, since `database_results` (and so
+    `per_database`) has one entry per STATEMENT RESULT, not per database -
+    a database whose SQL had multiple statements gets multiple indices,
+    all sharing the same identity - so "database_summaries" really is one
+    entry PER DATABASE (as its own shape below already promised), each
+    "text" combining every one of that database's own resultset
+    paragraphs (newline-joined, so they render as sub-paragraphs nested
+    under one heading rather than that heading repeating once per
+    resultset), not one entry per resultset. "database_summaries" and
     "cross_database_summary" are purely ADDITIVE new fields alongside that
     unchanged "summary" string (Chunk 1's own sql_blocks precedent) - the
     per-database split callers need to record separate per-database turns
@@ -2873,6 +2967,18 @@ def summarize_results():
                 if isinstance(error, BaseException) else
                 'Unable to summarize results right now.'
             )
+            # Logged the same way a successful Phase C call is (see below) -
+            # "All Databases"/"All Databases", 0 duration-attributed tokens
+            # (a total failure never has a usable response to report token
+            # counts from - see summarize_all_mode_results'/_summarize_with_
+            # retry's own docstrings), and the sql_command column holding a
+            # TRANSLATION_ERROR(...) sentinel rather than real SQL, since
+            # there is none - same overloaded-column convention this app
+            # already uses for "*** NO SQL ***" text.
+            record_all_databases_triage(
+                user_identity, prompt, f"TRANSLATION_ERROR ({error_message})", llm_model, duration,
+                0, 0, 0, 0, 0,
+            )
             yield json.dumps({'status': 'done', 'success': False, 'error': error_message}) + "\n"
             return
 
@@ -2883,16 +2989,50 @@ def summarize_results():
         # route's own docstring above for why this reconstruction (rather
         # than trusting the model's own name copy) is now a reliability
         # improvement, not just a format change.
+        #
+        # `database_results` has one entry per STATEMENT RESULT/note/
+        # failure (see _build_summary_prompt's own docstring), not one per
+        # database - a database whose own SQL had multiple statements
+        # contributes multiple entries here, all sharing the same (kind,
+        # id, name), and the model likewise wrote one paragraph per index
+        # (still asked to reason about just "that index's" own results,
+        # not to merge across indices itself - the wording of each
+        # paragraph is unchanged by this). Grouped here, by (kind, id), so
+        # the rendered summary shows ONE heading per actual database, with
+        # each of its own resultsets' paragraphs nested underneath as
+        # sub-paragraphs (joined by a single '\n' - a soft line break the
+        # Summary tab's `white-space: pre-wrap` renders without a blank
+        # line, distinct from the blank-line-separated '\n\n' between
+        # different databases below) - instead of the same database's name
+        # repeating as a separate, flat top-level paragraph once per
+        # resultset.
         per_database = parsed["per_database"]
+        grouped_by_database = {}
+        database_order = []
+        for i, entry in enumerate(database_results):
+            key = (entry.get("kind"), entry.get("id"))
+            if key not in grouped_by_database:
+                grouped_by_database[key] = {
+                    "kind": entry.get("kind"), "id": entry.get("id"),
+                    "name": entry.get("name") or "Unknown database",
+                    "paragraphs": [],
+                }
+                database_order.append(key)
+            grouped_by_database[key]["paragraphs"].append(per_database.get(i, ""))
+
         database_summaries = []
         summary_paragraphs = []
-        for i, entry in enumerate(database_results):
-            name = entry.get("name") or "Unknown database"
-            paragraph = per_database.get(i, "")
+        for key in database_order:
+            group = grouped_by_database[key]
+            # One combined block of text per database - a single resultset
+            # (the common case) looks byte-identical to before this
+            # change; 2+ resultsets get their own paragraphs stacked on
+            # separate lines under the one heading instead of repeating it.
+            combined_text = "\n".join(p for p in group["paragraphs"] if p)
             database_summaries.append({
-                "kind": entry.get("kind"), "id": entry.get("id"), "name": name, "text": paragraph,
+                "kind": group["kind"], "id": group["id"], "name": group["name"], "text": combined_text,
             })
-            summary_paragraphs.append(f"**{name}:** {paragraph}")
+            summary_paragraphs.append(f"**{group['name']}:** {combined_text}")
 
         cross_database_summary = parsed.get("cross_database")
         if cross_database_summary:
@@ -3148,6 +3288,16 @@ def summarize_result():
                 format_llm_error_for_user(provider, llm_model, error, using_byok=bool(byok_key))
                 if isinstance(error, BaseException) else
                 'Unable to summarize results right now.'
+            )
+            # Logged against the real connection this was run for (unlike
+            # Phase C's "All Databases"/"All Databases" logging above), 0
+            # tokens (no usable response on a total failure - see
+            # _summarize_with_retry's own docstring), sql_command holding a
+            # TRANSLATION_ERROR(...) sentinel in place of real SQL, same
+            # overloaded-column convention "*** NO SQL ***" already uses.
+            record_translation(
+                user_identity, conn_str, prompt, f"TRANSLATION_ERROR ({error_message})", llm_model, duration,
+                0, 0, 0, 0, 0,
             )
             yield json.dumps({'status': 'done', 'success': False, 'error': error_message}) + "\n"
             return
@@ -3587,7 +3737,7 @@ def translate_query():
                                 **classified,
                             }) + "\n"
                     except StopIteration as stop:
-                        sql_blocks, database_notes, generation_failures, phase_b_usage = stop.value
+                        sql_blocks, database_notes, generation_failures, phase_b_usage, phase_b_log_entries = stop.value
 
                     generated_sql = "\n\n".join(marked for _, marked in sql_blocks)
                     # Per-database structured equivalent of the joined
@@ -3599,10 +3749,12 @@ def translate_query():
                     # be reconstructed later by re-parsing the combined
                     # string's own '-- database: ...' markers. `sql`
                     # above stays exactly as it's always been (joined,
-                    # marker-tagged) for every existing consumer (history
-                    # logging via record_translation below, the SQL
-                    # editor box, existing tests) - this is purely
-                    # additive, feeding a future per-database-history
+                    # marker-tagged) for every existing consumer (the
+                    # response's own 'sql' field, the SQL editor box,
+                    # existing tests) - history logging below now uses
+                    # `phase_b_log_entries` instead, one dedicated row per
+                    # connection, rather than this joined string. This is
+                    # purely additive, feeding a future per-database-history
                     # feature (and any other future per-database
                     # consumer) without touching anything that already
                     # depends on the flattened shape. Only ever present
@@ -3643,7 +3795,6 @@ def translate_query():
                         "generation_failures": generation_failures,
                         "sql_blocks": sql_by_database,
                     }
-                    record_entry = selected_entries[0]
                     # Phase A's own text isn't real SQL - "route" just
                     # means it decided real data was needed and picked
                     # who to ask, same '*** NO SQL ***' convention as the
@@ -3673,20 +3824,27 @@ def translate_query():
                 )
 
                 if triage_result["outcome"] == "route":
-                    # Phase B's own portion only, attributed to the first
-                    # selected connection (same convention `connection_
-                    # selection`'s ordering already uses elsewhere in this
-                    # branch) - Phase A's share of the total duration/usage
-                    # was already logged separately just above, so it's
-                    # subtracted out here rather than counted twice.
-                    phase_b_duration = max(0, duration - triage_duration)
-                    record_translation(
-                        user_identity, record_entry["descriptor"], prompt, generated_sql, llm_model,
-                        phase_b_duration,
-                        phase_b_usage.get("input_tokens", 0), phase_b_usage.get("output_tokens", 0),
-                        phase_b_usage.get("total_tokens", 0), phase_b_usage.get("thinking_tokens", 0),
-                        phase_b_usage.get("cached_content_tokens", 0),
-                    )
+                    # One dedicated translations-table row PER SELECTED
+                    # CONNECTION - not one combined row for the whole batch
+                    # attributed only to the first connection, which is
+                    # what this used to do (see phase_b_log_entries'
+                    # docstring in _run_phase_b_fanout for the full
+                    # reasoning). Each entry already carries its own real,
+                    # independently-measured duration and its own usage
+                    # (zeroed for a failure) - no derived "share of the
+                    # total" math needed here at all, since Phase A's
+                    # duration/usage was already logged separately above
+                    # and every Phase B call's own elapsed time was
+                    # measured directly, not inferred from a shared total.
+                    for log_entry in phase_b_log_entries:
+                        usage = log_entry["usage"]
+                        record_translation(
+                            user_identity, log_entry["entry"]["descriptor"], log_entry["prompt"],
+                            log_entry["sql_command"], llm_model, log_entry["duration"],
+                            usage.get("input_tokens", 0), usage.get("output_tokens", 0),
+                            usage.get("total_tokens", 0), usage.get("thinking_tokens", 0),
+                            usage.get("cached_content_tokens", 0),
+                        )
 
                 # `sql` may legitimately be "" here (every selected
                 # connection returned a note or failed) - still
@@ -3799,69 +3957,103 @@ def translate_query():
             # separately via tried_llm_keys/gemini_key_pool_size, so a run
             # of 429s doesn't eat into this counter at all, and vice versa.
             transient_attempt = 1
-            while True:
-                try:
-                    generated_sql, usage_info = provider.call(client, llm_model, llm_input, system_instruction)
-                    break
-                except Exception as e:
-                    retry_action = provider.classify_error(e)
-                    if retry_action is None:
-                        raise LlmCallFailed(format_llm_error_for_user(provider, llm_model, e, using_byok=bool(byok_key))) from e
-
-                    if retry_action["rotate_key"]:
-                        # Key-rotation budget: one attempt per configured
-                        # key. Checked BEFORE picking the next key (rather
-                        # than relying on pick_api_key's own fallback-to-
-                        # full-pool behavior) so exhaustion is decided here,
-                        # not masked by that fallback.
-                        if len(tried_llm_keys) >= key_pool_size:
+            try:
+                while True:
+                    try:
+                        generated_sql, usage_info = provider.call(client, llm_model, llm_input, system_instruction)
+                        break
+                    except Exception as e:
+                        retry_action = provider.classify_error(e)
+                        if retry_action is None:
                             raise LlmCallFailed(format_llm_error_for_user(provider, llm_model, e, using_byok=bool(byok_key))) from e
-                        next_key = provider.pick_api_key(exclude=tried_llm_keys)
-                        if next_key != api_key:
-                            api_key = next_key
-                            client = provider.make_client(api_key)
-                        tried_llm_keys.add(api_key)
-                        # No "in %ds" here - a key-rotation retry always
-                        # fires immediately (see _classify_gemini_error's
-                        # comment for why waiting doesn't make sense when
-                        # the next attempt already uses a different key).
+
+                        if retry_action["rotate_key"]:
+                            # Key-rotation budget: one attempt per configured
+                            # key. Checked BEFORE picking the next key (rather
+                            # than relying on pick_api_key's own fallback-to-
+                            # full-pool behavior) so exhaustion is decided here,
+                            # not masked by that fallback.
+                            if len(tried_llm_keys) >= key_pool_size:
+                                raise LlmCallFailed(format_llm_error_for_user(provider, llm_model, e, using_byok=bool(byok_key))) from e
+                            next_key = provider.pick_api_key(exclude=tried_llm_keys)
+                            if next_key != api_key:
+                                api_key = next_key
+                                client = provider.make_client(api_key)
+                            tried_llm_keys.add(api_key)
+                            # No "in %ds" here - a key-rotation retry always
+                            # fires immediately (see _classify_gemini_error's
+                            # comment for why waiting doesn't make sense when
+                            # the next attempt already uses a different key).
+                            logger.warning(
+                                "%s call failed (%d/%d configured keys tried), rotating API key and retrying immediately: %s",
+                                provider.name, len(tried_llm_keys), key_pool_size, e
+                            )
+                            # Told to the client before continuing, so
+                            # "retrying..." is visible even though there's no
+                            # delay to speak of.
+                            yield json.dumps({
+                                "status": "retrying",
+                                "attempt": len(tried_llm_keys),
+                                "maxAttempts": key_pool_size,
+                                "delaySeconds": 0,
+                                "rotatedKey": True,
+                            }) + "\n"
+                            continue
+
+                        # Shared transient-error budget (both providers).
+                        if transient_attempt >= MAX_TRANSLATION_ATTEMPTS:
+                            raise LlmCallFailed(format_llm_error_for_user(provider, llm_model, e, using_byok=bool(byok_key))) from e
                         logger.warning(
-                            "%s call failed (%d/%d configured keys tried), rotating API key and retrying immediately: %s",
-                            provider.name, len(tried_llm_keys), key_pool_size, e
+                            "%s call failed (attempt %d/%d), retrying in %ds: %s",
+                            provider.name, transient_attempt, MAX_TRANSLATION_ATTEMPTS, retry_action["delay"], e
                         )
-                        # Told to the client before continuing, so
-                        # "retrying..." is visible even though there's no
-                        # delay to speak of.
+                        # Told to the client before sleeping, not after, so
+                        # "retrying..." is visible for the full delay instead of
+                        # appearing right as the next attempt actually fires.
                         yield json.dumps({
                             "status": "retrying",
-                            "attempt": len(tried_llm_keys),
-                            "maxAttempts": key_pool_size,
-                            "delaySeconds": 0,
-                            "rotatedKey": True,
+                            "attempt": transient_attempt + 1,
+                            "maxAttempts": MAX_TRANSLATION_ATTEMPTS,
+                            "delaySeconds": retry_action["delay"],
+                            "rotatedKey": False,
                         }) + "\n"
+                        transient_attempt += 1
+                        if retry_action["delay"]:
+                            time.sleep(retry_action["delay"])
                         continue
-
-                    # Shared transient-error budget (both providers).
-                    if transient_attempt >= MAX_TRANSLATION_ATTEMPTS:
-                        raise LlmCallFailed(format_llm_error_for_user(provider, llm_model, e, using_byok=bool(byok_key))) from e
-                    logger.warning(
-                        "%s call failed (attempt %d/%d), retrying in %ds: %s",
-                        provider.name, transient_attempt, MAX_TRANSLATION_ATTEMPTS, retry_action["delay"], e
-                    )
-                    # Told to the client before sleeping, not after, so
-                    # "retrying..." is visible for the full delay instead of
-                    # appearing right as the next attempt actually fires.
-                    yield json.dumps({
-                        "status": "retrying",
-                        "attempt": transient_attempt + 1,
-                        "maxAttempts": MAX_TRANSLATION_ATTEMPTS,
-                        "delaySeconds": retry_action["delay"],
-                        "rotatedKey": False,
-                    }) + "\n"
-                    transient_attempt += 1
-                    if retry_action["delay"]:
-                        time.sleep(retry_action["delay"])
-                    continue
+            except LlmCallFailed as e:
+                # Every attempt (and, for Gemini, every configured key) is
+                # exhausted - this is the ONE exception type raised only
+                # from inside this retry loop, so reaching here means the
+                # LLM genuinely was called and genuinely never returned
+                # usable SQL, as opposed to e.g. a schema-fetch failure
+                # before this loop even started (those fall through to the
+                # generic `except Exception` below, unlogged, since no LLM
+                # call was ever attempted for them).
+                #
+                # duration is measured from the SAME start_time the success
+                # path uses (captured right before this loop's first
+                # attempt) - so, same as a successful 2nd-attempt call, it
+                # already includes every attempt's own call time plus every
+                # inter-attempt wait/rotation, and nothing from before the
+                # loop (schema fetch, prompt building) or after it - i.e.
+                # only time actually spent waiting on the LLM.
+                duration = round(1000 * (time.perf_counter() - start_time))
+                error_message = str(e)
+                # No usage_info was ever populated (it's only ever assigned
+                # on a successful provider.call() return above), so every
+                # token count here is a real, honest 0 - not a placeholder
+                # standing in for tokens that were actually spent.
+                record_translation(
+                    user_identity, conn_str, prompt, f"TRANSLATION_ERROR ({error_message})", llm_model, duration,
+                    0, 0, 0, 0, 0,
+                )
+                yield json.dumps({
+                    'status': 'done',
+                    'success': False,
+                    'error': error_message,
+                }) + "\n"
+                return
             end_time = time.perf_counter()
 
             if generated_sql.startswith("```"):

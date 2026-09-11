@@ -389,6 +389,60 @@ def compute_connection_key(name, url, credentials_json=None):
 TRANSLATION_HISTORY_LIST_LIMIT = int(os.environ.get("TRANSLATION_HISTORY_LIST_LIMIT", 50))
 
 
+# --- Persisted chat/turn-navigation history (client.js's chatStoresByBucket) -
+#
+# Distinct from the "translations" table/collection above: that's an
+# append-only AUDIT LOG (one row per NL->SQL call, read by /api/history for
+# the History modal's stats/list, cleared by "Purge Translations"). This is
+# the actual CONVERSATION state - the back/forward-navigable turns, results,
+# and summaries client.js keeps per (identity, connection) "bucket" - which
+# used to live only in an in-memory Map and vanish on every page reload or
+# server restart. One row/doc per (user_id, bucket_key); "bucket_key" is
+# exactly client.js's own bucketKeySuffix (e.g. "all", "preset:<id>",
+# "custom:<key>", "custom-adhoc:<url>") - NOT prefixed with identity, since
+# user_id is already its own separate partition here, same as every other
+# per-user table in this module.
+#
+# Tags every stored row/doc with the shape version of the payload it was
+# written under (currently always CHAT_HISTORY_SCHEMA_VERSION), so a future
+# change to what a "turn" looks like can tell an old row apart from a new
+# one rather than guessing from its contents. get_chat_history's read path
+# (_decode_chat_turns) treats a row from a NEWER version than this build
+# understands - or a payload that fails to parse/isn't a list at all - as
+# "silently unavailable", never a hard error: one corrupt/foreign bucket
+# should never take down every other bucket a user has, and a version bump
+# rolled out to only some replicas/processes shouldn't crash the others.
+CHAT_HISTORY_SCHEMA_VERSION = 1
+
+
+def _decode_chat_turns(value, schema_version):
+    """Best-effort decode of one persisted chat-history bucket's turn list.
+    `value` is SQLite's TEXT column content (a JSON string, since a SQLite
+    column can't hold a native list) or Firestore's field value (already a
+    native list - Firestore has no reason to double-encode it the way
+    SQLite must); this transparently handles either shape, same "one
+    decode path for both backends" pattern _loads_config already
+    established for database_config. Returns None (never raises) if
+    `schema_version` is newer than CHAT_HISTORY_SCHEMA_VERSION, or the
+    value is missing/corrupt/not ultimately a list - the caller
+    (get_chat_history) treats None as "omit this one bucket", not as a
+    reason to fail the whole call."""
+    if schema_version and schema_version > CHAT_HISTORY_SCHEMA_VERSION:
+        logger.warning(
+            "Ignoring a chat history bucket with schema_version=%r - this "
+            "build only understands up to %d.",
+            schema_version, CHAT_HISTORY_SCHEMA_VERSION,
+        )
+        return None
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except Exception:
+            logger.warning("Failed to parse stored chat history payload JSON; ignoring it.")
+            return None
+    return value if isinstance(value, list) else None
+
+
 class StateStore(ABC):
     """Backend-agnostic persistence for sessions, saved DB connections, and
     translation history/stats. Deliberately holds no notion of "the default
@@ -612,6 +666,43 @@ class StateStore(ABC):
     @abstractmethod
     def purge_translation_history(self, user_id):
         """Deletes all translation history for a user."""
+
+    @abstractmethod
+    def get_chat_history(self, user_id):
+        """Returns {"buckets": {bucket_key: [turns...]}, "active_bucket_key":
+        str} - every persisted conversation bucket this identity has ever
+        saved (see this module's "Persisted chat/turn-navigation history"
+        section above for what a bucket_key/turn actually is). A bucket
+        whose stored payload is corrupt or from an unrecognized future
+        schema version is silently omitted rather than failing the whole
+        call (see _decode_chat_turns). "active_bucket_key" is "" if this
+        user has never had one explicitly set (see
+        set_active_chat_bucket)."""
+
+    @abstractmethod
+    def save_chat_bucket(self, user_id, bucket_key, turns):
+        """Upserts one bucket's full turn list, tagged with the current
+        CHAT_HISTORY_SCHEMA_VERSION. `turns` is already trimmed to
+        history_max_turns by the client (createChatHistoryStore's own
+        maxEntries cap) - this stores it as-is, opaquely, the same "don't
+        interpret the caller's blob" posture database_config/llm_byok_keys
+        already use. Deliberately does NOT also mark `bucket_key` active -
+        pushing a turn into a bucket that ISN'T the currently active one
+        (all-mode's per-database history fan-out) must never disturb which
+        bucket the user is actually looking at; see set_active_chat_bucket
+        for the one thing that does that."""
+
+    @abstractmethod
+    def set_active_chat_bucket(self, user_id, bucket_key):
+        """Records which bucket_key is "active" for a user, without
+        touching any bucket's own saved turns - called whenever the client
+        switches to a (possibly still-empty) bucket, independent of
+        whether a turn was ever pushed into it this request. Purely a
+        restart-time hint for get_chat_history's "active_bucket_key" -
+        which bucket a restart actually reopens on is primarily decided by
+        the user's separately-persisted connection/in-scope-mode selection
+        (get_session/set_session above), which already recomputes the same
+        bucket_key in the common case."""
 
 
 # --------------------------------------------------------------------------
@@ -870,6 +961,32 @@ class SqliteStateStore(StateStore):
                     cursor.execute(
                         "ALTER TABLE sessions ADD COLUMN llm_byok_keys TEXT;"
                     )
+                # Migration: existing DBs created before persisted chat
+                # history existed (see this module's "Persisted chat/turn-
+                # navigation history" section). '' means "never explicitly
+                # set" - same convention theme/llm_provider already use -
+                # set_active_chat_bucket() is the only thing that ever
+                # writes a non-empty value here.
+                if "active_chat_bucket_key" not in session_columns:
+                    cursor.execute(
+                        "ALTER TABLE sessions ADD COLUMN active_chat_bucket_key TEXT NOT NULL DEFAULT '';"
+                    )
+
+                # One row per (user_id, bucket_key) - see this module's
+                # "Persisted chat/turn-navigation history" section above.
+                # "payload" is the turn list, JSON-encoded (a SQLite TEXT
+                # column can't hold a native list the way a Firestore field
+                # can - see _decode_chat_turns).
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS chat_history (
+                        user_id TEXT NOT NULL,
+                        bucket_key TEXT NOT NULL,
+                        payload TEXT NOT NULL,
+                        schema_version INTEGER NOT NULL DEFAULT 1,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (user_id, bucket_key)
+                    );
+                """)
 
                 # Drop table if it exists under the old schema (where user_id was
                 # the single primary key) or if the temporary custom_databases
@@ -1344,6 +1461,74 @@ class SqliteStateStore(StateStore):
             cursor.execute("DELETE FROM translations WHERE user_id = ?", (effective_user,))
             conn.commit()
 
+    def get_chat_history(self, user_id):
+        effective_user = _effective_user(user_id)
+        buckets = {}
+        active_bucket_key = ""
+        try:
+            with self._connect() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT bucket_key, payload, schema_version FROM chat_history WHERE user_id = ?",
+                    (effective_user,),
+                )
+                for bucket_key, raw_payload, schema_version in cursor.fetchall():
+                    turns = _decode_chat_turns(raw_payload, schema_version)
+                    if turns is not None:
+                        buckets[bucket_key] = turns
+                cursor.execute(
+                    "SELECT active_chat_bucket_key FROM sessions WHERE session_id = ?",
+                    (effective_user,),
+                )
+                row = cursor.fetchone()
+                active_bucket_key = (row[0] or "") if row else ""
+        except Exception:
+            logger.exception("Error fetching chat history from SQLite")
+            return {"buckets": {}, "active_bucket_key": ""}
+        return {"buckets": buckets, "active_bucket_key": active_bucket_key}
+
+    def save_chat_bucket(self, user_id, bucket_key, turns):
+        if not bucket_key:
+            return
+        effective_user = _effective_user(user_id)
+        try:
+            with self._connect() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO chat_history (user_id, bucket_key, payload, schema_version, updated_at)
+                    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(user_id, bucket_key) DO UPDATE SET
+                        payload = excluded.payload,
+                        schema_version = excluded.schema_version,
+                        updated_at = CURRENT_TIMESTAMP;
+                """, (effective_user, bucket_key, json.dumps(turns or []), CHAT_HISTORY_SCHEMA_VERSION))
+                conn.commit()
+        except Exception:
+            logger.exception("Error saving chat history bucket to SQLite")
+
+    def set_active_chat_bucket(self, user_id, bucket_key):
+        effective_user = _effective_user(user_id)
+        try:
+            with self._connect() as conn:
+                cursor = conn.cursor()
+                # Same "ensure a row exists, defaults for everything else"
+                # insert-then-conflict-update shape set_session() uses -
+                # this can be the very first thing ever written for a
+                # brand-new session/user (e.g. a fresh anonymous visitor
+                # who switches connections before their first translate),
+                # and every other sessions column already has a schema
+                # DEFAULT to fall back on.
+                cursor.execute("""
+                    INSERT INTO sessions (session_id, active_chat_bucket_key)
+                    VALUES (?, ?)
+                    ON CONFLICT(session_id) DO UPDATE SET
+                        active_chat_bucket_key = excluded.active_chat_bucket_key,
+                        updated_at = CURRENT_TIMESTAMP;
+                """, (effective_user, bucket_key or ""))
+                conn.commit()
+        except Exception:
+            logger.exception("Error saving active chat bucket to SQLite")
+
 
 # --------------------------------------------------------------------------
 # Firestore backend (Cloud Run)
@@ -1715,3 +1900,64 @@ class FirestoreStateStore(StateStore):
                 count = 0
         if count > 0:
             batch.commit()
+
+    def get_chat_history(self, user_id):
+        effective_user = _effective_user(user_id)
+        buckets = {}
+        try:
+            docs = self.client.collection("chat_history").where("user_id", "==", effective_user).stream()
+            for doc in docs:
+                d = doc.to_dict() or {}
+                bucket_key = d.get("bucket_key")
+                turns = _decode_chat_turns(d.get("payload"), d.get("schema_version", 1))
+                if bucket_key and turns is not None:
+                    buckets[bucket_key] = turns
+        except Exception:
+            logger.exception("Error fetching chat history from Firestore")
+            return {"buckets": {}, "active_bucket_key": ""}
+        active_bucket_key = ""
+        try:
+            doc = self.client.collection("sessions").document(effective_user).get()
+            if doc.exists:
+                active_bucket_key = (doc.to_dict() or {}).get("active_chat_bucket_key") or ""
+        except Exception:
+            logger.exception("Error fetching active chat bucket from Firestore")
+        return {"buckets": buckets, "active_bucket_key": active_bucket_key}
+
+    def save_chat_bucket(self, user_id, bucket_key, turns):
+        if not bucket_key:
+            return
+        effective_user = _effective_user(user_id)
+        try:
+            # Composite doc id, same "flatten (user_id, key) into one doc
+            # id" pattern set_db_connections() already uses for
+            # db_connections - a plain field-based document, not a
+            # subcollection, so a single get_chat_history() query (below)
+            # can list every bucket for this user with one where() filter.
+            doc_id = f"{effective_user}_{bucket_key}"
+            self.client.collection("chat_history").document(doc_id).set({
+                "user_id": effective_user,
+                "bucket_key": bucket_key,
+                # Stored as a native list, unlike SQLite's TEXT column -
+                # Firestore documents hold nested lists/maps directly, so
+                # there's no reason to double-encode this as a JSON string
+                # the way _encrypt_config_to_text does for a column-bound
+                # backend (and this data isn't a credential, so it gets no
+                # encryption-at-rest treatment either - same plaintext
+                # posture the "translations" collection already has for
+                # nl_prompt/sql_command).
+                "payload": turns or [],
+                "schema_version": CHAT_HISTORY_SCHEMA_VERSION,
+                "updated_at": firestore.SERVER_TIMESTAMP,
+            })
+        except Exception:
+            logger.exception("Error saving chat history bucket to Firestore")
+
+    def set_active_chat_bucket(self, user_id, bucket_key):
+        effective_user = _effective_user(user_id)
+        try:
+            self.client.collection("sessions").document(effective_user).set(
+                {"active_chat_bucket_key": bucket_key or ""}, merge=True
+            )
+        except Exception:
+            logger.exception("Error saving active chat bucket to Firestore")

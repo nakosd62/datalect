@@ -7,18 +7,20 @@ venv/
 
 # Ignore local env setting
 .env
-presets_local.json
-atlas-credentials.env
+
+# Ignore accounts files
+accounts/
 
 # Leftovers
 _to_delete/
-Golf-Scores-main/
 
 # Ignore utility scripts
 *.sh
 
 # Ignore testing files
 tests/
+pytest.ini
+requirements-dev.txt
 
 # Ignore utils
 utils/
@@ -26,11 +28,9 @@ utils/
 # Ignore local state
 state/
 
-# Ignore mobile app
-mobile/
-
 # Ignore README
 README.md
+ydyl_eval_tool_plan.md
 
 # Ignore log files
 *.log
@@ -41,6 +41,4 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
-*-save*
-*.save*
 .DS_Store

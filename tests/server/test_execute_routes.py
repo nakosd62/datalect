@@ -296,12 +296,12 @@ def test_ping_times_out_and_returns_success_false(app_factory, monkeypatch):
     fake = _FakeBackend(results=[], delay=0.3)
     _patch_backend(monkeypatch, env, fake)
     resp = env.client.get('/api/ping')
-    # Same "never leak error detail" posture as any other /api/ping failure
-    # (see test_ping_query_failure_returns_400_and_success_false_without_
-    # leaking_error_detail above) - a timeout is just another failure as far
-    # as /api/ping's response shape is concerned.
+    # Same "the real exception text IS included" posture as any other
+    # /api/ping failure now (see test_ping_query_failure_returns_400_and_
+    # success_false_with_error_detail above) - a timeout is just another
+    # failure as far as /api/ping's response shape is concerned.
     assert resp.status_code == 400
-    assert resp.get_json() == {"success": False}
+    assert resp.get_json() == {"success": False, "error": "Query execution timed out after 0.05 seconds"}
     fake.execute_finished.wait(timeout=1)
 
 
@@ -332,25 +332,27 @@ def test_ping_success_returns_200_and_success_true(app_env, monkeypatch):
     assert resp.get_json() == {"success": True}
 
 
-def test_ping_query_failure_returns_400_and_success_false_without_leaking_error_detail(app_env, monkeypatch):
-    # Unlike /api/execute, /api/ping never surfaces the raw exception text -
-    # the status dot only ever shows connected/disconnected (see the
-    # route's own docstring).
+def test_ping_query_failure_returns_400_and_success_false_with_error_detail(app_env, monkeypatch):
+    # The status dot itself still only ever shows connected/disconnected -
+    # no message is ever rendered for it in the UI - but the raw exception
+    # text IS now included in the response body (same "raw DB errors are
+    # fine to hand back" posture /api/execute already has), so client.js's
+    # checkDbStatus() can attach it to the 'error_shown'/"Database
+    # Connection" GA4 event it fires whenever this check comes back down.
     fake = _FakeBackend(raise_exc=Exception("ORA-00923: FROM keyword not found where expected"))
     _patch_backend(monkeypatch, app_env, fake)
     resp = app_env.client.get('/api/ping')
     assert resp.status_code == 400
     data = resp.get_json()
-    assert data == {"success": False}
-    assert "ORA-00923" not in resp.get_data(as_text=True)
+    assert data == {"success": False, "error": "ORA-00923: FROM keyword not found where expected"}
 
 
-def test_ping_connect_failure_returns_400_and_success_false(app_env, monkeypatch):
+def test_ping_connect_failure_returns_400_and_success_false_with_error_detail(app_env, monkeypatch):
     fake = _FakeBackend(connect_exc=Exception("could not connect to server"))
     _patch_backend(monkeypatch, app_env, fake)
     resp = app_env.client.get('/api/ping')
     assert resp.status_code == 400
-    assert resp.get_json() == {"success": False}
+    assert resp.get_json() == {"success": False, "error": "could not connect to server"}
 
 
 def test_ping_always_closes_connection_on_success(app_env, monkeypatch):

@@ -428,3 +428,119 @@ def test_get_translation_history_limit_is_configurable_via_env_var(monkeypatch):
     assert len(rows) == 3  # capped to the overridden limit
     assert [r["nl_prompt"] for r in rows] == ["p9", "p8", "p7"]  # still newest-first
     assert sum(s["total_translations"] for s in stats) == 10  # stats: complete history
+
+
+# --- chat_history (persisted conversation buckets, client.js's
+# chatStoresByBucket) - distinct from translations above, which is the
+# separate NL->SQL audit log. ---------------------------------------------
+
+def test_get_chat_history_defaults_to_empty_for_a_new_user():
+    store, client = make_store()
+    result = store.get_chat_history("alice")
+    assert result == {"buckets": {}, "active_bucket_key": ""}
+
+
+def test_save_and_get_chat_bucket_round_trips():
+    store, client = make_store()
+    turns = [{"role": "user", "text": "show users"}, {"role": "model", "text": "SELECT * FROM users;"}]
+    store.save_chat_bucket("alice", "preset:1", turns)
+    result = store.get_chat_history("alice")
+    assert result["buckets"] == {"preset:1": turns}
+
+
+def test_save_chat_bucket_upserts_in_place_not_duplicated():
+    store, client = make_store()
+    store.save_chat_bucket("alice", "preset:1", [{"role": "user", "text": "first"}])
+    store.save_chat_bucket("alice", "preset:1", [{"role": "user", "text": "second"}])
+    result = store.get_chat_history("alice")
+    assert result["buckets"] == {"preset:1": [{"role": "user", "text": "second"}]}
+
+
+def test_multiple_buckets_for_the_same_user_are_all_returned():
+    store, client = make_store()
+    store.save_chat_bucket("alice", "preset:1", [{"role": "user", "text": "a"}])
+    store.save_chat_bucket("alice", "all", [{"role": "user", "text": "b"}])
+    result = store.get_chat_history("alice")
+    assert set(result["buckets"].keys()) == {"preset:1", "all"}
+
+
+def test_chat_history_isolated_per_user():
+    store, client = make_store()
+    store.save_chat_bucket("alice", "preset:1", [{"role": "user", "text": "a"}])
+    store.save_chat_bucket("bob", "preset:1", [{"role": "user", "text": "b"}])
+    alice_result = store.get_chat_history("alice")
+    bob_result = store.get_chat_history("bob")
+    assert alice_result["buckets"] == {"preset:1": [{"role": "user", "text": "a"}]}
+    assert bob_result["buckets"] == {"preset:1": [{"role": "user", "text": "b"}]}
+
+
+def test_save_chat_bucket_with_no_bucket_key_is_a_no_op():
+    store, client = make_store()
+    store.save_chat_bucket("alice", "", [{"role": "user", "text": "a"}])
+    result = store.get_chat_history("alice")
+    assert result["buckets"] == {}
+
+
+def test_set_active_chat_bucket_round_trips():
+    store, client = make_store()
+    store.set_active_chat_bucket("alice", "preset:1")
+    result = store.get_chat_history("alice")
+    assert result["active_bucket_key"] == "preset:1"
+
+
+def test_set_active_chat_bucket_never_touches_a_bucket_own_saved_turns():
+    store, client = make_store()
+    store.save_chat_bucket("alice", "preset:1", [{"role": "user", "text": "a"}])
+    store.set_active_chat_bucket("alice", "all")
+    result = store.get_chat_history("alice")
+    assert result["buckets"] == {"preset:1": [{"role": "user", "text": "a"}]}
+    assert result["active_bucket_key"] == "all"
+
+
+def test_set_active_chat_bucket_does_not_clobber_an_existing_session_doc():
+    # active_chat_bucket_key is stored on the SAME "sessions" doc
+    # get_session()/set_session() use - merge=True must leave an already-
+    # saved connection_id/theme/etc. completely untouched.
+    store, client = make_store()
+    store.set_session("alice", connection_id="key123", theme="dark")
+    store.set_active_chat_bucket("alice", "preset:1")
+    session = store.get_session("alice")
+    assert session["connection_id"] == "key123"
+    assert session["theme"] == "dark"
+    result = store.get_chat_history("alice")
+    assert result["active_bucket_key"] == "preset:1"
+
+
+def test_save_chat_bucket_does_not_set_active_bucket():
+    store, client = make_store()
+    store.save_chat_bucket("alice", "preset:1", [{"role": "user", "text": "a"}])
+    result = store.get_chat_history("alice")
+    assert result["active_bucket_key"] == ""
+
+
+def test_chat_history_bucket_with_unrecognized_future_schema_version_is_omitted():
+    store, client = make_store()
+    store.save_chat_bucket("alice", "preset:1", [{"role": "user", "text": "a"}])
+    doc_id = "alice_preset:1"
+    client._collections["chat_history"][doc_id]["schema_version"] = 999
+    result = store.get_chat_history("alice")
+    assert result["buckets"] == {}
+
+
+def test_chat_history_bucket_with_non_list_payload_is_omitted():
+    store, client = make_store()
+    client._collections.setdefault("chat_history", {})["alice_preset:1"] = {
+        "user_id": "alice", "bucket_key": "preset:1",
+        "payload": {"not": "a list"}, "schema_version": 1,
+    }
+    result = store.get_chat_history("alice")
+    assert result["buckets"] == {}
+
+
+def test_one_corrupt_bucket_does_not_prevent_other_buckets_from_loading():
+    store, client = make_store()
+    store.save_chat_bucket("alice", "preset:1", [{"role": "user", "text": "good"}])
+    store.save_chat_bucket("alice", "all", [{"role": "user", "text": "also good"}])
+    client._collections["chat_history"]["alice_preset:1"]["schema_version"] = 999
+    result = store.get_chat_history("alice")
+    assert result["buckets"] == {"all": [{"role": "user", "text": "also good"}]}

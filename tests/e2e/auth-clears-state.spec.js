@@ -203,6 +203,43 @@ async function mockCloudRunConfig(page) {
       }),
     });
   });
+  // /api/chat-history (GET/save/activate) is deliberately mocked here too,
+  // not left to hit the real local server the way /api/translate/
+  // /api/execute are: this file's fake JWTs all share the exact same
+  // unsigned {"alg":"none","typ":"JWT"} header, which is exactly 32 base64
+  // characters on its own - and since GOOGLE_CLIENT_ID isn't configured on
+  // this real local test server (see fixtures.js's module docstring),
+  // server/auth.py's get_current_user_identity() falls back to
+  // `f"token:{token[:32]}"` for ANY Bearer token, which truncates to just
+  // that header. Every fake sign-in in this whole file - alice, bob,
+  // "user@example.com", newuser, all of them - would therefore collapse to
+  // the exact SAME real server-side identity, regardless of which email
+  // the mocked /api/config above claims. That's harmless for the
+  // client-side bucket-switching behavior this file actually tests (which
+  // never leaves the browser), but the real chat_history persistence
+  // feature this history-bucket switch now also drives (see
+  // hydrateChatHistoryFromServer()/persistChatBucket() in client.js) would
+  // otherwise silently bleed real, server-persisted conversation state
+  // between every "different identity" scenario below. Mocked to always
+  // report/accept nothing, exactly as if this identity had never persisted
+  // anything before - keeping this file scoped to what it says it tests:
+  // the in-memory bucket switch, not server-side persistence (which has
+  // its own dedicated coverage in tests/server/test_chat_history_routes.py
+  // and test_state_store_*.py).
+  await page.route('**/api/chat-history', async (route) => {
+    if (route.request().method() !== 'GET') return route.fallback();
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ success: true, buckets: {}, active_bucket_key: '' }),
+    });
+  });
+  await page.route('**/api/chat-history/save', async (route) => {
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ success: true }) });
+  });
+  await page.route('**/api/chat-history/activate', async (route) => {
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ success: true }) });
+  });
 }
 
 test.describe('logging out from the narrow-screen "more" menu', () => {

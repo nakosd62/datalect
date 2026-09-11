@@ -146,10 +146,8 @@ test.describe('translate + execute', () => {
 
     // Two tabs total - one per ATTEMPTED statement (the succeeded one +
     // the failed one) - never a third for the statement that was never
-    // run. Scoped to #resultsTabsNav specifically: the unrelated History
-    // modal's own internal tab switcher (#tabBtnTranslations/
-    // #tabBtnStatistics in index.html) reuses the same .result-tab-btn
-    // class name, so an unscoped page-wide locator would overcount.
+    // run. Scoped to #resultsTabsNav rather than an unscoped page-wide
+    // .result-tab-btn locator, on general principle.
     const tabs = page.locator('#resultsTabsNav .result-tab-btn');
     await expect(tabs).toHaveCount(2);
 
@@ -329,6 +327,77 @@ test.describe('translate + execute', () => {
     await expect(modelBadge).not.toHaveClass(/badge-disabled/);
     await expect(micBtn).not.toBeDisabled();
     await expect(runBtn).not.toBeDisabled();
+  });
+
+  // Regression guard: .badge-disabled used to be applied straight to
+  // #configTriggerBadge itself, and CSS opacity/filter both composite the
+  // WHOLE rendered subtree as one group once set on an ancestor - so the
+  // grayed-out look during an in-flight query also desaturated/dimmed
+  // #connDbDot, making a perfectly healthy (green) connection look grey,
+  // as if its actual status had changed or become unknown. Fixed by
+  // applying opacity/grayscale to the badge's other children individually
+  // instead of the badge itself, explicitly excluding .status-dot (see
+  // style.css's own comment) - this asserts the dot's real computed style
+  // is untouched while the badge is disabled, and that the rest of the
+  // badge (its text) still visibly dims exactly as before.
+  test('the DB badge dot keeps its real connected/disconnected color while the badge is grayed out for an in-flight query', async ({ page }) => {
+    let resolveTranslate;
+    const translateStarted = new Promise((resolve) => { resolveTranslate = resolve; });
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      resolveTranslate();
+      await new Promise((r) => setTimeout(r, 2000));
+      await route.fulfill({
+        status: 200, contentType: 'application/x-ndjson',
+        body: JSON.stringify({ status: 'done', success: true, sql: 'SELECT 1;' }) + '\n',
+      });
+    });
+    await gotoApp(page);
+
+    const dot = page.locator('#connDbDot');
+    const nameText = page.locator('#connDbName');
+    const readDotStyle = () => dot.evaluate((el) => {
+      const cs = getComputedStyle(el);
+      return { opacity: cs.opacity, filter: cs.filter, backgroundColor: cs.backgroundColor };
+    });
+
+    await expect(dot).toHaveClass(/connected/);
+    // `.status-dot` animates background-color via `transition: var(--transition)`
+    // (style.css) - right after the "connected" class lands, the color may
+    // still be mid-transition from its previous (checking/muted) resting
+    // color. Poll until two reads taken a beat apart agree, so the captured
+    // baseline is the settled color rather than a transitional one - same
+    // idiom onboarding.spec.js uses for #tourSpotlight's own CSS transition.
+    let restingDotStyle;
+    await expect(async () => {
+      const first = await readDotStyle();
+      await new Promise((r) => setTimeout(r, 50));
+      const second = await readDotStyle();
+      expect(second).toEqual(first);
+      restingDotStyle = second;
+    }).toPass({ timeout: 2000 });
+    // Sanity check on the resting state - a real, non-grayscale color and
+    // full opacity, before anything is in flight.
+    expect(restingDotStyle.opacity).toBe('1');
+    expect(restingDotStyle.filter).toBe('none');
+
+    await page.locator('#aiPrompt').fill('anything');
+    await page.locator('#aiPrompt').press('Enter');
+    await translateStarted;
+
+    await expect(page.locator('#configTriggerBadge')).toHaveClass(/badge-disabled/);
+    // The dot's own computed style is completely unchanged from its
+    // resting state above - same opacity, same "no filter", same actual
+    // color - even while its parent badge carries badge-disabled.
+    const dotStyleWhileDisabled = await readDotStyle();
+    expect(dotStyleWhileDisabled).toEqual(restingDotStyle);
+    // The badge's OTHER content still visibly dims, same as always - this
+    // fix is scoped to the dot specifically, not a regression on the
+    // "grayed out, not clickable" look for the rest of the badge.
+    const nameOpacityWhileDisabled = await nameText.evaluate((el) => getComputedStyle(el).opacity);
+    expect(Number(nameOpacityWhileDisabled)).toBeLessThan(1);
+
+    await expect.poll(() => normalizedSql(page), { timeout: 5000 }).toContain('SELECT 1');
   });
 
   test('directly entering and running SQL bypasses translate entirely', async ({ page }) => {

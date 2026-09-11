@@ -24,7 +24,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   // this here (instead of three loose variables mutated from five different
   // places) means the turn cap, the "always push in pairs" rule, and the
   // undo/redo bookkeeping only need to be correct in one place.
-  function createChatHistoryStore(maxTurns) {
+  function createChatHistoryStore(maxTurns, onPersist) {
     // Not a const: the real cap is the server's HISTORY_MAX_TURNS env var
     // (see setMaxTurns() below), which isn't known yet at this synchronous
     // creation point - fetchBackendConfig() hasn't made its first request
@@ -41,11 +41,18 @@ document.addEventListener('DOMContentLoaded', async () => {
     return {
       // Appends one (user, model) turn, enforces the cap, and clears the
       // redo stack (a genuinely new turn invalidates any "future" branch).
+      // `onPersist`, when given (see getOrCreateBucketStore()), is called
+      // with the resulting (already-trimmed) `history` array right after -
+      // this is the ONLY thing that triggers a server-side save of this
+      // bucket (see persistChatBucket()); undo()/redo()/setPending() are
+      // deliberately NOT persisted - see hydrate()'s own docstring for why
+      // that's fine.
       pushTurn(userText, modelEntry) {
         history.push({ role: 'user', text: userText });
         history.push(modelEntry);
         history = history.slice(-maxEntries);
         future = [];
+        if (onPersist) onPersist(history);
       },
       // Applies a new turn cap (from /api/config's history_max_turns) and
       // immediately re-trims `history` if it's now over the new, smaller
@@ -119,6 +126,23 @@ document.addEventListener('DOMContentLoaded', async () => {
       },
       // What gets sent to /api/translate as `history`.
       toPayload() { return history; },
+      // Replaces this store's history wholesale with a previously-
+      // persisted turn list (server restore - see
+      // hydrateChatHistoryFromServer()), trimmed to the current cap same
+      // as pushTurn() does. Redo stack and any "pending" (SQL generated,
+      // not yet executed) pointer are reset rather than restored - neither
+      // is part of what pushTurn() ever persists (only `history` is, see
+      // pushTurn()'s own onPersist call), so there's nothing saved to
+      // bring back for them; a turn that was mid-flight (pending) at the
+      // moment this browser last closed simply reads back as a normal,
+      // already-settled turn. Deliberately does NOT call onPersist itself -
+      // this is populating FROM the server, not a new client-side change
+      // that needs saving back to it.
+      hydrate(turns) {
+        history = Array.isArray(turns) ? turns.slice(-maxEntries) : [];
+        future = [];
+        pending = null;
+      },
     };
   }
 
@@ -156,14 +180,35 @@ document.addEventListener('DOMContentLoaded', async () => {
   // a bucket that already exists (same identity, same connection) picks
   // its chatStore back up exactly where it was left, pending SQL included;
   // switching to one never visited this page-load creates it fresh, same
-  // as chatStore always started out. Everything here is plain in-memory JS
-  // state (a Map, same as chatStore itself always was) - deliberately NOT
-  // localStorage or anything else that would survive a reload - so a page
-  // reload still starts every bucket over from empty, exactly as before.
-  // Only login/logout/connection-switch no longer wipe it out from under
-  // you.
+  // as chatStore always started out. This registry itself is still plain
+  // in-memory JS state (a Map, same as chatStore itself always was) - but
+  // each bucket it holds is now backed by the server (see
+  // getOrCreateBucketStore()'s onPersist callback and
+  // hydrateChatHistoryFromServer() below), so a page reload or a server
+  // restart no longer starts every bucket over from empty the way it used
+  // to. Login/logout/connection-switch still never wipe it out from under
+  // you - that was always the point of this registry existing at all.
   const chatStoresByBucket = new Map();
   let activeBucketKey = null;
+  // Guards hydrateChatHistoryFromServer() (see its own docstring) so this
+  // page-load only ever fetches a given identity's persisted buckets once -
+  // fetchBackendConfig() is called far more often (after every save,
+  // connection switch, translate/execute) than identity actually changes.
+  let chatHistoryHydratedForIdentity = null;
+  // True while the prompt/SQL/results area is showing #newTurnBtn's blank
+  // slate (see startNewTurn()) rather than any real turn from chatStore -
+  // a purely visual "detached from history" position, never itself pushed
+  // into chatStore. Exists so #goBackBtn can tell the difference between
+  // "step back past the turn already on screen" (the normal chatStore.undo()
+  // case) and "reveal the turn I just blanked out, without consuming it"
+  // (this flag's whole reason for existing) - without it, pressing back
+  // right after #newTurnBtn would call chatStore.undo() against the actual
+  // last turn (still sitting untouched at the top of history, since
+  // startNewTurn() never pops it) and skip straight past it to the turn
+  // BEFORE that. Cleared by pushActiveTurn() below the moment a real new
+  // turn actually lands, and by #goBackBtn's own handler once it's used to
+  // reveal that real last turn.
+  let viewingBlankSlate = false;
   // Mirrors whatever the last real /api/config response's history_max_turns
   // said (see fetchBackendConfig()'s own chatStore.setMaxTurns() call) - so
   // a bucket created well after startup (the first time a given connection
@@ -197,6 +242,50 @@ document.addEventListener('DOMContentLoaded', async () => {
     return `${kind}:${id}`;
   }
 
+  // The "connection" half of a bucket key - see computeBucketKey() below,
+  // which combines this with the current identity. Split out on its own
+  // so callers that need to talk to the server about ONE SPECIFIC bucket
+  // (persistChatBucket()/persistActiveChatBucket() - see their own
+  // docstrings) can send this value alone: the server's chat_history table
+  // already partitions by user_id as its own column (see state_store.py),
+  // so re-embedding the identity inside this string would just be
+  // duplicated information.
+  //
+  // "All databases" mode is ONE shared conversation regardless of which
+  // specific presets/custom connections are currently checked into scope -
+  // checking one more database in or out mid-conversation changes who
+  // might answer the NEXT question, not which conversation this is.
+  // Everything else (a single active connection) is now identified by its
+  // own stable (kind, id) pair - see connectionBucketKey's own docstring
+  // for why this replaced the old url|is_custom|customKey|presetId tuple:
+  // that tuple went stale whenever ACTIVE_DB_URL wasn't reset on a preset
+  // switch (see triggerConfigSave()'s own fix earlier this session) and,
+  // more fundamentally, could never match the {kind, id} pair an all-mode
+  // fan-out entry for the SAME database is tagged with, since a URL alone
+  // says nothing about which specific preset/custom connection that URL
+  // belongs to. A saved custom connection is identified by its own
+  // connection_key, same as resolve_descriptor_by_reference's own "custom"
+  // branch; an UNSAVED ad hoc custom URL (typed directly, never given a
+  // name/saved - see ACTIVE_CUSTOM_CONNECTION_KEY's own declaration
+  // comment) has no connection_key or other server-side identity at all,
+  // so this falls back to the raw URL for that one case, same as every
+  // bucket key did before this refactor - all-mode's own fan-out never
+  // visits an unsaved connection in the first place
+  // (resolve_in_scope_descriptors only ever resolves saved presets/custom
+  // connections), so there's no fan-out entry this fallback could ever
+  // fail to match anyway.
+  function computeBucketConnectionSuffix() {
+    if (IN_SCOPE_MODE === 'all') {
+      return 'all';
+    } else if (ACTIVE_IS_CUSTOM) {
+      return ACTIVE_CUSTOM_CONNECTION_KEY
+        ? connectionBucketKey('custom', ACTIVE_CUSTOM_CONNECTION_KEY)
+        : `custom-adhoc:${ACTIVE_DB_URL}`;
+    } else {
+      return connectionBucketKey('preset', ACTIVE_PRESET_ID);
+    }
+  }
+
   // What actually identifies "a conversation" for bucketing purposes -
   // called after anything that could change the answer (see
   // reconcileActiveHistoryBucket()'s own call sites: fetchBackendConfig()
@@ -204,53 +293,25 @@ document.addEventListener('DOMContentLoaded', async () => {
   // changes).
   function computeBucketKey() {
     const identity = CURRENT_USER_IDENTITY || 'global';
-    // "All databases" mode is ONE shared conversation regardless of which
-    // specific presets/custom connections are currently checked into
-    // scope - checking one more database in or out mid-conversation
-    // changes who might answer the NEXT question, not which conversation
-    // this is. Everything else (a single active connection) is now
-    // identified by its own stable (kind, id) pair - see
-    // connectionBucketKey's own docstring for why this replaced the old
-    // url|is_custom|customKey|presetId tuple: that tuple went stale
-    // whenever ACTIVE_DB_URL wasn't reset on a preset switch (see
-    // triggerConfigSave()'s own fix earlier this session) and, more
-    // fundamentally, could never match the {kind, id} pair an all-mode
-    // fan-out entry for the SAME database is tagged with, since a URL
-    // alone says nothing about which specific preset/custom connection
-    // that URL belongs to. A saved custom connection is identified by its
-    // own connection_key, same as resolve_descriptor_by_reference's own
-    // "custom" branch; an UNSAVED ad hoc custom URL (typed directly, never
-    // given a name/saved - see ACTIVE_CUSTOM_CONNECTION_KEY's own
-    // declaration comment) has no connection_key or other server-side
-    // identity at all, so this falls back to the raw URL for that one
-    // case, same as every bucket key did before this refactor - all-mode's
-    // own fan-out never visits an unsaved connection in the first place
-    // (resolve_in_scope_descriptors only ever resolves saved presets/
-    // custom connections), so there's no fan-out entry this fallback could
-    // ever fail to match anyway.
-    let connection;
-    if (IN_SCOPE_MODE === 'all') {
-      connection = 'all';
-    } else if (ACTIVE_IS_CUSTOM) {
-      connection = ACTIVE_CUSTOM_CONNECTION_KEY
-        ? connectionBucketKey('custom', ACTIVE_CUSTOM_CONNECTION_KEY)
-        : `custom-adhoc:${ACTIVE_DB_URL}`;
-    } else {
-      connection = connectionBucketKey('preset', ACTIVE_PRESET_ID);
-    }
-    return `${identity}::${connection}`;
+    return `${identity}::${computeBucketConnectionSuffix()}`;
   }
 
   // Finds (or creates, starting empty) the chat history store for `key` -
   // shared by reconcileActiveHistoryBucket() below (switching the
-  // CURRENTLY ACTIVE bucket) and pushTurnIntoBucket() further down (an
+  // CURRENTLY ACTIVE bucket), pushTurnIntoBucket() further down (an
   // all-mode turn's own per-database fan-out, appending to a bucket that
-  // may or may not be the active one) so bucket-creation is written in
-  // exactly one place for both.
-  function getOrCreateBucketStore(key) {
+  // may or may not be the active one), and hydrateChatHistoryFromServer()
+  // (populating a bucket restored from the server) - so bucket-creation is
+  // written in exactly one place for all three. `bucketKeySuffix` is
+  // `key`'s own connection-only half (see computeBucketConnectionSuffix())
+  // - threaded through separately, rather than re-derived by splitting
+  // `key` back apart, so a freshly-created store's onPersist callback
+  // always sends the server exactly the same value this file uses
+  // everywhere else to name this bucket.
+  function getOrCreateBucketStore(key, bucketKeySuffix) {
     let store = chatStoresByBucket.get(key);
     if (!store) {
-      store = createChatHistoryStore(currentHistoryMaxTurns);
+      store = createChatHistoryStore(currentHistoryMaxTurns, (turns) => persistChatBucket(bucketKeySuffix, turns));
       chatStoresByBucket.set(key, store);
     }
     return store;
@@ -266,10 +327,18 @@ document.addEventListener('DOMContentLoaded', async () => {
   // nextConnectionIdentity check this replaced in triggerConfigSave) -
   // just compare the one computed key.
   function reconcileActiveHistoryBucket() {
-    const key = computeBucketKey();
+    const suffix = computeBucketConnectionSuffix();
+    const key = `${CURRENT_USER_IDENTITY || 'global'}::${suffix}`;
     if (key === activeBucketKey) return;
     activeBucketKey = key;
-    chatStore = getOrCreateBucketStore(key);
+    chatStore = getOrCreateBucketStore(key, suffix);
+    // Switching buckets always lands on a real turn (or a genuinely empty
+    // bucket - restoreLatestTurn() below handles both) via restoreLatestTurn(),
+    // never on the OLD bucket's own #newTurnBtn blank slate - leaving this
+    // true here would misapply that bucket's back/forward rules to a
+    // completely different, unrelated bucket (see viewingBlankSlate's own
+    // docstring).
+    viewingBlankSlate = false;
     // restoreLatestTurn() (defined far below, in section 12 - a plain
     // function declaration, so it's already hoisted and callable from up
     // here) already does exactly the right thing for both an empty bucket
@@ -277,8 +346,17 @@ document.addEventListener('DOMContentLoaded', async () => {
     // unconditionally via clearActiveQueryState()) and a previously-
     // visited one (re-shows its last turn's SQL/results) - "finding the
     // history you left", not just making it reachable via the back arrow.
+    // This now applies just as well to a bucket that's "previously
+    // visited" only because hydrateChatHistoryFromServer() restored it
+    // from an earlier session, not just one touched already this page-load.
     restoreLatestTurn();
     updateHistoryTurnsSubtitle();
+    // Best-effort restart-time hint (see persistActiveChatBucket()'s own
+    // docstring) - not load-bearing for correctness, since a restart
+    // primarily finds its way back to the right bucket by recomputing this
+    // same suffix from the user's separately-persisted connection/in-scope
+    // selection.
+    persistActiveChatBucket(suffix);
   }
 
   // Appends one (user, model) turn directly into a SPECIFIC database's own
@@ -288,11 +366,78 @@ document.addEventListener('DOMContentLoaded', async () => {
   // shown on screen (see fanOutAllModeHistoryPerDatabase's own docstring
   // for why that's the deliberate, "never disturb the active view" design
   // for this feature - the turn is simply there, waiting, the next time
-  // the user navigates that bucket's own history).
+  // the user navigates that bucket's own history). This bucket's own
+  // pushTurn() still persists it server-side exactly the same way the
+  // active bucket's does (see getOrCreateBucketStore()'s onPersist) - only
+  // the ACTIVE-bucket pointer is left untouched here.
   function pushTurnIntoBucket(kind, id, userText, modelEntry) {
     const identity = CURRENT_USER_IDENTITY || 'global';
-    const key = `${identity}::${connectionBucketKey(kind, id)}`;
-    getOrCreateBucketStore(key).pushTurn(userText, modelEntry);
+    const suffix = connectionBucketKey(kind, id);
+    const key = `${identity}::${suffix}`;
+    getOrCreateBucketStore(key, suffix).pushTurn(userText, modelEntry);
+  }
+
+  // One-time-per-identity restore of every persisted conversation bucket
+  // (see the "Per-bucket history registry" section above) from the
+  // server's chat_history table/collection - called from
+  // fetchBackendConfig() itself, right before reconcileActiveHistoryBucket()
+  // runs, so a fresh page load (or a login/logout that changes identity)
+  // finds every bucket already populated instead of
+  // reconcileActiveHistoryBucket() switching to, and rendering, an empty
+  // one first. Guarded by chatHistoryHydratedForIdentity so this never
+  // re-fetches for an identity already hydrated this page-load - every
+  // OTHER fetchBackendConfig() call (after a save, a connection switch, a
+  // translate/execute) vastly outnumbers actual identity changes. Never
+  // overwrites a bucket already present in chatStoresByBucket - defensive
+  // only; in practice nothing this page-load could have created one before
+  // this ever runs for a identity it hasn't seen yet.
+  async function hydrateChatHistoryFromServer() {
+    try {
+      const response = await fetch('/api/chat-history', { headers: getApiHeaders(), credentials: 'same-origin' });
+      const data = await response.json();
+      if (!data || !data.success) return;
+      const identity = CURRENT_USER_IDENTITY || 'global';
+      for (const [bucketKeySuffix, turns] of Object.entries(data.buckets || {})) {
+        const fullKey = `${identity}::${bucketKeySuffix}`;
+        if (chatStoresByBucket.has(fullKey)) continue;
+        getOrCreateBucketStore(fullKey, bucketKeySuffix).hydrate(Array.isArray(turns) ? turns : []);
+      }
+    } catch (err) {
+      console.error('Failed to load persisted chat history:', err);
+    }
+  }
+
+  // Fire-and-forget persistence for one bucket's full turn list - passed
+  // as onPersist to every createChatHistoryStore() call (see
+  // getOrCreateBucketStore()), so it runs for whichever bucket just
+  // received a turn: the currently active one via chatStore.pushTurn(), or
+  // a DIFFERENT database's own bucket via pushTurnIntoBucket()'s all-mode
+  // fan-out. Best-effort: a failed save here never blocks or surfaces an
+  // error to the user mid-conversation - this page's own in-memory bucket
+  // is unaffected either way; the only risk is this turn not being there
+  // on some FUTURE restart.
+  function persistChatBucket(bucketKeySuffix, turns) {
+    fetch('/api/chat-history/save', {
+      method: 'POST',
+      headers: getApiHeaders(),
+      credentials: 'same-origin',
+      body: JSON.stringify({ bucket_key: bucketKeySuffix, turns }),
+    }).catch((err) => console.error('Failed to persist chat history:', err));
+  }
+
+  // Fire-and-forget - records which bucket is "active" server-side, purely
+  // as a restart-time hint (see get_chat_history's own docstring in
+  // state_store.py) - the bucket a restart ACTUALLY reopens on is whichever
+  // one computeBucketKey() recomputes from the user's separately-persisted
+  // connection/in-scope-mode selection, which already lands back on the
+  // same bucket in the common case.
+  function persistActiveChatBucket(bucketKeySuffix) {
+    fetch('/api/chat-history/activate', {
+      method: 'POST',
+      headers: getApiHeaders(),
+      credentials: 'same-origin',
+      body: JSON.stringify({ bucket_key: bucketKeySuffix }),
+    }).catch((err) => console.error('Failed to persist active chat bucket:', err));
   }
 
   // Chunk 5 of "splitting SQL/summary per in-scope database" (see
@@ -834,6 +979,28 @@ document.addEventListener('DOMContentLoaded', async () => {
     return (preset && preset.type) || '';
   }
 
+  // Fires 'error_shown'/"Database Connection" - shared by every place that
+  // flips connDbDot to 'status-dot disconnected': checkDbStatus()'s own
+  // /api/ping check (both its non-throwing failure and its network-
+  // exception catch), fetchBackendConfig()'s catch (the initial/periodic
+  // config fetch itself failing), and triggerConfigSave()'s catch (a
+  // network exception while saving a DB connection). The dot itself still
+  // only ever shows connected/disconnected in the UI - no message is ever
+  // rendered for it anywhere - but every time it actually goes down, that's
+  // a real error the user is experiencing (their selected database is
+  // unreachable), so it's tracked the same way translation/execution
+  // failures are - see this section's ANALYTICS comment above. `message`
+  // may legitimately be empty (nothing more specific than "it failed" was
+  // available) - truncateForAnalytics() already handles that fine.
+  function trackDbConnectionError(message) {
+    trackEvent('error_shown', {
+      category: 'Database Connection',
+      database_name: connDbName ? connDbName.textContent : '',
+      database_type: getActiveDatabaseType(),
+      message: truncateForAnalytics(message || ''),
+    });
+  }
+
   // Fires 'translate_submitted' AGAIN, once per connection in
   // `connectionSelection` (the same {kind,id,name,type,prompt} list
   // translate_routes.py's "phase_a_route" event and, for the rare
@@ -931,8 +1098,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   // An inline <head> script in index.html reads the same storage key before
   // any stylesheet loads (see its comment there) so the very first paint
   // already has the right data-theme attribute - this section only handles
-  // switching it after load, plus keeping CodeMirror/Chart.js in sync since
-  // neither reads CSS custom properties on its own.
+  // switching it after load, plus keeping CodeMirror in sync since it
+  // doesn't read CSS custom properties on its own.
   // ===========================================================================
   const THEME_STORAGE_KEY = 'datalectTheme';
 
@@ -953,13 +1120,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (sqlEditor) {
       sqlEditor.setOption('theme', normalized === 'light' ? 'eclipse' : 'dracula');
     }
-    // The history-stats charts bake resolved colors into their Chart.js
-    // config at creation time (Chart.js doesn't read CSS custom properties
-    // live), so the only way to re-theme an already-rendered chart is to
-    // rebuild it from the same data used last time.
-    if ((chartCountInstance || chartTotalTokensInstance) && lastStatsDataForCharts) {
-      renderStatisticsCharts(lastStatsDataForCharts);
-    }
   }
 
   // DOM Elements - Primary Controls
@@ -968,9 +1128,20 @@ document.addEventListener('DOMContentLoaded', async () => {
   const translateBtn = document.getElementById('translateBtn');
   const runBtn = document.getElementById('runBtn');
   const stopBtn = document.getElementById('stopBtn');
-  const purgeHistoryBtn = document.getElementById('purgeHistoryBtn');
   const goBackBtn = document.getElementById('goBackBtn');
   const goForwardBtn = document.getElementById('goForwardBtn');
+  const newTurnBtn = document.getElementById('newTurnBtn');
+  // Declared (as null) here rather than at its original spot right above
+  // the CodeMirror.fromTextArea() call further down - hasNothingToClear()
+  // (called from updateHistoryNavButtons() immediately below, to set
+  // #newTurnBtn's initial disabled state) reads it via getSqlQuery(), and
+  // a `let` binding is in the temporal dead zone - accessing it throws -
+  // from the top of its enclosing scope until its own declaration line
+  // actually runs. Moving the declaration up here (its value is still only
+  // ever really assigned down at the original spot) is enough to get it
+  // out of the TDZ before this first call needs it; sqlEditor itself stays
+  // null until CodeMirror actually initializes either way.
+  let sqlEditor = null;
   updateHistoryNavButtons();
   const micBtn = document.getElementById('micBtn');
   // Opens #reportIssueModal in 'wrong_sql' mode (see REPORT_CATEGORY_CONFIG
@@ -1128,17 +1299,16 @@ document.addEventListener('DOMContentLoaded', async () => {
       });
   }
 
-  // DOM Elements - History Modal & Tabs
+  // DOM Elements - History Modal (see loadChatHistorySummary()/
+  // renderChatHistoryBucketList() below - this modal used to show the
+  // "translations" audit log's own table/charts/purge button; it now shows
+  // chat_history's per-database turn counts instead, with per-database and
+  // delete-all controls, per bucket_key)
   const historyModal = document.getElementById('historyModal');
   const historyBtn = document.getElementById('historyBtn');
   const historyModalCloseBtn = document.getElementById('historyModalCloseBtn');
-  const historyTableHeader = document.getElementById('historyTableHeader');
-  const historyTableBody = document.getElementById('historyTableBody');
-
-  const tabBtnTranslations = document.getElementById('tabBtnTranslations');
-  const tabBtnStatistics = document.getElementById('tabBtnStatistics');
-  const historyTabTranslations = document.getElementById('historyTabTranslations');
-  const historyTabStatistics = document.getElementById('historyTabStatistics');
+  const chatHistoryBucketList = document.getElementById('chatHistoryBucketList');
+  const deleteAllChatHistoryBtn = document.getElementById('deleteAllChatHistoryBtn');
 
   // DOM Elements - New Version Banner (see fetchClientBuildId()/
   // checkForNewClientVersion() below)
@@ -1182,10 +1352,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   // forwards to a click on this same button rather than duplicating any of
   // this wiring.
   const sendFeedbackBtn = document.getElementById('sendFeedbackBtn');
-
-  // Chart.js Instances
-  let chartCountInstance = null;
-  let chartTotalTokensInstance = null;
 
   // ===========================================================================
   // 3. SPEECH RECOGNITION (mic button)
@@ -1247,7 +1413,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   setupMicButton(micBtn, aiPrompt);
 
-  let sqlEditor = null;
+  // sqlEditor itself is declared (as null) much earlier in this file now -
+  // see that declaration's own comment for why - this is still where it
+  // actually gets a real CodeMirror instance assigned, if one loads.
   if (sqlQueryTextarea && window.CodeMirror) {
     sqlEditor = window.CodeMirror.fromTextArea(sqlQueryTextarea, {
       mode: 'text/x-sql',
@@ -1762,6 +1930,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (disabled) {
       if (goBackBtn) goBackBtn.disabled = true;
       if (goForwardBtn) goForwardBtn.disabled = true;
+      if (newTurnBtn) newTurnBtn.disabled = true;
     } else {
       // Re-enabling: defer to the boundary logic rather than unconditionally
       // turning them back on (e.g. stay disabled if already at the oldest turn).
@@ -1876,7 +2045,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const keyNote = rotatedKey ? ', switching to a different API key' : '';
     resultsRetryStatus.innerHTML =
       `<span class="retry-status-icon animate-spin">⟳</span> ` +
-      `Translation hit a transient error${keyNote} - retrying (attempt ${attempt} of ${maxAttempts})...`;
+      `The model ran into a transient error${keyNote} - retrying (attempt ${attempt} of ${maxAttempts})...`;
     resultsRetryStatus.classList.remove('hidden');
   }
 
@@ -2062,12 +2231,29 @@ document.addEventListener('DOMContentLoaded', async () => {
     updateHistoryNavButtons();
   }
 
+  // True if there's currently nothing for #newTurnBtn to clear - the
+  // prompt/SQL boxes are both empty AND this bucket has no turns to step
+  // back into - in which case it's disabled rather than sitting there as
+  // an inert no-op. Also true while already viewing the blank slate itself
+  // (clicking it again would do nothing new).
+  function hasNothingToClear() {
+    if (viewingBlankSlate) return true;
+    const promptHasText = !!(aiPrompt && aiPrompt.value.trim());
+    const sqlHasText = !!getSqlQuery();
+    return !promptHasText && !sqlHasText && chatStore.turnCount() === 0;
+  }
+
   function updateHistoryNavButtons() {
     // chatStore holds [user, model] pairs. When only one turn remains,
     // it's already the oldest turn on screen - going back from there would
-    // pop it and leave the UI blank, so disable one step early.
-    const atOldestTurn = !chatStore.canUndo();
-    const atNewestTurn = !chatStore.canRedo();
+    // pop it and leave the UI blank, so disable one step early. While
+    // viewingBlankSlate (see its own docstring), that's no longer the right
+    // test for #goBackBtn - the blank slate itself is already "one step
+    // early", so back should be enabled as long as any real turn exists to
+    // reveal, and #goForwardBtn has nothing to redo TO from a position that
+    // was never pushed into history in the first place.
+    const atOldestTurn = viewingBlankSlate ? chatStore.turnCount() === 0 : !chatStore.canUndo();
+    const atNewestTurn = viewingBlankSlate ? true : !chatStore.canRedo();
 
     if (goBackBtn) {
       goBackBtn.disabled = atOldestTurn;
@@ -2078,6 +2264,11 @@ document.addEventListener('DOMContentLoaded', async () => {
       goForwardBtn.disabled = atNewestTurn;
       goForwardBtn.classList.toggle('is-boundary', atNewestTurn);
       goForwardBtn.title = atNewestTurn ? "No later turns" : "Go forward to next turn";
+    }
+    if (newTurnBtn) {
+      const nothingToClear = hasNothingToClear();
+      newTurnBtn.disabled = nothingToClear;
+      newTurnBtn.classList.toggle('is-boundary', nothingToClear);
     }
   }
 
@@ -2127,9 +2318,20 @@ document.addEventListener('DOMContentLoaded', async () => {
         connDbDot.className = 'status-dot connected';
       } else {
         connDbDot.className = 'status-dot disconnected';
+        // `data.error` is the raw exception text /api/ping's own except
+        // branch now includes (see that route's own comment for why it's
+        // fine to hand back) - see trackDbConnectionError()'s own comment
+        // above for the full tracking rationale.
+        trackDbConnectionError(data.error);
       }
     } catch (err) {
       connDbDot.className = 'status-dot disconnected';
+      // Same tracking as the non-throwing failure branch above, just for
+      // the case where the /api/ping fetch itself never came back at all
+      // (network drop, etc.) rather than responding with success:false -
+      // err.message stands in for data.error here since there's no
+      // response body to read one from.
+      trackDbConnectionError(err && err.message);
     }
   }
 
@@ -2420,6 +2622,20 @@ document.addEventListener('DOMContentLoaded', async () => {
         MAX_IN_SCOPE_CONNECTIONS = data.max_in_scope_connections;
       }
 
+      // Restore every persisted bucket for this identity from the server
+      // BEFORE reconcileActiveHistoryBucket() switches to one - otherwise
+      // that call would create and render an empty bucket first, then
+      // this would have to swap in the real data a moment later. Guarded
+      // so it only actually fetches once per identity (see
+      // chatHistoryHydratedForIdentity's own declaration comment); placed
+      // here (not earlier in this function) so currentHistoryMaxTurns has
+      // already been reconciled with this response's history_max_turns by
+      // the time any restored bucket is trimmed to it.
+      if (CURRENT_USER_IDENTITY !== chatHistoryHydratedForIdentity) {
+        await hydrateChatHistoryFromServer();
+        chatHistoryHydratedForIdentity = CURRENT_USER_IDENTITY;
+      }
+
       // Now that CURRENT_USER_IDENTITY/ACTIVE_*/IN_SCOPE_MODE all reflect
       // this response, switch to whichever bucket they now name - covers
       // login/logout (identity changed) and, on a fresh page load, the
@@ -2435,7 +2651,14 @@ document.addEventListener('DOMContentLoaded', async () => {
       updateModelBadge();
     } catch (err) {
       console.error("Failed to fetch backend configuration:", err);
-      if (connDbDot) connDbDot.className = 'status-dot disconnected';
+      if (connDbDot) {
+        connDbDot.className = 'status-dot disconnected';
+        // See trackDbConnectionError()'s own comment for why this counts -
+        // the badge can't confirm the selected database is reachable
+        // without a successful config fetch, so it's shown as down, same
+        // as checkDbStatus()'s own dedicated liveness check.
+        trackDbConnectionError(err && err.message);
+      }
     }
   }
 
@@ -4396,7 +4619,13 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
     } catch (err) {
       console.error("Failed to save backend configuration:", err);
-      if (connDbDot) connDbDot.className = 'status-dot disconnected';
+      if (connDbDot) {
+        connDbDot.className = 'status-dot disconnected';
+        // See trackDbConnectionError()'s own comment for why this counts -
+        // a network exception while saving a DB connection means the
+        // badge can't confirm it's reachable either.
+        trackDbConnectionError(err && err.message);
+      }
     }
 
     if (closeModal) {
@@ -4735,105 +4964,14 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   // ===========================================================================
-  // 7. HISTORY MODAL: TABS, STATS CHARTS, LOAD/PURGE
+  // 7. HISTORY MODAL: see loadChatHistorySummary()/renderChatHistoryBucketList()/
+  //    the per-row and #deleteAllChatHistoryBtn handlers further down -
+  //    this used to be tab-switching + Chart.js setup for the "translations"
+  //    audit log's own stats view, removed along with that view (see
+  //    chat_history_routes.py's module docstring for where that log went:
+  //    nowhere - it's still recorded and still queryable via /api/history,
+  //    just no longer shown here).
   // ===========================================================================
-  if (tabBtnTranslations && tabBtnStatistics) {
-    tabBtnTranslations.addEventListener('click', () => {
-      tabBtnTranslations.classList.add('active');
-      tabBtnStatistics.classList.remove('active');
-      if (historyTabTranslations) historyTabTranslations.classList.remove('hidden');
-      if (historyTabStatistics) historyTabStatistics.classList.add('hidden');
-    });
-
-    tabBtnStatistics.addEventListener('click', () => {
-      tabBtnStatistics.classList.add('active');
-      tabBtnTranslations.classList.remove('active');
-      if (historyTabStatistics) historyTabStatistics.classList.remove('hidden');
-      if (historyTabTranslations) historyTabTranslations.classList.add('hidden');
-
-      requestAnimationFrame(() => {
-        if (chartCountInstance) chartCountInstance.resize();
-        if (chartTotalTokensInstance) chartTotalTokensInstance.resize();
-      });
-    });
-  }
-
-  // Cached so setTheme() can rebuild these charts with the new theme's
-  // colors without needing to re-fetch /api/history's stats - Chart.js
-  // bakes resolved color strings into its config at creation time and
-  // never re-reads CSS custom properties on its own.
-  let lastStatsDataForCharts = null;
-
-  function renderStatisticsCharts(statsData) {
-    if (!statsData || statsData.length === 0 || typeof window.Chart === 'undefined') return;
-    lastStatsDataForCharts = statsData;
-
-    const dates = statsData.map(item => item.day_date || item.date || 'Unknown');
-    const totalTranslations = statsData.map(item => item.total_translations || 0);
-    const sumTotalTokens = statsData.map(item => item.sum_total_tokens || 0);
-
-    // Read the active theme's resolved colors rather than hardcoding hex
-    // values, so these charts stay correct in both themes (see the THEME
-    // SWITCHING section, which rebuilds these charts from
-    // lastStatsDataForCharts whenever the theme changes).
-    const rootStyle = getComputedStyle(document.documentElement);
-    const tickColor = rootStyle.getPropertyValue('--text-secondary').trim() || '#94a3b8';
-    const gridColor = rootStyle.getPropertyValue('--overlay-1').trim() || 'rgba(255,255,255,0.05)';
-    const cyanColor = rootStyle.getPropertyValue('--accent-cyan').trim() || '#38bdf8';
-    const cyanRgb = rootStyle.getPropertyValue('--accent-cyan-rgb').trim() || '56, 189, 248';
-    const primaryColor = rootStyle.getPropertyValue('--primary').trim() || '#10b981';
-    const primaryRgb = rootStyle.getPropertyValue('--primary-rgb').trim() || '16, 185, 129';
-
-    const commonOptions = {
-      responsive: true,
-      maintainAspectRatio: false,
-      plugins: {
-        legend: { display: false }
-      },
-      scales: {
-        x: { ticks: { color: tickColor, font: { size: 10 } }, grid: { color: gridColor } },
-        y: { ticks: { color: tickColor, font: { size: 10 } }, grid: { color: gridColor } }
-      }
-    };
-
-    const ctxCount = document.getElementById('chartTranslationsPerDay')?.getContext('2d');
-    if (ctxCount) {
-      if (chartCountInstance) chartCountInstance.destroy();
-      chartCountInstance = new window.Chart(ctxCount, {
-        type: 'bar',
-        data: {
-          labels: dates,
-          datasets: [{
-            label: 'Total Translations',
-            data: totalTranslations,
-            backgroundColor: `rgba(${cyanRgb}, 0.6)`,
-            borderColor: cyanColor,
-            borderWidth: 1
-          }]
-        },
-        options: commonOptions
-      });
-    }
-
-    const ctxTotalTokens = document.getElementById('chartTotalTokensPerDay')?.getContext('2d');
-    if (ctxTotalTokens) {
-      if (chartTotalTokensInstance) chartTotalTokensInstance.destroy();
-      chartTotalTokensInstance = new window.Chart(ctxTotalTokens, {
-        type: 'bar',
-        data: {
-          labels: dates,
-          datasets: [{
-            label: 'Sum of Total Tokens',
-            data: sumTotalTokens,
-            backgroundColor: `rgba(${primaryRgb}, 0.6)`,
-            borderColor: primaryColor,
-            borderWidth: 1
-          }]
-        },
-        options: commonOptions
-      });
-    }
-  }
 
   function showConfirmDialog(message) {
     return new Promise((resolve) => {
@@ -5325,101 +5463,241 @@ document.addEventListener('DOMContentLoaded', async () => {
     reportIssueSendBtn.addEventListener('click', sendReportIssue);
   }
 
-  async function loadHistoryData() {
-    if (!historyTableHeader || !historyTableBody) return;
-  
-    historyTableHeader.innerHTML = '';
-    historyTableBody.innerHTML = '<tr><td class="text-center text-muted py-8">Loading history...</td></tr>';
+  // The summary endpoint's own last response - cached so the per-row
+  // delete buttons and #deleteAllChatHistoryBtn don't need to re-derive a
+  // bucket's display label/turn_count from its bare bucket_key, and so
+  // "delete all" knows exactly which bucket_keys currently exist without a
+  // second round trip.
+  let currentChatHistoryBuckets = [];
 
-    document.getElementById('historyCountSubtitle')?.remove();
-  
-    try {
-      const response = await fetch('/api/history', { headers: getApiHeaders(), credentials: 'same-origin' });
-      const data = await response.json();
-  
-      if (response.ok && data.success) {
-        const totalCount = (data.total_count !== undefined && data.total_count !== null && data.total_count > 0) 
-          ? data.total_count 
-          : (data.history ? data.history.length : 0);
+  // Mirrors chat_history_routes.py's own _resolve_bucket_display() -
+  // "available" false means this bucket's connection could no longer be
+  // resolved against this user's CURRENT presets/custom connections (see
+  // that function's docstring for why such a bucket is still shown, not
+  // hidden). "custom-adhoc" never gets its raw URL rendered here either -
+  // the server already withheld it from `name`/`type` for exactly that
+  // reason; this function has no more of it to work with than that.
+  function bucketDisplayLabel(bucket) {
+    if (bucket.kind === 'all') return bucket.name || 'All databases (combined)';
+    if (bucket.available && bucket.name) return bucket.name;
+    if (bucket.kind === 'preset') return 'Unavailable preset';
+    if (bucket.kind === 'custom') return 'Unavailable connection';
+    if (bucket.kind === 'custom-adhoc') return 'Unsaved custom connection';
+    return 'Unknown connection';
+  }
 
-        const purgeTitleEl = document.querySelector('.btn-purge-title');
-        if (purgeTitleEl) {
-          purgeTitleEl.textContent = `(${totalCount})`;
-        }
+  function renderChatHistoryBucketList(buckets) {
+    if (!chatHistoryBucketList) return;
+    chatHistoryBucketList.innerHTML = '';
+    if (deleteAllChatHistoryBtn) deleteAllChatHistoryBtn.disabled = buckets.length === 0;
 
-        if (data.history && data.history.length > 0) {
-          const rows = data.history;
-          const columns = Object.keys(rows[0]);
-  
-          columns.forEach(col => {
-            const th = document.createElement('th');
-            th.textContent = col;
-            historyTableHeader.appendChild(th);
-          });
-  
-          historyTableBody.innerHTML = '';
-          rows.forEach(row => {
-            const tr = document.createElement('tr');
-            columns.forEach(col => {
-              const td = document.createElement('td');
-              const val = row[col];
-              td.textContent = val !== null && val !== undefined ? val : 'NULL';
-              td.classList.add('cell-multiline');
-              if (val === null || val === undefined) td.classList.add('text-null');
-              tr.appendChild(td);
-            });
-            historyTableBody.appendChild(tr);
-          });
-        } else {
-          historyTableBody.innerHTML = '<tr><td class="text-center text-muted py-8">No history records found.</td></tr>';
-        }
-  
-        renderStatisticsCharts(data.stats || []);
-      } else {
-        const errMsg = response.status === 401 
-          ? "Authentication required. Please click 'Sign in with Google' in the top-right corner to authenticate." 
-          : (data.error || `Server returned status ${response.status}`);
-        historyTableBody.innerHTML = `
-          <tr>
-            <td class="error-cell">
-              <div class="error-container">
-                <span class="error-icon">⚠️</span>
-                <div class="error-details">
-                  <strong>Error Loading History</strong>
-                  <p>${errMsg}</p>
-                </div>
-              </div>
-            </td>
-          </tr>`;
+    if (buckets.length === 0) {
+      const li = document.createElement('li');
+      li.className = 'chat-history-bucket-row chat-history-bucket-row--empty text-center text-muted py-8';
+      li.textContent = 'No saved conversations yet.';
+      chatHistoryBucketList.appendChild(li);
+      return;
+    }
+
+    // "all" first (a global, not-really-a-database bucket), then every
+    // resolvable database alphabetically by name, then unresolvable/
+    // orphaned buckets last, grouped together rather than interleaved -
+    // there's no name to alphabetize THEM by, and they're the least
+    // important entries here.
+    const sorted = [...buckets].sort((a, b) => {
+      const rank = (x) => (x.kind === 'all' ? 0 : x.available ? 1 : 2);
+      const rankDiff = rank(a) - rank(b);
+      if (rankDiff !== 0) return rankDiff;
+      return (a.name || '').localeCompare(b.name || '') || a.bucket_key.localeCompare(b.bucket_key);
+    });
+
+    sorted.forEach((bucket) => {
+      const li = document.createElement('li');
+      li.className = 'chat-history-bucket-row';
+      if (!bucket.available) li.classList.add('chat-history-bucket-row--unavailable');
+
+      const info = document.createElement('div');
+      info.className = 'chat-history-bucket-info';
+
+      // Built with textContent, never innerHTML - bucket.name for a
+      // "custom" kind is a user-supplied connection name (whichever user
+      // saved it), not something this app generated.
+      const nameEl = document.createElement('span');
+      nameEl.className = 'chat-history-bucket-name';
+      nameEl.textContent = bucketDisplayLabel(bucket);
+      info.appendChild(nameEl);
+
+      if (bucket.type) {
+        const typeEl = document.createElement('span');
+        typeEl.className = 'chat-history-bucket-type';
+        typeEl.textContent = bucket.type;
+        info.appendChild(typeEl);
       }
-    } catch (err) {
-      console.error("Failed to fetch history:", err);
-      historyTableBody.innerHTML = `
-        <tr>
-          <td class="error-cell">
+
+      const countEl = document.createElement('span');
+      countEl.className = 'chat-history-bucket-count';
+      countEl.textContent = `${bucket.turn_count} turn${bucket.turn_count === 1 ? '' : 's'}`;
+      info.appendChild(countEl);
+
+      li.appendChild(info);
+
+      const deleteBtn = document.createElement('button');
+      deleteBtn.type = 'button';
+      deleteBtn.className = 'btn chat-history-bucket-delete-btn';
+      deleteBtn.textContent = 'Delete';
+      deleteBtn.dataset.bucketKey = bucket.bucket_key;
+      li.appendChild(deleteBtn);
+
+      chatHistoryBucketList.appendChild(li);
+    });
+  }
+
+  async function loadChatHistorySummary() {
+    if (!chatHistoryBucketList) return;
+    chatHistoryBucketList.innerHTML = '<li class="chat-history-bucket-row chat-history-bucket-row--empty text-center text-muted py-8">Loading...</li>';
+    if (deleteAllChatHistoryBtn) deleteAllChatHistoryBtn.disabled = true;
+
+    try {
+      const response = await fetch('/api/chat-history/summary', { headers: getApiHeaders(), credentials: 'same-origin' });
+      const data = await response.json();
+
+      if (response.ok && data.success) {
+        currentChatHistoryBuckets = data.buckets || [];
+        renderChatHistoryBucketList(currentChatHistoryBuckets);
+      } else {
+        currentChatHistoryBuckets = [];
+        const errMsg = response.status === 401
+          ? "Authentication required. Please click 'Sign in with Google' in the top-right corner to authenticate."
+          : (data.error || `Server returned status ${response.status}`);
+        chatHistoryBucketList.innerHTML = `
+          <li class="chat-history-bucket-row chat-history-bucket-row--empty error-cell">
             <div class="error-container">
               <span class="error-icon">⚠️</span>
               <div class="error-details">
                 <strong>Error Loading History</strong>
-                <p>${err.message || "Failed to reach the backend service."}</p>
+                <p>${errMsg}</p>
               </div>
             </div>
-          </td>
-        </tr>`;
+          </li>`;
+      }
+    } catch (err) {
+      console.error("Failed to fetch chat history summary:", err);
+      currentChatHistoryBuckets = [];
+      chatHistoryBucketList.innerHTML = `
+        <li class="chat-history-bucket-row chat-history-bucket-row--empty error-cell">
+          <div class="error-container">
+            <span class="error-icon">⚠️</span>
+            <div class="error-details">
+              <strong>Error Loading History</strong>
+              <p>${err.message || "Failed to reach the backend service."}</p>
+            </div>
+          </div>
+        </li>`;
     }
+  }
+
+  // Clears one bucket's saved turns server-side - just save_chat_bucket()
+  // with an empty list (see /api/chat-history/save's own docstring; there's
+  // no separate delete endpoint, "cleared" and "deleted" are the same
+  // state here). Also evicts this bucket's own IN-MEMORY store if one
+  // exists: without this, a bucket cleared here while some OTHER
+  // connection is on screen would still show its old (now server-cleared)
+  // turns if the user switched to it later this same page-load, since
+  // reconcileActiveHistoryBucket()/getOrCreateBucketStore() reuse an
+  // existing in-memory store rather than re-fetching it. If the CLEARED
+  // bucket is the one currently active, also blanks the visible prompt/
+  // SQL/results right away, same as restoring a genuinely empty bucket
+  // already looks.
+  async function clearChatHistoryBucket(bucketKeySuffix) {
+    const response = await fetch('/api/chat-history/save', {
+      method: 'POST',
+      headers: getApiHeaders(),
+      credentials: 'same-origin',
+      body: JSON.stringify({ bucket_key: bucketKeySuffix, turns: [] }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.success) {
+      throw new Error(data.error || `Server returned status ${response.status}`);
+    }
+
+    const identity = CURRENT_USER_IDENTITY || 'global';
+    const fullKey = `${identity}::${bucketKeySuffix}`;
+    const store = chatStoresByBucket.get(fullKey);
+    if (store) store.clear();
+
+    if (fullKey === activeBucketKey) {
+      restoreLatestTurn();
+      updateHistoryTurnsSubtitle();
+    }
+  }
+
+  function setHistoryActionMsg(text, isError) {
+    const msgEl = document.getElementById('historyActionMsg');
+    if (!msgEl) return;
+    msgEl.textContent = text;
+    msgEl.style.color = isError ? 'var(--danger, #f87171)' : 'var(--primary, #10b981)';
+  }
+
+  if (chatHistoryBucketList) {
+    chatHistoryBucketList.addEventListener('click', async (e) => {
+      const btn = e.target.closest('.chat-history-bucket-delete-btn');
+      if (!btn) return;
+      const bucketKey = btn.dataset.bucketKey;
+      const bucket = currentChatHistoryBuckets.find((b) => b.bucket_key === bucketKey);
+      const label = bucket ? bucketDisplayLabel(bucket) : 'this database';
+
+      // Fired on the click itself, before the confirm dialog - same
+      // "measure intent, not just follow-through" posture the old
+      // history_purge_clicked event had.
+      trackEvent('chat_history_delete_clicked', bucket ? { kind: bucket.kind, turn_count: bucket.turn_count } : {});
+
+      const confirmed = await showConfirmDialog(`Delete all saved turns for "${label}"? This cannot be undone.`);
+      if (!confirmed) return;
+
+      btn.disabled = true;
+      try {
+        await clearChatHistoryBucket(bucketKey);
+        setHistoryActionMsg('Deleted successfully.', false);
+        await loadChatHistorySummary();
+      } catch (err) {
+        console.error('Failed to clear chat history bucket:', err);
+        setHistoryActionMsg(err.message || 'Failed to delete.', true);
+        btn.disabled = false;
+      }
+    });
+  }
+
+  if (deleteAllChatHistoryBtn) {
+    deleteAllChatHistoryBtn.addEventListener('click', async () => {
+      if (currentChatHistoryBuckets.length === 0) return;
+      const bucketCount = currentChatHistoryBuckets.length;
+      const turnCount = currentChatHistoryBuckets.reduce((sum, b) => sum + b.turn_count, 0);
+
+      trackEvent('chat_history_delete_all_clicked', { bucket_count: bucketCount, turn_count: turnCount });
+
+      const confirmed = await showConfirmDialog(`Delete ALL saved turns across every database (${bucketCount} in total)? This cannot be undone.`);
+      if (!confirmed) return;
+
+      deleteAllChatHistoryBtn.disabled = true;
+      try {
+        await Promise.all(currentChatHistoryBuckets.map((b) => clearChatHistoryBucket(b.bucket_key)));
+        setHistoryActionMsg('Deleted successfully.', false);
+        await loadChatHistorySummary();
+      } catch (err) {
+        console.error('Failed to clear all chat history:', err);
+        setHistoryActionMsg(err.message || 'Failed to delete.', true);
+        deleteAllChatHistoryBtn.disabled = false;
+      }
+    });
   }
 
   if (historyBtn && historyModal) {
     historyBtn.addEventListener('click', () => {
       trackEvent('history_viewed', {});
       updateHistoryTurnsSubtitle();
-      const purgeTitleEl = document.querySelector('.btn-purge-title');
-      if (purgeTitleEl) {
-        purgeTitleEl.textContent = '(...)';
-      }
       historyModal.classList.remove('hidden');
       bringModalToFront(historyModal);
-      loadHistoryData();
+      loadChatHistorySummary();
     });
   }
 
@@ -7433,7 +7711,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         // through to the "Translation Error" branch the way a truly
         // absent/falsy `sql` would for every other response shape.
         const modelEntry = { role: 'model', text: data.sql || '' };
-        chatStore.pushTurn(promptText, modelEntry);
+        pushActiveTurn(promptText, modelEntry);
         updateHistoryTurnsSubtitle();
 
         if (data.sql) {
@@ -7552,7 +7830,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         const isNoSql = trimmedSql.startsWith('*** NO SQL ***');
 
         const modelEntry = { role: 'model', text: data.sql };
-        chatStore.pushTurn(promptText, modelEntry);
+        pushActiveTurn(promptText, modelEntry);
         updateHistoryTurnsSubtitle();
 
         if (isOpenHelp) {
@@ -7935,7 +8213,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             const modelEntry = { role: 'model', text: sql, results: summarizedResults };
             if (allModeNotes) captureAllModeHistory(modelEntry, allModeNotes, [], allModeSummaryResult);
             if (singleModeSummary) modelEntry.summary = singleModeSummary;
-            chatStore.pushTurn(promptText, modelEntry);
+            pushActiveTurn(promptText, modelEntry);
             updateHistoryTurnsSubtitle();
           }
           // Chunk 4 - see fanOutAllModeHistoryPerDatabase's own docstring.
@@ -8036,7 +8314,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           } else {
             const modelEntry = { role: 'model', text: sql, results: summarizedResults };
             captureAllModeHistory(modelEntry, allModeNotes, executeFailures, summaryResult);
-            chatStore.pushTurn(promptText, modelEntry);
+            pushActiveTurn(promptText, modelEntry);
             updateHistoryTurnsSubtitle();
           }
           // Chunk 4 - see fanOutAllModeHistoryPerDatabase's own docstring.
@@ -8118,7 +8396,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           } else {
             const modelEntry = { role: 'model', text: sql, results: summarizedResults };
             if (singleModeSummary) modelEntry.summary = singleModeSummary;
-            chatStore.pushTurn(promptText, modelEntry);
+            pushActiveTurn(promptText, modelEntry);
             updateHistoryTurnsSubtitle();
           }
         } else if (resultsBody) {
@@ -8186,7 +8464,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             } else {
               const modelEntry = { role: 'model', text: sql, results: summarizedResults };
               if (singleModeSummary) modelEntry.summary = singleModeSummary;
-              chatStore.pushTurn(promptText, modelEntry);
+              pushActiveTurn(promptText, modelEntry);
               updateHistoryTurnsSubtitle();
             }
           }
@@ -8304,6 +8582,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
 
     aiPrompt.addEventListener('keydown', (e) => {
+      // Keyboard shortcut for #newTurnBtn (see startNewTurn()) - scoped to
+      // this textarea's own keydown, not a document-wide listener, so it
+      // can never fight with some other, unrelated Escape behavior
+      // elsewhere in the page.
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        startNewTurn();
+        return;
+      }
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
         // Guard against double-submission while a translation is already
@@ -8510,8 +8797,60 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
+  // Thin wrapper around chatStore.pushTurn() for every "a real turn just
+  // landed in the ACTIVE bucket" call site in this file (translatePrompt()/
+  // executeSql()'s several branches) - clears viewingBlankSlate as a side
+  // effect, so submitting a genuinely new question from #newTurnBtn's
+  // blank slate correctly exits it rather than leaving the flag stuck true
+  // once a real turn is back on screen. Deliberately NOT used by
+  // pushTurnIntoBucket() (all-mode's fan-out into OTHER databases' own
+  // buckets) - a background bucket receiving a turn says nothing about
+  // whether the bucket currently on screen is still blank.
+  function pushActiveTurn(promptText, modelEntry) {
+    viewingBlankSlate = false;
+    chatStore.pushTurn(promptText, modelEntry);
+  }
+
+  // #newTurnBtn: blanks the prompt/SQL/results so the user can ask a new
+  // question, WITHOUT touching this bucket's actual turn history - see
+  // viewingBlankSlate's own docstring for why this has to be more than
+  // just clearing three fields. Deliberately does not persist anything
+  // server-side either: nothing about this bucket's saved turns has
+  // changed, so a reload before a real new turn is submitted correctly
+  // shows the last real turn again, same as reloading ever did.
+  function startNewTurn() {
+    if (aiPrompt) aiPrompt.value = '';
+    setSqlQuery('');
+    chatStore.clearPending();
+    clearResultsDisplay();
+    // The last turn's all-mode routing pinned specific databases (see
+    // PINNED_CONNECTIONS' own declaration) - a genuinely new question
+    // should triage across every in-scope database again, not stay
+    // artificially narrowed to wherever the turn being cleared landed.
+    PINNED_CONNECTIONS = [];
+    viewingBlankSlate = true;
+    updateHistoryTurnsSubtitle();
+    if (aiPrompt) aiPrompt.focus();
+    trackEvent('new_turn_clicked', { turn_offset: chatStore.turnOffset() });
+  }
+
+  if (newTurnBtn) {
+    newTurnBtn.addEventListener('click', startNewTurn);
+  }
+
   if (goBackBtn) {
     goBackBtn.addEventListener('click', () => {
+      if (viewingBlankSlate) {
+        // Nothing to undo() - the blank slate was never pushed into
+        // history - just reveal the real last turn that's still sitting
+        // there untouched.
+        if (chatStore.turnCount() === 0) return;
+        viewingBlankSlate = false;
+        updateHistoryTurnsSubtitle();
+        restoreLatestTurn();
+        trackEvent('history_nav_clicked', { turn_offset: chatStore.turnOffset() });
+        return;
+      }
       if (chatStore.undo()) {
         updateHistoryTurnsSubtitle();
         restoreLatestTurn();
@@ -8526,66 +8865,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         updateHistoryTurnsSubtitle();
         restoreLatestTurn();
         trackEvent('history_nav_clicked', { turn_offset: chatStore.turnOffset() });
-      }
-    });
-  }
-
-  /** The record count currently shown next to "Purge Translations"
-   * (`.btn-purge-title`, e.g. "(42)" - kept in sync by loadHistoryData()).
-   * Read fresh at click time so history_purge_clicked's `record_count`
-   * always reflects what's on screen right before the purge happens, not a
-   * stale earlier load. Returns null while the count hasn't loaded yet
-   * (shows "(...)" - see the historyBtn click handler above) rather than
-   * fabricating a number. */
-  function currentHistoryRecordCount() {
-    const purgeTitleEl = document.querySelector('.btn-purge-title');
-    if (!purgeTitleEl) return null;
-    const match = purgeTitleEl.textContent.match(/\d+/);
-    return match ? parseInt(match[0], 10) : null;
-  }
-
-  if (purgeHistoryBtn) {
-    purgeHistoryBtn.addEventListener('click', async () => {
-      // Fired on the click itself, before the confirm dialog - this is
-      // "the user clicked Purge", not "the user confirmed the purge" - and
-      // record_count is the count as of right now, before anything is
-      // actually deleted.
-      const recordCount = currentHistoryRecordCount();
-      trackEvent('history_purge_clicked', recordCount !== null ? { record_count: recordCount } : {});
-
-      const confirmed = await showConfirmDialog('Are you sure you want to purge history records within the current scope? This action cannot be undone.');
-      if (!confirmed) {
-        return;
-      }
-      const msgEl = document.getElementById('historyActionMsg');
-      try {
-        const response = await fetch('/api/history/purge', {
-          method: 'DELETE',
-          headers: getApiHeaders(),
-          credentials: 'same-origin'
-        });
-        const data = await response.json();
-        if (response.ok && data.success) {
-          if (msgEl) {
-            msgEl.textContent = 'Purged successfully.';
-            msgEl.style.color = 'var(--primary, #10b981)';
-          }
-          await loadHistoryData();
-        } else {
-          const errMsg = response.status === 401 
-            ? "Authentication required." 
-            : (data.error || "Failed to purge history.");
-          if (msgEl) {
-            msgEl.textContent = errMsg;
-            msgEl.style.color = 'var(--danger, #f87171)';
-          }
-        }
-      } catch (err) {
-        console.error("Failed to purge history:", err);
-        if (msgEl) {
-          msgEl.textContent = 'Network error purging history';
-          msgEl.style.color = 'var(--danger, #f87171)';
-        }
       }
     });
   }

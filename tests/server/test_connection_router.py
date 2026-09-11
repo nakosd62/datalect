@@ -989,6 +989,32 @@ def test_all_mode_route_outcome_with_one_database_generation_failure_still_retur
     assert failure["error"].endswith("Actual error message received:\nsimulated Gemini failure")
     assert data['database_notes'] == []
 
+    # Each Phase B connection now gets its OWN dedicated translations-table
+    # row regardless of outcome - including this one's failed connection,
+    # which used to get no row logged at all. Row 0 is Phase A's triage
+    # row (unaffected by this test), rows 1/2 are pg-a's (sql) and pg-b's
+    # (failed) own Phase B rows.
+    rows = _translation_rows(env)
+    assert len(rows) == 3
+    _triage_row, pg_a_row, pg_b_row = rows
+    assert pg_a_row['database_type'] == 'postgres'
+    assert pg_a_row['database_name'] == 'Sales Postgres'
+    assert pg_a_row['sql_command'] == "-- database: preset:pg-a (Sales Postgres)\nSELECT * FROM deals;"
+
+    assert pg_b_row['database_type'] == 'postgres'
+    assert pg_b_row['database_name'] == 'Marketing Postgres'
+    # Same TRANSLATION_ERROR(...) convention the single-connection
+    # /api/translate and both summarize routes' own failure logging uses -
+    # this connection's real, categorized error text, not a bare generic
+    # message.
+    assert pg_b_row['sql_command'] == f"TRANSLATION_ERROR ({failure['error']})"
+    # A genuine LLM-call failure never returns a billable response - all
+    # five token counts are honest zeros, same as every other failure-path
+    # logging call in this app.
+    assert (pg_b_row['input_tokens'], pg_b_row['output_tokens'], pg_b_row['total_tokens'],
+            pg_b_row['thinking_tokens'], pg_b_row['cached_content_tokens']) == (0, 0, 0, 0, 0)
+    assert pg_b_row['duration'] >= 0
+
 
 def test_all_mode_route_outcome_all_databases_fail_or_note_returns_empty_sql_but_success_true(app_factory, tmp_path, monkeypatch):
     env = _two_preset_env(app_factory, tmp_path)
@@ -1029,6 +1055,18 @@ def test_all_mode_route_outcome_all_databases_fail_or_note_returns_empty_sql_but
     assert failure["error"].startswith("The selected model (")
     assert "ran into an error" in failure["error"]
     assert failure["error"].endswith("Actual error message received:\nsimulated failure")
+
+    # Both connections still get their own dedicated row despite neither
+    # producing real SQL - a "note" outcome logs with the same
+    # "*** NO SQL ***" convention every other non-SQL reply in this table
+    # uses, and the failed one logs TRANSLATION_ERROR(...), same as above.
+    rows = _translation_rows(env)
+    assert len(rows) == 3
+    _triage_row, pg_a_row, pg_b_row = rows
+    assert pg_a_row['database_name'] == 'Sales Postgres'
+    assert pg_a_row['sql_command'] == '*** NO SQL *** Deals table has nothing relevant.'
+    assert pg_b_row['database_name'] == 'Marketing Postgres'
+    assert pg_b_row['sql_command'] == f"TRANSLATION_ERROR ({failure['error']})"
 
 
 def test_all_mode_emits_phase_status_lines_for_schema_collection_and_routing_before_any_outcome(
@@ -1196,16 +1234,16 @@ def test_classify_generation_outcome_covers_sql_note_empty_and_failed_shapes(app
     classify = env.translate_routes._classify_generation_outcome
     entry = {"kind": "preset", "id": "pg-a", "name": "Sales Postgres"}
 
-    assert classify(entry, ("ok", "SELECT * FROM deals;", {})) == {
+    assert classify(entry, ("ok", "SELECT * FROM deals;", {}, 42)) == {
         "outcome": "sql",
         "sql": "-- database: preset:pg-a (Sales Postgres)\nSELECT * FROM deals;",
     }
-    assert classify(entry, ("ok", "*** NO SQL *** nothing relevant here", {})) == {
+    assert classify(entry, ("ok", "*** NO SQL *** nothing relevant here", {}, 42)) == {
         "outcome": "note",
         "text": "nothing relevant here",
     }
-    assert classify(entry, ("ok", "   ", {})) == {"outcome": "note", "text": ""}
-    assert classify(entry, ("failed", "boom")) == {"outcome": "failed", "error": "boom"}
+    assert classify(entry, ("ok", "   ", {}, 42)) == {"outcome": "note", "text": ""}
+    assert classify(entry, ("failed", "boom", 42)) == {"outcome": "failed", "error": "boom"}
 
 
 def test_all_mode_failed_outcome_returns_fixed_apology_text_not_candidate_zero_fallback(app_factory, tmp_path, monkeypatch):
@@ -1984,13 +2022,13 @@ def test_all_mode_route_outcome_logs_a_separate_all_all_triage_row_with_no_doubl
     assert data['success'] is True
     assert data['router_route'] is True
 
-    # Two rows now: Phase A's own "All Databases"/"All Databases" row, and Phase B's row
-    # attributed to the first selected connection (same convention
-    # `connection_selection`'s ordering already uses) - never combined
-    # into just one the way this used to work.
+    # THREE rows now: Phase A's own "All Databases"/"All Databases" row,
+    # and one dedicated row PER Phase B connection (pg-a, pg-b) - never
+    # bundled into a single combined row attributed only to the first
+    # selected connection, which is what this used to do.
     rows = _translation_rows(env)
-    assert len(rows) == 2
-    triage_row, phase_b_row = rows
+    assert len(rows) == 3
+    triage_row, phase_b_row_a, phase_b_row_b = rows
 
     assert triage_row['database_type'] == 'All Databases'
     assert triage_row['database_name'] == 'All Databases'
@@ -2001,25 +2039,38 @@ def test_all_mode_route_outcome_logs_a_separate_all_all_triage_row_with_no_doubl
     assert (triage_row['input_tokens'], triage_row['output_tokens'], triage_row['total_tokens'],
             triage_row['thinking_tokens'], triage_row['cached_content_tokens']) == (10, 5, 15, 0, 0)
 
-    assert phase_b_row['database_type'] == 'postgres'
-    assert phase_b_row['database_name'] == 'Sales Postgres'
-    assert phase_b_row['sql_command'] == data['sql']
-    # Phase B's own portion only - two successful Phase B calls, each with
-    # _gemini_ok's fixed usage, summed - Phase A's own usage (already in
-    # the row above) is never folded in here too.
-    assert (phase_b_row['input_tokens'], phase_b_row['output_tokens'], phase_b_row['total_tokens'],
-            phase_b_row['thinking_tokens'], phase_b_row['cached_content_tokens']) == (20, 10, 30, 0, 0)
+    # pg-a's own row: its own real SQL (not the joined multi-database
+    # blob), attributed to Sales Postgres specifically, with only ITS OWN
+    # call's usage - never summed with pg-b's.
+    assert phase_b_row_a['database_type'] == 'postgres'
+    assert phase_b_row_a['database_name'] == 'Sales Postgres'
+    assert phase_b_row_a['sql_command'] == "-- database: preset:pg-a (Sales Postgres)\nSELECT * FROM deals;"
+    assert (phase_b_row_a['input_tokens'], phase_b_row_a['output_tokens'], phase_b_row_a['total_tokens'],
+            phase_b_row_a['thinking_tokens'], phase_b_row_a['cached_content_tokens']) == (10, 5, 15, 0, 0)
+
+    # pg-b's own row: same shape, its own SQL/usage, previously not logged
+    # at all.
+    assert phase_b_row_b['database_type'] == 'postgres'
+    assert phase_b_row_b['database_name'] == 'Marketing Postgres'
+    assert phase_b_row_b['sql_command'] == "-- database: preset:pg-b (Marketing Postgres)\nSELECT * FROM campaigns;"
+    assert (phase_b_row_b['input_tokens'], phase_b_row_b['output_tokens'], phase_b_row_b['total_tokens'],
+            phase_b_row_b['thinking_tokens'], phase_b_row_b['cached_content_tokens']) == (10, 5, 15, 0, 0)
 
     # The response's own combined totals (what the client actually shows
-    # the user for this turn) still reflect Phase A + Phase B together...
+    # the user for this turn) still reflect Phase A + both Phase B calls
+    # together - unchanged by this fix, since the client-facing aggregate
+    # was never the thing that was wrong.
     assert data['input_tokens'] == 30
     assert data['output_tokens'] == 15
     assert data['total_tokens'] == 45
-    # ...while the two logged rows' durations are an exact split of that
-    # same combined total - proof nothing is double-counted (or dropped)
-    # across the two rows, not just that both happen to be non-negative.
-    assert triage_row['duration'] + phase_b_row['duration'] == data['duration']
-    assert triage_row['duration'] >= 0 and phase_b_row['duration'] >= 0
+    # Durations are no longer a derived "split" of one shared total - each
+    # row now carries its OWN real, independently-measured elapsed time
+    # (Phase B's two calls run in PARALLEL, so their durations legitimately
+    # overlap in wall-clock time rather than summing to it). Just sanity-
+    # check they're real, non-negative measurements, each within the
+    # overall turn duration.
+    for row in (triage_row, phase_b_row_a, phase_b_row_b):
+        assert 0 <= row['duration'] <= data['duration']
 
 
 # --- "All databases" mode, Phase C: post-execution results summarization ---
@@ -2505,6 +2556,75 @@ def test_summarize_results_endpoint_returns_no_sql_prefixed_summary_and_logs_an_
     assert "SELECT * FROM deals;" in call_text
 
 
+def test_summarize_results_endpoint_groups_multiple_resultsets_for_the_same_database(
+    app_factory, tmp_path, monkeypatch,
+):
+    """Regression guard for the real bug this fixes: a database whose own
+    SQL had multiple statements gets multiple entries in `database_results`
+    (one per resultset/tab - see _build_summary_prompt's own docstring),
+    all sharing the same (kind, id, name). Before this fix, each one got
+    its own flat, independent "**Name:**"-prefixed paragraph - the same
+    database's name repeating once per resultset instead of once total.
+    Now they're grouped into ONE heading per database, with each
+    resultset's own paragraph nested underneath as a newline-joined
+    sub-paragraph."""
+    env = _two_preset_env(app_factory, tmp_path)
+    login_as(env.client, "alice@example.com")
+    import db as db_module
+    monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
+        "postgresql://u:p@host-a:5432/a": "Table: deals\nid INTEGER\n",
+        "postgresql://u:p@host-b:5432/b": "Table: campaigns\nid INTEGER\n",
+    }))
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    # Indices 0 and 1 are BOTH pg-a (its own two statements' resultsets);
+    # index 2 is pg-b's single resultset - same "one paragraph per index"
+    # shape the model has always been asked for (unchanged prompt/
+    # instruction), just three indices instead of two databases.
+    harness.queue_response(_gemini_ok(_summary_json({
+        0: "Deals total $500.",
+        1: "12 new customers signed up.",
+        2: "Marketing had nothing relevant.",
+    })))
+
+    resp = env.client.post('/api/summarize-results', json={
+        'prompt': 'how is everything performing across the board',
+        'database_results': [
+            {"kind": "preset", "id": "pg-a", "name": "Sales Postgres",
+             "sql": "SELECT SUM(amount) FROM deals;",
+             "columns": ["total"], "rows": [{"total": 500}], "rowCount": 1},
+            {"kind": "preset", "id": "pg-a", "name": "Sales Postgres",
+             "sql": "SELECT COUNT(*) FROM customers;",
+             "columns": ["n"], "rows": [{"n": 12}], "rowCount": 1},
+            {"kind": "preset", "id": "pg-b", "name": "Marketing Postgres", "note": "Nothing relevant."},
+        ],
+    })
+    assert resp.status_code == 200
+    _retry_events, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    # ONE "**Sales Postgres:**" heading, with both of its resultsets'
+    # paragraphs stacked on their own lines underneath (a single '\n', not
+    # '\n\n' - the Summary tab's `white-space: pre-wrap` renders that as a
+    # soft line break within the same visual block, not a new paragraph) -
+    # never a second "**Sales Postgres:**" heading repeating for its
+    # second resultset.
+    assert data['summary'] == (
+        "*** NO SQL *** Results Summary\n\n"
+        "**Sales Postgres:** Deals total $500.\n12 new customers signed up.\n\n"
+        "**Marketing Postgres:** Marketing had nothing relevant."
+    )
+    assert data['summary'].count('Sales Postgres') == 1
+    # database_summaries really is one entry PER DATABASE now (matching
+    # its own documented shape) - pg-a's combined text carries both of its
+    # resultsets' paragraphs, not just one, and not a second pg-a entry.
+    assert data['database_summaries'] == [
+        {"kind": "preset", "id": "pg-a", "name": "Sales Postgres",
+         "text": "Deals total $500.\n12 new customers signed up."},
+        {"kind": "preset", "id": "pg-b", "name": "Marketing Postgres", "text": "Marketing had nothing relevant."},
+    ]
+
+
 def test_summarize_results_endpoint_streams_a_retrying_line_before_the_terminal_line(
     app_factory, tmp_path, monkeypatch,
 ):
@@ -2617,9 +2737,25 @@ def test_summarize_results_endpoint_returns_success_false_when_the_llm_call_fail
     assert resp.status_code == 200
     _retry_events, data = parse_translate_stream(resp)
     assert data['success'] is False
-    # Best-effort - no translations-table row for a call that never
-    # produced anything to log.
-    assert _translation_rows(env) == []
+    # A total LLM-call failure IS now logged - same "All Databases"/"All
+    # Databases" attribution a successful Phase C call gets (this is never
+    # "about" one specific connection), 0 for every token count (no
+    # response was ever successfully returned to have real usage numbers
+    # from), and a TRANSLATION_ERROR(...) sentinel in sql_command in place
+    # of real SQL/summary text, so the failure is still visible in history/
+    # exports instead of silently vanishing.
+    rows = _translation_rows(env)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row['database_type'] == 'All Databases'
+    assert row['database_name'] == 'All Databases'
+    assert row['sql_command'].startswith('TRANSLATION_ERROR (')
+    assert data['error'] in row['sql_command']
+    assert row['input_tokens'] == 0
+    assert row['output_tokens'] == 0
+    assert row['total_tokens'] == 0
+    assert row['thinking_tokens'] == 0
+    assert row['cached_content_tokens'] == 0
 
 
 # --- Regression: a real provider reporting None (not 0) for a usage field ---

@@ -69,15 +69,11 @@ RUN pip install --no-cache-dir --upgrade pip && \
 COPY ./server ./server
 COPY ./webClient ./webClient
 
-# Copy the admin database-presets file (see DATABASE_PRESETS_FILE in
-# app_config.py/README.md) - it's gitignored like env.yaml, so it must
-# exist locally (even as an empty "[]") before building this image, same
-# precondition gcp_deploy.sh already has for env.yaml.
-COPY presets_CR.json .
-COPY grand-cosmos-716-3afa9cbc32b7.json .
+# Copy preset databases
+COPY presets.json .
 
-# Copy CRDB certificate
-# COPY crdb.crt .
+# Copy service account credentials
+COPY grand-cosmos-716-3afa9cbc32b7.json .
 
 # Expose container port (Cloud Run defaults to 8080, but we can configure it)
 EXPOSE 3000

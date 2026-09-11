@@ -26,6 +26,7 @@ from config_routes import config_bp
 from translate_routes import translate_bp
 from execute_routes import execute_bp
 from history_routes import history_bp
+from chat_history_routes import chat_history_bp
 from report_routes import report_bp
 
 # Auth guard runs before every request (see EXEMPT_ENDPOINTS in auth.py
@@ -38,7 +39,7 @@ app.before_request(enforce_authentication)
 # alive. See auth.py's refresh_auth_session_cookie()/auth_session.py.
 app.after_request(refresh_auth_session_cookie)
 
-for bp in (auth_bp, config_bp, translate_bp, execute_bp, history_bp, report_bp):
+for bp in (auth_bp, config_bp, translate_bp, execute_bp, history_bp, chat_history_bp, report_bp):
     app.register_blueprint(bp)
 
 

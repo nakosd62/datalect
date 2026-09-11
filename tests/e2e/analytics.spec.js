@@ -259,6 +259,58 @@ test.describe('analytics: query flow', () => {
     expect(events[0].database_type.length).toBeGreaterThan(0);
   });
 
+  test('error_shown fires with category "Database Connection" when the status ping comes back down', async ({ page }) => {
+    // Overrides the `test` fixture's own default /api/ping mock (always
+    // success:true) - Playwright checks the most-recently-registered
+    // matching route handler first, so this one wins for this test only.
+    // gotoApp() itself only waits for A response (any status) to the
+    // initial ping, not specifically a successful one, so this doesn't
+    // need any special handling beyond the route override itself.
+    await page.route('**/api/ping', async (route) => {
+      if (route.request().method() !== 'GET') return route.fallback();
+      await route.fulfill({
+        status: 400,
+        contentType: 'application/json',
+        body: JSON.stringify({ success: false, error: 'could not connect to server: Connection refused' }),
+      });
+    });
+    await gotoApp(page);
+
+    await expect(page.locator('#connDbDot')).toHaveClass(/disconnected/);
+
+    const events = await trackedEvents(page, 'error_shown');
+    expect(events.length).toBe(1);
+    expect(events[0].category).toBe('Database Connection');
+    expect(events[0].message).toContain('Connection refused');
+    expect(typeof events[0].database_type).toBe('string');
+  });
+
+  test('error_shown fires with category "Database Connection" when the ping request itself fails (network error)', async ({ page }) => {
+    // Same event, but for checkDbStatus()'s catch branch (the fetch itself
+    // rejects) rather than a non-throwing success:false response - see
+    // that function's own two trackEvent() call sites. Not using gotoApp()
+    // here - it waits for a real 'response' event to the initial ping,
+    // which an aborted request never produces (it only ever surfaces as
+    // 'requestfailed'), so that wait would just hang until timeout. This
+    // inlines gotoApp()'s own post-navigation waits minus that one.
+    await page.route('**/api/ping', (route) => route.abort());
+    await page.goto('/');
+    await page.locator('#connDbName').waitFor({ state: 'attached' });
+    await expect
+      .poll(async () => (await page.locator('#connDbName').textContent())?.trim())
+      .not.toBe('');
+
+    await expect(page.locator('#connDbDot')).toHaveClass(/disconnected/);
+
+    const events = await trackedEvents(page, 'error_shown');
+    expect(events.length).toBe(1);
+    expect(events[0].category).toBe('Database Connection');
+    // Whatever the browser's own fetch-rejection message is (e.g. "Failed
+    // to fetch") - not asserting exact text since that's runtime/browser-
+    // dependent, just that SOME message came through rather than nothing.
+    expect(events[0].message.length).toBeGreaterThan(0);
+  });
+
   test('quick_prompt_clicked fires with the chip label and prompt, and still submits a translation', async ({ page }) => {
     await mockTranslate(page, { sql: 'SELECT 1;' });
     await gotoApp(page);
@@ -708,56 +760,71 @@ test.describe('analytics: connection/model/nav', () => {
     expect((await trackedEvents(page, 'history_viewed')).length).toBe(1);
   });
 
-  test('history_purge_clicked fires with the record count shown next to the Purge button, on click - before the confirm dialog resolves', async ({ page }) => {
-    // /api/history is real (unmocked) elsewhere in this suite (see
-    // history-anonymous-access.spec.js's header comment) - mocked here
-    // instead, purely so the count next to "Purge Translations" is a known,
-    // fixed number rather than whatever this test's isolated user identity
-    // happens to already have on the shared real dev-server SQLite state.
-    await page.route('**/api/history', async (route) => {
+  test('chat_history_delete_clicked fires with the bucket\'s kind and turn count, on click - before the confirm dialog resolves', async ({ page }) => {
+    // /api/chat-history/summary is real (unmocked) elsewhere in this suite
+    // (chat-history-persistence.spec.js) - mocked here purely so there's a
+    // known, fixed bucket to click Delete on, rather than whatever this
+    // test's isolated identity happens to already have on the shared real
+    // dev-server SQLite state.
+    await page.route('**/api/chat-history/summary', async (route) => {
       if (route.request().method() !== 'GET') return route.fallback();
       await route.fulfill({
         status: 200,
         contentType: 'application/json',
-        body: JSON.stringify({ success: true, total_count: 7, history: [], stats: [] }),
+        body: JSON.stringify({
+          success: true,
+          buckets: [{ bucket_key: 'preset:x', turn_count: 5, kind: 'preset', name: 'Test DB', type: 'postgres', available: true }],
+        }),
       });
     });
     await gotoApp(page);
 
     await page.locator('#historyBtn').click();
-    await expect(page.locator('.btn-purge-title')).toHaveText('(7)');
-
-    await page.locator('#purgeHistoryBtn').click();
+    const deleteBtn = page.locator('.chat-history-bucket-delete-btn');
+    await expect(deleteBtn).toBeVisible();
+    await deleteBtn.click();
     // The confirm dialog is up (nothing clicked in it yet) - the event
     // fires on the button click itself, not on confirmation - see
-    // client.js's purgeHistoryBtn handler comment.
+    // client.js's chatHistoryBucketList click handler comment.
     await expect(page.locator('#confirmModal')).not.toHaveClass(/hidden/);
 
-    const events = await trackedEvents(page, 'history_purge_clicked');
+    const events = await trackedEvents(page, 'chat_history_delete_clicked');
     expect(events.length).toBe(1);
-    expect(events[0].record_count).toBe(7);
+    expect(events[0].kind).toBe('preset');
+    expect(events[0].turn_count).toBe(5);
 
-    // Cancel rather than confirm - the purge itself (and its DELETE call)
+    // Cancel rather than confirm - the delete itself (and its POST call)
     // is out of scope for this test.
     await page.locator('#confirmModalCancelBtn').click();
   });
 
-  test('history_purge_clicked does not fire a record_count when the count has not loaded yet', async ({ page }) => {
-    // A GET /api/history that never resolves - .btn-purge-title stays at
-    // its "(...)" loading placeholder (see the historyBtn click handler in
-    // client.js) for the lifetime of this test.
-    await page.route('**/api/history', () => {});
+  test('chat_history_delete_all_clicked fires with the total bucket and turn counts, on click - before the confirm dialog resolves', async ({ page }) => {
+    await page.route('**/api/chat-history/summary', async (route) => {
+      if (route.request().method() !== 'GET') return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          buckets: [
+            { bucket_key: 'preset:x', turn_count: 3, kind: 'preset', name: 'Test DB', type: 'postgres', available: true },
+            { bucket_key: 'all', turn_count: 2, kind: 'all', name: 'All databases (combined)', type: null, available: true },
+          ],
+        }),
+      });
+    });
     await gotoApp(page);
 
     await page.locator('#historyBtn').click();
-    await expect(page.locator('.btn-purge-title')).toHaveText('(...)');
+    await expect(page.locator('.chat-history-bucket-row')).toHaveCount(2);
 
-    await page.locator('#purgeHistoryBtn').click();
+    await page.locator('#deleteAllChatHistoryBtn').click();
     await expect(page.locator('#confirmModal')).not.toHaveClass(/hidden/);
 
-    const events = await trackedEvents(page, 'history_purge_clicked');
+    const events = await trackedEvents(page, 'chat_history_delete_all_clicked');
     expect(events.length).toBe(1);
-    expect(events[0].record_count).toBeUndefined();
+    expect(events[0].bucket_count).toBe(2);
+    expect(events[0].turn_count).toBe(5);
 
     await page.locator('#confirmModalCancelBtn').click();
   });

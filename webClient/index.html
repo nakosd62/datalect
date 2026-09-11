@@ -69,7 +69,6 @@
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/theme/eclipse.min.css">
   <link rel="stylesheet" href="style.css">
 
-  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
 
@@ -174,7 +173,7 @@
             </svg>
           </button>
 
-          <button id="historyBtn" class="history-btn" title="Translation History">
+          <button id="historyBtn" class="history-btn" title="History">
             <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <circle cx="12" cy="12" r="10"></circle>
               <polyline points="12 6 12 12 16 14"></polyline>
@@ -226,6 +225,7 @@
                   <button id="goBackBtn" class="btn-action-sm" type="button" title="Go back to previous turn">&lt;</button>
                   <span id="historyLabel"></span>
                   <button id="goForwardBtn" class="btn-action-sm" type="button" title="Go forward to next turn">&gt;</button>
+                  <button id="newTurnBtn" class="btn-action-sm" type="button" title="Start a new question">+</button>
                 </div>
                 <button type="button" id="micBtn" class="mic-btn" title="Voice-to-text input">
                   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -251,11 +251,11 @@
             <div id="examplePrompts" class="example-prompts">
               <button type="button" id="dismissExamplePromptsBtn" class="example-prompts-dismiss" title="Hide quick prompts">&times;</button>
               <span class="example-prompts-label">Quick prompts:</span>
-              <button type="button" class="example-chip" data-prompt="What tables are in this database and how are they related?" data-prompt-all="What tables are in these databases?">What's in here</button>
-              <button type="button" class="example-chip" data-prompt="Show me some records from some tables that you find most interesting." data-prompt-all="Show me some records from some tables that you find most interesting.">Sample Data</button>
-              <button type="button" class="example-chip" data-prompt="Analyze this data. Document your query." data-prompt-all="Analyze the data in a couple of these datasets that you find most interesting. Document your queries.">Data Analysis</button>
+              <button type="button" class="example-chip" data-prompt="What tables are in this dataset and how are they related?" data-prompt-all="What tables are in these databases?">What's in here</button>
+              <button type="button" class="example-chip" data-prompt="Show me a few records from a couple of tables that you find most interesting." data-prompt-all="Show me a few records from a couple of tables in different datasets that you find most interesting.">Sample Data</button>
+              <button type="button" class="example-chip" data-prompt="Analyze this dataset and give me a couple of insights from it with supporting data." data-prompt-all="Select a couple datasets that seem comparable and compare the data-driven insights your gather from each.">Data Analysis</button>
               <button type="button" class="example-chip" data-prompt="Write something in the database (like create a table or insert a record) and tell me if you succeeded. If you succeed in writing something, make sure you delete what you added." data-prompt-all="Write something in each database (like create a table or insert a record) and tell me if you succeeded. If you succeed in writing something, make sure you delete what you added.">Write Data</button>
-              <button type="button" class="example-chip" data-prompt="What are a few interesting questions to ask about the data" data-prompt-all="What are a few interesting questions to ask about the data in each of these databases">What to ask</button>
+              <button type="button" class="example-chip" data-prompt="What are a few interesting questions to ask about the data" data-prompt-all="What are a few interesting questions to ask about the data in each of these datasets">What to ask</button>
             </div>
             <div class="input-row">
               <div class="speech-bubble-wrapper sql-bubble">
@@ -348,58 +348,19 @@
             <span>History</span>
           </h2>
           <div class="history-clear-wrapper">
-            <button type="button" id="purgeHistoryBtn" class="btn btn-primary history-action-btn">
-              <span>Purge Translations</span>
-              <span class="btn-purge-title">(0)</span>
+            <button type="button" id="deleteAllChatHistoryBtn" class="btn btn-primary history-action-btn">
+              <span>Delete All</span>
             </button>
             <div id="historyActionMsg" class="history-action-msg"></div>
           </div>
         </div>
         <button id="historyModalCloseBtn" class="modal-close-btn" type="button">&times;</button>
       </div>
-      <div id="historyTabsNav" class="results-tabs-nav">
-        <button type="button" id="tabBtnTranslations" class="result-tab-btn active">
-          <span class="result-tab-title">Translations</span>
-          <span class="result-tab-flare-right"></span>
-        </button>
-        <button type="button" id="tabBtnStatistics" class="result-tab-btn">
-          <span class="result-tab-title">Statistics</span>
-          <span class="result-tab-flare-right"></span>
-        </button>
-      </div>
       <div class="modal-body">
-        <div id="historyTabTranslations" class="history-tab-content">
-          <div class="results-container history-results-container">
-            <div class="results-table-wrapper">
-              <table>
-                <thead>
-                  <tr id="historyTableHeader"></tr>
-                </thead>
-                <tbody id="historyTableBody">
-                  <tr>
-                    <td class="text-center text-muted py-8">Loading history...</td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-        <div id="historyTabStatistics" class="history-tab-content hidden">
-          <div class="stats-charts-vertical-container">
-            <div class="chart-card vertical-chart-card">
-              <h3>Total Translations per Day</h3>
-              <div class="chart-wrapper">
-                <canvas id="chartTranslationsPerDay"></canvas>
-              </div>
-            </div>
-            <div class="chart-card vertical-chart-card">
-              <h3>Total Tokens per Day</h3>
-              <div class="chart-wrapper">
-                <canvas id="chartTotalTokensPerDay"></canvas>
-              </div>
-            </div>
-          </div>
-        </div>
+        <p class="chat-history-list-subtitle text-muted">Past conversations, by database. Deleting one only clears its saved turns here - it never touches the database itself.</p>
+        <ul id="chatHistoryBucketList" class="chat-history-bucket-list">
+          <li class="chat-history-bucket-row chat-history-bucket-row--empty text-center text-muted py-8">Loading...</li>
+        </ul>
       </div>
     </div>
   </div>

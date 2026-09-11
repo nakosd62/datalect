@@ -44,8 +44,8 @@ if SERVER_DIR not in sys.path:
 # rather than returning the previous test's cached module object.
 _APP_MODULE_NAMES = [
     "app_config", "auth", "auth_session", "config_routes", "execute_routes",
-    "translate_routes", "history_routes", "report_routes", "db", "schema_cache",
-    "state_store", "connection_router", "cancel_registry",
+    "translate_routes", "history_routes", "chat_history_routes", "report_routes",
+    "db", "schema_cache", "state_store", "connection_router", "cancel_registry",
 ]
 
 # Every env var any of the above modules reads at import or request time.
@@ -200,6 +200,7 @@ def fresh_import(monkeypatch, tmp_path, env=None, register_blueprints=True, mock
         import execute_routes
         import translate_routes
         import history_routes
+        import chat_history_routes
         import report_routes
         import cancel_registry
 
@@ -213,7 +214,7 @@ def fresh_import(monkeypatch, tmp_path, env=None, register_blueprints=True, mock
         for bp in (
             auth.auth_bp, config_routes.config_bp, execute_routes.execute_bp,
             translate_routes.translate_bp, history_routes.history_bp,
-            report_routes.report_bp,
+            chat_history_routes.chat_history_bp, report_routes.report_bp,
         ):
             app_config.app.register_blueprint(bp)
 

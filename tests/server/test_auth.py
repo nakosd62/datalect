@@ -162,6 +162,23 @@ def test_apply_session_cookie_sets_httponly_cookie(app_env):
         assert "HttpOnly" in cookie_header
 
 
+def test_apply_session_cookie_max_age_is_400_days_not_the_old_24h(app_env):
+    # Was a fixed 86400 (24h) - extended so an anonymous visitor's DB
+    # selection/auto-execute preference and (as of the persisted
+    # chat-history feature) their whole conversation history aren't
+    # orphaned every single day. 400 days specifically because that's the
+    # actual ceiling every major browser enforces on Set-Cookie's Max-Age
+    # regardless of what a server asks for (see
+    # ANONYMOUS_SESSION_COOKIE_MAX_AGE_SECONDS's own comment in auth.py) -
+    # not an arbitrary round number.
+    with app_env.app_config.app.test_request_context('/api/config'):
+        from flask import jsonify
+        resp = app_env.auth.apply_session_cookie(jsonify({"ok": True}), "sess-123")
+        cookie_header = resp.headers.get("Set-Cookie", "")
+        assert f"Max-Age={app_env.auth.ANONYMOUS_SESSION_COOKIE_MAX_AGE_SECONDS}" in cookie_header
+        assert app_env.auth.ANONYMOUS_SESSION_COOKIE_MAX_AGE_SECONDS == 400 * 24 * 60 * 60
+
+
 # --- App-owned long-lived session cookie (auth_session.py) --------------------
 #
 # These exercise the actual fix for "Google auto-logs users off roughly

@@ -3,6 +3,7 @@ SqliteStateStore, exercised directly (no Flask/app_config involvement) -
 just point it at a fresh file under tmp_path per test.
 """
 
+import json
 import os
 import sqlite3
 import sys
@@ -600,6 +601,149 @@ def test_get_translation_history_limit_is_configurable_via_env_var(tmp_path, mon
     assert sum(s["total_translations"] for s in stats) == 10  # stats: complete history
 
 
+# --- chat_history (persisted conversation buckets, client.js's
+# chatStoresByBucket) - distinct from translations/history above, which is
+# the separate NL->SQL audit log. -----------------------------------------
+
+def test_get_chat_history_defaults_to_empty_for_a_new_user(tmp_path):
+    store = make_store(tmp_path)
+    result = store.get_chat_history("alice")
+    assert result == {"buckets": {}, "active_bucket_key": ""}
+
+
+def test_save_and_get_chat_bucket_round_trips(tmp_path):
+    store = make_store(tmp_path)
+    turns = [{"role": "user", "text": "show users"}, {"role": "model", "text": "SELECT * FROM users;"}]
+    store.save_chat_bucket("alice", "preset:1", turns)
+    result = store.get_chat_history("alice")
+    assert result["buckets"] == {"preset:1": turns}
+
+
+def test_save_chat_bucket_upserts_in_place_not_duplicated(tmp_path):
+    store = make_store(tmp_path)
+    store.save_chat_bucket("alice", "preset:1", [{"role": "user", "text": "first"}])
+    store.save_chat_bucket("alice", "preset:1", [{"role": "user", "text": "second"}])
+    result = store.get_chat_history("alice")
+    assert result["buckets"] == {"preset:1": [{"role": "user", "text": "second"}]}
+
+
+def test_multiple_buckets_for_the_same_user_are_all_returned(tmp_path):
+    store = make_store(tmp_path)
+    store.save_chat_bucket("alice", "preset:1", [{"role": "user", "text": "a"}])
+    store.save_chat_bucket("alice", "all", [{"role": "user", "text": "b"}])
+    result = store.get_chat_history("alice")
+    assert set(result["buckets"].keys()) == {"preset:1", "all"}
+
+
+def test_chat_history_isolated_per_user(tmp_path):
+    store = make_store(tmp_path)
+    store.save_chat_bucket("alice", "preset:1", [{"role": "user", "text": "a"}])
+    store.save_chat_bucket("bob", "preset:1", [{"role": "user", "text": "b"}])
+    alice_result = store.get_chat_history("alice")
+    bob_result = store.get_chat_history("bob")
+    assert alice_result["buckets"] == {"preset:1": [{"role": "user", "text": "a"}]}
+    assert bob_result["buckets"] == {"preset:1": [{"role": "user", "text": "b"}]}
+
+
+def test_save_chat_bucket_with_no_bucket_key_is_a_no_op(tmp_path):
+    store = make_store(tmp_path)
+    store.save_chat_bucket("alice", "", [{"role": "user", "text": "a"}])
+    result = store.get_chat_history("alice")
+    assert result["buckets"] == {}
+
+
+def test_set_active_chat_bucket_defaults_to_empty_string(tmp_path):
+    store = make_store(tmp_path)
+    result = store.get_chat_history("alice")
+    assert result["active_bucket_key"] == ""
+
+
+def test_set_active_chat_bucket_round_trips(tmp_path):
+    store = make_store(tmp_path)
+    store.set_active_chat_bucket("alice", "preset:1")
+    result = store.get_chat_history("alice")
+    assert result["active_bucket_key"] == "preset:1"
+
+
+def test_set_active_chat_bucket_never_touches_a_bucket_own_saved_turns(tmp_path):
+    store = make_store(tmp_path)
+    store.save_chat_bucket("alice", "preset:1", [{"role": "user", "text": "a"}])
+    store.set_active_chat_bucket("alice", "all")
+    result = store.get_chat_history("alice")
+    assert result["buckets"] == {"preset:1": [{"role": "user", "text": "a"}]}
+    assert result["active_bucket_key"] == "all"
+
+
+def test_set_active_chat_bucket_works_even_with_no_prior_session_row(tmp_path):
+    # Regression guard: this can be the very first thing ever written for a
+    # brand-new session (e.g. switching connections before the first
+    # translate ever happens) - must not require get_session/set_session to
+    # have run first.
+    store = make_store(tmp_path)
+    store.set_active_chat_bucket("brand-new-user", "preset:1")
+    result = store.get_chat_history("brand-new-user")
+    assert result["active_bucket_key"] == "preset:1"
+
+
+def test_save_chat_bucket_does_not_set_active_bucket(tmp_path):
+    store = make_store(tmp_path)
+    store.save_chat_bucket("alice", "preset:1", [{"role": "user", "text": "a"}])
+    result = store.get_chat_history("alice")
+    assert result["active_bucket_key"] == ""
+
+
+def test_chat_history_bucket_with_unrecognized_future_schema_version_is_omitted(tmp_path):
+    store = make_store(tmp_path)
+    store.save_chat_bucket("alice", "preset:1", [{"role": "user", "text": "a"}])
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE chat_history SET schema_version = ? WHERE user_id = ? AND bucket_key = ?",
+            (999, "alice", "preset:1"),
+        )
+        conn.commit()
+    result = store.get_chat_history("alice")
+    assert result["buckets"] == {}
+
+
+def test_chat_history_bucket_with_corrupt_json_is_omitted_not_a_crash(tmp_path):
+    store = make_store(tmp_path)
+    store.save_chat_bucket("alice", "preset:1", [{"role": "user", "text": "a"}])
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE chat_history SET payload = ? WHERE user_id = ? AND bucket_key = ?",
+            ("not valid json{{{", "alice", "preset:1"),
+        )
+        conn.commit()
+    result = store.get_chat_history("alice")
+    assert result["buckets"] == {}
+
+
+def test_chat_history_bucket_with_non_list_payload_is_omitted(tmp_path):
+    store = make_store(tmp_path)
+    with store._connect() as conn:
+        conn.execute(
+            "INSERT INTO chat_history (user_id, bucket_key, payload, schema_version) VALUES (?, ?, ?, ?)",
+            ("alice", "preset:1", json.dumps({"not": "a list"}), 1),
+        )
+        conn.commit()
+    result = store.get_chat_history("alice")
+    assert result["buckets"] == {}
+
+
+def test_one_corrupt_bucket_does_not_prevent_other_buckets_from_loading(tmp_path):
+    store = make_store(tmp_path)
+    store.save_chat_bucket("alice", "preset:1", [{"role": "user", "text": "good"}])
+    store.save_chat_bucket("alice", "all", [{"role": "user", "text": "also good"}])
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE chat_history SET payload = ? WHERE user_id = ? AND bucket_key = ?",
+            ("not valid json{{{", "alice", "preset:1"),
+        )
+        conn.commit()
+    result = store.get_chat_history("alice")
+    assert result["buckets"] == {"all": [{"role": "user", "text": "also good"}]}
+
+
 # --- init() migrations: legacy schema upgrade paths ----------------------------
 
 def test_init_migrates_sessions_table_predating_llm_fields(tmp_path):
@@ -804,6 +948,7 @@ def test_init_migrates_pre_connection_id_sessions_table_for_custom_row(tmp_path)
         "in_scope_preset_ids", "in_scope_custom_connection_keys", "in_scope_mode",
         "theme",
         "llm_byok_keys",
+        "active_chat_bucket_key",
         "updated_at",
     }
 

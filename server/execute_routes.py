@@ -539,12 +539,15 @@ def ping():
         resp = jsonify({'success': True})
         return apply_session_cookie(resp, session_id)
     except Exception as e:
-        # Same "log server-side, don't leak detail" posture as every other
-        # non-/api/execute route in this app - the status dot only ever
-        # shows connected/disconnected, never an error message, so there's
-        # no reason for the client to see the raw exception text here.
+        # The status dot itself still only ever shows connected/
+        # disconnected in the UI - no error text is rendered anywhere for
+        # this - but the real exception text IS included here (unlike this
+        # route's previous posture) so client.js's checkDbStatus() can
+        # attach it to the 'error_shown'/"Database Connection" GA4 event it
+        # fires whenever this check comes back down, same "raw DB errors
+        # are fine to hand back" posture /api/execute already has.
         logger.warning("Ping (liveness check) failed for user=%s: %s", user_identity, e)
-        resp = jsonify({'success': False})
+        resp = jsonify({'success': False, 'error': str(e)})
         return apply_session_cookie(resp, session_id), 400
     finally:
         if conn and backend:

@@ -86,6 +86,7 @@ implicit dependency on stream_translation()'s exact yield order, not a
 guarantee - it just happened to hold until this comment was added.
 """
 
+import sqlite3
 import types as pytypes
 
 import anthropic
@@ -98,6 +99,25 @@ from helpers import (
     parse_translate_stream_events, write_database_presets_file, login_as,
     select_llm_provider, set_llm_byok_key,
 )
+
+
+def _translation_rows(env):
+    """Every row currently in the translations table, oldest first, as
+    plain dicts - a raw query against the same SQLite file app_config's
+    state_store is using. get_translation_history() only surfaces
+    nl_prompt/sql_command/created_at, not the token/duration/database_*
+    columns some tests here need to assert on directly (same reasoning as
+    test_connection_router.py's own _translation_rows helper)."""
+    with sqlite3.connect(env.app_config.state_store.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT database_type, database_name, nl_prompt, sql_command, model,
+                   duration, input_tokens, output_tokens, total_tokens,
+                   thinking_tokens, cached_content_tokens
+            FROM translations ORDER BY id ASC
+        """)
+        return [dict(row) for row in cursor.fetchall()]
 
 
 class FakeGenaiResponse:
@@ -2646,6 +2666,67 @@ def test_single_connection_translate_final_failure_shows_categorized_message(app
     assert data['error'].endswith("fake API error 503")
 
 
+def test_single_connection_translate_final_failure_logs_a_translation_row(app_factory, monkeypatch):
+    """A total single-connection LLM-call failure - every attempt in the
+    retry loop exhausted, LlmCallFailed raised - now logs a real
+    translations-table row (against the actual connection, same as a
+    success does) instead of vanishing silently: 0 for every token count
+    (no response was ever successfully returned to have real usage numbers
+    from - see the retry loop's usage_info, only ever assigned on a
+    successful provider.call()), a non-negative duration measured across
+    every attempt and inter-attempt wait, and a TRANSLATION_ERROR(...)
+    sentinel in sql_command in place of real SQL, following the same
+    overloaded-column convention "*** NO SQL ***" already uses for non-SQL
+    text in that column."""
+    env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    monkeypatch.setattr(env.translate_routes.time, "sleep", lambda *a, **k: None)
+    for _ in range(10):
+        harness.queue_error(FakeApiError(503))
+
+    env.client.set_cookie("crbot_user_id", "alice@example.com")
+    resp = env.client.post('/api/translate', json={'prompt': 'give me one'})
+    assert resp.status_code == 200
+    _, data = parse_translate_stream(resp)
+    assert data['success'] is False
+
+    rows = _translation_rows(env)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row['nl_prompt'] == 'give me one'
+    assert row['sql_command'] == f"TRANSLATION_ERROR ({data['error']})"
+    assert row['input_tokens'] == 0
+    assert row['output_tokens'] == 0
+    assert row['total_tokens'] == 0
+    assert row['thinking_tokens'] == 0
+    assert row['cached_content_tokens'] == 0
+    assert row['duration'] >= 0
+
+
+def test_single_connection_translate_non_retryable_failure_also_logs_a_translation_row(app_factory, monkeypatch):
+    """Same as above, but for the immediate (no-retry) non-retryable
+    failure path - LlmCallFailed is raised on the very first attempt here,
+    so this is also a regression guard that the new logging doesn't
+    accidentally depend on having gone through at least one retry."""
+    env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    monkeypatch.setattr(env.translate_routes.time, "sleep", lambda *a, **k: None)
+    harness.queue_error(FakeApiError(400))  # bad request - _classify_gemini_error returns None
+
+    env.client.set_cookie("crbot_user_id", "alice@example.com")
+    resp = env.client.post('/api/translate', json={'prompt': 'hi'})
+    assert resp.status_code == 200
+    _, data = parse_translate_stream(resp)
+    assert data['success'] is False
+
+    rows = _translation_rows(env)
+    assert len(rows) == 1
+    assert rows[0]['sql_command'] == f"TRANSLATION_ERROR ({data['error']})"
+    assert rows[0]['total_tokens'] == 0
+
+
 # --- "invalid_key" category (a rejected/invalid API key) -----------------
 #
 # See the section comment above _gemini_error_category() in
@@ -3104,5 +3185,16 @@ def test_summarize_result_endpoint_returns_success_false_when_the_llm_call_fails
     _retry_events, data = parse_translate_stream(resp)
     assert data['success'] is False
 
-    _rows, _stats, total_count = env.app_config.state_store.get_translation_history("alice@example.com")
-    assert total_count == 0
+    # A total LLM-call failure IS now logged, against the real connection
+    # this was run for (unlike Phase C's "All Databases" attribution), with
+    # a TRANSLATION_ERROR(...) sentinel standing in for the summary text
+    # and 0 for every token count (no response was ever successfully
+    # returned to have real usage numbers from).
+    rows = _translation_rows(env)
+    assert len(rows) == 1
+    assert rows[0]['nl_prompt'] == 'q'
+    assert rows[0]['sql_command'].startswith('TRANSLATION_ERROR (')
+    assert data['error'] in rows[0]['sql_command']
+    assert rows[0]['input_tokens'] == 0
+    assert rows[0]['output_tokens'] == 0
+    assert rows[0]['total_tokens'] == 0

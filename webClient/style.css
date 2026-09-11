@@ -810,11 +810,31 @@ textarea:focus {
      connection/model can't be swapped out from under it - clicking is a
      plain no-op here (see modelTriggerBadge's/configTriggerBadge's own
      'click' listeners). */
-.history-btn.icon-disabled,
-.status-badge.badge-disabled {
+.history-btn.icon-disabled {
   opacity: 0.45;
   filter: grayscale(1);
   cursor: not-allowed;
+}
+
+.status-badge.badge-disabled {
+  cursor: not-allowed;
+}
+
+/* opacity/grayscale applied to each child individually here, NOT to
+   .status-badge.badge-disabled itself - #connDbDot (configTriggerBadge's
+   real connected/disconnected color indicator) is deliberately excluded
+   via :not() so it keeps showing its actual status untouched while the
+   rest of the badge (name text, edit icon) visibly dims to show it's not
+   clickable right now. This can't be done by putting opacity/filter on
+   the badge itself and trying to "undo" it on .status-dot: both
+   properties composite the ENTIRE rendered subtree as one group once set
+   on an ancestor, with no way for a descendant to opt back out - dimming
+   each child separately, skipping the dot, is the only way to leave it
+   at full color/opacity. modelTriggerBadge has no .status-dot child at
+   all, so this dims both of its children exactly as before. */
+.status-badge.badge-disabled > *:not(.status-dot) {
+  opacity: 0.45;
+  filter: grayscale(1);
 }
 
 .history-btn.icon-disabled:hover {
@@ -2875,22 +2895,13 @@ tr.report-issue-row td {
 .history-action-btn {
   flex: 0 0 auto;
   min-width: 120px;
-  height: auto; /* Allows the button to expand evenly for 2 lines */
+  height: auto;
   display: inline-flex;
-  flex-direction: column;
   align-items: center;
   justify-content: center;
   text-align: center;
-  padding: 0.1rem 0.1rem;
-  gap: 0.1rem; /* Controls spacing between the 2 lines cleanly */
+  padding: 0.4rem 0.9rem;
   line-height: 1.2;
-}
-
-.history-action-btn .btn-purge-title {
-  display: block;
-  font-size: 0.68rem;
-  opacity: 0.8;
-  margin-top: 0; /* Clear margin so flex gap does all the spacing */
 }
 
 .modal-title {
@@ -2906,10 +2917,100 @@ tr.report-issue-row td {
   flex-shrink: 0;
 }
 
-.chart-wrapper {
-  position: relative;
-  height: 200px;
-  width: 100%;
+/* History modal's per-database turn list (see loadChatHistorySummary()/
+   renderChatHistoryBucketList() in client.js) - a plain vertical list of
+   rows, each one database's name/type/turn-count plus its own Delete
+   button, rather than the old data table + charts this modal used to show. */
+.chat-history-list-subtitle {
+  margin: 0;
+  font-size: 0.82rem;
+}
+
+.chat-history-bucket-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.chat-history-bucket-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.65rem 0.9rem;
+  border: 1px solid var(--bg-card-border);
+  border-radius: 8px;
+  background: var(--overlay-2);
+}
+
+.chat-history-bucket-row--empty {
+  justify-content: center;
+  border-style: dashed;
+  background: transparent;
+}
+
+/* An orphaned bucket (its preset/custom connection no longer exists, or
+   it's an unsaved ad hoc connection - see _resolve_bucket_display()'s own
+   docstring in chat_history_routes.py) reads as clearly de-emphasized -
+   still fully listed and deletable, just visually secondary to a real,
+   currently-usable database. */
+.chat-history-bucket-row--unavailable {
+  opacity: 0.65;
+}
+
+.chat-history-bucket-info {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  min-width: 0;
+}
+
+.chat-history-bucket-name {
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+
+.chat-history-bucket-type {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--text-secondary);
+  background: var(--overlay-6);
+  border-radius: 4px;
+  padding: 0.1rem 0.4rem;
+}
+
+.chat-history-bucket-count {
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.chat-history-bucket-delete-btn {
+  flex: 0 0 auto;
+  padding: 0.3rem 0.75rem;
+  font-size: 0.78rem;
+  color: var(--danger, #f87171);
+  background: transparent;
+  border: 1px solid var(--danger, #f87171);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: var(--transition);
+}
+
+.chat-history-bucket-delete-btn:hover:not(:disabled) {
+  background: var(--danger, #f87171);
+  color: var(--on-danger, #080b11);
+}
+
+.chat-history-bucket-delete-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 /* Dynamic Controls Layout Grid Base */
@@ -3138,6 +3239,15 @@ tr.report-issue-row td {
 }
 
 .speech-bubble-wrapper .inline-history-nav button:last-child {
+  border-left: 1px solid var(--overlay-18);
+}
+
+/* #newTurnBtn ("+") joined this pill as a 4th child after #goForwardBtn,
+   which cost #goForwardBtn its own :last-child divider above (newTurnBtn
+   is :last-child now, not it) - restored explicitly here rather than
+   reshuffling the generic first/last-child rules, which every OTHER
+   button in this pill still relies on unchanged. */
+.speech-bubble-wrapper .inline-history-nav button#goForwardBtn {
   border-left: 1px solid var(--overlay-18);
 }
 

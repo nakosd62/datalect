@@ -10,24 +10,15 @@ utils/data/
 # Files containing secrets
 env.yaml
 .env
-crdb.crt
-ydyl-bq-test-key.json
-presets_local.json
-presets_CR.json
+presets.json
+accounts/
 grand-cosmos-716-*.json
-cloudsql-ca.pem
-atlas-credentials.env
-.ipynb_checkpoints/
 
 # Leftovers
 _to_delete/
 
 # Logs
 *.log
-
-# Temporary files
-*-save*
-*.save*
 
 # Python cache
 __pycache__/
@@ -44,5 +35,3 @@ tests/e2e/.auth/
 # macOS system files
 .DS_Store
 
-# Golf download foles
-Golf-Scores-main/

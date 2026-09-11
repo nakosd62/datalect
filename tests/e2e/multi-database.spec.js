@@ -279,12 +279,11 @@ test.describe('multi-database question answering', () => {
     expect(await currentSql(page)).toContain('-- database: preset:p-b (Marketing Postgres)');
 
     await page.locator('#runBtn').click();
-    // Scoped to #resultsTabsNav - the bare .result-tab-btn class is also
-    // reused, unrelatedly, by the History modal's own always-in-DOM tab
-    // switcher (index.html's #tabBtnTranslations/#tabBtnStatistics), so an
-    // unscoped locator here would only pass by the accident of catching
-    // this assertion's count mid-race before the real tabs finish
-    // rendering, not because it actually verified them.
+    // Scoped to #resultsTabsNav rather than an unscoped .result-tab-btn
+    // locator - kept explicit even though the History modal's own former
+    // tab switcher (which used to share this same class) is gone now, so a
+    // future feature reusing .result-tab-btn elsewhere doesn't silently
+    // make this assertion pass for the wrong reason again.
     const tabs = page.locator('#resultsTabsNav .result-tab-btn');
     await expect(tabs).toHaveCount(2);
     await expect(tabs.nth(0)).toContainText('Sales Postgres');
