@@ -1464,12 +1464,72 @@ def test_all_mode_with_only_one_configured_connection_still_runs_triage_and_can_
     ]
 
 
-def test_all_mode_dynamically_includes_a_newly_saved_custom_connection(app_factory, tmp_path, monkeypatch):
-    # The whole point of "all" over a frozen, save-time-computed list: a
-    # connection the user saves AFTER the session already has in_scope_mode
-    # "all" must be included on the very next request, with no re-save of
-    # scope at all - db.py's _resolve_all_configured_descriptors resolves
-    # state_store.get_db_connections() fresh every call.
+def test_all_mode_dynamically_includes_a_newly_added_preset(app_factory, tmp_path, monkeypatch):
+    # The whole point of "All Pre-Configured Datasets" over a frozen, save-time-
+    # computed list: a PRESET added AFTER the session already has
+    # in_scope_mode "all" must be included on the very next request, with
+    # no re-save of scope at all - db.py's _resolve_all_configured_
+    # descriptors reads CONFIGURED_DBS fresh on every call. (This used to
+    # also be true of a user's own newly-saved custom connections, back
+    # when this feature was named/framed as "All Databases" - see
+    # test_all_mode_never_includes_a_newly_saved_custom_connection below
+    # for the deliberate behavior change: presets only, now and dynamically
+    # so, customs never.)
+    presets_path = write_database_presets_file(tmp_path, [
+        {"id": "pg-a", "name": "Sales Postgres", "type": "postgres", "url": "postgresql://u:p@host-a:5432/a"},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": presets_path, "GEMINI_PRESET_KEYS": "fake-key-1"})
+    login_as(env.client, "alice@example.com")
+    _set_all_mode(env.client)
+
+    import db as db_module
+    monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
+        "postgresql://u:p@host-a:5432/a": "Table: deals\nid INTEGER\n",
+        "postgresql://u:p@host-c:5432/c": "Table: campaigns\nid INTEGER\n",
+    }))
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(_gemini_ok('{"action": "answer", "answer": "You have 1 database configured."}'))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'show me stuff'})
+    _, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    assert 'connection_selection' not in data
+    assert data['sql'] == '*** NO SQL *** You have 1 database configured.'
+
+    # An admin adds a second PRESET - simulated, per this codebase's
+    # established pattern (see test_config_missing_connection.py), by
+    # mutating the live CONFIGURED_DBS list in place, which db.py's own
+    # bound reference to that same list object picks up without any
+    # re-import or app restart.
+    env.config_routes.CONFIGURED_DBS.append(
+        {"id": "pg-c", "name": "Ops Postgres", "type": "postgres", "url": "postgresql://u:p@host-c:5432/c"},
+    )
+
+    harness.queue_response(_gemini_ok('{"action": "route", "indices": [1], "message": "Checking Ops Postgres."}'))
+    harness.register_marker("campaigns", _gemini_ok("SELECT * FROM campaigns;"))
+    resp3 = env.client.post('/api/translate', json={'prompt': 'ops figures please'})
+    _, data3 = parse_translate_stream(resp3)
+    assert data3['success'] is True
+    assert data3['router_route'] is True
+    assert "-- database: preset:pg-c (Ops Postgres)" in data3['sql']
+    assert "SELECT * FROM campaigns;" in data3['sql']
+
+
+def test_all_mode_never_includes_a_newly_saved_custom_connection(app_factory, tmp_path, monkeypatch):
+    # Requirement: "All Pre-Configured Datasets" mode only ever considers presets
+    # as candidates - a user's own custom connections must never be
+    # offered to the triage LLM at all, dynamically-added or not (see
+    # db.py's _resolve_all_configured_descriptors docstring for the full
+    # reasoning: a personal/ad hoc custom connection silently joining a
+    # broad "ask across everything" question is exactly the surprise this
+    # is meant to prevent). Proven directly and robustly by inspecting the
+    # actual triage prompt sent to the (mocked) LLM - the custom
+    # connection's name must never appear in it, while the one real
+    # preset's name does - rather than via an indirect mechanism like an
+    # out-of-range triage index, which _clean_indices() would just as
+    # silently drop, proving nothing about whether it was ever a candidate.
     presets_path = write_database_presets_file(tmp_path, [
         {"id": "pg-a", "name": "Sales Postgres", "type": "postgres", "url": "postgresql://u:p@host-a:5432/a"},
     ])
@@ -1483,34 +1543,37 @@ def test_all_mode_dynamically_includes_a_newly_saved_custom_connection(app_facto
         "postgresql://u:p@host-b:5432/b": "Table: campaigns\nid INTEGER\n",
     }))
 
-    harness = GenaiHarness()
-    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(_gemini_ok('{"action": "answer", "answer": "You have 1 database configured."}'))
-
-    resp = env.client.post('/api/translate', json={'prompt': 'show me stuff'})
-    _, data = parse_translate_stream(resp)
-    assert data['success'] is True
-    assert 'connection_selection' not in data
-    assert data['sql'] == '*** NO SQL *** You have 1 database configured.'
-
-    # Alice saves a second connection of her own (a custom one) - a
-    # completely separate save from the in-scope arrays/in_scope_mode,
-    # neither of which this request even mentions.
+    # Alice saves a custom connection of her own - a completely separate
+    # save from the in-scope arrays/in_scope_mode, which this test never
+    # touches at all.
     resp2 = env.client.post('/api/config', json={
         "database_type": "postgres", "database_url": "postgresql://u:p@host-b:5432/b",
         "database_name": "Marketing Postgres", "is_custom": True,
     })
     assert resp2.status_code == 200
 
-    harness.queue_response(_gemini_ok('{"action": "route", "indices": [1], "message": "Checking Marketing Postgres."}'))
-    harness.register_marker("campaigns", _gemini_ok("SELECT * FROM campaigns;"))
-    resp3 = env.client.post('/api/translate', json={'prompt': 'marketing figures please'})
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(_gemini_ok('{"action": "route", "indices": [0], "message": "Checking Sales Postgres."}'))
+    harness.register_marker("deals", _gemini_ok("SELECT * FROM deals;"))
+
+    resp3 = env.client.post('/api/translate', json={'prompt': 'sales figures please'})
     _, data3 = parse_translate_stream(resp3)
     assert data3['success'] is True
     assert data3['router_route'] is True
-    assert "-- database: custom:" in data3['sql']
-    assert "Marketing Postgres" in data3['sql']
-    assert "SELECT * FROM campaigns;" in data3['sql']
+    assert "-- database: preset:pg-a (Sales Postgres)" in data3['sql']
+    assert "SELECT * FROM deals;" in data3['sql']
+    # Exactly one candidate was ever offered to triage - the sole preset -
+    # never the custom connection Alice just saved.
+    assert data3['connection_selection'] == [
+        {"kind": "preset", "id": "pg-a", "name": "Sales Postgres", "type": "postgres",
+         "prompt": "sales figures please"},
+    ]
+
+    triage_call = harness.generate_calls[0]
+    triage_prompt_text = str(triage_call["contents"])
+    assert "Sales Postgres" in triage_prompt_text
+    assert "Marketing Postgres" not in triage_prompt_text
 
 
 def test_all_mode_fetches_schema_for_every_candidate_regardless_of_cache_state(app_factory, tmp_path, monkeypatch):
@@ -1918,7 +1981,7 @@ def test_all_mode_route_phase_b_calls_run_concurrently_not_serially(app_factory,
     assert elapsed < delay_seconds * 1.8
 
 
-# --- Phase A (triage) logged to the translations table as "All Databases"/"All Databases" ---
+# --- Phase A (triage) logged to the translations table as "All Pre-Configured Datasets"/"All Pre-Configured Datasets" ---
 
 
 def _translation_rows(env):
@@ -1957,14 +2020,14 @@ def test_all_mode_answer_outcome_logs_triage_as_a_dedicated_all_all_row(app_fact
     assert data['success'] is True
 
     # The "answer" outcome IS Phase A in its entirety - exactly one
-    # translations-table row, tagged "All Databases"/"All Databases" rather than any real
+    # translations-table row, tagged "All Pre-Configured Datasets"/"All Pre-Configured Datasets" rather than any real
     # database (there's no real database involved at all here), carrying
     # triage's own token usage (see _gemini_ok's fixed usage_metadata).
     rows = _translation_rows(env)
     assert len(rows) == 1
     row = rows[0]
-    assert row['database_type'] == 'All Databases'
-    assert row['database_name'] == 'All Databases'
+    assert row['database_type'] == 'All Pre-Configured Datasets'
+    assert row['database_name'] == 'All Pre-Configured Datasets'
     assert row['nl_prompt'] == 'how many databases do I have'
     assert row['sql_command'] == data['sql']
     assert (row['input_tokens'], row['output_tokens'], row['total_tokens'],
@@ -1991,8 +2054,8 @@ def test_all_mode_failed_outcome_logs_triage_as_a_dedicated_all_all_row(app_fact
     rows = _translation_rows(env)
     assert len(rows) == 1
     row = rows[0]
-    assert row['database_type'] == 'All Databases'
-    assert row['database_name'] == 'All Databases'
+    assert row['database_type'] == 'All Pre-Configured Datasets'
+    assert row['database_name'] == 'All Pre-Configured Datasets'
     assert row['sql_command'] == data['sql']
 
 
@@ -2022,7 +2085,7 @@ def test_all_mode_route_outcome_logs_a_separate_all_all_triage_row_with_no_doubl
     assert data['success'] is True
     assert data['router_route'] is True
 
-    # THREE rows now: Phase A's own "All Databases"/"All Databases" row,
+    # THREE rows now: Phase A's own "All Pre-Configured Datasets"/"All Pre-Configured Datasets" row,
     # and one dedicated row PER Phase B connection (pg-a, pg-b) - never
     # bundled into a single combined row attributed only to the first
     # selected connection, which is what this used to do.
@@ -2030,8 +2093,8 @@ def test_all_mode_route_outcome_logs_a_separate_all_all_triage_row_with_no_doubl
     assert len(rows) == 3
     triage_row, phase_b_row_a, phase_b_row_b = rows
 
-    assert triage_row['database_type'] == 'All Databases'
-    assert triage_row['database_name'] == 'All Databases'
+    assert triage_row['database_type'] == 'All Pre-Configured Datasets'
+    assert triage_row['database_name'] == 'All Pre-Configured Datasets'
     assert triage_row['nl_prompt'] == 'how is everything performing across the board'
     # Not real SQL - Phase A's own routing decision, same '*** NO SQL ***'
     # convention the "answer"/"failed" outcomes use for their own text.
@@ -2540,8 +2603,8 @@ def test_summarize_results_endpoint_returns_no_sql_prefixed_summary_and_logs_an_
     rows = _translation_rows(env)
     assert len(rows) == 1
     row = rows[0]
-    assert row['database_type'] == 'All Databases'
-    assert row['database_name'] == 'All Databases'
+    assert row['database_type'] == 'All Pre-Configured Datasets'
+    assert row['database_name'] == 'All Pre-Configured Datasets'
     assert row['nl_prompt'] == 'how is everything performing across the board'
     assert row['sql_command'] == data['summary']
     assert (row['input_tokens'], row['output_tokens'], row['total_tokens']) == (10, 5, 15)
@@ -2737,9 +2800,9 @@ def test_summarize_results_endpoint_returns_success_false_when_the_llm_call_fail
     assert resp.status_code == 200
     _retry_events, data = parse_translate_stream(resp)
     assert data['success'] is False
-    # A total LLM-call failure IS now logged - same "All Databases"/"All
-    # Databases" attribution a successful Phase C call gets (this is never
-    # "about" one specific connection), 0 for every token count (no
+    # A total LLM-call failure IS now logged - same "All Pre-Configured Datasets"/
+    # "All Pre-Configured Datasets" attribution a successful Phase C call gets (this
+    # is never "about" one specific connection), 0 for every token count (no
     # response was ever successfully returned to have real usage numbers
     # from), and a TRANSLATION_ERROR(...) sentinel in sql_command in place
     # of real SQL/summary text, so the failure is still visible in history/
@@ -2747,8 +2810,8 @@ def test_summarize_results_endpoint_returns_success_false_when_the_llm_call_fail
     rows = _translation_rows(env)
     assert len(rows) == 1
     row = rows[0]
-    assert row['database_type'] == 'All Databases'
-    assert row['database_name'] == 'All Databases'
+    assert row['database_type'] == 'All Pre-Configured Datasets'
+    assert row['database_name'] == 'All Pre-Configured Datasets'
     assert row['sql_command'].startswith('TRANSLATION_ERROR (')
     assert data['error'] in row['sql_command']
     assert row['input_tokens'] == 0

@@ -346,7 +346,7 @@ test.describe('analytics: query flow', () => {
 // a turn against 2 in-scope databases shows up as 3 translate_submitted
 // events (1 generic "the prompt was submitted" + 2 real per-database
 // calls), distinguishable by `database_name`: the generic one's is the
-// "All databases" badge text, each fan-out one's is that specific
+// "All Pre-Configured Datasets" badge text, each fan-out one's is that specific
 // database's own name. See trackEvent()'s own header comment in client.js
 // for the full reasoning. Config/NDJSON shapes here mirror
 // multi-database.spec.js's own "all databases" mode fixtures
@@ -445,17 +445,17 @@ test.describe('analytics: "all databases" mode fan-out', () => {
     const events = await trackedEvents(page, 'translate_submitted');
     expect(events.length).toBe(3);
 
-    // The generic, once-per-prompt call - same "All databases" badge text
-    // connDbName shows, and no way to know which specific database(s) will
-    // even be asked yet (translatePrompt() fires this before the request
-    // is even sent).
-    const genericEvent = events.find((e) => e.database_name === 'All databases');
+    // The generic, once-per-prompt call - same "All Pre-Configured Datasets" badge
+    // text connDbName shows, and no way to know which specific database(s)
+    // will even be asked yet (translatePrompt() fires this before the
+    // request is even sent).
+    const genericEvent = events.find((e) => e.database_name === 'All Pre-Configured Datasets');
     expect(genericEvent).toBeTruthy();
     expect(genericEvent.mode).toBe('all');
 
     // The two real per-database calls, fired once phase_a_route reveals
     // which connections the fan-out actually picked.
-    const perDatabase = events.filter((e) => e.database_name !== 'All databases');
+    const perDatabase = events.filter((e) => e.database_name !== 'All Pre-Configured Datasets');
     expect(perDatabase.length).toBe(2);
     expect(perDatabase.every((e) => e.mode === 'all')).toBe(true);
     const byName = Object.fromEntries(perDatabase.map((e) => [e.database_name, e]));
@@ -627,11 +627,11 @@ test.describe('analytics: "all databases" mode fan-out', () => {
     await expect.poll(async () => (await trackedEvents(page, 'sql_executed')).length).toBe(3);
     const events = await trackedEvents(page, 'sql_executed');
 
-    const genericEvent = events.find((e) => e.database_name === 'All databases');
+    const genericEvent = events.find((e) => e.database_name === 'All Pre-Configured Datasets');
     expect(genericEvent).toBeTruthy();
     expect(genericEvent.trigger).toBe('manual');
 
-    const perDatabase = events.filter((e) => e.database_name !== 'All databases');
+    const perDatabase = events.filter((e) => e.database_name !== 'All Pre-Configured Datasets');
     expect(perDatabase.length).toBe(2);
     expect(perDatabase.every((e) => e.trigger === 'manual')).toBe(true);
     const byName = Object.fromEntries(perDatabase.map((e) => [e.database_name, e]));
@@ -818,7 +818,7 @@ test.describe('analytics: connection/model/nav', () => {
           success: true,
           buckets: [
             { bucket_key: 'preset:x', turn_count: 3, kind: 'preset', name: 'Test DB', type: 'postgres', available: true },
-            { bucket_key: 'all', turn_count: 2, kind: 'all', name: 'All databases (combined)', type: null, available: true },
+            { bucket_key: 'all', turn_count: 2, kind: 'all', name: 'All Pre-Configured Datasets (combined)', type: null, available: true },
           ],
         }),
       });

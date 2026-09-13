@@ -2973,7 +2973,7 @@ def summarize_results():
                 'Unable to summarize results right now.'
             )
             # Logged the same way a successful Phase C call is (see below) -
-            # "All Databases"/"All Databases", 0 duration-attributed tokens
+            # "All Pre-Configured Datasets"/"All Pre-Configured Datasets", 0 duration-attributed tokens
             # (a total failure never has a usable response to report token
             # counts from - see summarize_all_mode_results'/_summarize_with_
             # retry's own docstrings), and the sql_command column holding a
@@ -3046,8 +3046,8 @@ def summarize_results():
         summary_text = "*** NO SQL *** " + parsed["label"] + "\n\n" + "\n\n".join(summary_paragraphs)
         usage_dict = usage or {}
         # Logged the same way Phase A's own triage call is (see
-        # record_all_databases_triage's docstring) - "All Databases"/
-        # "All Databases" rather than any one real connection, since this call
+        # record_all_databases_triage's docstring) - "All Pre-Configured Datasets"/
+        # "All Pre-Configured Datasets" rather than any one real connection, since this call
         # is likewise never "about" just one specific database.
         record_all_databases_triage(
             user_identity, prompt, summary_text, llm_model, duration,
@@ -3295,7 +3295,7 @@ def summarize_result():
                 'Unable to summarize results right now.'
             )
             # Logged against the real connection this was run for (unlike
-            # Phase C's "All Databases"/"All Databases" logging above), 0
+            # Phase C's "All Pre-Configured Datasets"/"All Pre-Configured Datasets" logging above), 0
             # tokens (no usable response on a total failure - see
             # _summarize_with_retry's own docstring), sql_command holding a
             # TRANSLATION_ERROR(...) sentinel in place of real SQL, same
@@ -3310,7 +3310,7 @@ def summarize_result():
         summary_text = "*** NO SQL *** " + text
         usage_dict = usage or {}
         # Logged as a real translations-table row against the actual connection
-        # this was run for (unlike Phase C's "All Databases"/"All Databases"
+        # this was run for (unlike Phase C's "All Pre-Configured Datasets"/"All Pre-Configured Datasets"
         # special-case logging - there IS one real connection here), same call
         # translate_query()'s own single-connection path already uses.
         record_translation(
@@ -3564,7 +3564,7 @@ def translate_query():
                 )
                 # Phase A's own elapsed time and LLM usage, isolated from
                 # whatever Phase B work (if any) happens next below -
-                # logged as its own dedicated "All Databases"/"All Databases" translations-
+                # logged as its own dedicated "All Pre-Configured Datasets"/"All Pre-Configured Datasets" translations-
                 # table row further down (see
                 # db.record_all_databases_triage's docstring), regardless
                 # of outcome, since triage always runs exactly once per
@@ -3816,7 +3816,7 @@ def translate_query():
                 cached_content_tokens = usage_info.get("cached_content_tokens", 0)
 
                 # Phase A (triage) always gets its own dedicated
-                # "All Databases"/"All Databases" translations-table row - see
+                # "All Pre-Configured Datasets"/"All Pre-Configured Datasets" translations-table row - see
                 # record_all_databases_triage's docstring - using ONLY its
                 # own duration/usage computed above, never Phase B's (kept
                 # entirely separate below) so nothing is ever double-

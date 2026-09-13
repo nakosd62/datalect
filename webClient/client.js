@@ -2248,6 +2248,27 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function updateHistoryNavButtons() {
+    // While a turn is in flight (uiActionBusy - see its own declaration
+    // comment), these three stay forced disabled regardless of undo/redo
+    // boundary state below. setButtonsDisabled(true) is what disables them
+    // at the very start of a turn, but this function also gets called mid-
+    // turn, well before that turn's own setButtonsDisabled(false) runs -
+    // e.g. the "route" outcome's pushActiveTurn()/updateHistoryTurnsSubtitle()
+    // call fires as soon as the terminal /api/translate line arrives, but
+    // translatePrompt() itself may still be awaiting an internal
+    // executeSql() call and/or Phase C summarization after that. Recomputing
+    // a fresh (by now non-boundary) undo/redo state at that point would
+    // re-enable Back/Forward/New well before the turn as a whole is
+    // actually done - a real regression, since setButtonsDisabled() alone
+    // no longer has the last word once something later in the same turn
+    // calls this function again.
+    if (uiActionBusy) {
+      if (goBackBtn) goBackBtn.disabled = true;
+      if (goForwardBtn) goForwardBtn.disabled = true;
+      if (newTurnBtn) newTurnBtn.disabled = true;
+      return;
+    }
+
     // chatStore holds [user, model] pairs. When only one turn remains,
     // it's already the oldest turn on screen - going back from there would
     // pop it and leave the UI blank, so disable one step early. While
@@ -2347,9 +2368,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   // in the connection picker and then seeing only one name in the badge
   // would run into. Returns {count, label, names} - `label` is what the
   // badge text should show (the primary's own name when count <= 1,
-  // "All databases" otherwise) and `names` is the full in-scope name list
-  // (resolved via configured_databases/custom_databases, both already
-  // present on every /api/config response) for the tooltip.
+  // "All Pre-Configured Datasets" for real "all" mode, "Multiple databases" for
+  // the legacy explicit-subset case below) and `names` is the full
+  // in-scope name list (resolved via configured_databases/custom_databases,
+  // both already present on every /api/config response) for the tooltip.
   //
   // "All" (data.in_scope_mode === 'all') is checked FIRST and directly -
   // the same source of truth isAllConnectionsSelected() uses - rather
@@ -2368,8 +2390,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     const configuredDbs = data?.configured_databases || [];
     const customDbs = data?.custom_databases || [];
     if (data?.in_scope_mode === 'all') {
-      const names = [...configuredDbs.map(db => db.name), ...customDbs.map(db => db.name)];
-      return { count: names.length, label: names.length > 1 ? 'All databases' : null, names };
+      // Presets only - see db.py's _resolve_all_configured_descriptors'
+      // own docstring for why custom connections are deliberately never
+      // part of "All Pre-Configured Datasets" mode. customDbs is intentionally
+      // NOT included in `names` here (unlike the legacy branch below,
+      // which can legitimately include them - it's an explicit, user-
+      // picked subset, not "all").
+      const names = configuredDbs.map(db => db.name);
+      return { count: names.length, label: names.length > 1 ? 'All Pre-Configured Datasets' : null, names };
     }
     const presetIds = data?.in_scope_preset_ids || [];
     const customKeys = data?.in_scope_custom_connection_keys || [];
@@ -2378,15 +2406,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     // A legacy session that saved an arbitrary multi-connection subset
     // before the binary single/all choice existed (see
     // resolve_in_scope_descriptors' docstring) - still more than one
-    // connection in scope, so this reuses the same "All databases" badge
-    // text as real "all" mode above (this badge has no separate copy for
-    // "several specific connections"), just resolved from the explicit
-    // arrays instead of the full configured/custom lists.
+    // connection in scope, but deliberately given its OWN label rather
+    // than "All Pre-Configured Datasets" too: this subset is explicit and can
+    // include custom connections, and isn't necessarily every preset
+    // either, so calling it "All" anything would misdescribe it.
     const names = [
       ...presetIds.map(id => configuredDbs.find(db => db.id === id)?.name || id),
       ...customKeys.map(key => customDbs.find(db => db.connection_key === key)?.name || key),
     ];
-    return { count, label: 'All databases', names };
+    return { count, label: 'Multiple databases', names };
   }
 
   async function updateConnectionDetails(data) {
@@ -3553,7 +3581,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const activeUrl = currentDbUrl || ACTIVE_DB_URL || DEFAULT_DB_URL;
     const allSelected = isAllConnectionsSelected();
 
-    let html = `<div class="radio-group-heading">Pre-configured Database Playgrounds</div>`;
+    let html = `<div class="radio-group-heading">PRE-CONFIGURED DATASETS (PLAYGROUNDS)</div>`;
 
     // Two visual columns, purely a layout grouping (no change to what's
     // selectable or how - db_connection_option/preset:<id> works exactly
@@ -3571,6 +3599,28 @@ document.addEventListener('DOMContentLoaded', async () => {
     const leftCount = Math.ceil(CONFIGURED_DBS.length / 2);
     const leftPresets = CONFIGURED_DBS.slice(0, leftCount);
     const rightPresets = CONFIGURED_DBS.slice(leftCount);
+
+    // "All Pre-Configured Datasets" (see db.py's _resolve_all_configured_
+    // descriptors - presets only, never custom connections) renders as one
+    // more option in the SAME two-column preset list, directly after the
+    // very last preset - never its own separate section below the custom
+    // connections list the way it used to when it still spanned both
+    // lists. Appended to whichever column that last preset itself landed
+    // in (the right column whenever there's more than one preset total,
+    // so it sits right under the last preset there; the left column in
+    // the edge case where there's only 0-1 presets and the right column
+    // is empty) - this never disturbs the existing left/right preset
+    // split itself (see the count-based comment above), it only adds one
+    // extra item to whichever column already ends last.
+    const allOptionGoesInRightColumn = rightPresets.length > 0;
+
+    // Explanation of what this option does - previously a standalone <p>
+    // below the two-column grid, now an on-hover title attribute on the
+    // option itself instead (per explicit request to get it out of the
+    // dialog body), same text unchanged.
+    const ALL_OPTION_HINT = "Ask a question without picking a database first - the app figures out which preset "
+      + "dataset(s) it applies to, and can query more than one at once when a question genuinely needs it. Only "
+      + "presets are eligible here - your own custom connections are never included.";
 
     const renderPresetOption = (db) => {
       // Encodes the preset's stable id (never a secret, unlike the real
@@ -3599,10 +3649,19 @@ document.addEventListener('DOMContentLoaded', async () => {
       `;
     };
 
+    const allOption = `
+      <label class="radio-option all-databases-option" title="${ALL_OPTION_HINT}">
+        <input type="radio" name="db_connection_option" value="all" ${allSelected ? 'checked' : ''}>
+        <span class="radio-label">All Pre-Configured Datasets</span>
+      </label>
+    `;
+    const leftColumnHtml = leftPresets.map(renderPresetOption).join('') + (allOptionGoesInRightColumn ? '' : allOption);
+    const rightColumnHtml = rightPresets.map(renderPresetOption).join('') + (allOptionGoesInRightColumn ? allOption : '');
+
     html += `
       <div class="preset-columns">
-        <div class="preset-column">${leftPresets.map(renderPresetOption).join('')}</div>
-        <div class="preset-column">${rightPresets.map(renderPresetOption).join('')}</div>
+        <div class="preset-column">${leftColumnHtml}</div>
+        <div class="preset-column">${rightColumnHtml}</div>
       </div>
     `;
 
@@ -3617,25 +3676,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       </p>
     `;
     html += `<div id="customDbsContainer" class="custom-dbs-list"></div>`;
-
-    // "All configured databases" - moved to the bottom of the group,
-    // below every preset and custom connection, since it applies across
-    // both lists rather than belonging to either one; a separator
-    // (.all-databases-section's own top border) marks it as its own
-    // section rather than one more item tacked onto the custom
-    // connections list right above it.
-    html += `
-      <div class="all-databases-section">
-        <label class="radio-option all-databases-option">
-          <input type="radio" name="db_connection_option" value="all" ${allSelected ? 'checked' : ''}>
-          <span class="radio-label">All configured databases</span>
-        </label>
-        <p class="all-databases-hint">
-          Ask a question without picking a database first - the app figures out which connection(s) it applies to,
-          and can query more than one at once when a question genuinely needs it.
-        </p>
-      </div>
-    `;
 
     radioGroup.innerHTML = html;
 
@@ -5482,7 +5522,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   // the server already withheld it from `name`/`type` for exactly that
   // reason; this function has no more of it to work with than that.
   function bucketDisplayLabel(bucket) {
-    if (bucket.kind === 'all') return bucket.name || 'All databases (combined)';
+    if (bucket.kind === 'all') return bucket.name || 'All Pre-Configured Datasets (combined)';
     if (bucket.available && bucket.name) return bucket.name;
     if (bucket.kind === 'preset') return 'Unavailable preset';
     if (bucket.kind === 'custom') return 'Unavailable connection';
@@ -7964,8 +8004,14 @@ document.addEventListener('DOMContentLoaded', async () => {
       // never clobbers a newer turn's buttons/uiActionBusy state.
       if (myTurnId === currentTurnId) {
         hideRetryStatus();
-        setButtonsDisabled(false);
+        // Cleared BEFORE setButtonsDisabled(false), not after: that call's
+        // own re-enable branch calls updateHistoryNavButtons(), which now
+        // checks uiActionBusy itself (see its own comment) to stay
+        // disabled mid-turn - if the flag were still true here, that same
+        // guard would keep Back/Forward/New force-disabled at the exact
+        // moment they're supposed to finally come back.
         uiActionBusy = false;
+        setButtonsDisabled(false);
       }
     }
   }
@@ -8532,8 +8578,12 @@ document.addEventListener('DOMContentLoaded', async () => {
       // uiActionBusy out from under a NEWER turn the user already started
       // after clicking Cancel.
       if (!internal && myTurnId === currentTurnId) {
-        setButtonsDisabled(false);
+        // Cleared BEFORE setButtonsDisabled(false) - see translatePrompt()'s
+        // identical ordering/comment; its re-enable branch calls
+        // updateHistoryNavButtons(), which stays force-disabled while
+        // uiActionBusy is still true.
         uiActionBusy = false;
+        setButtonsDisabled(false);
       }
     }
   }
@@ -8599,8 +8649,12 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     hideRetryStatus();
     hideAllModeStreamStatus();
-    setButtonsDisabled(false);
+    // Cleared BEFORE setButtonsDisabled(false) - see translatePrompt()'s
+    // identical ordering/comment; its re-enable branch calls
+    // updateHistoryNavButtons(), which stays force-disabled while
+    // uiActionBusy is still true.
     uiActionBusy = false;
+    setButtonsDisabled(false);
   }
 
   // ===========================================================================

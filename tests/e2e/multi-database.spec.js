@@ -182,16 +182,16 @@ test.describe('multi-database question answering', () => {
     expect(state.in_scope_custom_connection_keys).toEqual([]);
   });
 
-  test('the connection badge reads "All databases" whenever 2+ are in scope, and the single name once only one remains', async ({ page }) => {
+  test('the connection badge reads "All Pre-Configured Datasets" whenever 2+ are in scope, and the single name once only one remains', async ({ page }) => {
     const state = await mockConfig(page);
     await gotoApp(page);
 
     // buildConfigState() starts with both p-a and p-b in scope (as if a
     // prior "All" save, or a session that predates this binary choice) -
-    // the badge should say "All databases", not just the primary's
+    // the badge should say "All Pre-Configured Datasets", not just the primary's
     // ("Sales Postgres") name, since showing one name would hide that the
     // other connection is also in play for this session's questions.
-    await expect(page.locator('#connDbName')).toHaveText('All databases');
+    await expect(page.locator('#connDbName')).toHaveText('All Pre-Configured Datasets');
     await expect(page.locator('#configTriggerBadge')).toHaveAttribute(
       'title', 'In scope: Sales Postgres, Marketing Postgres (Click to configure)');
 
@@ -208,13 +208,13 @@ test.describe('multi-database question answering', () => {
       'title', 'Connected to: Marketing Postgres (Click to configure)');
   });
 
-  test('the badge reads "All databases" for a real in_scope_mode "all" session even when the leftover in-scope arrays are short', async ({ page }) => {
+  test('the badge reads "All Pre-Configured Datasets" for a real in_scope_mode "all" session even when the leftover in-scope arrays are short', async ({ page }) => {
     // Regression guard: a session that saved "All" leaves
     // in_scope_preset_ids/in_scope_custom_connection_keys untouched (see
     // triggerConfigSave() - "all" mode ignores them entirely, see db.py's
     // resolve_in_scope_descriptors), so they can be arbitrarily short - even
     // a single leftover entry from whatever was picked before "All" was
-    // last selected. The badge must still read "All databases" here,
+    // last selected. The badge must still read "All Pre-Configured Datasets" here,
     // straight off in_scope_mode, not off those arrays' length (which is
     // exactly what summarizeInScopeConnections() once got wrong).
     await mockConfig(page, {
@@ -225,7 +225,7 @@ test.describe('multi-database question answering', () => {
     });
     await gotoApp(page);
 
-    await expect(page.locator('#connDbName')).toHaveText('All databases');
+    await expect(page.locator('#connDbName')).toHaveText('All Pre-Configured Datasets');
     await expect(page.locator('#configTriggerBadge')).toHaveAttribute(
       'title', 'In scope: Sales Postgres, Marketing Postgres (Click to configure)');
 

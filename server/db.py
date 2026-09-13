@@ -150,12 +150,15 @@ def resolve_in_scope_descriptors(session, user_id):
     docstring) takes a completely different path here - see
     _resolve_all_configured_descriptors below - ignoring
     in_scope_preset_ids/in_scope_custom_connection_keys entirely in favor
-    of a dynamic, resolved-fresh-every-request "every configured
-    connection" set. Every other mode (the default "single", and any
-    legacy session that saved an arbitrary multi-connection subset before
-    the binary single/all choice existed) resolves the explicit
-    in_scope_preset_ids/in_scope_custom_connection_keys lists below,
-    exactly as this function always has.
+    of a dynamic, resolved-fresh-every-request "every configured preset"
+    set (presets only - see that function's own docstring for why custom
+    connections are deliberately excluded from it). Every other mode (the
+    default "single", and any legacy session that saved an arbitrary
+    multi-connection subset before the binary single/all choice existed)
+    resolves the explicit in_scope_preset_ids/in_scope_custom_connection_keys
+    lists below, exactly as this function always has - that legacy
+    explicit-subset path CAN still include custom connections, since it's
+    a user-picked list, not "all".
 
     A reference that no longer resolves (resolve_descriptor_by_reference
     returned None - a removed preset, a deleted custom connection) is
@@ -186,39 +189,36 @@ def resolve_in_scope_descriptors(session, user_id):
 
 
 def _resolve_all_configured_descriptors(user_id):
-    """"All configured databases" (see webClient/client.js's
+    """"All Pre-Configured Datasets" (see webClient/client.js's
     renderDbRadioButtons()) - the dynamic candidate pool for a session in
     in_scope_mode == "all": EVERY currently-configured preset
     (CONFIGURED_DBS, read fresh on every call, so a preset added or
     removed since this was last true is immediately reflected - the whole
     point of "All" over the frozen, save-time-computed subset the old
-    arbitrary checkbox picker produced) plus every one of this user's own
-    saved custom connections. Each resolved via
-    resolve_descriptor_by_reference exactly like the explicit-list branch
-    in resolve_in_scope_descriptors above, so a connection that
-    (implausibly, mid-request) stops resolving is silently skipped the
-    same way, not a special case. Falls back to the single app-default
-    entry only if there's nothing configured at all - CONFIGURED_DBS
-    always has at least DEFAULT_CONN in practice (see app_config.py), so
-    this is a defensive floor, not an expected path."""
+    arbitrary checkbox picker produced).
+
+    Deliberately PRESETS ONLY, never this user's own custom connections -
+    unlike an earlier version of this feature (when it was still named/
+    framed as "All Databases"), which folded in every one of the user's
+    saved custom connections too. A user's custom connections are their
+    own ad hoc, often one-off or credential-sensitive additions, not part
+    of the curated set an admin actually intends "ask across everything"
+    to mean - and silently including them meant a prompt like "how many
+    customers do we have" could route to a personal scratch connection
+    the user never meant to include in a broad, unscoped question. Each
+    preset is resolved via resolve_descriptor_by_reference exactly like
+    the explicit-list branch in resolve_in_scope_descriptors above, so a
+    preset that (implausibly, mid-request) stops resolving is silently
+    skipped the same way, not a special case. Falls back to the single
+    app-default entry only if there's nothing configured at all -
+    CONFIGURED_DBS always has at least DEFAULT_CONN in practice (see
+    app_config.py), so this is a defensive floor, not an expected path."""
     entries = []
     for db in CONFIGURED_DBS:
         preset_id = db.get("id")
         descriptor, name = resolve_descriptor_by_reference("preset", preset_id, user_id)
         if descriptor is not None:
             entries.append({"kind": "preset", "id": preset_id, "name": name, "descriptor": descriptor})
-    for db in state_store.get_db_connections(user_id, include_credentials=True):
-        custom_key = db.get("connection_key")
-        if not custom_key:
-            # A legacy custom connection saved before connection_key
-            # existed (see get_db_connections' docstring) can't be
-            # individually addressed by resolve_descriptor_by_reference at
-            # all - same "nothing to do here" this feature's explicit-list
-            # branch above always had for such a row.
-            continue
-        descriptor, name = resolve_descriptor_by_reference("custom", custom_key, user_id)
-        if descriptor is not None:
-            entries.append({"kind": "custom", "id": custom_key, "name": name, "descriptor": descriptor})
     if not entries:
         return [{
             "kind": "preset", "id": "", "name": "Default connection",
@@ -361,29 +361,31 @@ def record_translation(user_id, conn_str, nl_prompt, sql_command, gemini_model, 
 
 
 def record_all_databases_triage(user_id, nl_prompt, sql_command, gemini_model, duration, input_tokens, output_tokens, total_tokens, thinking_tokens, cached_content_tokens):
-    """Logs "all databases" mode's Phase A (triage) step to the same
+    """Logs "All Pre-Configured Datasets" mode's Phase A (triage) step to the same
     translations table record_translation() writes to, but tagged with the
-    literal database_type/database_name "All Databases"/"All Databases"
-    rather than any real connection descriptor - unlike every other row in
-    this table, a triage call isn't "about" one specific database at all
-    (it's the step that decides whether real data is even needed, and if
-    so, which connection(s) to route to), so there's no real descriptor to
-    resolve a db_type/db_name from the way record_translation() does above.
+    literal database_type/database_name "All Pre-Configured Datasets"/"All Preset
+    Datasets" rather than any real connection descriptor - unlike every
+    other row in this table, a triage call isn't "about" one specific
+    database at all (it's the step that decides whether real data is even
+    needed, and if so, which connection(s) to route to), so there's no
+    real descriptor to resolve a db_type/db_name from the way
+    record_translation() does above.
 
     Deliberately bypasses record_translation()'s _to_descriptor/
     _resolve_database_name resolution entirely rather than trying to feed
-    it a synthetic descriptor - "All Databases" is a fixed, literal label,
-    not a lookup result.
+    it a synthetic descriptor - "All Pre-Configured Datasets" is a fixed, literal
+    label, not a lookup result.
 
-    Called once per "all databases" request regardless of triage's outcome
-    (answer/failed/route - see translate_routes.py's router_only_all_mode
-    branch), always with ONLY triage's own duration and LLM token usage -
-    never folded in with any Phase B (per-database generation) numbers, so
-    a "route" outcome's real, per-database translations-table row (logged
-    separately, attributed to that specific connection) never double-counts
-    the tokens/time this row already accounts for."""
+    Called once per "All Pre-Configured Datasets" request regardless of triage's
+    outcome (answer/failed/route - see translate_routes.py's
+    router_only_all_mode branch), always with ONLY triage's own duration
+    and LLM token usage - never folded in with any Phase B (per-database
+    generation) numbers, so a "route" outcome's real, per-database
+    translations-table row (logged separately, attributed to that specific
+    connection) never double-counts the tokens/time this row already
+    accounts for."""
     state_store.record_translation(
-        user_id, "All Databases", "All Databases", nl_prompt, sql_command, gemini_model,
+        user_id, "All Pre-Configured Datasets", "All Pre-Configured Datasets", nl_prompt, sql_command, gemini_model,
         duration, input_tokens, output_tokens, total_tokens, thinking_tokens, cached_content_tokens
     )
 

@@ -237,6 +237,83 @@ def test_post_config_silently_drops_stale_custom_connection_key(app_factory, tmp
     assert data["in_scope_custom_connection_keys"] == []
 
 
+def test_post_config_reconciles_stale_in_scope_key_when_renaming_the_scoped_custom_connection(app_env):
+    # Real bug report: connection_key is a hash of (name, url, credential) -
+    # see compute_connection_key's docstring - so renaming (or otherwise
+    # editing an identity field of) the one custom connection currently in
+    # scope changes its key out from under the in-scope array the browser
+    # built before this exact save even went out - the client has no way to
+    # predict a hash it can't compute client-side (see client.js's
+    # renderCustomDbRows(), which checks that row's radio the moment its
+    # own field is edited, and triggerConfigSave(), which then sends the
+    # OLD, not-yet-superseded connection_key alongside the new name).
+    # Previously this hit the server's "at least one connection must be in
+    # scope" empty-set rejection and aborted the WHOLE save, including the
+    # rename itself - reconciled instead of rejected now, since the
+    # request's own active-connection fields unambiguously identify what
+    # the user meant to keep in scope.
+    login_as(app_env.client, "alice@example.com")
+    resp = app_env.client.post('/api/config', json={
+        "database_type": "postgres", "database_url": "postgresql://u:p@h/db",
+        "database_name": "Original Name", "is_custom": True,
+        "custom_databases": [
+            {"name": "Original Name", "type": "postgres", "url": "postgresql://u:p@h/db", "config": {}},
+        ],
+    })
+    assert resp.status_code == 200
+    before = app_env.client.get('/api/config').get_json()
+    old_key = before["active_custom_connection_key"]
+    assert old_key
+    assert before["in_scope_custom_connection_keys"] == [old_key]
+
+    # The browser's own in-memory customDatabases[index].connection_key is
+    # still `old_key` at this point (it's never updated locally until a
+    # round-trip completes) - exactly what triggerConfigSave() sends below,
+    # alongside the renamed row's fresh name/url in both database_name and
+    # custom_databases.
+    resp2 = app_env.client.post('/api/config', json={
+        "database_type": "postgres", "database_url": "postgresql://u:p@h/db",
+        "database_name": "Renamed", "is_custom": True,
+        "custom_databases": [
+            {"name": "Renamed", "type": "postgres", "url": "postgresql://u:p@h/db", "config": {}},
+        ],
+        "in_scope_preset_ids": [],
+        "in_scope_custom_connection_keys": [old_key],
+    })
+    assert resp2.status_code == 200
+
+    after = app_env.client.get('/api/config').get_json()
+    new_key = after["active_custom_connection_key"]
+    assert new_key
+    assert new_key != old_key
+    assert after["custom_database_name"] == "Renamed"
+    # Reconciled to the connection's own FRESH key, not left pointing at
+    # the now-nonexistent old one and not silently dropped to empty.
+    assert after["in_scope_custom_connection_keys"] == [new_key]
+    assert after["in_scope_preset_ids"] == []
+
+
+def test_post_config_reconciliation_does_not_apply_without_an_active_custom_connection_this_request(app_factory, tmp_path):
+    # The reconciliation above only ever substitutes THIS SAME request's
+    # own freshly-active custom connection (active_connection_key) - it
+    # must not kick in just because exactly one (stale, unrelated) custom
+    # key was submitted when this request isn't activating any custom
+    # connection at all (e.g. a preset-only save, or an in-scope-only save
+    # with no active-connection fields present) - active_connection_key
+    # stays None in that case, so the empty-set rejection still applies,
+    # same as before this fix.
+    env = _two_preset_env(app_factory, tmp_path)
+    login_as(env.client, "alice@example.com")
+
+    resp = env.client.post('/api/config', json={
+        "preset_id": "pg-a",
+        "in_scope_preset_ids": [],
+        "in_scope_custom_connection_keys": ["never-saved-key"],
+    })
+    assert resp.status_code == 400
+    assert resp.get_json()["error"] == "At least one database connection must be in scope."
+
+
 def test_post_config_accepts_custom_key_added_in_the_same_request(app_env):
     # A connection added AND marked in-scope in the same Save must not be
     # spuriously dropped for "not existing yet" - see config_routes.py's

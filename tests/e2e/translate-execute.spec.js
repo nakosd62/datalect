@@ -329,6 +329,82 @@ test.describe('translate + execute', () => {
     await expect(runBtn).not.toBeDisabled();
   });
 
+  // Regression guard: the history nav buttons (#goBackBtn/#goForwardBtn/
+  // #newTurnBtn) used to get re-enabled mid-turn, well before the turn as a
+  // whole actually settled - setButtonsDisabled(true) force-disables them
+  // at the very start of a turn, same as every other control above, but
+  // updateHistoryNavButtons() (wired to fire again as soon as the new
+  // turn's own pushActiveTurn()/updateHistoryTurnsSubtitle() runs, right
+  // after /api/translate's terminal line arrives but BEFORE auto-execute's
+  // own /api/execute call - which auto_sql_execute defaults to firing
+  // automatically - has resolved) used to recompute a fresh, no-longer-
+  // boundary undo/redo state and flip them back on itself, ignoring the
+  // in-flight turn entirely. Fixed by having updateHistoryNavButtons() also
+  // check uiActionBusy (client.js) and stay forced-disabled while it's
+  // true, mirroring the identical pattern onSqlContentMaybeChanged()
+  // already used for the SQL box's own Execute/report buttons.
+  test('the history nav buttons stay disabled through the ENTIRE turn, not just until the SQL comes back', async ({ page }) => {
+    // Two turns completed up front (fast, no delay) so #goBackBtn is
+    // genuinely enabled at rest afterward (chatStore.canUndo() needs 2+
+    // turns - see client.js's ChatStore) - otherwise its "no earlier turn
+    // to go back to" boundary state alone would already leave it disabled,
+    // masking the regression this test is actually about.
+    await mockTranslate(page, { sql: 'SELECT 1;' });
+    await mockExecute(page, { results: [{ columns: ['n'], rows: [{ n: 1 }], rowCount: 1 }] });
+    await gotoApp(page);
+    await page.locator('#aiPrompt').fill('first question');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect.poll(() => currentSql(page)).toContain('SELECT 1');
+
+    await mockTranslate(page, { sql: 'SELECT 2;' });
+    await mockExecute(page, { results: [{ columns: ['n'], rows: [{ n: 2 }], rowCount: 1 }] });
+    await page.locator('#aiPrompt').fill('second question');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect.poll(() => currentSql(page)).toContain('SELECT 2');
+
+    const goBackBtn = page.locator('#goBackBtn');
+    const newTurnBtn = page.locator('#newTurnBtn');
+    await expect(goBackBtn).not.toBeDisabled();
+    await expect(newTurnBtn).not.toBeDisabled();
+
+    // Third turn: /api/translate resolves quickly with real SQL (so
+    // pushActiveTurn()/updateHistoryTurnsSubtitle() fires - the exact call
+    // that used to re-enable these buttons), but the auto-execute call it
+    // triggers internally is held open, simulating a slow query - the turn
+    // as a whole is still very much in flight for the whole delay.
+    await mockTranslate(page, { sql: 'SELECT 3;' });
+    let resolveExecute;
+    const executeStarted = new Promise((resolve) => { resolveExecute = resolve; });
+    await page.route('**/api/execute', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      resolveExecute();
+      await new Promise((r) => setTimeout(r, 2000));
+      await route.fulfill({
+        status: 200, contentType: 'application/json',
+        body: JSON.stringify({ success: true, results: [{ columns: ['n'], rows: [{ n: 3 }], rowCount: 1 }] }),
+      });
+    });
+
+    await page.locator('#aiPrompt').fill('third question');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect.poll(() => currentSql(page)).toContain('SELECT 3');
+    await executeStarted;
+
+    // The SQL is already in the box (translate's own terminal line landed)
+    // but /api/execute is still in flight - this is exactly the window the
+    // old code got wrong.
+    await expect(goBackBtn).toBeDisabled();
+    await expect(newTurnBtn).toBeDisabled();
+
+    await expect.poll(() => normalizedSql(page), { timeout: 5000 }).toContain('SELECT 3');
+    await expect(page.locator('#resultsBody')).toContainText('3');
+
+    // Now the whole turn has genuinely settled - back to their real,
+    // boundary-derived enabled state.
+    await expect(goBackBtn).not.toBeDisabled();
+    await expect(newTurnBtn).not.toBeDisabled();
+  });
+
   // Regression guard: .badge-disabled used to be applied straight to
   // #configTriggerBadge itself, and CSS opacity/filter both composite the
   // WHOLE rendered subtree as one group once set on an ancestor - so the

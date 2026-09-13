@@ -1452,6 +1452,66 @@ def handle_config():
         )
         custom_list_saved = False
 
+        # Hoisted up from the "elif is_custom:" branch further down (same
+        # computation, moved rather than duplicated - the later branch now
+        # just reuses these instead of re-deriving them) so the in-scope
+        # reconciliation immediately below can already know the fresh
+        # connection_key TODAY's active-connection edit produces, before
+        # deciding whether the in-scope arrays the client sent are really
+        # invalid. Pure/side-effect-free (no state_store writes happen
+        # until further down), so computing it here even when it turns out
+        # unneeded (e.g. a preset selection, where none of this applies)
+        # costs nothing. `active_connection_key` stays None whenever
+        # is_custom is False OR the request never actually identifies/
+        # touches a connection (no new_db_url and no auto_sql_execute
+        # change) - only "" vs. a real hash distinguishes "is_custom but no
+        # connection identified this request" from "a real one", exactly
+        # as the original call site's own comment already documented.
+        new_db_type = new_db_url = new_db_config = connection_error = None
+        db_name_to_save = None
+        active_connection_key = None
+        if is_custom:
+            new_db_type, new_db_url, new_db_config, connection_error = _parse_incoming_connection(
+                data, user_identity
+            )
+            if new_db_url or new_auto_sql_execute is not None:
+                if new_db_url:
+                    db_name_to_save = new_db_name
+                    if not db_name_to_save:
+                        if new_db_type == 'bigquery':
+                            db_name_to_save = new_db_config.get("dataset") or "Custom BigQuery"
+                        elif new_db_type == 'snowflake':
+                            db_name_to_save = new_db_config.get("database") or "Custom Snowflake"
+                        elif new_db_type == 'databricks':
+                            db_name_to_save = new_db_config.get("http_path") or "Custom Databricks"
+                        elif new_db_type == 'oracle':
+                            db_name_to_save = (
+                                new_db_config.get("service_name") or new_db_config.get("sid")
+                                or "Custom Oracle"
+                            )
+                        elif new_db_type == 'redshift':
+                            db_name_to_save = new_db_config.get("database") or "Custom Redshift"
+                        elif new_db_type == 'mssql':
+                            db_name_to_save = new_db_config.get("database") or "Custom SQL Server"
+                        elif new_db_type == 'sheets':
+                            db_name_to_save = new_db_config.get("tab_name") or "Custom Sheet"
+                        elif new_db_type == 'MongoDB':
+                            db_name_to_save = new_db_config.get("database") or "Custom MongoDB"
+                        else:
+                            try:
+                                parsed = urlparse(new_db_url)
+                                dbname = parsed.path.lstrip('/')
+                                if '?' in dbname:
+                                    dbname = dbname.split('?')[0]
+                                db_name_to_save = dbname or "Custom"
+                            except Exception:
+                                db_name_to_save = "Custom"
+
+                active_connection_key = (
+                    compute_connection_key(db_name_to_save, new_db_url, _credential_for_key(new_db_config))
+                    if new_db_url else ""
+                )
+
         # In-scope connections (multi-database question-answering - see
         # translate_routes.py's module docstring): the set of connections a
         # question may ever be routed to, curated via the connection
@@ -1494,6 +1554,34 @@ def handle_config():
             filtered_custom_keys = list(dict.fromkeys(
                 key for key in candidate_custom_keys if isinstance(key, str) and key in valid_custom_keys
             ))
+
+            # A stale custom key can legitimately reference the very
+            # connection THIS SAME request is editing right now:
+            # connection_key is a hash of (name, url, credential) - see
+            # compute_connection_key's docstring - so editing any of those
+            # on the currently-selected custom connection (e.g. just
+            # renaming it) changes its key out from under the in-scope
+            # array the client built before this save even went out; the
+            # client has no way to predict a hash it can't compute
+            # client-side. Reconciled here rather than rejected: when the
+            # client's only-ever actual use of this pair for a single
+            # custom connection - "in_scope_preset_ids: [], in_scope_
+            # custom_connection_keys: [<this row's old key>]" (see
+            # triggerConfigSave()'s "Picking one SPECIFIC connection
+            # narrows scope back down to exactly that one" comment) -
+            # would otherwise resolve to nothing, but this same request is
+            # ALSO activating a specific custom connection (active_
+            # connection_key, computed above from this request's fresh
+            # fields), that freshly-identified connection is unambiguously
+            # what the user meant to keep in scope - just under its new
+            # identity instead of the one that's already gone stale by the
+            # time this save takes effect.
+            if (
+                not filtered_preset_ids and not filtered_custom_keys
+                and not candidate_preset_ids and len(candidate_custom_keys) == 1
+                and active_connection_key
+            ):
+                filtered_custom_keys = [active_connection_key]
 
             total_in_scope = len(filtered_preset_ids) + len(filtered_custom_keys)
             if total_in_scope == 0:
@@ -1557,9 +1645,12 @@ def handle_config():
                 theme=new_theme,
             )
         elif is_custom:
-            new_db_type, new_db_url, new_db_config, connection_error = _parse_incoming_connection(
-                data, user_identity
-            )
+            # new_db_type/new_db_url/new_db_config/connection_error and
+            # db_name_to_save/active_connection_key were already computed
+            # above (hoisted so the in-scope reconciliation could see them
+            # too - see that block's own comment for why) - reused here
+            # as-is rather than re-derived, so there's exactly one place
+            # that ever computes them.
             if connection_error:
                 # Reject outright, before touching state_store - a
                 # half-valid save here (e.g. persisting project_id/dataset
@@ -1606,66 +1697,6 @@ def handle_config():
                         schema_cache.invalidate(get_conn_identifier(
                             {"type": new_db_type, "url": new_db_url_to_persist, **new_db_config}
                         ))
-
-                # Resolved once, up front (rather than inside the
-                # save-to-list block below), so the session's "which exact
-                # saved connection is this" pointer (connection_id) and the
-                # actual saved-list row always agree on the same name - a
-                # blank database_name from the frontend falls back to a
-                # derived one, and computing the key before that fallback
-                # ran would silently point at a connection that was never
-                # actually saved under that name.
-                db_name_to_save = None
-                if new_db_url:
-                    db_name_to_save = new_db_name
-                    if not db_name_to_save:
-                        if new_db_type == 'bigquery':
-                            db_name_to_save = new_db_config.get("dataset") or "Custom BigQuery"
-                        elif new_db_type == 'snowflake':
-                            db_name_to_save = new_db_config.get("database") or "Custom Snowflake"
-                        elif new_db_type == 'databricks':
-                            db_name_to_save = new_db_config.get("http_path") or "Custom Databricks"
-                        elif new_db_type == 'oracle':
-                            db_name_to_save = (
-                                new_db_config.get("service_name") or new_db_config.get("sid")
-                                or "Custom Oracle"
-                            )
-                        elif new_db_type == 'redshift':
-                            db_name_to_save = new_db_config.get("database") or "Custom Redshift"
-                        elif new_db_type == 'mssql':
-                            db_name_to_save = new_db_config.get("database") or "Custom SQL Server"
-                        elif new_db_type == 'sheets':
-                            db_name_to_save = new_db_config.get("tab_name") or "Custom Sheet"
-                        elif new_db_type == 'MongoDB':
-                            # new_db_config.get("database") directly, same
-                            # as Redshift's/SQL Server's branches above -
-                            # database is now a real structured field, not
-                            # something regex-scraped out of a packed
-                            # url/identity string (see backends/
-                            # mongodb_sql.py's and this module's
-                            # docstrings). new_db_type is already the
-                            # canonical "MongoDB" here (not lowercased) -
-                            # see _parse_incoming_connection's mongodb
-                            # branch, which is where this value came from.
-                            db_name_to_save = new_db_config.get("database") or "Custom MongoDB"
-                        else:
-                            try:
-                                parsed = urlparse(new_db_url)
-                                dbname = parsed.path.lstrip('/')
-                                if '?' in dbname:
-                                    dbname = dbname.split('?')[0]
-                                db_name_to_save = dbname or "Custom"
-                            except Exception:
-                                db_name_to_save = "Custom"
-
-                # "" (not None) whenever no connection was actually
-                # identified this request, so set_session leaves is_custom
-                # true but with a blank connection_id rather than pinning a
-                # stale one.
-                active_connection_key = (
-                    compute_connection_key(db_name_to_save, new_db_url, _credential_for_key(new_db_config))
-                    if new_db_url else ""
-                )
 
                 state_store.set_session(
                     user_identity, connection_id=active_connection_key, is_custom=True,

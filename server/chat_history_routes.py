@@ -48,7 +48,7 @@ def _resolve_bucket_display(bucket_key, preset_by_id, custom_by_key):
     deleted. Still returned (not dropped) - the whole point of this modal
     is letting old, otherwise-invisible turns actually get cleared out."""
     if bucket_key == 'all':
-        return {'kind': 'all', 'name': 'All databases (combined)', 'type': None, 'available': True}
+        return {'kind': 'all', 'name': 'All Pre-Configured Datasets (combined)', 'type': None, 'available': True}
     if bucket_key.startswith('preset:'):
         preset = preset_by_id.get(bucket_key[len('preset:'):])
         return {

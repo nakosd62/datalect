@@ -282,7 +282,7 @@ def test_summary_includes_the_all_databases_bucket_with_a_special_label(client):
         'bucket_key': 'all',
         'turn_count': 5,
         'kind': 'all',
-        'name': 'All databases (combined)',
+        'name': 'All Pre-Configured Datasets (combined)',
         'type': None,
         'available': True,
     }]
