@@ -1,8 +1,8 @@
 // tests/e2e/playwright.config.js
 //
 // E2E suite for yDyL's web client. Runs against a REAL Flask server (real
-// SqliteStateStore, real /api/config, /api/history, session handling) - the
-// only things mocked are /api/translate, /api/execute, and /api/ping,
+// SqliteStateStore, real /api/config, /api/chat-history, session handling) -
+// the only things mocked are /api/translate, /api/execute, and /api/ping,
 // intercepted in-browser via page.route() in each spec (or by fixtures.js's
 // default mocks), so no real Gemini/BigQuery/Postgres credentials are ever
 // needed to run this suite.

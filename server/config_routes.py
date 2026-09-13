@@ -1810,8 +1810,7 @@ def handle_config():
     # visitor already has their own fully isolated "anonymous:<session_id>"
     # identity at the state_store layer (see ANONYMOUS_USER_ID_PREFIX in
     # auth.py) - there's deliberately no is_authenticated gate here
-    # anymore, mirroring history_routes.py's reasoning for translation
-    # history: it would only be rejecting someone from seeing their own
+    # anymore: it would only be rejecting someone from seeing their own
     # already-isolated custom connections.
     custom_databases = state_store.get_db_connections(user_identity)  # credentials stripped
     # Must be whichever saved custom connection is actually active, not

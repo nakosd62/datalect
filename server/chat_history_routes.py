@@ -7,20 +7,25 @@ the multi-turn context sent to /api/translate, and the rendered result
 tabs/summaries - so it survives a page reload or a server restart instead
 of starting over empty every time.
 
-Deliberately a separate module/blueprint from history_routes.py: that one
-owns /api/history, the "translations" AUDIT LOG (one row per NL->SQL call).
-That log is still written to on every translation and still fully queryable
-via /api/history and /api/history/purge - it's just no longer surfaced by
-the History modal's UI, which now shows THIS module's data instead (one row per
-database with saved turns, via GET /api/chat-history/summary below, with a
-per-database or delete-all control that's really just save_chat_bucket()
-with an empty turns list - see /api/chat-history/save's own docstring).
-Unrelated data, a different shape, no purge button in common - this
-module's data is the conversation itself.
+Deliberately a separate concern from the "translations" table/collection
+(one row per NL->SQL call, written by db.py's record_translation() on every
+translation - see translate_routes.py's call site). That's a write-only
+audit trail now: it used to have its own read/purge HTTP endpoints
+(/api/history, /api/history/purge) backing a History-modal Statistics tab,
+but both the endpoints and that tab were removed as dead code once the
+History modal was redesigned to show THIS module's data instead (one row
+per database with saved turns, via GET /api/chat-history/summary below,
+with a per-database or delete-all control that's really just
+save_chat_bucket() with an empty turns list - see /api/chat-history/save's
+own docstring). Unrelated data, a different shape, no purge button in
+common - this module's data is the conversation itself. The translations
+table/collection is still written to (state_store.py's record_translation)
+for aggregate usage/cost visibility (e.g. via export_state.py), just with
+no in-app way to read or purge it anymore.
 
-Every route here resolves user_identity exactly like history_routes.py's
-own routes: session_id first (so an anonymous identity is scoped to THIS
-browser session, not a freshly-derived one - see auth.py's
+Every route here resolves user_identity the same way every other route in
+this app does: session_id first (so an anonymous identity is scoped to
+THIS browser session, not a freshly-derived one - see auth.py's
 get_current_user_identity docstring), then get_current_user_identity(session_id),
 then re-applies the session cookie on the way out so a first-time
 anonymous visitor's session_id is preserved consistently across every

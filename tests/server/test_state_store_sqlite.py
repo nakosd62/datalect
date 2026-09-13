@@ -13,7 +13,6 @@ from helpers import SERVER_DIR
 if SERVER_DIR not in sys.path:
     sys.path.insert(0, SERVER_DIR)
 
-import state_store
 from state_store import SqliteStateStore, compute_connection_key
 
 
@@ -489,116 +488,49 @@ def test_compute_connection_key_deterministic():
     assert compute_connection_key("A", "url1", "cred1") == compute_connection_key("A", "url1", "cred1")
 
 
-# --- translations / history -----------------------------------------------------
+# --- translations (write-only NL->SQL audit log; see record_translation's
+# own docstring in state_store.py - there's deliberately no read/purge
+# coverage here anymore: get_translation_history()/purge_translation_history()
+# and the /api/history[/purge] endpoints they backed were removed as dead
+# code once the History modal stopped surfacing them - see
+# chat_history_routes.py's module docstring for where that modal's data
+# comes from today. record_translation() itself is still live (called on
+# every translation, e.g. for aggregate usage/cost visibility via
+# export_state.py), so it still gets a smoke test below, verified via a
+# raw query the same way test_translation_history_naming.py already does.) -
 
-def test_record_and_fetch_translation_history(tmp_path):
+def test_record_translation_inserts_a_row(tmp_path):
     store = make_store(tmp_path)
     store.record_translation(
         "alice", "postgres", "My DB", "show users", "SELECT * FROM users;",
         "gemini-2.5-flash", 120, 10, 5, 15, 0, 0,
     )
-    rows, stats, total_count = store.get_translation_history("alice")
-    assert total_count == 1
-    assert rows[0]["nl_prompt"] == "show users"
-    assert rows[0]["sql_command"] == "SELECT * FROM users;"
-    assert len(stats) == 1
-    assert stats[0]["total_translations"] == 1
-    assert stats[0]["sum_total_tokens"] == 15
+    with sqlite3.connect(str(tmp_path / "state.db")) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM translations WHERE user_id = ?", ("alice",)
+        ).fetchone()
+    assert row is not None
+    assert row["nl_prompt"] == "show users"
+    assert row["sql_command"] == "SELECT * FROM users;"
+    assert row["database_name"] == "My DB"
+    assert row["total_tokens"] == 15
 
 
-def test_translation_history_isolated_per_user(tmp_path):
+def test_translations_are_recorded_independently_per_user(tmp_path):
     store = make_store(tmp_path)
     store.record_translation("alice", "postgres", "DB", "p1", "SELECT 1;", "m", 1, 1, 1, 2, 0, 0)
     store.record_translation("bob", "postgres", "DB", "p2", "SELECT 2;", "m", 1, 1, 1, 2, 0, 0)
-    _, _, alice_count = store.get_translation_history("alice")
-    _, _, bob_count = store.get_translation_history("bob")
+    with sqlite3.connect(str(tmp_path / "state.db")) as conn:
+        conn.row_factory = sqlite3.Row
+        alice_count = conn.execute(
+            "SELECT COUNT(*) as c FROM translations WHERE user_id = ?", ("alice",)
+        ).fetchone()["c"]
+        bob_count = conn.execute(
+            "SELECT COUNT(*) as c FROM translations WHERE user_id = ?", ("bob",)
+        ).fetchone()["c"]
     assert alice_count == 1
     assert bob_count == 1
-
-
-def test_purge_translation_history_deletes_all_rows_for_user(tmp_path):
-    store = make_store(tmp_path)
-    store.record_translation("alice", "postgres", "DB", "p1", "SELECT 1;", "m", 1, 1, 1, 2, 0, 0)
-    store.record_translation("alice", "postgres", "DB", "p2", "SELECT 2;", "m", 1, 1, 1, 2, 0, 0)
-    store.purge_translation_history("alice")
-    _, _, total_count = store.get_translation_history("alice")
-    assert total_count == 0
-
-
-def test_purge_translation_history_does_not_affect_other_users(tmp_path):
-    store = make_store(tmp_path)
-    store.record_translation("alice", "postgres", "DB", "p1", "SELECT 1;", "m", 1, 1, 1, 2, 0, 0)
-    store.record_translation("bob", "postgres", "DB", "p2", "SELECT 2;", "m", 1, 1, 1, 2, 0, 0)
-    store.purge_translation_history("alice")
-    _, _, bob_count = store.get_translation_history("bob")
-    assert bob_count == 1
-
-
-# --- translation history list cap (TRANSLATION_HISTORY_LIST_LIMIT) -------------
-# record_translation()'s created_at defaults to CURRENT_TIMESTAMP (second
-# granularity), so a tight loop of record_translation() calls can't be
-# trusted to produce distinct, orderable timestamps within a single test.
-# These tests instead insert rows directly with explicit, controlled
-# created_at values - same "build the row by hand" approach the legacy-
-# schema migration tests above already use for a different reason.
-
-def _insert_translation_row(db_path, user_id, nl_prompt, created_at):
-    conn = sqlite3.connect(str(db_path))
-    conn.execute(
-        "INSERT INTO translations "
-        "(user_id, database_type, database_name, nl_prompt, sql_command, model, "
-        " duration, input_tokens, output_tokens, total_tokens, thinking_tokens, "
-        " cached_content_tokens, created_at) "
-        "VALUES (?, 'postgres', 'DB', ?, 'SELECT 1;', 'm', 1, 1, 1, 2, 0, 0, ?)",
-        (user_id, nl_prompt, created_at),
-    )
-    conn.commit()
-    conn.close()
-
-
-def test_get_translation_history_defaults_to_50_row_limit(tmp_path):
-    store = make_store(tmp_path)
-    db_path = tmp_path / "state.db"
-    for i in range(60):
-        _insert_translation_row(db_path, "alice", f"p{i}", f"2024-01-01 00:{i:02d}:00")
-    rows, stats, total_count = store.get_translation_history("alice")
-    assert total_count == 60  # uncapped
-    assert len(rows) == 50  # capped
-    assert sum(s["total_translations"] for s in stats) == 60  # stats: complete history
-
-
-def test_get_translation_history_list_is_sorted_newest_first(tmp_path):
-    store = make_store(tmp_path)
-    db_path = tmp_path / "state.db"
-    _insert_translation_row(db_path, "alice", "oldest", "2024-01-01 00:00:00")
-    _insert_translation_row(db_path, "alice", "middle", "2024-01-02 00:00:00")
-    _insert_translation_row(db_path, "alice", "newest", "2024-01-03 00:00:00")
-    rows, _, _ = store.get_translation_history("alice")
-    assert [r["nl_prompt"] for r in rows] == ["newest", "middle", "oldest"]
-
-
-def test_get_translation_history_limit_is_configurable_via_env_var(tmp_path, monkeypatch):
-    # Patches the SAME module object SqliteStateStore's globals resolve
-    # TRANSLATION_HISTORY_LIST_LIMIT from - this file's own top-level
-    # `import state_store` (not one done here, function-local) - since
-    # other test files' app_factory/fresh_import calls swap sys.modules
-    # entries for "state_store" during the test-execution phase, well
-    # after this file's collection-time imports already bound both names
-    # to the one original module. A function-local `import state_store`
-    # here would risk fetching whatever the CURRENT sys.modules entry is
-    # by the time this test runs (possibly a different, later-reloaded
-    # module object than the one SqliteStateStore itself was defined in),
-    # silently patching a module the code under test never reads from.
-    monkeypatch.setattr(state_store, "TRANSLATION_HISTORY_LIST_LIMIT", 3)
-    store = make_store(tmp_path)
-    db_path = tmp_path / "state.db"
-    for i in range(10):
-        _insert_translation_row(db_path, "alice", f"p{i}", f"2024-01-01 00:{i:02d}:00")
-    rows, stats, total_count = store.get_translation_history("alice")
-    assert total_count == 10  # uncapped
-    assert len(rows) == 3  # capped to the overridden limit
-    assert [r["nl_prompt"] for r in rows] == ["p9", "p8", "p7"]  # still newest-first
-    assert sum(s["total_translations"] for s in stats) == 10  # stats: complete history
 
 
 # --- chat_history (persisted conversation buckets, client.js's

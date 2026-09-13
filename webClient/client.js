@@ -1120,6 +1120,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (sqlEditor) {
       sqlEditor.setOption('theme', normalized === 'light' ? 'eclipse' : 'dracula');
     }
+    // Chart.js reads plain CSS custom property VALUES at construction time
+    // (see getChartSeriesColors()/getChartAxisColors() below) rather than
+    // living CSS variables it can react to on its own - an already-drawn
+    // chart would otherwise keep the OLD theme's colors until the user
+    // switched tabs. rerenderActiveResultChartIfShowing (defined further
+    // down, in the charting section) is a no-op whenever the active tab
+    // isn't actually showing a chart right now.
+    rerenderActiveResultChartIfShowing();
   }
 
   // DOM Elements - Primary Controls
@@ -1325,6 +1333,14 @@ document.addEventListener('DOMContentLoaded', async () => {
   const resultsTabsNav = document.getElementById('resultsTabsNav');
   const resultsHeader = document.getElementById('resultsHeader');
   const resultsBody = document.getElementById('resultsBody');
+  // Table/Chart toggle + Chart.js canvas (see renderTableResult()'s own
+  // charting branch, near the bottom of section 8, and renderResultChart()
+  // just above it) - single-connection mode only, see this feature's own
+  // section comment above requestSingleModeResultsSummary().
+  const resultsViewToggle = document.getElementById('resultsViewToggle');
+  const resultsTableWrapper = document.getElementById('resultsTableWrapper');
+  const resultsChartWrapper = document.getElementById('resultsChartWrapper');
+  const resultsChartCanvas = document.getElementById('resultsChartCanvas');
 
   // DOM Elements - Report Error / Report Wrong Result (see
   // setReportContext()/reportButtonHtml() and openReportIssueModal()
@@ -2026,6 +2042,20 @@ document.addEventListener('DOMContentLoaded', async () => {
     currentResultsList = [];
     activeResultIndex = 0;
     setReportContext(null);
+    // Charting (see renderTableResult()'s own identical reset, and
+    // destroyResultsChart()/resultsViewToggle/resultsChartWrapper further
+    // down) - this function bypasses renderTableResult() entirely (it
+    // hand-clears resultsHeader/resultsBody instead of calling
+    // renderTableResult(null)), so without this a chart left showing from
+    // the PREVIOUS turn would keep rendering - stale data, on top of a
+    // "cleared" results area - right up until the next renderTableResult()
+    // call for whatever this new turn produces. Every call site of this
+    // function (translatePrompt() at the start of a new turn included) is
+    // exactly the moment a stale chart must not linger.
+    if (resultsViewToggle) resultsViewToggle.classList.add('hidden');
+    if (resultsChartWrapper) resultsChartWrapper.classList.add('hidden');
+    if (resultsTableWrapper) resultsTableWrapper.classList.remove('hidden');
+    destroyResultsChart();
   }
 
   // Shown at the top of the results area (above the tabs/table, see
@@ -5011,10 +5041,12 @@ document.addEventListener('DOMContentLoaded', async () => {
   // 7. HISTORY MODAL: see loadChatHistorySummary()/renderChatHistoryBucketList()/
   //    the per-row and #deleteAllChatHistoryBtn handlers further down -
   //    this used to be tab-switching + Chart.js setup for the "translations"
-  //    audit log's own stats view, removed along with that view (see
-  //    chat_history_routes.py's module docstring for where that log went:
-  //    nowhere - it's still recorded and still queryable via /api/history,
-  //    just no longer shown here).
+  //    audit log's own stats view. That view (and the /api/history +
+  //    /api/history/purge endpoints behind it) has since been removed as
+  //    dead code - see chat_history_routes.py's module docstring. The
+  //    translations log itself is still recorded server-side (write-only,
+  //    for aggregate usage/cost visibility), just with no UI or endpoint
+  //    surfacing it anymore.
   // ===========================================================================
 
   function showConfirmDialog(message) {
@@ -5460,6 +5492,11 @@ document.addEventListener('DOMContentLoaded', async () => {
         const direction = summaryFeedbackTrigger.dataset.summaryFeedbackTrigger;
         openReportIssueModal({ category: direction === 'up' ? 'summary_thumbs_up' : 'summary_thumbs_down' });
       }
+      // The Summary tab's "View as chart" callout (see
+      // summaryChartCalloutHtml()/jumpToChartableResultTab()) - same
+      // delegated-listener reasoning as the two triggers above.
+      const viewChartTrigger = e.target.closest('[data-view-chart-trigger]');
+      if (viewChartTrigger) jumpToChartableResultTab();
     });
   }
   // The header's "Send Feedback" button - a persistent element (unlike the
@@ -5913,6 +5950,18 @@ document.addEventListener('DOMContentLoaded', async () => {
     // is ever rendered for it.
     setReportContext(null);
 
+    // Same "reset first, let only the one branch that needs it turn it back
+    // on" posture as setReportContext(null) just above - only the
+    // successful, non-empty tabular branch at the very bottom of this
+    // function ever shows the toggle/chart at all (see this feature's own
+    // section comment above requestSingleModeResultsSummary()), so every
+    // other branch (isPending/isText/isError/no-dataset/0-rows) simply
+    // inherits this hidden-table-wrapper-visible, chart-destroyed default.
+    if (resultsViewToggle) resultsViewToggle.classList.add('hidden');
+    if (resultsChartWrapper) resultsChartWrapper.classList.add('hidden');
+    if (resultsTableWrapper) resultsTableWrapper.classList.remove('hidden');
+    destroyResultsChart();
+
     // "All databases" mode's live-streaming placeholder tab (see
     // startAllModeStreaming()) - stands in for one selected connection
     // from the moment triage picks it until either its own generation
@@ -5993,6 +6042,20 @@ document.addEventListener('DOMContentLoaded', async () => {
       // Summary tab (prependSingleModeSummaryTab) is only ever created
       // already fully formed, so it never sets this flag at all -
       // `undefined` is falsy, so it's unaffected by this gate.
+      // The chart-discoverability callout (see summaryChartCalloutHtml()'s
+      // own docstring) - rendered whenever THIS turn has a chartable tab
+      // somewhere, primary action first (directly under the summary text,
+      // before the secondary thumbs-up/down feedback row), same reasoning
+      // as the ordering of every other action in this tab. Gated on
+      // `!result.summaryPending` for the same reason as the feedback row
+      // above: "all databases" mode's Summary tab can render before Phase
+      // C - and therefore before any tab's own visualization - has
+      // actually arrived.
+      if (result.tabLabel === 'Summary' && !result.summaryPending
+        && currentResultsList && currentResultsList.some((r) => r && r.visualization)) {
+        td.insertAdjacentHTML('beforeend', summaryChartCalloutHtml());
+      }
+
       if (result.tabLabel === 'Summary' && !result.summaryPending) {
         td.insertAdjacentHTML('beforeend', summaryFeedbackButtonsHtml());
       }
@@ -6153,6 +6216,29 @@ document.addEventListener('DOMContentLoaded', async () => {
         content: (hasNotices ? result.notices.join('\n') + '\n\n' : '') + summarizeTabularResultForReport(result),
       });
       resultsBody.insertAdjacentHTML('beforeend', reportButtonRowHtml('wrong_result', result.columns.length));
+
+      // Table/Chart toggle (see this feature's own section comment above
+      // requestSingleModeResultsSummary()) - only ever appears for the one
+      // result this turn's LLM call decided (and the server re-validated)
+      // was chartable; every other successful result reaches this same
+      // branch with `result.visualization` simply absent, and stays a
+      // plain table, exactly as before this feature existed.
+      if (result.visualization && resultsViewToggle && resultsChartWrapper && resultsTableWrapper && typeof Chart !== 'undefined') {
+        resultsViewToggle.classList.remove('hidden');
+        // Defaults to the chart view the LLM itself decided on - `false`
+        // is the only way to land on the table instead, set exclusively by
+        // the user's own toggle click (see setActiveResultChartView) and
+        // never by anything server-side.
+        const showChart = result.chartView !== false;
+        resultsViewToggle.querySelectorAll('.results-view-toggle-btn').forEach((btn) => {
+          btn.classList.toggle('active', (btn.dataset.view === 'chart') === showChart);
+        });
+        if (showChart) {
+          resultsTableWrapper.classList.add('hidden');
+          resultsChartWrapper.classList.remove('hidden');
+          renderResultChart(result);
+        }
+      }
     } else {
       resultsBody.innerHTML = `<tr><td colspan="${result.columns ? result.columns.length : 1}" class="text-center text-muted py-8">0 rows returned.</td></tr>`;
       setReportContext({
@@ -6180,7 +6266,13 @@ document.addEventListener('DOMContentLoaded', async () => {
       const isError = !!res.isError;
       const isText = !!res.isText;
       const isPending = !!res.isPending;
-      btn.className = `result-tab-btn ${idx === activeResultIndex ? 'active' : ''} ${isError ? 'result-tab-btn--error' : ''} ${isPending ? 'result-tab-btn--pending' : ''}`.trim();
+      // Chart discoverability (see summaryChartCalloutHtml()'s own
+      // docstring above): a subtle, persistent tag on whichever tab
+      // actually carries a validated visualization, so a user who never
+      // clicks the Summary tab's callout - or comes back to this turn
+      // later - can still tell at a glance from the tab strip alone.
+      const isChartable = !!res.visualization;
+      btn.className = `result-tab-btn ${idx === activeResultIndex ? 'active' : ''} ${isError ? 'result-tab-btn--error' : ''} ${isPending ? 'result-tab-btn--pending' : ''} ${isChartable ? 'result-tab-btn--chartable' : ''}`.trim();
 
       const sqlText = res.query || res.sql || res.statement || '';
       // Multi-database question-answering: a result tagged with which
@@ -6217,7 +6309,11 @@ document.addEventListener('DOMContentLoaded', async () => {
       } else {
         const count = res.rowCount !== undefined ? res.rowCount : (res.rows ? res.rows.length : 0);
         const rowLabel = count === 1 ? '1 row' : `${count} rows`;
-        btn.textContent = `${dbLabel}Query ${idx + 1} (${rowLabel})`;
+        // The chart badge is appended to the label text itself (not just
+        // the `.result-tab-btn--chartable` color class) so it survives
+        // being read as plain text (title attribute, screen readers,
+        // narrow layouts that might otherwise strip a background tint).
+        btn.textContent = `${dbLabel}Query ${idx + 1} (${rowLabel})${isChartable ? ' 📊' : ''}`;
       }
 
       btn.addEventListener('click', () => {
@@ -6790,6 +6886,331 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
+  // --- Charting: rendering a single-connection result as a Chart.js chart ---
+  //
+  // Single-connection mode's own post-execution summarization call (below)
+  // now rides along a "visualization" decision from the same LLM call -
+  // see translate_routes.py's _SINGLE_SUMMARY_SYSTEM_INSTRUCTION and
+  // _clean_visualization for the server-side design/validation. By the
+  // time a `{chart_type, x_column, y_columns, series_column}` object
+  // reaches this file, it has ALREADY been validated against the real
+  // executed result set server-side (real columns, real numeric values) -
+  // this section trusts it at face value the same way client.js already
+  // trusts any other server response shape, rather than re-validating it a
+  // second time.
+  //
+  // Scope (matches the feature's own agreed v1 scope): single-connection
+  // mode only. "All databases" mode's own Summary/Note/per-database tabs
+  // (renderAllModeCombinedResults et al.) never carry a `.visualization`
+  // field at all - summarize_all_mode_results (Phase C) doesn't compute
+  // one - so nothing here needs an explicit guard against showing a chart
+  // there; it simply never has anything to show.
+
+  // In-flight Chart.js instance for whichever tab is currently showing a
+  // chart - at most one at a time, since only the active tab is ever
+  // rendered. Chart.js requires destroy()ing an old instance before
+  // building a new one on the same <canvas>, or the two silently overlap.
+  let resultsChartInstance = null;
+
+  const CHART_MAX_SERIES = 12; // sane cap on `series_column` grouping - see buildResultsChartConfig()'s own comment.
+
+  // Chart.js reads plain color VALUES at construction time, not live CSS
+  // variables - it can't react to a theme switch on its own the way CSS
+  // itself does (see setTheme()'s own call to rerenderActiveResultChartIfShowing()
+  // above). Reading the app's own custom properties here (rather than a
+  // separate hardcoded palette) keeps a chart's colors in lockstep with
+  // whichever theme is currently active, light or dark, without this file
+  // needing its own copy of either palette.
+  function cssVar(name, fallback) {
+    const value = getComputedStyle(document.documentElement).getPropertyValue(name);
+    return (value && value.trim()) || fallback;
+  }
+
+  function getChartSeriesColors() {
+    // --primary/--secondary/--accent-cyan/--warning/--danger plus each
+    // color's own --*-hover shade - eight distinct hues before any repeat,
+    // which comfortably covers CHART_MAX_SERIES without the same color
+    // appearing twice in a typical chart.
+    return [
+      cssVar('--primary', '#10b981'), cssVar('--secondary', '#6366f1'), cssVar('--accent-cyan', '#38bdf8'),
+      cssVar('--warning', '#f59e0b'), cssVar('--danger', '#f87171'), cssVar('--primary-hover', '#34d399'),
+      cssVar('--secondary-hover', '#818cf8'),
+    ];
+  }
+
+  function getChartAxisColors() {
+    return { text: cssVar('--text-secondary', '#94a3b8'), grid: cssVar('--surface-3', 'rgba(148, 163, 184, 0.25)') };
+  }
+
+  // Removes duplicates from `values` while keeping first-seen order (unlike
+  // a plain Set/sort, which would either lose order or impose one the data
+  // never had) - used to build a chart's x-axis categories and its list of
+  // series values, both of which should read in the same order the actual
+  // rows came back in.
+  function uniqueValuesInOrder(values) {
+    const seen = new Set();
+    const result = [];
+    values.forEach((v) => {
+      const key = typeof v === 'object' ? JSON.stringify(v) : v;
+      if (!seen.has(key)) {
+        seen.add(key);
+        result.push(v);
+      }
+    });
+    return result;
+  }
+
+  // Builds a Chart.js config object ({type, data, options}) from one
+  // executed result's real rows plus its validated `visualization`
+  // decision. `chart_type` is always one of "bar"/"line"/"scatter" by this
+  // point (_clean_visualization never lets anything else through).
+  //
+  // series_column (optional): when present, rows are grouped by that
+  // column's value into one dataset per group instead of one flat dataset
+  // per y_column - e.g. "sales over time, one line per region". Capped at
+  // CHART_MAX_SERIES distinct values (an adversarial or just very
+  // high-cardinality grouping column would otherwise produce an
+  // unreadable/unusably slow chart) - extra series beyond the cap are
+  // silently dropped rather than erroring, same "degrade gracefully"
+  // posture the rest of this feature already takes toward imperfect LLM
+  // output.
+  function buildResultsChartConfig(result, viz) {
+    const rows = result.rows || [];
+    const colors = getChartSeriesColors();
+    const axisColors = getChartAxisColors();
+    let colorIndex = 0;
+    const nextColor = () => colors[(colorIndex++) % colors.length];
+
+    const seriesValues = viz.series_column
+      ? uniqueValuesInOrder(rows.map((r) => r[viz.series_column])).slice(0, CHART_MAX_SERIES)
+      : [undefined];
+    const multiSeries = seriesValues.length > 1;
+    const multiY = viz.y_columns.length > 1;
+    const seriesLabel = (yCol, seriesVal) => {
+      if (multiSeries && multiY) return `${yCol} (${seriesVal})`;
+      if (multiSeries) return String(seriesVal);
+      return yCol;
+    };
+
+    const commonOptions = {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: false, // instant redraw on tab switch/theme toggle instead of a distracting re-animate
+      plugins: { legend: { display: multiSeries || multiY, labels: { color: axisColors.text } } },
+    };
+
+    if (viz.chart_type === 'scatter') {
+      // Scatter plots pairs of real numeric values directly - no shared
+      // x-axis category list to pivot onto, unlike bar/line below - so
+      // each series is just that group's own rows mapped to {x, y} points.
+      const datasets = [];
+      seriesValues.forEach((seriesVal) => {
+        const seriesRows = viz.series_column ? rows.filter((r) => r[viz.series_column] === seriesVal) : rows;
+        viz.y_columns.forEach((yCol) => {
+          const points = seriesRows
+            .map((r) => ({ x: r[viz.x_column], y: r[yCol] }))
+            .filter((p) => typeof p.x === 'number' && typeof p.y === 'number');
+          const color = nextColor();
+          datasets.push({ label: seriesLabel(yCol, seriesVal), data: points, backgroundColor: color, borderColor: color });
+        });
+      });
+      return {
+        type: 'scatter',
+        data: { datasets },
+        options: {
+          ...commonOptions,
+          scales: {
+            x: { title: { display: true, text: viz.x_column, color: axisColors.text }, ticks: { color: axisColors.text }, grid: { color: axisColors.grid } },
+            y: { ticks: { color: axisColors.text }, grid: { color: axisColors.grid } },
+          },
+        },
+      };
+    }
+
+    // bar/line: a shared, deduped x-axis of category labels, with each
+    // dataset's values looked up per label (a row missing from a given
+    // series/label combination - e.g. a region with no data for one day -
+    // becomes a `null` point, which Chart.js simply skips/gaps over via
+    // spanGaps rather than plotting as a false zero).
+    const xLabels = uniqueValuesInOrder(rows.map((r) => r[viz.x_column]));
+    const lookup = new Map();
+    rows.forEach((r) => {
+      lookup.set(`${r[viz.x_column]}␟${viz.series_column ? r[viz.series_column] : ''}`, r);
+    });
+    const datasets = [];
+    seriesValues.forEach((seriesVal) => {
+      viz.y_columns.forEach((yCol) => {
+        const data = xLabels.map((x) => {
+          const row = lookup.get(`${x}␟${viz.series_column ? seriesVal : ''}`);
+          const value = row ? row[yCol] : null;
+          return typeof value === 'number' ? value : null;
+        });
+        const color = nextColor();
+        datasets.push(
+          viz.chart_type === 'line'
+            ? { label: seriesLabel(yCol, seriesVal), data, borderColor: color, backgroundColor: color, tension: 0.15, spanGaps: true }
+            : { label: seriesLabel(yCol, seriesVal), data, backgroundColor: color }
+        );
+      });
+    });
+    return {
+      type: viz.chart_type,
+      data: { labels: xLabels, datasets },
+      options: {
+        ...commonOptions,
+        scales: {
+          x: { ticks: { color: axisColors.text }, grid: { color: axisColors.grid } },
+          y: { ticks: { color: axisColors.text }, grid: { color: axisColors.grid }, beginAtZero: true },
+        },
+      },
+    };
+  }
+
+  function destroyResultsChart() {
+    if (resultsChartInstance) {
+      resultsChartInstance.destroy();
+      resultsChartInstance = null;
+    }
+  }
+
+  // Draws `result.visualization` onto #resultsChartCanvas. Safe to call
+  // only when both the canvas element and the Chart.js library itself are
+  // actually available - see renderTableResult()'s own guard, which is the
+  // only call site (plus rerenderActiveResultChartIfShowing() below, for a
+  // theme switch).
+  function renderResultChart(result) {
+    if (!resultsChartCanvas || typeof Chart === 'undefined' || !result || !result.visualization) return;
+    destroyResultsChart();
+    const config = buildResultsChartConfig(result, result.visualization);
+    resultsChartInstance = new Chart(resultsChartCanvas.getContext('2d'), config);
+  }
+
+  // Re-draws the currently active tab's chart in place (new colors only,
+  // same data) - a no-op whenever the active tab either has no
+  // visualization at all or is currently showing its Table view instead.
+  // Called from setTheme() so a live theme switch doesn't leave an
+  // already-open chart showing the OLD theme's colors until the user
+  // switches tabs and back.
+  function rerenderActiveResultChartIfShowing() {
+    const result = currentResultsList && currentResultsList[activeResultIndex];
+    if (result && result.visualization && result.chartView !== false) {
+      renderResultChart(result);
+    }
+  }
+
+  // Finds, among `list`, the one result entry that visualization's own
+  // x_column/y_columns actually belong to, and tags it with `.visualization` -
+  // mirrors _pick_chartable_result/_clean_visualization's own server-side
+  // matching (there is, by construction, at most one such entry: the
+  // single chartable result _pick_chartable_result identified for this
+  // turn - see translate_routes.py's own docstring on that function).
+  // No-op when `visualization` is null (nothing to attach) or `list` isn't
+  // an array (e.g. a bare {error} entry list, which never has `.columns`
+  // to match against anyway - this would already no-op via `.find`
+  // finding nothing, this guard just skips the work).
+  //
+  // Called on BOTH the live, on-screen currentResultsList entries AND the
+  // separate `summarizedResults` copy executeSql() persists onto the turn
+  // (see summarizeResultForHistory()) - two different sets of objects
+  // built from the same underlying rows, so the same visualization object
+  // is attached to each independently, by each call's own caller.
+  function attachVisualizationToResultsList(list, visualization) {
+    if (!visualization || !Array.isArray(list)) return;
+    const needed = [visualization.x_column, ...visualization.y_columns];
+    const match = list.find((r) => r && Array.isArray(r.columns) && needed.every((c) => r.columns.includes(c)));
+    if (match) match.visualization = visualization;
+  }
+
+  // Keeps the CURRENT turn's own persisted copy (chatStore.lastTurn()'s
+  // modelEntry.results - a separate set of objects from currentResultsList,
+  // see attachVisualizationToResultsList's own comment) in sync with a
+  // live tab's chartView, so a choice survives stepping back and forward
+  // through history (chatStore's undo()/redo()) without needing a fresh
+  // execution to re-derive it. Matched by object identity: both copies
+  // were tagged with the exact same `visualization` object reference (see
+  // executeSql()'s own call sites), so this is exact, not a guess. Shared
+  // by setActiveResultChartView() (the manual toggle) and
+  // jumpToChartableResultTab() (the Summary tab's own callout) below,
+  // rather than duplicated between them.
+  function syncPersistedChartView(entry, showChart) {
+    const turn = chatStore.lastTurn();
+    const persistedResults = turn && turn.modelEntry && Array.isArray(turn.modelEntry.results)
+      ? turn.modelEntry.results : null;
+    if (persistedResults) {
+      const persistedMatch = persistedResults.find((r) => r && r.visualization === entry.visualization);
+      if (persistedMatch) persistedMatch.chartView = showChart;
+    }
+  }
+
+  // Toggles the currently active tab between its Table and Chart views (see
+  // renderTableResult()'s own toggle-button rendering, which wires this up
+  // once at load - the buttons themselves are static markup, not
+  // rebuilt per-render, unlike the tabs strip). No-op if the active
+  // result has no visualization at all - the toggle row is hidden in that
+  // case anyway, so this should never actually fire then.
+  function setActiveResultChartView(showChart) {
+    const result = currentResultsList && currentResultsList[activeResultIndex];
+    if (!result || !result.visualization) return;
+    result.chartView = showChart;
+    syncPersistedChartView(result, showChart);
+    renderTableResult(result);
+  }
+
+  if (resultsViewToggle) {
+    resultsViewToggle.querySelectorAll('.results-view-toggle-btn').forEach((btn) => {
+      btn.addEventListener('click', () => setActiveResultChartView(btn.dataset.view === 'chart'));
+    });
+  }
+
+  // --- Chart discoverability: Summary tab callout + tab-strip badge ---
+  //
+  // The Summary tab becomes the active tab the instant it's created (see
+  // prependSingleModeSummaryTab()) - the model's own answer is the first
+  // thing shown. That's exactly the problem for charting: a chart sitting
+  // on some OTHER, now-inactive tab is otherwise invisible unless the user
+  // happens to click around the tab strip on their own. Two things fix
+  // that, together: buildResultsTabsNav() below tags that tab's own label
+  // with a small chart badge (persistently visible whenever the user DOES
+  // look at the tab strip), and summaryChartCalloutHtml()/
+  // jumpToChartableResultTab() here put an explicit, clickable nudge
+  // directly under the Summary text itself - exactly where the user's
+  // attention already is the moment it matters.
+
+  // Jumps straight to whichever result tab in the CURRENT turn carries a
+  // validated visualization, and makes sure it lands showing the chart
+  // itself (not whatever Table/Chart state was left over from an earlier
+  // visit) - that's the whole point of the click. No-op if nothing in
+  // currentResultsList is chartable (shouldn't happen - the callout that
+  // triggers this is only ever rendered when one exists - but a no-op is
+  // cheaper than assuming that invariant always holds).
+  function jumpToChartableResultTab() {
+    if (!currentResultsList) return;
+    const idx = currentResultsList.findIndex((r) => r && r.visualization);
+    if (idx < 0) return;
+    activeResultIndex = idx;
+    const entry = currentResultsList[idx];
+    entry.chartView = true;
+    syncPersistedChartView(entry, true);
+    buildResultsTabsNav();
+    renderTableResult(entry);
+  }
+
+  // Rendered directly under the Summary tab's own text (see
+  // renderTableResult()'s isText branch) whenever this turn's results
+  // include a chartable tab. data-view-chart-trigger is handled by the
+  // same delegated #resultsBody click listener as the Report/feedback
+  // buttons below, for the same "rebuilt fresh on every render, so a
+  // persistent per-element listener would never survive a re-render"
+  // reason.
+  function summaryChartCalloutHtml() {
+    return `
+      <div class="summary-chart-callout">
+        <button type="button" class="summary-chart-callout-btn" data-view-chart-trigger>
+          <span aria-hidden="true">📊</span> View as chart
+        </button>
+      </div>`;
+  }
+
   // --- Single-connection mode's own post-execution results summarization ---
   //
   // The single-connection equivalent of "all databases" mode's Phase C
@@ -6806,11 +7227,17 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Fire-and-await (see executeSql()'s call site - already inside an
   // async flow with buttons disabled). Best-effort, same posture as
   // requestAllModeResultsSummary: a failure here never fails the turn
-  // itself. Returns the SUMMARY_TAB_BLOCK_MARKER-prefixed summary text on
-  // success (server's own "*** NO SQL ***" convention stripped first -
-  // see stripNoSqlPrefix), the server's own honest error text (also
-  // marked, so it reads the same way a real summary would) on failure, or
-  // null when there's nothing to show (abort, or no usable response).
+  // itself. Returns `{summaryText, visualization}` on success - `summaryText`
+  // is the SUMMARY_TAB_BLOCK_MARKER-prefixed summary text (server's own
+  // "*** NO SQL ***" convention stripped first - see stripNoSqlPrefix), or
+  // the server's own honest error text (also marked, so it reads the same
+  // way a real summary would) on failure; `visualization` is the server's
+  // already-validated {chart_type, x_column, y_columns, series_column}
+  // decision (see translate_routes.py's _clean_visualization), or null
+  // when this result set wasn't chartable/the model chose a table. Returns
+  // bare `null` (not an object) when there's nothing to show at all
+  // (abort, or no usable response) - every call site already guards on
+  // truthiness before touching either field, so this asymmetry is safe.
   //
   // /api/summarize-result streams NDJSON the same way /api/summarize-
   // results does now (see that function's identical comment just above)
@@ -6830,9 +7257,12 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (evt.status === 'retrying') showRetryStatus(evt);
       });
       if (response.ok && data && data.success && data.summary) {
-        return SUMMARY_TAB_BLOCK_MARKER + stripNoSqlPrefix(data.summary);
+        return {
+          summaryText: SUMMARY_TAB_BLOCK_MARKER + stripNoSqlPrefix(data.summary),
+          visualization: data.visualization || null,
+        };
       } else if (data && data.error) {
-        return SUMMARY_TAB_BLOCK_MARKER + data.error;
+        return { summaryText: SUMMARY_TAB_BLOCK_MARKER + data.error, visualization: null };
       }
       return null;
     } catch (err) {
@@ -8056,6 +8486,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     // columns/rows/rowCount/error and ignores unknown keys, so this is
     // harmless for what actually reaches the LLM.
     if (result.database) summarized.database = result.database;
+    // Same idea, for charting (see attachVisualizationToResultsList's own
+    // docstring) - a defensive belt-and-suspenders copy for whichever call
+    // site happens to attach `.visualization` onto `result` BEFORE this
+    // function runs over it; every current call site also re-attaches it
+    // onto the summarized copy explicitly afterward regardless of this
+    // function's own timing, so this is never the only path that matters,
+    // just one more place it can't be silently lost. Also unknown/ignored
+    // server-side, same as `.database` above.
+    if (result.visualization) summarized.visualization = result.visualization;
+    if (result.chartView !== undefined) summarized.chartView = result.chartView;
     return summarized;
   }
 
@@ -8260,8 +8700,22 @@ document.addEventListener('DOMContentLoaded', async () => {
           let singleModeSummary = null;
           if (!allModeNotes && promptText !== "[Direct SQL Execution]" && Array.isArray(data.results) && data.results.length) {
             showAllModeSummarizingStatus();
-            singleModeSummary = await requestSingleModeResultsSummary(promptText, sql, data.results);
+            const summaryResult = await requestSingleModeResultsSummary(promptText, sql, data.results);
             hideAllModeStreamStatus();
+            if (summaryResult) {
+              singleModeSummary = summaryResult.summaryText;
+              // Tags whichever one of THIS turn's own result tabs the
+              // visualization actually belongs to - see
+              // attachVisualizationToResultsList's own docstring. Applied to
+              // both the live, on-screen entries (data.results - the same
+              // objects currentResultsList already points at, via
+              // renderMultiTurnResults(data.results) just above) and the
+              // separate summarizedResults copy below that actually gets
+              // persisted onto the turn, since the two are different
+              // objects built from the same underlying rows.
+              attachVisualizationToResultsList(data.results, summaryResult.visualization);
+              attachVisualizationToResultsList(summarizedResults, summaryResult.visualization);
+            }
             if (singleModeSummary) prependSingleModeSummaryTab(singleModeSummary);
           }
 
@@ -8436,10 +8890,25 @@ document.addEventListener('DOMContentLoaded', async () => {
           // Same "no real question to summarize against" guard the
           // success branch uses.
           let singleModeSummary = null;
+          let singleModeVisualization = null;
           if (promptText !== "[Direct SQL Execution]") {
             showAllModeSummarizingStatus();
-            singleModeSummary = await requestSingleModeResultsSummary(promptText, sql, statementResults);
+            const summaryResult = await requestSingleModeResultsSummary(promptText, sql, statementResults);
             hideAllModeStreamStatus();
+            if (summaryResult) {
+              singleModeSummary = summaryResult.summaryText;
+              singleModeVisualization = summaryResult.visualization;
+              // Tags whichever succeeded-before-the-failure statement this
+              // belongs to (the failed statement itself is never chartable -
+              // it's an {error} entry, with no `.columns` to match against)
+              // - see attachVisualizationToResultsList's own docstring.
+              // statementResults shares its succeeded entries' object
+              // references with currentResultsList (both were built from
+              // data.results by renderResultsWithFailedStatement just
+              // above), so this alone is enough to make the live tab
+              // chartable too, not just the persisted copy below.
+              attachVisualizationToResultsList(statementResults, singleModeVisualization);
+            }
             // Preserves the active tab (the just-rendered failure, which
             // is what needs the user's attention) rather than stealing
             // focus to the new Summary tab - see that helper's own
@@ -8457,6 +8926,10 @@ document.addEventListener('DOMContentLoaded', async () => {
           // turn). Mirrors the success branch's identical pending-entry-
           // vs-new-turn logic further up this same function.
           const summarizedResults = statementResults.map(summarizeResultForHistory);
+          // Separate objects from statementResults' own (see
+          // summarizeResultForHistory) - re-tag this copy too, same as the
+          // success branch does for its own summarizedResults.
+          attachVisualizationToResultsList(summarizedResults, singleModeVisualization);
           if (chatStore.getPending() && !chatStore.isPendingCurrent()) {
             chatStore.clearPending();
           }
@@ -8506,8 +8979,12 @@ document.addEventListener('DOMContentLoaded', async () => {
           let singleModeSummary = null;
           if (reportable && promptText !== "[Direct SQL Execution]") {
             showAllModeSummarizingStatus();
-            singleModeSummary = await requestSingleModeResultsSummary(promptText, sql, [{ error: errMsg }]);
+            // No `.columns` anywhere in a bare `[{error}]` result set, so
+            // this is never chartable - only `summaryText` is ever
+            // meaningful here, unlike the two branches above.
+            const summaryResult = await requestSingleModeResultsSummary(promptText, sql, [{ error: errMsg }]);
             hideAllModeStreamStatus();
+            if (summaryResult) singleModeSummary = summaryResult.summaryText;
             // Preserves the active (error) tab - see that helper's own
             // docstring for why this differs from the success path's
             // prependSingleModeSummaryTab.

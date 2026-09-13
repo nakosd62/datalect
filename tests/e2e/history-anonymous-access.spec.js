@@ -11,10 +11,11 @@
 // config-modal.spec.js / auth-clears-state.spec.js for the same real-
 // network-risk reasoning behind not standing up a real Cloud Run +
 // Firestore backend here) - this only exercises the client-side gating
-// this change removed. The actual /api/history request underneath is left
-// unmocked and hits the real local dev server, which - after this same
-// change on the backend side - now happily answers it too (see
-// tests/server/test_history_routes.py for that coverage).
+// this change removed. Opening the modal underneath hits the real local
+// dev server's GET /api/chat-history/summary (mocked to an empty default
+// by fixtures.js's `test` fixture, same as every other spec that doesn't
+// care about its contents) - the point here is just that the modal opens
+// at all for an anonymous visitor, not what it shows.
 
 const { test, expect, gotoApp } = require('./fixtures');
 

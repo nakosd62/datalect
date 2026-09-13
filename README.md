@@ -95,8 +95,7 @@ directly instead — see the system prompt in
 │   ├── config_routes.py       # /api/config — session DB + model selection
 │   ├── connection_router.py   # "All databases" mode's triage step (see Multi-database question answering)
 │   ├── translate_routes.py    # /api/translate — NL -> SQL across 3 LLM providers, API key selection/retry
-│   ├── execute_routes.py      # /api/execute, /api/cancel — run SQL, return results
-│   └── history_routes.py      # /api/history, /api/history/purge
+│   └── execute_routes.py      # /api/execute, /api/cancel — run SQL, return results
 └── webClient/                 # Static frontend, served by Flask (../webClient relative to server/)
     ├── index.html
     ├── client.js
@@ -537,8 +536,6 @@ assets require authentication when running on Cloud Run or when
 | `POST /api/translate` | Body: `{ prompt, history, database_url?, gemini_model?/claude_model?/openai_model?/model?, refresh_schema?, pinned_connections? }` — a model override always wins over the session's saved model-selection choice (see [Model selection UI](#model-selection-ui)). Returns `{ success, sql, *_tokens, duration }`, plus `connection_selection: [{kind, id, name}, ...]` in "all" mode (see [Multi-database question answering](#multi-database-question-answering)). |
 | `POST /api/execute` | Body: `{ sql, database_url?, pinned_connections? }` — runs one or more `;`-separated statements and returns per-statement results. A script with no `-- database: ...` marker runs against one connection exactly as before; a marker-tagged script (see [Multi-database question answering](#multi-database-question-answering)) dispatches each connection's statements independently and the response gains a `failures` list plus a `database` field per result when at least one connection's statements fail. Returns the **raw** Postgres error message on failure (intentionally — this is a SQL runner, the user needs the real error to fix their query). |
 | `POST /api/cancel` | Best-effort abandonment of whatever's currently in flight for this browser session (an `/api/translate` LLM call, or an `/api/execute` database call) — backs the header's **Cancel** button. Always returns `{ success: true, cancelled: <count> }`, even when nothing was registered (the work may have already finished on its own). See [`cancel_registry.py`](./server/cancel_registry.py) for the mechanism and its limits — it's a best-effort nudge (closing whatever connection/client the work is blocked on), not a guaranteed hard stop. |
-| `GET /api/history` | Returns recent translations plus per-day usage stats for the current identity — including anonymous Cloud Run visitors, whose history is isolated per browser session. |
-| `DELETE/POST /api/history/purge` | Deletes all translation history for the current identity (same per-session isolation for anonymous visitors as above). |
 | `POST /api/report-issue` | Body: `{ category: "error"\|"wrong_result", prompt?, sql?, database_name?, provider?, model?, content?, details? }` — emails a report to `ISSUE_REPORT_TO_EMAIL` (see [Issue reporting](#issue-reporting-report-error--report-wrong-result)). Returns `503` if the feature isn't configured, `400` for an invalid/missing `category`. |
 
 ---
@@ -566,12 +563,13 @@ Identity is resolved in this order (see `get_current_user_identity` in
    scoping, since it's a separate fallback (step 5, not step 4).
 
 Anonymous users can translate and execute SQL against the default/preset
-databases, and can view/purge their own translation history too — it's
-isolated per browser session (see `ANONYMOUS_USER_ID_PREFIX` above), so
-there's nothing to protect it from. The one thing still off-limits is
-saving a custom database connection, which needs a more durable identity
-than a transient anonymous session — `config_routes.py` explicitly checks
-`is_anonymous_user(...)` there and returns a friendly 403.
+databases, with the same per-session isolation (see
+`ANONYMOUS_USER_ID_PREFIX` above) as any other identity gets — including
+their saved chat/turn history (`chat_history_routes.py`). The one thing
+still off-limits is saving a custom database connection, which needs a
+more durable identity than a transient anonymous session —
+`config_routes.py` explicitly checks `is_anonymous_user(...)` there and
+returns a friendly 403.
 
 ---
 
@@ -588,21 +586,19 @@ startup:
   Firestore collections (`sessions`, `db_connections`, `translations`)
   under a database named `ydyl`.
 
-Either way, translation history is recorded against a non-sensitive
-`username@dbname` identifier (see `get_conn_identifier` in
-[`db.py`](./server/db.py)) — raw connection strings, including credentials,
-are never written to the history table.
-
-`GET /api/history` (the history popup) returns two things from
-`get_translation_history()`: the translations list itself, capped to
-`TRANSLATION_HISTORY_LIST_LIMIT` most-recent rows (sorted newest-first),
-and the aggregated per-day stats shown on the popup's Statistics tab,
-which are always computed over the user's **complete** history —
-uncapped, regardless of how many rows the list above is limited to.
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `TRANSLATION_HISTORY_LIST_LIMIT` | `50` | How many rows the history popup's translations list shows, most-recent first. Does not affect the popup's Statistics tab (always the full history) or how much history is actually stored (`DELETE/POST /api/history/purge` is still the only way to remove rows). See [`state_store.py`](./server/state_store.py). |
+Either way, every NL→SQL translation is still logged to a `translations`
+table/collection against a non-sensitive `username@dbname` identifier (see
+`get_conn_identifier` in [`db.py`](./server/db.py)) — raw connection
+strings, including credentials, are never written there. This is a
+write-only audit trail: it used to back a history popup with a recent-
+translations list and a Statistics tab, but both that UI and the
+`/api/history`/`/api/history/purge` endpoints behind it were removed as
+dead code once the History modal was redesigned around the separate
+chat/turn-navigation history in `chat_history_routes.py` instead — see
+that module's docstring for the full story. The `translations` log itself
+is still written on every translation (e.g. for aggregate usage/cost
+visibility via `export_state.py`), just with no in-app way to read or
+purge it anymore.
 
 Every saved connection's `database_config` is encrypted at rest before
 either backend ever writes it — see [Encryption at
@@ -618,7 +614,6 @@ Notable pieces:
 
 - **CodeMirror** (SQL mode, Dracula theme) powers the SQL editor;
   **sql-formatter** pretty-prints generated SQL before display.
-- **Chart.js** renders the daily usage charts in the history modal.
 - **Web Speech API** (browser-native, no library) powers the mic button
   for dictating prompts.
 - **Quick prompts** — a row of example prompts above the SQL box to get

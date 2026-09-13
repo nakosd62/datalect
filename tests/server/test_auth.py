@@ -125,13 +125,11 @@ def test_protected_route_not_rejected_without_identity_when_auth_enabled(app_fac
     # enforce_authentication guard itself never actually 401s anonymous
     # requests in this app. There is currently no remaining
     # is_anonymous_user() rejection anywhere at the route level either -
-    # /api/history and saving a custom DB connection were the two features
-    # that used to gate on it, and both are now fully un-gated once their
-    # per-session "anonymous:<session_id>" identity gives them the same
-    # isolation an authenticated user's identity would (see
-    # test_history_routes.py and test_config_custom_connections.py). This
-    # exercises the custom-connection save specifically, to prove the old
-    # 403 is gone.
+    # saving a custom DB connection used to gate on it, and is now fully
+    # un-gated once its per-session "anonymous:<session_id>" identity gives
+    # it the same isolation an authenticated user's identity would (see
+    # test_config_custom_connections.py). This exercises the
+    # custom-connection save specifically, to prove the old 403 is gone.
     resp = env.client.post('/api/config', json={
         "database_type": "postgres", "database_url": "postgresql://u:p@h/mydb",
         "database_name": "My DB", "is_custom": True,

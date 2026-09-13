@@ -16,7 +16,6 @@ from helpers import SERVER_DIR
 if SERVER_DIR not in sys.path:
     sys.path.insert(0, SERVER_DIR)
 
-import state_store
 from state_store import FirestoreStateStore
 from helpers import FakeFirestoreClient
 
@@ -335,99 +334,36 @@ def test_single_connection_save_and_include_credentials():
     assert "credentials_json" not in stripped[0]["config"]
 
 
-# --- translations --------------------------------------------------------------
+# --- translations (write-only NL->SQL audit log; see record_translation's
+# own docstring in state_store.py - there's deliberately no read/purge
+# coverage here anymore: get_translation_history()/purge_translation_history()
+# and the /api/history[/purge] endpoints they backed were removed as dead
+# code once the History modal stopped surfacing them - see
+# chat_history_routes.py's module docstring for where that modal's data
+# comes from today. record_translation() itself is still live, so it still
+# gets a smoke test below, verified by poking the fake client's storage
+# directly the same way this file's other tests do.) -------------------------
 
-def test_record_and_fetch_translation_history():
+def test_record_translation_writes_a_doc():
     store, client = make_store()
     store.record_translation(
         "alice", "postgres", "My DB", "show users", "SELECT * FROM users;",
         "gemini-2.5-flash", 120, 10, 5, 15, 0, 0,
     )
-    rows, stats, total_count = store.get_translation_history("alice")
-    assert total_count == 1
-    assert rows[0]["nl_prompt"] == "show users"
-    assert stats[0]["sum_total_tokens"] == 15
+    docs = list(client._collections.get("translations", {}).values())
+    assert len(docs) == 1
+    assert docs[0]["user_id"] == "alice"
+    assert docs[0]["nl_prompt"] == "show users"
+    assert docs[0]["sql_command"] == "SELECT * FROM users;"
+    assert docs[0]["total_tokens"] == 15
 
 
-def test_purge_translation_history_deletes_all_docs_for_user():
-    store, client = make_store()
-    store.record_translation("alice", "postgres", "DB", "p1", "SELECT 1;", "m", 1, 1, 1, 2, 0, 0)
-    store.record_translation("alice", "postgres", "DB", "p2", "SELECT 2;", "m", 1, 1, 1, 2, 0, 0)
-    store.purge_translation_history("alice")
-    _, _, total_count = store.get_translation_history("alice")
-    assert total_count == 0
-
-
-def test_purge_translation_history_does_not_affect_other_users():
+def test_translations_are_recorded_independently_per_user():
     store, client = make_store()
     store.record_translation("alice", "postgres", "DB", "p1", "SELECT 1;", "m", 1, 1, 1, 2, 0, 0)
     store.record_translation("bob", "postgres", "DB", "p2", "SELECT 2;", "m", 1, 1, 1, 2, 0, 0)
-    store.purge_translation_history("alice")
-    _, _, bob_count = store.get_translation_history("bob")
-    assert bob_count == 1
-
-
-# --- translation history list cap (TRANSLATION_HISTORY_LIST_LIMIT) -------------
-# record_translation() stamps created_at with firestore.SERVER_TIMESTAMP,
-# which the fake client stores verbatim (it has no notion of "server time")
-# - not something these tests can use to control ordering. These insert
-# docs directly into client._collections instead, using plain datetime
-# objects as created_at (real Firestore's own representation once a
-# SERVER_TIMESTAMP resolves), same "poke the fake's storage directly" idiom
-# FakeFirestoreClient's own docstring calls out.
-
-def _insert_translation_doc(client, doc_id, user_id, nl_prompt, created_at):
-    coll = client._collections.setdefault("translations", {})
-    coll[doc_id] = {
-        "user_id": user_id, "database_type": "postgres", "database_name": "DB",
-        "nl_prompt": nl_prompt, "sql_command": "SELECT 1;", "model": "m",
-        "duration": 1, "input_tokens": 1, "output_tokens": 1, "total_tokens": 2,
-        "thinking_tokens": 0, "cached_content_tokens": 0, "created_at": created_at,
-    }
-
-
-def test_get_translation_history_defaults_to_50_row_limit():
-    import datetime
-    store, client = make_store()
-    for i in range(60):
-        _insert_translation_doc(
-            client, f"doc{i}", "alice", f"p{i}",
-            datetime.datetime(2024, 1, 1, 0, i, 0),
-        )
-    rows, stats, total_count = store.get_translation_history("alice")
-    assert total_count == 60  # uncapped
-    assert len(rows) == 50  # capped
-    assert sum(s["total_translations"] for s in stats) == 60  # stats: complete history
-
-
-def test_get_translation_history_list_is_sorted_newest_first():
-    import datetime
-    store, client = make_store()
-    _insert_translation_doc(client, "d1", "alice", "oldest", datetime.datetime(2024, 1, 1))
-    _insert_translation_doc(client, "d2", "alice", "middle", datetime.datetime(2024, 1, 2))
-    _insert_translation_doc(client, "d3", "alice", "newest", datetime.datetime(2024, 1, 3))
-    rows, _, _ = store.get_translation_history("alice")
-    assert [r["nl_prompt"] for r in rows] == ["newest", "middle", "oldest"]
-
-
-def test_get_translation_history_limit_is_configurable_via_env_var(monkeypatch):
-    import datetime
-    # Patches the SAME module object FirestoreStateStore's globals resolve
-    # TRANSLATION_HISTORY_LIST_LIMIT from - see the equivalent SQLite test's
-    # comment in test_state_store_sqlite.py for why this must be the
-    # module-level `import state_store` above, not a function-local one.
-    monkeypatch.setattr(state_store, "TRANSLATION_HISTORY_LIST_LIMIT", 3)
-    store, client = make_store()
-    for i in range(10):
-        _insert_translation_doc(
-            client, f"doc{i}", "alice", f"p{i}",
-            datetime.datetime(2024, 1, 1, 0, i, 0),
-        )
-    rows, stats, total_count = store.get_translation_history("alice")
-    assert total_count == 10  # uncapped
-    assert len(rows) == 3  # capped to the overridden limit
-    assert [r["nl_prompt"] for r in rows] == ["p9", "p8", "p7"]  # still newest-first
-    assert sum(s["total_translations"] for s in stats) == 10  # stats: complete history
+    docs = list(client._collections.get("translations", {}).values())
+    assert sorted(d["user_id"] for d in docs) == ["alice", "bob"]
 
 
 # --- chat_history (persisted conversation buckets, client.js's

@@ -371,30 +371,15 @@ def compute_connection_key(name, url, credentials_json=None):
     return hashlib.sha256(raw.encode('utf-8')).hexdigest()[:24]
 
 
-# How many rows get_translation_history() returns for the history popup's
-# translations list, most-recent first - NOT a cap on how much history is
-# actually stored (purge is still the only way to remove rows) and NOT a
-# cap on the aggregated per-day stats the same call returns alongside it
-# (see get_translation_history's docstring below and both backends'
-# implementations: the stats query has no LIMIT, so the stats tab always
-# reflects the complete history even once the list has been truncated to
-# this many rows). Same "env var, sane default" pattern as app_config.py's
-# MAX_IN_SCOPE_CONNECTIONS and translate_routes.py's HISTORY_RESULT_MAX_ROWS/
-# HISTORY_MAX_TURNS, but defined here (not app_config.py) since app_config.py
-# imports FROM this module (see its own "Startup / Module Scope Guard"
-# section) - state_store.py importing back from app_config.py would be
-# circular, and this constant has exactly one consumer (this module's two
-# StateStore implementations) so there's no shared-module reason to hoist
-# it up there anyway.
-TRANSLATION_HISTORY_LIST_LIMIT = int(os.environ.get("TRANSLATION_HISTORY_LIST_LIMIT", 50))
-
-
 # --- Persisted chat/turn-navigation history (client.js's chatStoresByBucket) -
 #
-# Distinct from the "translations" table/collection above: that's an
-# append-only AUDIT LOG (one row per NL->SQL call, read by /api/history for
-# the History modal's stats/list, cleared by "Purge Translations"). This is
-# the actual CONVERSATION state - the back/forward-navigable turns, results,
+# Distinct from the "translations" table/collection (see record_translation
+# above): that's an append-only, write-only AUDIT LOG (one row per NL->SQL
+# call) - it used to be read back by a /api/history endpoint for the
+# History modal's stats/list and clearable via "Purge Translations", but
+# both were removed as dead code once the modal was redesigned around THIS
+# module's data instead (see chat_history_routes.py's module docstring).
+# This is the actual CONVERSATION state - the back/forward-navigable turns, results,
 # and summaries client.js keeps per (identity, connection) "bucket" - which
 # used to live only in an in-memory Map and vanish on every page reload or
 # server restart. One row/doc per (user_id, bucket_key); "bucket_key" is
@@ -653,19 +638,6 @@ class StateStore(ABC):
         the old single "connect_string" identifier, which stopped being
         meaningful once presets could span multiple dialects/names rather
         than always being a single parseable Postgres URL."""
-
-    @abstractmethod
-    def get_translation_history(self, user_id):
-        """Returns (rows, daily_stats, total_count) for a user. rows is
-        capped at TRANSLATION_HISTORY_LIST_LIMIT, sorted newest-first;
-        daily_stats and total_count are always computed over the user's
-        COMPLETE history, uncapped, so the history popup's aggregated
-        stats tab stays accurate even once the translations list itself
-        has been truncated."""
-
-    @abstractmethod
-    def purge_translation_history(self, user_id):
-        """Deletes all translation history for a user."""
 
     @abstractmethod
     def get_chat_history(self, user_id):
@@ -1420,47 +1392,6 @@ class SqliteStateStore(StateStore):
         except Exception:
             logger.exception("Error recording translation")
 
-    def get_translation_history(self, user_id):
-        effective_user = _effective_user(user_id)
-        with self._connect() as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-
-            cursor.execute(
-                "SELECT COUNT(*) as total_count FROM translations WHERE user_id = ?",
-                (effective_user,),
-            )
-            total_row = cursor.fetchone()
-            total_count = total_row["total_count"] if total_row else 0
-
-            cursor.execute("""
-                SELECT nl_prompt, sql_command, created_at
-                FROM translations WHERE user_id = ?
-                ORDER BY created_at DESC LIMIT ?
-            """, (effective_user, TRANSLATION_HISTORY_LIST_LIMIT))
-            rows = [dict(row) for row in cursor.fetchall()]
-
-            cursor.execute("""
-                SELECT
-                    DATE(created_at) as day_date,
-                    COUNT(*) as total_translations,
-                    SUM(total_tokens) as sum_total_tokens,
-                    SUM(input_tokens) as sum_input_tokens
-                FROM translations WHERE user_id = ?
-                GROUP BY DATE(created_at)
-                ORDER BY DATE(created_at) ASC
-            """, (effective_user,))
-            stats = [dict(row) for row in cursor.fetchall()]
-
-        return rows, stats, total_count
-
-    def purge_translation_history(self, user_id):
-        effective_user = _effective_user(user_id)
-        with self._connect() as conn:
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM translations WHERE user_id = ?", (effective_user,))
-            conn.commit()
-
     def get_chat_history(self, user_id):
         effective_user = _effective_user(user_id)
         buckets = {}
@@ -1835,71 +1766,6 @@ class FirestoreStateStore(StateStore):
             })
         except Exception:
             logger.exception("Error recording translation in Firestore")
-
-    def get_translation_history(self, user_id):
-        # Note: matches prior behavior of querying by the raw user_id here
-        # (unlike purge_translation_history, which uses the "global" fallback).
-        # This code path only runs on Cloud Run, where auth is enforced and
-        # user_id is never empty, so the distinction is not user-visible.
-        docs = (
-            self.client.collection("translations")
-            .where("user_id", "==", user_id)
-            .order_by("created_at", direction=firestore.Query.DESCENDING)
-            .limit(TRANSLATION_HISTORY_LIST_LIMIT)
-            .stream()
-        )
-        rows = []
-        for doc in docs:
-            d = doc.to_dict()
-            created_at = d.get("created_at")
-            if created_at:
-                created_at = created_at.strftime("%Y-%m-%d %H:%M:%S") if hasattr(created_at, "strftime") else str(created_at)
-            else:
-                created_at = ""
-            rows.append({
-                "nl_prompt": d.get("nl_prompt", ""),
-                "sql_command": d.get("sql_command", ""),
-                "created_at": created_at,
-            })
-
-        docs_all = self.client.collection("translations").where("user_id", "==", user_id).stream()
-        daily = {}
-        total_count = 0
-        for doc in docs_all:
-            d = doc.to_dict()
-            total_count += 1
-            dt = d.get("created_at")
-            if not dt:
-                continue
-            day_str = dt.strftime("%Y-%m-%d") if hasattr(dt, "strftime") else str(dt)[:10]
-
-            bucket = daily.setdefault(day_str, {
-                "day_date": day_str,
-                "total_translations": 0,
-                "sum_total_tokens": 0,
-                "sum_input_tokens": 0,
-            })
-            bucket["total_translations"] += 1
-            bucket["sum_total_tokens"] += d.get("total_tokens", 0) or 0
-            bucket["sum_input_tokens"] += d.get("input_tokens", 0) or 0
-
-        stats = sorted(daily.values(), key=lambda x: x["day_date"])
-        return rows, stats, total_count
-
-    def purge_translation_history(self, user_id):
-        effective_user = _effective_user(user_id)
-        docs = self.client.collection("translations").where("user_id", "==", effective_user).stream()
-        batch = self.client.batch()
-        count = 0
-        for doc in docs:
-            batch.delete(doc.reference)
-            count += 1
-            if count >= 400:
-                batch.commit()
-                batch = self.client.batch()
-                count = 0
-        if count > 0:
-            batch.commit()
 
     def get_chat_history(self, user_id):
         effective_user = _effective_user(user_id)

@@ -9,12 +9,13 @@ to compare the resolved descriptor's own config fields against each saved
 row's config instead (see _resolve_database_name's docstring in db.py).
 
 Exercised at the db.py/state_store.py layer directly (not through
-/api/translate's streaming response) since get_translation_history()
-doesn't currently surface database_name back out through /api/history at
-all - it's recorded for the row regardless, so this checks the actual
-stored value via a raw query against the same SQLite file app_config's
-state_store is using, the same way test_database_config_encryption.py's
-raw_sqlite_config helper does.
+/api/translate's streaming response) since the translations audit log
+doesn't surface database_name back out anywhere in the app's UI at all
+(see chat_history_routes.py's module docstring - it's a write-only log
+these days) - it's recorded for the row regardless, so this checks the
+actual stored value via a raw query against the same SQLite file
+app_config's state_store is using, the same way
+test_database_config_encryption.py's raw_sqlite_config helper does.
 """
 
 import sqlite3

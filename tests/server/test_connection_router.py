@@ -1989,9 +1989,9 @@ def _translation_rows(env):
     plain dicts - a raw query against the same SQLite file app_config's
     state_store is using, same pattern as
     test_translation_history_naming.py's _last_recorded_database_name
-    (get_translation_history() doesn't surface database_type/database_name
-    at all, so there's no route through the app's own API to check
-    these)."""
+    (the translations audit log is write-only these days - no route
+    through the app's own API surfaces database_type/database_name, or
+    anything else about a row, so this is the only way to check them)."""
     with sqlite3.connect(env.app_config.state_store.db_path) as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()

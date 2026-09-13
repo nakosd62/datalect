@@ -11,7 +11,8 @@ able to save/select their OWN custom connections, stored under their own
 per-session "anonymous:<session_id>" identity (see auth.py's
 ANONYMOUS_USER_ID_PREFIX) and fully isolated from every other anonymous
 visitor and from authenticated users - the same state_store-layer isolation
-history_routes.py already relies on for anonymous translation history.
+every other per-user identity in this app relies on (e.g. the translations
+audit log and chat-history buckets).
 """
 
 import pytest
@@ -190,8 +191,7 @@ def test_two_anonymous_visitors_dont_see_each_others_custom_connections(app_fact
     # "anonymous:<session_id>" identities (see auth.py's
     # ANONYMOUS_USER_ID_PREFIX) - one visitor's self-saved connection must
     # never be visible to, or overwritten by, another's, the same isolation
-    # test_history_routes.py already proves for anonymous translation
-    # history.
+    # every other per-user identity in this app relies on.
     env = app_factory(env={"GOOGLE_CLIENT_ID": "fake.apps.googleusercontent.com"})
     browser_one = env.app_config.app.test_client()
     browser_two = env.app_config.app.test_client()

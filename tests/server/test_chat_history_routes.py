@@ -1,13 +1,15 @@
 """
 chat_history_routes.py: /api/chat-history, /api/chat-history/save, and
 /api/chat-history/activate. Persists the actual chat/turn-navigation
-conversation state (client.js's chatStoresByBucket) - distinct from
-history_routes.py's /api/history, which is the separate NL->SQL audit log.
+conversation state (client.js's chatStoresByBucket) - distinct from the
+"translations" table/collection, which is the separate NL->SQL audit log
+(write-only now - see chat_history_routes.py's own module docstring for
+why its old read/purge endpoints were removed).
 
 Same "works for any identity, including a genuinely anonymous one" posture
-as history_routes.py - auth.py's per-session ANONYMOUS_USER_ID_PREFIX
-identity already isolates one anonymous visitor's data from every other's,
-so there's no separate sign-in gate here either.
+as everywhere else in this app - auth.py's per-session
+ANONYMOUS_USER_ID_PREFIX identity already isolates one anonymous visitor's
+data from every other's, so there's no separate sign-in gate here either.
 """
 
 from helpers import login_as
@@ -91,10 +93,10 @@ def test_anonymous_visitor_can_read_and_save_their_own_chat_history(app_factory)
 
 
 def test_two_anonymous_visitors_have_isolated_chat_history(app_factory):
-    # Mirrors test_history_routes.py's own "two anonymous visitors" tests -
-    # chat history is keyed by the same per-session anonymous:<session_id>
-    # identity as translation history/DB selection, so it's isolated the
-    # same way.
+    # Mirrors test_config_custom_connections.py's own "two anonymous
+    # visitors" tests - chat history is keyed by the same per-session
+    # anonymous:<session_id> identity as DB selection/custom connections, so
+    # it's isolated the same way.
     env = app_factory(env={"GOOGLE_CLIENT_ID": "fake-client-id.apps.googleusercontent.com"})
     browser_one = env.app_config.app.test_client()
     browser_two = env.app_config.app.test_client()

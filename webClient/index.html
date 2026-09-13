@@ -300,7 +300,11 @@
             </button>
           </div>
           <div id="resultsTabsNav" class="results-tabs-nav hidden"></div>
-          <div class="results-table-wrapper">
+          <div id="resultsViewToggle" class="results-view-toggle hidden">
+            <button type="button" class="results-view-toggle-btn" data-view="table">Table</button>
+            <button type="button" class="results-view-toggle-btn" data-view="chart">Chart</button>
+          </div>
+          <div id="resultsTableWrapper" class="results-table-wrapper">
             <table>
               <thead>
                 <tr id="resultsHeader"></tr>
@@ -311,6 +315,9 @@
                 </tr>
               </tbody>
             </table>
+          </div>
+          <div id="resultsChartWrapper" class="results-chart-wrapper hidden">
+            <canvas id="resultsChartCanvas"></canvas>
           </div>
         </div>
       </section>
@@ -559,6 +566,14 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/codemirror.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/mode/sql/sql.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/addon/display/placeholder.min.js"></script>
+  <!-- Charting (single-connection results summary's "visualization" decision -
+       see translate_routes.py's _SINGLE_SUMMARY_SYSTEM_INSTRUCTION and
+       client.js's renderResultChart()). Re-added fresh for this feature -
+       previously used for the now-removed translation-history stats tab,
+       which is why no build-step/bundling exists for it here, matching the
+       CDN script-tag pattern already used for sql-formatter/CodeMirror
+       above. -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.js"></script>
   <script src="client.js"></script>
 
 </body>

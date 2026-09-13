@@ -44,7 +44,7 @@ if SERVER_DIR not in sys.path:
 # rather than returning the previous test's cached module object.
 _APP_MODULE_NAMES = [
     "app_config", "auth", "auth_session", "config_routes", "execute_routes",
-    "translate_routes", "history_routes", "chat_history_routes", "report_routes",
+    "translate_routes", "chat_history_routes", "report_routes",
     "db", "schema_cache", "state_store", "connection_router", "cancel_registry",
 ]
 
@@ -175,9 +175,8 @@ def fresh_import(monkeypatch, tmp_path, env=None, register_blueprints=True, mock
 
     Returns a SimpleNamespace with at least `.app_config`; when
     register_blueprints=True (the default) also `.auth`, `.config_routes`,
-    `.execute_routes`, `.translate_routes`, `.history_routes`,
-    `.cancel_registry`, and `.client` (a Flask test client with
-    state_store.init() already called).
+    `.execute_routes`, `.translate_routes`, `.cancel_registry`, and
+    `.client` (a Flask test client with state_store.init() already called).
     """
     os.makedirs(tmp_path, exist_ok=True)
     monkeypatch.chdir(tmp_path)
@@ -233,7 +232,6 @@ def fresh_import(monkeypatch, tmp_path, env=None, register_blueprints=True, mock
         import config_routes
         import execute_routes
         import translate_routes
-        import history_routes
         import chat_history_routes
         import report_routes
         import cancel_registry
@@ -247,7 +245,7 @@ def fresh_import(monkeypatch, tmp_path, env=None, register_blueprints=True, mock
         app_config.app.after_request(auth.refresh_auth_session_cookie)
         for bp in (
             auth.auth_bp, config_routes.config_bp, execute_routes.execute_bp,
-            translate_routes.translate_bp, history_routes.history_bp,
+            translate_routes.translate_bp,
             chat_history_routes.chat_history_bp, report_routes.report_bp,
         ):
             app_config.app.register_blueprint(bp)
@@ -257,7 +255,6 @@ def fresh_import(monkeypatch, tmp_path, env=None, register_blueprints=True, mock
         ns.config_routes = config_routes
         ns.execute_routes = execute_routes
         ns.translate_routes = translate_routes
-        ns.history_routes = history_routes
         ns.report_routes = report_routes
         ns.cancel_registry = cancel_registry
 
@@ -1478,8 +1475,10 @@ class _FakeFirestoreQuery:
             _FakeFirestoreDoc(doc_id, data) for doc_id, data in coll.items()
             if all(data.get(f) == v for f, v in self._filters)
         ]
-        # Give each returned doc a working .reference for
-        # purge_translation_history()'s batch.delete(doc.reference).
+        # Give each returned doc a working .reference for any caller that
+        # deletes queried docs via doc.reference.delete() (e.g.
+        # set_db_connections replacing a user's whole custom-connections
+        # list).
         for d in docs:
             d.reference = _FakeFirestoreDocRef(self._store, self._collection_name, d.id)
         if self._order:

@@ -4,7 +4,7 @@
 //
 // Every spec runs against the REAL Flask server + REAL SqliteStateStore
 // (launched by playwright.config.js's webServer block, isolated under
-// .e2e-runtime/) - /api/config, /api/history, session handling, and the
+// .e2e-runtime/) - /api/config, /api/chat-history, session handling, and the
 // custom-connection save/validation logic in config_routes.py are all the
 // genuine article. The endpoints mocked are /api/translate, /api/execute,
 // and /api/ping - see below for why /api/execute and /api/ping both get a
@@ -78,6 +78,42 @@ const isolatedTest = base.test.extend({
       /^https:\/\/(www\.googletagmanager\.com|([a-z0-9-]+\.)?google-analytics\.com|analytics\.google\.com)\//,
       (route) => route.abort()
     );
+    // CHART.JS NETWORK ISOLATION: index.html now loads Chart.js itself from
+    // jsdelivr (see client.js's renderResultChart()/buildResultsChartConfig() -
+    // the single-connection charting feature) on every single page load,
+    // same "external heavy dependency real tests shouldn't depend on"
+    // reasoning as GA4 above. Rather than abort()ing it outright (client.js
+    // guards every call site on `typeof Chart !== 'undefined'`, so an
+    // aborted load would just silently disable charting instead of
+    // erroring - fine for the vast majority of specs that don't care, but
+    // it would make chart-toggle.spec.js's own tests impossible to write
+    // at all), this serves a tiny instrumented FAKE `Chart` global instead:
+    // real enough for client.js's own code to construct/destroy successfully
+    // and for a test to assert on WHAT it was asked to draw
+    // (window.__lastChartConfig) and WHETHER a chart is currently "mounted"
+    // (window.__chartInstanceCount), without ever needing real network
+    // access to jsdelivr or a real <canvas> render. Every spec gets this
+    // by default (matching the /api/ping-style "safe default, override if
+    // you need something different" precedent below) - a test that wants
+    // to assert something this fake doesn't capture can register its own
+    // page.route() for the same URL afterward (Playwright checks the
+    // most-recently-registered matching handler first, same override
+    // precedent as mockExecute/mockTranslate below).
+    await page.route('https://cdn.jsdelivr.net/npm/chart.js@*/dist/chart.umd.js', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/javascript',
+        body: `
+          window.__chartInstanceCount = 0;
+          window.__lastChartConfig = null;
+          window.Chart = function(ctx, config) {
+            window.__lastChartConfig = config;
+            window.__chartInstanceCount += 1;
+            this.destroy = function() { window.__chartInstanceCount -= 1; };
+          };
+        `,
+      });
+    });
     await use(page);
   },
 });

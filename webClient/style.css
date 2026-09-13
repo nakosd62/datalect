@@ -2255,6 +2255,38 @@ textarea.report-issue-preview:focus {
   background-color: rgba(var(--danger-rgb), 0.12);
 }
 
+/* The Summary tab's "View as chart" nudge (see client.js's
+   summaryChartCalloutHtml()/jumpToChartableResultTab()) - sits directly
+   under the summary text and above .summary-feedback-row (primary action
+   before secondary feedback, see the ordering comment at that insertion
+   point in renderTableResult()). An outlined pill (tinted background,
+   colored text and border) rather than a solid-fill button, matching
+   .summary-feedback-btn--up's own transparent-background-plus-tinted-hover
+   convention - there's no --on-secondary contrast token defined in this
+   file to pair with a solid --secondary fill. */
+.summary-chart-callout {
+  margin-top: 0.75rem;
+}
+
+.summary-chart-callout-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.35rem 0.75rem;
+  border: 1px solid rgba(var(--secondary-rgb), 0.4);
+  border-radius: 999px;
+  background-color: rgba(var(--secondary-rgb), 0.08);
+  color: var(--secondary);
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.summary-chart-callout-btn:hover {
+  background-color: rgba(var(--secondary-rgb), 0.16);
+  border-color: var(--secondary);
+  color: var(--secondary-hover);
+}
+
 /* Wraps .report-issue-inline-btn when it has to be inserted as its own
    full-width table row (see client.js's reportButtonRowHtml()) - was for
    the tabular-result "Report Wrong Result" branches, where the button
@@ -2412,6 +2444,27 @@ tr.report-issue-row td {
   animation: pulse 2s ease-in-out infinite;
 }
 
+/* A tab whose result carries a validated chart visualization (see client.js's
+   buildResultsTabsNav() - the badge emoji itself is appended to the label
+   text, this class is just the subtle color tint alongside it) - tinted with
+   --secondary rather than --danger/--primary since this isn't a warning or a
+   success signal, just "there's more to see here". Mirrors
+   .result-tab-btn--error's own base/hover/active state trio above. */
+.result-tab-btn--chartable {
+  color: var(--secondary);
+}
+
+.result-tab-btn--chartable:hover:not(.active) {
+  background-color: rgba(var(--secondary-rgb), 0.12);
+  color: var(--secondary-hover);
+}
+
+.result-tab-btn--chartable.active {
+  background-color: var(--surface-1);
+  color: var(--secondary);
+  box-shadow: inset 0 -2px 0 var(--secondary);
+}
+
 .results-table-wrapper {
   flex: 1;
   min-height: 0;
@@ -2468,6 +2521,63 @@ tr.report-issue-row td {
   word-break: break-word;
   line-height: 1.5;
   font-family: var(--font-mono, monospace);
+}
+
+/* Table/Chart toggle (see client.js's renderTableResult()/
+   renderResultChart()) - only ever shown for the one single-connection
+   result tab per turn whose "visualization" decision survived server-side
+   validation (translate_routes.py's _clean_visualization); every other
+   tab never un-hides this row at all. Small pill-pair, modeled on
+   .result-tab-btn's own active/inactive treatment rather than inventing a
+   new control style, sitting in its own row between the tabs strip and
+   the table/chart area so it reads as "a property of the currently active
+   tab", not as another tab itself. */
+.results-view-toggle {
+  flex-shrink: 0;
+  display: flex;
+  gap: 4px;
+  padding: 6px 8px;
+  background-color: var(--surface-2);
+  border-bottom: 1px solid var(--surface-3);
+}
+
+.results-view-toggle-btn {
+  padding: 0.3rem 0.75rem;
+  font-size: 0.75rem;
+  font-weight: 500;
+  font-family: inherit;
+  color: var(--text-secondary);
+  background: transparent;
+  border: 1px solid var(--surface-3);
+  border-radius: 999px;
+  cursor: pointer;
+  transition: var(--transition);
+}
+
+.results-view-toggle-btn:hover:not(.active) {
+  background-color: var(--surface-3);
+  color: var(--text-table-strong);
+}
+
+.results-view-toggle-btn.active {
+  background-color: var(--accent-cyan);
+  border-color: var(--accent-cyan);
+  color: var(--on-accent-cyan);
+}
+
+/* Chart.js's own canvas needs an explicit-height positioned ancestor
+   (Chart.js reads the parent's box to size itself, then keeps that size
+   fixed on window resize via its own ResizeObserver) - a bare `flex: 1`
+   like .results-table-wrapper uses would leave it 0px tall. Swaps places
+   with #resultsTableWrapper (see renderTableResult()'s own toggle logic) -
+   never both visible at once. */
+.results-chart-wrapper {
+  flex: 1;
+  min-height: 0;
+  height: 360px;
+  position: relative;
+  padding: 12px;
+  box-sizing: border-box;
 }
 
 .inputs-column {

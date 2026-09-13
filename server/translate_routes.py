@@ -3087,6 +3087,122 @@ def summarize_results():
 # any failure here is reported back as {"success": false}, never a hard
 # error, so the client just leaves the Summary tab out rather than
 # treating a nice-to-have's failure as a turn failure.
+#
+# This call also decides, "ride-along" with the summary (one LLM call,
+# not a second round trip), whether the results are worth showing as a
+# chart instead of only a table - see _SINGLE_SUMMARY_SYSTEM_INSTRUCTION's
+# own "visualization" paragraph below and _clean_single_summary_response.
+# The model's own judgment about WHETHER charting is even possible is
+# never trusted on its own: _pick_chartable_result decides that server-
+# side, from the real executed statement_results, before the model is
+# ever asked anything - a multi-statement result, a single-row result, or
+# a result with no numeric column at all is never offered a chart no
+# matter what the model might otherwise claim, and its own x_column/
+# y_columns/series_column choices are re-validated against the real
+# columns (and, for y_columns, the real row VALUES - see
+# _column_looks_numeric) rather than trusted on faith, the same "never
+# blindly trust LLM output" posture this app already applies to generated
+# SQL (see translate_query()'s own docstring).
+
+_CHART_MIN_ROWS = 2
+
+
+def _column_looks_numeric(rows, column, sample_size=200):
+    """True when a solid majority of `column`'s own non-null sampled values
+    (across up to `sample_size` of `rows`) are real numbers. Excludes bool
+    (a Python bool is technically an int subclass, but a true/false column
+    is categorical, not something to plot on a value axis) and excludes
+    numeric-LOOKING strings on purpose - this app never asks the client to
+    stringify numbers before sending results here (see
+    _build_single_summary_prompt's docstring on `statement_results`' own
+    shape: real JSON values, not pre-stringified), so a string value here
+    is real text, not a number rendered as text.
+
+    Used twice: to build the prompt's own "Chartable columns" hints (see
+    _describe_chartable_columns) and, independently, to re-validate the
+    model's actual y_columns choice against the real data rather than
+    trusting its guess from the column name alone (e.g. a column named
+    "id" is numeric but rarely a sensible y-axis choice on its own - still
+    allowed here, since "sensible" is a judgment call left to the model,
+    but a column named "amount" that's actually stored as text is not a
+    valid choice at all, and this catches that).
+
+    Empty/all-null sampled data is treated as NOT numeric (there's nothing
+    to plot), not as a vacuous pass. A solid-majority (not unanimous)
+    threshold tolerates the occasional stray null/outlier without
+    disqualifying an otherwise-numeric column."""
+    seen = 0
+    numeric = 0
+    for row in (rows or [])[:sample_size]:
+        if not isinstance(row, dict):
+            continue
+        value = row.get(column)
+        if value is None:
+            continue
+        seen += 1
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            numeric += 1
+    if seen == 0:
+        return False
+    return (numeric / seen) >= 0.9
+
+
+def _pick_chartable_result(statement_results):
+    """Returns the single statement_results entry (see _build_single_
+    summary_prompt's own docstring for the shape) eligible to be charted
+    this turn, or None when charting isn't offered at all. Deliberately
+    conservative - this decides eligibility server-side from the real
+    executed results, rather than leaving it to the model's own judgment:
+      - Exactly ONE statement_results entry must have real tabular
+        columns/rows (not a note, not an error) - a multi-statement script
+        with more than one real result set is ambiguous about which one
+        to chart, so charting is skipped entirely rather than guessing.
+      - That entry must have at least _CHART_MIN_ROWS rows - a single-row
+        result has nothing to compare/trend, so a chart adds nothing over
+        a table.
+      - At least one of its columns must look numeric (_column_looks_
+        numeric) - with no numeric column at all there is nothing to plot
+        on a value axis.
+    Returns the qualifying entry itself (not just True/False) so callers
+    have its real columns/rows on hand both for building the prompt's own
+    "Chartable columns" list and for later validating the model's column
+    choices against them (see _clean_single_summary_response)."""
+    tabular = [
+        entry for entry in (statement_results or [])
+        if isinstance(entry, dict) and not entry.get("error") and not entry.get("note") and entry.get("columns")
+    ]
+    if len(tabular) != 1:
+        return None
+    entry = tabular[0]
+    rows = entry.get("rows") or []
+    if len(rows) < _CHART_MIN_ROWS:
+        return None
+    columns = entry.get("columns") or []
+    if not any(_column_looks_numeric(rows, col) for col in columns):
+        return None
+    return entry
+
+
+def _describe_chartable_columns(chartable_entry):
+    """Renders `chartable_entry`'s own columns (see _pick_chartable_result)
+    into the "Chartable columns" prompt section _SINGLE_SUMMARY_SYSTEM_
+    INSTRUCTION's "visualization" paragraph references - each column
+    tagged (numeric) or (text) via _column_looks_numeric, so the model can
+    tell which columns are even eligible for x_column/y_columns/
+    series_column without having to infer types from a raw data dump
+    itself. None (nothing chartable this turn - see _pick_chartable_
+    result) renders the explicit "no chartable columns" sentence instead,
+    so the prompt never leaves the model to guess why "visualization" must
+    be null."""
+    if chartable_entry is None:
+        return "Chartable columns: none available for this turn - \"visualization\" MUST be null.\n"
+    rows = chartable_entry.get("rows") or []
+    columns = chartable_entry.get("columns") or []
+    described = ", ".join(
+        f"{col} ({'numeric' if _column_looks_numeric(rows, col) else 'text'})" for col in columns
+    )
+    return f"Chartable columns (use these EXACT names only): {described}\n"
+
 
 _SINGLE_SUMMARY_SYSTEM_INSTRUCTION = (
     "You previously helped translate a user's natural-language question into a real SQL query - possibly "
@@ -3094,20 +3210,23 @@ _SINGLE_SUMMARY_SYSTEM_INSTRUCTION = (
     "the user's ORIGINAL question, the database schema, the SQL that was executed, and the outcome of "
     "each statement that ran: exactly one of its actual result rows, a note that it returned nothing "
     "useful, or an error explaining that it failed to execute.\n"
-    "CRITICAL, before anything else: your ENTIRE response - the label line below AND every paragraph that "
-    "follows it - MUST be written in the SAME LANGUAGE as the user's original question, never the language "
-    "of the schema/table names or of the results data you're given, and never any other language. This "
-    "applies to every single sentence you write, not just the label.\n"
-    "Your response has two parts. FIRST, a single label line: a short (one to two word) section-heading "
+    "CRITICAL, before anything else: every string you write - the label line AND every paragraph of "
+    "\"summary\" - MUST be written in the SAME LANGUAGE as the user's original question, never the "
+    "language of the schema/table names or of the results data you're given, and never any other "
+    "language. This applies to every single sentence you write, not just the label.\n"
+    "Respond with ONLY a single JSON object - no markdown code fences, no other text before or after it - "
+    "shaped exactly like this: {\"summary\": \"...\", \"visualization\": null or {...}}\n"
+    "\"summary\" has two parts. FIRST, a single label line: a short (one to two word) section-heading "
     "label meaning \"Results Summary\" - in English this label is literally the phrase \"Results Summary\", "
     "but you must instead write it TRANSLATED into the SAME LANGUAGE as the user's original question, with "
     "nothing else on that line, followed by a blank line. SECOND, immediately after that blank line, your "
     "real, substantive answer, ALSO written in that same language. Example of the full shape, if the "
     "question was in English: \"Results Summary\\n\\nRevenue is up 12% quarter over quarter, driven mostly "
     "by the Enterprise segment - worth digging into why SMB slipped.\". Never stop after the label - the "
-    "label by itself, with no paragraphs following it, is not a valid response; the label is a UI section "
-    "heading prepended to your answer, not a substitute for writing one. The label itself is plain text "
-    "with no markdown emphasis of your own around it.\n"
+    "label by itself, with no paragraphs following it, is not a valid \"summary\"; the label is a UI "
+    "section heading prepended to your answer, not a substitute for writing one. The label itself is "
+    "plain text with no markdown emphasis of your own around it, and \"summary\" as a whole must be plain "
+    "text only - no SQL, no markdown tables, no code fences, no bullet points, no other headings.\n"
     "Directly answer the user's original question using the actual result rows, and go further: call out "
     "whatever is genuinely notable in the data (trends, outliers, concentrations, anything surprising) and "
     "derive concrete, actionable insight or next steps the user could reasonably take away from these "
@@ -3120,14 +3239,32 @@ _SINGLE_SUMMARY_SYSTEM_INSTRUCTION = (
     "fix it, so the user understands the failure instead of only knowing that one occurred. When some "
     "statements succeeded and others failed, address both: summarize what the successful ones show, and "
     "explain the failure(s) alongside that, rather than covering only one or the other.\n"
-    "Respond with plain text only - no SQL, no markdown tables, no code fences, no bullet points, no "
-    "other headings. The leading translated label line is the only formatting to use.\n"
-    "One final reminder, since it's the single most important rule above: the language of your response "
+    "\"visualization\" decides whether the results are ALSO shown as a chart instead of only a table. Set "
+    "it to JSON null whenever a chart wouldn't add anything - a single scalar/lookup answer, mostly "
+    "textual data, or whenever the \"Chartable columns\" list given to you below says none are available "
+    "(charting isn't possible for this result set no matter what the question asks, in that case). When a "
+    "real \"Chartable columns\" list IS given, and the user's question is naturally about comparing, "
+    "trending, or ranking numeric values (e.g. \"sales by month\", \"top products by revenue\", \"how has "
+    "X changed over time\"), set \"visualization\" to an object shaped exactly like this: {\"chart_type\": "
+    "\"bar\" or \"line\" or \"scatter\", \"x_column\": \"<one column name>\", \"y_columns\": [\"<one or "
+    "more column names>\"], \"series_column\": \"<one column name>\" or null}. Use \"bar\" to compare "
+    "values across categories, \"line\" when x_column is a time/sequence-like column and the question is "
+    "about a trend over it, \"scatter\" to relate two numeric columns to each other. \"x_column\" is the "
+    "column to place along the other axis from the values being measured; \"y_columns\" are the numeric "
+    "column(s) actually being measured/compared - only ever pick columns explicitly marked \"(numeric)\" "
+    "in \"Chartable columns\" below, never a column marked \"(text)\". \"series_column\" optionally splits "
+    "the chart into multiple series/groups (e.g. one line per region) - set it to null unless the data "
+    "genuinely has a separate grouping column, distinct from x_column, that the question calls for "
+    "breaking out. Every column name you write anywhere inside \"visualization\" must be copied EXACTLY "
+    "(case-sensitive) from the \"Chartable columns\" list below - never invent, translate, or abbreviate a "
+    "column name. If you are ever unsure whether a chart genuinely helps here, prefer null - a plain table "
+    "is always an acceptable, safe default, and there is no penalty for choosing it.\n"
+    "One final reminder, since it's the single most important rule above: the language of \"summary\" "
     "must match the user's original question, not the language of the schema/SQL/data.\n"
 )
 
 
-def _build_single_summary_prompt(user_question, sql, statement_results, expected_language_code=None):
+def _build_single_summary_prompt(user_question, sql, statement_results, chartable_entry, expected_language_code=None):
     """Renders `statement_results` - client-submitted [{"columns", "rows",
     "rowCount"} | {"note"} | {"error"}, ...], one entry per SQL statement
     /api/execute actually ran for this turn - into one labeled text block
@@ -3141,6 +3278,13 @@ def _build_single_summary_prompt(user_question, sql, statement_results, expected
     truncated, the header names both the real total row count and how
     many are shown, so the model isn't misled into thinking it saw
     everything.
+
+    `chartable_entry` - _pick_chartable_result(statement_results)'s own
+    return value, computed once by the caller and threaded through here
+    (rather than recomputed) so the "Chartable columns" section below
+    always describes the exact same entry _clean_single_summary_response
+    will later validate the model's "visualization" choice against - see
+    _describe_chartable_columns for the rendering itself.
 
     `expected_language_code` - see _build_summary_prompt's own docstring
     for what this is and why it's threaded through from the caller rather
@@ -3180,10 +3324,144 @@ def _build_single_summary_prompt(user_question, sql, statement_results, expected
         f"Original question: {user_question}\n\n"
         f"SQL executed:\n{sql}\n\n"
         f"Results:\n\n{results_text}\n\n"
-        "Reminder: write your response - the label line AND every paragraph - in the SAME "
-        "LANGUAGE as the \"Original question\" above, no matter what language the schema, SQL, "
-        "or results data shown above happen to be in." + named_language_sentence
+        f"{_describe_chartable_columns(chartable_entry)}\n"
+        "Reminder: write your response - the label line AND every paragraph of \"summary\" - in "
+        "the SAME LANGUAGE as the \"Original question\" above, no matter what language the schema, "
+        "SQL, or results data shown above happen to be in." + named_language_sentence
     )
+
+
+def _clean_visualization(raw, chartable_entry):
+    """Validates the model's own "visualization" value (see
+    _SINGLE_SUMMARY_SYSTEM_INSTRUCTION's own paragraph on it) against the
+    REAL executed result this turn - `chartable_entry`, the exact same
+    _pick_chartable_result(...) value _describe_chartable_columns rendered
+    into the prompt the model actually saw. Returns a cleaned
+      {"chart_type": "bar"|"line"|"scatter", "x_column": <str>,
+       "y_columns": [<str>, ...], "series_column": <str>|None}
+    or None (meaning: show a table, not a chart) - never raises, and a
+    None return here is never treated as a parse failure by
+    _clean_single_summary_response (unlike a genuinely malformed
+    "summary") since a table is always an acceptable, valid outcome.
+
+    `chartable_entry` being None (charting wasn't even offered this turn -
+    see _pick_chartable_result) forces None regardless of what `raw` says,
+    the same "never trust the model's own judgment about eligibility"
+    posture _pick_chartable_result's own docstring describes - the model
+    was told there were no chartable columns, so anything else it might
+    have written for "visualization" anyway is simply ignored, not treated
+    as a reason to fail the whole response.
+
+    Otherwise: `raw` must be a dict; "chart_type" must be one of the three
+    values the prompt actually offers (deliberately NOT "pie" - see this
+    feature's own design notes on why that was left out); "x_column" must
+    name one of `chartable_entry`'s real columns; "y_columns" must be a
+    non-empty list of real column names, each independently re-verified
+    NUMERIC via _column_looks_numeric against the real row data (not just
+    "a real column name" - the model was already told which columns are
+    numeric, but its choice is re-checked here rather than trusted, same
+    as every other LLM output this app validates before acting on it) and
+    deduplicated, excluding x_column itself; a "series_column" is kept
+    only when it's also a real column, distinct from x_column. Any
+    structural problem with "x_column" or an empty "y_columns" after
+    filtering invalidates the whole visualization (returns None, falls
+    back to table) rather than partially rendering something the model
+    didn't actually intend."""
+    if chartable_entry is None or not isinstance(raw, dict):
+        return None
+    chart_type = raw.get("chart_type")
+    if chart_type not in ("bar", "line", "scatter"):
+        return None
+    columns = chartable_entry.get("columns") or []
+    rows = chartable_entry.get("rows") or []
+    column_set = set(columns)
+
+    x_column = raw.get("x_column")
+    if not (isinstance(x_column, str) and x_column in column_set):
+        return None
+
+    raw_y_columns = raw.get("y_columns")
+    if not isinstance(raw_y_columns, list):
+        return None
+    y_columns = []
+    for y in raw_y_columns:
+        if (
+            isinstance(y, str) and y in column_set and y != x_column
+            and y not in y_columns and _column_looks_numeric(rows, y)
+        ):
+            y_columns.append(y)
+    if not y_columns:
+        return None
+
+    series_column = raw.get("series_column")
+    if not (isinstance(series_column, str) and series_column in column_set and series_column != x_column):
+        series_column = None
+
+    return {
+        "chart_type": chart_type, "x_column": x_column,
+        "y_columns": y_columns, "series_column": series_column,
+    }
+
+
+def _clean_single_summary_response(raw_text, chartable_entry):
+    """Parses the single-connection summarization call's structured JSON
+    response (see _SINGLE_SUMMARY_SYSTEM_INSTRUCTION) into
+      {"summary": <non-empty str>, "visualization": <_clean_visualization's
+       shape> | None}
+    or None (unparseable, or "summary" itself is missing/invalid - the
+    caller's bounded retry, via _summarize_with_retry's content_parser,
+    treats None exactly like an empty/invalid response always was before
+    this call moved off free-text prose). Mirrors _clean_summary_response's
+    JSON-via-strip_markdown_fence-then-json.loads shape closely - see that
+    function's own docstring - adapted to this call's own "summary" +
+    "visualization" envelope instead of Phase C's per-database one.
+
+    "summary" is validated exactly like the old free-text contract
+    (_default_content_parser) always was: a non-empty, non-label-only
+    stripped string. A malformed/missing "summary" invalidates the WHOLE
+    response (returns None, giving the bounded retry another attempt) -
+    same as a missing per-database paragraph does for Phase C - since
+    there's nothing sensible to show in its place. "visualization", by
+    contrast, is validated leniently: _clean_visualization returning None
+    (a table) is always a fine, valid outcome, never a reason to retry -
+    only "summary" itself failing validation is."""
+    if not raw_text:
+        return None
+    cleaned = strip_markdown_fence(raw_text)
+    try:
+        parsed = json.loads(cleaned)
+    except Exception:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+
+    summary = parsed.get("summary")
+    if not (isinstance(summary, str) and summary.strip() and not is_label_only_response(summary)):
+        return None
+    summary = summary.strip()
+
+    visualization = _clean_visualization(parsed.get("visualization"), chartable_entry)
+    return {"summary": summary, "visualization": visualization}
+
+
+def _make_single_summary_content_parser(chartable_entry):
+    """Binds `chartable_entry` into a content_parser closure for
+    _summarize_with_retry - see _clean_single_summary_response above for
+    the actual validation. A small wrapper rather than a lambda so it's
+    consistent with, and greppable alongside, _make_summary_content_parser
+    (Phase C's own equivalent binder)."""
+    def _parser(text):
+        return _clean_single_summary_response(text, chartable_entry)
+    return _parser
+
+
+def _single_summary_language_text(parsed):
+    """language_text_extractor for this call's JSON-mode content_parser -
+    mirrors Phase C's own _summary_language_text, adapted to this call's
+    "summary" + "visualization" shape: only "summary" is ever prose worth
+    running _detect_language over ("visualization" is column names/enum
+    values, not natural language)."""
+    return parsed.get("summary") or ""
 
 
 def summarize_single_connection_results(user_question, schema, sql, statement_results, provider, client, model,
@@ -3205,16 +3483,38 @@ def summarize_single_connection_results(user_question, schema, sql, statement_re
     ahead of the (empty, here) history and the new prompt), and the SQL/
     results via _build_single_summary_prompt.
 
+    Also decides, ride-along with the summary (see this file's "Single-
+    connection mode's own post-execution results summarization" section
+    comment), whether the results are chartable - _pick_chartable_result
+    computed once here and threaded into both the prompt
+    (_describe_chartable_columns, via _build_single_summary_prompt) and
+    the response validation (_clean_visualization, via
+    _make_single_summary_content_parser), so the two can never disagree
+    about which columns were actually on offer.
+
     GENERATOR (see _summarize_with_retry's own docstring): `yield from`s
     that function directly, so its live 'retrying' progress lines pass
     straight through unchanged - this function adds none of its own.
 
-    Returns (text, usage, error) - see _summarize_with_retry's docstring
-    for the exact meaning of each on success/failure."""
+    Returns (parsed, usage, error) - `parsed` is exactly
+    _clean_single_summary_response's own {"summary", "visualization"}
+    dict, or None on failure (see _summarize_with_retry's docstring for
+    the exact meaning of `usage`/`error` in that case) - NOT yet unwrapped
+    into a plain summary string; that stays the caller's job (see
+    stream_summarize_result below), exactly the same "parsed, not
+    presentation-wrapped" contract summarize_all_mode_results' own
+    {"label", "per_database", "cross_database"} return already has."""
     expected_language_code = _detect_language(user_question)
-    prompt_content = _build_single_summary_prompt(user_question, sql, statement_results, expected_language_code)
+    chartable_entry = _pick_chartable_result(statement_results)
+    prompt_content = _build_single_summary_prompt(
+        user_question, sql, statement_results, chartable_entry, expected_language_code,
+    )
     return (yield from _summarize_with_retry(
         prompt_content, f"Database Schema:\n{schema}\n\n", _SINGLE_SUMMARY_SYSTEM_INSTRUCTION, provider, client, model,
+        content_parser=_make_single_summary_content_parser(chartable_entry),
+        language_text_extractor=_single_summary_language_text,
+        invalid_content_error="response was not the expected {\"summary\": ..., \"visualization\": ...} JSON shape, "
+                               "or \"summary\" itself was empty/label-only",
         api_key=api_key, tried_keys=tried_keys, using_byok=using_byok,
         log_label="Single-connection results summarization", expected_language_code=expected_language_code,
     ))
@@ -3277,7 +3577,7 @@ def summarize_result():
         if callable(close_fn):
             cancel_token, cancel_handle = cancel_registry.register(session_id, close_fn)
         try:
-            text, usage, error = yield from summarize_single_connection_results(
+            parsed, usage, error = yield from summarize_single_connection_results(
                 prompt, schema, sql, statement_results, provider, client, llm_model, api_key=api_key,
                 using_byok=bool(byok_key),
             )
@@ -3288,7 +3588,7 @@ def summarize_result():
                 cancel_handle.close()
         duration = round(1000 * (time.perf_counter() - start_time))
 
-        if text is None:
+        if parsed is None:
             error_message = (
                 format_llm_error_for_user(provider, llm_model, error, using_byok=bool(byok_key))
                 if isinstance(error, BaseException) else
@@ -3307,7 +3607,16 @@ def summarize_result():
             yield json.dumps({'status': 'done', 'success': False, 'error': error_message}) + "\n"
             return
 
-        summary_text = "*** NO SQL *** " + text
+        # `parsed` is summarize_single_connection_results' own
+        # {"summary", "visualization"} dict (see its own docstring) - only
+        # "summary" gets the "*** NO SQL ***" prefix/translations-table
+        # logging treatment; "visualization" (already fully validated
+        # against the real executed columns/rows - see _clean_
+        # visualization) rides along in the response as-is, for client.js
+        # to render as a chart instead of/alongside the results table when
+        # it's not None.
+        summary_text = "*** NO SQL *** " + parsed["summary"]
+        visualization = parsed["visualization"]
         usage_dict = usage or {}
         # Logged as a real translations-table row against the actual connection
         # this was run for (unlike Phase C's "All Pre-Configured Datasets"/"All Pre-Configured Datasets"
@@ -3320,7 +3629,9 @@ def summarize_result():
             usage_dict.get("cached_content_tokens", 0),
         )
 
-        yield json.dumps({'status': 'done', 'success': True, 'summary': summary_text}) + "\n"
+        yield json.dumps({
+            'status': 'done', 'success': True, 'summary': summary_text, 'visualization': visualization,
+        }) + "\n"
 
     resp = Response(stream_with_context(stream_summarize_result()), mimetype='application/x-ndjson')
     return apply_session_cookie(resp, session_id)
@@ -4078,10 +4389,13 @@ def translate_query():
 
             # Anonymous visitors share a single per-session identity
             # (anonymous:<session_id>) rather than a real signed-in one, but
-            # the translation is recorded the same way regardless - both for
-            # aggregate usage/cost visibility (e.g. via export_state.py) and
-            # because anonymous visitors can view/purge their own history via
-            # the app same as anyone else (see history_routes.py).
+            # the translation is recorded the same way regardless - a
+            # write-only audit trail (aggregate usage/cost visibility, e.g.
+            # via export_state.py) with no in-app read/purge surface anymore
+            # (the /api/history endpoint that used to expose it was removed
+            # as dead code once the History modal stopped showing it - see
+            # chat_history_routes.py's module docstring for where that
+            # modal's data actually comes from today).
             record_translation(user_identity, conn_str, prompt, generated_sql, llm_model, duration, input_tokens, output_tokens, total_tokens, thinking_tokens, cached_content_tokens)
 
             yield json.dumps({
