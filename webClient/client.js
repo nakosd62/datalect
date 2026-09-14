@@ -6942,6 +6942,57 @@ document.addEventListener('DOMContentLoaded', async () => {
     return { text: cssVar('--text-secondary', '#94a3b8'), grid: cssVar('--surface-3', 'rgba(148, 163, 184, 0.25)') };
   }
 
+  const DUAL_Y_AXIS_RATIO = 5;
+
+  // Multiple y_columns whose real magnitudes differ wildly (e.g. revenue in
+  // the thousands charted alongside a unit count in the tens) squash the
+  // smaller one flat against zero on a single shared axis before any chart
+  // library even gets involved. Measured directly from THIS turn's real row
+  // data (never the model's own say-so - same "trust the real data over
+  // the model's own judgment" posture as _clean_visualization's own
+  // server-side validation, just applied to an axis-layout decision
+  // instead of a chartability decision): if the single biggest peak value
+  // among all of `yColumns` is at least DUAL_Y_AXIS_RATIO times bigger than
+  // a given column's own peak, that column is moved onto a second,
+  // right-hand axis (Chart.js's own documented `yAxisID`/second-scale
+  // pattern) instead of getting flattened against zero on the shared one.
+  // A single y_column never triggers this - there's nothing to compare it
+  // against - and `series_column` grouping (multiple categories of the
+  // SAME measurement, e.g. one line per region) never does either, since
+  // that only ever produces one y_column to begin with; this is strictly
+  // about genuinely different measurements sharing a chart.
+  function assignYAxisIds(yColumns, rows) {
+    const axisIdByColumn = new Map();
+    if (yColumns.length < 2) {
+      yColumns.forEach((col) => axisIdByColumn.set(col, 'y'));
+      return { axisIdByColumn, usesSecondAxis: false };
+    }
+    const peakByColumn = new Map(yColumns.map((col) => {
+      let peak = 0;
+      rows.forEach((r) => {
+        const v = r[col];
+        if (typeof v === 'number' && Number.isFinite(v)) peak = Math.max(peak, Math.abs(v));
+      });
+      return [col, peak];
+    }));
+    const overallPeak = Math.max(...peakByColumn.values(), 0);
+    yColumns.forEach((col) => {
+      const peak = peakByColumn.get(col);
+      const ratio = peak > 0 ? overallPeak / peak : Infinity;
+      axisIdByColumn.set(col, ratio >= DUAL_Y_AXIS_RATIO ? 'y1' : 'y');
+    });
+    const usesSecondAxis = yColumns.some((col) => axisIdByColumn.get(col) === 'y1')
+      && yColumns.some((col) => axisIdByColumn.get(col) === 'y');
+    if (!usesSecondAxis) {
+      // The split didn't produce two non-empty groups (e.g. every column
+      // read back as all-zero/non-numeric this turn) - fall back to the
+      // single shared axis rather than stranding every column alone on
+      // 'y1' with nothing on the primary axis at all.
+      yColumns.forEach((col) => axisIdByColumn.set(col, 'y'));
+    }
+    return { axisIdByColumn, usesSecondAxis };
+  }
+
   // Removes duplicates from `values` while keeping first-seen order (unlike
   // a plain Set/sort, which would either lose order or impose one the data
   // never had) - used to build a chart's x-axis categories and its list of
@@ -6991,6 +7042,22 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (multiSeries) return String(seriesVal);
       return yCol;
     };
+    // Which y_columns (if any) get split onto a second, right-hand axis -
+    // see assignYAxisIds()'s own docstring. `primaryColumns`/
+    // `secondaryColumns` partition viz.y_columns rather than re-filtering
+    // it repeatedly below.
+    const { axisIdByColumn, usesSecondAxis } = assignYAxisIds(viz.y_columns, rows);
+    const primaryColumns = viz.y_columns.filter((c) => axisIdByColumn.get(c) === 'y');
+    const secondaryColumns = viz.y_columns.filter((c) => axisIdByColumn.get(c) === 'y1');
+    // An axis title: unambiguous (just the one column name) when there's
+    // only one column on that axis. With more than one, the legend (shown
+    // whenever multiY - see commonOptions.plugins.legend below) is what
+    // actually distinguishes them per-dataset; the axis title here just
+    // names the shared measurement(s) plotted on it, joined rather than
+    // picking just the first and silently dropping the rest.
+    const axisTitleFor = (cols) => (cols.length === 1 ? cols[0] : cols.join(' / '));
+    const yAxisTitle = axisTitleFor(primaryColumns);
+    const y1AxisTitle = usesSecondAxis ? axisTitleFor(secondaryColumns) : null;
 
     const commonOptions = {
       responsive: true,
@@ -7011,7 +7078,10 @@ document.addEventListener('DOMContentLoaded', async () => {
             .map((r) => ({ x: r[viz.x_column], y: r[yCol] }))
             .filter((p) => typeof p.x === 'number' && typeof p.y === 'number');
           const color = nextColor();
-          datasets.push({ label: seriesLabel(yCol, seriesVal), data: points, backgroundColor: color, borderColor: color });
+          datasets.push({
+            label: seriesLabel(yCol, seriesVal), data: points, backgroundColor: color, borderColor: color,
+            yAxisID: axisIdByColumn.get(yCol),
+          });
         });
       });
       return {
@@ -7021,7 +7091,16 @@ document.addEventListener('DOMContentLoaded', async () => {
           ...commonOptions,
           scales: {
             x: { title: { display: true, text: viz.x_column, color: axisColors.text }, ticks: { color: axisColors.text }, grid: { color: axisColors.grid } },
-            y: { ticks: { color: axisColors.text }, grid: { color: axisColors.grid } },
+            y: { title: { display: true, text: yAxisTitle, color: axisColors.text }, position: 'left', ticks: { color: axisColors.text }, grid: { color: axisColors.grid } },
+            // Only present when the real data actually calls for it (see
+            // assignYAxisIds) - its own grid is suppressed
+            // (drawOnChartArea: false) so it doesn't draw a second,
+            // misaligned set of gridlines over the primary axis's own.
+            ...(usesSecondAxis ? { y1: {
+              type: 'linear', position: 'right',
+              title: { display: true, text: y1AxisTitle, color: axisColors.text },
+              ticks: { color: axisColors.text }, grid: { drawOnChartArea: false },
+            } } : {}),
           },
         },
       };
@@ -7046,10 +7125,11 @@ document.addEventListener('DOMContentLoaded', async () => {
           return typeof value === 'number' ? value : null;
         });
         const color = nextColor();
+        const axisId = axisIdByColumn.get(yCol);
         datasets.push(
           viz.chart_type === 'line'
-            ? { label: seriesLabel(yCol, seriesVal), data, borderColor: color, backgroundColor: color, tension: 0.15, spanGaps: true }
-            : { label: seriesLabel(yCol, seriesVal), data, backgroundColor: color }
+            ? { label: seriesLabel(yCol, seriesVal), data, borderColor: color, backgroundColor: color, tension: 0.15, spanGaps: true, yAxisID: axisId }
+            : { label: seriesLabel(yCol, seriesVal), data, backgroundColor: color, yAxisID: axisId }
         );
       });
     });
@@ -7059,8 +7139,17 @@ document.addEventListener('DOMContentLoaded', async () => {
       options: {
         ...commonOptions,
         scales: {
-          x: { ticks: { color: axisColors.text }, grid: { color: axisColors.grid } },
-          y: { ticks: { color: axisColors.text }, grid: { color: axisColors.grid }, beginAtZero: true },
+          x: { title: { display: true, text: viz.x_column, color: axisColors.text }, ticks: { color: axisColors.text }, grid: { color: axisColors.grid } },
+          y: { title: { display: true, text: yAxisTitle, color: axisColors.text }, position: 'left', ticks: { color: axisColors.text }, grid: { color: axisColors.grid }, beginAtZero: true },
+          // Only present when the real data actually calls for it (see
+          // assignYAxisIds) - its own grid is suppressed
+          // (drawOnChartArea: false) so it doesn't draw a second,
+          // misaligned set of gridlines over the primary axis's own.
+          ...(usesSecondAxis ? { y1: {
+            type: 'linear', position: 'right',
+            title: { display: true, text: y1AxisTitle, color: axisColors.text },
+            ticks: { color: axisColors.text }, grid: { drawOnChartArea: false }, beginAtZero: true,
+          } } : {}),
         },
       },
     };

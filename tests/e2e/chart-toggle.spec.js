@@ -77,6 +77,14 @@ test.describe('single-connection mode: Table/Chart toggle', () => {
     expect(config.data.datasets).toHaveLength(1);
     expect(config.data.datasets[0].data).toEqual([10, 14, 9]);
     expect(await page.evaluate(() => window.__chartInstanceCount)).toBe(1);
+
+    // Axis labels are always shown (see buildResultsChartConfig()'s own
+    // x/y title options); the legend is not, since there's only one
+    // dataset here (no series_column, one y_column) - nothing for a legend
+    // to distinguish.
+    expect(config.options.scales.x.title).toEqual(expect.objectContaining({ display: true, text: 'day' }));
+    expect(config.options.scales.y.title).toEqual(expect.objectContaining({ display: true, text: 'signups' }));
+    expect(config.options.plugins.legend.display).toBe(false);
   });
 
   test('clicking Table switches to the table view (and destroys the chart); clicking Chart switches back', async ({ page }) => {
@@ -251,6 +259,175 @@ test.describe('single-connection mode: Table/Chart toggle', () => {
     // Let the turn actually finish, so the test doesn't leave an in-flight
     // request hanging past its own end.
     await expect(page.locator('.response-text')).toContainText('Here is two', { timeout: 10000 });
+  });
+});
+
+// Axis labels and legend: every chart shows x/y axis titles named after the
+// real columns being plotted (see buildResultsChartConfig()'s x/y `title`
+// options), and a legend only when there's actually more than one dataset
+// to distinguish - a single series/single y_column chart would just show a
+// legend redundant with its own axis title, so it's suppressed there (see
+// commonOptions.plugins.legend.display in client.js).
+test.describe('chart axis labels and legend', () => {
+  test('a scatter plot gets both axis titles, with no legend for a single series/y_column', async ({ page }) => {
+    await mockTranslate(page, { sql: 'SELECT weight, price FROM products;' });
+    await mockExecute(page, {
+      results: [{
+        columns: ['weight', 'price'],
+        rows: [{ weight: 1.2, price: 20 }, { weight: 2.4, price: 35 }, { weight: 0.8, price: 15 }],
+        rowCount: 3,
+      }],
+    });
+    await mockSummarizeResult(page, {
+      summary: '*** NO SQL *** Results Summary\n\nHeavier products tend to cost more.',
+      visualization: { chart_type: 'scatter', x_column: 'weight', y_columns: ['price'], series_column: null },
+    });
+    await gotoApp(page);
+
+    await page.locator('#aiPrompt').fill('how does weight relate to price');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect(page.locator('.response-text')).toContainText('Heavier products', { timeout: 10000 });
+    await page.locator('#resultsTabsNav .result-tab-btn').nth(1).click();
+
+    const config = await page.evaluate(() => window.__lastChartConfig);
+    expect(config.type).toBe('scatter');
+    expect(config.options.scales.x.title).toEqual(expect.objectContaining({ display: true, text: 'weight' }));
+    expect(config.options.scales.y.title).toEqual(expect.objectContaining({ display: true, text: 'price' }));
+    expect(config.options.plugins.legend.display).toBe(false);
+  });
+
+  // signups peaks at 14, churned at 4 - under DUAL_Y_AXIS_RATIO (5x), so
+  // this is deliberately the "share one axis" case; see the dedicated
+  // "dual y-axes" describe block below for the >=5x split itself.
+  test('multiple y_columns of a similar scale show a legend, and share one y-axis whose title names both', async ({ page }) => {
+    await mockTranslate(page, { sql: 'SELECT day, signups, churned FROM daily_stats;' });
+    await mockExecute(page, {
+      results: [{
+        columns: ['day', 'signups', 'churned'],
+        rows: [{ day: 'Mon', signups: 10, churned: 3 }, { day: 'Tue', signups: 14, churned: 4 }],
+        rowCount: 2,
+      }],
+    });
+    await mockSummarizeResult(page, {
+      summary: '*** NO SQL *** Results Summary\n\nSignups outpaced churn both days.',
+      visualization: { chart_type: 'line', x_column: 'day', y_columns: ['signups', 'churned'], series_column: null },
+    });
+    await gotoApp(page);
+
+    await page.locator('#aiPrompt').fill('compare signups and churn by day');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect(page.locator('.response-text')).toContainText('outpaced churn', { timeout: 10000 });
+    await page.locator('#resultsTabsNav .result-tab-btn').nth(1).click();
+
+    const config = await page.evaluate(() => window.__lastChartConfig);
+    expect(config.data.datasets).toHaveLength(2);
+    expect(config.options.plugins.legend.display).toBe(true);
+    expect(config.options.scales.x.title).toEqual(expect.objectContaining({ display: true, text: 'day' }));
+    expect(config.options.scales.y.title).toEqual(expect.objectContaining({ display: true, text: 'signups / churned' }));
+    expect(config.options.scales.y1).toBeUndefined();
+    expect(config.data.datasets.every((d) => d.yAxisID === 'y')).toBe(true);
+  });
+});
+
+// Dual y-axes: two y_columns whose real values differ wildly in scale (5x
+// or more, peak-to-peak - see client.js's assignYAxisIds()) would otherwise
+// squash the smaller one flat against zero on a single shared axis. See
+// that function's own docstring for the exact rule and the "compare every
+// column to the single largest peak" reasoning.
+test.describe('chart dual y-axes for wildly different scales', () => {
+  test('a >=5x scale difference splits onto a second, right-hand axis', async ({ page }) => {
+    await mockTranslate(page, { sql: 'SELECT day, revenue, orders FROM daily_sales;' });
+    await mockExecute(page, {
+      results: [{
+        columns: ['day', 'revenue', 'orders'],
+        // revenue peaks at 5000, orders at 40 - a 125x difference, well
+        // past the 5x threshold.
+        rows: [{ day: 'Mon', revenue: 3000, orders: 30 }, { day: 'Tue', revenue: 5000, orders: 40 }],
+        rowCount: 2,
+      }],
+    });
+    await mockSummarizeResult(page, {
+      summary: '*** NO SQL *** Results Summary\n\nRevenue and orders both grew.',
+      visualization: { chart_type: 'line', x_column: 'day', y_columns: ['revenue', 'orders'], series_column: null },
+    });
+    await gotoApp(page);
+
+    await page.locator('#aiPrompt').fill('compare revenue and orders by day');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect(page.locator('.response-text')).toContainText('both grew', { timeout: 10000 });
+    await page.locator('#resultsTabsNav .result-tab-btn').nth(1).click();
+
+    const config = await page.evaluate(() => window.__lastChartConfig);
+    // The big-magnitude column stays on the primary (left) axis...
+    expect(config.options.scales.y.position).toBe('left');
+    expect(config.options.scales.y.title).toEqual(expect.objectContaining({ display: true, text: 'revenue' }));
+    // ...the small one gets its own right-hand axis, own title, and a grid
+    // suppressed on the chart area (so it doesn't draw a second, misaligned
+    // set of gridlines over the primary axis's own).
+    expect(config.options.scales.y1).toBeTruthy();
+    expect(config.options.scales.y1.position).toBe('right');
+    expect(config.options.scales.y1.title).toEqual(expect.objectContaining({ display: true, text: 'orders' }));
+    expect(config.options.scales.y1.grid.drawOnChartArea).toBe(false);
+
+    const revenueDataset = config.data.datasets.find((d) => d.label === 'revenue');
+    const ordersDataset = config.data.datasets.find((d) => d.label === 'orders');
+    expect(revenueDataset.yAxisID).toBe('y');
+    expect(ordersDataset.yAxisID).toBe('y1');
+  });
+
+  test('a scale difference just under 5x stays on one shared axis', async ({ page }) => {
+    await mockTranslate(page, { sql: 'SELECT day, revenue, orders FROM daily_sales;' });
+    await mockExecute(page, {
+      results: [{
+        columns: ['day', 'revenue', 'orders'],
+        // 196 / 40 = 4.9x - deliberately just under the 5x threshold.
+        rows: [{ day: 'Mon', revenue: 150, orders: 30 }, { day: 'Tue', revenue: 196, orders: 40 }],
+        rowCount: 2,
+      }],
+    });
+    await mockSummarizeResult(page, {
+      summary: '*** NO SQL *** Results Summary\n\nRevenue and orders both grew.',
+      visualization: { chart_type: 'line', x_column: 'day', y_columns: ['revenue', 'orders'], series_column: null },
+    });
+    await gotoApp(page);
+
+    await page.locator('#aiPrompt').fill('compare revenue and orders by day');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect(page.locator('.response-text')).toContainText('both grew', { timeout: 10000 });
+    await page.locator('#resultsTabsNav .result-tab-btn').nth(1).click();
+
+    const config = await page.evaluate(() => window.__lastChartConfig);
+    expect(config.options.scales.y1).toBeUndefined();
+    expect(config.options.scales.y.title).toEqual(expect.objectContaining({ display: true, text: 'revenue / orders' }));
+    expect(config.data.datasets.every((d) => d.yAxisID === 'y')).toBe(true);
+  });
+
+  test('a scatter plot with two wildly different y_columns also splits its axes', async ({ page }) => {
+    await mockTranslate(page, { sql: 'SELECT hour, revenue, orders FROM hourly_sales;' });
+    await mockExecute(page, {
+      results: [{
+        columns: ['hour', 'revenue', 'orders'],
+        rows: [{ hour: 1, revenue: 3000, orders: 30 }, { hour: 2, revenue: 5000, orders: 40 }],
+        rowCount: 2,
+      }],
+    });
+    await mockSummarizeResult(page, {
+      summary: '*** NO SQL *** Results Summary\n\nBoth revenue and orders tracked together by hour.',
+      visualization: { chart_type: 'scatter', x_column: 'hour', y_columns: ['revenue', 'orders'], series_column: null },
+    });
+    await gotoApp(page);
+
+    await page.locator('#aiPrompt').fill('plot revenue and orders by hour');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect(page.locator('.response-text')).toContainText('tracked together', { timeout: 10000 });
+    await page.locator('#resultsTabsNav .result-tab-btn').nth(1).click();
+
+    const config = await page.evaluate(() => window.__lastChartConfig);
+    expect(config.type).toBe('scatter');
+    expect(config.options.scales.y1).toBeTruthy();
+    expect(config.options.scales.y1.title).toEqual(expect.objectContaining({ text: 'orders' }));
+    const ordersDataset = config.data.datasets.find((d) => d.label === 'orders');
+    expect(ordersDataset.yAxisID).toBe('y1');
   });
 });
 
