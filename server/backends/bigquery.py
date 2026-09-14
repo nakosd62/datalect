@@ -40,7 +40,6 @@ connections) are responsible for populating billing_project_id sensibly -
 see their comments for the actual defaulting rules.
 """
 
-import decimal
 import json
 
 from google.cloud import bigquery
@@ -50,6 +49,7 @@ import sqlparse
 from .base import (
     Backend, SqlExecutionError, SCHEMA_MAX_TABLE_NAMES_SCANNED, SCHEMA_MAX_TABLES,
     group_date_sharded_tables, cap_kept_tables, cap_schema_text,
+    EXECUTE_RESULTS_MAX_ROWS, normalize_cell_value,
 )
 
 
@@ -282,38 +282,47 @@ class BigQueryBackend(Backend):
 
             try:
                 query_job = self._run(connection, stmt_clean)
-                result = query_job.result()
+                # max_results here is BigQuery's own, API-level equivalent
+                # of the other backends' cursor.fetchmany(EXECUTE_RESULTS_MAX_ROWS)
+                # (see backends/base.py's EXECUTE_RESULTS_MAX_ROWS docstring)
+                # - the RowIterator this returns simply never yields more
+                # than that many rows, and never asks the API for more
+                # pages than it takes to produce them, so a query matching
+                # millions of rows never gets iterated in full here either.
+                result = query_job.result(max_results=EXECUTE_RESULTS_MAX_ROWS)
 
                 columns = None
                 rows = None
+                truncated = False
 
                 if result.schema:
                     columns = [field.name for field in result.schema]
                     rows = []
                     for row in result:
-                        row_dict = {}
-                        for col in columns:
-                            val = row[col]
-                            if hasattr(val, 'isoformat'):
-                                val = val.isoformat()
-                            elif isinstance(val, decimal.Decimal):
-                                val = float(val)
-                            elif isinstance(val, bytes):
-                                val = val.decode('utf-8', errors='replace')
-                            row_dict[col] = val
-                        rows.append(row_dict)
+                        rows.append({col: normalize_cell_value(row[col]) for col in columns})
                     count = len(rows)
+                    # RowIterator.total_rows reflects the query's REAL total
+                    # result size regardless of max_results above (it's
+                    # populated from the job's own metadata, not by
+                    # counting what this iterator actually yielded) - so
+                    # this is a real truncation check, not a guess from
+                    # count == the cap.
+                    total_rows = getattr(result, 'total_rows', None)
+                    truncated = total_rows is not None and total_rows > count
                 else:
                     # DML (INSERT/UPDATE/DELETE/MERGE) or DDL - no result rows.
                     affected = getattr(query_job, 'num_dml_affected_rows', None)
                     count = affected if affected is not None else 0
 
-                results.append({
+                result_entry = {
                     'statement': stmt_clean,
                     'columns': columns,
                     'rows': rows,
                     'rowCount': count,
-                })
+                }
+                if truncated:
+                    result_entry['truncated'] = True
+                results.append(result_entry)
             except Exception as e:
                 # Don't let a mid-script failure silently drop every
                 # result already collected in `results` - see

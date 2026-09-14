@@ -1,17 +1,26 @@
 """
 Pure-function tests for backends/base.py's schema-size-limiting helpers:
-group_date_sharded_tables, cap_kept_tables, cap_schema_text. No app/Flask
-involvement needed - these are dependency-free over plain data.
+group_date_sharded_tables, cap_kept_tables, cap_schema_text - plus
+normalize_cell_value/fetch_capped_rows, the query-execution row-cap helpers
+every DB-API-cursor backend's execute() shares (see EXECUTE_RESULTS_MAX_ROWS's
+own docstring for why the cap exists at all). No app/Flask involvement
+needed - these are dependency-free over plain data (fetch_capped_rows against
+a minimal local fake cursor, not a real driver).
 """
 
 import sys
+from datetime import date
+from decimal import Decimal
 
 from helpers import SERVER_DIR
 
 if SERVER_DIR not in sys.path:
     sys.path.insert(0, SERVER_DIR)
 
-from backends.base import Backend, group_date_sharded_tables, cap_kept_tables, cap_schema_text
+from backends.base import (
+    Backend, group_date_sharded_tables, cap_kept_tables, cap_schema_text,
+    normalize_cell_value, fetch_capped_rows,
+)
 
 
 # --- Backend.liveness_sql ----------------------------------------------------
@@ -174,3 +183,125 @@ def test_cap_schema_text_falls_back_to_hard_cut_when_no_paragraph_boundary():
     capped = cap_schema_text(text, max_chars=50)
     assert capped.startswith("A" * 50)
     assert "schema truncated" in capped
+
+
+# --- normalize_cell_value -----------------------------------------------------
+
+def test_normalize_cell_value_converts_dates_via_isoformat():
+    assert normalize_cell_value(date(2024, 1, 15)) == "2024-01-15"
+
+
+def test_normalize_cell_value_converts_decimal_to_float():
+    val = normalize_cell_value(Decimal("19.99"))
+    assert val == 19.99
+    assert isinstance(val, float)
+
+
+def test_normalize_cell_value_decodes_bytes_as_utf8():
+    assert normalize_cell_value(b"raw-bytes") == "raw-bytes"
+
+
+def test_normalize_cell_value_replaces_undecodable_bytes_instead_of_raising():
+    assert normalize_cell_value(b"\xff\xfe") == "��"
+
+
+def test_normalize_cell_value_passes_through_plain_values_unchanged():
+    assert normalize_cell_value(42) == 42
+    assert normalize_cell_value("plain string") == "plain string"
+    assert normalize_cell_value(None) is None
+
+
+def test_normalize_cell_value_catches_a_decimal_like_type_named_decimal_without_to_eng_string():
+    # A defensive last resort for a driver-specific decimal type that
+    # doesn't happen to implement to_eng_string - see this helper's own
+    # docstring. type(val).__name__ == 'Decimal' is what has to catch it.
+    class Decimal:  # shadows the real one deliberately, for this one test
+        def __init__(self, value):
+            self._value = value
+
+        def __float__(self):
+            return float(self._value)
+
+    assert normalize_cell_value(Decimal("3.5")) == 3.5
+
+
+# --- fetch_capped_rows ---------------------------------------------------------
+# A minimal local fake, not helpers.FakePgCursor - fetch_capped_rows only
+# ever touches .description/.fetchmany()/.fetchone(), so this is deliberately
+# simpler than the full scripted-response cursor every backend's own
+# execute() test file drives against.
+
+class _FakeCappingCursor:
+    def __init__(self, columns, rows):
+        self.description = [(c,) for c in columns]
+        self._rows = rows
+        self._pos = 0
+
+    def fetchmany(self, size):
+        chunk = self._rows[self._pos:self._pos + size]
+        self._pos += len(chunk)
+        return chunk
+
+    def fetchone(self):
+        if self._pos >= len(self._rows):
+            return None
+        row = self._rows[self._pos]
+        self._pos += 1
+        return row
+
+
+def test_fetch_capped_rows_returns_every_row_untruncated_when_under_the_cap():
+    cursor = _FakeCappingCursor(["id", "name"], [(1, "Alice"), (2, "Bob")])
+    columns, rows, truncated = fetch_capped_rows(cursor, max_rows=10)
+    assert columns == ["id", "name"]
+    assert rows == [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]
+    assert truncated is False
+
+
+def test_fetch_capped_rows_stops_at_max_rows_and_flags_truncated():
+    all_rows = [(i,) for i in range(10)]
+    cursor = _FakeCappingCursor(["n"], all_rows)
+    columns, rows, truncated = fetch_capped_rows(cursor, max_rows=3)
+    assert rows == [{"n": 0}, {"n": 1}, {"n": 2}]
+    assert truncated is True
+
+
+def test_fetch_capped_rows_exactly_at_the_cap_is_not_truncated():
+    # The result set has EXACTLY max_rows rows, not one more - the extra
+    # fetchone() check must correctly see nothing left rather than
+    # false-flagging this as truncated.
+    all_rows = [(i,) for i in range(3)]
+    cursor = _FakeCappingCursor(["n"], all_rows)
+    columns, rows, truncated = fetch_capped_rows(cursor, max_rows=3)
+    assert len(rows) == 3
+    assert truncated is False
+
+
+def test_fetch_capped_rows_never_fetches_more_than_max_rows_plus_one():
+    # The whole point of this cap (see EXECUTE_RESULTS_MAX_ROWS's own
+    # docstring) is to never pull an unbounded result set into memory -
+    # fetchmany(max_rows) plus exactly one fetchone() is the entire fetch
+    # footprint regardless of how many millions of rows actually exist
+    # server-side beyond the cap.
+    class _CountingCursor(_FakeCappingCursor):
+        def __init__(self, columns, total_rows):
+            super().__init__(columns, [(i,) for i in range(total_rows)])
+            self.fetchmany_calls = []
+
+        def fetchmany(self, size):
+            self.fetchmany_calls.append(size)
+            return super().fetchmany(size)
+
+    cursor = _CountingCursor(["n"], 5_000_000)
+    columns, rows, truncated = fetch_capped_rows(cursor, max_rows=100)
+    assert len(rows) == 100
+    assert truncated is True
+    assert cursor.fetchmany_calls == [100]  # exactly one fetchmany call
+    assert cursor._pos == 101  # 100 fetched + 1 discarded truncation probe
+
+
+def test_fetch_capped_rows_applies_normalize_cell_value_to_every_cell():
+    cursor = _FakeCappingCursor(["price", "d"], [(Decimal("9.99"), date(2024, 1, 1))])
+    columns, rows, truncated = fetch_capped_rows(cursor, max_rows=10)
+    assert rows == [{"price": 9.99, "d": "2024-01-01"}]
+    assert isinstance(rows[0]["price"], float)

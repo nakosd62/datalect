@@ -73,6 +73,11 @@ class _FakeCursor:
         self._conn = conn
         self.description = None
         self._next_rows = []
+        # See helpers.FakePgCursor's own _pos - fetch_capped_rows
+        # (backends/base.py) does one fetchmany(N) then one fetchone(),
+        # which only means what it's supposed to if fetchone() continues
+        # from where fetchmany() left off rather than re-reading row 0.
+        self._pos = 0
         self.closed = False
 
     def tables(self, tableType=None):
@@ -89,6 +94,7 @@ class _FakeCursor:
         if isinstance(response, Exception):
             raise response
         columns, rows = response
+        self._pos = 0
         if columns is None:
             self.description = None
             self._next_rows = []
@@ -97,7 +103,23 @@ class _FakeCursor:
             self._next_rows = list(rows)
 
     def fetchall(self):
-        return self._next_rows
+        chunk = self._next_rows[self._pos:]
+        self._pos = len(self._next_rows)
+        return chunk
+
+    def fetchmany(self, size=None):
+        if size is None:
+            size = len(self._next_rows) - self._pos
+        chunk = self._next_rows[self._pos:self._pos + size]
+        self._pos += len(chunk)
+        return chunk
+
+    def fetchone(self):
+        if self._pos >= len(self._next_rows):
+            return None
+        row = self._next_rows[self._pos]
+        self._pos += 1
+        return row
 
     def close(self):
         self.closed = True
@@ -458,3 +480,25 @@ def test_execute_wraps_a_real_driver_error_mid_script():
     err = exc_info.value
     assert len(err.results) == 1
     assert "connection reset" in str(err)
+
+
+# --- execute(): EXECUTE_RESULTS_MAX_ROWS cap ----------------------------------
+# See test_postgres_backend.py's identically-named tests for the full
+# rationale - this just proves MongoSqlBackend routes through the same
+# shared fetch_capped_rows() (backends/base.py) instead of its own
+# fetchall() loop.
+
+def test_execute_caps_rows_and_flags_truncated_past_the_default_limit():
+    from backends.base import EXECUTE_RESULTS_MAX_ROWS
+    rows = [(i,) for i in range(EXECUTE_RESULTS_MAX_ROWS + 1)]
+    conn = _FakeConnection(statement_responses=[(["n"], rows)])
+    results = MongoSqlBackend().execute(conn, "SELECT n FROM huge_collection")
+    assert results[0]["rowCount"] == EXECUTE_RESULTS_MAX_ROWS
+    assert len(results[0]["rows"]) == EXECUTE_RESULTS_MAX_ROWS
+    assert results[0]["truncated"] is True
+
+
+def test_execute_omits_truncated_key_entirely_when_not_truncated():
+    conn = _FakeConnection(statement_responses=[(["id", "name"], [(1, "Alice")])])
+    results = MongoSqlBackend().execute(conn, "SELECT id, name FROM users")
+    assert "truncated" not in results[0]

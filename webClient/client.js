@@ -765,6 +765,21 @@ document.addEventListener('DOMContentLoaded', async () => {
   let currentResultsList = [];
   let activeResultIndex = 0;
 
+  // In-browser column sort for the currently-rendered results table (see
+  // renderTableResult()'s sortable-header wiring and handleSortableColumn
+  // Click() below) - purely client-side, re-sorting the already-fetched
+  // `result.rows` array in place in the DOM; no server call, and nothing
+  // written to disk/localStorage/history, so it's intentionally NOT kept
+  // anywhere `result` itself is persisted (chatStore, etc.). Tracks which
+  // result object (by reference) and column index is currently sorted, plus
+  // the direction, so a second click on the SAME header toggles instead of
+  // re-applying the type default. Reset to null at the top of every
+  // renderTableResult() call (same "reset first" posture as the other resets
+  // there), so switching tabs or running a new query always starts unsorted
+  // - only repeated clicks on one already-rendered table's own header
+  // accumulate toggling state.
+  let currentTableSortState = null;
+
   // Report Error / Report Wrong Result (see report_routes.py's module
   // docstring, and setReportContext()/reportButtonHtml() below) - True
   // once GET /api/config's 'issue_reporting_enabled' confirms a deployer
@@ -1341,6 +1356,13 @@ document.addEventListener('DOMContentLoaded', async () => {
   const resultsTableWrapper = document.getElementById('resultsTableWrapper');
   const resultsChartWrapper = document.getElementById('resultsChartWrapper');
   const resultsChartCanvas = document.getElementById('resultsChartCanvas');
+  // Visible counterpart to a result's own "truncated" flag (see
+  // backends/base.py's EXECUTE_RESULTS_MAX_ROWS/fetch_capped_rows) - a
+  // query that genuinely matched more rows than that cap gets its data
+  // silently capped server-side (to avoid the out-of-memory crash an
+  // unbounded fetch/JSON payload would cause), so this is what tells the
+  // user they're looking at a partial result rather than the whole thing.
+  const resultsTruncatedNotice = document.getElementById('resultsTruncatedNotice');
 
   // DOM Elements - Report Error / Report Wrong Result (see
   // setReportContext()/reportButtonHtml() and openReportIssueModal()
@@ -2056,6 +2078,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (resultsChartWrapper) resultsChartWrapper.classList.add('hidden');
     if (resultsTableWrapper) resultsTableWrapper.classList.remove('hidden');
     destroyResultsChart();
+    // Same reasoning as the chart reset just above - a truncation notice
+    // left over from the PREVIOUS turn's result must not linger through a
+    // "cleared" results area either.
+    if (resultsTruncatedNotice) resultsTruncatedNotice.classList.add('hidden');
   }
 
   // Shown at the top of the results area (above the tabs/table, see
@@ -5936,6 +5962,163 @@ document.addEventListener('DOMContentLoaded', async () => {
     return lines.join('\n');
   }
 
+  // In-browser column sort for a results table (see currentTableSortState's
+  // own comment for the overall design - purely client-side, no server call,
+  // nothing persisted). Everything below this comment and above
+  // renderTableResult() supports that one feature.
+
+  // Looks at a sample of this column's own actual values (not any
+  // server-declared SQL type - none of the four supported result shapes
+  // carry one this far) to decide how clicking its header should sort:
+  // 'number' and 'datetime' both default to DESC (see
+  // handleSortableColumnClick()), everything else ('string', including
+  // booleans and anything ambiguous) defaults to ASC. Only ever called when
+  // result.rows has at least 2 rows (see isSortable in renderTableResult()),
+  // so there's always at least one value to sample.
+  function classifySortableColumnType(rows, col) {
+    const SAMPLE_LIMIT = 25;
+    let sampleCount = 0;
+    let numericCount = 0;
+    let dateCount = 0;
+    // Matches backends/base.py's normalize_cell_value() output shapes:
+    // real dates/timestamps arrive as ISO-ish strings (isoformat()), never
+    // as a JS Date - so a plain numeric string ("2024") must be checked
+    // for FIRST, or every 4-digit year-like number would misclassify as a
+    // date column.
+    const DATE_RE = /^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?$/;
+    for (let i = 0; i < rows.length && sampleCount < SAMPLE_LIMIT; i++) {
+      const val = rows[i][col];
+      if (val === null || val === undefined || val === '') continue;
+      sampleCount++;
+      if (typeof val === 'number') {
+        numericCount++;
+        continue;
+      }
+      if (typeof val !== 'string') continue; // booleans/objects - counted as sampled, not numeric/date, so they pull toward 'string'
+      if (/^-?\d+(\.\d+)?$/.test(val)) {
+        numericCount++;
+      } else if (DATE_RE.test(val) && !isNaN(Date.parse(val))) {
+        dateCount++;
+      }
+    }
+    if (sampleCount === 0) return 'string';
+    if (numericCount / sampleCount >= 0.8) return 'number';
+    if (dateCount / sampleCount >= 0.8) return 'datetime';
+    return 'string';
+  }
+
+  // NULL/empty always sort to the bottom regardless of direction (handled by
+  // the caller's comparator wrapper, not here) - this only orders two actual
+  // values against each other.
+  function compareSortableValues(a, b, colType) {
+    if (colType === 'number') {
+      const an = typeof a === 'number' ? a : parseFloat(a);
+      const bn = typeof b === 'number' ? b : parseFloat(b);
+      if (Number.isNaN(an) && Number.isNaN(bn)) return 0;
+      if (Number.isNaN(an)) return 1;
+      if (Number.isNaN(bn)) return -1;
+      return an - bn;
+    }
+    if (colType === 'datetime') {
+      const at = Date.parse(a);
+      const bt = Date.parse(b);
+      return at - bt;
+    }
+    return String(a).localeCompare(String(b), undefined, { numeric: true, sensitivity: 'base' });
+  }
+
+  // Sorts a NEW array - never mutates result.rows in place. That array is
+  // also what a chart (Table/Chart toggle, above) would render if the user
+  // switches views, and a chart - a time series in particular - generally
+  // depends on its own natural row order, so a table-only sort must not
+  // silently reorder it out from under the chart.
+  function sortRowsByColumn(rows, col, colType, direction) {
+    const withIndex = rows.map((row, idx) => ({ row, idx }));
+    withIndex.sort((a, b) => {
+      const av = a.row[col];
+      const bv = b.row[col];
+      const aEmpty = av === null || av === undefined || av === '';
+      const bEmpty = bv === null || bv === undefined || bv === '';
+      if (aEmpty && bEmpty) return a.idx - b.idx; // stable
+      if (aEmpty) return 1; // NULLs last, regardless of direction
+      if (bEmpty) return -1;
+      const cmp = compareSortableValues(av, bv, colType);
+      if (cmp !== 0) return direction === 'asc' ? cmp : -cmp;
+      return a.idx - b.idx; // stable tie-break
+    });
+    return withIndex.map((entry) => entry.row);
+  }
+
+  // Builds one <tr> of data cells - shared by renderTableResult()'s initial
+  // render and handleSortableColumnClick()'s re-render below, so the two
+  // never drift apart on cell markup.
+  function buildResultDataRow(columns, row) {
+    const tr = document.createElement('tr');
+    tr.classList.add('result-data-row');
+    columns.forEach((col) => {
+      const td = document.createElement('td');
+      const val = row[col];
+      td.textContent = val !== null && val !== undefined ? val : 'NULL';
+      td.classList.add('cell-multiline');
+      if (val === null || val === undefined) td.classList.add('text-null');
+      tr.appendChild(td);
+    });
+    return tr;
+  }
+
+  // Updates every sortable header's arrow indicator to reflect which column
+  // (if any) is currently sorted - called once right after a sort so
+  // exactly one header shows an arrow at a time.
+  function updateSortIndicatorArrows(sortedColIndex, direction) {
+    if (!resultsHeader) return;
+    const headerCells = resultsHeader.querySelectorAll('th.sortable-col');
+    headerCells.forEach((th, idx) => {
+      const arrow = th.querySelector('.sortable-col-arrow');
+      if (!arrow) return;
+      th.classList.toggle('sortable-col--active', idx === sortedColIndex);
+      arrow.textContent = idx === sortedColIndex ? (direction === 'asc' ? '▲' : '▼') : '';
+    });
+  }
+
+  // Click handler for a sortable column header (see renderTableResult()'s
+  // isSortable branch, which wires this up). Re-sorts and re-renders just
+  // this table's own data rows in place - never touches result.rows itself
+  // (see sortRowsByColumn()'s own comment on why), never calls the server,
+  // and nothing here is written anywhere persistent: currentTableSortState
+  // is reset to null at the top of every renderTableResult() call, so this
+  // is purely a same-tab, same-render convenience.
+  function handleSortableColumnClick(result, colIndex, colType) {
+    if (!resultsBody || !result || !result.rows || result.rows.length === 0) return;
+    const col = result.columns[colIndex];
+    let direction;
+    if (currentTableSortState && currentTableSortState.result === result && currentTableSortState.colIndex === colIndex) {
+      // Second (or later) click on the SAME header - toggle.
+      direction = currentTableSortState.direction === 'asc' ? 'desc' : 'asc';
+    } else {
+      // First click on this header (or a click on a different header) -
+      // the type default: ASC for strings, DESC for numbers/datetimes.
+      direction = (colType === 'number' || colType === 'datetime') ? 'desc' : 'asc';
+    }
+    currentTableSortState = { result, colIndex, direction };
+
+    const sortedRows = sortRowsByColumn(result.rows, col, colType, direction);
+
+    // Replace only the actual data rows - a notices row (if any) sits above
+    // them and a report-issue row (if any) sits below them, in the same
+    // #resultsBody <tbody>, and both need to stay exactly where they are.
+    const anchor = resultsBody.querySelector('tr.report-issue-row');
+    const fragment = document.createDocumentFragment();
+    sortedRows.forEach((row) => fragment.appendChild(buildResultDataRow(result.columns, row)));
+    resultsBody.querySelectorAll('tr.result-data-row').forEach((tr) => tr.remove());
+    if (anchor) {
+      resultsBody.insertBefore(fragment, anchor);
+    } else {
+      resultsBody.appendChild(fragment);
+    }
+
+    updateSortIndicatorArrows(colIndex, direction);
+  }
+
   function renderTableResult(result) {
     if (!resultsHeader || !resultsBody) return;
     resultsHeader.innerHTML = '';
@@ -5961,6 +6144,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (resultsChartWrapper) resultsChartWrapper.classList.add('hidden');
     if (resultsTableWrapper) resultsTableWrapper.classList.remove('hidden');
     destroyResultsChart();
+    // Same reset-first posture as the toggle/chart-wrapper lines just
+    // above - only the successful, non-empty tabular branch below ever
+    // turns this back on, and only when THIS tab's own result was
+    // actually truncated; every other branch (and every other tab) must
+    // not inherit a previous tab's notice.
+    if (resultsTruncatedNotice) resultsTruncatedNotice.classList.add('hidden');
+    // Column sort (see currentTableSortState's own comment) - every fresh
+    // render (a tab switch, a new query, a re-execute) starts unsorted;
+    // only clicks on this render's own header accumulate toggle state.
+    currentTableSortState = null;
 
     // "All databases" mode's live-streaming placeholder tab (see
     // startAllModeStreaming()) - stands in for one selected connection
@@ -6187,26 +6380,44 @@ document.addEventListener('DOMContentLoaded', async () => {
       return;
     }
 
+    // Only worth making headers clickable when there's actually more than
+    // one row to reorder - classifySortableColumnType() samples result.rows,
+    // so it needs that array to exist and be non-empty anyway.
+    const isSortable = !!(result.rows && result.rows.length > 1);
+
     if (result.columns && result.columns.length > 0) {
-      result.columns.forEach(col => {
+      result.columns.forEach((col, colIndex) => {
         const th = document.createElement('th');
-        th.textContent = col;
+        if (isSortable) {
+          // Sortable column header (see handleSortableColumnClick() below) -
+          // classified once per column from a sample of this result's own
+          // rows, not from any server-provided type, since the row-cap/
+          // truncation feature above is the only place a backend's own
+          // column typing already got threaded this far, and even that's
+          // SQL-dialect column names, not JS-usable type tags.
+          const colType = classifySortableColumnType(result.rows, col);
+          th.classList.add('sortable-col');
+          th.title = 'Click to sort';
+          const labelSpan = document.createElement('span');
+          labelSpan.className = 'sortable-col-label';
+          labelSpan.textContent = col;
+          const arrowSpan = document.createElement('span');
+          arrowSpan.className = 'sortable-col-arrow';
+          th.appendChild(labelSpan);
+          th.appendChild(arrowSpan);
+          th.addEventListener('click', () => {
+            handleSortableColumnClick(result, colIndex, colType);
+          });
+        } else {
+          th.textContent = col;
+        }
         resultsHeader.appendChild(th);
       });
     }
 
     if (result.rows && result.rows.length > 0) {
       result.rows.forEach(row => {
-        const tr = document.createElement('tr');
-        result.columns.forEach(col => {
-          const td = document.createElement('td');
-          const val = row[col];
-          td.textContent = val !== null && val !== undefined ? val : 'NULL';
-
-          td.classList.add('cell-multiline');
-          if (val === null || val === undefined) td.classList.add('text-null');
-          tr.appendChild(td);
-        });
+        const tr = buildResultDataRow(result.columns, row);
         resultsBody.appendChild(tr);
       });
       setReportContext({
@@ -6216,6 +6427,16 @@ document.addEventListener('DOMContentLoaded', async () => {
         content: (hasNotices ? result.notices.join('\n') + '\n\n' : '') + summarizeTabularResultForReport(result),
       });
       resultsBody.insertAdjacentHTML('beforeend', reportButtonRowHtml('wrong_result', result.columns.length));
+
+      // Truncation notice (see resultsTruncatedNotice's own comment near
+      // its DOM ref, and backends/base.py's EXECUTE_RESULTS_MAX_ROWS) -
+      // never silent: a result cut off at the cap is shown as exactly
+      // that, not as if it were the complete answer.
+      if (result.truncated && resultsTruncatedNotice) {
+        resultsTruncatedNotice.textContent =
+          `⚠️ Showing the first ${result.rowCount.toLocaleString()} rows only — this query matched more rows than that.`;
+        resultsTruncatedNotice.classList.remove('hidden');
+      }
 
       // Table/Chart toggle (see this feature's own section comment above
       // requestSingleModeResultsSummary()) - only ever appears for the one
@@ -6308,7 +6529,14 @@ document.addEventListener('DOMContentLoaded', async () => {
         btn.textContent = `${dbLabel}Query ${idx + 1} (Error)`;
       } else {
         const count = res.rowCount !== undefined ? res.rowCount : (res.rows ? res.rows.length : 0);
-        const rowLabel = count === 1 ? '1 row' : `${count} rows`;
+        // A "+" after the count is the tab strip's own half of the
+        // truncation signal (see EXECUTE_RESULTS_MAX_ROWS/fetch_capped_rows
+        // in backends/base.py, and renderTableResult()'s own banner for the
+        // other half) - makes it visible even before the user opens this
+        // tab, and even if they never read the banner inside it.
+        const rowLabel = res.truncated
+          ? `${count.toLocaleString()}+ rows`
+          : (count === 1 ? '1 row' : `${count} rows`);
         // The chart badge is appended to the label text itself (not just
         // the `.result-tab-btn--chartable` color class) so it survives
         // being read as plain text (title attribute, screen readers,

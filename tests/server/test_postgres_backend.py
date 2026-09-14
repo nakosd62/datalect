@@ -495,3 +495,37 @@ def test_execute_ignores_blank_statements_between_semicolons():
     # sqlparse.split + the blank-statement guard should collapse the
     # trailing empty statements down to just the one real query.
     assert len(results) == 1
+
+
+# --- execute(): EXECUTE_RESULTS_MAX_ROWS cap ----------------------------------
+# Regression coverage for the crash this cap exists to prevent - see
+# backends/base.py's EXECUTE_RESULTS_MAX_ROWS/fetch_capped_rows docstrings.
+# PostgresBackend.execute() must go through fetch_capped_rows() (a bare
+# cursor.fetchall() on a real result set is exactly the unbounded-memory
+# failure mode being fixed), so these exercise that wiring specifically,
+# against the REAL default cap - fetch_capped_rows()'s own cap/truncation-
+# detection logic is covered exhaustively (every row count relative to the
+# cap) in test_backend_base_helpers.py; this just proves Postgres actually
+# routes through it instead of its own inline fetchall() loop.
+
+def test_execute_caps_rows_and_flags_truncated_past_the_default_limit():
+    from backends.base import EXECUTE_RESULTS_MAX_ROWS
+    rows = [(i,) for i in range(EXECUTE_RESULTS_MAX_ROWS + 1)]
+    responses = [(rows, [("n",)], EXECUTE_RESULTS_MAX_ROWS + 1)]
+    conn, cursor = make_fake_pg_connection(responses)
+    backend = PostgresBackend()
+    results = backend.execute(conn, "SELECT n FROM huge_table;")
+    assert results[0]["rowCount"] == EXECUTE_RESULTS_MAX_ROWS
+    assert len(results[0]["rows"]) == EXECUTE_RESULTS_MAX_ROWS
+    assert results[0]["truncated"] is True
+
+
+def test_execute_omits_truncated_key_entirely_when_not_truncated():
+    # "truncated" must be entirely ABSENT (not a present-but-False key) for
+    # an ordinary, un-truncated result - see Backend.execute()'s own
+    # docstring on why (mirrors the existing "notices" key's convention).
+    responses = [([(1, "Alice")], [("id",), ("name",)], 1)]
+    conn, cursor = make_fake_pg_connection(responses)
+    backend = PostgresBackend()
+    results = backend.execute(conn, "SELECT id, name FROM users;")
+    assert "truncated" not in results[0]

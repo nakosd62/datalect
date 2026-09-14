@@ -96,6 +96,125 @@ test.describe('translate + execute', () => {
     await expect(rows.nth(1)).toContainText('Grace');
   });
 
+  // Client-only column sorting (client.js's classifySortableColumnType()/
+  // handleSortableColumnClick()) - no network request involved at all, so
+  // this only needs the one initial /api/execute mock; every assertion below
+  // is about in-browser reordering of the already-rendered rows.
+  test('clicking a column header sorts rows: numbers/dates default DESC, strings default ASC, and a second click toggles', async ({ page }) => {
+    await mockTranslate(page, { sql: 'SELECT name, age FROM people;' });
+    await mockExecute(page, {
+      results: [{
+        columns: ['name', 'age'],
+        rows: [
+          { name: 'Charlie', age: 30 },
+          { name: 'Alice', age: 10 },
+          { name: 'Bob', age: 20 },
+        ],
+        rowCount: 3,
+      }],
+    });
+    await gotoApp(page);
+
+    await page.locator('#aiPrompt').fill('list people');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect.poll(() => normalizedSql(page)).toContain('SELECT');
+    await page.locator('#runBtn').click();
+
+    const rows = page.locator('#resultsBody tr.result-data-row');
+    await expect(rows).toHaveCount(3);
+    // Unsorted (translate/execute mock order): Charlie, Alice, Bob.
+    await expect(rows.nth(0)).toContainText('Charlie');
+
+    const ageHeader = page.locator('#resultsHeader th', { hasText: 'age' });
+    const nameHeader = page.locator('#resultsHeader th', { hasText: 'name' });
+
+    // Numeric column's first click defaults to DESC.
+    await ageHeader.click();
+    await expect(rows.nth(0)).toContainText('30');
+    await expect(rows.nth(1)).toContainText('20');
+    await expect(rows.nth(2)).toContainText('10');
+    await expect(ageHeader).toContainText('▼');
+
+    // Second click on the SAME header toggles to ASC.
+    await ageHeader.click();
+    await expect(rows.nth(0)).toContainText('10');
+    await expect(rows.nth(1)).toContainText('20');
+    await expect(rows.nth(2)).toContainText('30');
+    await expect(ageHeader).toContainText('▲');
+
+    // Switching to a string column's header defaults (fresh) to ASC, and
+    // only that header shows an arrow now.
+    await nameHeader.click();
+    await expect(rows.nth(0)).toContainText('Alice');
+    await expect(rows.nth(1)).toContainText('Bob');
+    await expect(rows.nth(2)).toContainText('Charlie');
+    await expect(nameHeader).toContainText('▲');
+    await expect(ageHeader).not.toContainText('▼');
+    await expect(ageHeader).not.toContainText('▲');
+
+    // No server calls were made by any of the clicks above beyond the
+    // original translate/execute ones already awaited - nothing to assert
+    // here beyond the fact that the mocked routes only fire once each,
+    // which mockTranslate/mockExecute's own single-registration already
+    // guarantees (a second real request with no matching route would hang
+    // the test rather than silently passing).
+  });
+
+  // Regression/feature coverage for EXECUTE_RESULTS_MAX_ROWS (backends/
+  // base.py) - a query matching more rows than that cap gets its result
+  // silently truncated server-side (every backend's execute() flags this
+  // with a "truncated": true key on that statement's result dict, see
+  // fetch_capped_rows()'s own docstring), and the client must never show
+  // that as if it were the complete answer.
+  test('a truncated result shows a visible warning banner and a "+" on its tab, scoped to just that tab', async ({ page }) => {
+    await mockTranslate(page, { sql: 'SELECT id FROM huge_table; SELECT 1 AS n;' });
+    await mockExecute(page, {
+      results: [
+        { columns: ['id'], rows: [{ id: 1 }, { id: 2 }], rowCount: 2, truncated: true },
+        { columns: ['n'], rows: [{ n: 1 }], rowCount: 1 },
+      ],
+    });
+    await gotoApp(page);
+
+    await page.locator('#aiPrompt').fill('show me every id, then a plain 1');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect.poll(() => normalizedSql(page)).toContain('huge_table');
+
+    await page.locator('#runBtn').click();
+
+    const tabs = page.locator('#resultsTabsNav .result-tab-btn');
+    await expect(tabs).toHaveCount(2);
+    // The truncated statement's own tab (index 0, active by default) shows
+    // a "2+ rows" count, not a plain "2 rows".
+    await expect(tabs.nth(0)).toContainText('2+ rows');
+    await expect(page.locator('#resultsTruncatedNotice')).toBeVisible();
+    await expect(page.locator('#resultsTruncatedNotice')).toContainText('first 2 rows');
+
+    // The second, un-truncated statement's own tab has a plain row count
+    // and no banner at all when it's the active one.
+    await expect(tabs.nth(1)).toContainText('1 row');
+    await expect(tabs.nth(1)).not.toContainText('+');
+    await tabs.nth(1).click();
+    await expect(page.locator('#resultsTruncatedNotice')).toBeHidden();
+  });
+
+  test('an ordinary, un-truncated result never shows the truncation banner or a "+" on its tab', async ({ page }) => {
+    await mockTranslate(page, { sql: 'SELECT id, name FROM users;' });
+    await mockExecute(page, {
+      results: [{ columns: ['id', 'name'], rows: [{ id: 1, name: 'Ada' }], rowCount: 1 }],
+    });
+    await gotoApp(page);
+
+    await page.locator('#aiPrompt').fill('list users');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect.poll(() => normalizedSql(page)).toContain('SELECT');
+
+    await page.locator('#runBtn').click();
+
+    await expect(page.locator('#resultsHeader th')).toHaveText(['id', 'name']);
+    await expect(page.locator('#resultsTruncatedNotice')).toBeHidden();
+  });
+
   test('a translation error is surfaced in the results area', async ({ page }) => {
     await mockTranslate(page, { error: 'The model could not understand that request.', status: 400 });
     await gotoApp(page);

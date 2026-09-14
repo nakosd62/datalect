@@ -460,3 +460,34 @@ def test_execute_blank_query_returns_zero_row_result_without_a_fetch(monkeypatch
     results = backend.execute(_conn(), "   ")
     assert results == [{"statement": "", "columns": None, "rows": None, "rowCount": 0}]
     assert harness.calls == []
+
+
+# --- execute(): EXECUTE_RESULTS_MAX_ROWS cap ----------------------------------
+# See test_postgres_backend.py's identically-named tests for the full
+# rationale. Sheets has no query-time LIMIT/cursor concept - the whole
+# gviz table is already in memory by the time execute() sees it (see
+# backends/sheets.py's own comment on why this cap only protects the
+# second half of the failure mode, not the initial fetch) - so this proves
+# execute() still caps what it BUILDS from that table into dicts/JSON.
+
+def test_execute_caps_rows_and_flags_truncated_past_the_default_limit(monkeypatch):
+    from backends.base import EXECUTE_RESULTS_MAX_ROWS
+    backend, harness = _sheets(monkeypatch)
+    harness.queue_table(
+        cols=[{"label": "n", "type": "number"}],
+        rows=[[i] for i in range(EXECUTE_RESULTS_MAX_ROWS + 1)],
+    )
+    results = backend.execute(_conn(), "select A")
+    assert results[0]["rowCount"] == EXECUTE_RESULTS_MAX_ROWS
+    assert len(results[0]["rows"]) == EXECUTE_RESULTS_MAX_ROWS
+    assert results[0]["truncated"] is True
+
+
+def test_execute_omits_truncated_key_entirely_when_not_truncated(monkeypatch):
+    backend, harness = _sheets(monkeypatch)
+    harness.queue_table(
+        cols=[{"label": "Name", "type": "string"}, {"label": "Age", "type": "number"}],
+        rows=[["Reza", 28], ["Amy", 34]],
+    )
+    results = backend.execute(_conn(), "select A, B")
+    assert "truncated" not in results[0]

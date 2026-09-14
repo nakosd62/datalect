@@ -2503,6 +2503,33 @@ tr.report-issue-row td {
   word-break: break-word;
 }
 
+/* Sortable column headers (see client.js's classifySortableColumnType()/
+   handleSortableColumnClick()) - purely client-side, no server round-trip.
+   Only headers with 2+ rows to reorder get this treatment at all (see
+   isSortable in renderTableResult()); a 0/1-row result's plain <th> is
+   untouched by these rules. */
+.results-table-wrapper th.sortable-col {
+  cursor: pointer;
+  user-select: none;
+}
+
+.results-table-wrapper th.sortable-col:hover {
+  background-color: var(--surface-3);
+  color: var(--text-primary);
+}
+
+.results-table-wrapper th.sortable-col--active {
+  color: var(--text-primary);
+}
+
+.sortable-col-arrow {
+  display: inline-block;
+  min-width: 0.9em;
+  margin-left: 0.35em;
+  font-size: 0.7rem;
+  color: var(--secondary);
+}
+
 .results-table-wrapper tbody tr:nth-child(even) {
   background-color: var(--surface-stripe);
 }
@@ -2563,6 +2590,29 @@ tr.report-issue-row td {
   background-color: var(--accent-cyan);
   border-color: var(--accent-cyan);
   color: var(--on-accent-cyan);
+}
+
+/* Shown whenever the currently-displayed tab's result was cut off by
+   EXECUTE_RESULTS_MAX_ROWS (see backends/base.py's own docstring on why
+   that cap exists, and renderTableResult()'s own comment on where this
+   text is set) - a genuinely incomplete result set, so this uses --warning
+   (a caution) rather than --accent-cyan's "mild, in-progress" tone that
+   .results-retry-status/the new-version banner use elsewhere in this
+   file. Sits directly above the table it describes, always visible
+   without needing to scroll the table itself, and reappears/updates on
+   every tab switch via renderTableResult()'s own top-of-function reset -
+   same "reset first, only the one branch that needs it turns it back on"
+   posture as the toggle/chart-wrapper reset right above it. */
+.results-truncated-notice {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  background-color: rgba(var(--warning-rgb), 0.12);
+  border-bottom: 1px solid rgba(var(--warning-rgb), 0.3);
+  color: var(--warning);
+  font-size: 0.8rem;
 }
 
 /* Chart.js's own canvas needs an explicit-height positioned ancestor

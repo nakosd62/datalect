@@ -108,7 +108,7 @@ import requests
 from google.oauth2 import service_account
 from google.auth.transport import requests as google_requests  # same alias auth.py uses
 
-from .base import Backend, DB_CONNECT_TIMEOUT_SECONDS, cap_schema_text
+from .base import Backend, DB_CONNECT_TIMEOUT_SECONDS, cap_schema_text, EXECUTE_RESULTS_MAX_ROWS
 from sheets_util import column_letter
 
 
@@ -396,8 +396,21 @@ class SheetsBackend(Backend):
         columns = [c.get("label") or column_letter(i + 1) for i, c in enumerate(cols)]
         col_types = [c.get("type") for c in cols]
 
+        # Unlike every real-SQL backend (see backends/base.py's
+        # EXECUTE_RESULTS_MAX_ROWS docstring), there's no query-time LIMIT
+        # concept to push this cap down into: self._fetch() above already
+        # pulled the gviz API's whole response into memory before execute()
+        # ever sees it, since Sheets' query language has no cursor/paging
+        # protocol to stream through. This at least caps what gets built
+        # into Python dicts and JSON-serialized into the HTTP response -
+        # the second half of the same failure mode - even though it can't
+        # help the first (a spreadsheet is bounded by Google's own ~10M
+        # total-cell sheet limit regardless, so the request itself is
+        # naturally bounded in a way a real database's rows never are).
+        all_rows = table.get("rows") or []
+        truncated = len(all_rows) > EXECUTE_RESULTS_MAX_ROWS
         rows = []
-        for row in table.get("rows") or []:
+        for row in all_rows[:EXECUTE_RESULTS_MAX_ROWS]:
             cells = row.get("c") or []
             row_dict = {}
             for i, col_name in enumerate(columns):
@@ -411,10 +424,13 @@ class SheetsBackend(Backend):
                     row_dict[col_name] = cell.get("v")
             rows.append(row_dict)
 
-        return [{
+        result_entry = {
             "statement": query_text,
             "columns": columns if columns else None,
             "rows": rows,
             "rowCount": len(rows),
-        }]
+        }
+        if truncated:
+            result_entry["truncated"] = True
+        return [result_entry]
 

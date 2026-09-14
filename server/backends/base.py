@@ -221,6 +221,91 @@ def cap_schema_text(text, max_chars=SCHEMA_MAX_CHARS):
     )
 
 
+# --- Query-execution row cap -------------------------------------------------
+# Bounds how many rows a single statement's real result set can put into
+# memory and into the HTTP response at all - a completely different thing
+# from SUMMARY_RESULTS_MAX_ROWS (translate_routes.py), which only bounds
+# what the post-execution summarization LLM call sees, never what actually
+# gets returned to and rendered by the browser. Without a cap here, a query
+# that genuinely matches millions of rows gets pulled entirely into a Python
+# list via a bare cursor.fetchall() and then JSON-serialized into the HTTP
+# response in one unbounded shot - an out-of-memory crash (or a response so
+# large the browser/proxy chokes on it) waiting to happen the moment a user
+# asks a broad enough question. Every backend's execute() must cap what it
+# actually fetches, not just truncate an already-fully-materialized list
+# afterward - that would still take the OOM hit before the truncation ever
+# gets a chance to run. Standard DB-API-cursor backends (postgres/mysql/
+# mssql/oracle/redshift/snowflake/databricks/mongodb_sql) get this via
+# fetch_capped_rows() below; bigquery.py (a RowIterator, not a cursor) and
+# sheets.py (a plain fetched table, no query-time LIMIT concept) apply the
+# same cap their own way - see each one's own comment. One shared,
+# env-configurable knob rather than a per-dialect constant, same posture as
+# DB_CONNECT_TIMEOUT_SECONDS above - the failure mode is identical
+# regardless of which dialect a preset happens to be.
+EXECUTE_RESULTS_MAX_ROWS = int(os.environ.get("EXECUTE_RESULTS_MAX_ROWS", 10_000))
+
+
+def normalize_cell_value(val):
+    """Coerces one raw driver value into a JSON-safe Python value. Shared by
+    every DB-API-style backend's row-building loop - previously duplicated
+    nearly verbatim in each of postgres.py/mysql.py/mssql.py/oracle.py/
+    redshift.py/snowflake.py/databricks.py (and in mongodb_sql.py, minus
+    the to_eng_string branch below - an existing inconsistency this
+    quietly fixes rather than preserves, since there's no reason a Mongo-
+    via-ODBC decimal-like value should be normalized differently from every
+    other dialect's). bigquery.py uses this too even though it never shared
+    the fetch loop these came from (a RowIterator, not a cursor).
+
+    Checked in order: anything with an isoformat() method (date/datetime/
+    time objects, from every driver); anything with a to_eng_string()
+    method (Python's own decimal.Decimal, and driver-specific numeric types
+    that mimic it); raw bytes (decoded as UTF-8, replacing anything that
+    isn't); and, as a last defensive catch-all, any other value whose type
+    is literally named "Decimal" (a driver-specific decimal type that
+    doesn't happen to implement to_eng_string). Everything else passes
+    through unchanged."""
+    if hasattr(val, 'isoformat'):
+        return val.isoformat()
+    if hasattr(val, 'to_eng_string'):
+        return float(val)
+    if isinstance(val, bytes):
+        return val.decode('utf-8', errors='replace')
+    if type(val).__name__ == 'Decimal':
+        return float(val)
+    return val
+
+
+def fetch_capped_rows(cursor, max_rows=EXECUTE_RESULTS_MAX_ROWS):
+    """For `cursor`, immediately after it ran a statement with a real
+    result set (cursor.description is truthy), returns
+    (columns, rows, truncated): `columns` from cursor.description, up to
+    `max_rows` rows as {column: value} dicts with every value passed
+    through normalize_cell_value, and `truncated` = True iff the cursor
+    actually had at least one more row beyond `max_rows` still unread.
+
+    Uses cursor.fetchmany(max_rows) rather than fetchall() - the entire
+    point of EXECUTE_RESULTS_MAX_ROWS above is to never pull an unbounded
+    result set into memory in the first place, so truncating an
+    already-fully-fetched list afterward would defeat it. `truncated` is
+    determined with exactly one extra cursor.fetchone() past the cap
+    (discarded either way - never counted in `rows` or fetched again) -
+    not by trusting cursor.rowcount, which several of these drivers don't
+    reliably populate for a SELECT ahead of consuming the result set.
+
+    Shared by every backend built on a standard DB-API-style cursor
+    (postgres/mysql/mssql/oracle/redshift/snowflake/databricks/
+    mongodb_sql) instead of each duplicating this fetch-and-normalize loop.
+    bigquery.py and sheets.py have no such cursor (a RowIterator and a
+    plain already-fetched table, respectively) and apply the same cap
+    their own way instead - see each one's own comment."""
+    columns = [desc[0] for desc in cursor.description]
+    rows = []
+    for r in cursor.fetchmany(max_rows):
+        rows.append({col: normalize_cell_value(r[idx]) for idx, col in enumerate(columns)})
+    truncated = len(rows) == max_rows and cursor.fetchone() is not None
+    return columns, rows, truncated
+
+
 # Matches the entry-heading convention every backend's get_schema() already
 # emits, one per table/table-family/tab entry, always as the first line of
 # that entry's block: "Table: <name>", "Table family: <name-pattern> (...)",
@@ -403,9 +488,22 @@ class Backend(ABC):
         its own result set (e.g. Oracle's DBMS_OUTPUT.PUT_LINE, captured by
         backends/oracle.py's execute() - see its _drain_dbms_output()) -
         entirely absent for a backend/statement with nothing to report,
-        never an empty list. execute_routes.py passes results through
-        untouched, so this key reaches the client as-is; see webClient/
-        client.js's renderTableResult() for how it's displayed. If a
+        never an empty list. A dict MAY also carry an optional
+        "truncated": True key - this statement's real result set had more
+        rows than EXECUTE_RESULTS_MAX_ROWS (below), so `rows`/`rowCount`
+        reflect only the first EXECUTE_RESULTS_MAX_ROWS of it, never the
+        full set - entirely absent (never explicitly False) when nothing
+        was cut off. Every backend built on a standard DB-API cursor gets
+        this via fetch_capped_rows() (below); bigquery.py/sheets.py apply
+        the same cap their own way (see each one's own comment) - all
+        MUST cap what they actually fetch/build, not just what they
+        report, since fetching an unbounded result set into memory (and
+        then JSON-serializing all of it into the HTTP response) is itself
+        the failure mode this exists to prevent, not just an oversized
+        `rowCount`. execute_routes.py passes results through untouched, so
+        both keys reach the client as-is; see webClient/client.js's
+        renderTableResult() for how "truncated" is surfaced to the user
+        (never silently - see that function's own comment on why). If a
         statement partway through fails, raise
         SqlExecutionError (see its docstring above) instead of letting the
         raw driver exception propagate directly, so the statements that

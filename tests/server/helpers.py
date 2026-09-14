@@ -508,9 +508,15 @@ class FakeBQRow:
 
 
 class FakeBQRowIterator:
-    def __init__(self, rows, schema):
+    def __init__(self, rows, schema, total_rows=None):
         self._rows = rows
         self.schema = schema
+        # A real RowIterator's total_rows reflects the query's REAL total
+        # result size from the job's own metadata, independent of whatever
+        # `max_results` the caller passed to .result() - see
+        # backends/bigquery.py's execute() for why that distinction is
+        # what makes its truncation check meaningful rather than circular.
+        self.total_rows = total_rows if total_rows is not None else len(rows)
 
     def __iter__(self):
         return iter(self._rows)
@@ -530,8 +536,13 @@ class FakeBQQueryJob:
         self._rows = [FakeBQRow(r) for r in row_dicts]
         self.num_dml_affected_rows = num_dml_affected_rows
 
-    def result(self):
-        return FakeBQRowIterator(self._rows, self._schema)
+    def result(self, max_results=None):
+        # Mirrors the real bigquery.job.QueryJob.result(max_results=...) -
+        # the returned iterator yields at most `max_results` rows, but
+        # total_rows still reports the FULL result's real size (see
+        # FakeBQRowIterator above), exactly like the real API.
+        rows = self._rows if max_results is None else self._rows[:max_results]
+        return FakeBQRowIterator(rows, self._schema, total_rows=len(self._rows))
 
 
 class FakeBQDatasetReference:
@@ -678,6 +689,13 @@ class FakePgCursor:
         self.description = None
         self.rowcount = -1
         self._rows = []
+        # A real DB-API cursor's fetchall/fetchmany/fetchone all advance
+        # the SAME underlying position in the result set - fetch_capped_rows
+        # (backends/base.py) relies on exactly that: one fetchmany(N) call
+        # followed by one fetchone() to check for a row beyond it, which
+        # only means what it's supposed to if fetchone() continues from
+        # where fetchmany() left off rather than re-reading row 0.
+        self._pos = 0
 
     def __enter__(self):
         return self
@@ -695,14 +713,28 @@ class FakePgCursor:
             raise item
         rows, description, rowcount = item
         self._rows = rows
+        self._pos = 0
         self.description = description
         self.rowcount = rowcount if rowcount is not None else -1
 
     def fetchall(self):
-        return self._rows
+        chunk = self._rows[self._pos:]
+        self._pos = len(self._rows)
+        return chunk
+
+    def fetchmany(self, size=None):
+        if size is None:
+            size = len(self._rows) - self._pos
+        chunk = self._rows[self._pos:self._pos + size]
+        self._pos += len(chunk)
+        return chunk
 
     def fetchone(self):
-        return self._rows[0] if self._rows else None
+        if self._pos >= len(self._rows):
+            return None
+        row = self._rows[self._pos]
+        self._pos += 1
+        return row
 
 
 class FakePgConnection:

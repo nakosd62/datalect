@@ -115,7 +115,7 @@ import sqlparse
 from .base import (
     Backend, SqlExecutionError, SCHEMA_MAX_TABLE_NAMES_SCANNED, SCHEMA_MAX_TABLES,
     DB_CONNECT_TIMEOUT_SECONDS,
-    group_date_sharded_tables, cap_kept_tables, cap_schema_text,
+    group_date_sharded_tables, cap_kept_tables, cap_schema_text, fetch_capped_rows,
 )
 
 # CLOB/BLOB columns are fetched as LOB locator objects (requiring .read())
@@ -589,24 +589,13 @@ class OracleBackend(Backend):
 
                     columns = None
                     rows = None
+                    truncated = False
 
                     if cursor.description:
-                        columns = [desc[0] for desc in cursor.description]
-                        rows = []
-                        for r in cursor.fetchall():
-                            row_dict = {}
-                            for idx, col in enumerate(columns):
-                                val = r[idx]
-                                if hasattr(val, 'isoformat'):
-                                    val = val.isoformat()
-                                elif hasattr(val, 'to_eng_string'):
-                                    val = float(val)
-                                elif isinstance(val, bytes):
-                                    val = val.decode('utf-8', errors='replace')
-                                elif type(val).__name__ == 'Decimal':
-                                    val = float(val)
-                                row_dict[col] = val
-                            rows.append(row_dict)
+                        # fetch_capped_rows (backends/base.py) - never a
+                        # bare cursor.fetchall() here; see
+                        # EXECUTE_RESULTS_MAX_ROWS's own docstring for why.
+                        columns, rows, truncated = fetch_capped_rows(cursor)
                         count = len(rows)
                     else:
                         count = row_count if row_count >= 0 else 0
@@ -615,8 +604,10 @@ class OracleBackend(Backend):
                         'statement': stmt_clean,
                         'columns': columns,
                         'rows': rows,
-                        'rowCount': count
+                        'rowCount': count,
                     }
+                    if truncated:
+                        result_entry['truncated'] = True
                     # Drained AFTER this statement's own columns/rows/count
                     # are already captured above, so a subsequent
                     # dbms_output.get_lines callproc() (which sets the

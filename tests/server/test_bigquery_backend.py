@@ -282,3 +282,36 @@ def test_execute_mid_script_failure_raises_sql_execution_error_with_partial_resu
     assert err.statement_index == 1
     assert err.total_statements == 3
     assert "Syntax error" in str(err)
+
+
+# --- execute(): EXECUTE_RESULTS_MAX_ROWS cap ----------------------------------
+# See test_postgres_backend.py's identically-named tests for the full
+# rationale. BigQuery has no cursor/fetchmany() to route through
+# fetch_capped_rows() the way the other backends do - it caps via
+# query_job.result(max_results=...) instead (see backends/bigquery.py's
+# execute()) and detects truncation via the REAL RowIterator.total_rows,
+# not by comparing against how many rows this test iterated - so
+# FakeBQRowIterator's own total_rows (helpers.py) is what actually proves
+# this out, not just how many dict rows this fake happens to hold.
+
+def test_execute_caps_rows_and_flags_truncated_past_the_default_limit(monkeypatch):
+    from backends.base import EXECUTE_RESULTS_MAX_ROWS
+    backend, harness = _bq(monkeypatch)
+    harness.set_handler(lambda sql, jc: FakeBQQueryJob(
+        rows=[{"n": i} for i in range(EXECUTE_RESULTS_MAX_ROWS + 1)]
+    ))
+    conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
+    results = backend.execute(conn, "SELECT n FROM huge_table;")
+    assert results[0]["rowCount"] == EXECUTE_RESULTS_MAX_ROWS
+    assert len(results[0]["rows"]) == EXECUTE_RESULTS_MAX_ROWS
+    assert results[0]["truncated"] is True
+
+
+def test_execute_omits_truncated_key_entirely_when_not_truncated(monkeypatch):
+    backend, harness = _bq(monkeypatch)
+    harness.set_handler(lambda sql, jc: FakeBQQueryJob(
+        rows=[{"id": 1, "name": "Alice"}]
+    ))
+    conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
+    results = backend.execute(conn, "SELECT id, name FROM t;")
+    assert "truncated" not in results[0]
