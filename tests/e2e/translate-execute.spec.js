@@ -949,7 +949,12 @@ test.describe('single-connection mode: post-execution results summarization', ()
       (m) => m.role === 'model' && Array.isArray(m.results) && m.results.some((r) => r.error)
     );
     expect(failedTurn).toBeTruthy();
-    expect(failedTurn.results).toContainEqual({ error: 'relation "does_not_exist" does not exist' });
+    // isError: true (not just the error text) must survive into history too
+    // - summarizeResultForHistory()'s error branch preserves it so that
+    // stepping back to this turn later still renders a real error box
+    // (renderTableResult()'s isError branch) instead of silently falling
+    // through to "No dataset returned".
+    expect(failedTurn.results).toContainEqual({ error: 'relation "does_not_exist" does not exist', isError: true });
     // The Summary tab's own explanation (Phase C's single-connection
     // equivalent) is preserved on the turn too - see Gap 2's fix on the
     // server side (build_gemini_history_contents et al. now append a
@@ -985,7 +990,9 @@ test.describe('single-connection mode: post-execution results summarization', ()
       (m) => m.role === 'model' && Array.isArray(m.results) && m.results.some((r) => r.error)
     );
     expect(failedTurn).toBeTruthy();
-    expect(failedTurn.results).toContainEqual({ error: 'relation "does_not_exist" does not exist' });
+    // isError: true must survive into history too - see the identical
+    // assertion/comment in the multi-statement-failure test above.
+    expect(failedTurn.results).toContainEqual({ error: 'relation "does_not_exist" does not exist', isError: true });
     expect(failedTurn.summary).toContain('That table is missing.');
   });
 });

@@ -124,6 +124,29 @@ document.addEventListener('DOMContentLoaded', async () => {
         const stepsBack = future.length / 2;
         return stepsBack === 0 ? 0 : -stepsBack;
       },
+      // Re-persists `history` as it stands RIGHT NOW - for every call site
+      // that fills in a turn's results/summary/allMode data AFTER it was
+      // already pushed (chatStore.getPending()/isPendingCurrent()'s whole
+      // reason for existing: SQL is pushed as its own turn the moment
+      // translate() returns, then executeSql() mutates that SAME
+      // modelEntry object in place once execution finishes, rather than
+      // creating a second turn - see setPending()'s own comment). pushTurn()
+      // above is the ONLY thing that calls onPersist, and only at the
+      // moment a turn is first pushed - a later in-place mutation of an
+      // already-pushed entry (pending.entry.results = ...,
+      // captureAllModeHistory(pending.entry, ...), etc.) changes this
+      // store's own in-memory `history` array immediately (same object
+      // reference), but the copy already sitting in the server's chat
+      // history table stays exactly as it was at push time - missing
+      // results entirely - until something calls this to send the
+      // corrected array back. Previously nothing did, so a turn's results
+      // only ever reached the server by accident, if some LATER turn's own
+      // pushTurn() happened to re-save the whole (by-then-mutated) history
+      // array first - meaning after a page reload, only turns with a
+      // later sibling turn showed their results; the newest turn in any
+      // bucket always came back with none. Every call site that mutates an
+      // already-pushed entry must call this afterward.
+      persistCurrent() { if (onPersist) onPersist(history); },
       // What gets sent to /api/translate as `history`.
       toPayload() { return history; },
       // Replaces this store's history wholesale with a previously-
@@ -7455,7 +7478,14 @@ document.addEventListener('DOMContentLoaded', async () => {
       ? turn.modelEntry.results : null;
     if (persistedResults) {
       const persistedMatch = persistedResults.find((r) => r && r.visualization === entry.visualization);
-      if (persistedMatch) persistedMatch.chartView = showChart;
+      if (persistedMatch) {
+        persistedMatch.chartView = showChart;
+        // This turn was already pushed (and already saved server-side)
+        // before this toggle click - see chatStore.persistCurrent()'s own
+        // docstring for why an in-place edit like this one needs its own
+        // explicit re-save, or the server's copy never picks it up.
+        chatStore.persistCurrent();
+      }
     }
   }
 
@@ -8348,6 +8378,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         modelEntry.results = summarizedResults;
         captureAllModeHistory(modelEntry, notes, state.executeFailures, summaryResult);
       }
+      // Both branches above just mutated an ALREADY-PUSHED turn's own
+      // modelEntry in place (pushActiveTurn() put it in `history` back in
+      // translatePrompt(), before this SQL was even executed) - see
+      // chatStore.persistCurrent()'s own docstring for why that mutation
+      // needs its own explicit re-save, rather than trusting it'll reach
+      // the server eventually.
+      chatStore.persistCurrent();
       // Chunk 4 - see fanOutAllModeHistoryPerDatabase's own docstring: does
       // NOT touch chatStore/activeBucketKey, so this runs regardless of
       // which branch above just fired.
@@ -8785,7 +8822,18 @@ document.addEventListener('DOMContentLoaded', async () => {
     // contents et al. (server/translate_routes.py) now render an `error`
     // key as real error text instead of a blank block.
     if (result && result.error !== undefined) {
-      const summarizedError = { error: result.error };
+      // isError/statement (not just the error text) must survive too -
+      // renderTableResult()'s isError branch (what actually draws the red
+      // "Execution Error" box) checks result.isError specifically, not
+      // just whether `.error` is present. Without this, a restored failed
+      // turn silently fell through to the "No dataset returned" branch
+      // instead - the tab was there, but showed the wrong thing entirely,
+      // with the real error text nowhere on screen. Mirrors the exact
+      // shape renderResultsWithFailedStatement()'s own failedEntry and
+      // executeSql()'s own bare-failure currentResultsList entry already
+      // use live, on-screen, before this function ever sees them.
+      const summarizedError = { isError: true, error: result.error };
+      if (result.statement) summarizedError.statement = result.statement;
       if (result.database) summarizedError.database = result.database;
       return summarizedError;
     }
@@ -8795,6 +8843,12 @@ document.addEventListener('DOMContentLoaded', async () => {
       rowCount: result.rowCount !== undefined ? result.rowCount : rows.length,
       rows: rows
     };
+    // EXECUTE_RESULTS_MAX_ROWS's own truncation flag (backends/base.py) -
+    // without this, stepping back to a turn whose result set was cut off
+    // silently lost that fact: the restored tab looked like a complete,
+    // untruncated result instead of the same capped preview the user was
+    // actually shown at execution time.
+    if (result.truncated) summarized.truncated = true;
     // "All databases" mode results are tagged with which connection they
     // came from (see execute_routes.py and buildResultsTabsNav()'s dbLabel)
     // - preserve that tag so a later history restore can still label each
@@ -9050,6 +9104,11 @@ document.addEventListener('DOMContentLoaded', async () => {
             pending.entry.results = summarizedResults;
             if (allModeNotes) captureAllModeHistory(pending.entry, allModeNotes, [], allModeSummaryResult);
             if (singleModeSummary) pending.entry.summary = singleModeSummary;
+            // This turn was already pushed (as bare SQL, before it was
+            // executed) - see chatStore.persistCurrent()'s own docstring
+            // for why filling in its results afterward needs its own
+            // explicit re-save.
+            chatStore.persistCurrent();
             chatStore.clearPending();
           } else {
             // Any other execution (direct SQL entry, or re-running a query
@@ -9154,6 +9213,9 @@ document.addEventListener('DOMContentLoaded', async () => {
             const pending = chatStore.getPending();
             pending.entry.results = summarizedResults;
             captureAllModeHistory(pending.entry, allModeNotes, executeFailures, summaryResult);
+            // Already-pushed turn, filled in afterward - see
+            // chatStore.persistCurrent()'s own docstring.
+            chatStore.persistCurrent();
             chatStore.clearPending();
           } else {
             const modelEntry = { role: 'model', text: sql, results: summarizedResults };
@@ -9255,6 +9317,9 @@ document.addEventListener('DOMContentLoaded', async () => {
             pending.entry.text = sql;
             pending.entry.results = summarizedResults;
             if (singleModeSummary) pending.entry.summary = singleModeSummary;
+            // Already-pushed turn, filled in afterward - see
+            // chatStore.persistCurrent()'s own docstring.
+            chatStore.persistCurrent();
             chatStore.clearPending();
           } else {
             const modelEntry = { role: 'model', text: sql, results: summarizedResults };
@@ -9327,6 +9392,9 @@ document.addEventListener('DOMContentLoaded', async () => {
               pending.entry.text = sql;
               pending.entry.results = summarizedResults;
               if (singleModeSummary) pending.entry.summary = singleModeSummary;
+              // Already-pushed turn, filled in afterward - see
+              // chatStore.persistCurrent()'s own docstring.
+              chatStore.persistCurrent();
               chatStore.clearPending();
             } else {
               const modelEntry = { role: 'model', text: sql, results: summarizedResults };

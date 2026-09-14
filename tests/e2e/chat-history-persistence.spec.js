@@ -121,6 +121,132 @@ test.describe('chat history persistence', () => {
     }
   });
 
+  // Regression test for chatStore.persistCurrent() (see its own docstring):
+  // a turn is pushed to the server as soon as translate() returns (bare SQL,
+  // no results yet - see translatePrompt()'s chatStore.setPending() call),
+  // then executeSql() fills in that SAME turn's results IN PLACE once
+  // execution finishes. Before persistCurrent() existed, that in-place edit
+  // never triggered a second save - the server's copy of the turn was stuck
+  // with whatever was true at push time (no results at all), and only ever
+  // caught up by accident if some LATER turn's own pushTurn() happened to
+  // re-save the whole (by-then-mutated) history array first. A reload right
+  // after running a query - with no later turn to paper over it - reproduced
+  // this exactly: the SQL editor restored fine, but the results table came
+  // back empty, as if the query had never been run.
+  test("a turn's results survive a reload, not just its SQL - regression for the in-place-mutation persistence gap", async ({ page }) => {
+    await page.unroute('**/api/chat-history');
+    await page.unroute('**/api/chat-history/summary');
+    await mockTranslate(page, { sql: 'SELECT id, name FROM widgets;' });
+    await mockExecute(page, {
+      results: [{ columns: ['id', 'name'], rows: [{ id: 1, name: 'Gadget' }], rowCount: 1 }],
+    });
+    // Single-connection mode's post-execution summarization call - left
+    // unmocked, this hits the real /api/summarize-result endpoint, which
+    // then tries a real LLM call that's unreachable in a sandboxed test
+    // environment and only gives up after a real retry/backoff delay.
+    // chatStore.persistCurrent() (what this test is actually checking for)
+    // fires AFTER that call settles either way, so mocking it keeps this
+    // deterministic and fast. Whether this succeeds or "fails" (a failure
+    // still produces its own apology summary text - see the "apology tab"
+    // test in translate-execute.spec.js), a leading Summary tab ends up
+    // persisted and active either way (prependSingleModeSummaryTab) - this
+    // test clicks past it to the actual query-results tab below rather
+    // than trying to avoid it.
+    await page.route('**/api/summarize-result', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200, contentType: 'application/json',
+        body: JSON.stringify({ success: false, error: 'summarization disabled for this test' }),
+      });
+    });
+    await gotoApp(page);
+
+    const prompt = `chat history results-persist e2e ${Date.now()}`;
+
+    // Collects EVERY /api/chat-history/save POST this turn causes - there
+    // should be at least two: pushTurn()'s own save the moment translate()
+    // returns (bare SQL, no results yet - see translatePrompt()'s
+    // chatStore.setPending() call), and a SECOND one from
+    // chatStore.persistCurrent() once executeSql() fills in that SAME
+    // turn's results in place. Collected via a running listener (not one
+    // `waitForRequest` per phase) since this app's default is auto-execute
+    // ON - the second save can already be in flight, or done, by the time
+    // this test would otherwise get around to registering a wait for it.
+    const saveRequests = [];
+    page.on('request', (req) => {
+      if (req.url().includes('/api/chat-history/save') && req.method() === 'POST') {
+        saveRequests.push(req);
+      }
+    });
+
+    // Read the real, current auto-execute preference DIRECTLY, rather than
+    // racing it: if it's on (this app's default), translate() alone will
+    // trigger the execution (and the second save this test is checking
+    // for) internally - clicking Run too would fire a genuinely separate,
+    // second execution and push a SECOND turn instead of exercising the
+    // in-place-mutation path this test exists to cover. If it's off, this
+    // turn is left as bare, unexecuted SQL - awaiting a manual click, same
+    // as a real user would do.
+    const configResp = await page.request.get('/api/config');
+    const autoExecuteEnabled = (await configResp.json()).auto_sql_execute !== false;
+
+    await page.locator('#aiPrompt').fill(prompt);
+    await page.locator('#aiPrompt').press('Enter');
+    await expect.poll(() => normalizedSql(page)).toContain('SELECT');
+
+    expect(saveRequests.length).toBeGreaterThan(0);
+    const bucketKey = saveRequests[0].postDataJSON().bucket_key;
+
+    try {
+      if (!autoExecuteEnabled) {
+        await page.locator('#runBtn').click();
+      }
+
+      // The actual regression check: without chatStore.persistCurrent(),
+      // there is only ever the one, pre-execution save above - this turn's
+      // results never reach the server at all until some LATER, unrelated
+      // turn's own pushTurn() happens to re-save the whole (by-then-
+      // mutated) history array first, purely by accident.
+      await expect.poll(() => saveRequests.length, {
+        message: 'expected a second /api/chat-history/save once results were filled in (chatStore.persistCurrent())',
+      }).toBeGreaterThanOrEqual(2);
+
+      // The mocked (failed) summarization above still prepends its own
+      // leading, active "Summary" tab (see this test's own comment above)
+      // - switch to the actual query-results tab (index 1) to see the
+      // real table underneath it.
+      await page.locator('#resultsTabsNav .result-tab-btn').nth(1).click();
+      await expect(page.locator('#resultsBody')).toContainText('Gadget');
+
+      // Confirm the real server actually has the results now, not just
+      // that some POST fired.
+      const afterExecute = await page.request.get('/api/chat-history');
+      const afterExecuteBody = await afterExecute.json();
+      const savedTurns = afterExecuteBody.buckets[bucketKey];
+      const savedModelTurn = savedTurns.find((t) => t.role === 'model');
+      expect(Array.isArray(savedModelTurn.results)).toBe(true);
+      expect(savedModelTurn.results[0].rows).toEqual([{ id: 1, name: 'Gadget' }]);
+
+      // The actual proof: a completely fresh page load restores the
+      // RESULTS TABLE, not just the SQL editor - this is exactly what came
+      // back empty before persistCurrent() existed.
+      await gotoApp(page);
+
+      await expect(page.locator('#aiPrompt')).toHaveValue(prompt);
+      await expect.poll(() => normalizedSql(page)).toContain('SELECT');
+      // Same persisted Summary tab as before reload (the failed-
+      // summarization apology text is part of what got persisted too) -
+      // switch past it to the real query-results tab again.
+      await page.locator('#resultsTabsNav .result-tab-btn').nth(1).click();
+      await expect(page.locator('#resultsHeader th')).toHaveText(['id', 'name']);
+      await expect(page.locator('#resultsBody')).toContainText('Gadget');
+    } finally {
+      await page.request.post('/api/chat-history/save', {
+        data: { bucket_key: bucketKey, turns: [] },
+      });
+    }
+  });
+
   test('the History modal lists a real saved turn, and deleting it clears both the server and the visible turn', async ({ page }) => {
     // /api/chat-history/summary is real (unmocked) here too - this is the
     // one test in the suite proving the whole "list databases with saved
