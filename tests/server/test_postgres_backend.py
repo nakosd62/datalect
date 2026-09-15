@@ -248,6 +248,30 @@ def test_get_schema_views_section_is_not_scoped_to_kept_names_regression():
     assert "customer_orders" in schema
 
 
+def test_get_schema_survives_view_with_null_definition():
+    # Regression test: Postgres returns a real SQL NULL (not "") for
+    # information_schema.views.view_definition when the connected role
+    # lacks the privilege to see a given view's definition - the bare
+    # v[1].strip() this used to be raised AttributeError on that None and
+    # aborted schema fetch for the WHOLE database (see db.py's
+    # _fetch_database_schema, which lets this exception propagate as a 500
+    # rather than a partial schema). One unreadable view must not take
+    # down every other table/view this schema fetch would otherwise
+    # successfully report - matches every other backend's own
+    # `(v[1] or '').strip()` guard (see this fix's comment in
+    # postgres.py's get_schema for the full list).
+    conn, cursor = make_fake_pg_connection(_schema_responses(
+        table_names=["customers"],
+        columns_rows=[("customers", "id", "integer", "NO", None)],
+        views=[("restricted_view", None), ("customer_orders", "SELECT * FROM orders")],
+    ))
+    backend = PostgresBackend()
+    schema = backend.get_schema(conn)
+    assert "Views:" in schema
+    assert "View restricted_view: " in schema
+    assert "View customer_orders: SELECT * FROM orders" in schema
+
+
 def test_get_schema_includes_constraints_indexes_grants_triggers():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["orders"],

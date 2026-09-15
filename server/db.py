@@ -451,6 +451,29 @@ def _fetch_database_schema(descriptor):
     try:
         connection = backend.connect(descriptor)
         schema_text = backend.get_schema(connection)
+        if not schema_text:
+            # get_schema() returning None/"" is a normal, NON-exceptional
+            # return value for every backend (see e.g. backends/postgres.py's
+            # own "if not all_table_names: return None" - the connection
+            # succeeded and the query ran fine, there just wasn't a base
+            # table to describe), so this used to fall through to
+            # _SCHEMA_FETCH_FAILED completely silently - no logger.exception
+            # call is reached on this path at all, unlike a real connection/
+            # query error just below. That made "why does this one
+            # connection always show 'No schema description available.'"
+            # unanswerable from the logs alone (see this function's own
+            # history: a schema made up entirely of views, with zero BASE
+            # TABLEs, hit exactly this path with nothing recorded anywhere).
+            # A warning here doesn't change the returned fallback text at
+            # all - it just means the next time this happens, the log says
+            # which connection and why, instead of nothing.
+            logger.warning(
+                "Schema fetch for %s returned no schema text (get_schema() "
+                "gave back %r) - no exception was raised, so this is likely "
+                "a schema with no BASE TABLEs (e.g. views-only) rather than "
+                "a connection/query failure.",
+                get_conn_identifier(descriptor), schema_text,
+            )
         return schema_text if schema_text else _SCHEMA_FETCH_FAILED
     except Exception:
         logger.exception("Error fetching schema")

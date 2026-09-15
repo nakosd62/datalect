@@ -359,7 +359,17 @@ class PostgresBackend(Backend):
             """)
             views = cursor.fetchall()
             if views:
-                view_lines = [f"  View {v[0]}: {v[1].strip()}" for v in views]
+                # view_definition legitimately comes back NULL from Postgres
+                # (not just an empty string) when the connected role lacks
+                # the privilege to see a given view's definition - the bare
+                # v[1].strip() this used to be raised AttributeError on
+                # that None and aborted schema fetch for the WHOLE
+                # database, not just this one view. `(v[1] or '').strip()`
+                # matches every other backend's own views-section guard
+                # (bigquery.py/databricks.py/mssql.py/mysql.py/oracle.py/
+                # redshift.py/snowflake.py all already do exactly this) -
+                # postgres.py was the one outlier missing it.
+                view_lines = [f"  View {v[0]}: {(v[1] or '').strip()}" for v in views]
                 schema_parts.append("Views:\n" + "\n".join(view_lines))
 
             # 5. Role Grants
