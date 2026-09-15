@@ -1,4 +1,7 @@
 Flask==3.0.3
+gunicorn==26.2.0  # production WSGI server (Dockerfile's CMD) - server/server.py's own `python server/server.py` (Werkzeug's dev server) is local/dev-only now; see server.py's __main__ docstring
+flask-limiter==4.1.1  # rate_limiter.py - per-user RATE_LIMIT_TRANSLATE/RATE_LIMIT_EXECUTE admission control
+limits  # rate_limiter.py imports limits.parse() directly (to validate a limit string eagerly) - already a transitive dep of flask-limiter, now explicit
 psycopg2-binary==2.9.9
 flask-cors==4.0.1
 google-genai>=1.0.0

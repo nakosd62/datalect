@@ -78,5 +78,57 @@ COPY grand-cosmos-716-3afa9cbc32b7.json .
 # Expose container port (Cloud Run defaults to 8080, but we can configure it)
 EXPOSE 3000
 
-# Start the Flask app
-CMD ["python", "server/server.py"]
+# Start the app under gunicorn rather than running server/server.py's own
+# `if __name__ == '__main__'` block directly - that block runs Werkzeug's
+# development server, which Flask's own docs say isn't designed to handle
+# real production load/concurrency (see server.py's __main__ docstring for
+# this app's own reasoning). gunicorn is a real, battle-tested WSGI server:
+# proper request queuing/backlog, worker recycling, and correct SIGTERM
+# handling on Cloud Run scale-down/redeploy (the `exec` below matters for
+# that last part - without it, `sh` stays PID 1 and gunicorn never sees the
+# signal directly).
+#
+# `--pythonpath server` (rather than `--chdir server`) is deliberate:
+# server/*.py files import each other with bare names ("from app_config
+# import app", not "from server.app_config import app" - see
+# tests/server/helpers.py's own comment on why, server/ has no __init__.py)
+# so gunicorn needs `/app/server` on sys.path for `server:app` and its
+# internal imports to resolve, exactly like running
+# `python server/server.py` does implicitly. But several of those modules
+# also read *relative file paths* from env.yaml (DATABASE_PRESETS_FILE=
+# "./presets.json", SHEETS_SERVICE_ACCOUNT_CREDENTIALS_FILE=
+# "./grand-cosmos-716-3afa9cbc32b7.json", state_store.py's
+# TRANSLATION_STATS_DB_PATH="state/ydyl_state.db") which are copied to
+# /app, not /app/server (see the COPY lines above) - `--chdir server`
+# would move the process's cwd there too and break every one of those
+# lookups. `--pythonpath` adds to sys.path WITHOUT touching cwd, so this
+# container's cwd stays at /app (this Dockerfile's WORKDIR, matching
+# `python server/server.py` run from the repo root) while imports still
+# resolve. Verified directly: `--chdir server` reproducibly breaks
+# DATABASE_PRESETS_FILE lookup ("No such file or directory: './presets.json'"),
+# `--pythonpath server` does not.
+#
+# --worker-class gthread --workers 1 --threads N: ONE process, N threads -
+# not multiple worker processes - is deliberate, not a tuning oversight.
+# schema_cache.py's cache and cancel_registry.py's cancellation registry
+# are both process-local, in-memory, and guarded by a plain
+# threading.Lock() (see cancel_registry.py's own module docstring, which
+# explicitly calls out that "a future move to a multi-process server
+# (gunicorn with >1 worker, say) would break this silently" - a
+# /api/cancel call landing on a different worker process than the one
+# actually running the query it's meant to cancel). Multiple *threads*
+# within one process preserve the exact shared-memory assumption
+# server.py's own threaded=True already relied on; multiple *worker
+# processes* would silently fragment that state instead. If this ever
+# needs to scale beyond one process's throughput, cancel_registry.py and
+# schema_cache.py both need to move to a shared backend (Firestore, e.g.)
+# BEFORE adding --workers > 1 - don't casually bump this thinking more
+# workers is strictly better.
+#
+# GUNICORN_THREADS/GUNICORN_TIMEOUT are plain env vars (settable via
+# env.yaml, no image rebuild needed) rather than hardcoded, so the thread
+# count can be tuned alongside Cloud Run's own --concurrency flag without
+# a redeploy-from-source - they should move together (gunicorn can't
+# usefully serve more concurrent requests per instance than it has
+# threads for, regardless of what Cloud Run is willing to route it).
+CMD ["sh", "-c", "exec gunicorn --pythonpath server --bind 0.0.0.0:${CRBOT_PORT:-3000} --worker-class gthread --workers 1 --threads ${GUNICORN_THREADS:-8} --timeout ${GUNICORN_TIMEOUT:-300} server:app"]

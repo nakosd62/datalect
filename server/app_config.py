@@ -236,6 +236,21 @@ DEFAULT_CONN = "postgresql://postgres:password@host:23456/defaultdb?sslmode=veri
 # other malformed preset below (missing "name"/"url"/credential) - it never
 # ends up in CONFIGURED_DBS at all, rather than loading anyway and quietly
 # activating the WRONG connection whenever its (collided) radio is clicked.
+# Every object may also carry "include_in_all_mode": false to opt that one
+# preset OUT of "All Pre-Configured Datasets" mode (db.py's
+# _resolve_all_configured_descriptors - the dynamically-resolved candidate
+# pool a session in in_scope_mode "all" asks its question against). Defaults
+# to true/omitted, meaning every preset participates - the only behavior
+# that ever existed before this field did. A preset with this set to false
+# is still fully usable on its own (its individual radio in the DB picker
+# is unaffected), it's just never offered to "All" mode's triage step - use
+# this for a preset that's slow, quarantined/paused, or simply not meant to
+# be silently included in a broad "ask across everything" question (e.g. a
+# scratch/demo dataset an admin wants available individually but never
+# folded into "All"). Custom, user-saved connections were already always
+# excluded from "All" mode regardless of this flag (see
+# _resolve_all_configured_descriptors' own docstring) - this only ever
+# narrows the PRESET pool further, it doesn't change that.
 # The rest of each object's shape is dialect-specific:
 #   Postgres:  {"type": "postgres", "name": "...", "url": "postgresql://...",
 #               "schema": "..."} ("schema" optional - see below)
@@ -539,6 +554,31 @@ if raw_db_presets.strip():
             )
             continue
         _seen_preset_ids.add(preset_id)
+
+        # Optional, dialect-agnostic - unlike everything else parsed in this
+        # loop, applies identically no matter which "type" branch below ends
+        # up handling this entry, so it's read once here rather than
+        # threaded through all ten of them individually. Controls whether
+        # this preset is a candidate for "All Pre-Configured Datasets" mode
+        # (db.py's _resolve_all_configured_descriptors, which today - before
+        # this existed - unconditionally included EVERY entry in
+        # CONFIGURED_DBS with no way to opt one out). Defaults to True (the
+        # only behavior that ever existed before this field did), so a
+        # preset that has never heard of this field behaves exactly as
+        # before. Falsy (false/0/""/null - same leniency this app already
+        # gives a blank optional string field elsewhere in this loop, e.g.
+        # Postgres' "schema" above) opts the preset OUT of "All" mode
+        # entirely - it's still selectable on its own, individually, exactly
+        # as before; it just never joins the dynamically-resolved "all"
+        # candidate pool. Recorded on `preset`/`sql_preset`/etc. below (via
+        # _dbs_len_before_dispatch) ONLY when explicitly False, never as an
+        # explicit "include_in_all_mode": True - mirrors every other
+        # optional field in this loop (blank/omitted = not stored at all),
+        # so a preset dict's shape is completely unchanged for anyone who's
+        # never touched this field, matching every existing test's exact-
+        # equality assertion on CONFIGURED_DBS/configured_databases shapes.
+        exclude_from_all_mode = not entry.get("include_in_all_mode", True)
+        _dbs_len_before_dispatch = len(CONFIGURED_DBS)
 
         if db_type == "postgres":
             url = (entry.get("url") or "").strip()
@@ -953,6 +993,20 @@ if raw_db_presets.strip():
 
         else:
             logger.warning("Skipping database preset '%s': unsupported type %r.", name, db_type)
+
+        # Applies the flag parsed above to whichever preset dict the
+        # dialect dispatch just appended (if any - a `continue` above for a
+        # malformed entry, or the "unsupported type" branch just above,
+        # means nothing was appended this iteration, so there's nothing to
+        # tag). Comparing CONFIGURED_DBS' length rather than mutating each
+        # branch's own `preset`/`sql_preset`/`sheets_preset` variable
+        # individually is deliberate: ten separate dialect branches above
+        # each build and append their own dict under their own local name,
+        # and a future eleventh dialect added here would silently forget
+        # this one-line addition if it had to be repeated per-branch - this
+        # single, branch-independent check can't be missed that way.
+        if exclude_from_all_mode and len(CONFIGURED_DBS) > _dbs_len_before_dispatch:
+            CONFIGURED_DBS[-1]["include_in_all_mode"] = False
 
 
 # Ensure at least one default fallback exists

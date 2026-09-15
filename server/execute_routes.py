@@ -70,6 +70,8 @@ from auth import get_or_create_session_id, get_current_user_identity, apply_sess
 from db import resolve_conn_str, resolve_descriptor_by_reference
 from backends import get_backend, SqlExecutionError
 import cancel_registry
+from concurrency_guard import EXECUTE_GUARD, guarded_route
+from rate_limiter import execute_rate_limit
 
 execute_bp = Blueprint('execute', __name__)
 
@@ -375,6 +377,27 @@ def cancel_query():
 
 
 @execute_bp.route('/api/execute', methods=['POST'])
+# rate_limiter.py's RATE_LIMIT_EXECUTE (per-user request RATE over time,
+# via Flask-Limiter) - listed ABOVE @guarded_route below so a rate-limited
+# request is rejected before it ever reaches EXECUTE_GUARD.try_acquire(),
+# never consuming a concurrency slot for a request that was going to be
+# rejected anyway. See rate_limiter.py's own module docstring for why this
+# is a different, complementary axis from the concurrency guard just below
+# (rate over time vs. simultaneous in-flight requests).
+@execute_rate_limit
+# See concurrency_guard.py's own module docstring for why this exists
+# alongside Cloud Run's --concurrency/--max-instances (gcp_deploy.sh):
+# admission control here is per-ROUTE, which Cloud Run's own flags can't
+# express, letting MAX_CONCURRENT_EXECUTE_REQUESTS be configured BELOW
+# GUNICORN_THREADS to reserve headroom for cheap routes (/api/config,
+# /api/cancel, /api/ping) even while every execute-capable thread is busy.
+# {"success": False, "error": ...} matches every other failure shape this
+# route already returns (see the except blocks below) - client.js's
+# `response.ok && data.success` check already treats this the same way.
+@guarded_route(EXECUTE_GUARD, {
+    'success': False,
+    'error': 'The server is handling too many database queries right now. Please try again in a few seconds.',
+})
 def execute_query():
     # session_id resolved first and passed into get_current_user_identity()
     # so an anonymous visitor's identity is scoped to THIS session, not a

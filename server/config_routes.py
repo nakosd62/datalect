@@ -1857,10 +1857,24 @@ def handle_config():
     # connection is never a secret from them, but another (admin's)
     # preset's credentials always are, regardless of who's asking or where
     # this is running.
-    configured_dbs = [
-        {"id": db.get("id"), "name": db.get("name"), "type": db.get("type", "postgres")}
-        for db in CONFIGURED_DBS
-    ]
+    def _redact_preset_for_client(db):
+        redacted = {"id": db.get("id"), "name": db.get("name"), "type": db.get("type", "postgres")}
+        # Not a secret (unlike everything else CONFIGURED_DBS carries for
+        # this preset) - client.js's summarizeInScopeConnections() needs it
+        # to keep its "All Pre-Configured Datasets" badge/tooltip text in
+        # sync with what db.py's _resolve_all_configured_descriptors will
+        # actually query, now that a preset can opt out of "all" mode (see
+        # app_config.py's DATABASE_PRESETS_FILE comment on
+        # "include_in_all_mode"). Only added when explicitly False, exactly
+        # like CONFIGURED_DBS' own dict shape - omitted for the common case
+        # so this never changes shape for a deployment that's never touched
+        # the field, matching every existing exact-equality test on this
+        # list's shape.
+        if db.get("include_in_all_mode") is False:
+            redacted["include_in_all_mode"] = False
+        return redacted
+
+    configured_dbs = [_redact_preset_for_client(db) for db in CONFIGURED_DBS]
 
     # Which preset (if any) is active - read straight off session_data's
     # own connection_id/is_custom, computed once, unconditionally,

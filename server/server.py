@@ -46,23 +46,49 @@ def index():
     return send_from_directory(app.static_folder, 'index.html')
 
 
+# Runs at IMPORT time, not just under `if __name__ == '__main__'` below -
+# deliberately. In production (see the Dockerfile's CMD) this module is
+# imported by gunicorn as `server:app`, so this file's own `__main__` block
+# never executes there; state_store.init() (schema creation/migrations -
+# see its docstring, "safe to call on every startup") still has to run
+# somewhere every process actually reaches, or a fresh SqliteStateStore
+# would silently have no tables (FirestoreStateStore.init() is a no-op, so
+# this mattered less there, but is a real correctness gap for local/dev use
+# under gunicorn or any other non-`__main__` entry point). Confirmed by
+# direct testing: before this was hoisted out of `__main__`, running this
+# app under gunicorn instead of `python server/server.py` left every
+# session/db_connection/chat_history read silently falling back to
+# in-memory defaults (sqlite3.OperationalError: no such table, caught and
+# logged rather than raised) instead of ever actually persisting.
+state_store.init()
+
 if __name__ == '__main__':
+    # Local/dev entrypoint only now (`run_server.sh`'s
+    # `python3 -u server/server.py`) - production runs this same `app`
+    # object under gunicorn instead (see the Dockerfile's CMD), which is
+    # why state_store.init() above was moved out of this block.
     hostname = os.environ.get("CRBOT_HOSTNAME", "0.0.0.0")
     port = int(os.environ.get("CRBOT_PORT", 3000))
-    state_store.init()
-    # threaded=True: without it, Werkzeug's dev server (what this actually
-    # is, in production too - see the Dockerfile's CMD) handles one request
+    # threaded=True: without it, Werkzeug's dev server handles one request
     # at a time. A single slow/unreachable admin-configured database preset
     # - even with backends/base.py's DB_CONNECT_TIMEOUT_SECONDS now bounding
     # how long its connect() calls can hang - would otherwise stall every
     # other user's completely unrelated request for that whole window,
     # since nothing else can be serviced while the one worker is blocked.
     # Verified safe to flip on: every process-wide mutable global this app
-    # has (schema_cache.py's _cache) is already guarded by its own
-    # threading.Lock(), and state_store.py's SqliteStateStore opens a fresh
-    # sqlite3 connection per operation rather than sharing one across
-    # threads, so nothing here relied on single-threaded execution to begin
-    # with. See backends/base.py's DB_CONNECT_TIMEOUT_SECONDS docstring for
-    # the other half of this fix (bounding *how long* a bad connection can
-    # block) - this half bounds *what else* is blocked meanwhile.
+    # has (schema_cache.py's _cache, cancel_registry.py's _registry) is
+    # already guarded by its own threading.Lock(), and state_store.py's
+    # SqliteStateStore opens a fresh sqlite3 connection per operation
+    # rather than sharing one across threads, so nothing here relied on
+    # single-threaded execution to begin with. See backends/base.py's
+    # DB_CONNECT_TIMEOUT_SECONDS docstring for the other half of this fix
+    # (bounding *how long* a bad connection can block) - this half bounds
+    # *what else* is blocked meanwhile. The same reasoning is exactly why
+    # production's gunicorn config (Dockerfile) uses one process with
+    # multiple threads (--worker-class gthread) rather than multiple
+    # worker processes: schema_cache.py's and cancel_registry.py's
+    # in-memory state is process-local by design (see cancel_registry.py's
+    # own module docstring) and assumes every request-handling thread
+    # shares the same process - true here and under gunicorn's threaded
+    # worker, but NOT true across multiple gunicorn worker processes.
     app.run(host=hostname, port=port, debug=False, use_reloader=False, threaded=True)

@@ -180,6 +180,67 @@ def test_preset_missing_name_is_skipped(app_factory, tmp_path):
     assert env.app_config.CONFIGURED_DBS[0]["name"] == "Default DB"
 
 
+# --- include_in_all_mode (dialect-agnostic - see the DATABASE_PRESETS_FILE
+# comment above this field's parsing in app_config.py) --------------------
+
+def test_preset_include_in_all_mode_omitted_is_not_stored(app_factory, tmp_path):
+    # The common case (a preset that's never heard of this field) must
+    # leave CONFIGURED_DBS' shape completely unchanged - same reasoning as
+    # every other optional field in this loop (e.g. Postgres' "schema"),
+    # and what every other exact-equality test in this file already
+    # depends on implicitly by never mentioning this key.
+    path = write_database_presets_file(tmp_path, [
+        {"type": "postgres", "name": "Shop", "url": "postgresql://u:p@h/db"},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    assert "include_in_all_mode" not in env.app_config.CONFIGURED_DBS[0]
+
+
+def test_preset_include_in_all_mode_true_explicit_is_not_stored(app_factory, tmp_path):
+    # Explicit true is the default anyway - stored the same way as omitted
+    # (not stored at all), not as a literal "include_in_all_mode": True.
+    path = write_database_presets_file(tmp_path, [
+        {"type": "postgres", "name": "Shop", "url": "postgresql://u:p@h/db", "include_in_all_mode": True},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    assert "include_in_all_mode" not in env.app_config.CONFIGURED_DBS[0]
+
+
+def test_preset_include_in_all_mode_false_is_recorded(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [
+        {"type": "postgres", "name": "Shop", "url": "postgresql://u:p@h/db", "include_in_all_mode": False},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    assert env.app_config.CONFIGURED_DBS[0]["include_in_all_mode"] is False
+
+
+@pytest.mark.parametrize("falsy_value", [False, 0, "", None])
+def test_preset_include_in_all_mode_falsy_values_all_exclude(app_factory, tmp_path, falsy_value):
+    # Lenient on purpose, same forgiveness this app already gives a blank
+    # optional string field elsewhere in this same parsing loop - an admin
+    # writing "include_in_all_mode": 0 or "" by mistake still gets excluded
+    # rather than silently (and surprisingly) staying included.
+    path = write_database_presets_file(tmp_path, [
+        {"type": "postgres", "name": "Shop", "url": "postgresql://u:p@h/db", "include_in_all_mode": falsy_value},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    assert env.app_config.CONFIGURED_DBS[0]["include_in_all_mode"] is False
+
+
+def test_preset_include_in_all_mode_does_not_affect_other_dialect_branches(app_factory, tmp_path):
+    # Parsed once, generically, before the type dispatch (see app_config.py)
+    # - proven here against a non-Postgres dialect too, not just the one
+    # every other test above happens to use.
+    path = write_database_presets_file(tmp_path, [{
+        "type": "bigquery", "name": "Trends", "project_id": "bigquery-public-data",
+        "dataset": "google_trends", "include_in_all_mode": False,
+    }])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    db = env.app_config.CONFIGURED_DBS[0]
+    assert db["type"] == "bigquery"
+    assert db["include_in_all_mode"] is False
+
+
 def test_bigquery_preset_with_explicit_billing_project_id(app_factory, tmp_path):
     path = write_database_presets_file(tmp_path, [{
         "type": "bigquery", "name": "Trends", "project_id": "bigquery-public-data",

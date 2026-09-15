@@ -83,6 +83,8 @@ from db import (
 from backends import get_backend
 from connection_router import triage_all_mode_question, is_label_only_response, strip_markdown_fence
 import cancel_registry
+from concurrency_guard import TRANSLATE_GUARD, busy_response
+from rate_limiter import translate_rate_limit, summarize_rate_limit
 
 translate_bp = Blueprint('translate', __name__)
 
@@ -2860,6 +2862,14 @@ def summarize_all_mode_results(user_question, database_results, provider, client
 
 
 @translate_bp.route('/api/summarize-results', methods=['POST'])
+# See concurrency_guard.py's own module docstring (TRANSLATE_GUARD) and
+# rate_limiter.py's own docstring (RATE_LIMIT_TRANSLATE/
+# _translate_family_rate_limit) for why this route draws from the SAME
+# pooled guard/rate limit as /api/translate and summarize_result() below,
+# rather than a separate one of its own: an LLM call to generate SQL and
+# an LLM call to summarize results are the same kind of work as far as
+# this app's admission control is concerned.
+@summarize_rate_limit
 def summarize_results():
     """See the "All databases" mode, Phase C section comment above for the
     full picture. Called by the client exactly once per "route" outcome
@@ -3062,7 +3072,33 @@ def summarize_results():
             'cross_database_summary': cross_database_summary,
         }) + "\n"
 
-    resp = Response(stream_with_context(stream_summarize_results()), mimetype='application/x-ndjson')
+    # See concurrency_guard.py's own module docstring - TRANSLATE_GUARD,
+    # the SAME guard /api/translate itself uses (pooled, not a dedicated
+    # one for this route) - acquired HERE, right before actually
+    # streaming, same placement/reasoning as translate_query()'s own
+    # TRANSLATE_GUARD.try_acquire() below: nothing above this point does
+    # any real work, so nothing before it should compete for a scarce
+    # slot. {"success": False, "error": ...} matches this route's own
+    # early-validation failures above.
+    if not TRANSLATE_GUARD.try_acquire():
+        return busy_response({
+            'success': False,
+            'error': 'The server is handling too many results-summarization requests right now. Please try again in a few seconds.',
+        })
+
+    def _stream_summarize_results_with_guard_release():
+        # Holds the guard slot open for stream_summarize_results()'s ENTIRE
+        # lifetime - see translate_query()'s own
+        # _translation_stream_with_guard_release for the identical
+        # reasoning (the generator, not this view function, is what does
+        # the real work, driven lazily by Flask/gunicorn as the response
+        # streams out).
+        try:
+            yield from stream_summarize_results()
+        finally:
+            TRANSLATE_GUARD.release()
+
+    resp = Response(stream_with_context(_stream_summarize_results_with_guard_release()), mimetype='application/x-ndjson')
     return apply_session_cookie(resp, session_id)
 
 
@@ -3521,6 +3557,13 @@ def summarize_single_connection_results(user_question, schema, sql, statement_re
 
 
 @translate_bp.route('/api/summarize-result', methods=['POST'])
+# See rate_limiter.py's own docstring (RATE_LIMIT_TRANSLATE/
+# _translate_family_rate_limit) - pooled with /api/translate and
+# summarize_results() above under the SAME budget, not a separate knob of
+# its own: an LLM call to generate SQL and an LLM call to summarize
+# results are the same kind of work as far as this app's admission
+# control is concerned.
+@summarize_rate_limit
 def summarize_result():
     """See this module's "Single-connection mode's own post-execution
     results summarization" section comment above for the full picture.
@@ -3563,13 +3606,35 @@ def summarize_result():
         resp = jsonify({'success': False, 'error': 'prompt, sql and results are required'})
         return apply_session_cookie(resp, session_id), 400
 
-    # Same connection this turn's own /api/translate call itself resolved
-    # (no client-side override needed/sent - the session's current single
-    # connection, exactly like /api/translate's single-connection path).
-    conn_str = resolve_conn_str(data.get('database_url'), user_identity)
-    schema = get_database_schema(conn_str, user_identity)
+    # See concurrency_guard.py's own module docstring - TRANSLATE_GUARD,
+    # the SAME pooled guard /api/translate and /api/summarize-results also
+    # use, not a dedicated one for this route - acquired HERE, before the
+    # schema lookup just below, not just before streaming starts: unlike
+    # /api/summarize-results above (which has no equivalent inline DB work
+    # before its own guard acquire), this route's schema fetch is itself
+    # real (schema-cache-backed, but occasionally cold) DB work, and needs
+    # to happen while this guard is actually held, not in a gap between
+    # acquiring it and the point where a wrapping generator's own finally
+    # would take over. {"success": False, "error": ...} matches this
+    # route's own early-validation failures above.
+    if not TRANSLATE_GUARD.try_acquire():
+        return busy_response({
+            'success': False,
+            'error': 'The server is handling too many results-summarization requests right now. Please try again in a few seconds.',
+        })
 
     def stream_summarize_result():
+        # Same connection this turn's own /api/translate call itself
+        # resolved (no client-side override needed/sent - the session's
+        # current single connection, exactly like /api/translate's
+        # single-connection path). Resolved HERE, inside the generator
+        # (rather than synchronously above, before TRANSLATE_GUARD was even
+        # acquired) so this DB work happens entirely within the window the
+        # guard is held - see the comment above this generator's
+        # definition.
+        conn_str = resolve_conn_str(data.get('database_url'), user_identity)
+        schema = get_database_schema(conn_str, user_identity)
+
         start_time = time.perf_counter()
         client = provider.make_client(api_key)
         cancel_token = cancel_handle = None
@@ -3633,11 +3698,30 @@ def summarize_result():
             'status': 'done', 'success': True, 'summary': summary_text, 'visualization': visualization,
         }) + "\n"
 
-    resp = Response(stream_with_context(stream_summarize_result()), mimetype='application/x-ndjson')
+    def _stream_summarize_result_with_guard_release():
+        # Same reasoning as _stream_summarize_results_with_guard_release
+        # above (and translate_query()'s own equivalent wrapper) - holds
+        # the guard slot open for stream_summarize_result()'s ENTIRE
+        # lifetime, schema lookup included, not just until this view
+        # function returns.
+        try:
+            yield from stream_summarize_result()
+        finally:
+            TRANSLATE_GUARD.release()
+
+    resp = Response(stream_with_context(_stream_summarize_result_with_guard_release()), mimetype='application/x-ndjson')
     return apply_session_cookie(resp, session_id)
 
 
 @translate_bp.route('/api/translate', methods=['POST'])
+# rate_limiter.py's RATE_LIMIT_TRANSLATE (per-user request RATE over time,
+# via Flask-Limiter) - runs before translate_query() is called at all, so
+# a rate-limited request never reaches this function's own early-
+# validation checks or TRANSLATE_GUARD.try_acquire() further down. See
+# rate_limiter.py's own module docstring for why this is a different,
+# complementary axis from that concurrency guard (rate over time vs.
+# simultaneous in-flight requests).
+@translate_rate_limit
 def translate_query():
     data = request.get_json() or {}
 
@@ -4423,5 +4507,44 @@ def translate_query():
             if cancel_handle is not None:
                 cancel_handle.close()
 
-    resp = Response(stream_with_context(stream_translation()), mimetype='application/x-ndjson')
+    # See concurrency_guard.py's own module docstring for why this exists
+    # alongside Cloud Run's --concurrency/--max-instances (gcp_deploy.sh).
+    # Acquired HERE, right before actually streaming - not any earlier -
+    # so the two early-validation returns above (missing API key, empty
+    # prompt) never touch this guard at all: they do essentially no work,
+    # so they shouldn't consume one of a scarce number of "expensive work"
+    # slots. A rejection here keeps the same real, non-streamed HTTP
+    # status (503, not 200-with-success-false) those two early returns
+    # already use, for the identical reason spelled out in the big comment
+    # above stream_translation() - nothing has streamed yet at this point,
+    # so an ordinary HTTP status is still possible. {"error": ...} (no
+    # "success" key) matches that same early-validation shape exactly,
+    # which client.js's readNdjsonStream already reads correctly as a
+    # single, non-streamed line straight into `finalData` (see that
+    # function's own docstring) - zero client-side changes needed.
+    if not TRANSLATE_GUARD.try_acquire():
+        return busy_response({
+            'error': 'The server is handling too many translation requests right now. Please try again in a few seconds.',
+        })
+
+    def _translation_stream_with_guard_release():
+        # Holds the guard slot open for stream_translation()'s ENTIRE
+        # lifetime, not just until this route function returns - the
+        # generator itself is what does the real (expensive) work, driven
+        # lazily by Flask/gunicorn as it sends the response, well after
+        # translate_query() has already returned the Response object below.
+        # A plain try/finally around the outer call (the way
+        # execute_routes.py's @guarded_route decorator works for its own,
+        # non-streaming route) would release this slot immediately,
+        # before any real work even started. Relies on stream_translation()'s
+        # own `finally` (just above) reliably running even if the client
+        # disconnects/cancels mid-stream - already something this codebase
+        # depends on for cancel_registry's own cleanup there, not a new
+        # assumption introduced here.
+        try:
+            yield from stream_translation()
+        finally:
+            TRANSLATE_GUARD.release()
+
+    resp = Response(stream_with_context(_translation_stream_with_guard_release()), mimetype='application/x-ndjson')
     return apply_session_cookie(resp, session_id)

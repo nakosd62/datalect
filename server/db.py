@@ -191,11 +191,23 @@ def resolve_in_scope_descriptors(session, user_id):
 def _resolve_all_configured_descriptors(user_id):
     """"All Pre-Configured Datasets" (see webClient/client.js's
     renderDbRadioButtons()) - the dynamic candidate pool for a session in
-    in_scope_mode == "all": EVERY currently-configured preset
-    (CONFIGURED_DBS, read fresh on every call, so a preset added or
-    removed since this was last true is immediately reflected - the whole
-    point of "All" over the frozen, save-time-computed subset the old
-    arbitrary checkbox picker produced).
+    in_scope_mode == "all": EVERY currently-configured preset that hasn't
+    explicitly opted out (CONFIGURED_DBS, read fresh on every call, so a
+    preset added or removed since this was last true is immediately
+    reflected - the whole point of "All" over the frozen, save-time-computed
+    subset the old arbitrary checkbox picker produced).
+
+    A preset with "include_in_all_mode": false in DATABASE_PRESETS_FILE
+    (see app_config.py's own comment on that field) is skipped here even
+    though it's still a perfectly valid, individually-selectable preset
+    everywhere else - this is the ONLY place that distinction matters, since
+    every other code path that touches CONFIGURED_DBS (the explicit-list
+    branch in resolve_in_scope_descriptors above, the single-connection
+    radio picker, resolve_descriptor_by_reference) has no notion of "all
+    mode" to exclude a preset from in the first place. Defaults to included
+    (db.get("include_in_all_mode", True)) for any preset that predates this
+    field or never sets it - unchanged behavior for everyone who hasn't
+    opted a preset out.
 
     Deliberately PRESETS ONLY, never this user's own custom connections -
     unlike an earlier version of this feature (when it was still named/
@@ -210,11 +222,17 @@ def _resolve_all_configured_descriptors(user_id):
     the explicit-list branch in resolve_in_scope_descriptors above, so a
     preset that (implausibly, mid-request) stops resolving is silently
     skipped the same way, not a special case. Falls back to the single
-    app-default entry only if there's nothing configured at all -
-    CONFIGURED_DBS always has at least DEFAULT_CONN in practice (see
-    app_config.py), so this is a defensive floor, not an expected path."""
+    app-default entry if there's nothing left in the candidate pool -
+    either because nothing is configured at all (CONFIGURED_DBS always has
+    at least DEFAULT_CONN in practice, see app_config.py, so this half is a
+    defensive floor, not an expected path) or, now, because an admin has
+    set "include_in_all_mode": false on every single configured preset
+    (an unusual but legitimate config - "All" mode degrading to one default
+    connection is a saner outcome than returning zero candidates)."""
     entries = []
     for db in CONFIGURED_DBS:
+        if not db.get("include_in_all_mode", True):
+            continue
         preset_id = db.get("id")
         descriptor, name = resolve_descriptor_by_reference("preset", preset_id, user_id)
         if descriptor is not None:

@@ -46,6 +46,7 @@ _APP_MODULE_NAMES = [
     "app_config", "auth", "auth_session", "config_routes", "execute_routes",
     "translate_routes", "chat_history_routes", "report_routes",
     "db", "schema_cache", "state_store", "connection_router", "cancel_registry",
+    "concurrency_guard", "rate_limiter",
 ]
 
 # Every env var any of the above modules reads at import or request time.
@@ -93,6 +94,20 @@ _ENV_VARS_TO_CLEAR = [
     # auth_session.py's long-lived session-cookie signing key - cleared for
     # the same reason as every other secret-shaped var above.
     "SESSION_SIGNING_KEY",
+    # concurrency_guard.py's two admission-control limits - cleared for the
+    # same reason as every other env-derived constant above: a developer's
+    # real shell plausibly has these set for their own local Cloud Run
+    # testing, which would otherwise silently leak into any test that
+    # doesn't explicitly pass its own `env` (and, unlike most vars here, a
+    # leaked non-zero value would make an otherwise-unrelated test start
+    # returning 503s under concurrent access, a confusing failure to debug).
+    "MAX_CONCURRENT_TRANSLATE_REQUESTS", "MAX_CONCURRENT_EXECUTE_REQUESTS",
+    # rate_limiter.py's two per-user rate-limit strings - cleared for the
+    # same reason as the pair above: a developer's real shell plausibly has
+    # these set for their own local Cloud Run testing, and a leaked value
+    # would make an otherwise-unrelated test start returning 429s under
+    # repeated requests, a confusing failure to debug.
+    "RATE_LIMIT_TRANSLATE", "RATE_LIMIT_EXECUTE",
 ]
 
 # A syntactically valid (but obviously throwaway, fixed/shared) Fernet
@@ -175,8 +190,9 @@ def fresh_import(monkeypatch, tmp_path, env=None, register_blueprints=True, mock
 
     Returns a SimpleNamespace with at least `.app_config`; when
     register_blueprints=True (the default) also `.auth`, `.config_routes`,
-    `.execute_routes`, `.translate_routes`, `.cancel_registry`, and
-    `.client` (a Flask test client with state_store.init() already called).
+    `.execute_routes`, `.translate_routes`, `.cancel_registry`,
+    `.concurrency_guard`, `.rate_limiter`, and `.client` (a Flask test
+    client with state_store.init() already called).
     """
     os.makedirs(tmp_path, exist_ok=True)
     monkeypatch.chdir(tmp_path)
@@ -235,6 +251,8 @@ def fresh_import(monkeypatch, tmp_path, env=None, register_blueprints=True, mock
         import chat_history_routes
         import report_routes
         import cancel_registry
+        import concurrency_guard
+        import rate_limiter
 
         app_config.app.before_request(auth.enforce_authentication)
         # Mirrors server.py's own after_request registration - see auth.py's
@@ -257,6 +275,8 @@ def fresh_import(monkeypatch, tmp_path, env=None, register_blueprints=True, mock
         ns.translate_routes = translate_routes
         ns.report_routes = report_routes
         ns.cancel_registry = cancel_registry
+        ns.concurrency_guard = concurrency_guard
+        ns.rate_limiter = rate_limiter
 
         # Mirrors server.py's own '/' route registration (serves the SPA
         # shell) - not a blueprint, so it's not picked up above, but it's

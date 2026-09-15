@@ -1576,6 +1576,56 @@ def test_all_mode_never_includes_a_newly_saved_custom_connection(app_factory, tm
     assert "Marketing Postgres" not in triage_prompt_text
 
 
+def test_all_mode_excludes_a_preset_marked_include_in_all_mode_false(app_factory, tmp_path, monkeypatch):
+    # Requirement: an admin can opt a specific PRESET out of "All
+    # Pre-Configured Datasets" mode via "include_in_all_mode": false in
+    # DATABASE_PRESETS_FILE (see app_config.py's own comment on this field
+    # and db.py's _resolve_all_configured_descriptors) - it was previously
+    # hardcoded to always include every configured preset with no way to
+    # exclude one. Proven the same robust way
+    # test_all_mode_never_includes_a_newly_saved_custom_connection proves
+    # its own exclusion above: by inspecting the actual triage prompt sent
+    # to the (mocked) LLM, not by an indirect mechanism.
+    presets_path = write_database_presets_file(tmp_path, [
+        {"id": "pg-a", "name": "Sales Postgres", "type": "postgres", "url": "postgresql://u:p@host-a:5432/a"},
+        {
+            "id": "pg-b", "name": "Quarantined Postgres", "type": "postgres",
+            "url": "postgresql://u:p@host-b:5432/b", "include_in_all_mode": False,
+        },
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": presets_path, "GEMINI_PRESET_KEYS": "fake-key-1"})
+    login_as(env.client, "alice@example.com")
+    _set_all_mode(env.client)
+
+    import db as db_module
+    monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
+        "postgresql://u:p@host-a:5432/a": "Table: deals\nid INTEGER\n",
+    }))
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(_gemini_ok('{"action": "route", "indices": [0], "message": "Checking Sales Postgres."}'))
+    harness.register_marker("deals", _gemini_ok("SELECT * FROM deals;"))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'sales figures please'})
+    _, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    assert data['router_route'] is True
+    assert "-- database: preset:pg-a (Sales Postgres)" in data['sql']
+    # Exactly one candidate was ever offered to triage - the eligible
+    # preset - never the one marked include_in_all_mode: false, even though
+    # it's a perfectly normal, individually-selectable preset otherwise.
+    assert data['connection_selection'] == [
+        {"kind": "preset", "id": "pg-a", "name": "Sales Postgres", "type": "postgres",
+         "prompt": "sales figures please"},
+    ]
+
+    triage_call = harness.generate_calls[0]
+    triage_prompt_text = str(triage_call["contents"])
+    assert "Sales Postgres" in triage_prompt_text
+    assert "Quarantined Postgres" not in triage_prompt_text
+
+
 def test_all_mode_fetches_schema_for_every_candidate_regardless_of_cache_state(app_factory, tmp_path, monkeypatch):
     # Triage's candidate summaries must reflect a live schema fetch for
     # EVERY in-scope connection, not just whichever happens to already be

@@ -2474,8 +2474,17 @@ document.addEventListener('DOMContentLoaded', async () => {
       // part of "All Pre-Configured Datasets" mode. customDbs is intentionally
       // NOT included in `names` here (unlike the legacy branch below,
       // which can legitimately include them - it's an explicit, user-
-      // picked subset, not "all").
-      const names = configuredDbs.map(db => db.name);
+      // picked subset, not "all"). Also excludes any preset the admin has
+      // opted out of "all" mode (include_in_all_mode: false in
+      // presets.json - see app_config.py's DATABASE_PRESETS_FILE comment
+      // and db.py's _resolve_all_configured_descriptors) - configuredDbs
+      // only ever carries this key when it's explicitly false (see
+      // config_routes.py's _redact_preset_for_client), so `!== false`
+      // treats a missing key exactly like an explicit true, matching the
+      // server's own default. Without this filter, an opted-out preset
+      // would still show up in this badge/tooltip as if it were part of
+      // "All", even though the server never actually queries it.
+      const names = configuredDbs.filter(db => db.include_in_all_mode !== false).map(db => db.name);
       return { count: names.length, label: names.length > 1 ? 'All Pre-Configured Datasets' : null, names };
     }
     const presetIds = data?.in_scope_preset_ids || [];
@@ -3679,6 +3688,26 @@ document.addEventListener('DOMContentLoaded', async () => {
     const leftPresets = CONFIGURED_DBS.slice(0, leftCount);
     const rightPresets = CONFIGURED_DBS.slice(leftCount);
 
+    // Whether "All Pre-Configured Datasets" is even worth offering as a
+    // choice - see app_config.py's DATABASE_PRESETS_FILE comment on
+    // "include_in_all_mode" and db.py's _resolve_all_configured_descriptors,
+    // which now excludes any preset an admin has opted out. Deliberately
+    // ">  0", not "> 1": a single eligible preset already renders "All"
+    // today (see config-modal.spec.js's "with only one preset configured"
+    // test - unchanged, since include_in_all_mode defaults to eligible),
+    // so this must stay a no-op for every deployment that's never touched
+    // the new field. It only ever hides the option in the NEW case this
+    // field introduces: an admin has opted every single configured preset
+    // out, leaving nothing for "All" to mean beyond the single fallback
+    // default connection - confusing to still offer as if it were a real
+    // combined-mode choice. NOTE: this is a display-only check computed
+    // fresh every render - a session already saved in_scope_mode "all"
+    // from before an admin dropped eligibility to zero simply shows no
+    // radio checked next time this dialog opens, rather than something
+    // crashing; not solved further here ("for now").
+    const allModeEligibleCount = CONFIGURED_DBS.filter(db => db.include_in_all_mode !== false).length;
+    const showAllOption = allModeEligibleCount > 0;
+
     // "All Pre-Configured Datasets" (see db.py's _resolve_all_configured_
     // descriptors - presets only, never custom connections) renders as one
     // more option in the SAME two-column preset list, directly after the
@@ -3690,7 +3719,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     // the edge case where there's only 0-1 presets and the right column
     // is empty) - this never disturbs the existing left/right preset
     // split itself (see the count-based comment above), it only adds one
-    // extra item to whichever column already ends last.
+    // extra item to whichever column already ends last. Only relevant at
+    // all when showAllOption is true.
     const allOptionGoesInRightColumn = rightPresets.length > 0;
 
     // Explanation of what this option does - previously a standalone <p>
@@ -3728,12 +3758,12 @@ document.addEventListener('DOMContentLoaded', async () => {
       `;
     };
 
-    const allOption = `
+    const allOption = showAllOption ? `
       <label class="radio-option all-databases-option" title="${ALL_OPTION_HINT}">
         <input type="radio" name="db_connection_option" value="all" ${allSelected ? 'checked' : ''}>
         <span class="radio-label">All Pre-Configured Datasets</span>
       </label>
-    `;
+    ` : '';
     const leftColumnHtml = leftPresets.map(renderPresetOption).join('') + (allOptionGoesInRightColumn ? '' : allOption);
     const rightColumnHtml = rightPresets.map(renderPresetOption).join('') + (allOptionGoesInRightColumn ? allOption : '');
 

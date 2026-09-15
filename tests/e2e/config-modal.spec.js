@@ -331,6 +331,98 @@ test.describe('config modal', () => {
     await expect(allOption).toHaveAttribute('title', /your own custom connections are never included/);
   });
 
+  test('"All Pre-Configured Datasets" is hidden entirely when every preset has opted out via include_in_all_mode: false', async ({ page }) => {
+    // app_config.py's DATABASE_PRESETS_FILE "include_in_all_mode" field
+    // (db.py's _resolve_all_configured_descriptors) lets an admin exclude
+    // specific presets from "All" mode. Once EVERY configured preset is
+    // excluded, offering the "All" radio at all would be misleading - it
+    // would just silently fall back to the single default connection
+    // server-side (see that function's own docstring) rather than
+    // genuinely combining anything - so renderDbRadioButtons() (client.js)
+    // hides the option outright in that case. Each preset stays fully
+    // selectable individually regardless - only the combined "All" choice
+    // is affected.
+    const configuredDatabases = [
+      { id: 'p-0', name: 'Solo Postgres', type: 'postgres', include_in_all_mode: false },
+    ];
+    await page.route('**/api/config', async (route) => {
+      if (route.request().method() !== 'GET') return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          auth_enabled: false,
+          session_id: 'e2e-session',
+          user_id: 'global',
+          authenticated: false,
+          is_cloud_run: false,
+          configured_databases: configuredDatabases,
+          active_preset_id: 'p-0',
+          default_database_url: '',
+          active_database_url: '',
+          active_database_type: 'postgres',
+          active_is_custom: false,
+          active_custom_connection_key: '',
+          active_uses_custom_credentials: false,
+          database_name: 'Solo Postgres',
+          custom_database_name: '',
+          custom_database_url: '',
+          custom_databases: [],
+          auto_sql_execute: false,
+        }),
+      });
+    });
+
+    await gotoApp(page);
+    await openConfigModal(page);
+
+    const columns = page.locator('.preset-column');
+    await expect(columns.nth(0).locator('.radio-label')).toHaveText(['Solo Postgres']);
+    await expect(page.locator('.all-databases-option')).toHaveCount(0);
+  });
+
+  test('"All Pre-Configured Datasets" still shows when at least one preset remains eligible', async ({ page }) => {
+    // Mixed case: one preset opted out, one still eligible - "All" must
+    // still render (it would only combine the eligible one server-side,
+    // but that's still a meaningful, non-trivial choice to offer).
+    const configuredDatabases = [
+      { id: 'p-0', name: 'Quarantined Postgres', type: 'postgres', include_in_all_mode: false },
+      { id: 'p-1', name: 'Sales Postgres', type: 'postgres' },
+    ];
+    await page.route('**/api/config', async (route) => {
+      if (route.request().method() !== 'GET') return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          auth_enabled: false,
+          session_id: 'e2e-session',
+          user_id: 'global',
+          authenticated: false,
+          is_cloud_run: false,
+          configured_databases: configuredDatabases,
+          active_preset_id: 'p-0',
+          default_database_url: '',
+          active_database_url: '',
+          active_database_type: 'postgres',
+          active_is_custom: false,
+          active_custom_connection_key: '',
+          active_uses_custom_credentials: false,
+          database_name: 'Quarantined Postgres',
+          custom_database_name: '',
+          custom_database_url: '',
+          custom_databases: [],
+          auto_sql_execute: false,
+        }),
+      });
+    });
+
+    await gotoApp(page);
+    await openConfigModal(page);
+
+    await expect(page.locator('.all-databases-option')).toHaveCount(1);
+  });
+
   test('custom connections heading has a security note that opens the Help modal', async ({ page }) => {
     await gotoApp(page);
     await openConfigModal(page);
