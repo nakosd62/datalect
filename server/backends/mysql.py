@@ -93,7 +93,94 @@ from .base import (
     Backend, SqlExecutionError, SCHEMA_MAX_TABLE_NAMES_SCANNED, SCHEMA_MAX_TABLES,
     DB_CONNECT_TIMEOUT_SECONDS, materialize_ca_cert_tempfile,
     group_date_sharded_tables, cap_kept_tables, cap_schema_text, fetch_capped_rows,
+    find_naming_convention_relationships,
 )
+
+
+def _quote_ident(name):
+    """Backtick-quotes a MySQL identifier for interpolation into a plain SQL
+    string (doubling an embedded backtick, the way MySQL itself expects),
+    for the Phase 2 per-table live-query section below (get_schema()'s
+    "Column value samples"/"Live row counts" sections) - mirrors
+    backends/postgres.py's own _quote_ident helper, just with MySQL's
+    backtick quoting instead of Postgres's double quotes. `name` always
+    comes from information_schema data this same connection already
+    queried (kept_names / column names Phase 1 just fetched) - never from
+    raw user input - so this only needs to be correct, not defend against
+    an adversarial identifier."""
+    return '`' + str(name).replace('`', '``') + '`'
+
+
+# Phase 2 (deep-only) sampling: which information_schema.columns.DATA_TYPE
+# strings (MySQL reports these lowercased, e.g. "int", "varchar") are worth a
+# MIN()/MAX() range query (numeric/date-ish) vs a frequent-value GROUP BY
+# (bounded/categorical-ish) - mirrors backends/postgres.py's
+# NUMERIC_OR_DATE_TYPES/CATEGORICAL_TYPES, adapted to MySQL's own type names.
+# Deliberately conservative/small lists rather than "everything that isn't
+# the other list" - a DATA_TYPE this doesn't recognize (json, blob, binary,
+# geometry, ...) is simply skipped for sampling rather than guessed at.
+NUMERIC_OR_DATE_TYPES = frozenset({
+    "tinyint", "smallint", "mediumint", "int", "integer", "bigint",
+    "decimal", "numeric", "float", "double",
+    "date", "datetime", "timestamp", "time", "year",
+})
+CATEGORICAL_TYPES = frozenset({"varchar", "char", "tinytext", "enum", "set"})
+
+# Bounds on Phase 2's per-table sampling cost - see get_schema()'s "Column
+# value samples" section for how each is used. Same values as
+# backends/postgres.py's own constants, kept as separate module-level
+# constants (not imported) since each backend's Phase 2 section is
+# independently tunable.
+MAX_COLUMNS_FOR_SAMPLING = 25
+MAX_NUMERIC_COLUMNS_FOR_MINMAX = 15
+MAX_CATEGORICAL_SAMPLE_COLUMNS_PER_TABLE = 3
+# MySQL has no free planner statistic as cheap as Postgres's pg_stats.n_distinct
+# to gate frequent-value sampling with (see _is_near_unique_distinct_count's
+# docstring below for why a live COUNT(DISTINCT ...) is used instead) - that
+# means checking a categorical column's cardinality here always costs one
+# extra live query, unlike Postgres where the gate is free. This second cap
+# bounds how many categorical columns even get that COUNT(DISTINCT ...)
+# check per table, independent of how many turn out eligible - without it, a
+# table with many categorical columns that all happen to be near-unique
+# would still cost one live query per column just to rule each one out.
+MAX_CATEGORICAL_COLUMNS_CHECKED_PER_TABLE = 10
+# Matches the "GROUP BY ... ORDER BY COUNT(*) DESC LIMIT 15" shape called
+# for in the plan this implements.
+FREQUENT_VALUES_LIMIT = 15
+
+
+def _is_near_unique_distinct_count(distinct_count, row_count):
+    """Gate for whether a categorical column's "frequent values" sample is
+    worth rendering at all - using a live `SELECT COUNT(DISTINCT col)`
+    rather than a pre-computed planner statistic the way
+    backends/postgres.py's _is_near_unique_n_distinct does with
+    pg_stats.n_distinct. MySQL's closest catalog analog,
+    information_schema.STATISTICS.CARDINALITY, only exists for indexed
+    columns and is itself just an estimate refreshed on ANALYZE TABLE/some
+    engine operations - not reliable enough to gate on for an arbitrary
+    categorical column that may have no index at all. A live COUNT(DISTINCT)
+    is used instead: this is acceptable here specifically because gating
+    only ever runs from get_schema() (deep, Phase 2, already a live-query
+    context) - get_schema_shallow() (Phase 1) never reaches this function.
+
+    `distinct_count is None` (the COUNT(DISTINCT) query itself failed, e.g.
+    a permissions gap) is treated as "not near-unique" - permissive by
+    design, matching backends/postgres.py's own None handling, since the
+    alternative (always skipping a column this couldn't check) would hide
+    sampling entirely rather than just occasionally rendering a sample for
+    an unexpectedly-unique column. A column is near-unique when it has more
+    than 1000 distinct values outright (mirrors Postgres's own absolute
+    cutoff), or - for a smaller table where 1000 alone wouldn't catch a
+    fully-unique column - when at least half of all rows have a distinct
+    value (`row_count` is the live row count this same Phase 2 pass already
+    fetched for the table, so this needs no extra query of its own)."""
+    if distinct_count is None:
+        return False
+    if distinct_count > 1000:
+        return True
+    if row_count:
+        return distinct_count / row_count >= 0.5
+    return False
 
 
 def _parse_mysql_url(url):
@@ -279,8 +366,33 @@ class MySQLBackend(Backend):
                 db_name, username = row[0], row[1]
         return db_name, username
 
-    def get_schema(self, connection):
+    def _build_shallow_schema_parts(self, connection):
+        """Phase 1 (catalog-only, no live queries): every query both
+        get_schema_shallow() and get_schema() (deep) need, run exactly once
+        here and shared by both - see backends/postgres.py's own
+        _build_shallow_schema_parts() for the identical shape this mirrors,
+        and backends/base.py's Backend.get_schema()/get_schema_shallow()
+        docstrings for why this split exists at all.
+
+        Returns None if the connection's database has no BASE TABLE at all
+        (mirrors get_schema()'s old "return None" for that case). Otherwise
+        returns (schema_parts, table_columns, phase2_ctx):
+          - schema_parts: the ordered list of text sections, not yet joined/
+            capped.
+          - table_columns: {table_name: [column_name, ...]}, scoped to the
+            same bounded kept_names set schema_parts describes - handed to
+            the shared find_naming_convention_relationships() helper by
+            get_schema()'s Phase 2 pass (no extra query needed for that).
+          - phase2_ctx: raw, already-fetched data Phase 2 wants to reuse
+            without re-querying - kept_names/column_types (for deciding what
+            to sample) and the raw views/routines rows (so get_schema() can
+            render their full body text without a second trip to the
+            database - see the "Views"/"Routines" sections below for why
+            only the *name*/signature is rendered here).
+        """
         schema_parts = []
+        table_columns = {}
+        column_types = {}
 
         with connection.cursor() as cursor:
             # Phase 1: cheap - just the distinct base-table names, bounded
@@ -289,7 +401,7 @@ class MySQLBackend(Backend):
             # into date-shard families and capped to SCHEMA_MAX_TABLES
             # entries (see backends/base.py) before any column/constraint/
             # index/view/trigger query runs, same staging as
-            # backends/postgres.py's get_schema().
+            # backends/postgres.py's own version.
             cursor.execute("""
                 SELECT TABLE_NAME
                 FROM information_schema.TABLES
@@ -310,6 +422,17 @@ class MySQLBackend(Backend):
             }
 
             # 1. Tables and Columns - scoped to the bounded kept_names set.
+            # EXTRA/COLUMN_COMMENT (new) are appended at the end of the
+            # SELECT list (not inserted in the middle) so that a test/caller
+            # still passing the old 5-column row shape can be padded rather
+            # than needing every existing row rewritten - see
+            # tests/server/test_mysql_backend.py's own _pad_column_row.
+            # EXTRA contains the literal substring "auto_increment" for an
+            # AUTO_INCREMENT column (MySQL's identity-column equivalent -
+            # see the plan's "Identity/auto-increment marker" attribute);
+            # COLUMN_COMMENT is whatever comment text was set on the column
+            # via COMMENT '...' at CREATE/ALTER TABLE time (empty string,
+            # never NULL, when none was set).
             format_strings = ",".join(["%s"] * len(kept_names))
             cursor.execute(f"""
                 SELECT
@@ -317,7 +440,9 @@ class MySQLBackend(Backend):
                     c.COLUMN_NAME,
                     c.DATA_TYPE,
                     c.IS_NULLABLE,
-                    c.COLUMN_DEFAULT
+                    c.COLUMN_DEFAULT,
+                    c.EXTRA,
+                    c.COLUMN_COMMENT
                 FROM information_schema.COLUMNS c
                 WHERE c.TABLE_SCHEMA = DATABASE()
                   AND c.TABLE_NAME IN ({format_strings})
@@ -326,12 +451,22 @@ class MySQLBackend(Backend):
             columns_data = cursor.fetchall()
 
             tables = {}
-            for table_name, col_name, data_type, is_nullable, col_default in columns_data:
-                if table_name not in tables:
-                    tables[table_name] = []
+            column_comments = {}
+            for row in columns_data:
+                table_name, col_name, data_type, is_nullable, col_default, extra, col_comment = row
+                tables.setdefault(table_name, [])
+                table_columns.setdefault(table_name, []).append(col_name)
+                column_types.setdefault(table_name, {})[col_name] = data_type
                 default_str = f" DEFAULT {col_default}" if col_default is not None else ""
                 null_str = "NULL" if is_nullable == "YES" else "NOT NULL"
-                tables[table_name].append(f"  {col_name} {data_type} {null_str}{default_str}")
+                extra_str = ""
+                if extra and "auto_increment" in extra.lower():
+                    extra_str = " AUTO_INCREMENT"
+                tables[table_name].append(
+                    f"  {col_name} {data_type} {null_str}{default_str}{extra_str}"
+                )
+                if col_comment:
+                    column_comments.setdefault(table_name, []).append((col_name, col_comment))
 
             for table_name in kept_names:
                 col_defs = tables.get(table_name)
@@ -419,6 +554,13 @@ class MySQLBackend(Backend):
             # reasoning as backends/postgres.py's get_schema(): kept_names
             # is built exclusively from BASE TABLE names, so no view name
             # could ever appear in it.
+            #
+            # Shallow rendering is name-only (no VIEW_DEFINITION body) - the
+            # raw rows (including each view's body) are still fetched here
+            # (one query, reused by both phases) and threaded through via
+            # phase2_ctx below so get_schema() (deep) can render the full
+            # body without a second query - see get_schema()'s "View
+            # definitions" section.
             cursor.execute("""
                 SELECT TABLE_NAME, VIEW_DEFINITION
                 FROM information_schema.VIEWS
@@ -426,7 +568,7 @@ class MySQLBackend(Backend):
             """)
             views = cursor.fetchall()
             if views:
-                view_lines = [f"  View {v[0]}: {(v[1] or '').strip()}" for v in views]
+                view_lines = [f"  View {v[0]}" for v in views]
                 schema_parts.append("Views:\n" + "\n".join(view_lines))
 
             # 5. Grants - MySQL's closest equivalent to Postgres's
@@ -457,6 +599,275 @@ class MySQLBackend(Backend):
             if triggers:
                 trig_lines = [f"  [{t[0]}] {t[1]} ({t[2]}): {t[3]}" for t in triggers]
                 schema_parts.append("Triggers:\n" + "\n".join(trig_lines))
+
+            # 7. Table comments + row count estimate (new) - both live on
+            # the exact same information_schema.TABLES row per kept table,
+            # so one query covers two new attribute groups (table/column
+            # comments, and the row-count estimate) instead of two separate
+            # round trips to the same catalog view. Column comments were
+            # already collected above from the COLUMNS query itself
+            # (column_comments); combined with this query's table-level
+            # comments into a single "Comments:" section below.
+            #
+            # TABLE_ROWS is an InnoDB *estimate* (refreshed by ANALYZE
+            # TABLE/some background operations, not a live scan) - it can
+            # read 0 or be stale for a table that hasn't been analyzed
+            # recently, especially right after a server restart (InnoDB's
+            # own documented caveat); see get_schema()'s "Live row counts"
+            # section for the authoritative, deep-only counterpart. Best-
+            # effort/try-except: a role that can't evaluate this still gets
+            # every other section, rather than losing the whole schema
+            # fetch over one cosmetic/estimate addition.
+            try:
+                cursor.execute(f"""
+                    SELECT TABLE_NAME, TABLE_COMMENT, TABLE_ROWS
+                    FROM information_schema.TABLES
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME IN ({format_strings});
+                """, tuple(kept_names))
+                table_meta = cursor.fetchall()
+            except Exception:
+                table_meta = []
+
+            table_comments = {}
+            estimate_lines = []
+            for tbl, table_comment, table_rows in table_meta:
+                if table_comment:
+                    table_comments[tbl] = table_comment
+                if table_rows is not None:
+                    estimate_lines.append(
+                        f"  {tbl}: ~{int(table_rows)} rows (estimate - InnoDB "
+                        f"statistics, may be 0 or stale for some tables)"
+                    )
+
+            comment_lines = []
+            for table_name in kept_names:
+                if table_name in table_comments:
+                    comment_lines.append(f"  [table] {table_name}: {table_comments[table_name]}")
+                for col_name, col_comment in column_comments.get(table_name, []):
+                    comment_lines.append(f"  [column] {table_name}.{col_name}: {col_comment}")
+            if comment_lines:
+                schema_parts.append("Comments:\n" + "\n".join(comment_lines))
+            if estimate_lines:
+                schema_parts.append("Row count estimates:\n" + "\n".join(estimate_lines))
+
+            # 8. Routines (new) - existence + signature only, no body (see
+            # get_schema()'s "Routine definitions" section for the full-body
+            # deep-only counterpart, reusing ROUTINE_DEFINITION fetched here
+            # rather than re-querying it). Not scoped to kept_names (like
+            # Views above) - routines aren't tables and ROUTINE_SCHEMA =
+            # DATABASE() already bounds this to the connection's own schema.
+            #
+            # PARAMETER_MODE IS NOT NULL on the join excludes a FUNCTION's
+            # own return-value row from information_schema.PARAMETERS (MySQL
+            # represents a function's return type as a parameter-shaped row
+            # with PARAMETER_MODE/PARAMETER_NAME both NULL) - without this,
+            # a function's signature would include a spurious "None None"
+            # entry alongside its real parameters.
+            routines = []
+            try:
+                cursor.execute("""
+                    SELECT r.ROUTINE_NAME,
+                           COALESCE(GROUP_CONCAT(
+                               CONCAT(p.PARAMETER_NAME, ' ', p.DATA_TYPE)
+                               ORDER BY p.ORDINAL_POSITION SEPARATOR ', '
+                           ), '') AS signature,
+                           r.DATA_TYPE AS return_type,
+                           r.ROUTINE_DEFINITION
+                    FROM information_schema.ROUTINES r
+                    LEFT JOIN information_schema.PARAMETERS p
+                      ON p.SPECIFIC_SCHEMA = r.ROUTINE_SCHEMA
+                     AND p.SPECIFIC_NAME = r.SPECIFIC_NAME
+                     AND p.PARAMETER_MODE IS NOT NULL
+                    WHERE r.ROUTINE_SCHEMA = DATABASE()
+                    GROUP BY r.ROUTINE_NAME, r.SPECIFIC_NAME, r.DATA_TYPE, r.ROUTINE_DEFINITION
+                    ORDER BY r.ROUTINE_NAME;
+                """)
+                routines = cursor.fetchall()
+                if routines:
+                    routine_lines = []
+                    for name, signature, return_type, _definition in routines:
+                        if return_type:
+                            routine_lines.append(f"  {name}({signature}) -> {return_type}")
+                        else:
+                            routine_lines.append(f"  {name}({signature})")
+                    schema_parts.append("Routines:\n" + "\n".join(routine_lines))
+            except Exception:
+                pass
+
+            # 9. Session timezone / default collation (new) - one line for
+            # the whole connection, not per-table. @@session.time_zone is
+            # the session's effective timezone (what TIMESTAMP arithmetic
+            # and NOW()/CURRENT_TIMESTAMP resolve against);
+            # @@collation_database is the connected database's default
+            # collation (affects text ordering/comparison).
+            try:
+                cursor.execute("SELECT @@session.time_zone, @@collation_database;")
+                row = cursor.fetchone()
+                if row:
+                    tz, collation = row[0], row[1]
+                    schema_parts.append(f"Session: timezone={tz}; default collation={collation}")
+            except Exception:
+                pass
+
+        phase2_ctx = {
+            "kept_names": kept_names,
+            "column_types": column_types,
+            "views": views,
+            "routines": routines,
+        }
+        return schema_parts, table_columns, phase2_ctx
+
+    def get_schema_shallow(self, connection):
+        built = self._build_shallow_schema_parts(connection)
+        if built is None:
+            return None
+        schema_parts, _table_columns, _phase2_ctx = built
+        if not schema_parts:
+            return None
+        return cap_schema_text("\n\n".join(schema_parts))
+
+    def get_schema(self, connection):
+        """Deep fetch: Phase 1 (catalog-only, via _build_shallow_schema_parts)
+        plus Phase 2 (live-query enrichment) - see get_schema_shallow() for
+        the catalog-only subset, and the module-level constants above for
+        the sampling caps this section respects."""
+        built = self._build_shallow_schema_parts(connection)
+        if built is None:
+            return None
+        schema_parts, table_columns, phase2_ctx = built
+        schema_parts = list(schema_parts)
+
+        kept_names = phase2_ctx["kept_names"]
+        column_types = phase2_ctx["column_types"]
+        views = phase2_ctx["views"]
+        routines = phase2_ctx["routines"]
+
+        # Phase 2 (deep-only): full view/routine bodies, reusing the raw
+        # rows _build_shallow_schema_parts already fetched - no re-query.
+        if views:
+            view_lines = [f"  View {v[0]}: {(v[1] or '').strip()}" for v in views]
+            schema_parts.append("View definitions:\n" + "\n".join(view_lines))
+
+        routine_body_lines = [
+            f"  {r[0]}: {(r[3] or '').strip()}" for r in routines if (r[3] or "").strip()
+        ]
+        if routine_body_lines:
+            schema_parts.append("Routine definitions:\n" + "\n".join(routine_body_lines))
+
+        with connection.cursor() as cursor:
+            live_count_lines = []
+            sample_blocks = []
+            row_counts = {}
+
+            for table_name in kept_names:
+                col_types = column_types.get(table_name) or {}
+                if not col_types:
+                    # A kept_names entry cap_kept_tables dropped columns for
+                    # (shouldn't normally happen - kept_names and
+                    # column_types are built from the same query - but
+                    # guards against an empty/omitted table cleanly).
+                    continue
+
+                # Fresh/live row count - authoritative, unlike the Phase 1
+                # TABLE_ROWS estimate above (which is free but can be 0/
+                # stale until the next ANALYZE TABLE/background refresh).
+                try:
+                    cursor.execute(f"SELECT COUNT(*) FROM {_quote_ident(table_name)};")
+                    row = cursor.fetchone()
+                    if row is not None:
+                        row_counts[table_name] = row[0]
+                        live_count_lines.append(f"  {table_name}: {row[0]} rows (live, authoritative)")
+                except Exception:
+                    pass
+
+                if len(col_types) > MAX_COLUMNS_FOR_SAMPLING:
+                    # Table too wide to sample column-by-column without an
+                    # explosion of tiny queries - still gets its live count
+                    # above, just no per-column sampling below.
+                    continue
+
+                numeric_cols = [
+                    c for c, t in col_types.items() if t in NUMERIC_OR_DATE_TYPES
+                ][:MAX_NUMERIC_COLUMNS_FOR_MINMAX]
+                categorical_cols = [
+                    c for c, t in col_types.items() if t in CATEGORICAL_TYPES
+                ][:MAX_CATEGORICAL_COLUMNS_CHECKED_PER_TABLE]
+
+                table_sample_lines = []
+
+                # Min/max, all eligible numeric/date columns in one combined
+                # query per table (bounded by MAX_NUMERIC_COLUMNS_FOR_MINMAX)
+                # rather than one query per column.
+                if numeric_cols:
+                    try:
+                        select_parts = ", ".join(
+                            f"MIN({_quote_ident(c)}) AS `{c}__min`, MAX({_quote_ident(c)}) AS `{c}__max`"
+                            for c in numeric_cols
+                        )
+                        cursor.execute(f"SELECT {select_parts} FROM {_quote_ident(table_name)};")
+                        row = cursor.fetchone()
+                        if row is not None:
+                            for i, c in enumerate(numeric_cols):
+                                min_v, max_v = row[2 * i], row[2 * i + 1]
+                                table_sample_lines.append(f"    {c}: range [{min_v} .. {max_v}]")
+                    except Exception:
+                        pass
+
+                # Frequent values - one COUNT(DISTINCT ...) gate query plus
+                # (if eligible) one frequent-value GROUP BY query per
+                # categorical column, capped at
+                # MAX_CATEGORICAL_SAMPLE_COLUMNS_PER_TABLE eligible columns
+                # per table (categorical_cols itself is already capped at
+                # MAX_CATEGORICAL_COLUMNS_CHECKED_PER_TABLE candidates - see
+                # that constant's own docstring for why a second cap is
+                # needed here, unlike Postgres's free pg_stats gate).
+                eligible_count = 0
+                for c in categorical_cols:
+                    if eligible_count >= MAX_CATEGORICAL_SAMPLE_COLUMNS_PER_TABLE:
+                        break
+                    try:
+                        cursor.execute(
+                            f"SELECT COUNT(DISTINCT {_quote_ident(c)}) FROM {_quote_ident(table_name)};"
+                        )
+                        row = cursor.fetchone()
+                        distinct_count = row[0] if row is not None else None
+                    except Exception:
+                        distinct_count = None
+
+                    if _is_near_unique_distinct_count(distinct_count, row_counts.get(table_name)):
+                        continue
+                    eligible_count += 1
+
+                    try:
+                        cursor.execute(
+                            f"SELECT {_quote_ident(c)}, COUNT(*) FROM {_quote_ident(table_name)} "
+                            f"GROUP BY {_quote_ident(c)} ORDER BY COUNT(*) DESC LIMIT {FREQUENT_VALUES_LIMIT};"
+                        )
+                        freq_rows = cursor.fetchall()
+                        if freq_rows:
+                            freq_text = ", ".join(f"{val} ({cnt})" for val, cnt in freq_rows)
+                            table_sample_lines.append(f"    {c}: frequent values = {freq_text}")
+                    except Exception:
+                        pass
+
+                if table_sample_lines:
+                    sample_blocks.append(f"  Table: {table_name}\n" + "\n".join(table_sample_lines))
+
+            if live_count_lines:
+                schema_parts.append("Live row counts:\n" + "\n".join(live_count_lines))
+            if sample_blocks:
+                schema_parts.append("Column value samples:\n" + "\n\n".join(sample_blocks))
+
+        # Naming-convention relationship pass (shared helper, no new SQL) -
+        # pure heuristic over table_columns, which _build_shallow_schema_parts
+        # already assembled from Phase 1's own column query.
+        relationships = find_naming_convention_relationships(table_columns)
+        if relationships:
+            schema_parts.append(
+                "Likely relationships (naming convention, unconfirmed):\n"
+                + "\n".join(f"  {r}" for r in relationships)
+            )
 
         if not schema_parts:
             return None

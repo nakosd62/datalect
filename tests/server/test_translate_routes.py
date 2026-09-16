@@ -363,6 +363,105 @@ def test_schema_precedes_history_and_is_not_glued_to_the_new_prompt(app_factory,
     assert "now show orders" in contents[-1].parts[0].text
 
 
+# --- Language verification for the single-connection '*** NO SQL ***' -----
+# free-text reply (stream_translation()'s own retry loop) - regression
+# guard for the gap _COMMON_FORMAT_RULES' bare "write this in the user's
+# language" instruction line used to leave open with nothing verifying the
+# model actually complied (the exact gap the summarization calls'
+# _detect_language/_summarize_with_retry machinery was already fixed for -
+# see that section's own comment in translate_routes.py). fresh_import()
+# always substitutes a fake, always-returns-nothing language identifier
+# (see helpers.py's FakeLanguageIdentifier) so the real py3langid model
+# isn't reloaded on every single test - these tests monkeypatch
+# translate_routes._detect_language directly with a small, deterministic
+# stand-in so the retry/failure behavior can be exercised without depending
+# on real language classification.
+
+
+def test_no_sql_reply_in_wrong_language_is_retried_and_corrected(app_factory, monkeypatch):
+    env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+
+    # Question is in English; the model's first '*** NO SQL ***' reply
+    # comes back in German - flagged as a mismatch by the stand-in below -
+    # and its second, corrected reply is accepted.
+    monkeypatch.setattr(
+        env.translate_routes, "_detect_language",
+        lambda text: "de" if "Datenbanken" in text else ("en" if text else None),
+    )
+    harness.queue_response(FakeGenaiResponse("*** NO SQL *** Sie haben 3 Datenbanken konfiguriert."))
+    harness.queue_response(FakeGenaiResponse("*** NO SQL *** You have 3 databases configured."))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'how many databases do I have?'})
+    assert resp.status_code == 200
+    retry_events, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    assert data['sql'] == "*** NO SQL *** You have 3 databases configured."
+    assert len(harness.generate_calls) == 2
+    # The retry prompt actually sent to the model must carry the explicit
+    # correction naming the mistake - confirms this isn't a coincidental
+    # second attempt, but the language-mismatch retry actually firing.
+    second_prompt_text = harness.generate_calls[1]["contents"][-1].parts[0].text
+    assert "CORRECTION" in second_prompt_text and "German" in second_prompt_text
+
+
+def test_no_sql_reply_still_wrong_language_after_retry_fails_the_turn(app_factory, monkeypatch):
+    env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+
+    # Both attempts come back in German - mirrors _summarize_with_retry's
+    # own "never knowingly serve a response in the wrong language"
+    # guarantee: this must fail the turn outright (an honest, specific
+    # error) rather than silently showing text already confirmed wrong.
+    monkeypatch.setattr(
+        env.translate_routes, "_detect_language",
+        lambda text: "de" if "Datenbanken" in text else ("en" if text else None),
+    )
+    harness.queue_response(FakeGenaiResponse("*** NO SQL *** Sie haben 3 Datenbanken konfiguriert."))
+    harness.queue_response(FakeGenaiResponse("*** NO SQL *** Immer noch 3 Datenbanken."))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'how many databases do I have?'})
+    assert resp.status_code == 200
+    retry_events, data = parse_translate_stream(resp)
+    assert data['success'] is False
+    assert "German" in data['error'] and "English" in data['error']
+    assert len(harness.generate_calls) == 2
+
+    rows = _translation_rows(env)
+    assert len(rows) == 1
+    assert "TRANSLATION_ERROR" in rows[0]['sql_command']
+
+
+def test_plain_sql_response_never_triggers_a_language_check(app_factory, monkeypatch):
+    # Regression guard for _no_sql_language_mismatch's own scoping: a plain
+    # generated-SQL response (no '*** NO SQL ***' prefix) must never be run
+    # through language detection at all - detect_language on a SELECT
+    # statement is meaningless, and this must never cost a second LLM call.
+    env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+
+    detect_calls = []
+
+    def _spy_detect_language(text):
+        detect_calls.append(text)
+        return "en"
+
+    monkeypatch.setattr(env.translate_routes, "_detect_language", _spy_detect_language)
+    harness.queue_response(FakeGenaiResponse("SELECT * FROM users;"))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'show all users'})
+    retry_events, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    assert data['sql'] == "SELECT * FROM users;"
+    assert len(harness.generate_calls) == 1
+    # _detect_language is still called once, on the user's own PROMPT
+    # (expected_language_code) - just never on the generated SQL itself.
+    assert detect_calls == ['show all users']
+
+
 def test_429_rotates_key_and_retries_immediately_with_no_delay(app_factory, monkeypatch):
     # A 429 (per-key rate limit/capacity exhausted) rotates to a different
     # key and retries right away - no TRANSLATION_RETRY_DELAY_SECONDS wait,

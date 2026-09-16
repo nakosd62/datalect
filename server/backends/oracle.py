@@ -116,6 +116,7 @@ from .base import (
     Backend, SqlExecutionError, SCHEMA_MAX_TABLE_NAMES_SCANNED, SCHEMA_MAX_TABLES,
     DB_CONNECT_TIMEOUT_SECONDS,
     group_date_sharded_tables, cap_kept_tables, cap_schema_text, fetch_capped_rows,
+    find_naming_convention_relationships,
 )
 
 # CLOB/BLOB columns are fetched as LOB locator objects (requiring .read())
@@ -280,6 +281,92 @@ def _named_in_params(prefix, values):
     return fragment, dict(zip(names, values))
 
 
+# Phase 2 (deep-only) sampling: which ALL_TAB_COLUMNS.data_type strings are
+# worth a MIN()/MAX() range query (numeric/date-ish) vs a frequent-value
+# GROUP BY (bounded/categorical-ish) - see get_schema()'s "Column value
+# samples" section below. Deliberately conservative/small lists rather than
+# "everything that isn't the other list", same reasoning as backends/
+# postgres.py's own NUMERIC_OR_DATE_TYPES/CATEGORICAL_TYPES, just spelled for
+# Oracle's own type names. TIMESTAMP columns carry a precision suffix (e.g.
+# "TIMESTAMP(6)", "TIMESTAMP(6) WITH TIME ZONE") - matched via a prefix check
+# (_is_numeric_or_date_type below) rather than exact set membership, since
+# the precision digit (and WITH [LOCAL] TIME ZONE suffix) varies per column.
+NUMERIC_OR_DATE_TYPES = frozenset({
+    "NUMBER", "FLOAT", "INTEGER", "BINARY_FLOAT", "BINARY_DOUBLE", "DATE",
+})
+CATEGORICAL_TYPES = frozenset({"VARCHAR2", "CHAR", "NCHAR", "NVARCHAR2", "VARCHAR"})
+
+
+def _is_numeric_or_date_type(data_type):
+    return data_type in NUMERIC_OR_DATE_TYPES or (data_type or "").startswith("TIMESTAMP")
+
+
+# Bounds on Phase 2's per-table sampling cost - same values, same rationale,
+# as backends/postgres.py's own MAX_COLUMNS_FOR_SAMPLING/
+# MAX_NUMERIC_COLUMNS_FOR_MINMAX/MAX_CATEGORICAL_SAMPLE_COLUMNS_PER_TABLE/
+# FREQUENT_VALUES_LIMIT: MAX_COLUMNS_FOR_SAMPLING skips per-column sampling
+# entirely for a table wider than this (still gets a live row count);
+# MAX_NUMERIC_COLUMNS_FOR_MINMAX bounds one table's combined MIN()/MAX()
+# SELECT list; MAX_CATEGORICAL_SAMPLE_COLUMNS_PER_TABLE bounds how many
+# separate "frequent values" GROUP BY queries one table gets.
+MAX_COLUMNS_FOR_SAMPLING = 25
+MAX_NUMERIC_COLUMNS_FOR_MINMAX = 15
+MAX_CATEGORICAL_SAMPLE_COLUMNS_PER_TABLE = 3
+# Oracle 12c+ "FETCH FIRST n ROWS ONLY" (this file's table-name-scan query
+# already relies on this same syntax for scan_limit) rather than a LIMIT
+# clause, which Oracle has no equivalent of.
+FREQUENT_VALUES_LIMIT = 15
+
+
+def _quote_ident(name):
+    """Double-quotes an Oracle identifier for interpolation into a plain SQL
+    string (escaping an embedded '"'), for the Phase 2 per-table live-query
+    section below - mirrors backends/postgres.py's own _quote_ident (the
+    same quoting rule Oracle itself uses for a case-preserving identifier).
+    `name` always comes from ALL_TABLES/ALL_TAB_COLUMNS data this same
+    connection already queried in Phase 1 (kept_names / column names) -
+    never raw user input - so this only needs to be correct, not defend
+    against adversarial identifiers."""
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def _is_near_unique_column(num_distinct, num_rows):
+    """Gate for whether a categorical column's "frequent values" sample is
+    worth rendering at all. ALL_TAB_COL_STATISTICS.NUM_DISTINCT (an
+    optimizer statistic DBMS_STATS computes - no live scan) is a plain
+    estimated distinct-value COUNT, unlike Postgres's pg_stats.n_distinct
+    (which already encodes a signed distinct/total ratio) - so "near-unique"
+    is computed here as num_distinct / num_rows, using num_rows from
+    ALL_TABLES.NUM_ROWS (also a free optimizer stat, already fetched in
+    Phase 1 - see _build_shallow_schema_parts). >= 0.5 mirrors the same
+    threshold backends/postgres.py's own _is_near_unique_n_distinct uses for
+    its ratio branch (n_distinct <= -0.5, i.e. >=50% of rows have a distinct
+    value).
+
+    None for num_distinct (stats never gathered for this column) is treated
+    permissively as "not near-unique", matching Postgres's own None
+    handling - the alternative would silently hide sampling for a freshly
+    created/unanalyzed table forever. When num_rows is itself unknown
+    (table-level stats never gathered either), falls back to treating a
+    large absolute NUM_DISTINCT (>1000) as near-unique - the same threshold
+    Postgres's own n_distinct-as-absolute-count branch uses.
+
+    Deliberately does NOT fall back to a live COUNT(DISTINCT col) scan when
+    ALL_TAB_COL_STATISTICS has nothing for a column (see the plan this
+    implements, which allows either choice): that would add yet another
+    per-column live query on top of the min/max and frequent-value queries
+    this same table already pays for, just to handle the already-rare case
+    of a table DBMS_STATS was never pointed at - a case where being
+    slightly over-eager about sampling is a minor cost, not a correctness
+    problem, unlike the query-count blowup a live fallback would risk on a
+    schema with many never-analyzed tables."""
+    if num_distinct is None:
+        return False
+    if num_rows:
+        return (num_distinct / num_rows) >= 0.5
+    return num_distinct > 1000
+
+
 def _set_current_schema(connection, schema):
     """ALTER SESSION SET CURRENT_SCHEMA doesn't accept bind variables -
     Oracle has no parameterized form for session-control statements - so
@@ -402,18 +489,53 @@ class OracleBackend(Backend):
                 db_name, username = row[0], row[1]
         return db_name, username
 
-    def get_schema(self, connection):
+    def _build_shallow_schema_parts(self, connection):
+        """Phase 1 (catalog-only, no live queries): every query both
+        get_schema_shallow() and get_schema() (deep) need, run exactly once
+        here and shared by both - mirrors backends/postgres.py's own
+        _build_shallow_schema_parts (see its docstring for the general
+        shape) and backends/base.py's Backend.get_schema()/
+        get_schema_shallow() docstrings for why this split exists at all.
+
+        Returns None if the connection's current schema/owner has no table
+        at all (mirrors the pre-split get_schema()'s "return None" for that
+        case). Otherwise returns (schema_parts, table_columns, phase2_ctx):
+          - schema_parts: the ordered list of text sections, not yet
+            joined/capped - identical in kind to what get_schema() used to
+            build directly, just returned before the final cap_schema_text()
+            call.
+          - table_columns: {table_name: [column_name, ...]}, scoped to the
+            same bounded kept_names set schema_parts describes - handed to
+            the shared find_naming_convention_relationships() helper by
+            get_schema()'s Phase 2 pass (no extra query needed for that).
+          - phase2_ctx: raw, already-fetched data Phase 2 wants to reuse
+            without re-querying - kept_names/column_types (for deciding what
+            to sample), num_rows_by_table (ALL_TABLES.NUM_ROWS, already
+            fetched below - reused as the row-count baseline
+            _is_near_unique_column() needs), and the raw views rows (so
+            get_schema() can render full view body text without a second
+            trip to the database - see the "Views" section below for why
+            only the view *name* is rendered here). There is no routines
+            entry: Oracle's ALL_PROCEDURES/ALL_ARGUMENTS carry no reusable
+            body text at all - see the "Routines" section below.
+        """
         schema_parts = []
+        table_columns = {}
+        column_types = {}
 
         with connection.cursor() as cursor:
-            # Phase 1: cheap - just the distinct table names, bounded so a
-            # schema with an extreme number of tables can't make even this
-            # scan unbounded (SCHEMA_MAX_TABLE_NAMES_SCANNED). Grouped into
-            # date-shard families and capped to SCHEMA_MAX_TABLES entries
-            # (see backends/base.py) before any column/constraint/view
-            # query runs, same staging as every other backend's
-            # get_schema(). Scoped to SYS_CONTEXT('USERENV','CURRENT_SCHEMA')
-            # rather than a hardcoded owner name.
+            # Phase 1: cheap - just the distinct table names (+ NUM_ROWS,
+            # new - see "Row count estimates" below, folded into this same
+            # query since it's already a column of ALL_TABLES, the exact
+            # view this query already reads - no extra round trip needed),
+            # bounded so a schema with an extreme number of tables can't
+            # make even this scan unbounded (SCHEMA_MAX_TABLE_NAMES_SCANNED).
+            # Grouped into date-shard families and capped to
+            # SCHEMA_MAX_TABLES entries (see backends/base.py) before any
+            # column/constraint/view query runs, same staging as every
+            # other backend's get_schema(). Scoped to
+            # SYS_CONTEXT('USERENV','CURRENT_SCHEMA') rather than a
+            # hardcoded owner name.
             #
             # ALL_TABLES on its own is NOT just "ordinary tables" - it also
             # includes each materialized view's internal storage table
@@ -425,7 +547,7 @@ class OracleBackend(Backend):
             # which would otherwise show up as extra, uninterpretable
             # "tables" alongside real ones.
             cursor.execute("""
-                SELECT table_name
+                SELECT table_name, num_rows
                 FROM all_tables
                 WHERE owner = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')
                   AND (iot_type IS NULL OR iot_type = 'IOT')
@@ -437,7 +559,9 @@ class OracleBackend(Backend):
                 ORDER BY table_name
                 FETCH FIRST :scan_limit ROWS ONLY
             """, {"scan_limit": SCHEMA_MAX_TABLE_NAMES_SCANNED})
-            all_table_names = [row[0] for row in cursor.fetchall()]
+            all_rows = cursor.fetchall()
+            all_table_names = [row[0] for row in all_rows]
+            num_rows_by_table = {row[0]: row[1] for row in all_rows}
 
             if not all_table_names:
                 return None
@@ -454,20 +578,40 @@ class OracleBackend(Backend):
             # 1. Tables and columns - scoped to the bounded kept_names set.
             # NULLABLE is 'N'/'Y' (not 'NO'/'YES' the way ANSI
             # information_schema.columns.is_nullable is elsewhere).
+            #
+            # Identity marker (new) - LEFT JOINed against
+            # ALL_TAB_IDENTITY_COLS and folded into this same unconditional
+            # query, the same way Postgres's own is_identity/
+            # identity_generation columns are (see backends/postgres.py's
+            # _build_shallow_schema_parts) rather than a separate query.
+            # Safe to leave unconditional (not try/except-wrapped): both
+            # identity columns and ALL_TAB_IDENTITY_COLS are Oracle 12c+
+            # features, and this file already assumes 12c+ elsewhere (the
+            # FETCH FIRST syntax just above has no pre-12c equivalent this
+            # app would fall back to).
             in_fragment, in_params = _named_in_params("t", kept_names)
             cursor.execute(f"""
-                SELECT table_name, column_name, data_type, nullable
-                FROM all_tab_columns
-                WHERE owner = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')
-                  AND table_name IN ({in_fragment})
-                ORDER BY table_name, column_id
+                SELECT c.table_name, c.column_name, c.data_type, c.nullable,
+                       i.generation_type
+                FROM all_tab_columns c
+                LEFT JOIN all_tab_identity_cols i
+                  ON i.owner = c.owner
+                 AND i.table_name = c.table_name
+                 AND i.column_name = c.column_name
+                WHERE c.owner = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')
+                  AND c.table_name IN ({in_fragment})
+                ORDER BY c.table_name, c.column_id
             """, in_params)
             columns_data = cursor.fetchall()
 
             tables = {}
-            for table_name, col_name, data_type, nullable in columns_data:
+            for table_name, col_name, data_type, nullable, generation_type in columns_data:
+                table_columns.setdefault(table_name, []).append(col_name)
+                column_types.setdefault(table_name, {})[col_name] = data_type
+                identity_str = f" IDENTITY ({generation_type})" if generation_type else ""
                 tables.setdefault(table_name, []).append(
-                    f"  {col_name} {data_type} {'NULL' if nullable == 'Y' else 'NOT NULL'}"
+                    f"  {col_name} {data_type} "
+                    f"{'NULL' if nullable == 'Y' else 'NOT NULL'}{identity_str}"
                 )
 
             for table_name in kept_names:
@@ -535,30 +679,416 @@ class OracleBackend(Backend):
             # TEXT (a LONG column, with the usual LONG-fetching
             # restrictions) - this may truncate a very long view
             # definition, an accepted tradeoff for schema-summary context
-            # rather than a full DDL dump. TEXT_VC doesn't exist on every
-            # Oracle version this app might connect to, so this is
-            # best-effort like the constraints section above - a version
-            # without it just skips this section.
+            # rather than a full DDL dump (unchanged by this pass - see
+            # module docstring; DBMS_METADATA.GET_DDL is a bigger,
+            # out-of-scope change, not a fix applied here). TEXT_VC doesn't
+            # exist on every Oracle version this app might connect to, so
+            # this is best-effort like the constraints section above - a
+            # version without it just skips this section.
+            #
+            # Shallow rendering is name-only (no TEXT_VC body) - the raw
+            # rows (including each view's possibly-truncated body text) are
+            # still fetched here (one query, reused by both phases) and
+            # threaded through via phase2_ctx below so get_schema() (deep)
+            # can render the full body without a second query - mirrors
+            # backends/postgres.py's own Views/"View definitions" split.
+            views = []
             try:
                 cursor.execute("""
                     SELECT view_name, text_vc
                     FROM all_views
                     WHERE owner = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')
                 """)
-                view_rows = cursor.fetchall()
-                if view_rows:
+                views = cursor.fetchall()
+                if views:
                     schema_parts.append(
-                        "Views:\n" + "\n".join(
-                            f"  View {t}: {(d or '').strip()}" for (t, d) in view_rows
-                        )
+                        "Views:\n" + "\n".join(f"  View {t}" for (t, _d) in views)
                     )
             except Exception:
                 pass
 
-            # Deliberately no Indexes/Triggers/Grants sections: left for
-            # follow-up, same status backends/snowflake.py's/backends/
-            # databricks.py's own gaps have - not verified against a real
-            # Oracle instance as part of this first pass.
+            # 4. Comments (new) - table and column comments via Oracle's own
+            # ALL_TAB_COMMENTS/ALL_COL_COMMENTS dictionary views, scoped to
+            # the current schema/owner and kept_names. Best-effort/
+            # try-except, like every new optional section below (mirrors
+            # backends/postgres.py's own Comments section): a role that
+            # somehow can't evaluate these still gets every other section,
+            # rather than losing the whole schema fetch over one cosmetic
+            # addition. The same `:t0, :t1, ...` bind names from in_params
+            # are reused across both UNION ALL branches below - Oracle
+            # resolves a repeated named bind to the same bound value
+            # everywhere it appears in one statement, so in_params doesn't
+            # need to be duplicated under different names.
+            try:
+                cursor.execute(f"""
+                    SELECT * FROM (
+                        SELECT table_name AS tbl, CAST(NULL AS VARCHAR2(128)) AS col, comments
+                        FROM all_tab_comments
+                        WHERE owner = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')
+                          AND table_name IN ({in_fragment})
+                        UNION ALL
+                        SELECT table_name, column_name, comments
+                        FROM all_col_comments
+                        WHERE owner = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')
+                          AND table_name IN ({in_fragment})
+                    )
+                    ORDER BY tbl, col
+                """, in_params)
+                comment_lines = []
+                for tbl, col, comment in cursor.fetchall():
+                    if not comment:
+                        continue
+                    if col:
+                        comment_lines.append(f"  [column] {tbl}.{col}: {comment}")
+                    else:
+                        comment_lines.append(f"  [table] {tbl}: {comment}")
+                if comment_lines:
+                    schema_parts.append("Comments:\n" + "\n".join(comment_lines))
+            except Exception:
+                pass
+
+            # 5. Row count estimates (new) - ALL_TABLES.NUM_ROWS, already
+            # fetched above (the table-name query) rather than re-queried -
+            # an optimizer stat (last DBMS_STATS run's estimate, not a live
+            # scan; NULL if stats were never gathered for that table - see
+            # get_schema()'s "Live row counts" section for the
+            # authoritative, deep-only counterpart). A NULL/never-analyzed
+            # table is skipped rather than rendered as a misleading "~None
+            # rows".
+            estimate_lines = [
+                f"  {t}: ~{int(num_rows_by_table[t])} rows (estimate)"
+                for t in kept_names
+                if num_rows_by_table.get(t) is not None
+            ]
+            if estimate_lines:
+                schema_parts.append("Row count estimates:\n" + "\n".join(estimate_lines))
+
+            # 6. Routines (new) - existence + signature only, no body, ever
+            # (not just in the shallow fetch - see get_schema() below).
+            # Unlike every ANSI-information_schema dialect (which exposes a
+            # ready-made routine_definition/ROUTINE_DEFINITION text column),
+            # Oracle's ALL_PROCEDURES/ALL_ARGUMENTS carry no body text at
+            # all - the only way to get a routine's source is ALL_SOURCE
+            # (line-by-line PL/SQL text, reconstructed by concatenation),
+            # which is exactly the kind of package/body introspection this
+            # pass deliberately doesn't take on (see the plan this
+            # implements: "don't over-engineer package introspection"). So
+            # there is no "Routine definitions" Phase 2 section for Oracle -
+            # only the Views section has a full-body deep counterpart.
+            #
+            # Scoped to standalone procedures/functions only
+            # (PROCEDURE_NAME IS NULL excludes package members - a package
+            # member's "procedure name" in ALL_PROCEDURES is its own name
+            # inside the package, not NULL - so packages themselves stay
+            # out of scope per the plan). ALL_ARGUMENTS is joined to build
+            # each routine's parameter list (DATA_LEVEL = 0 excludes nested
+            # record/table-type argument members; PACKAGE_NAME IS NULL
+            # matches the same standalone-only scope); a function's return
+            # value is its own "argument" row with ARGUMENT_NAME IS NULL
+            # and POSITION = 0, picked out in the Python loop below rather
+            # than via a second query.
+            try:
+                cursor.execute("""
+                    SELECT p.object_name, p.object_type, a.argument_name, a.data_type, a.position
+                    FROM all_procedures p
+                    LEFT JOIN all_arguments a
+                      ON a.owner = p.owner
+                     AND a.object_name = p.object_name
+                     AND a.package_name IS NULL
+                     AND a.data_level = 0
+                    WHERE p.owner = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')
+                      AND p.object_type IN ('FUNCTION', 'PROCEDURE')
+                      AND p.procedure_name IS NULL
+                    ORDER BY p.object_name, a.position
+                """)
+                routine_rows = cursor.fetchall()
+                routines_map = {}
+                for obj_name, obj_type, arg_name, data_type, position in routine_rows:
+                    entry = routines_map.setdefault(
+                        obj_name, {"type": obj_type, "params": [], "return": None}
+                    )
+                    if arg_name is None:
+                        if obj_type == "FUNCTION" and position == 0:
+                            entry["return"] = data_type
+                    else:
+                        entry["params"].append(f"{arg_name} {data_type}")
+                if routines_map:
+                    routine_lines = []
+                    for name in sorted(routines_map):
+                        entry = routines_map[name]
+                        sig = f"  {name}({', '.join(entry['params'])})"
+                        if entry["return"]:
+                            sig += f" -> {entry['return']}"
+                        routine_lines.append(sig)
+                    schema_parts.append("Routines:\n" + "\n".join(routine_lines))
+            except Exception:
+                pass
+
+            # 7. Session facts (new) - one line for the whole connection,
+            # not per-table. SESSIONTIMEZONE is the session's effective
+            # timezone; NLS_TERRITORY/NLS_SORT (read from
+            # NLS_SESSION_PARAMETERS) are Oracle's rough equivalent of a
+            # default collation - there's no single "collation" concept in
+            # Oracle the way ANSI SQL/Postgres has one: NLS_SORT governs
+            # linguistic string comparison/ordering (the role a Postgres
+            # collation plays), and NLS_TERRITORY additionally influences
+            # locale-dependent defaults (date/number formatting) alongside
+            # it.
+            try:
+                cursor.execute("""
+                    SELECT SESSIONTIMEZONE,
+                           (SELECT value FROM nls_session_parameters WHERE parameter = 'NLS_TERRITORY'),
+                           (SELECT value FROM nls_session_parameters WHERE parameter = 'NLS_SORT')
+                    FROM DUAL
+                """)
+                row = cursor.fetchone()
+                if row:
+                    tz, territory, sort_order = row
+                    schema_parts.append(
+                        f"Session: timezone={tz}; territory={territory}; sort={sort_order}"
+                    )
+            except Exception:
+                pass
+
+            # 8. Grants (new) - ALL_TAB_PRIVS, scoped to the current
+            # schema/owner (TABLE_SCHEMA) and kept_names.
+            #
+            # Re-examining this module's own long-standing "Deliberately no
+            # Indexes/Triggers/Grants sections ... not verified against a
+            # real Oracle instance" caveat (previously right here, now
+            # updated - see below): that caveat was about never having
+            # written ANY grants query yet, not about ALL_TAB_PRIVS
+            # specifically being unsafe. ALL_TAB_PRIVS is a standard,
+            # always-present data-dictionary view (like every other ALL_*
+            # view this file already queries), it's inherently
+            # current-user-scoped by Oracle itself (it only ever shows
+            # privileges the connected user can actually see - grants made
+            # BY or TO them, or on objects they own - never another
+            # schema's private grant graph, so there's no risk of leaking
+            # more than the connected role could already see via SQL*Plus),
+            # and it's wrapped in this same try/except convention as every
+            # other optional section here - so a permissions edge case
+            # degrades to "skip this section" exactly like Constraints/
+            # Views above, never a failed schema fetch. That resolves the
+            # caveat in favor of adding a minimal grants query now, rather
+            # than leaving it deferred a second time (the plan this
+            # implements explicitly allows either choice here - this is the
+            # "add it safely" branch, not an override of the original
+            # reasoning).
+            #
+            # Indexes/Triggers remain out of scope for this pass (neither
+            # attribute is in the plan's Phase 1/Phase 2 tables this change
+            # implements) - still left for a future follow-up, unchanged
+            # from before.
+            try:
+                cursor.execute(f"""
+                    SELECT grantee, table_name, privilege
+                    FROM all_tab_privs
+                    WHERE table_schema = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')
+                      AND table_name IN ({in_fragment})
+                    ORDER BY table_name, grantee
+                """, in_params)
+                grant_rows = cursor.fetchall()
+                if grant_rows:
+                    grant_lines = [f"  Grant {priv} on {t} to {g}" for (g, t, priv) in grant_rows]
+                    schema_parts.append("Grants:\n" + "\n".join(grant_lines))
+            except Exception:
+                pass
+
+            # 9. External tables (new) - ALL_EXTERNAL_TABLES, cleanly
+            # introspectable, scoped to kept_names. No RLS/masking
+            # equivalent is added here: Oracle's RLS (VPD, Virtual Private
+            # Database) is enforced by a security policy FUNCTION attached
+            # at runtime via DBMS_RLS, not a simple per-table catalog flag
+            # the way Postgres's pg_class.relrowsecurity is - there is no
+            # reliable "is RLS enabled on this table" catalog column to
+            # read, and fabricating a heuristic (e.g. "a policy-shaped
+            # function with this naming convention exists") risks a false
+            # negative/positive that would actively mislead query
+            # generation, which is worse than omitting it entirely - per
+            # the plan's own explicit caution on this exact point. So this
+            # section reports external tables only, never RLS, and is
+            # titled accordingly rather than reusing Postgres's combined
+            # "Row-level security / federation" heading.
+            try:
+                cursor.execute(f"""
+                    SELECT table_name
+                    FROM all_external_tables
+                    WHERE owner = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')
+                      AND table_name IN ({in_fragment})
+                """, in_params)
+                external_rows = cursor.fetchall()
+                if external_rows:
+                    ext_lines = [f"  {row[0]}: [external table]" for row in external_rows]
+                    schema_parts.append("External tables:\n" + "\n".join(ext_lines))
+            except Exception:
+                pass
+
+        phase2_ctx = {
+            "kept_names": kept_names,
+            "column_types": column_types,
+            "num_rows_by_table": num_rows_by_table,
+            "views": views,
+        }
+        return schema_parts, table_columns, phase2_ctx
+
+    def get_schema_shallow(self, connection):
+        built = self._build_shallow_schema_parts(connection)
+        if built is None:
+            return None
+        schema_parts, _table_columns, _phase2_ctx = built
+        if not schema_parts:
+            return None
+        return cap_schema_text("\n\n".join(schema_parts))
+
+    def get_schema(self, connection):
+        """Phase 1 (catalog-only, via _build_shallow_schema_parts) plus
+        Phase 2 (live queries: full view body text, cardinality-gated
+        sampling, live row counts, naming-convention relationships) - see
+        backends/base.py's Backend.get_schema() docstring."""
+        built = self._build_shallow_schema_parts(connection)
+        if built is None:
+            return None
+        schema_parts, table_columns, phase2_ctx = built
+        schema_parts = list(schema_parts)
+
+        kept_names = phase2_ctx["kept_names"]
+        column_types = phase2_ctx["column_types"]
+        num_rows_by_table = phase2_ctx["num_rows_by_table"]
+        views = phase2_ctx["views"]
+
+        # Full view bodies (deep-only) - reusing the raw rows
+        # _build_shallow_schema_parts already fetched (TEXT_VC, possibly
+        # truncated per the module docstring's accepted tradeoff) - no
+        # re-query. No "Routine definitions" counterpart exists for Oracle
+        # - see _build_shallow_schema_parts' Routines section above for why.
+        if views:
+            schema_parts.append(
+                "View definitions:\n" + "\n".join(
+                    f"  View {t}: {(d or '').strip()}" for (t, d) in views
+                )
+            )
+
+        with connection.cursor() as cursor:
+            # Cardinality gate for the frequent-value sampling below -
+            # ALL_TAB_COL_STATISTICS.NUM_DISTINCT is a planner/optimizer
+            # statistic Oracle already computes via DBMS_STATS (no live
+            # scan) - see _is_near_unique_column()'s docstring for exactly
+            # what this gates, why num_rows_by_table (from Phase 1) is
+            # needed alongside it, and why this deliberately doesn't fall
+            # back to a live COUNT(DISTINCT ...) scan.
+            distinct_stats = {}
+            if kept_names:
+                try:
+                    stats_fragment, stats_params = _named_in_params("t", kept_names)
+                    cursor.execute(f"""
+                        SELECT table_name, column_name, num_distinct
+                        FROM all_tab_col_statistics
+                        WHERE owner = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')
+                          AND table_name IN ({stats_fragment})
+                    """, stats_params)
+                    for tbl, col, num_distinct in cursor.fetchall():
+                        distinct_stats.setdefault(tbl, {})[col] = num_distinct
+                except Exception:
+                    pass
+
+            live_count_lines = []
+            sample_blocks = []
+            for table_name in kept_names:
+                col_types = column_types.get(table_name) or {}
+                if not col_types:
+                    # A kept_names entry cap_kept_tables dropped columns for
+                    # (shouldn't normally happen - kept_names and
+                    # column_types are built from the same query - but
+                    # guards against an empty/omitted table cleanly).
+                    continue
+
+                # Fresh/live row count - authoritative, unlike the Phase 1
+                # NUM_ROWS estimate above (free but stale until the next
+                # DBMS_STATS run).
+                try:
+                    cursor.execute(f"SELECT COUNT(*) FROM {_quote_ident(table_name)}")
+                    row = cursor.fetchone()
+                    if row is not None:
+                        live_count_lines.append(f"  {table_name}: {row[0]} rows (live, authoritative)")
+                except Exception:
+                    pass
+
+                if len(col_types) > MAX_COLUMNS_FOR_SAMPLING:
+                    # Table too wide to sample column-by-column without an
+                    # explosion of tiny queries - still gets its live count
+                    # above, just no per-column sampling below.
+                    continue
+
+                numeric_cols = [
+                    c for c, t in col_types.items() if _is_numeric_or_date_type(t)
+                ][:MAX_NUMERIC_COLUMNS_FOR_MINMAX]
+                categorical_cols = [c for c, t in col_types.items() if t in CATEGORICAL_TYPES]
+
+                table_sample_lines = []
+
+                # Min/max, all eligible numeric/date columns in one combined
+                # query per table (bounded by MAX_NUMERIC_COLUMNS_FOR_MINMAX)
+                # rather than one query per column.
+                if numeric_cols:
+                    try:
+                        select_parts = ", ".join(
+                            f"MIN({_quote_ident(c)}), MAX({_quote_ident(c)})" for c in numeric_cols
+                        )
+                        cursor.execute(f"SELECT {select_parts} FROM {_quote_ident(table_name)}")
+                        row = cursor.fetchone()
+                        if row is not None:
+                            for i, c in enumerate(numeric_cols):
+                                min_v, max_v = row[2 * i], row[2 * i + 1]
+                                table_sample_lines.append(f"    {c}: range [{min_v} .. {max_v}]")
+                    except Exception:
+                        pass
+
+                # Frequent values - one query per eligible categorical
+                # column (capped at MAX_CATEGORICAL_SAMPLE_COLUMNS_PER_TABLE
+                # per table), skipping any column ALL_TAB_COL_STATISTICS
+                # says is close to unique (see _is_near_unique_column).
+                num_rows = num_rows_by_table.get(table_name)
+                eligible_categorical = []
+                for c in categorical_cols:
+                    num_distinct = distinct_stats.get(table_name, {}).get(c)
+                    if _is_near_unique_column(num_distinct, num_rows):
+                        continue
+                    eligible_categorical.append(c)
+                    if len(eligible_categorical) >= MAX_CATEGORICAL_SAMPLE_COLUMNS_PER_TABLE:
+                        break
+
+                for c in eligible_categorical:
+                    try:
+                        cursor.execute(
+                            f"SELECT {_quote_ident(c)}, COUNT(*) FROM {_quote_ident(table_name)} "
+                            f"GROUP BY {_quote_ident(c)} ORDER BY COUNT(*) DESC "
+                            f"FETCH FIRST {FREQUENT_VALUES_LIMIT} ROWS ONLY"
+                        )
+                        freq_rows = cursor.fetchall()
+                        if freq_rows:
+                            freq_text = ", ".join(f"{val} ({cnt})" for val, cnt in freq_rows)
+                            table_sample_lines.append(f"    {c}: frequent values = {freq_text}")
+                    except Exception:
+                        pass
+
+                if table_sample_lines:
+                    sample_blocks.append(f"  Table: {table_name}\n" + "\n".join(table_sample_lines))
+
+            if live_count_lines:
+                schema_parts.append("Live row counts:\n" + "\n".join(live_count_lines))
+            if sample_blocks:
+                schema_parts.append("Column value samples:\n" + "\n\n".join(sample_blocks))
+
+        # Naming-convention relationship pass (shared helper, no new SQL) -
+        # pure heuristic over table_columns, which _build_shallow_schema_parts
+        # already assembled from Phase 1's own column query.
+        relationships = find_naming_convention_relationships(table_columns)
+        if relationships:
+            schema_parts.append(
+                "Likely relationships (naming convention, unconfirmed):\n"
+                + "\n".join(f"  {r}" for r in relationships)
+            )
 
         if not schema_parts:
             return None

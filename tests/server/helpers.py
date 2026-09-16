@@ -47,6 +47,13 @@ _APP_MODULE_NAMES = [
     "translate_routes", "chat_history_routes", "report_routes",
     "db", "schema_cache", "state_store", "connection_router", "cancel_registry",
     "concurrency_guard", "rate_limiter",
+    # Shared by translate_routes.py and connection_router.py (see its own
+    # module docstring for why it's a separate module rather than living in
+    # either one) - dropped here for the exact same reason translate_routes.py
+    # itself is: the FakeLanguageIdentifier patch just below only takes
+    # effect for code that hasn't already imported the real py3langid model,
+    # and this module is where that import now actually lives.
+    "language_detect",
 ]
 
 # Every env var any of the above modules reads at import or request time.
@@ -56,7 +63,7 @@ _APP_MODULE_NAMES = [
 _ENV_VARS_TO_CLEAR = [
     "GCP_PROJECT_ID", "GOOGLE_CLOUD_PROJECT", "GCP_PROJECT", "K_SERVICE",
     "GOOGLE_CLIENT_ID", "DATABASE_PRESETS_FILE", "GEMINI_API_KEY", "GOOGLE_API_KEY",
-    "GEMINI_PRESET_KEYS", "GOOGLE_MODELS", "SCHEMA_CACHE_TTL_SECONDS",
+    "GEMINI_PRESET_KEYS", "GOOGLE_MODELS",
     "SCHEMA_MAX_TABLES", "SCHEMA_MAX_TABLE_NAMES_SCANNED",
     "SCHEMA_MAX_SCHEMA_CHARS", "SCHEMA_SHARD_MIN_GROUP_SIZE", "LOG_LEVEL",
     "CRBOT_HOSTNAME", "CRBOT_PORT", "MAX_TRANSLATION_ATTEMPTS", "TRANSLATION_RETRY_DELAY_SECONDS",
@@ -209,19 +216,22 @@ def fresh_import(monkeypatch, tmp_path, env=None, register_blueprints=True, mock
         if mod_name in _APP_MODULE_NAMES or mod_name.startswith("backends"):
             del sys.modules[mod_name]
 
-    # translate_routes.py loads a real py3langid language-detection model
-    # at module import time (its own comment explains why: ~1s of real
-    # LZMA-decompress-a-bundled-numpy-model work, deliberately paid ONCE
-    # per process rather than per-request). That's the right trade-off for
-    # a real running server, but this function re-executes translate_routes.py
-    # from scratch on every single test (see this module's docstring on why
-    # fresh imports are needed at all) - so left alone, every test in this
-    # whole suite would silently re-pay that ~1s of pure CPU-bound
-    # decompression, turning a fast suite into a very slow, CPU-pegged one
-    # for zero benefit (no test here exercises real language detection -
-    # see _detect_language()'s own no-op-on-failure design, which this
-    # leans on). Patching LanguageIdentifier itself (not just an instance)
-    # means translate_routes.py's own `from py3langid.langid import
+    # language_detect.py (imported by both translate_routes.py and
+    # connection_router.py - see its own module docstring for why it's a
+    # standalone shared module rather than living in either one) loads a
+    # real py3langid language-detection model at module import time (its
+    # own comment explains why: ~1s of real LZMA-decompress-a-bundled-
+    # numpy-model work, deliberately paid ONCE per process rather than per-
+    # request). That's the right trade-off for a real running server, but
+    # this function re-executes every app module from scratch on every
+    # single test (see this module's docstring on why fresh imports are
+    # needed at all) - so left alone, every test in this whole suite would
+    # silently re-pay that ~1s of pure CPU-bound decompression, turning a
+    # fast suite into a very slow, CPU-pegged one for zero benefit (no test
+    # here exercises real language detection - see detect_language()'s own
+    # no-op-on-failure design, which this leans on). Patching
+    # LanguageIdentifier itself (not just an instance) means
+    # language_detect.py's own `from py3langid.langid import
     # LanguageIdentifier as _LangIdentifier` picks up the fake automatically,
     # whether or not that module actually gets re-imported this call.
     import py3langid.langid as _py3langid_module
@@ -637,29 +647,102 @@ def install_fake_bigquery(monkeypatch):
     return harness
 
 
-def schema_query_handler(tables=(), columns=(), views=(), constraints=()):
+def schema_query_handler(tables=(), columns=(), views=(), constraints=(),
+                          table_types=None, partitioning_columns=None,
+                          clustering_columns=None, table_comments=None,
+                          require_partition_filter=None, table_storage=None,
+                          routines=(), routine_params=()):
     """Builds a handler for install_fake_bigquery()'s harness.set_handler()
-    that answers backends/bigquery.py's get_schema() query sequence based
-    on matching a marker substring in the SQL text - good enough for schema
-    tests without needing to hardcode call order.
+    that answers backends/bigquery.py's get_schema()/get_schema_shallow()
+    query sequence based on matching a marker substring in the SQL text -
+    good enough for schema tests without needing to hardcode call order.
 
     - tables: list of table-name strings (INFORMATION_SCHEMA.TABLES)
     - columns: list of (table_name, column_name, data_type, is_nullable)
     - views: list of (table_name, view_definition)
     - constraints: list of (table_name, constraint_name, constraint_type, column_name)
+    - table_types: optional {table_name: "BASE TABLE"|"EXTERNAL"} - any
+      name in `tables` not present here defaults to "BASE TABLE".
+    - partitioning_columns: optional {table_name: column_name} - marks
+      that one column is_partitioning_column="YES" for that table (every
+      other column of that table reports "NO").
+    - clustering_columns: optional {table_name: [column_name, ...]}, in
+      clustering-key order - each gets a 1-based clustering_ordinal_position;
+      a column not listed gets None (not part of the clustering key).
+    - table_comments: optional {table_name: comment_text} -
+      INFORMATION_SCHEMA.TABLE_OPTIONS option_name='description' rows.
+    - require_partition_filter: optional {table_name: bool} -
+      INFORMATION_SCHEMA.TABLE_OPTIONS option_name='require_partition_filter'
+      rows (only tables present here get a row at all).
+    - table_storage: optional {table_name: total_rows} -
+      INFORMATION_SCHEMA.TABLE_STORAGE rows.
+    - routines: list of (routine_name, specific_name, return_type, definition).
+    - routine_params: list of (specific_name, parameter_name, data_type, ordinal_position).
     """
+    table_types = table_types or {}
+    partitioning_columns = partitioning_columns or {}
+    clustering_columns = clustering_columns or {}
+    table_comments = table_comments or {}
+    require_partition_filter = require_partition_filter or {}
+    table_storage = table_storage or {}
+
     def handler(sql_text, job_config):
-        if "INFORMATION_SCHEMA.TABLES" in sql_text:
+        if "INFORMATION_SCHEMA.TABLE_OPTIONS" in sql_text:
+            rows = []
+            for t, c in table_comments.items():
+                # Mirrors BigQuery's own pre-quoted DDL-literal rendering
+                # of a STRING option's value - see backends/bigquery.py's
+                # own strip-the-quotes handling of this.
+                rows.append({"table_name": t, "option_name": "description", "option_value": f'"{c}"'})
+            for t, flag in require_partition_filter.items():
+                rows.append({
+                    "table_name": t, "option_name": "require_partition_filter",
+                    "option_value": "true" if flag else "false",
+                })
             return FakeBQQueryJob(
-                rows=[{"table_name": t} for t in tables], columns=["table_name"]
+                rows=rows, columns=["table_name", "option_name", "option_value"]
             )
-        if "INFORMATION_SCHEMA.COLUMNS" in sql_text:
+        if "INFORMATION_SCHEMA.TABLE_STORAGE" in sql_text:
+            return FakeBQQueryJob(
+                rows=[{"table_name": t, "total_rows": n} for t, n in table_storage.items()],
+                columns=["table_name", "total_rows"],
+            )
+        if "INFORMATION_SCHEMA.PARAMETERS" in sql_text:
             return FakeBQQueryJob(
                 rows=[
-                    {"table_name": t, "column_name": c, "data_type": d, "is_nullable": n}
-                    for (t, c, d, n) in columns
+                    {"specific_name": sn, "parameter_name": pn, "data_type": dt, "ordinal_position": op}
+                    for (sn, pn, dt, op) in routine_params
                 ],
-                columns=["table_name", "column_name", "data_type", "is_nullable"],
+                columns=["specific_name", "parameter_name", "data_type", "ordinal_position"],
+            )
+        if "INFORMATION_SCHEMA.ROUTINES" in sql_text:
+            return FakeBQQueryJob(
+                rows=[
+                    {"routine_name": rn, "specific_name": sn, "data_type": rt, "routine_definition": rd}
+                    for (rn, sn, rt, rd) in routines
+                ],
+                columns=["routine_name", "specific_name", "data_type", "routine_definition"],
+            )
+        if "INFORMATION_SCHEMA.TABLES" in sql_text:
+            return FakeBQQueryJob(
+                rows=[{"table_name": t, "table_type": table_types.get(t, "BASE TABLE")} for t in tables],
+                columns=["table_name", "table_type"],
+            )
+        if "INFORMATION_SCHEMA.COLUMNS" in sql_text:
+            rows = []
+            for (t, c, d, n) in columns:
+                cluster_list = clustering_columns.get(t) or []
+                rows.append({
+                    "table_name": t, "column_name": c, "data_type": d, "is_nullable": n,
+                    "is_partitioning_column": "YES" if partitioning_columns.get(t) == c else "NO",
+                    "clustering_ordinal_position": (
+                        cluster_list.index(c) + 1 if c in cluster_list else None
+                    ),
+                })
+            return FakeBQQueryJob(
+                rows=rows,
+                columns=["table_name", "column_name", "data_type", "is_nullable",
+                         "is_partitioning_column", "clustering_ordinal_position"],
             )
         if "INFORMATION_SCHEMA.VIEWS" in sql_text:
             return FakeBQQueryJob(

@@ -184,6 +184,482 @@ def test_get_schema_survives_constraints_query_failure(monkeypatch):
     assert "Constraints:" not in schema
 
 
+def test_get_schema_shallow_returns_none_when_no_tables(monkeypatch):
+    backend, harness = _bq(monkeypatch)
+    harness.set_handler(schema_query_handler(tables=[]))
+    conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
+    assert backend.get_schema_shallow(conn) is None
+
+
+def test_get_schema_shallow_lists_plain_table_with_columns(monkeypatch):
+    backend, harness = _bq(monkeypatch)
+    harness.set_handler(schema_query_handler(
+        tables=["customers"],
+        columns=[("customers", "id", "INT64", "NO"), ("customers", "name", "STRING", "YES")],
+    ))
+    conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
+    schema = backend.get_schema_shallow(conn)
+    assert "Table: customers" in schema
+    assert "id INT64 NOT NULL" in schema
+    assert "name STRING NULL" in schema
+
+
+# --- Phase 1: table/column comments -------------------------------------------
+
+def test_get_schema_shallow_includes_table_comment(monkeypatch):
+    backend, harness = _bq(monkeypatch)
+    harness.set_handler(schema_query_handler(
+        tables=["customers"],
+        columns=[("customers", "id", "INT64", "NO")],
+        table_comments={"customers": "Customer master table"},
+    ))
+    conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
+    schema = backend.get_schema_shallow(conn)
+    assert "Table comments:" in schema
+    assert "customers: Customer master table" in schema
+
+
+def test_get_schema_shallow_omits_table_comments_section_when_none_present(monkeypatch):
+    backend, harness = _bq(monkeypatch)
+    harness.set_handler(schema_query_handler(
+        tables=["customers"], columns=[("customers", "id", "INT64", "NO")],
+    ))
+    conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
+    schema = backend.get_schema_shallow(conn)
+    assert "Table comments:" not in schema
+
+
+def test_get_schema_survives_table_options_query_failure(monkeypatch):
+    # TABLE_OPTIONS backs both table comments and the require_partition_filter
+    # flag - a failure here must degrade to "skip both", not fail the whole
+    # schema fetch (mirrors the existing constraints-query resilience test).
+    backend, harness = _bq(monkeypatch)
+
+    def handler(sql_text, job_config):
+        if "INFORMATION_SCHEMA.TABLES" in sql_text:
+            return FakeBQQueryJob(
+                rows=[{"table_name": "orders", "table_type": "BASE TABLE"}],
+                columns=["table_name", "table_type"],
+            )
+        if "INFORMATION_SCHEMA.COLUMNS" in sql_text:
+            return FakeBQQueryJob(
+                rows=[{
+                    "table_name": "orders", "column_name": "id", "data_type": "INT64",
+                    "is_nullable": "NO", "is_partitioning_column": "NO",
+                    "clustering_ordinal_position": None,
+                }],
+                columns=["table_name", "column_name", "data_type", "is_nullable",
+                         "is_partitioning_column", "clustering_ordinal_position"],
+            )
+        if "INFORMATION_SCHEMA.TABLE_OPTIONS" in sql_text:
+            raise Exception("TABLE_OPTIONS not supported in this region")
+        return FakeBQQueryJob(rows=[])
+
+    harness.set_handler(handler)
+    conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
+    schema = backend.get_schema(conn)
+    assert "Table: orders" in schema
+    assert "Table comments:" not in schema
+    assert "REQUIRES PARTITION FILTER" not in schema
+
+
+# --- Phase 1: row-count estimate (INFORMATION_SCHEMA.TABLE_STORAGE) -----------
+
+def test_get_schema_shallow_includes_row_count_estimate(monkeypatch):
+    backend, harness = _bq(monkeypatch)
+    harness.set_handler(schema_query_handler(
+        tables=["customers"],
+        columns=[("customers", "id", "INT64", "NO")],
+        table_storage={"customers": 12345},
+    ))
+    conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
+    schema = backend.get_schema_shallow(conn)
+    assert "Row count estimates:" in schema
+    assert "customers: ~12345 rows (estimate)" in schema
+
+
+def test_get_schema_survives_table_storage_query_failure(monkeypatch):
+    # TABLE_STORAGE is flagged best-effort in the plan (can be slower/less
+    # available than TABLES/COLUMNS) - a failure here must not break the
+    # rest of the fetch.
+    backend, harness = _bq(monkeypatch)
+
+    def handler(sql_text, job_config):
+        if "INFORMATION_SCHEMA.TABLES" in sql_text:
+            return FakeBQQueryJob(
+                rows=[{"table_name": "orders", "table_type": "BASE TABLE"}],
+                columns=["table_name", "table_type"],
+            )
+        if "INFORMATION_SCHEMA.COLUMNS" in sql_text:
+            return FakeBQQueryJob(
+                rows=[{
+                    "table_name": "orders", "column_name": "id", "data_type": "INT64",
+                    "is_nullable": "NO", "is_partitioning_column": "NO",
+                    "clustering_ordinal_position": None,
+                }],
+                columns=["table_name", "column_name", "data_type", "is_nullable",
+                         "is_partitioning_column", "clustering_ordinal_position"],
+            )
+        if "INFORMATION_SCHEMA.TABLE_STORAGE" in sql_text:
+            raise Exception("TABLE_STORAGE unavailable")
+        return FakeBQQueryJob(rows=[])
+
+    harness.set_handler(handler)
+    conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
+    schema = backend.get_schema(conn)
+    assert "Table: orders" in schema
+    assert "Row count estimates:" not in schema
+
+
+# --- Phase 1: routines (existence + signature, no body) -----------------------
+
+def test_get_schema_shallow_includes_routine_signature_without_body(monkeypatch):
+    backend, harness = _bq(monkeypatch)
+    harness.set_handler(schema_query_handler(
+        tables=["orders"],
+        columns=[("orders", "id", "INT64", "NO")],
+        routines=[("total_rev", "total_rev_1", "FLOAT64", "SELECT SUM(amount) FROM orders")],
+        routine_params=[("total_rev_1", "region", "STRING", 1)],
+    ))
+    conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
+    schema = backend.get_schema_shallow(conn)
+    assert "Routines:" in schema
+    assert "total_rev(region STRING) -> FLOAT64" in schema
+    assert "SELECT SUM(amount) FROM orders" not in schema
+
+
+def test_get_schema_includes_routine_body_in_deep_but_not_shallow(monkeypatch):
+    backend, harness = _bq(monkeypatch)
+    handler = schema_query_handler(
+        tables=["orders"],
+        columns=[("orders", "id", "INT64", "NO")],
+        routines=[("total_rev", "total_rev_1", "FLOAT64", "SELECT SUM(amount) FROM orders")],
+    )
+    harness.set_handler(handler)
+    conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
+    shallow = backend.get_schema_shallow(conn)
+    deep = backend.get_schema(conn)
+    assert "total_rev() -> FLOAT64" in shallow
+    assert "SELECT SUM(amount) FROM orders" not in shallow
+    assert "Routine definitions:" in deep
+    assert "SELECT SUM(amount) FROM orders" in deep
+
+
+def test_get_schema_routine_signature_survives_parameters_query_failure(monkeypatch):
+    backend, harness = _bq(monkeypatch)
+
+    def handler(sql_text, job_config):
+        if "INFORMATION_SCHEMA.TABLES" in sql_text:
+            return FakeBQQueryJob(
+                rows=[{"table_name": "orders", "table_type": "BASE TABLE"}],
+                columns=["table_name", "table_type"],
+            )
+        if "INFORMATION_SCHEMA.COLUMNS" in sql_text:
+            return FakeBQQueryJob(
+                rows=[{
+                    "table_name": "orders", "column_name": "id", "data_type": "INT64",
+                    "is_nullable": "NO", "is_partitioning_column": "NO",
+                    "clustering_ordinal_position": None,
+                }],
+                columns=["table_name", "column_name", "data_type", "is_nullable",
+                         "is_partitioning_column", "clustering_ordinal_position"],
+            )
+        if "INFORMATION_SCHEMA.ROUTINES" in sql_text:
+            return FakeBQQueryJob(
+                rows=[{
+                    "routine_name": "total_rev", "specific_name": "total_rev_1",
+                    "data_type": "FLOAT64", "routine_definition": "SELECT SUM(amount) FROM orders",
+                }],
+                columns=["routine_name", "specific_name", "data_type", "routine_definition"],
+            )
+        if "INFORMATION_SCHEMA.PARAMETERS" in sql_text:
+            raise Exception("PARAMETERS not supported in this region")
+        return FakeBQQueryJob(rows=[])
+
+    harness.set_handler(handler)
+    conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
+    schema = backend.get_schema_shallow(conn)
+    assert "total_rev() -> FLOAT64" in schema
+
+
+def test_get_schema_survives_routines_query_failure(monkeypatch):
+    backend, harness = _bq(monkeypatch)
+
+    def handler(sql_text, job_config):
+        if "INFORMATION_SCHEMA.TABLES" in sql_text:
+            return FakeBQQueryJob(
+                rows=[{"table_name": "orders", "table_type": "BASE TABLE"}],
+                columns=["table_name", "table_type"],
+            )
+        if "INFORMATION_SCHEMA.COLUMNS" in sql_text:
+            return FakeBQQueryJob(
+                rows=[{
+                    "table_name": "orders", "column_name": "id", "data_type": "INT64",
+                    "is_nullable": "NO", "is_partitioning_column": "NO",
+                    "clustering_ordinal_position": None,
+                }],
+                columns=["table_name", "column_name", "data_type", "is_nullable",
+                         "is_partitioning_column", "clustering_ordinal_position"],
+            )
+        if "INFORMATION_SCHEMA.ROUTINES" in sql_text:
+            raise Exception("ROUTINES not supported in this region")
+        return FakeBQQueryJob(rows=[])
+
+    harness.set_handler(handler)
+    conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
+    schema = backend.get_schema(conn)
+    assert "Table: orders" in schema
+    assert "Routines:" not in schema
+
+
+# --- Phase 1: distribution/clustering/partition columns (free COLUMNS add) ----
+
+def test_get_schema_shallow_includes_partitioning_and_clustering_markers(monkeypatch):
+    backend, harness = _bq(monkeypatch)
+    harness.set_handler(schema_query_handler(
+        tables=["events"],
+        columns=[
+            ("events", "event_date", "DATE", "NO"),
+            ("events", "user_id", "STRING", "NO"),
+            ("events", "country", "STRING", "YES"),
+        ],
+        partitioning_columns={"events": "event_date"},
+        clustering_columns={"events": ["user_id", "country"]},
+    ))
+    conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
+    schema = backend.get_schema_shallow(conn)
+    assert "event_date DATE NOT NULL [PARTITION]" in schema
+    assert "user_id STRING NOT NULL [CLUSTER #1]" in schema
+    assert "country STRING NULL [CLUSTER #2]" in schema
+
+
+# --- Phase 1: require_partition_filter (correctness-gating) -------------------
+
+def test_get_schema_shallow_flags_require_partition_filter(monkeypatch):
+    backend, harness = _bq(monkeypatch)
+    harness.set_handler(schema_query_handler(
+        tables=["events"],
+        columns=[("events", "event_date", "DATE", "NO")],
+        partitioning_columns={"events": "event_date"},
+        require_partition_filter={"events": True},
+    ))
+    conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
+    schema = backend.get_schema_shallow(conn)
+    assert "REQUIRES PARTITION FILTER on event_date" in schema
+
+
+def test_get_schema_shallow_omits_partition_filter_flag_when_false(monkeypatch):
+    backend, harness = _bq(monkeypatch)
+    harness.set_handler(schema_query_handler(
+        tables=["customers"],
+        columns=[("customers", "id", "INT64", "NO")],
+        require_partition_filter={"customers": False},
+    ))
+    conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
+    schema = backend.get_schema_shallow(conn)
+    assert "REQUIRES PARTITION FILTER" not in schema
+
+
+# --- Phase 1: external tables --------------------------------------------------
+
+def test_get_schema_shallow_flags_external_table(monkeypatch):
+    backend, harness = _bq(monkeypatch)
+    harness.set_handler(schema_query_handler(
+        tables=["ext_data"],
+        columns=[("ext_data", "id", "INT64", "NO")],
+        table_types={"ext_data": "EXTERNAL"},
+    ))
+    conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
+    schema = backend.get_schema_shallow(conn)
+    assert "Table: ext_data [external table]" in schema
+
+
+# --- Phase 1 vs Phase 2: shallow excludes Phase 2 / full bodies; deep is a ----
+# --- superset -------------------------------------------------------------
+
+def test_get_schema_shallow_excludes_phase2_content_and_full_bodies(monkeypatch):
+    backend, harness = _bq(monkeypatch)
+    harness.set_handler(schema_query_handler(
+        tables=["customers"],
+        columns=[("customers", "id", "INT64", "NO")],
+        views=[("customer_orders", "SELECT * FROM orders")],
+        routines=[("total", "total_1", "INT64", "SELECT 1")],
+    ))
+    conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
+    shallow = backend.get_schema_shallow(conn)
+    assert "Views:" in shallow
+    assert "customer_orders" in shallow
+    assert "SELECT * FROM orders" not in shallow
+    assert "Routines:" in shallow
+    assert "total() -> INT64" in shallow
+    assert "SELECT 1" not in shallow
+    assert "View definitions:" not in shallow
+    assert "Routine definitions:" not in shallow
+    assert "Live row counts:" not in shallow
+    assert "Column value samples:" not in shallow
+
+
+def test_get_schema_deep_is_superset_of_shallow(monkeypatch):
+    backend, harness = _bq(monkeypatch)
+    handler = schema_query_handler(
+        tables=["customers"],
+        columns=[("customers", "id", "INT64", "NO")],
+        views=[("customer_orders", "SELECT * FROM orders")],
+    )
+    harness.set_handler(handler)
+    conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
+    shallow = backend.get_schema_shallow(conn)
+    deep = backend.get_schema(conn)
+    assert deep.startswith(shallow)
+    assert "View definitions:" in deep
+    assert "SELECT * FROM orders" in deep
+
+
+# --- Phase 2: live row counts, min/max, frequent values, cardinality gate ----
+
+def test_get_schema_includes_live_row_count_min_max_and_frequent_values(monkeypatch):
+    backend, harness = _bq(monkeypatch)
+    base = schema_query_handler(
+        tables=["orders"],
+        columns=[
+            ("orders", "amount", "FLOAT64", "NO"),
+            ("orders", "status", "STRING", "NO"),
+        ],
+    )
+
+    def handler(sql_text, job_config):
+        if "SELECT COUNT(*) AS n FROM" in sql_text:
+            return FakeBQQueryJob(rows=[{"n": 50}])
+        if "MIN(" in sql_text:
+            return FakeBQQueryJob(rows=[{"min_0": 1.5, "max_0": 999.0}])
+        if "APPROX_COUNT_DISTINCT(" in sql_text:
+            return FakeBQQueryJob(rows=[{"distinct_0": 3}])
+        if "TABLESAMPLE" in sql_text:
+            assert "TABLESAMPLE SYSTEM (10 PERCENT)" in sql_text
+            return FakeBQQueryJob(rows=[{"val": "shipped", "cnt": 40}, {"val": "pending", "cnt": 10}])
+        return base(sql_text, job_config)
+
+    harness.set_handler(handler)
+    conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
+    schema = backend.get_schema(conn)
+    assert "Live row counts:" in schema
+    assert "orders: 50 rows (live, authoritative)" in schema
+    assert "Column value samples:" in schema
+    assert "amount: range [1.5 .. 999.0]" in schema
+    assert "status: frequent values = shipped (40), pending (10)" in schema
+
+
+def test_get_schema_skips_frequent_values_for_near_unique_column(monkeypatch):
+    # Cardinality gate: APPROX_COUNT_DISTINCT close to the live row count
+    # marks a column near-unique (e.g. a UUID) - not worth sampling.
+    backend, harness = _bq(monkeypatch)
+    base = schema_query_handler(tables=["orders"], columns=[("orders", "order_uuid", "STRING", "NO")])
+
+    def handler(sql_text, job_config):
+        if "SELECT COUNT(*) AS n FROM" in sql_text:
+            return FakeBQQueryJob(rows=[{"n": 100}])
+        if "APPROX_COUNT_DISTINCT(" in sql_text:
+            return FakeBQQueryJob(rows=[{"distinct_0": 99}])
+        if "TABLESAMPLE" in sql_text:
+            return FakeBQQueryJob(rows=[{"val": "x", "cnt": 1}])
+        return base(sql_text, job_config)
+
+    harness.set_handler(handler)
+    conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
+    schema = backend.get_schema(conn)
+    assert "Column value samples:" not in schema
+
+
+def test_get_schema_includes_naming_convention_relationships(monkeypatch):
+    backend, harness = _bq(monkeypatch)
+    harness.set_handler(schema_query_handler(
+        tables=["customers", "orders"],
+        columns=[
+            ("customers", "id", "INT64", "NO"),
+            ("orders", "id", "INT64", "NO"),
+            ("orders", "customer_id", "INT64", "NO"),
+        ],
+    ))
+    conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
+    schema = backend.get_schema(conn)
+    assert "Likely relationships (naming convention, unconfirmed):" in schema
+    assert "orders.customer_id" in schema
+
+
+# --- Phase 2: require_partition_filter threaded into Phase 2's own queries ---
+
+def test_get_schema_threads_partition_filter_into_phase2_queries(monkeypatch):
+    from backends.bigquery import _bigquery_partition_filter_clause
+
+    backend, harness = _bq(monkeypatch)
+    base = schema_query_handler(
+        tables=["events"],
+        columns=[
+            ("events", "event_date", "DATE", "NO"),
+            ("events", "region", "STRING", "NO"),
+        ],
+        partitioning_columns={"events": "event_date"},
+        require_partition_filter={"events": True},
+    )
+    captured = []
+
+    def handler(sql_text, job_config):
+        if "INFORMATION_SCHEMA" in sql_text:
+            return base(sql_text, job_config)
+        captured.append(sql_text)
+        if "SELECT COUNT(*) AS n FROM" in sql_text:
+            return FakeBQQueryJob(rows=[{"n": 10}])
+        if "MIN(" in sql_text:
+            return FakeBQQueryJob(rows=[{"min_0": "2024-01-01"}])
+        if "APPROX_COUNT_DISTINCT(" in sql_text:
+            return FakeBQQueryJob(rows=[{"distinct_0": 2}])
+        if "TABLESAMPLE" in sql_text:
+            return FakeBQQueryJob(rows=[{"val": "us", "cnt": 5}])
+        return FakeBQQueryJob(rows=[])
+
+    harness.set_handler(handler)
+    conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
+    schema = backend.get_schema(conn)
+
+    # Detected in Phase 1, rendered on the table's own heading.
+    assert "REQUIRES PARTITION FILTER on event_date" in schema
+
+    # Threaded into every one of Phase 2's own new queries for this table -
+    # not skipped, not sent unfiltered.
+    expected_clause = _bigquery_partition_filter_clause("event_date", "DATE")
+    assert captured, "expected at least one Phase 2 query for the partitioned table"
+    for sql_text in captured:
+        assert expected_clause in sql_text
+
+
+def test_get_schema_skips_phase2_queries_when_partition_column_unknown(monkeypatch):
+    # require_partition_filter is true but Phase 1 couldn't identify which
+    # column is the partitioning column - Phase 2 must skip this table's
+    # own new queries entirely rather than send one unfiltered (which
+    # BigQuery would reject for exactly this table).
+    backend, harness = _bq(monkeypatch)
+    base = schema_query_handler(
+        tables=["orders"],
+        columns=[("orders", "id", "INT64", "NO")],
+        require_partition_filter={"orders": True},
+    )
+    captured = []
+
+    def handler(sql_text, job_config):
+        if "INFORMATION_SCHEMA" in sql_text:
+            return base(sql_text, job_config)
+        captured.append(sql_text)
+        return FakeBQQueryJob(rows=[{"n": 999}])
+
+    harness.set_handler(handler)
+    conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
+    schema = backend.get_schema(conn)
+
+    assert "REQUIRES PARTITION FILTER" in schema
+    assert not captured, "Phase 2 must not query this table without a partition filter"
+    assert "Live row counts:" not in schema
+
+
 def test_get_schema_scopes_columns_query_with_unnest_param_not_string_formatting(monkeypatch):
     backend, harness = _bq(monkeypatch)
     harness.set_handler(schema_query_handler(

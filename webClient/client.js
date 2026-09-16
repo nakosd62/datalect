@@ -711,6 +711,14 @@ document.addEventListener('DOMContentLoaded', async () => {
   let customDbUrl = "";
   let customDbName = "";
   let customDatabases = [];
+  // Which saved custom connections currently have a "Refresh Schema"
+  // request in flight - keyed by connection_key (stable across a row's
+  // array index shifting from an add/remove elsewhere), not by button/DOM
+  // reference, specifically so renderCustomDbRows() can look this up fresh
+  // on every re-render (see its own refresh-button-rendering comment) and
+  // handleRefreshSchemaClick (below) can guard against firing a second,
+  // fully concurrent request for a connection that's already mid-refresh.
+  let refreshingConnectionKeys = new Set();
   let autoSqlExecuteEnabled = true;
   // True when running on Cloud Run and the current request has no verified
   // login (i.e. the backend resolved it to a per-session "anonymous:..."
@@ -2930,6 +2938,26 @@ document.addEventListener('DOMContentLoaded', async () => {
       // re-renders since it lives on the object itself rather than index.
       const isExpanded = db._expanded !== undefined ? db._expanded : !db.connection_key;
 
+      // Looked up from refreshingConnectionKeys (a Set keyed by
+      // connection_key, declared alongside customDatabases) rather than
+      // from any per-row/per-index flag, specifically so it survives this
+      // function's own re-renders - renderCustomDbRows() rebuilds every
+      // row's HTML from scratch on ANY change (toggling a totally
+      // unrelated row's expand arrow, removing a different connection,
+      // ...), which would otherwise silently wipe out a plain DOM
+      // btn.disabled. Used below both to keep the refresh button itself
+      // disabled+spinning and to disable this row's OWN remove ("x")
+      // button for as long as its schema fetch is in flight - deleting a
+      // connection whose refresh is mid-request doesn't corrupt anything
+      // (the fetch just keeps running against whatever the server still
+      // has persisted, and prime_schema_cache()/get_database_schema() only
+      // ever touch the in-memory schema cache - see this feature's own
+      // design notes), but it can produce a confusing "Failed to refresh
+      // schema for X: Connection not found" popup later for a connection
+      // the user already intentionally removed - simplest to just not let
+      // the two race in the first place.
+      const isRefreshing = Boolean(db.connection_key) && refreshingConnectionKeys.has(db.connection_key);
+
       // Row 1 (all types): selection radio, dialect select, and Name -
       // dialect-specific fields live on their own dedicated rows below,
       // never crowding this first line.
@@ -2954,7 +2982,14 @@ document.addEventListener('DOMContentLoaded', async () => {
               <input type="text" id="custom-db-name-${index}" class="config-input custom-db-name-input" data-index="${index}" placeholder="e.g. My Database" value="${db.name || ''}" autocomplete="off">
             </div>
             <button type="button" class="btn btn-secondary custom-db-toggle-btn" data-index="${index}" aria-expanded="${isExpanded}" title="${isExpanded ? 'Hide connection details' : 'Show connection details'}">${isExpanded ? '▾' : '▸'}</button>
-            <button type="button" class="btn btn-secondary custom-db-remove-btn" data-index="${index}" title="Remove this connection">&times;</button>
+            ${db.connection_key ? `<button type="button" class="btn btn-secondary custom-db-refresh-btn" data-index="${index}" title="${isRefreshing ? 'Refreshing schema…' : 'Refresh Schema'}" ${isRefreshing ? 'disabled' : ''}>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="${isRefreshing ? 'animate-spin' : ''}">
+                <polyline points="23 4 23 10 17 10"></polyline>
+                <polyline points="1 20 1 14 7 14"></polyline>
+                <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+              </svg>
+            </button>` : ''}
+            <button type="button" class="btn btn-secondary custom-db-remove-btn" data-index="${index}" title="${isRefreshing ? 'Wait for the schema refresh to finish before removing this connection' : 'Remove this connection'}" ${isRefreshing ? 'disabled' : ''}>&times;</button>
           </div>
           ${isExpanded ? (isBigQuery ? `
           <div class="custom-db-field-row">
@@ -3285,6 +3320,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         const index = parseInt(btn.dataset.index);
         customDatabases.splice(index, 1);
         renderCustomDbRows(activeUrl);
+      });
+    });
+
+    container.querySelectorAll('.custom-db-refresh-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const index = parseInt(btn.dataset.index);
+        handleRefreshSchemaClick(customDatabases[index], activeUrl);
       });
     });
 
@@ -3643,6 +3685,66 @@ document.addEventListener('DOMContentLoaded', async () => {
           if (last) last.focus();
         });
       });
+    }
+  }
+
+  // "Refresh Schema" (see renderCustomDbRows()'s new .custom-db-refresh-btn
+  // above, only rendered for an already-saved custom connection) - a
+  // blocking call scoped to just this one connection, not the whole config
+  // modal (no existing modal-wide disable helper covers #configModal; see
+  // setButtonsDisabled(), which is scoped to the main chat/translate
+  // controls only). On success, just re-renders back to normal - no success
+  // message. On failure, shows a popup dialog (showAlertDialog, below) -
+  // a deliberate departure from this app's usual inline-#configSaveError
+  // convention, per how this feature was specified.
+  //
+  // In-flight state lives in refreshingConnectionKeys (declared alongside
+  // customDatabases), not in a plain btn.disabled flip - a bare DOM flag
+  // would get silently reset the moment ANY unrelated change re-renders
+  // this row (see renderCustomDbRows()'s refresh-button comment), which is
+  // exactly how this used to let a user fire off several fully concurrent
+  // refresh requests for the very same connection: click, then toggle/
+  // expand a different row (or remove one, or add a new blank one) while
+  // the fetch is still pending, and the re-render handed back a fresh,
+  // enabled button with no memory of the request still running. Guarding
+  // on the Set here - checked BEFORE anything else, and populated before
+  // the very first re-render - closes that regardless of how many times
+  // this row happens to get rebuilt while a request is outstanding.
+  //
+  // Refreshing two DIFFERENT connections at once is fine and intentional -
+  // each is its own independent /api/config/refresh-schema call against
+  // its own connection_key, exactly like clicking "Refresh Schema" on two
+  // separate rows always has been. Only a second click on the SAME
+  // still-in-flight connection is what this guards against.
+  async function handleRefreshSchemaClick(db, activeUrl) {
+    if (!db || !db.connection_key || refreshingConnectionKeys.has(db.connection_key)) return;
+    const displayName = db.name || 'this connection';
+    refreshingConnectionKeys.add(db.connection_key);
+    renderCustomDbRows(activeUrl);
+    try {
+      const response = await fetch('/api/config/refresh-schema', {
+        method: 'POST',
+        headers: getApiHeaders(),
+        body: JSON.stringify({ connection_key: db.connection_key }),
+      });
+      if (!response.ok) {
+        let errorMessage = 'Failed to refresh schema.';
+        try {
+          const errData = await response.json();
+          if (errData && errData.error) errorMessage = errData.error;
+        } catch (parseErr) { /* non-JSON error body - keep the generic message */ }
+        // Named explicitly - a bare "Failed to refresh schema." gives no
+        // way to tell which of several saved connections it was about,
+        // especially once the button itself has already gone back to its
+        // normal (non-spinning) state by the time this dialog is dismissed.
+        await showAlertDialog(`Failed to refresh schema for "${displayName}": ${errorMessage}`);
+      }
+    } catch (err) {
+      console.error(`Failed to refresh schema for "${displayName}":`, err);
+      await showAlertDialog(`Failed to refresh schema for "${displayName}". Check your connection and try again.`);
+    } finally {
+      refreshingConnectionKeys.delete(db.connection_key);
+      renderCustomDbRows(activeUrl);
     }
   }
 
@@ -5166,6 +5268,51 @@ document.addEventListener('DOMContentLoaded', async () => {
       okBtn.addEventListener('click', onOk);
       cancelBtn.addEventListener('click', onCancel);
       closeBtn?.addEventListener('click', onCancel);
+      modal.addEventListener('click', onOutside);
+    });
+  }
+
+  // OK-only variant of showConfirmDialog() above, for the failure case -
+  // this app otherwise shows errors inline (e.g. #configSaveError), but
+  // the "Refresh Schema" button (handleRefreshSchemaClick, above) is
+  // specified to show a real popup on failure instead. Nothing to
+  // confirm/cancel here, only to acknowledge, so OK, the close button,
+  // and clicking outside the modal all just dismiss it the same way.
+  function showAlertDialog(message) {
+    return new Promise((resolve) => {
+      const modal = document.getElementById('alertModal');
+      const textEl = document.getElementById('alertModalText');
+      const okBtn = document.getElementById('alertModalOkBtn');
+      const closeBtn = document.getElementById('alertModalCloseBtn');
+
+      if (!modal || !textEl || !okBtn) {
+        alert(message);
+        resolve();
+        return;
+      }
+
+      textEl.textContent = message;
+      modal.classList.remove('hidden');
+      bringModalToFront(modal);
+
+      let cleanedUp = false;
+      const cleanup = () => {
+        if (cleanedUp) return;
+        cleanedUp = true;
+        modal.classList.add('hidden');
+        okBtn.removeEventListener('click', onOk);
+        closeBtn?.removeEventListener('click', onOk);
+        modal.removeEventListener('click', onOutside);
+        resolve();
+      };
+
+      const onOk = () => cleanup();
+      const onOutside = (e) => {
+        if (e.target === modal) cleanup();
+      };
+
+      okBtn.addEventListener('click', onOk);
+      closeBtn?.addEventListener('click', onOk);
       modal.addEventListener('click', onOutside);
     });
   }

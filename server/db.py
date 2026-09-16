@@ -24,13 +24,134 @@ strings/credentials never end up in the translation-history table.
 """
 
 import concurrent.futures
+import threading
 
 from app_config import DEFAULT_DESCRIPTOR, CONFIGURED_DBS, state_store, logger
 from backends import get_backend
-from backends.base import extract_entry_names_from_schema_text
+from backends.base import (
+    extract_entry_names_from_schema_text, schema_text_was_truncated, schema_text_has_omitted_tables,
+    SCHEMA_MAX_CHARS, SCHEMA_MAX_TABLES,
+)
 import schema_cache
 
 _SCHEMA_FETCH_FAILED = "No schema description available."
+
+# Three reasons a schema fetch can fail, threaded through
+# get_database_schema_with_reason()/prime_schema_cache_with_reason() below
+# to config_routes.py's /api/config/refresh-schema (so it can tell a user
+# something more accurate than a blanket "could not fetch schema") and to
+# prefetch_all_preset_schemas() below (so it can decide whether a preset
+# that failed at startup stays in the dialog's list or gets dropped from
+# it - see that function's own docstring). Never surfaced to the model or
+# embedded in cached schema text itself - a failed fetch's actual
+# returned/cached text is always exactly _SCHEMA_FETCH_FAILED's plain
+# string, regardless of which reason produced it; this is purely additive
+# metadata for a caller that wants more than that one bare sentinel. Plain
+# string constants rather than an enum - simplest thing that works for
+# three values with two readers today.
+SCHEMA_FETCH_FAILURE_REASON_EMPTY = "empty"  # connected/queried fine - zero BASE TABLEs visible
+# A raised connect()/get_schema() failure is further split into two
+# sub-reasons - see _looks_like_timeout_error() below for how the split is
+# made, and prefetch_all_preset_schemas()'s own docstring for why the
+# split exists at all (a startup preset prefetch treats the two very
+# differently): TIMEOUT means the attempt hit DB_CONNECT_TIMEOUT_SECONDS
+# (or an equivalent query/read timeout) without ever getting a definitive
+# answer - typically a slow/currently-unreachable host, worth trying again
+# later. FATAL means the attempt got a definitive, fast rejection instead
+# (wrong credentials, a missing driver, a malformed request, DNS
+# resolution failure, a real query error) - retrying won't help until
+# whatever's actually wrong is fixed.
+SCHEMA_FETCH_FAILURE_REASON_TIMEOUT = "timeout"
+SCHEMA_FETCH_FAILURE_REASON_FATAL = "fatal"
+
+
+def _looks_like_timeout_error(exc):
+    """Best-effort, cross-dialect check for "this connect()/get_schema()
+    failure was specifically a timeout" rather than a definitive
+    rejection - see SCHEMA_FETCH_FAILURE_REASON_TIMEOUT/_FATAL above for
+    why the distinction matters.
+
+    There's no single shared timeout exception type across this app's 8
+    SQL backends' drivers to reliably isinstance()-check against instead:
+    backends/mssql.py's own _connect_with_hard_timeout wrapper explicitly
+    raises a plain built-in TimeoutError when pytds's own timeout handling
+    can't be trusted (see its docstring) - a clean, unambiguous signal,
+    checked first - but every other driver (psycopg2, pymysql, oracledb,
+    the snowflake/databricks connectors, pyodbc) just raises its own
+    generic connection-error exception class (OperationalError,
+    DatabaseError, ...) for a connect_timeout/tcp_connect_timeout/
+    login_timeout expiry, indistinguishable from any other connection
+    failure except by message text. backends/sheets.py's requests-based
+    calls are the other clean case (requests.exceptions.Timeout).
+
+    For everything else, this falls back to a permissive, case-insensitive
+    substring check for "timeout"/"timed out" in str(exc) - every driver's
+    own timeout-expiry message includes one of those words in practice.
+    Deliberately permissive: a false NEGATIVE here (calling a real timeout
+    "fatal") is worse than a false positive (a genuinely fatal error that
+    happens to mention "timeout" in unrelated text), since this feeds
+    prefetch_all_preset_schemas()'s decision to permanently drop a preset
+    from the dialog's list until the next restart - being overly eager to
+    call something "fatal" would remove presets that just needed a retry,
+    the worse of the two failure modes this feature exists to avoid."""
+    if isinstance(exc, TimeoutError):
+        return True
+    try:
+        import requests
+        if isinstance(exc, requests.exceptions.Timeout):
+            return True
+    except ImportError:
+        pass
+    message = str(exc).lower()
+    return "timeout" in message or "timed out" in message
+
+
+# Preset ids that startup prefetch determined have a FATAL (non-timeout)
+# schema-fetch failure - see prefetch_all_preset_schemas()'s own docstring
+# for the full "fatal vs. timeout" design. Process-wide (presets have no
+# per-user identity) and guarded by its own lock rather than reusing
+# schema_cache.py's, since this is conceptually unrelated state (which
+# PRESETS EXIST, not what their schema IS) - mirrors cancel_registry.py's
+# own "one small lock-guarded module-level structure per independent
+# concern" convention. Reset only by a process restart (CONFIGURED_DBS
+# itself is rebuilt fresh at import time every restart too, and startup
+# prefetch runs again from scratch, so a preset that was excluded gets
+# another chance rather than being permanently banned).
+_fatally_failed_preset_ids = set()
+_fatally_failed_preset_ids_lock = threading.Lock()
+
+
+def _mark_preset_fatally_failed(preset_id):
+    with _fatally_failed_preset_ids_lock:
+        _fatally_failed_preset_ids.add(preset_id)
+
+
+def visible_configured_dbs():
+    """CONFIGURED_DBS, minus any preset startup prefetch has since marked
+    fatally failed (see prefetch_all_preset_schemas()) - the one filtered
+    view every call site that resolves or lists SELECTABLE presets should
+    read through instead of iterating CONFIGURED_DBS directly: this
+    module's own resolve_active_descriptor/resolve_descriptor_by_reference/
+    _resolve_all_configured_descriptors, and config_routes.py's preset-
+    listing/preset-selection code in its GET/POST /api/config handler.
+
+    Deliberately NOT used by call sites that need to resolve a preset for
+    HISTORICAL purposes regardless of its current visibility (e.g.
+    chat_history_routes.py labeling which preset a past translation ran
+    against) - those still read CONFIGURED_DBS directly, since a preset
+    excluded today shouldn't erase which one a past request actually used.
+
+    A plain filter over the live CONFIGURED_DBS list (not a cached/
+    snapshotted copy) for the same reason _resolve_all_configured_descriptors
+    already reads CONFIGURED_DBS fresh on every call: an admin-configured
+    preset set doesn't change within a process's lifetime today, but this
+    keeps the same "read live" property that function already documents
+    rather than introducing a second, potentially-stale view of it."""
+    if not _fatally_failed_preset_ids:
+        return CONFIGURED_DBS
+    with _fatally_failed_preset_ids_lock:
+        excluded = set(_fatally_failed_preset_ids)
+    return [db for db in CONFIGURED_DBS if db.get("id") not in excluded]
 
 
 def _to_descriptor(conn_str):
@@ -91,7 +212,7 @@ def resolve_active_descriptor(session, user_id):
                 descriptor.update(db.get("config") or {})
                 return descriptor, False
         return _to_descriptor(DEFAULT_DESCRIPTOR), True
-    for db in CONFIGURED_DBS:
+    for db in visible_configured_dbs():
         if db.get("id") == connection_id:
             # CONFIGURED_DBS entries already ARE full descriptors plus
             # "id"/"name" - stripping just those two is all that's needed,
@@ -130,7 +251,7 @@ def resolve_descriptor_by_reference(kind, ref_id, user_id):
                 return descriptor, db.get("name") or "Custom"
         return None, None
     if kind == "preset":
-        for db in CONFIGURED_DBS:
+        for db in visible_configured_dbs():
             if db.get("id") == ref_id:
                 return {k: v for k, v in db.items() if k not in ("id", "name")}, db.get("name") or ref_id
         return None, None
@@ -230,7 +351,7 @@ def _resolve_all_configured_descriptors(user_id):
     (an unusual but legitimate config - "All" mode degrading to one default
     connection is a saner outcome than returning zero candidates)."""
     entries = []
-    for db in CONFIGURED_DBS:
+    for db in visible_configured_dbs():
         if not db.get("include_in_all_mode", True):
             continue
         preset_id = db.get("id")
@@ -253,11 +374,18 @@ def build_router_candidate_summaries(in_scope_entries, user_id):
     with this list.
 
     Deliberately never includes column-level schema - only enough for the
-    router to guess relevance from table/tab names and dialect. Reuses the
-    same TTL-cached get_database_schema() every other schema-aware code
-    path already goes through (so this doesn't cost a second round-trip
-    for a connection whose schema is already cached), reduced via
-    backends/base.py's extract_entry_names_from_schema_text.
+    router to guess relevance from table/tab names and dialect. Calls
+    get_database_schema(..., deep=False) - the Phase 1-only ("shallow")
+    fetch - rather than the deep fetch every real generation path uses,
+    so an all-dbs question against N in-scope connections doesn't pay
+    Phase 2's live-query cost (sampling, min/max, live row counts, ...)
+    for the N-1 connections the router doesn't end up selecting; a
+    connection that IS selected gets its schema re-fetched deep, through
+    the normal get_database_schema() call Phase B already makes, at which
+    point it's a fresh cache lookup under a different key (see
+    get_database_schema()'s cache_key suffixing) - not reused from here.
+    Reduced via backends/base.py's extract_entry_names_from_schema_text,
+    same as before this split existed.
 
     Fetched in parallel (one worker per in-scope connection) via
     ThreadPoolExecutor, mirroring execute_routes.py's
@@ -273,7 +401,7 @@ def build_router_candidate_summaries(in_scope_entries, user_id):
         return []
 
     def _summarize(entry):
-        schema_text = get_database_schema(entry["descriptor"], user_id)
+        schema_text = get_database_schema(entry["descriptor"], user_id, deep=False)
         table_names = extract_entry_names_from_schema_text(schema_text)
         try:
             dialect = get_backend(entry["descriptor"]).dialect_name
@@ -413,44 +541,341 @@ def get_db_connection(conn_str=None, user_id=None):
     return get_backend(descriptor).connect(descriptor)
 
 
-def get_database_schema(conn_str=None, user_id=None, force_refresh=False):
+# Suffix appended to a connection's cache_key for the shallow (Phase 1
+# only, catalog-only) schema-cache entry - kept independent of the plain
+# cache_key (the deep/full-schema entry, unchanged from before this split
+# existed) so a connection can have both cached at once, and so
+# invalidating one doesn't accidentally read/clear the other. See
+# invalidate_schema_cache() below, which clears both together - the only
+# correct way to invalidate a connection's schema, now that there can be
+# two entries for it.
+_SHALLOW_CACHE_KEY_SUFFIX = "::shallow"
+
+
+def get_database_schema(conn_str=None, user_id=None, force_refresh=False, deep=True):
     """
     Returns the schema introspection text for the resolved connection,
-    using a short-TTL in-memory cache (see schema_cache.py) so repeated
-    /api/translate calls in the same chat session don't re-run the
-    backend's introspection queries every time.
+    using an in-memory cache (see schema_cache.py) so repeated
+    /api/translate calls in the same chat session - or across an entire
+    process's lifetime - don't re-run the backend's introspection queries
+    every time.
 
-    Pass force_refresh=True to bypass and repopulate the cache - e.g. when
-    the frontend knows the user just changed database/schema and wants an
-    immediate refresh rather than waiting out the TTL.
+    Every successful fetch is cached indefinitely (schema_cache.py has no
+    TTL/expiry concept at all - see its own module docstring): a
+    connection's schema only ever changes here via force_refresh=True (an
+    explicit "fetch this now" request - the startup preset prefetch, the
+    "Refresh Schema" button, or /api/translate's own in-conversation
+    refresh_schema checkbox - see prime_schema_cache()/
+    prefetch_all_preset_schemas() below and config_routes.py's
+    /api/config/refresh-schema) or a process restart. force_refresh=True
+    bypasses the cached read and re-fetches, and that fresh result is
+    cached indefinitely too, exactly the same as any other successful
+    fetch - there's no "temporary" cache tier to fall back to.
+
+    deep=True (default - every pre-existing caller keeps getting exactly
+    this) returns the full Phase 1 + Phase 2 ("deep") schema text, cached
+    under this connection's plain cache_key exactly as before this
+    parameter existed. deep=False returns the Phase 1-only ("shallow")
+    text instead, cached separately under cache_key + "::shallow" - used
+    by build_router_candidate_summaries() so an all-dbs triage pass over
+    every in-scope connection doesn't pay Phase 2's live-query cost for
+    connections the router may never actually select.
+
+    Deliberately calls _fetch_database_schema() (the plain-text function),
+    NOT _fetch_database_schema_with_reason() - this keeps
+    _fetch_database_schema() as the one and only real-fetch seam every
+    existing test monkeypatches (tests/server/test_connection_router.py,
+    among others) to stand in for a real backend round-trip. Only
+    get_database_schema_with_reason() (below) - used solely by
+    prime_schema_cache_with_reason(), which nothing here monkeypatches
+    this way - goes through the reason-returning path instead. Keeping
+    these as two independent implementations (rather than one delegating
+    to the other) duplicates a handful of cache-read/cache-write lines,
+    but that's a deliberately small price for not silently routing every
+    existing caller/test through a lower-level seam they were never
+    written against.
     """
     descriptor = resolve_conn_str(conn_str, user_id)
     cache_key = get_conn_identifier(descriptor)
+    if not deep:
+        cache_key += _SHALLOW_CACHE_KEY_SUFFIX
 
     if not force_refresh:
         cached = schema_cache.get(cache_key)
         if cached is not None:
             return cached
 
-    schema_text = _fetch_database_schema(descriptor)
+    schema_text = _fetch_database_schema(descriptor, deep=deep)
     # Don't cache the failure fallback - a transient connection hiccup
-    # shouldn't get "frozen in" as the answer for the rest of the TTL
-    # window once the DB is reachable again.
+    # shouldn't get "frozen in" as the answer forever just because the DB
+    # happened to be unreachable at the moment of this one fetch; the
+    # very next attempt (whenever that happens to be) tries live again.
     if schema_text != _SCHEMA_FETCH_FAILED:
         schema_cache.set(cache_key, schema_text)
     return schema_text
 
 
-def _fetch_database_schema(descriptor):
-    """The actual DB-hitting introspection logic, delegated to whichever
-    backend matches the descriptor's type. Always fetches live - call
-    get_database_schema() instead unless you specifically need to bypass
-    the cache layer."""
+def get_database_schema_with_reason(conn_str=None, user_id=None, force_refresh=False, deep=True):
+    """
+    Same caching behavior get_database_schema() above documents (see its
+    docstring - identical cache-key/TTL/deep-vs-shallow semantics), but
+    also returns WHY a failed fetch failed, as a (schema_text, reason)
+    pair: reason is None on a cache hit or a successful fetch, else
+    SCHEMA_FETCH_FAILURE_REASON_EMPTY, _TIMEOUT, or _FATAL
+    (see _fetch_database_schema_with_reason()'s own docstring for exactly
+    what each means). Only prime_schema_cache_with_reason() below currently
+    calls this - every other caller uses the plain get_database_schema()
+    above, which goes through the separate, reason-less
+    _fetch_database_schema() seam instead (see that function's own comment
+    on why these two aren't just one delegating to the other).
+    """
+    descriptor = resolve_conn_str(conn_str, user_id)
+    cache_key = get_conn_identifier(descriptor)
+    if not deep:
+        cache_key += _SHALLOW_CACHE_KEY_SUFFIX
+
+    if not force_refresh:
+        cached = schema_cache.get(cache_key)
+        if cached is not None:
+            return cached, None
+
+    schema_text, reason = _fetch_database_schema_with_reason(descriptor, deep=deep)
+    # Don't cache the failure fallback - same reasoning as
+    # get_database_schema() above.
+    if schema_text != _SCHEMA_FETCH_FAILED:
+        schema_cache.set(cache_key, schema_text)
+    return schema_text, reason
+
+
+def prime_schema_cache(descriptor, user_id=None):
+    """Force-fetches BOTH the deep and shallow schema cache entries for
+    one connection - thin wrapper around prime_schema_cache_with_reason()
+    (below) for the two pre-existing callers that only ever needed a bare
+    success/failure signal (prefetch_all_preset_schemas, and
+    config_routes.py's own-connection-config-changed branch), discarding
+    the failure reason. See that function's docstring for the full
+    deep+shallow/success semantics, unchanged here."""
+    success, _reason = prime_schema_cache_with_reason(descriptor, user_id)
+    return success
+
+
+def prime_schema_cache_with_reason(descriptor, user_id=None):
+    """Same deep+shallow force-fetch prime_schema_cache() above documents,
+    shared by the startup preset prefetch (prefetch_all_preset_schemas,
+    below), the connection-config-changed branch, and the "Refresh Schema"
+    endpoint (config_routes.py's /api/config/refresh-schema) - but also
+    returns a failure reason, as a (success, reason) pair: reason is None
+    on success, else whatever get_database_schema_with_reason()'s deep
+    fetch reported (SCHEMA_FETCH_FAILURE_REASON_EMPTY, _TIMEOUT, or _FATAL
+    - see its own docstring). /api/config/refresh-schema reads this to
+    tell a user something more specific than a blanket "could not fetch
+    schema" when the connection actually worked fine but simply has
+    nothing to describe; prefetch_all_preset_schemas() below reads it to
+    decide whether a preset that failed at startup should stay in the
+    dialog's list (EMPTY/TIMEOUT) or be dropped from it until the next
+    restart (FATAL) - see that function's own docstring.
+
+    Both are fetched (not just deep) because build_router_candidate_summaries()
+    (all-dbs triage) uses the shallow entry - leaving it stale after an
+    explicit refresh would mean triage still sees the OLD schema even
+    though a real generation call would now see the new one.
+
+    success is True if the (user-visible) deep fetch succeeded, False if
+    it hit the _SCHEMA_FETCH_FAILED fallback - callers use this to decide
+    success/failure. The shallow fetch is best-effort and only attempted
+    if the deep fetch succeeded; a shallow-only failure never downgrades
+    an otherwise-successful deep fetch back to an overall failure (and
+    never produces its own reason - only the deep fetch's outcome is ever
+    reported)."""
+    deep_text, reason = get_database_schema_with_reason(descriptor, user_id, force_refresh=True, deep=True)
+    success = deep_text != _SCHEMA_FETCH_FAILED
+    if success:
+        get_database_schema(descriptor, user_id, force_refresh=True, deep=False)
+    return success, (reason if not success else None)
+
+
+def prefetch_all_preset_schemas():
+    """Warms every admin-configured preset's schema cache at server
+    startup - called once, at module import time, from server.py (same
+    precedent as state_store.init() - see that module's own comment on
+    why it runs there rather than only under `if __name__ == '__main__':`),
+    on its own background thread (see server.py's own comment on that
+    call site) so it never blocks the server from serving requests.
+    Presets have no per-user credentials (CONFIGURED_DBS entries are
+    already complete, credentialed descriptors - see
+    resolve_active_descriptor's preset branch above), so user_id is
+    irrelevant here - None throughout.
+
+    Fetches concurrently (ThreadPoolExecutor), mirroring
+    build_router_candidate_summaries()'s existing pattern, so N slow/
+    unreachable presets prefetch in parallel rather than serializing
+    behind each other and delaying server startup further. This function
+    never raises, so one bad preset can't take any other preset down with
+    it.
+
+    A preset's failure is handled differently depending on
+    prime_schema_cache_with_reason()'s reported reason - see
+    SCHEMA_FETCH_FAILURE_REASON_TIMEOUT/_FATAL's own comment for the full
+    reasoning, summarized here:
+
+    - EMPTY or TIMEOUT: logged and left alone, exactly as before this
+      distinction existed. Since every successful fetch is cached
+      indefinitely regardless of how it was triggered (see
+      get_database_schema() above), the very next real request against
+      this preset - once its DB is reachable again, or its schema
+      actually has tables to describe - fetches and caches it exactly as
+      if this prefetch had succeeded in the first place, with no separate
+      retry/pending bookkeeping needed.
+    - FATAL: this preset gets a definitive, fast rejection (bad
+      credentials, a missing driver, a malformed request, ...) that a
+      retry can't fix without an admin actually changing something - so
+      unlike EMPTY/TIMEOUT, leaving it in the dialog's list would just
+      mean every future request against it repeats the exact same
+      failure forever. Instead it's marked via _mark_preset_fatally_failed()
+      and disappears from visible_configured_dbs() - the filtered view
+      resolve_active_descriptor/resolve_descriptor_by_reference/
+      _resolve_all_configured_descriptors above and config_routes.py's
+      preset-listing/selection code all read instead of CONFIGURED_DBS
+      directly - until the next server restart re-runs this whole
+      function from scratch and gives it another chance. A session
+      already pointed at a preset that gets excluded this way resolves as
+      "missing" (see resolve_active_descriptor's own docstring) the very
+      next time it's resolved - which happens fresh on every request, not
+      from anything cached - and gracefully falls back to the default
+      connection, surfaced to the frontend via the existing
+      active_connection_missing/_message fields (config_routes.py's GET
+      /api/config handler) exactly as if the preset had been removed from
+      DATABASE_PRESETS_FILE entirely. This is what closes the race where a
+      user selects a preset (or already has it as their active
+      connection) moments before prefetch determines it's fatal: nothing
+      about that selection is trusted as still valid without re-checking
+      visible_configured_dbs() fresh, so it can never wedge a user onto a
+      connection that's since been excluded - the one gap that remains is
+      a request that lands in the brief window before prefetch has
+      reached this preset AT ALL, which gets one honest, live failed
+      fetch instead of a clean "unavailable" message; that's no worse than
+      what every connection's very first use has always risked, and
+      isn't something prefetch running in the background can fully close
+      without going back to blocking startup on every preset finishing
+      first (see server.py's own comment on why that tradeoff was made).
+
+    Custom connections are deliberately NOT covered here - see this
+    task's plan for why ("presets only" was the chosen scope): each
+    user's own custom connections still warm up lazily on first use,
+    same as before this existed, and get cached indefinitely from that
+    first successful fetch onward, same as everything else. (They also
+    have no equivalent of this FATAL-exclusion behavior - a custom
+    connection that fails is just left as the user's own problem to fix
+    via "Refresh Schema", same as always; there's no shared "list of
+    presets" for an individual custom connection to be removed from.)"""
+    if not CONFIGURED_DBS:
+        return
+
+    def _prefetch_one(db):
+        descriptor = {k: v for k, v in db.items() if k not in ("id", "name")}
+        preset_label = db.get("name") or db.get("id")
+        try:
+            ok, reason = prime_schema_cache_with_reason(descriptor, user_id=None)
+            if ok:
+                return
+            if reason == SCHEMA_FETCH_FAILURE_REASON_FATAL:
+                _mark_preset_fatally_failed(db.get("id"))
+                logger.warning(
+                    "Startup schema prefetch failed for preset %r with a fatal "
+                    "(non-timeout) error - removing it from the list of presets "
+                    "in the DB connections dialog until the next server restart. "
+                    "See the error logged just above this line for the actual "
+                    "cause (bad credentials, a missing driver, a malformed "
+                    "request, ...).",
+                    preset_label,
+                )
+            else:
+                logger.warning(
+                    "Startup schema prefetch failed for preset %r (%s) - it "
+                    "will be fetched (and cached) on its first successful real "
+                    "request instead",
+                    preset_label, reason or "unknown reason",
+                )
+        except Exception:
+            # prime_schema_cache_with_reason() itself isn't expected to
+            # raise (its own try/except already turns a fetch failure into
+            # a (False, reason) pair) - this is a last-resort net for
+            # something going wrong OUTSIDE that (e.g. a bug in this
+            # function's own bookkeeping), so it's treated the same, safe
+            # way EMPTY/TIMEOUT is: logged and left in the list rather than
+            # assumed fatal, since it's not something SCHEMA_FETCH_FAILURE_
+            # REASON_FATAL was ever actually able to confirm.
+            logger.exception(
+                "Error during startup schema prefetch for preset %r - it will be "
+                "fetched (and cached) on its first successful real request instead",
+                preset_label,
+            )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(CONFIGURED_DBS)) as pool:
+        list(pool.map(_prefetch_one, CONFIGURED_DBS))
+
+
+def invalidate_schema_cache(cache_key):
+    """Drops BOTH of a connection's schema-cache entries (deep and
+    shallow) for the given plain cache_key (i.e. get_conn_identifier's
+    return value, with no "::shallow" suffix - callers always pass the
+    plain form, this function adds the suffix itself). Use this instead
+    of calling schema_cache.invalidate(cache_key) directly wherever a
+    connection's schema is known to have changed (e.g.
+    config_routes.py's own-connection-edited path) - invalidating only
+    the plain key would leave a stale shallow entry cached, now
+    indefinitely (schema_cache.py has no TTL/expiry at all - see its own
+    module docstring), rather than just for a bounded window, since the
+    two entries are otherwise completely independent (see
+    get_database_schema()'s own cache_key suffixing above)."""
+    schema_cache.invalidate(cache_key)
+    schema_cache.invalidate(cache_key + _SHALLOW_CACHE_KEY_SUFFIX)
+
+
+def _fetch_database_schema(descriptor, deep=True):
+    """The actual DB-hitting introspection logic - thin wrapper around
+    _fetch_database_schema_with_reason() (below) for every caller that
+    only wants the schema text itself and doesn't care why a failed fetch
+    failed (which is every existing caller as of this writing: a real
+    /api/translate schema fetch always just wants the text, or the
+    _SCHEMA_FETCH_FAILED placeholder either way). Always fetches live -
+    call get_database_schema() instead unless you specifically need to
+    bypass the cache layer."""
+    schema_text, _reason = _fetch_database_schema_with_reason(descriptor, deep=deep)
+    return schema_text
+
+
+def _fetch_database_schema_with_reason(descriptor, deep=True):
+    """Same introspection logic _fetch_database_schema() above documents
+    (deep=True: full Phase 1 + Phase 2 backend.get_schema(); deep=False:
+    Phase 1-only backend.get_schema_shallow(), used by
+    build_router_candidate_summaries() below) but also returns WHY a
+    failed fetch failed, as a (schema_text, reason) pair: reason is None
+    on success, else SCHEMA_FETCH_FAILURE_REASON_EMPTY (connected and
+    queried fine, there's just nothing to describe - e.g. a views-only
+    schema, a genuinely empty database, or a role with no table-level
+    privileges - see the "no schema text" warning below), or - when the
+    connect()/get_schema() call itself raised -
+    SCHEMA_FETCH_FAILURE_REASON_TIMEOUT (the attempt hit
+    DB_CONNECT_TIMEOUT_SECONDS or an equivalent read timeout without ever
+    getting a definitive answer - see _looks_like_timeout_error() above)
+    or SCHEMA_FETCH_FAILURE_REASON_FATAL (any other raised error - a
+    definitive rejection: bad credentials, a missing driver, a malformed
+    request, a real query error, ...).
+
+    schema_text is always exactly _SCHEMA_FETCH_FAILED's plain placeholder
+    string on failure regardless of which reason produced it - this
+    function changes nothing about what ever gets embedded in a prompt or
+    cached; the reason is purely additive metadata for
+    get_database_schema_with_reason()/prime_schema_cache_with_reason() to
+    hand up to a caller (today, only config_routes.py's
+    /api/config/refresh-schema) that wants to tell a user something more
+    specific than a blanket "could not fetch schema"."""
     backend = get_backend(descriptor)
     connection = None
     try:
         connection = backend.connect(descriptor)
-        schema_text = backend.get_schema(connection)
+        schema_text = backend.get_schema(connection) if deep else backend.get_schema_shallow(connection)
         if not schema_text:
             # get_schema() returning None/"" is a normal, NON-exceptional
             # return value for every backend (see e.g. backends/postgres.py's
@@ -474,10 +899,58 @@ def _fetch_database_schema(descriptor):
                 "a connection/query failure.",
                 get_conn_identifier(descriptor), schema_text,
             )
-        return schema_text if schema_text else _SCHEMA_FETCH_FAILED
-    except Exception:
+            return _SCHEMA_FETCH_FAILED, SCHEMA_FETCH_FAILURE_REASON_EMPTY
+        else:
+            # The two checks below are independent, not mutually exclusive -
+            # a schema can have more tables than SCHEMA_MAX_TABLES allows
+            # AND still overflow SCHEMA_MAX_CHARS with just the tables it
+            # DID keep, so both get checked (and, rarely, could both fire)
+            # rather than treating one as ruling out the other.
+            if schema_text_has_omitted_tables(schema_text):
+                # Every backend's own "N more table(s)... not shown" note
+                # (see e.g. backends/postgres.py's "if omitted_count:"
+                # block) already tells the model directly, in-prompt, that
+                # some tables were left out entirely - but until now that
+                # was the only place it was visible: nothing recorded which
+                # connection actually exceeds SCHEMA_MAX_TABLES, or how
+                # often. Same visibility-only fix as the two warnings
+                # around it - the returned schema_text is unchanged.
+                logger.warning(
+                    "Schema text for %s omits at least one table/table-family "
+                    "because it exceeds the SCHEMA_MAX_TABLES limit (%d) - the "
+                    "model is not seeing this connection's full table list. If "
+                    "this happens often, raise SCHEMA_MAX_TABLES for this "
+                    "connection's dataset.",
+                    get_conn_identifier(descriptor), SCHEMA_MAX_TABLES,
+                )
+            if schema_text_was_truncated(schema_text):
+                # cap_schema_text() (backends/base.py) already embeds a
+                # truncation note directly in the prompt text itself, so the
+                # model always sees it - but until now that was the ONLY
+                # place it was visible: nothing recorded which connection
+                # actually hits the SCHEMA_MAX_CHARS ceiling, or how often.
+                # This doesn't change what's returned (still the same,
+                # already-truncated schema_text) - it's purely a visibility
+                # fix, same spirit as the "no schema text" warning above, so
+                # "is this connection's schema actually getting cut off" is
+                # answerable from server logs instead of only by noticing
+                # the note buried in a model response.
+                logger.warning(
+                    "Schema text for %s was truncated to fit SCHEMA_MAX_CHARS "
+                    "(%s characters) - the model is not seeing this "
+                    "connection's full schema. If this happens often, raise "
+                    "SCHEMA_MAX_SCHEMA_CHARS or narrow this connection's "
+                    "SCHEMA_MAX_TABLES scope.",
+                    get_conn_identifier(descriptor), f"{SCHEMA_MAX_CHARS:,}",
+                )
+        return schema_text, None
+    except Exception as exc:
         logger.exception("Error fetching schema")
-        return _SCHEMA_FETCH_FAILED
+        reason = (
+            SCHEMA_FETCH_FAILURE_REASON_TIMEOUT if _looks_like_timeout_error(exc)
+            else SCHEMA_FETCH_FAILURE_REASON_FATAL
+        )
+        return _SCHEMA_FETCH_FAILED, reason
     finally:
         if connection:
             backend.close(connection)

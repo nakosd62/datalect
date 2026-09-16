@@ -19,6 +19,8 @@ if SERVER_DIR not in sys.path:
 
 from backends.base import (
     Backend, group_date_sharded_tables, cap_kept_tables, cap_schema_text,
+    schema_text_was_truncated, schema_text_has_omitted_tables,
+    find_naming_convention_relationships,
     normalize_cell_value, fetch_capped_rows,
 )
 
@@ -91,6 +93,30 @@ def test_supports_yyyymm_yyyy_mm_dd_and_yyyy_us_mm_us_dd_suffixes():
     names3 = ["d_2024_01_01", "d_2024_01_02", "d_2024_01_03"]
     kept3, groups3 = group_date_sharded_tables(names3, min_group_size=3)
     assert "d" in groups3
+
+
+def test_supports_postgres_declarative_partitioning_p_prefixed_suffix():
+    # e.g. "payment_p2023_10" - Postgres declarative partitioning's own
+    # common monthly-range-partition naming convention (a literal "p"
+    # followed by zero-padded year_month), distinct from the plain
+    # all-digit YYYYMM/YYYY_MM_DD suffixes covered above.
+    names = ["payment_p2023_10", "payment_p2023_11", "payment_p2023_12"]
+    kept, groups = group_date_sharded_tables(names, min_group_size=3)
+    assert "payment" in groups
+    assert groups["payment"] == sorted(names)
+    assert kept == [sorted(names)[-1]]
+
+
+def test_p_prefixed_suffix_month_must_be_two_digits_to_sort_chronologically():
+    # A lone single-digit month (no leading zero) wouldn't match the
+    # pattern at all - it's kept as a plain table rather than silently
+    # joining a family where alphabetical sort could misorder it.
+    kept, groups = group_date_sharded_tables(
+        ["payment_p2023_9", "payment_p2023_10", "payment_p2023_11"],
+        min_group_size=3,
+    )
+    assert groups == {}
+    assert sorted(kept) == sorted(["payment_p2023_9", "payment_p2023_10", "payment_p2023_11"])
 
 
 def test_prefix_with_its_own_underscores_resolves_via_backtracking():
@@ -183,6 +209,153 @@ def test_cap_schema_text_falls_back_to_hard_cut_when_no_paragraph_boundary():
     capped = cap_schema_text(text, max_chars=50)
     assert capped.startswith("A" * 50)
     assert "schema truncated" in capped
+
+
+# --- schema_text_was_truncated -------------------------------------------------
+#
+# Regression guard for db.py's own truncation-visibility logging (see
+# _fetch_database_schema): this is what recognizes a cap_schema_text()
+# result that actually got cut, without re-running cap_schema_text or
+# needing the original uncapped text - so these tests pin down that it
+# reads cap_schema_text's own output correctly, in both directions.
+
+def test_schema_text_was_truncated_true_for_an_actually_truncated_result():
+    text = "A" * 200
+    capped = cap_schema_text(text, max_chars=50)
+    assert schema_text_was_truncated(capped) is True
+
+
+def test_schema_text_was_truncated_false_for_untruncated_text():
+    text = "short schema text"
+    assert schema_text_was_truncated(cap_schema_text(text, max_chars=1000)) is False
+    assert schema_text_was_truncated(text) is False  # never even passed through cap_schema_text
+
+
+def test_schema_text_was_truncated_false_for_none_or_empty():
+    assert schema_text_was_truncated(None) is False
+    assert schema_text_was_truncated("") is False
+
+
+# --- schema_text_has_omitted_tables --------------------------------------------
+#
+# Companion to schema_text_was_truncated above, for the OTHER cap
+# (SCHEMA_MAX_TABLES rather than SCHEMA_MAX_CHARS): recognizes the "N more
+# table(s)... not shown" note every backend's own `if omitted_count:` block
+# appends (see e.g. backends/postgres.py) via the literal substring both
+# that wording and mongodb_sql.py's slightly different one share, rather
+# than needing the original omitted_count value.
+
+def test_schema_text_has_omitted_tables_true_when_the_note_is_present():
+    text = (
+        "Table: a\n  id integer NOT NULL\n\n"
+        "[... 5 more table(s)/table-family(ies) not shown - this schema has "
+        "more than the 200-table summary limit. Ask about a narrower set of "
+        "tables to see the rest.]"
+    )
+    assert schema_text_has_omitted_tables(text) is True
+
+
+def test_schema_text_has_omitted_tables_true_for_mongodbs_own_wording():
+    # mongodb_sql.py's note omits "/table-family(ies)" (no date-shard
+    # families for collections) - still recognized via the shared
+    # "more table(s)" substring both wordings contain.
+    text = (
+        "[... 3 more table(s) not shown - this schema has more than the "
+        "200-table summary limit. Ask about a narrower set of collections "
+        "to see the rest.]"
+    )
+    assert schema_text_has_omitted_tables(text) is True
+
+
+def test_schema_text_has_omitted_tables_false_when_every_table_was_described():
+    text = "Table: a\n  id integer NOT NULL\n\nTable: b\n  id integer NOT NULL"
+    assert schema_text_has_omitted_tables(text) is False
+
+
+def test_schema_text_has_omitted_tables_false_for_none_or_empty():
+    assert schema_text_has_omitted_tables(None) is False
+    assert schema_text_has_omitted_tables("") is False
+
+
+# --- find_naming_convention_relationships --------------------------------------
+#
+# Shared Phase 2 heuristic (see its own docstring in backends/base.py):
+# every backend's get_schema() calls this same function rather than
+# reimplementing the naming-convention pass per dialect, so it's tested
+# once here rather than once per backend.
+
+def test_finds_prefix_match_against_a_real_table_name():
+    matches = find_naming_convention_relationships({
+        "orders": ["id", "customer_id", "total"],
+        "customers": ["id", "name"],
+    })
+    assert len(matches) == 1
+    assert "orders.customer_id" in matches[0]
+    assert "customers" in matches[0]
+    assert "likely relationship (unconfirmed)" in matches[0]
+
+
+def test_finds_shared_fk_shaped_column_name_across_tables_with_no_matching_table_name():
+    # Neither table is named "regions" - only heuristic 2 (same column
+    # name in 2+ tables) should catch this, not heuristic 1.
+    matches = find_naming_convention_relationships({
+        "stores": ["id", "region_id"],
+        "warehouses": ["id", "region_id"],
+    })
+    texts = "\n".join(matches)
+    assert "stores.region_id" in texts
+    assert "warehouses.region_id" in texts
+
+
+def test_bare_id_column_is_never_flagged_as_a_relationship():
+    # Regression guard: virtually every table has its own "id" primary
+    # key, so two (or ten) tables all having a plain "id" column must
+    # never be reported as a "likely relationship" - that would be true
+    # of almost any schema and would just be noise, not a real signal.
+    matches = find_naming_convention_relationships({
+        "orders": ["id", "total"],
+        "customers": ["id", "name"],
+        "products": ["id", "name"],
+    })
+    assert matches == []
+
+
+def test_bare_underscore_id_column_is_never_flagged_either():
+    # Same regression guard as above, for MongoDB's own universal
+    # per-document "_id" field - a bare suffix with no real prefix before
+    # it, same reasoning as plain "id".
+    matches = find_naming_convention_relationships({
+        "orders": ["_id", "total"],
+        "customers": ["_id", "name"],
+    })
+    assert matches == []
+
+
+def test_no_false_positive_for_an_unrelated_table():
+    matches = find_naming_convention_relationships({
+        "orders": ["id", "customer_id"],
+        "customers": ["id"],
+        "widgets": ["id", "name"],
+    })
+    texts = "\n".join(matches)
+    assert "widgets" not in texts
+
+
+def test_empty_or_none_input_returns_empty_list():
+    assert find_naming_convention_relationships({}) == []
+    assert find_naming_convention_relationships(None) == []
+
+
+def test_deterministic_order_regardless_of_dict_iteration_order():
+    table_columns = {
+        "warehouses": ["id", "region_id"],
+        "stores": ["id", "region_id"],
+    }
+    matches_a = find_naming_convention_relationships(table_columns)
+    matches_b = find_naming_convention_relationships(
+        {"stores": table_columns["stores"], "warehouses": table_columns["warehouses"]}
+    )
+    assert matches_a == matches_b
 
 
 # --- normalize_cell_value -----------------------------------------------------

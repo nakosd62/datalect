@@ -40,8 +40,8 @@ from abc import ABC, abstractmethod
 # latency scale with it directly), and it's also cached as-is in
 # schema_cache.py. These are shared across every backend so the protection
 # is consistent regardless of dialect, and env-configurable (like
-# schema_cache.py's own SCHEMA_CACHE_TTL_SECONDS) so a deployment with
-# unusually large schemas can tune them without a code change.
+# SCHEMA_SHARD_MIN_GROUP_SIZE below) so a deployment with unusually large
+# schemas can tune them without a code change.
 
 # Hard cap on how many distinct table "entries" (a plain table, or one
 # collapsed date-shard family - see group_date_sharded_tables below) a
@@ -128,15 +128,26 @@ ROUTER_MAX_TABLE_NAMES_PER_CONNECTION = int(
 # date-shaped number shouldn't be swept into a "family" of one.
 SCHEMA_SHARD_MIN_GROUP_SIZE = int(os.environ.get("SCHEMA_SHARD_MIN_GROUP_SIZE", 3))
 
-# Matches <prefix>_<date> where date is YYYYMMDD, YYYYMM, YYYY-MM-DD, or
-# YYYY_MM_DD - the common date-sharding conventions (BigQuery's own docs use
-# YYYYMMDD; the others show up often enough in hand-rolled sharding to be
-# worth covering). Prefix is matched non-greedily so a prefix that itself
-# contains underscores (e.g. "raw_events_20240101" -> prefix "raw_events")
-# still resolves to the longest non-date-shaped prefix via backtracking,
-# not just the text before the first underscore.
+# Matches <prefix>_<date> where date is YYYYMMDD, YYYYMM, YYYY-MM-DD,
+# YYYY_MM_DD, or p<YYYY>_<MM> - the common date-sharding conventions
+# (BigQuery's own docs use YYYYMMDD; the others show up often enough in
+# hand-rolled sharding to be worth covering; p<YYYY>_<MM>, e.g.
+# "payment_p2023_10", is Postgres declarative-partitioning's own common
+# naming convention for monthly range partitions - a literal "p" followed
+# by a zero-padded year_month, as opposed to the other four alternatives
+# which are all-digit). Prefix is matched non-greedily so a prefix that
+# itself contains underscores (e.g. "raw_events_20240101" -> prefix
+# "raw_events") still resolves to the longest non-date-shaped prefix via
+# backtracking, not just the text before the first underscore - this is
+# also what correctly resolves "payment_p2023_10" to prefix "payment"
+# rather than swallowing the "p2023_10" partition suffix into the prefix.
+# The month is required to be exactly 2 digits (zero-padded) so that
+# group_date_sharded_tables' plain alphabetical sort (used both to pick
+# the "most recent" representative and to order shard_groups' member
+# list) stays chronological - an unpadded "p2023_9" would otherwise sort
+# after "p2023_10" as a string, even though September precedes October.
 _DATE_SHARD_RE = re.compile(
-    r'^(?P<prefix>.+?)_(?P<date>\d{8}|\d{6}|\d{4}-\d{2}-\d{2}|\d{4}_\d{2}_\d{2})$'
+    r'^(?P<prefix>.+?)_(?P<date>\d{8}|\d{6}|\d{4}-\d{2}-\d{2}|\d{4}_\d{2}_\d{2}|p\d{4}_\d{2})$'
 )
 
 
@@ -199,6 +210,48 @@ def cap_kept_tables(kept_names, shard_groups, max_tables=SCHEMA_MAX_TABLES):
     return kept_names, shard_groups, omitted_count
 
 
+# Substring every backend's own "N more table(s)... not shown" note (built
+# from cap_kept_tables' omitted_count above - see e.g. backends/postgres.py's
+# own "if omitted_count:" block) is guaranteed to contain, regardless of the
+# exact rest of that backend's wording. The SQL backends that go through
+# cap_kept_tables all say "more table(s)/table-family(ies) not shown";
+# mongodb_sql.py computes omitted_count itself (no date-shard families to
+# speak of) and says "more table(s) not shown" - both contain this literal
+# substring, so schema_text_has_omitted_tables below recognizes either
+# wording without forcing every backend's note text to be reworded to
+# match a single shared string. Deliberately not made into a single shared
+# note-building helper the way cap_schema_text's own note is centralized -
+# that would mean rewording every backend's already-tested note text for no
+# behavioral gain, just to detect something a plain substring check already
+# detects just as reliably.
+_TABLE_TRUNCATION_MARKER = "more table(s)"
+
+
+def schema_text_has_omitted_tables(text):
+    """True if `text` is a get_schema() result that left out at least one
+    table/table-family because SCHEMA_MAX_TABLES was exceeded (carries the
+    "N more table(s)... not shown" note every backend appends via its own
+    `if omitted_count:` block) - False for None/empty text or a schema
+    that described every table it found. Mirrors schema_text_was_truncated
+    just above: recognizes an existing note already embedded in the text
+    rather than needing the original omitted_count value threaded all the
+    way out to a caller that never otherwise sees it - db.py's
+    _fetch_database_schema is the one place both this and
+    schema_text_was_truncated get checked, right after backend.get_schema()
+    returns, for the same reason: SCHEMA_MAX_TABLES truncation was
+    previously visible only inside the prompt text itself, never in server
+    logs."""
+    return bool(text) and _TABLE_TRUNCATION_MARKER in text
+
+
+# Leading text of the note cap_schema_text appends when it actually
+# truncates - factored out as a single source of truth so
+# schema_text_was_truncated() below recognizes exactly the note
+# cap_schema_text produces, rather than a second, separately-maintained
+# copy of the same literal string drifting out of sync with it.
+_SCHEMA_TRUNCATION_MARKER = "[... schema truncated:"
+
+
 def cap_schema_text(text, max_chars=SCHEMA_MAX_CHARS):
     """Hard backstop on the final assembled schema text's length, regardless
     of what caused it to grow. Truncates on a paragraph boundary where
@@ -214,11 +267,157 @@ def cap_schema_text(text, max_chars=SCHEMA_MAX_CHARS):
         cut = max_chars
     return (
         text[:cut]
-        + "\n\n[... schema truncated: exceeded "
+        + f"\n\n{_SCHEMA_TRUNCATION_MARKER} exceeded "
         + f"{max_chars:,} characters. Ask about fewer tables at once, or "
         + "reduce SCHEMA_MAX_CHARS/SCHEMA_MAX_TABLES scope on this "
         + "connection's dataset, to see more of it.]"
     )
+
+
+def schema_text_was_truncated(text):
+    """True if `text` is a cap_schema_text() result that actually got cut
+    (carries its truncation marker) - False for None/empty text or text
+    that never hit the SCHEMA_MAX_CHARS ceiling. Recognizes cap_schema_text's
+    own output rather than re-running it, so a caller already holding the
+    final schema text (db.py's _fetch_database_schema, right after
+    backend.get_schema() returns) can log/alert on a truncation event
+    without needing the original uncapped text or a second pass over it.
+    See _fetch_database_schema's own use of this: SCHEMA_MAX_CHARS was
+    previously silent everywhere except the note embedded in the prompt
+    text itself - visible to the model, but invisible to anyone checking
+    server logs to see how often a given connection's schema actually hits
+    the ceiling."""
+    return bool(text) and _SCHEMA_TRUNCATION_MARKER in text
+
+
+# Column-name suffixes that conventionally mark a foreign-key-shaped column
+# (customer_id, order_key, region_fk) - matched case-insensitively against
+# the tail of a column name, longest suffix first so "_id" doesn't shadow a
+# more specific match that happens to also end in "id" (there isn't one
+# today, but ordering by length keeps this correct if a suffix is ever
+# added). Not a personal name (e.g. a real "id" primary key column itself,
+# with no suffix at all) - the exact-column-name path in
+# find_naming_convention_relationships handles that case separately.
+_FK_SUFFIXES = ("_id", "_key", "_fk")
+
+
+def find_naming_convention_relationships(table_columns):
+    """Phase 2, shared across every backend: a pure heuristic pass over
+    already-fetched table/column names (no SQL - table_columns is
+    {table_name: [column_name, ...]}, whatever Phase 1 already queried),
+    returning "likely relationship, unconfirmed" strings for column-name
+    patterns that look like an unenforced foreign key.
+
+    Two independent heuristics, each conservative on purpose - false
+    negatives (a real relationship this misses) are fine; false positives
+    (telling the model two unrelated tables are linked) actively mislead
+    query generation, so both require an exact name match against another
+    table, not a fuzzy one:
+
+    1. A column ending in _id/_key/_fk (see _FK_SUFFIXES) whose prefix
+       exactly matches another table's name (singular or with a trailing
+       "s" - "customer_id" -> "customers" or "customer") - e.g.
+       orders.customer_id -> customers. This only checks that the target
+       table exists by name (table_columns' minimal shape has no reliable
+       cross-backend way to identify "the" PK column of an arbitrary
+       table without a second, backend-specific query) - it does not
+       verify the target table actually has a matching PK/id column, so
+       it's a name-existence check, one notch looser than heuristic 2.
+    2. A column with the exact same name in two different tables, where
+       that name itself looks like a foreign-key-shaped identifier (ends
+       in one of _FK_SUFFIXES, with a real prefix before the suffix) -
+       e.g. two tables both having a "region_id" column, even if neither
+       is named "regions". Deliberately excludes a *bare* suffix with no
+       prefix - plain "id" (doesn't match any _FK_SUFFIXES entry at all)
+       and MongoDB's own universal per-document "_id" field (matches
+       "_id" but has an empty prefix) both fall under "virtually every
+       table/collection conventionally has its own identifier column
+       named exactly this," which is the norm, not a relationship signal
+       - only heuristic 1 above (a name like "customer_id" pointing at a
+       table actually named "customers") gets to use a bare identifier
+       name as a match *target*.
+
+    Every match is worded as "likely" and "unconfirmed" (see the returned
+    string) precisely because this is a naming convention, not a real
+    constraint lookup (see PK/FK/unique constraints, which come from an
+    actual catalog query and need no such hedge) - callers must not
+    present this with the same confidence as a real foreign key.
+
+    Returns a list of human-readable strings, one per match, in a
+    deterministic order (sorted by (referencing table, column) - table_columns'
+    own dict/list ordering is preserved wherever possible, but the final
+    sort makes output stable regardless of dict iteration order across
+    Python versions/call sites). Pure function, no I/O, safe to call with
+    any table_columns shape Phase 1 already assembled - callers pass
+    whatever kept_names/columns data _build_shallow_schema_parts already
+    produced, no new query."""
+    if not table_columns:
+        return []
+
+    table_names = set(table_columns.keys())
+
+    def _referenced_table(column_name):
+        lower = column_name.lower()
+        for suffix in _FK_SUFFIXES:
+            if lower.endswith(suffix) and len(lower) > len(suffix):
+                prefix = lower[: -len(suffix)]
+                for candidate in table_names:
+                    candidate_lower = candidate.lower()
+                    if candidate_lower in (prefix, prefix + "s", prefix.rstrip("s")):
+                        return candidate
+        return None
+
+    # name -> set of tables that have a column with exactly this name,
+    # for heuristic 2 (same identifier-shaped column name in 2+ tables).
+    columns_by_name = {}
+    for table, columns in table_columns.items():
+        for column in columns:
+            columns_by_name.setdefault(column.lower(), set()).add(table)
+
+    matches = []
+    seen = set()
+
+    for table, columns in table_columns.items():
+        for column in columns:
+            referenced = _referenced_table(column)
+            if referenced and referenced != table:
+                key = (table, column, referenced, "prefix")
+                if key not in seen:
+                    seen.add(key)
+                    matches.append((
+                        table, column,
+                        f"{table}.{column} -> likely relationship (unconfirmed): "
+                        f"references {referenced}, based on column naming "
+                        f"convention only - no enforced foreign key found."
+                    ))
+
+    for name, tables in columns_by_name.items():
+        # len(name) > len(suffix) excludes a *bare* suffix with no real
+        # prefix before it - e.g. MongoDB's own universal per-document
+        # "_id" field name is, by that dialect's convention, every single
+        # collection's own identifier (the same role plain "id" plays in
+        # an RDBMS, just spelled with the underscore folded into the
+        # suffix instead of separated from it) - two collections both
+        # having a bare "_id" column is the norm, not a relationship
+        # signal, same reasoning as excluding plain "id" above. A real
+        # prefix (e.g. "region_id") still qualifies.
+        is_fk_shaped = any(name.endswith(s) and len(name) > len(s) for s in _FK_SUFFIXES)
+        if is_fk_shaped and len(tables) > 1:
+            for table in tables:
+                key = (table, name, None, "shared-name")
+                if key not in seen:
+                    seen.add(key)
+                    others = sorted(t for t in tables if t != table)
+                    matches.append((
+                        table, name,
+                        f"{table}.{name} -> likely relationship (unconfirmed): "
+                        f"same column name also appears in {', '.join(others)}, "
+                        f"based on column naming convention only - no enforced "
+                        f"foreign key found."
+                    ))
+
+    matches.sort(key=lambda m: (m[0], m[1]))
+    return [text for (_table, _column, text) in matches]
 
 
 # --- Query-execution row cap -------------------------------------------------
@@ -476,7 +675,36 @@ class Backend(ABC):
         indexes, views, grants, triggers, or the closest per-backend
         equivalents) suitable for inclusion in the Gemini prompt. Return
         None/empty if nothing could be introspected - the caller (db.py)
-        owns deciding what fallback text to show and whether to cache it."""
+        owns deciding what fallback text to show and whether to cache it.
+
+        This is the "deep" fetch (Phase 1 catalog-only content plus Phase 2
+        live-query enrichment - sampling, min/max, cardinality, live row
+        counts, full view/routine bodies, naming-convention relationship
+        pass) - see get_schema_shallow() below for the catalog-only subset.
+        Every existing caller of get_schema() (single-connection mode, and
+        all-dbs Phase B generation for a connection the router actually
+        selected) wants this one, unchanged from before this split
+        existed."""
+
+    @abstractmethod
+    def get_schema_shallow(self, connection):
+        """Return the Phase 1 (catalog-only, no live queries) subset of
+        get_schema()'s text - same tables/columns/constraints/indexes plus
+        the new catalog-only attributes (identity markers, comments, row-
+        count estimates, routine existence+signature without bodies,
+        distribution/partition/clustering keys, session facts, widened
+        grants, RLS/external flags), but view/routine bodies are named/
+        signatured only, never rendered in full here.
+
+        Used for connections that may not even be selected for SQL
+        generation - db.py's build_router_candidate_summaries() (all-dbs
+        Phase A triage) calls this instead of get_schema() specifically so
+        an all-dbs question against N connections doesn't pay Phase 2's
+        live-query cost for the N-1 connections the router never routes
+        to. get_schema() (deep) builds on top of the same catalog data
+        this returns rather than re-querying it - see each backend's
+        _build_shallow_schema_parts() private helper, which both this
+        method and get_schema() call."""
 
     @abstractmethod
     def execute(self, connection, sql_text):

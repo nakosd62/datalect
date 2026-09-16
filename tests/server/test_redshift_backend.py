@@ -6,20 +6,34 @@ backends/redshift.py, driven two ways:
     (never opt-in the way Oracle's "ssl" flag is), and the SET search_path
     call a "schema" descriptor field triggers, without opening a real
     connection.
-  - get_schema()/execute()/identity_label()/cache_key(): against the same
-    fake psycopg2-shaped cursor/connection tests/test_postgres_backend.py
-    uses (helpers.make_fake_pg_connection) - RedshiftBackend talks the
-    exact same psycopg2 DB-API shape backends/postgres.py does, so no
-    Redshift-specific fake is needed for these.
+  - get_schema()/get_schema_shallow()/execute()/identity_label()/
+    cache_key(): against the same fake psycopg2-shaped cursor/connection
+    tests/test_postgres_backend.py uses (helpers.make_fake_pg_connection) -
+    RedshiftBackend talks the exact same psycopg2 DB-API shape
+    backends/postgres.py does, so no Redshift-specific fake is needed for
+    these.
 
-get_schema()'s query order is unconditional for tables/columns and views,
-then best-effort (try/except) for constraints and distribution/sort keys -
-see backends/redshift.py:
-  1. table names   2. columns   3. constraints (best-effort)
-  4. distkey/sortkey (best-effort, via svv_table_info)   5. views
-No indexes/grants/triggers queries at all - Redshift has no index or
-trigger concept, and grants support is left for follow-up (see module
-docstring).
+_build_shallow_schema_parts() (called by both get_schema_shallow() and
+get_schema()) issues its Phase 1 queries unconditionally and in a fixed
+order (several of them individually try/except-wrapped for graceful
+degradation - see backends/redshift.py itself), so responses are queued in
+the exact order it issues them:
+  1. table names        2. columns             3. constraints
+  4. distkey/sortkey/tbl_rows/stats_off (svv_table_info, widened)
+  5. views               6. comments (new)      7. routines (new)
+  8. session timezone (new)   9. grants (new)   10. external tables (new)
+No Indexes/Triggers queries at all - Redshift has no such concept. RLS is
+also not a Redshift concept, so there's no RLS section/query to fake here
+either (see backends/redshift.py's module docstring).
+
+get_schema() (deep) then runs _build_shallow_schema_parts() (the ten
+queries above) and appends its own Phase 2 queries on a fresh cursor use:
+  11. pg_stats n_distinct (shared, once)
+  then per kept table (in order): live COUNT(*), an optional combined
+  MIN()/MAX() query (if it has numeric/date columns), and up to
+  MAX_CATEGORICAL_SAMPLE_COLUMNS_PER_TABLE frequent-value GROUP BY queries
+  (if it has eligible categorical columns) - mirrors
+  test_postgres_backend.py's own Phase 2 test shape.
 """
 
 import sys
@@ -33,7 +47,7 @@ from helpers import SERVER_DIR
 if SERVER_DIR not in sys.path:
     sys.path.insert(0, SERVER_DIR)
 
-from backends.redshift import RedshiftBackend
+from backends.redshift import RedshiftBackend, MAX_COLUMNS_FOR_SAMPLING
 from backends.base import DB_CONNECT_TIMEOUT_SECONDS, SqlExecutionError
 from helpers import install_fake_redshift_connect, make_fake_pg_connection
 
@@ -43,13 +57,36 @@ def _rs(monkeypatch):
     return RedshiftBackend(), harness
 
 
-def _schema_responses(table_names, columns_rows, constraints=(), layout=(), views=()):
+def _pad_layout_row(row):
+    """A layout tuple may still be the pre-row-count-estimate 3-tuple
+    (table, diststyle, sortkey1) that every test predating the tbl_rows/
+    stats_off addition already uses - padded here to the real 5-column
+    shape _build_shallow_schema_parts()'s svv_table_info query now selects
+    (..., tbl_rows, stats_off), defaulting both new columns to None (no row
+    count estimate rendered), so none of those existing tests need
+    rewriting just because two more columns joined the SELECT list."""
+    row = list(row)
+    while len(row) < 5:
+        row.append(None)
+    return tuple(row)
+
+
+def _schema_responses(
+    table_names, columns_rows, constraints=(), layout=(), views=(),
+    comments=(), routines=(), session_settings=("UTC",), grants=(),
+    external_tables=(),
+):
     return [
         ([(n,) for n in table_names], None, -1),
-        (columns_rows, None, -1),
+        (list(columns_rows), None, -1),
         (list(constraints), None, -1),
-        (list(layout), None, -1),
+        ([_pad_layout_row(r) for r in layout], None, -1),
         (list(views), None, -1),
+        (list(comments), None, -1),
+        (list(routines), None, -1),
+        ([session_settings] if session_settings is not None else [], None, -1),
+        (list(grants), None, -1),
+        (list(external_tables), None, -1),
     ]
 
 
@@ -312,6 +349,412 @@ def test_get_schema_scopes_to_current_schema_not_hardcoded_public():
     first_query = cursor.calls[0][0]
     assert "current_schema()" in first_query
     assert "'public'" not in first_query
+
+
+def test_get_schema_shallow_every_query_is_scoped_via_current_schema_not_hardcoded_public():
+    """Regression guard for the "schema" descriptor feature (see
+    backends/redshift.py's connect()): every one of
+    _build_shallow_schema_parts()'s ten catalog-only queries must follow
+    current_schema() rather than a literal 'public'. The one deliberate
+    exception is the new session-timezone query (query #7):
+    current_setting('TimeZone') describes the whole session, not a
+    particular schema, so it has no current_schema() text to check - see
+    backends/postgres.py's own identically-shaped test for the same
+    exception."""
+    conn, cursor = make_fake_pg_connection(_schema_responses(
+        table_names=["orders"],
+        columns_rows=[("orders", "id", "integer", "NO", None)],
+        constraints=[("orders", "orders_pkey", "PRIMARY KEY", "id", None, None)],
+        layout=[("orders", "KEY(customer_id)", "order_date")],
+        views=[("v", "SELECT 1")],
+        grants=[("app_user", "orders", "SELECT")],
+    ))
+    backend = RedshiftBackend()
+    backend.get_schema_shallow(conn)
+    assert len(cursor.calls) == 10
+    session_calls = [c for c in cursor.calls if "current_setting" in c[0]]
+    assert len(session_calls) == 1
+    for sql_text, _params in cursor.calls:
+        if sql_text == session_calls[0][0]:
+            continue
+        assert "current_schema()" in sql_text
+        assert "'public'" not in sql_text
+
+
+# --- Phase 1 (catalog-only, shallow) new attributes --------------------------
+
+def test_get_schema_shallow_identity_column_marker_renders_with_seed_and_step():
+    conn, cursor = make_fake_pg_connection(_schema_responses(
+        table_names=["users"],
+        columns_rows=[
+            ("users", "id", "integer", "NO", '"identity"(387363, 0, \'1,1\'::text)'),
+            ("users", "email", "character varying", "NO", None),
+        ],
+    ))
+    backend = RedshiftBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "id integer NOT NULL IDENTITY(seed=1, step=1)" in schema
+    # The raw internal identity-default expression must not be shown
+    # verbatim once the human-readable marker already says the same thing.
+    assert '"identity"(387363' not in schema
+    email_line = [l for l in schema.splitlines() if l.strip().startswith("email")][0]
+    assert "IDENTITY" not in email_line
+
+
+def test_get_schema_shallow_identity_marker_falls_back_to_bare_marker_when_seed_step_unparseable():
+    """A column_default that merely contains "identity" text without the
+    documented "'<seed>,<step>'"-shaped substring still gets flagged as an
+    identity column - see _identity_marker_from_column_default()'s
+    docstring for why this degrades to a bare marker rather than silently
+    missing the column altogether."""
+    conn, cursor = make_fake_pg_connection(_schema_responses(
+        table_names=["users"],
+        columns_rows=[("users", "id", "bigint", "NO", '"identity"(1, 0)')],
+    ))
+    backend = RedshiftBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "id bigint NOT NULL IDENTITY" in schema
+    assert "IDENTITY(seed=" not in schema
+
+
+def test_get_schema_shallow_identity_marker_absent_for_plain_default():
+    conn, cursor = make_fake_pg_connection(_schema_responses(
+        table_names=["customers"],
+        columns_rows=[("customers", "status", "character varying", "NO", "'active'::character varying")],
+    ))
+    backend = RedshiftBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "IDENTITY" not in schema
+    assert "DEFAULT 'active'" in schema
+
+
+def test_get_schema_shallow_comments_render_table_and_column():
+    conn, cursor = make_fake_pg_connection(_schema_responses(
+        table_names=["orders"],
+        columns_rows=[("orders", "status", "character varying", "NO", None)],
+        comments=[
+            ("orders", None, "Customer purchase orders."),
+            ("orders", "status", "Order lifecycle state."),
+        ],
+    ))
+    backend = RedshiftBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "Comments:" in schema
+    assert "[table] orders: Customer purchase orders." in schema
+    assert "[column] orders.status: Order lifecycle state." in schema
+
+
+def test_get_schema_shallow_comments_section_absent_when_no_comments():
+    conn, cursor = make_fake_pg_connection(_schema_responses(
+        table_names=["orders"],
+        columns_rows=[("orders", "id", "integer", "NO", None)],
+        comments=[("orders", None, None), ("orders", "id", "")],
+    ))
+    backend = RedshiftBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "Comments:" not in schema
+
+
+def test_get_schema_shallow_row_count_estimate_renders_from_widened_svv_table_info_query():
+    conn, cursor = make_fake_pg_connection(_schema_responses(
+        table_names=["orders"],
+        columns_rows=[("orders", "id", "integer", "NO", None)],
+        layout=[("orders", "KEY(customer_id)", "order_date", 1234, 0)],
+    ))
+    backend = RedshiftBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "Row count estimates:" in schema
+    assert "orders: ~1234 rows (estimate)" in schema
+    assert "stats may be stale" not in schema
+    # Same widened query still renders the pre-existing DISTSTYLE/SORTKEY
+    # section too - this is one query, not two.
+    assert "[orders] DISTSTYLE KEY(customer_id), SORTKEY(order_date)" in schema
+    layout_calls = [c for c in cursor.calls if "svv_table_info" in c[0]]
+    assert len(layout_calls) == 1
+    assert "tbl_rows" in layout_calls[0][0]
+    assert "stats_off" in layout_calls[0][0]
+
+
+def test_get_schema_shallow_row_count_estimate_flags_stale_stats():
+    conn, cursor = make_fake_pg_connection(_schema_responses(
+        table_names=["orders"],
+        columns_rows=[("orders", "id", "integer", "NO", None)],
+        layout=[("orders", None, None, 500, 42)],
+    ))
+    backend = RedshiftBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "Row count estimates:" in schema
+    assert "orders: ~500 rows (estimate) (stats may be stale - 42% off since last ANALYZE)" in schema
+
+
+def test_get_schema_shallow_row_count_estimate_absent_when_tbl_rows_is_none():
+    """Pre-existing layout tuples (table, diststyle, sortkey1) pad
+    tbl_rows/stats_off to None - see _pad_layout_row - so no existing test
+    needs rewriting, and no misleading "~None rows" text is ever rendered."""
+    conn, cursor = make_fake_pg_connection(_schema_responses(
+        table_names=["orders"],
+        columns_rows=[("orders", "id", "integer", "NO", None)],
+        layout=[("orders", "KEY(customer_id)", "order_date")],
+    ))
+    backend = RedshiftBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "Row count estimates:" not in schema
+
+
+def test_get_schema_shallow_routines_render_name_and_signature_without_body():
+    conn, cursor = make_fake_pg_connection(_schema_responses(
+        table_names=["orders"],
+        columns_rows=[("orders", "id", "integer", "NO", None)],
+        routines=[("total_for_customer", "customer_id integer", "numeric", "SELECT SUM(amount) ...")],
+    ))
+    backend = RedshiftBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "Routines:" in schema
+    assert "total_for_customer(customer_id integer) -> numeric" in schema
+    assert "SELECT SUM(amount)" not in schema
+
+
+def test_get_schema_shallow_routines_query_error_is_swallowed():
+    """Whether information_schema.routines/parameters behaves the same way
+    on Redshift as it does on Postgres could not be verified from this
+    sandbox (see module docstring) - a cluster/version where it errors must
+    still get every other section."""
+    # Replace the routines response with an Exception to simulate an
+    # unsupported/erroring catalog view on this cluster.
+    responses = _schema_responses(
+        table_names=["t"],
+        columns_rows=[("t", "id", "integer", "NO", None)],
+    )
+    routines_index = 6  # 0-based: table names, columns, constraints, layout, views, comments, routines
+    responses[routines_index] = RuntimeError("routines catalog not supported")
+    conn, cursor = make_fake_pg_connection(responses)
+    backend = RedshiftBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "Table: t" in schema
+    assert "Routines:" not in schema
+
+
+def test_get_schema_shallow_session_timezone_renders():
+    conn, cursor = make_fake_pg_connection(_schema_responses(
+        table_names=["orders"],
+        columns_rows=[("orders", "id", "integer", "NO", None)],
+        session_settings=("America/New_York",),
+    ))
+    backend = RedshiftBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "Session: timezone=America/New_York" in schema
+
+
+def test_get_schema_shallow_grants_render_when_query_succeeds():
+    conn, cursor = make_fake_pg_connection(_schema_responses(
+        table_names=["orders"],
+        columns_rows=[("orders", "id", "integer", "NO", None)],
+        grants=[("app_user", "orders", "SELECT")],
+    ))
+    backend = RedshiftBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "Grants" in schema
+    assert "Grant SELECT on orders to app_user" in schema
+    assert "role_table_grants support varies" in schema
+
+
+def test_get_schema_shallow_grants_query_error_degrades_gracefully():
+    """The exact concern the original module docstring raised (role_table_
+    grants support is inconsistent across Redshift versions/configurations)
+    - this test simulates that inconsistency actually manifesting as a
+    query error, and confirms it degrades to "skip this section" rather
+    than failing the whole schema fetch."""
+    responses = _schema_responses(
+        table_names=["orders"],
+        columns_rows=[("orders", "id", "integer", "NO", None)],
+    )
+    grants_index = 8  # 0-based: ... comments, routines, session, grants
+    responses[grants_index] = RuntimeError("permission denied for relation role_table_grants")
+    conn, cursor = make_fake_pg_connection(responses)
+    backend = RedshiftBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "Table: orders" in schema
+    assert "Grants" not in schema
+
+
+def test_get_schema_shallow_external_tables_render():
+    conn, cursor = make_fake_pg_connection(_schema_responses(
+        table_names=["orders"],
+        columns_rows=[("orders", "id", "integer", "NO", None)],
+        external_tables=[("raw_events",)],
+    ))
+    backend = RedshiftBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "External tables (Redshift Spectrum):" in schema
+    assert "raw_events: [external table - Redshift Spectrum]" in schema
+
+
+def test_get_schema_shallow_external_tables_absent_when_none():
+    conn, cursor = make_fake_pg_connection(_schema_responses(
+        table_names=["orders"],
+        columns_rows=[("orders", "id", "integer", "NO", None)],
+    ))
+    backend = RedshiftBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "External tables" not in schema
+
+
+def test_get_schema_shallow_still_has_no_indexes_triggers_or_rls_sections():
+    conn, cursor = make_fake_pg_connection(_schema_responses(
+        table_names=["t"],
+        columns_rows=[("t", "id", "integer", "NO", None)],
+    ))
+    backend = RedshiftBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "Indexes:" not in schema
+    assert "Triggers:" not in schema
+    assert "Row-level security" not in schema
+
+
+# --- get_schema_shallow() must never include Phase 2 (deep-only) content -----
+
+def test_get_schema_shallow_excludes_full_view_and_routine_bodies_and_phase2_sections():
+    conn, cursor = make_fake_pg_connection(_schema_responses(
+        table_names=["orders"],
+        columns_rows=[
+            ("orders", "id", "integer", "NO", None),
+            ("orders", "status", "character varying", "NO", None),
+        ],
+        views=[("v", "SELECT 1 FROM orders")],
+        routines=[("get_total", "p1 integer", "integer", "SELECT 1;")],
+    ))
+    backend = RedshiftBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "View v" in schema
+    assert "SELECT 1 FROM orders" not in schema
+    assert "View definitions:" not in schema
+    assert "get_total" in schema
+    assert "SELECT 1;" not in schema
+    assert "Routine definitions:" not in schema
+    assert "Live row counts:" not in schema
+    assert "Column value samples:" not in schema
+    assert "Likely relationships" not in schema
+    # Exactly the ten Phase 1 queries - no Phase 2 query was ever issued.
+    assert len(cursor.calls) == 10
+
+
+# --- get_schema() (deep): Phase 2 additions on top of the shallow content ----
+
+def _base_deep_responses():
+    return _schema_responses(
+        table_names=["orders"],
+        columns_rows=[
+            ("orders", "id", "integer", "NO", None),
+            ("orders", "status", "character varying", "NO", None),
+        ],
+        views=[("v", "SELECT 1 FROM orders")],
+        routines=[("get_total", "p1 integer", "integer", "SELECT 1;")],
+        layout=[("orders", "KEY(id)", "id", 500, 0)],
+    )
+
+
+def _phase2_sampling_responses():
+    return [
+        ([("orders", "status", 5)], None, -1),                  # n_distinct (pg_stats)
+        ([(42,)], None, -1),                                     # live count for orders
+        ([(1, 100)], None, -1),                                  # min/max for id
+        ([("active", 30), ("inactive", 12)], None, -1),          # frequent values for status
+    ]
+
+
+def test_get_schema_deep_is_superset_of_shallow_plus_phase2_sampling():
+    conn, cursor = make_fake_pg_connection(_base_deep_responses() + _phase2_sampling_responses())
+    backend = RedshiftBackend()
+    schema = backend.get_schema(conn)
+
+    # Shallow content still present (Phase 1 catalog-only sections).
+    assert "Table: orders" in schema
+    assert "View v" in schema
+    assert "get_total(p1 integer) -> integer" in schema
+    assert "~500 rows (estimate)" in schema
+
+    # Phase 2 additions on top.
+    assert "View definitions:" in schema and "View v: SELECT 1 FROM orders" in schema
+    assert "Routine definitions:" in schema and "get_total: SELECT 1;" in schema
+    assert "Live row counts:" in schema and "orders: 42 rows (live, authoritative)" in schema
+    assert "Column value samples:" in schema
+    assert "id: range [1 .. 100]" in schema
+    assert "status: frequent values = active (30), inactive (12)" in schema
+
+    assert len(cursor.calls) == 10 + 4
+
+
+def test_get_schema_deep_skips_frequent_values_for_near_unique_column():
+    responses = _base_deep_responses() + [
+        ([("orders", "status", -0.98)], None, -1),  # near-unique ratio
+        ([(42,)], None, -1),                          # live count
+        ([(1, 100)], None, -1),                        # min/max for id
+        # no frequent-value response queued - it must not be requested
+    ]
+    conn, cursor = make_fake_pg_connection(responses)
+    backend = RedshiftBackend()
+    schema = backend.get_schema(conn)
+    assert "Column value samples:" in schema
+    assert "id: range [1 .. 100]" in schema
+    assert "frequent values" not in schema
+    assert len(cursor.calls) == 10 + 3
+
+
+def test_get_schema_deep_naming_convention_relationships_section():
+    responses = _schema_responses(
+        table_names=["customers", "orders"],
+        columns_rows=[
+            ("customers", "id", "bigint", "NO", None),
+            ("orders", "customer_id", "bigint", "NO", None),
+        ],
+    ) + [
+        ([], None, -1),        # n_distinct (no categorical cols to gate)
+        ([(10,)], None, -1),   # live count: customers
+        ([(1, 10)], None, -1),  # min/max: customers.id
+        ([(20,)], None, -1),   # live count: orders
+        ([(1, 20)], None, -1),  # min/max: orders.customer_id
+    ]
+    conn, cursor = make_fake_pg_connection(responses)
+    backend = RedshiftBackend()
+
+    deep = backend.get_schema(conn)
+    assert "Likely relationships (naming convention, unconfirmed):" in deep
+    assert "orders.customer_id -> likely relationship (unconfirmed): references customers" in deep
+
+    # The shallow fetch (fresh cursor/queue) must not include this section.
+    conn2, cursor2 = make_fake_pg_connection(_schema_responses(
+        table_names=["customers", "orders"],
+        columns_rows=[
+            ("customers", "id", "bigint", "NO", None),
+            ("orders", "customer_id", "bigint", "NO", None),
+        ],
+    ))
+    shallow = backend.get_schema_shallow(conn2)
+    assert "Likely relationships" not in shallow
+
+
+def test_get_schema_deep_skips_sampling_for_wide_tables_but_keeps_live_count():
+    """A table with more columns than MAX_COLUMNS_FOR_SAMPLING still gets a
+    live row count, just no per-column sampling - bounding the "explosion of
+    tiny queries" the cap exists to prevent."""
+    columns_rows = [
+        ("wide", f"col_{i}", "integer", "NO", None)
+        for i in range(MAX_COLUMNS_FOR_SAMPLING + 1)
+    ]
+    responses = _schema_responses(
+        table_names=["wide"],
+        columns_rows=columns_rows,
+    ) + [
+        ([], None, -1),       # n_distinct
+        ([(7,)], None, -1),   # live count for wide
+        # no min/max response queued - it must not be requested
+    ]
+    conn, cursor = make_fake_pg_connection(responses)
+    backend = RedshiftBackend()
+    schema = backend.get_schema(conn)
+    assert "Live row counts:" in schema and "wide: 7 rows (live, authoritative)" in schema
+    assert "Column value samples:" not in schema
+    assert len(cursor.calls) == 10 + 2
 
 
 # --- execute() ---------------------------------------------------------------

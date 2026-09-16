@@ -1,10 +1,26 @@
 """
 backends/mysql.py, driven entirely against a fake PyMySQL-shaped
 connection/cursor (see helpers.make_fake_mysql_connection) - no real MySQL
-needed. get_schema()'s query order is unconditional, same staging as
-backends/postgres.py's get_schema():
-  1. table names   2. columns   3. constraints   4. indexes
-  5. views         6. grants    7. triggers
+needed.
+
+_build_shallow_schema_parts() (called by both get_schema_shallow() and
+get_schema()) issues its queries unconditionally and in a fixed order
+(several of the new sections are individually try/except-wrapped for
+graceful degradation - see mysql.py itself), so responses are queued in the
+exact order it issues them:
+  1. table names        2. columns             3. constraints
+  4. indexes            5. views                6. grants
+  7. triggers           8. table comments/rows (new)
+  9. routines (new)     10. session settings (new)
+
+get_schema() (deep) then runs _build_shallow_schema_parts() (the ten queries
+above) and appends its own Phase 2 queries on a fresh cursor use, per kept
+table (in order): live COUNT(*), an optional combined MIN()/MAX() query (if
+it has numeric/date columns), and - per eligible categorical column, up to
+MAX_CATEGORICAL_SAMPLE_COLUMNS_PER_TABLE - one COUNT(DISTINCT ...) gate
+query followed by a frequent-value GROUP BY query - see
+test_get_schema_deep_* below for worked examples of this second phase's
+exact response queue.
 
 connect()'s own URL-parsing/kwarg-building logic is tested separately
 against helpers.install_fake_pymysql_connect, which patches
@@ -32,15 +48,39 @@ from helpers import (
 )
 
 
-def _schema_responses(table_names, columns_rows, constraints=(), indexes=(), views=(), grants=(), triggers=()):
+def _pad_column_row(row):
+    """A columns_rows tuple may still be the pre-EXTRA/COLUMN_COMMENT
+    5-tuple (table_name, column_name, data_type, is_nullable, column_default)
+    that every test predating the Phase 1 identity/comment attributes
+    already uses - padded here to the real 7-column shape
+    _build_shallow_schema_parts()'s columns query now selects
+    (..., EXTRA, COLUMN_COMMENT), defaulting to ""/None (not an
+    auto_increment column, no comment), so none of those existing tests
+    need to be rewritten just because two more columns joined the SELECT
+    list. Mirrors backends/postgres.py's own _pad_column_row exactly, just
+    with MySQL's EXTRA/COLUMN_COMMENT pair instead of Postgres's
+    is_identity/identity_generation pair."""
+    row = list(row)
+    while len(row) < 7:
+        row.append("" if len(row) == 5 else None)
+    return tuple(row)
+
+
+def _schema_responses(
+    table_names, columns_rows, constraints=(), indexes=(), views=(), grants=(), triggers=(),
+    table_meta=(), routines=(), session_settings=("SYSTEM", "utf8mb4_general_ci"),
+):
     return [
         ([(n,) for n in table_names], None, -1),
-        (columns_rows, None, -1),
+        ([_pad_column_row(r) for r in columns_rows], None, -1),
         (list(constraints), None, -1),
         (list(indexes), None, -1),
         (list(views), None, -1),
         (list(grants), None, -1),
         (list(triggers), None, -1),
+        (list(table_meta), None, -1),
+        (list(routines), None, -1),
+        ([session_settings] if session_settings is not None else [], None, -1),
     ]
 
 
@@ -166,6 +206,286 @@ def test_get_schema_scan_query_uses_configured_scan_cap():
     first_sql, first_params = cursor.calls[0]
     assert "information_schema.TABLES" in first_sql
     assert first_params[0] > 0  # SCHEMA_MAX_TABLE_NAMES_SCANNED
+
+
+# --- Phase 1 (catalog-only, shallow) new attributes --------------------------
+
+def test_get_schema_shallow_auto_increment_marker_renders():
+    conn, cursor = make_fake_mysql_connection(_schema_responses(
+        table_names=["users"],
+        columns_rows=[
+            ("users", "id", "int", "NO", None, "auto_increment", None),
+            ("users", "email", "varchar", "NO", None, "", None),
+        ],
+    ))
+    backend = MySQLBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "id int NOT NULL AUTO_INCREMENT" in schema
+    # The non-auto_increment column's own line must not pick up a marker.
+    email_line = [l for l in schema.splitlines() if l.strip().startswith("email")][0]
+    assert "AUTO_INCREMENT" not in email_line
+
+
+def test_get_schema_shallow_auto_increment_absent_by_default():
+    """Old-style 5-tuple columns_rows (predating EXTRA/COLUMN_COMMENT) must
+    be padded to "not auto_increment, no comment" - see _pad_column_row - so
+    no existing test needs rewriting."""
+    conn, cursor = make_fake_mysql_connection(_schema_responses(
+        table_names=["customers"],
+        columns_rows=[("customers", "id", "int", "NO", None)],
+    ))
+    backend = MySQLBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "AUTO_INCREMENT" not in schema
+
+
+def test_get_schema_shallow_comments_render_table_and_column():
+    conn, cursor = make_fake_mysql_connection(_schema_responses(
+        table_names=["orders"],
+        columns_rows=[("orders", "status", "varchar", "NO", None, "", "Order lifecycle state.")],
+        table_meta=[("orders", "Customer purchase orders.", 500)],
+    ))
+    backend = MySQLBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "Comments:" in schema
+    assert "[table] orders: Customer purchase orders." in schema
+    assert "[column] orders.status: Order lifecycle state." in schema
+
+
+def test_get_schema_shallow_comments_section_absent_when_no_comments():
+    conn, cursor = make_fake_mysql_connection(_schema_responses(
+        table_names=["orders"],
+        columns_rows=[("orders", "id", "int", "NO", None, "", "")],
+        table_meta=[("orders", "", 500)],
+    ))
+    backend = MySQLBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "Comments:" not in schema
+
+
+def test_get_schema_shallow_row_count_estimate_renders():
+    conn, cursor = make_fake_mysql_connection(_schema_responses(
+        table_names=["orders"],
+        columns_rows=[("orders", "id", "int", "NO", None)],
+        table_meta=[("orders", None, 1234)],
+    ))
+    backend = MySQLBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "Row count estimates:" in schema
+    assert "orders: ~1234 rows (estimate" in schema
+
+
+def test_get_schema_shallow_row_count_estimate_renders_zero_not_skipped():
+    """Unlike Postgres's reltuples (-1 sentinel for "never analyzed"), MySQL's
+    TABLE_ROWS genuinely reports 0 for an empty (or not-yet-populated) InnoDB
+    table - that's a real, if approximate, value and must still render, not
+    be treated as a missing-estimate sentinel."""
+    conn, cursor = make_fake_mysql_connection(_schema_responses(
+        table_names=["fresh_table"],
+        columns_rows=[("fresh_table", "id", "int", "NO", None)],
+        table_meta=[("fresh_table", None, 0)],
+    ))
+    backend = MySQLBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "Row count estimates:" in schema
+    assert "fresh_table: ~0 rows (estimate" in schema
+
+
+def test_get_schema_shallow_row_count_estimate_skips_null_table_rows():
+    conn, cursor = make_fake_mysql_connection(_schema_responses(
+        table_names=["mystery_table"],
+        columns_rows=[("mystery_table", "id", "int", "NO", None)],
+        table_meta=[("mystery_table", None, None)],
+    ))
+    backend = MySQLBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "Row count estimates:" not in schema
+
+
+def test_get_schema_shallow_routines_render_name_and_signature_without_body():
+    conn, cursor = make_fake_mysql_connection(_schema_responses(
+        table_names=["orders"],
+        columns_rows=[("orders", "id", "int", "NO", None)],
+        routines=[("total_for_customer", "customer_id int", "decimal", "SELECT SUM(amount) ...")],
+    ))
+    backend = MySQLBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "Routines:" in schema
+    assert "total_for_customer(customer_id int) -> decimal" in schema
+    assert "SELECT SUM(amount)" not in schema
+
+
+def test_get_schema_shallow_routines_procedure_with_no_return_type():
+    """A PROCEDURE (as opposed to a FUNCTION) has no return type - r.DATA_TYPE
+    comes back NULL/empty for it, so the rendered line must omit the
+    "-> ..." suffix entirely rather than showing "-> None"."""
+    conn, cursor = make_fake_mysql_connection(_schema_responses(
+        table_names=["orders"],
+        columns_rows=[("orders", "id", "int", "NO", None)],
+        routines=[("archive_old_orders", "cutoff_date date", None, "DELETE FROM orders ...")],
+    ))
+    backend = MySQLBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "archive_old_orders(cutoff_date date)" in schema
+    assert "->" not in schema
+
+
+def test_get_schema_shallow_session_settings_render():
+    conn, cursor = make_fake_mysql_connection(_schema_responses(
+        table_names=["orders"],
+        columns_rows=[("orders", "id", "int", "NO", None)],
+        session_settings=("America/New_York", "utf8mb4_unicode_ci"),
+    ))
+    backend = MySQLBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "Session: timezone=America/New_York; default collation=utf8mb4_unicode_ci" in schema
+
+
+# --- get_schema_shallow() must never include Phase 2 (deep-only) content -----
+
+def test_get_schema_shallow_excludes_full_view_and_routine_bodies_and_phase2_sections():
+    conn, cursor = make_fake_mysql_connection(_schema_responses(
+        table_names=["orders"],
+        columns_rows=[
+            ("orders", "id", "int", "NO", None),
+            ("orders", "status", "varchar", "NO", None),
+        ],
+        views=[("v", "select 1 from orders")],
+        routines=[("get_total", "p1 int", "int", "SELECT 1;")],
+    ))
+    backend = MySQLBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "View v" in schema
+    assert "select 1 from orders" not in schema
+    assert "View definitions:" not in schema
+    assert "get_total" in schema
+    assert "SELECT 1;" not in schema
+    assert "Routine definitions:" not in schema
+    assert "Live row counts:" not in schema
+    assert "Column value samples:" not in schema
+    assert "Likely relationships" not in schema
+    # Exactly the ten Phase 1 queries - no Phase 2 query was ever issued.
+    assert len(cursor.calls) == 10
+
+
+# --- get_schema() (deep): Phase 2 additions on top of the shallow content ----
+
+def _base_deep_responses():
+    return _schema_responses(
+        table_names=["orders"],
+        columns_rows=[
+            ("orders", "id", "int", "NO", None),
+            ("orders", "status", "varchar", "NO", None),
+        ],
+        views=[("v", "select 1 from orders")],
+        routines=[("get_total", "p1 int", "int", "SELECT 1;")],
+        table_meta=[("orders", None, 500)],
+    )
+
+
+def _phase2_sampling_responses():
+    return [
+        ([(42,)], None, -1),                              # live count for orders
+        ([(1, 100)], None, -1),                            # min/max for id
+        ([(2,)], None, -1),                                # COUNT(DISTINCT status)
+        ([("active", 30), ("inactive", 12)], None, -1),   # frequent values for status
+    ]
+
+
+def test_get_schema_deep_is_superset_of_shallow_plus_phase2_sampling():
+    conn, cursor = make_fake_mysql_connection(_base_deep_responses() + _phase2_sampling_responses())
+    backend = MySQLBackend()
+    schema = backend.get_schema(conn)
+
+    # Shallow content still present (Phase 1 catalog-only sections).
+    assert "Table: orders" in schema
+    assert "View v" in schema
+    assert "get_total(p1 int) -> int" in schema
+    assert "~500 rows (estimate" in schema
+
+    # Phase 2 additions on top.
+    assert "View definitions:" in schema and "View v: select 1 from orders" in schema
+    assert "Routine definitions:" in schema and "get_total: SELECT 1;" in schema
+    assert "Live row counts:" in schema and "orders: 42 rows (live, authoritative)" in schema
+    assert "Column value samples:" in schema
+    assert "id: range [1 .. 100]" in schema
+    assert "status: frequent values = active (30), inactive (12)" in schema
+
+    assert len(cursor.calls) == 10 + 4
+
+
+def test_get_schema_deep_skips_frequent_values_for_near_unique_column():
+    """A COUNT(DISTINCT ...) close to the live row count means the column is
+    near-unique - sampling "frequent values" for it wouldn't be meaningful,
+    so that column's GROUP BY query must never even be issued."""
+    responses = _base_deep_responses() + [
+        ([(42,)], None, -1),   # live count for orders
+        ([(1, 100)], None, -1),  # min/max for id
+        ([(40,)], None, -1),   # COUNT(DISTINCT status) - 40/42 rows distinct
+        # no frequent-value response queued - it must not be requested
+    ]
+    conn, cursor = make_fake_mysql_connection(responses)
+    backend = MySQLBackend()
+    schema = backend.get_schema(conn)
+    assert "Column value samples:" in schema
+    assert "id: range [1 .. 100]" in schema
+    assert "frequent values" not in schema
+    assert len(cursor.calls) == 10 + 3
+
+
+def test_get_schema_deep_naming_convention_relationships_section():
+    responses = _schema_responses(
+        table_names=["customers", "orders"],
+        columns_rows=[
+            ("customers", "id", "varbinary", "NO", None),
+            ("orders", "customer_id", "varbinary", "NO", None),
+        ],
+    ) + [
+        ([(10,)], None, -1),   # live count: customers
+        ([(20,)], None, -1),   # live count: orders
+    ]
+    conn, cursor = make_fake_mysql_connection(responses)
+    backend = MySQLBackend()
+
+    deep = backend.get_schema(conn)
+    assert "Likely relationships (naming convention, unconfirmed):" in deep
+    assert "orders.customer_id -> likely relationship (unconfirmed): references customers" in deep
+
+    # The shallow fetch (fresh cursor/queue) must not include this section.
+    conn2, cursor2 = make_fake_mysql_connection(_schema_responses(
+        table_names=["customers", "orders"],
+        columns_rows=[
+            ("customers", "id", "varbinary", "NO", None),
+            ("orders", "customer_id", "varbinary", "NO", None),
+        ],
+    ))
+    shallow = backend.get_schema_shallow(conn2)
+    assert "Likely relationships" not in shallow
+
+
+def test_get_schema_deep_skips_sampling_for_wide_tables_but_keeps_live_count():
+    """A table with more columns than MAX_COLUMNS_FOR_SAMPLING still gets a
+    live row count, just no per-column sampling - bounding the "explosion of
+    tiny queries" the cap exists to prevent."""
+    from backends.mysql import MAX_COLUMNS_FOR_SAMPLING
+
+    columns_rows = [
+        ("wide", f"col_{i}", "int", "NO", None)
+        for i in range(MAX_COLUMNS_FOR_SAMPLING + 1)
+    ]
+    responses = _schema_responses(
+        table_names=["wide"],
+        columns_rows=columns_rows,
+    ) + [
+        ([(7,)], None, -1),   # live count for wide
+        # no min/max response queued - it must not be requested
+    ]
+    conn, cursor = make_fake_mysql_connection(responses)
+    backend = MySQLBackend()
+    schema = backend.get_schema(conn)
+    assert "Live row counts:" in schema and "wide: 7 rows (live, authoritative)" in schema
+    assert "Column value samples:" not in schema
+    assert len(cursor.calls) == 10 + 1
 
 
 # --- cache_key -------------------------------------------------------------------

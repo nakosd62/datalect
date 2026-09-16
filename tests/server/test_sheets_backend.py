@@ -322,6 +322,26 @@ def test_fetch_uses_connect_read_timeout_tuple_not_single_float(monkeypatch):
 
 # --- get_schema ----------------------------------------------------------------
 
+def test_get_schema_is_an_alias_for_get_schema_shallow(monkeypatch):
+    # Sheets has no real Phase 1/Phase 2 distinction (see
+    # get_schema_shallow()'s own docstring - there's no catalog to
+    # introspect cheaply, so even the "shallow" fetch already runs the
+    # live sample query) - get_schema() must return byte-identical text
+    # to get_schema_shallow(), not a separately-computed deep variant.
+    backend, harness = _sheets(monkeypatch)
+    harness.queue_table(
+        cols=[{"label": "Name", "type": "string"}],
+        rows=[["Reza"]],
+    )
+    shallow = backend.get_schema_shallow(_conn())
+    harness.queue_table(
+        cols=[{"label": "Name", "type": "string"}],
+        rows=[["Reza"]],
+    )
+    deep = backend.get_schema(_conn())
+    assert shallow == deep
+
+
 def test_get_schema_lists_letter_label_type_and_samples(monkeypatch):
     backend, harness = _sheets(monkeypatch)
     harness.queue_table(

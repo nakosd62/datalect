@@ -225,17 +225,21 @@ from flask import Blueprint, request, jsonify
 from app_config import (
     CONFIGURED_DBS, DEFAULT_PRESET_ID, MAX_IN_SCOPE_CONNECTIONS,
     AUTH_ENABLED, IS_CLOUD_RUN, state_store,
-    ISSUE_REPORTING_ENABLED, CLIENT_BUILD_ID,
+    ISSUE_REPORTING_ENABLED, CLIENT_BUILD_ID, logger,
 )
 import os
 from auth import (
     get_or_create_session_id, get_current_user_identity, apply_session_cookie,
     is_anonymous_user,
 )
-from db import get_conn_identifier, resolve_active_descriptor
+from db import (
+    get_conn_identifier, resolve_active_descriptor, invalidate_schema_cache,
+    prime_schema_cache, prime_schema_cache_with_reason, SCHEMA_FETCH_FAILURE_REASON_EMPTY,
+    visible_configured_dbs,
+)
+import schema_cache
 from state_store import compute_connection_key, LLM_BYOK_PROVIDER_NAMES
 from sheets_util import extract_spreadsheet_id
-import schema_cache
 # Read-only reuse of translate_routes.py's HISTORY_MAX_TURNS - the client
 # needs the same number that already governs how many past turns
 # /api/translate replays to the LLM (see that module's comment on it), so
@@ -1355,6 +1359,140 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
     return merged
 
 
+@config_bp.route('/api/config/refresh-schema', methods=['POST'])
+def handle_refresh_schema():
+    """Forces a fresh schema introspection for one of the current user's
+    own saved custom connections, and pins the result (infinite TTL - see
+    db.py's prime_schema_cache()) so it doesn't silently go stale again
+    until the next explicit refresh or a server restart - the same
+    treatment prefetch_all_preset_schemas() gives every preset at
+    startup. Presets aren't refreshable here by design (see that
+    function's docstring): they can only be re-fetched via a server
+    restart.
+
+    Client identifies the connection by connection_key (never a raw
+    descriptor/credentials - same convention as everywhere else a single
+    custom connection is addressed, e.g. resolve_descriptor_by_reference
+    in db.py), looked up via state_store.get_db_connections() scoped to
+    this request's own user_identity - a user can only ever refresh their
+    own saved connections, never another user's, since the lookup below
+    never sees any other user's rows.
+
+    This is a deliberately blocking, synchronous call (per the frontend's
+    own "Refresh Schema" button - see webClient/client.js) - no background
+    job/polling here, the request just takes as long as the introspection
+    itself does.
+    """
+    session_id = get_or_create_session_id()
+    user_identity = get_current_user_identity(session_id)
+    data = request.get_json(silent=True) or {}
+    connection_key = (data.get('connection_key') or '').strip()
+    if not connection_key:
+        resp = jsonify({'success': False, 'error': 'Missing connection_key.'})
+        return apply_session_cookie(resp, session_id), 400
+
+    for db in state_store.get_db_connections(user_identity, include_credentials=True):
+        if db.get('connection_key') == connection_key:
+            descriptor = {"type": db.get("type") or "postgres", "url": db.get("url")}
+            descriptor.update(db.get("config") or {})
+            try:
+                ok, reason = prime_schema_cache_with_reason(descriptor, user_identity)
+            except Exception:
+                logger.exception("Error refreshing schema for connection %r", connection_key)
+                ok, reason = False, None
+            if ok:
+                resp = jsonify({'success': True})
+                return apply_session_cookie(resp, session_id), 200
+            # Two very different situations collapse to "ok=False" here,
+            # and they read very differently to a user clicking "Refresh
+            # Schema": the connection genuinely couldn't be reached/
+            # queried (bad host, expired credentials, a query error) vs.
+            # it connected and queried FINE but there's simply nothing to
+            # describe (a views-only schema, a genuinely empty database,
+            # or a role with no table-level privileges - see db.py's
+            # _fetch_database_schema_with_reason()'s own "no schema text"
+            # warning, which is exactly what produces this reason). The
+            # old, single generic message ("Check that it is reachable and
+            # its credentials are still valid") is actively misleading for
+            # the second case - the connection is fine, so telling someone
+            # to go check its reachability/credentials sends them looking
+            # in the wrong place entirely.
+            if reason == SCHEMA_FETCH_FAILURE_REASON_EMPTY:
+                error_message = (
+                    "Connected successfully, but this connection has no tables to "
+                    "describe - it may be empty, contain only views, or the "
+                    "configured user may not have been granted access to any tables. "
+                    "Double-check it's pointed at the right database."
+                )
+            else:
+                error_message = (
+                    "Could not fetch schema for this connection. Check that it is "
+                    "reachable and its credentials are still valid."
+                )
+            resp = jsonify({'success': False, 'error': error_message})
+            return apply_session_cookie(resp, session_id), 502
+
+    resp = jsonify({'success': False, 'error': 'Connection not found.'})
+    return apply_session_cookie(resp, session_id), 404
+
+
+@config_bp.route('/api/debug/schema-cache', methods=['GET'])
+def handle_debug_schema_cache():
+    """Local-dev-only introspection endpoint dumping the entire in-memory
+    schema_cache.py cache (schema_cache.dump()'s own docstring explains
+    why that's the one and only caller of dump()) - added on request
+    while spot-checking the startup-prefetch/fatal-exclusion feature
+    against real presets/connections, not something the webClient calls.
+
+    Gated off entirely on Cloud Run (IS_CLOUD_RUN, from app_config.py) -
+    this returns full schema/DDL text for every cached connection, which
+    is fine for a developer eyeballing their own local process but has no
+    business being reachable on a deployed instance, unauthenticated, just
+    because someone knows the path.
+
+    Returns the full text per entry (not just a preview or length) plus a
+    total size in bytes across every entry, since both were asked for -
+    "content" is the schema text as cached (UTF-8; a Postgres/MySQL/etc.
+    DDL-shaped description, not credentials - see get_conn_identifier()'s
+    own docstring on why cache keys themselves are non-sensitive too),
+    and "total_bytes" is the sum of each entry's UTF-8 encoded length so
+    it's an accurate byte count rather than a Python str length (which
+    would undercount any non-ASCII schema/column names)."""
+    if IS_CLOUD_RUN:
+        return jsonify({'error': 'Not available in this environment.'}), 404
+
+    cache_contents = schema_cache.dump()
+    entries = {}
+    total_bytes = 0
+    dataset_totals = {}  # dataset identifier -> summed bytes across its deep + shallow entries
+    for key, text in cache_contents.items():
+        text = text or ""
+        byte_length = len(text.encode('utf-8'))
+        total_bytes += byte_length
+        entries[key] = {"length": byte_length, "content": text}
+
+        # Group by dataset: db.py caches a deep entry under the plain
+        # connection identifier and a shallow entry under that same
+        # identifier + "::shallow" (db.py's own, module-private
+        # _SHALLOW_CACHE_KEY_SUFFIX - duplicated here as a literal rather
+        # than importing a leading-underscore name, since this is a debug
+        # view, not a load-bearing dependency on db.py's internals). One
+        # dataset can have up to two entries; this collapses them into a
+        # single per-dataset byte total.
+        dataset_key = key[:-len("::shallow")] if key.endswith("::shallow") else key
+        dataset_totals[dataset_key] = dataset_totals.get(dataset_key, 0) + byte_length
+
+    return jsonify({
+        "count": len(entries),
+        "total_bytes": total_bytes,
+        "datasets": {
+            key: {"total_bytes": value}
+            for key, value in sorted(dataset_totals.items())
+        },
+        "entries": entries,
+    }), 200
+
+
 @config_bp.route('/api/config', methods=['GET', 'POST'])
 def handle_config():
     # session_id resolved first and passed into get_current_user_identity()
@@ -1535,7 +1673,7 @@ def handle_config():
             candidate_preset_ids = new_in_scope_preset_ids if isinstance(new_in_scope_preset_ids, list) else []
             candidate_custom_keys = new_in_scope_custom_keys if isinstance(new_in_scope_custom_keys, list) else []
 
-            valid_preset_ids = {db.get("id") for db in CONFIGURED_DBS}
+            valid_preset_ids = {db.get("id") for db in visible_configured_dbs()}
             reference_custom_databases = (
                 merged_custom_databases if merged_custom_databases is not None
                 else state_store.get_db_connections(user_identity)
@@ -1622,7 +1760,7 @@ def handle_config():
         )
 
         preset_id = data.get('preset_id') if not is_custom else None
-        preset = next((db for db in CONFIGURED_DBS if db.get("id") == preset_id), None) if preset_id else None
+        preset = next((db for db in visible_configured_dbs() if db.get("id") == preset_id), None) if preset_id else None
 
         if preset is not None:
             # A preset selection - anonymous and signed-in users alike now
@@ -1680,13 +1818,20 @@ def handle_config():
                     )
                     prior_config = {k: v for k, v in prior_descriptor.items() if k not in ("type", "url")}
                     if new_db_url != prior_descriptor.get("url") or new_db_config != prior_config:
-                        # The DB connection is changing - drop any cached schema
-                        # for the connection we're switching to. Without this,
-                        # if that connection was cached earlier - e.g. by
-                        # another session/user on the same DB, or from before
-                        # the schema changed - /api/translate would keep
-                        # serving that stale schema for up to
-                        # SCHEMA_CACHE_TTL_SECONDS after the switch.
+                        # The DB connection is changing - drop any cached
+                        # schema for the connection we're switching to, and
+                        # immediately refetch a fresh one, rather than
+                        # leaving that to happen lazily whenever /api/translate
+                        # next needs it. Without the drop, if that connection
+                        # was cached earlier - e.g. by another session/user on
+                        # the same DB, or from before the schema changed -
+                        # /api/translate would keep serving that stale schema
+                        # INDEFINITELY after the switch, not just for a while:
+                        # schema_cache.py has no TTL/expiry at all (see its own
+                        # module docstring), so unlike before that cache
+                        # existed purely as a short-lived latency optimization,
+                        # this is now the ONLY thing that ever corrects a
+                        # stale entry short of a full process restart.
                         # Comparing new_db_config too (not just url), unlike
                         # before, is what makes this also fire for the 7
                         # structured dialects (whose real distinguishing
@@ -1694,9 +1839,44 @@ def handle_config():
                         # incidentally now also catches a Postgres/MySQL
                         # ca_cert_pem-only change, which url comparison alone
                         # would have missed.
-                        schema_cache.invalidate(get_conn_identifier(
-                            {"type": new_db_type, "url": new_db_url_to_persist, **new_db_config}
-                        ))
+                        #
+                        # invalidate_schema_cache() (not schema_cache.invalidate()
+                        # directly) - a connection can now have two independent
+                        # cache entries, deep and shallow (see db.py's
+                        # get_database_schema()); clearing only the plain key
+                        # would leave a stale shallow-fetched schema cached
+                        # indefinitely after this switch.
+                        #
+                        # invalidate BEFORE attempting the refetch (not
+                        # after, and not skipped in favor of relying on
+                        # prime_schema_cache's own force_refresh=True) is
+                        # what guarantees the failure case is correct too: if
+                        # the new connection's DB happens to be unreachable
+                        # right now, prime_schema_cache() below fails and
+                        # caches nothing - but if the OLD entry were still
+                        # sitting there uninvalidated, that stale schema (for
+                        # config that no longer applies) would keep being
+                        # served indefinitely. Invalidating first means a
+                        # failed refetch here correctly leaves NO schema
+                        # cached, not the old one.
+                        changed_descriptor = {
+                            "type": new_db_type, "url": new_db_url_to_persist, **new_db_config,
+                        }
+                        invalidate_schema_cache(get_conn_identifier(changed_descriptor))
+                        try:
+                            if not prime_schema_cache(changed_descriptor, user_identity):
+                                logger.warning(
+                                    "Schema refetch failed after connection config "
+                                    "changed for %r - no schema is cached for it "
+                                    "until the next successful fetch",
+                                    db_name_to_save,
+                                )
+                        except Exception:
+                            logger.exception(
+                                "Error refetching schema after connection config "
+                                "changed for %r",
+                                db_name_to_save,
+                            )
 
                 state_store.set_session(
                     user_identity, connection_id=active_connection_key, is_custom=True,
@@ -1758,8 +1938,11 @@ def handle_config():
     # (is_custom, connection_id), never a copy of the connection's own
     # details. `connection_missing` is true when connection_id was set to
     # something but it no longer resolves to anything real - the preset
-    # was removed/renamed, or the saved custom connection was deleted -
-    # in which case active_descriptor is already the app default, and the
+    # was removed/renamed, the saved custom connection was deleted, or (see
+    # db.py's visible_configured_dbs()) the preset failed its schema fetch
+    # at server startup with a fatal, non-timeout error and was excluded
+    # from selection until the next restart - in which case
+    # active_descriptor is already the app default, and the
     # active_connection_missing* fields below tell the frontend so it can
     # warn the user instead of silently showing the default as if it were
     # what they'd actually picked.
@@ -1801,8 +1984,8 @@ def handle_config():
             "(it may have been deleted) - showing the default connection instead."
             if session_data.get("is_custom") else
             "Your previously selected database preset is no longer available "
-            "(it may have been removed or renamed) - showing the default "
-            "connection instead."
+            "(it may have been removed or renamed, or it failed to connect at "
+            "server startup) - showing the default connection instead."
         )
 
     # Anonymous (Cloud Run, signed-out) users can now save their own custom
@@ -1874,7 +2057,7 @@ def handle_config():
             redacted["include_in_all_mode"] = False
         return redacted
 
-    configured_dbs = [_redact_preset_for_client(db) for db in CONFIGURED_DBS]
+    configured_dbs = [_redact_preset_for_client(db) for db in visible_configured_dbs()]
 
     # Which preset (if any) is active - read straight off session_data's
     # own connection_id/is_custom, computed once, unconditionally,
@@ -1912,9 +2095,19 @@ def handle_config():
         # being hidden from them (only configured_dbs above stays redacted
         # regardless, since that's about OTHER people's presets, not their
         # own active connection).
+        # Reads through visible_configured_dbs(), not raw CONFIGURED_DBS -
+        # if active_preset_id refers to a preset that's since been excluded
+        # (see db.py's visible_configured_dbs()), connection_missing is
+        # already True and active_descriptor above already resolved to the
+        # default; this lookup must agree with that rather than still
+        # finding the excluded preset's own name/id here and showing a
+        # "Connected to: <broken preset>" label that contradicts the
+        # "no longer available, showing the default" warning being shown
+        # for the exact same connection.
+        visible_dbs = visible_configured_dbs()
         preset_for_display = (
-            next((db for db in CONFIGURED_DBS if db.get("id") == active_preset_id), None)
-            or (CONFIGURED_DBS[0] if CONFIGURED_DBS else None)
+            next((db for db in visible_dbs if db.get("id") == active_preset_id), None)
+            or (visible_dbs[0] if visible_dbs else None)
         )
         db_name = preset_for_display["name"] if preset_for_display else "Database"
         username = ""

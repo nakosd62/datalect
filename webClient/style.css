@@ -1827,15 +1827,45 @@ textarea.report-issue-preview:focus {
 }
 
 .custom-db-toggle-btn,
-.custom-db-remove-btn {
+.custom-db-remove-btn,
+.custom-db-refresh-btn {
   /* Doubled from the original 0.15rem 0.6rem padding / 0.7rem font-size -
-     these are the only way to expand/collapse or delete a saved custom
-     connection, so they need to read as clearly clickable rather than
-     blend into the row alongside the type/name fields. */
+     these are the only way to expand/collapse, delete, or refresh the
+     schema of a saved custom connection, so they need to read as clearly
+     clickable rather than blend into the row alongside the type/name
+     fields. */
   flex: 0 0 auto;
   padding: 0.3rem 1.2rem;
   line-height: 1;
   font-size: 1.4rem;
+}
+
+.custom-db-refresh-btn {
+  /* Holds an inline SVG icon rather than a text glyph like its siblings -
+     centers it the same way padding centers their text/unicode content. */
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.custom-db-refresh-btn:disabled,
+.custom-db-remove-btn:disabled {
+  /* Shared with the refresh button: the remove ("x") button is also
+     disabled (see renderCustomDbRows()'s isRefreshing) for as long as
+     that row's own schema refresh is in flight, so it needs the same
+     greyed-out treatment. */
+  opacity: 0.5;
+  cursor: default;
+}
+
+.custom-db-refresh-btn svg.animate-spin {
+  /* Explicit, rather than relying on each browser's own default
+     transform-box for an inline SVG - belt-and-suspenders so the icon
+     spins in place around its own center instead of visibly drifting/
+     wobbling around some other origin while .animate-spin's rotation
+     (style.css's shared @keyframes spin) is running. */
+  transform-box: fill-box;
+  transform-origin: center;
 }
 
 .custom-db-field-row {

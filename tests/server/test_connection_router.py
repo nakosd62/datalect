@@ -383,6 +383,129 @@ def test_clean_database_prompts_returns_empty_dict_for_non_dict_input():
     assert _clean_database_prompts("also not a dict", [0, 1]) == {}
 
 
+# --- triage_all_mode_question's language verification - direct unit tests -
+#
+# Regression guard for the gap this closes: _TRIAGE_SYSTEM_INSTRUCTION's own
+# "write your answer in the user's language" line was previously the ONLY
+# thing keeping triage's free text ("answer"/"message") in the question's
+# own language - nothing ever verified the model actually complied, unlike
+# the post-execution summarization calls' _detect_language/
+# _summarize_with_retry machinery (translate_routes.py). These monkeypatch
+# connection_router.detect_language/describe_language directly rather than
+# relying on real py3langid classification, for the same determinism reason
+# every other direct _FakeProvider-based test in this file avoids the real
+# Gemini/py3langid machinery.
+
+
+def test_triage_answer_outcome_in_wrong_language_is_retried_and_corrected(monkeypatch):
+    from connection_router import triage_all_mode_question
+    import connection_router as connection_router_module
+
+    monkeypatch.setattr(
+        connection_router_module, "detect_language",
+        lambda text: "de" if "Datenbanken" in text else ("en" if text == "how many databases?" else None),
+    )
+    monkeypatch.setattr(
+        connection_router_module, "describe_language",
+        lambda code: {"de": "German", "en": "English"}.get(code, code),
+    )
+    provider = _FakeProvider([
+        '{"action": "answer", "answer": "Sie haben 3 Datenbanken."}',
+        '{"action": "answer", "answer": "You have 3 databases."}',
+    ])
+    candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": []}]
+    result = _drain(triage_all_mode_question(candidates, "how many databases?", provider, client=None, model="m"))
+
+    assert result["outcome"] == "answer"
+    assert result["answer"] == "You have 3 databases."
+    assert len(provider.calls) == 2
+    # The retry actually carried the explicit correction, not just a
+    # coincidental second identical attempt.
+    assert "CORRECTION" in provider.calls[1]["llm_input"]
+    assert "German" in provider.calls[1]["llm_input"]
+
+
+def test_triage_route_outcome_message_in_wrong_language_is_retried_and_corrected(monkeypatch):
+    from connection_router import triage_all_mode_question
+    import connection_router as connection_router_module
+
+    monkeypatch.setattr(
+        connection_router_module, "detect_language",
+        lambda text: "de" if "Datenbanken" in text else ("en" if text == "check the databases" else None),
+    )
+    monkeypatch.setattr(
+        connection_router_module, "describe_language",
+        lambda code: {"de": "German", "en": "English"}.get(code, code),
+    )
+    provider = _FakeProvider([
+        '{"action": "route", "indices": [0], "message": "Prüfe die Datenbanken."}',
+        '{"action": "route", "indices": [0], "message": "Checking the databases."}',
+    ])
+    candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": []}]
+    result = _drain(triage_all_mode_question(candidates, "check the databases", provider, client=None, model="m"))
+
+    assert result["outcome"] == "route"
+    assert result["message"] == "Checking the databases."
+    assert len(provider.calls) == 2
+    assert "CORRECTION" in provider.calls[1]["llm_input"]
+
+
+def test_triage_still_wrong_language_after_retry_fails_without_api_error(monkeypatch):
+    from connection_router import triage_all_mode_question
+    import connection_router as connection_router_module
+
+    # Mirrors _summarize_with_retry's/stream_translation()'s own "never
+    # knowingly serve a response in the wrong language" guarantee: both
+    # attempts wrong-language must fail triage outright (the caller's
+    # existing fixed apology, api_error=False - same bucket as the
+    # unparseable-both-times case), not silently leak the known-wrong text.
+    monkeypatch.setattr(
+        connection_router_module, "detect_language",
+        lambda text: "de" if "Datenbanken" in text else ("en" if text == "how many databases?" else None),
+    )
+    monkeypatch.setattr(
+        connection_router_module, "describe_language",
+        lambda code: {"de": "German", "en": "English"}.get(code, code),
+    )
+    provider = _FakeProvider([
+        '{"action": "answer", "answer": "Sie haben 3 Datenbanken."}',
+        '{"action": "answer", "answer": "Immer noch Datenbanken."}',
+    ])
+    candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": []}]
+    result = _drain(triage_all_mode_question(candidates, "how many databases?", provider, client=None, model="m"))
+
+    assert result == {"outcome": "failed", "api_error": False, "error": None}
+    assert len(provider.calls) == 2
+
+
+def test_triage_route_outcome_with_no_message_never_triggers_a_language_check(monkeypatch):
+    from connection_router import triage_all_mode_question
+    import connection_router as connection_router_module
+
+    # Regression guard: a "route" outcome whose "message" the model simply
+    # omitted (_parse_triage_response already tolerates this - see
+    # test_parse_triage_response_downgrades_a_message_of_just_a_label_line_
+    # to_none above) has no free text to check at all, so detect_language
+    # must never even be called - no wasted retry, no spurious mismatch.
+    detect_calls = []
+
+    def _spy_detect_language(text):
+        detect_calls.append(text)
+        return "en"
+
+    monkeypatch.setattr(connection_router_module, "detect_language", _spy_detect_language)
+    provider = _FakeProvider(['{"action": "route", "indices": [0], "message": "\\n\\n"}'])
+    candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": []}]
+    result = _drain(triage_all_mode_question(candidates, "q", provider, client=None, model="m"))
+
+    assert result["outcome"] == "route"
+    assert result["message"] is None
+    assert len(provider.calls) == 1  # no wasted retry
+    # detect_language is still called once, on the user's own question
+    # (expected_language_code) - just never on the (nonexistent) message.
+    assert detect_calls == ['q']
+
+
 # --- triage_all_mode_question's own retry policy - direct unit tests ---
 #
 # Regression guard for the bug this fixes: the LLM call raising was
@@ -649,8 +772,16 @@ def _schema_fetch_by_url(mapping):
     """Returns a _fetch_database_schema replacement keyed by connection
     url, for monkeypatching db_module._fetch_database_schema - shared
     shape across the tests below that need per-connection full-schema
-    control without a real database connection."""
-    def _fetch(descriptor):
+    control without a real database connection.
+
+    Accepts (and ignores) the real _fetch_database_schema's `deep`
+    keyword - these tests are about triage/routing behavior, not about
+    the shallow-vs-deep content difference itself (that's covered in
+    test_db_schema_fetch.py), so the same mapped text is returned either
+    way; every call site here (both build_router_candidate_summaries'
+    deep=False triage call and every real deep=True generation call)
+    keeps working unchanged."""
+    def _fetch(descriptor, deep=True):
         return mapping[descriptor.get("url")]
     return _fetch
 
@@ -1649,7 +1780,7 @@ def test_all_mode_fetches_schema_for_every_candidate_regardless_of_cache_state(a
 
     fetched_urls = []
 
-    def _fake_fetch(descriptor):
+    def _fake_fetch(descriptor, deep=True):
         fetched_urls.append(descriptor.get("url"))
         if descriptor.get("url") == "postgresql://u:p@host-a:5432/a":
             return "Table: deals\nid INTEGER\n"

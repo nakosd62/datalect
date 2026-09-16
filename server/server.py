@@ -16,6 +16,7 @@ guard, register each blueprint, serve the SPA shell, and run.
 """
 
 import os
+import threading
 
 from flask import send_from_directory
 
@@ -26,6 +27,7 @@ from translate_routes import translate_bp
 from execute_routes import execute_bp
 from chat_history_routes import chat_history_bp
 from report_routes import report_bp
+from db import prefetch_all_preset_schemas
 
 # Auth guard runs before every request (see EXEMPT_ENDPOINTS in auth.py
 # for the routes that skip it).
@@ -61,6 +63,37 @@ def index():
 # in-memory defaults (sqlite3.OperationalError: no such table, caught and
 # logged rather than raised) instead of ever actually persisting.
 state_store.init()
+
+# Kicked off at import time, for the same reason as state_store.init()
+# above (production imports this module under gunicorn, never reaching
+# `__main__` below) - but on a background daemon thread, deliberately NOT
+# a blocking call like state_store.init() just above. Warms every admin-
+# configured preset's schema cache - cached indefinitely, like every
+# schema fetch (see schema_cache.py) - so most requests after boot don't
+# pay a live introspection query. Running it on its own thread instead of
+# inline means the server starts accepting requests immediately rather
+# than making every request wait out however long the slowest preset
+# takes to introspect (observed to be up to about a minute with several
+# presets configured, dominated by whichever single one is slowest, since
+# a blocking call here waits for ALL of them - see
+# prefetch_all_preset_schemas()'s own docstring for why it fetches
+# concurrently across presets in the first place). The tradeoff: a
+# request that picks a preset before its prefetch thread gets to it falls
+# back to fetching that one preset's schema live, inline, itself - exactly
+# the same "fetch it on first use" path a custom connection already goes
+# through today (see get_database_schema()'s cache-miss branch) - so this
+# is a startup-latency/first-request-latency tradeoff, not a correctness
+# one: nothing is different about whether a request eventually gets a
+# working schema, only about which request pays for fetching it. See
+# prefetch_all_preset_schemas()'s own docstring for why a single
+# unreachable preset can't block (or delay) any other preset either.
+# daemon=True so this thread can't keep the process alive on shutdown if
+# it's still mid-fetch against a slow/unreachable preset.
+threading.Thread(
+    target=prefetch_all_preset_schemas,
+    name="startup-schema-prefetch",
+    daemon=True,
+).start()
 
 if __name__ == '__main__':
     # Local/dev entrypoint only now (`run_server.sh`'s

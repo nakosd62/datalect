@@ -356,6 +356,50 @@ def test_get_schema_caps_at_schema_max_tables(monkeypatch):
     assert "1 more table(s) not shown" in schema
 
 
+# --- get_schema_shallow() / get_schema() two-phase split ------------------------
+#
+# mongodb_sql.py has no Phase 2 live-query content of its own (see
+# get_schema_shallow()'s own docstring) - the only difference between the
+# two methods is the shared naming-convention relationship pass, so that's
+# what these tests pin down.
+
+def test_get_schema_shallow_matches_get_schema_when_no_relationships_found():
+    conn = _FakeConnection(
+        tables_rows=[_FakeRow(table_name="widgets")],
+        columns_by_table={"widgets": [_FakeRow(column_name="_id", type_name="VARCHAR", is_nullable="NO")]},
+    )
+    shallow = MongoSqlBackend().get_schema_shallow(conn)
+    deep = MongoSqlBackend().get_schema(conn)
+    assert shallow == deep
+    assert "Likely Relationships" not in deep
+
+
+def test_get_schema_deep_adds_naming_convention_section_that_shallow_omits():
+    conn = _FakeConnection(
+        tables_rows=[_FakeRow(table_name="orders"), _FakeRow(table_name="customers")],
+        columns_by_table={
+            "orders": [
+                _FakeRow(column_name="_id", type_name="VARCHAR", is_nullable="NO"),
+                _FakeRow(column_name="customer_id", type_name="VARCHAR", is_nullable="YES"),
+            ],
+            "customers": [
+                _FakeRow(column_name="_id", type_name="VARCHAR", is_nullable="NO"),
+            ],
+        },
+    )
+    shallow = MongoSqlBackend().get_schema_shallow(conn)
+    deep = MongoSqlBackend().get_schema(conn)
+    assert "Likely Relationships" not in shallow
+    assert "Likely Relationships" in deep
+    assert "orders.customer_id" in deep
+    assert "customers" in deep
+
+
+def test_get_schema_shallow_returns_none_with_no_tables():
+    conn = _FakeConnection(tables_rows=[])
+    assert MongoSqlBackend().get_schema_shallow(conn) is None
+
+
 # --- execute(): read-only enforcement -----------------------------------------
 
 @pytest.mark.parametrize("bad_sql", [

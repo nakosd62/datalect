@@ -6,18 +6,35 @@ backends/mssql.py, driven two ways:
     descriptor's "schema" value is stashed on the returned connection
     (mssql_schema) rather than applied via any session-level statement -
     without opening a real connection.
-  - get_schema()/execute()/identity_label()/cache_key(): against the same
-    psycopg2-shaped fake cursor/connection tests/test_postgres_backend.py
-    uses (helpers.make_fake_mssql_connection, itself built on FakePgCursor) -
+  - _build_shallow_schema_parts()/get_schema_shallow()/get_schema()/
+    execute()/identity_label()/cache_key(): against the same psycopg2-shaped
+    fake cursor/connection tests/test_postgres_backend.py uses
+    (helpers.make_fake_mssql_connection, itself built on FakePgCursor) -
     pytds implements the same PEP 249 DB-API cursor shape, so no
     mssql-specific cursor fake is needed for these, just a connection
     wrapper that also carries the mssql_schema attribute get_schema() reads.
 
-get_schema()'s query order is unconditional for tables/columns, then
-best-effort (try/except) for constraints/views - see backends/mssql.py:
-  1. table names   2. columns   3. constraints (best-effort)   4. views (best-effort)
-No indexes/grants/triggers queries at all (deferred, same status
-backends/oracle.py's/backends/redshift.py's own first-pass gaps have).
+_build_shallow_schema_parts() (called by both get_schema_shallow() and
+get_schema()) issues its queries unconditionally for tables/columns, then
+best-effort (try/except) for every other section - see backends/mssql.py:
+  1. table names        2. columns             3. constraints (best-effort)
+  4. views (best-effort) 5. identity (new)      6. comments (new)
+  7. row count estimates (new)                  8. routines (new)
+  9. session facts/collation (new)              10. grants (new)
+  11. RLS flags (new)                           12. external tables flag (new)
+Indexes/Triggers are still no queries at all (deferred, same status
+backends/oracle.py's/backends/redshift.py's own first-pass gaps have) -
+Grants is no longer deferred, see backends/mssql.py's module docstring for
+why.
+
+get_schema() (deep) then runs _build_shallow_schema_parts() (the twelve
+queries above) and appends its own Phase 2 queries on the same cursor use:
+  per kept table (in order): live COUNT(*), an optional combined MIN()/MAX()
+  query (if it has numeric/date columns), and up to
+  MAX_CATEGORICAL_SAMPLE_COLUMNS_PER_TABLE (cardinality-gate COUNT(DISTINCT),
+  frequent-value TOP-N GROUP BY) query pairs (if it has eligible categorical
+  columns) - see test_get_schema_deep_* below for worked examples of this
+  second phase's exact response queue.
 
 pytds's declared DB-API paramstyle is "pyformat" (confirmed against the
 installed package) - the dynamic IN (...) clause tests below check for
@@ -55,12 +72,32 @@ def _ms(monkeypatch):
     return MssqlBackend(), harness
 
 
-def _schema_responses(table_names, columns_rows, constraints=(), views=()):
+def _schema_responses(
+    table_names, columns_rows, constraints=(), views=(),
+    identity_columns=(), comments=(), row_count_estimates=(), routines=(),
+    session_collation=("SQL_Latin1_General_CP1_CI_AS",), grants=(), rls_flags=(),
+    external_tables=(),
+):
+    """Queues _build_shallow_schema_parts()'s twelve Phase 1 responses in
+    the exact order backends/mssql.py issues them (see this file's module
+    docstring). `session_collation` defaults to a real one-row tuple
+    (like backends/postgres.py's own `session_settings` default) so tests
+    that don't care about the Session line still get harmless, deterministic
+    output rather than needing to pass it every time; `None` simulates the
+    query itself returning zero rows."""
     return [
         ([(n,) for n in table_names], None, -1),
-        (columns_rows, None, -1),
+        (list(columns_rows), None, -1),
         (list(constraints), None, -1),
         (list(views), None, -1),
+        (list(identity_columns), None, -1),
+        (list(comments), None, -1),
+        (list(row_count_estimates), None, -1),
+        (list(routines), None, -1),
+        ([session_collation] if session_collation is not None else [], None, -1),
+        (list(grants), None, -1),
+        (list(rls_flags), None, -1),
+        (list(external_tables), None, -1),
     ]
 
 
@@ -628,6 +665,346 @@ def test_get_schema_table_name_query_uses_top_not_limit():
     table_names_sql, _ = cursor.calls[0]
     assert "TOP (%s)" in table_names_sql
     assert "LIMIT" not in table_names_sql
+
+
+# --- Phase 1 (catalog-only, shallow) new attributes --------------------------
+
+def test_get_schema_shallow_identity_column_marker_renders():
+    conn, cursor = make_fake_mssql_connection(_schema_responses(
+        table_names=["users"],
+        columns_rows=[
+            ("users", "id", "int", "NO", None),
+            ("users", "email", "varchar", "NO", None),
+        ],
+        identity_columns=[("users", "id")],
+    ))
+    backend = MssqlBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "id int NOT NULL IDENTITY" in schema
+    # The non-identity column's own line must not pick up a marker.
+    email_line = [l for l in schema.splitlines() if l.strip().startswith("email")][0]
+    assert "IDENTITY" not in email_line
+
+
+def test_get_schema_shallow_identity_marker_absent_by_default():
+    conn, cursor = make_fake_mssql_connection(_schema_responses(
+        table_names=["customers"],
+        columns_rows=[("customers", "id", "int", "NO", None)],
+    ))
+    backend = MssqlBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "IDENTITY" not in schema
+
+
+def test_get_schema_shallow_comments_render_table_and_column():
+    conn, cursor = make_fake_mssql_connection(_schema_responses(
+        table_names=["orders"],
+        columns_rows=[("orders", "status", "varchar", "NO", None)],
+        comments=[
+            ("orders", None, "Customer purchase orders."),
+            ("orders", "status", "Order lifecycle state."),
+        ],
+    ))
+    backend = MssqlBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "Comments:" in schema
+    assert "[table] orders: Customer purchase orders." in schema
+    assert "[column] orders.status: Order lifecycle state." in schema
+
+
+def test_get_schema_shallow_comments_section_absent_when_no_comments():
+    conn, cursor = make_fake_mssql_connection(_schema_responses(
+        table_names=["orders"],
+        columns_rows=[("orders", "id", "int", "NO", None)],
+        comments=[("orders", None, None), ("orders", "id", "")],
+    ))
+    backend = MssqlBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "Comments:" not in schema
+
+
+def test_get_schema_shallow_row_count_estimate_renders():
+    conn, cursor = make_fake_mssql_connection(_schema_responses(
+        table_names=["orders"],
+        columns_rows=[("orders", "id", "int", "NO", None)],
+        row_count_estimates=[("orders", 1234)],
+    ))
+    backend = MssqlBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "Row count estimates:" in schema
+    assert "orders: ~1234 rows (estimate)" in schema
+
+
+def test_get_schema_shallow_row_count_estimate_skips_null_sum():
+    """SUM(ps.row_count) comes back NULL when a table has no
+    sys.dm_db_partition_stats rows at all (shouldn't normally happen for a
+    real table, but a caller-crafted None must not render "~None rows")."""
+    conn, cursor = make_fake_mssql_connection(_schema_responses(
+        table_names=["fresh_table"],
+        columns_rows=[("fresh_table", "id", "int", "NO", None)],
+        row_count_estimates=[("fresh_table", None)],
+    ))
+    backend = MssqlBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "Row count estimates:" not in schema
+
+
+def test_get_schema_shallow_routines_render_name_and_signature_without_body():
+    conn, cursor = make_fake_mssql_connection(_schema_responses(
+        table_names=["orders"],
+        columns_rows=[("orders", "id", "int", "NO", None)],
+        routines=[
+            ("total_for_customer", "SQL_SCALAR_FUNCTION", "customer_id", 1, "int",
+             "SELECT SUM(amount) FROM orders WHERE customer_id = @customer_id;"),
+        ],
+    ))
+    backend = MssqlBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "Routines:" in schema
+    assert "total_for_customer(customer_id int) [SQL_SCALAR_FUNCTION]" in schema
+    assert "SELECT SUM(amount)" not in schema
+
+
+def test_get_schema_shallow_routines_aggregates_multiple_parameters():
+    conn, cursor = make_fake_mssql_connection(_schema_responses(
+        table_names=["orders"],
+        columns_rows=[("orders", "id", "int", "NO", None)],
+        routines=[
+            ("adjust_price", "SQL_STORED_PROCEDURE", "p_id", 1, "int", None),
+            ("adjust_price", "SQL_STORED_PROCEDURE", "p_amount", 2, "money", None),
+        ],
+    ))
+    backend = MssqlBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "adjust_price(p_id int, p_amount money) [SQL_STORED_PROCEDURE]" in schema
+
+
+def test_get_schema_shallow_session_facts_render_collation():
+    conn, cursor = make_fake_mssql_connection(_schema_responses(
+        table_names=["orders"],
+        columns_rows=[("orders", "id", "int", "NO", None)],
+        session_collation=("Latin1_General_100_CI_AS_SC",),
+    ))
+    backend = MssqlBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "Session: default collation=Latin1_General_100_CI_AS_SC" in schema
+    # No fabricated timezone value - see backends/mssql.py's module
+    # docstring on why this dialect has no real session-timezone concept.
+    assert "timezone" not in schema.lower()
+
+
+def test_get_schema_shallow_grants_render():
+    conn, cursor = make_fake_mssql_connection(_schema_responses(
+        table_names=["orders"],
+        columns_rows=[("orders", "id", "int", "NO", None)],
+        grants=[("app_user", "orders", "SELECT")],
+    ))
+    backend = MssqlBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "Grants:" in schema
+    assert "Grant SELECT on orders to app_user" in schema
+
+
+def test_get_schema_shallow_rls_and_external_table_flags_render_when_true():
+    conn, cursor = make_fake_mssql_connection(_schema_responses(
+        table_names=["accounts", "remote_orders"],
+        columns_rows=[
+            ("accounts", "id", "int", "NO", None),
+            ("remote_orders", "id", "int", "NO", None),
+        ],
+        rls_flags=[("accounts",)],
+        external_tables=[("remote_orders",)],
+    ))
+    backend = MssqlBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "Row-level security / external tables:" in schema
+    assert "accounts: [RLS enabled]" in schema
+    assert "remote_orders: [external table]" in schema
+
+
+def test_get_schema_shallow_rls_section_absent_when_all_flags_false():
+    conn, cursor = make_fake_mssql_connection(_schema_responses(
+        table_names=["accounts"],
+        columns_rows=[("accounts", "id", "int", "NO", None)],
+    ))
+    backend = MssqlBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "Row-level security / external tables:" not in schema
+
+
+# --- get_schema_shallow() must never include Phase 2 (deep-only) content -----
+
+def test_get_schema_shallow_excludes_full_view_and_routine_bodies_and_phase2_sections():
+    conn, cursor = make_fake_mssql_connection(_schema_responses(
+        table_names=["orders"],
+        columns_rows=[
+            ("orders", "id", "int", "NO", None),
+            ("orders", "status", "varchar", "NO", None),
+        ],
+        views=[("v", "SELECT 1 FROM orders")],
+        routines=[("get_total", "SQL_SCALAR_FUNCTION", "p1", 1, "int", "SELECT 1;")],
+    ))
+    backend = MssqlBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "View v" in schema
+    assert "SELECT 1 FROM orders" not in schema
+    assert "View definitions:" not in schema
+    assert "get_total" in schema
+    assert "SELECT 1;" not in schema
+    assert "Routine definitions:" not in schema
+    assert "Live row counts:" not in schema
+    assert "Column value samples:" not in schema
+    assert "Likely relationships" not in schema
+    # Exactly the twelve Phase 1 queries - no Phase 2 query was ever issued.
+    assert len(cursor.calls) == 12
+
+
+# --- get_schema() (deep): Phase 2 additions on top of the shallow content ----
+
+def _base_deep_responses():
+    return _schema_responses(
+        table_names=["orders"],
+        columns_rows=[
+            ("orders", "id", "int", "NO", None),
+            ("orders", "status", "varchar", "NO", None),
+        ],
+        views=[("v", "SELECT 1 FROM orders")],
+        routines=[("get_total", "SQL_SCALAR_FUNCTION", "p1", 1, "int", "SELECT 1;")],
+        row_count_estimates=[("orders", 500)],
+    )
+
+
+def _phase2_sampling_responses():
+    return [
+        ([(42,)], None, -1),                                # live count for orders
+        ([(1, 100)], None, -1),                              # min/max for id
+        ([(2,)], None, -1),                                  # COUNT(DISTINCT status) gate
+        ([("active", 30), ("inactive", 12)], None, -1),      # frequent values for status
+    ]
+
+
+def test_get_schema_deep_is_superset_of_shallow_plus_phase2_sampling():
+    conn, cursor = make_fake_mssql_connection(_base_deep_responses() + _phase2_sampling_responses())
+    backend = MssqlBackend()
+    schema = backend.get_schema(conn)
+
+    # Shallow content still present (Phase 1 catalog-only sections).
+    assert "Table: orders" in schema
+    assert "View v" in schema
+    assert "get_total(p1 int) [SQL_SCALAR_FUNCTION]" in schema
+    assert "~500 rows (estimate)" in schema
+
+    # Phase 2 additions on top.
+    assert "View definitions:" in schema and "View v: SELECT 1 FROM orders" in schema
+    assert "Routine definitions:" in schema and "get_total: SELECT 1;" in schema
+    assert "Live row counts:" in schema and "orders: 42 rows (live, authoritative)" in schema
+    assert "Column value samples:" in schema
+    assert "id: range [1 .. 100]" in schema
+    assert "status: frequent values = active (30), inactive (12)" in schema
+
+    assert len(cursor.calls) == 12 + 4
+
+
+def test_get_schema_deep_skips_frequent_values_for_near_unique_column():
+    """A categorical column whose live COUNT(DISTINCT ...) is at least
+    NEAR_UNIQUE_DISTINCT_RATIO of the table's own live row count is treated
+    as near-unique - sampling "frequent values" for it wouldn't be
+    meaningful, so that column's GROUP BY query must never even be
+    issued."""
+    responses = _base_deep_responses() + [
+        ([(42,)], None, -1),   # live count
+        ([(1, 100)], None, -1),  # min/max for id
+        ([(40,)], None, -1),   # COUNT(DISTINCT status) gate: 40/42 ~ 0.95, near-unique
+        # no frequent-value response queued - it must not be requested
+    ]
+    conn, cursor = make_fake_mssql_connection(responses)
+    backend = MssqlBackend()
+    schema = backend.get_schema(conn)
+    assert "Column value samples:" in schema
+    assert "id: range [1 .. 100]" in schema
+    assert "frequent values" not in schema
+    assert len(cursor.calls) == 12 + 3
+
+
+def test_get_schema_deep_naming_convention_relationships_section():
+    # "varbinary" is deliberately outside both NUMERIC_OR_DATE_TYPES and
+    # CATEGORICAL_TYPES (an ill-fitting type for MIN()/MAX() or a frequent-
+    # value GROUP BY - see those frozensets' own comment), so each table
+    # gets only its live row count query, no sampling - keeping this test
+    # focused on the naming-convention pass alone.
+    responses = _schema_responses(
+        table_names=["customers", "orders"],
+        columns_rows=[
+            ("customers", "id", "varbinary", "NO", None),
+            ("orders", "customer_id", "varbinary", "NO", None),
+        ],
+    ) + [
+        ([(10,)], None, -1),  # live count: customers (no numeric/categorical cols to sample)
+        ([(20,)], None, -1),  # live count: orders
+    ]
+    conn, cursor = make_fake_mssql_connection(responses)
+    backend = MssqlBackend()
+
+    deep = backend.get_schema(conn)
+    assert "Likely relationships (naming convention, unconfirmed):" in deep
+    assert "orders.customer_id -> likely relationship (unconfirmed): references customers" in deep
+
+    # The shallow fetch (fresh cursor/queue) must not include this section.
+    conn2, cursor2 = make_fake_mssql_connection(_schema_responses(
+        table_names=["customers", "orders"],
+        columns_rows=[
+            ("customers", "id", "varbinary", "NO", None),
+            ("orders", "customer_id", "varbinary", "NO", None),
+        ],
+    ))
+    shallow = backend.get_schema_shallow(conn2)
+    assert "Likely relationships" not in shallow
+
+
+def test_get_schema_deep_skips_sampling_for_wide_tables_but_keeps_live_count():
+    """A table with more columns than MAX_COLUMNS_FOR_SAMPLING still gets a
+    live row count, just no per-column sampling - bounding the "explosion of
+    tiny queries" the cap exists to prevent."""
+    from backends.mssql import MAX_COLUMNS_FOR_SAMPLING
+
+    columns_rows = [
+        ("wide", f"col_{i}", "int", "NO", None)
+        for i in range(MAX_COLUMNS_FOR_SAMPLING + 1)
+    ]
+    responses = _schema_responses(
+        table_names=["wide"],
+        columns_rows=columns_rows,
+    ) + [
+        ([(7,)], None, -1),   # live count for wide
+        # no min/max or gate/frequent-value response queued - must not be requested
+    ]
+    conn, cursor = make_fake_mssql_connection(responses)
+    backend = MssqlBackend()
+    schema = backend.get_schema(conn)
+    assert "Live row counts:" in schema and "wide: 7 rows (live, authoritative)" in schema
+    assert "Column value samples:" not in schema
+    assert len(cursor.calls) == 12 + 1
+
+
+def test_get_schema_deep_qualifies_live_row_count_and_sample_lines_when_schema_configured():
+    """Phase 2's own rendered lines (live counts, sample blocks) must be
+    schema-qualified too when an override is configured - not just Phase
+    1's headings - so a query built from this schema text stays consistent
+    throughout (see module docstring's schema-qualification rationale)."""
+    responses = _schema_responses(
+        table_names=["orders"],
+        columns_rows=[("orders", "id", "int", "NO", None)],
+    ) + [
+        ([(5,)], None, -1),     # live count
+        ([(1, 5)], None, -1),   # min/max for id
+    ]
+    conn, cursor = make_fake_mssql_connection(responses, schema="reporting")
+    backend = MssqlBackend()
+    schema = backend.get_schema(conn)
+    assert "reporting.orders: 5 rows (live, authoritative)" in schema
+    assert "Table: reporting.orders" in schema
+    live_count_sql = [c for c, _p in cursor.calls if c.startswith("SELECT COUNT(*)")][0]
+    assert "[reporting].[orders]" in live_count_sql
 
 
 # --- execute ---------------------------------------------------------------------

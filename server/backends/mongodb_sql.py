@@ -105,6 +105,7 @@ import sqlparse
 from .base import (
     Backend, SqlExecutionError, SCHEMA_MAX_TABLE_NAMES_SCANNED, SCHEMA_MAX_TABLES,
     DB_CONNECT_TIMEOUT_SECONDS, cap_kept_tables, cap_schema_text, fetch_capped_rows,
+    find_naming_convention_relationships,
 )
 
 # Matches the first non-comment, non-whitespace keyword of a statement -
@@ -301,19 +302,30 @@ class MongoSqlBackend(Backend):
         except Exception:
             return "Unknown", "Unknown"
 
-    def get_schema(self, connection):
-        """Collection/column introspection via the ODBC driver's own
-        standard catalog functions (SQLTables/SQLColumns, exposed by pyodbc
-        as cursor.tables()/cursor.columns()) rather than any Mongo-specific
-        query - these are part of the ODBC spec itself, not something
-        MongoDB's driver invented, so this works the same way it would for
-        any other ODBC-only dialect this app might add later. MongoDB
-        Atlas SQL exposes each collection as one "table"; a document's
-        nested fields are flattened/typed by the driver's own schema
-        inference (see MongoDB's SQL Interface docs), so a "column" here is
-        really "a field path the driver has already inferred a type for" -
-        this backend has no visibility into (and no need to reproduce)
-        however that inference actually works."""
+    def _build_shallow_schema_parts(self, connection):
+        """Phase 1: collection/column introspection via the ODBC driver's
+        own standard catalog functions (SQLTables/SQLColumns, exposed by
+        pyodbc as cursor.tables()/cursor.columns()) rather than any Mongo-
+        specific query - these are part of the ODBC spec itself, not
+        something MongoDB's driver invented, so this works the same way it
+        would for any other ODBC-only dialect this app might add later.
+        MongoDB Atlas SQL exposes each collection as one "table"; a
+        document's nested fields are flattened/typed by the driver's own
+        schema inference (see MongoDB's SQL Interface docs), so a "column"
+        here is really "a field path the driver has already inferred a
+        type for" - this backend has no visibility into (and no need to
+        reproduce) however that inference actually works.
+
+        Returns (schema_parts, table_columns) - table_columns is
+        {table_name: [column_name, ...]} for get_schema()'s Phase 2 naming-
+        convention pass, built here rather than re-querying cursor.columns()
+        a second time. No other Phase 1 attribute in the shared table
+        (identity markers, comments, row-count estimates, routine
+        signatures, distribution keys, session facts, widened grants,
+        RLS/external flags) has a safe, driver-exposed catalog equivalent
+        here worth fabricating - MongoDB Atlas SQL's ODBC surface is
+        already narrower than a real RDBMS catalog, so this stays scoped to
+        exactly what cursor.tables()/cursor.columns() already gave it."""
         cursor = connection.cursor()
 
         # Phase 1: cheap - just the collection ("table") names, bounded the
@@ -328,7 +340,7 @@ class MongoSqlBackend(Backend):
                 break
 
         if not all_table_names:
-            return None
+            return None, {}
 
         # No date-shard collapsing here (unlike postgres.py/bigquery.py) -
         # date-sharded collection families aren't a convention MongoDB users
@@ -341,13 +353,17 @@ class MongoSqlBackend(Backend):
             kept_names = kept_names[:SCHEMA_MAX_TABLES]
 
         schema_parts = []
+        table_columns = {}
         for table_name in kept_names:
             col_defs = []
+            column_names = []
             for col in cursor.columns(table=table_name):
                 null_str = "NULL" if getattr(col, "is_nullable", "YES") != "NO" else "NOT NULL"
                 col_defs.append(f"  {col.column_name} {col.type_name} {null_str}")
+                column_names.append(col.column_name)
             if col_defs:
                 schema_parts.append(f"Table: {table_name}\n" + "\n".join(col_defs))
+                table_columns[table_name] = column_names
 
         if omitted_count:
             schema_parts.append(
@@ -357,9 +373,40 @@ class MongoSqlBackend(Backend):
             )
 
         cursor.close()
+        return schema_parts, table_columns
 
+    def get_schema_shallow(self, connection):
+        """Phase 1 only. See _build_shallow_schema_parts - MongoDB's ODBC
+        catalog surface has no Phase 2 live-query content worth adding
+        (row counts/sampling would need a live query against a document
+        store, not a cheap catalog stat the way pg_class.reltuples is), so
+        this and get_schema() below differ only by the naming-convention
+        pass, not by any live query."""
+        schema_parts, _table_columns = self._build_shallow_schema_parts(connection)
         if not schema_parts:
             return None
+        return cap_schema_text("\n\n".join(schema_parts))
+
+    def get_schema(self, connection):
+        """Phase 1 + Phase 2. Phase 2 here is just the shared, query-free
+        naming-convention relationship pass (backends/base.py's
+        find_naming_convention_relationships) - see get_schema_shallow()'s
+        own docstring for why nothing else in the Phase 2 attribute list
+        (sampling, min/max, cardinality, live row counts, full view/
+        routine bodies) applies to this backend at all (no views/routines
+        concept, and a live per-collection scan isn't worth adding given
+        how narrow this ODBC surface already is)."""
+        schema_parts, table_columns = self._build_shallow_schema_parts(connection)
+        if not schema_parts:
+            return None
+
+        relationships = find_naming_convention_relationships(table_columns)
+        if relationships:
+            schema_parts.append(
+                "Likely Relationships (naming convention, unconfirmed):\n"
+                + "\n".join(relationships)
+            )
+
         return cap_schema_text("\n\n".join(schema_parts))
 
     def execute(self, connection, sql_text):

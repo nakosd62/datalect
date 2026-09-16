@@ -85,12 +85,67 @@ def _ora(monkeypatch):
     return OracleBackend(), harness
 
 
-def _schema_responses(table_names, columns_rows, constraints=(), views=()):
+def _pad_table_row(t):
+    """A table_names entry may be a plain string (the pre-NUM_ROWS test
+    convention every test predating the row-count-estimate feature already
+    uses) or an explicit (name, num_rows) tuple - padded here to the latter,
+    defaulting num_rows to None (not analyzed / no estimate), so none of
+    those existing tests need to be rewritten just because the table-name
+    query now also selects ALL_TABLES.NUM_ROWS (see backends/oracle.py's
+    _build_shallow_schema_parts) - mirrors test_postgres_backend.py's own
+    _pad_column_row backward-compat trick, applied here to the query whose
+    shape actually changed for this dialect (Oracle folds its row-count
+    estimate into the table-name query itself, unlike Postgres's separate
+    query - see _build_shallow_schema_parts' own comment on why)."""
+    if isinstance(t, tuple):
+        return t
+    return (t, None)
+
+
+def _pad_column_row(row):
+    """A columns_rows tuple may still be the pre-identity 4-tuple
+    (table_name, column_name, data_type, nullable) every test predating the
+    identity-column feature already uses - padded here to the real 5-column
+    shape _build_shallow_schema_parts()'s columns query now selects (...,
+    i.generation_type), defaulting to None (not an identity column), so
+    none of those existing tests need to be rewritten just because a column
+    joined the SELECT list - mirrors test_postgres_backend.py's own
+    _pad_column_row."""
+    row = list(row)
+    while len(row) < 5:
+        row.append(None)
+    return tuple(row)
+
+
+def _schema_responses(
+    table_names, columns_rows, constraints=(), views=(), comments=(), routines=(),
+    session_facts=("+00:00", "AMERICA", "BINARY"), grants=(), external_tables=(),
+):
+    """Response queue matching _build_shallow_schema_parts()'s own fixed,
+    unconditional query order (see backends/oracle.py):
+      1. table names (+ NUM_ROWS)   2. columns (+ identity marker)
+      3. constraints (best-effort)  4. views (best-effort)
+      5. comments (new, best-effort)      6. routines (new, best-effort)
+      7. session facts (new, best-effort) 8. grants (new, best-effort)
+      9. external tables (new, best-effort)
+    get_schema() (deep) then runs these same nine queries via
+    _build_shallow_schema_parts() and appends its own Phase 2 queries on a
+    fresh cursor use (cardinality stats, then per kept table: live count,
+    optional min/max, optional frequent-value queries) - see
+    test_get_schema_deep_* below for worked examples of that second queue.
+    `session_facts=None` omits the single-row response entirely (an empty
+    result set), matching every other best-effort section's "no row(s) at
+    all" shape."""
     return [
-        ([(n,) for n in table_names], None, -1),
-        (columns_rows, None, -1),
+        ([_pad_table_row(t) for t in table_names], None, -1),
+        ([_pad_column_row(r) for r in columns_rows], None, -1),
         (list(constraints), None, -1),
         (list(views), None, -1),
+        (list(comments), None, -1),
+        (list(routines), None, -1),
+        ([session_facts] if session_facts is not None else [], None, -1),
+        (list(grants), None, -1),
+        (list(external_tables), None, -1),
     ]
 
 
@@ -410,10 +465,13 @@ def test_get_schema_survives_constraints_query_failure():
 
         def fetchall(self):
             if "all_tables" in self.calls[-1][0]:
-                return [("ORDERS",)]
+                return [("ORDERS", None)]
             if "all_tab_columns" in self.calls[-1][0]:
-                return [("ORDERS", "ID", "NUMBER", "N")]
+                return [("ORDERS", "ID", "NUMBER", "N", None)]
             return []
+
+        def fetchone(self):
+            return None
 
     class RaisingConnection:
         def cursor(self):
@@ -446,12 +504,15 @@ def test_get_schema_survives_views_query_failure_on_older_oracle_versions():
 
         def fetchall(self):
             if "all_tables" in self.calls[-1][0]:
-                return [("ORDERS",)]
+                return [("ORDERS", None)]
             if "all_tab_columns" in self.calls[-1][0]:
-                return [("ORDERS", "ID", "NUMBER", "N")]
+                return [("ORDERS", "ID", "NUMBER", "N", None)]
             if "all_constraints" in self.calls[-1][0]:
                 return []
             return []
+
+        def fetchone(self):
+            return None
 
     class RaisingConnection:
         def cursor(self):
@@ -509,6 +570,404 @@ def test_get_schema_table_name_query_excludes_mview_iot_and_nested_tables():
     assert "iot_type" in table_names_sql
     assert "nested" in table_names_sql
     assert "FETCH FIRST" in table_names_sql  # Oracle has no LIMIT clause
+
+
+# --- get_schema_shallow() / get_schema() two-phase split: Phase 1 (new) ----------
+
+def test_get_schema_shallow_identity_marker_renders_with_generation_type():
+    conn, cursor = make_fake_pg_connection(_schema_responses(
+        table_names=["USERS"],
+        columns_rows=[
+            ("USERS", "ID", "NUMBER", "N", "ALWAYS"),
+            ("USERS", "EMAIL", "VARCHAR2", "N", None),
+        ],
+    ))
+    backend = OracleBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "ID NUMBER NOT NULL IDENTITY (ALWAYS)" in schema
+    email_line = [l for l in schema.splitlines() if l.strip().startswith("EMAIL")][0]
+    assert "IDENTITY" not in email_line
+
+
+def test_get_schema_shallow_identity_marker_absent_for_old_style_four_tuples():
+    """Old-style 4-tuple columns_rows (predating the identity-column
+    feature) must be padded to "not an identity column" - see
+    _pad_column_row - so no existing test needs rewriting."""
+    conn, cursor = make_fake_pg_connection(_schema_responses(
+        table_names=["CUSTOMERS"],
+        columns_rows=[("CUSTOMERS", "ID", "NUMBER", "N")],
+    ))
+    backend = OracleBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "IDENTITY" not in schema
+
+
+def test_get_schema_shallow_identity_column_query_left_joins_all_tab_identity_cols():
+    conn, cursor = make_fake_pg_connection(_schema_responses(
+        table_names=["USERS"],
+        columns_rows=[("USERS", "ID", "NUMBER", "N", "ALWAYS")],
+    ))
+    backend = OracleBackend()
+    backend.get_schema_shallow(conn)
+    columns_sql, _ = cursor.calls[1]
+    assert "all_tab_identity_cols" in columns_sql
+
+
+def test_get_schema_shallow_comments_render_table_and_column():
+    conn, cursor = make_fake_pg_connection(_schema_responses(
+        table_names=["ORDERS"],
+        columns_rows=[("ORDERS", "STATUS", "VARCHAR2", "N")],
+        comments=[
+            ("ORDERS", None, "Customer purchase orders."),
+            ("ORDERS", "STATUS", "Order lifecycle state."),
+        ],
+    ))
+    backend = OracleBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "Comments:" in schema
+    assert "[table] ORDERS: Customer purchase orders." in schema
+    assert "[column] ORDERS.STATUS: Order lifecycle state." in schema
+
+
+def test_get_schema_shallow_comments_section_absent_when_no_comments():
+    conn, cursor = make_fake_pg_connection(_schema_responses(
+        table_names=["ORDERS"],
+        columns_rows=[("ORDERS", "ID", "NUMBER", "N")],
+        comments=[("ORDERS", None, None), ("ORDERS", "ID", "")],
+    ))
+    backend = OracleBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "Comments:" not in schema
+
+
+def test_get_schema_shallow_row_count_estimate_renders():
+    conn, cursor = make_fake_pg_connection(_schema_responses(
+        table_names=[("ORDERS", 1234)],
+        columns_rows=[("ORDERS", "ID", "NUMBER", "N")],
+    ))
+    backend = OracleBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "Row count estimates:" in schema
+    assert "ORDERS: ~1234 rows (estimate)" in schema
+
+
+def test_get_schema_shallow_row_count_estimate_skips_when_num_rows_is_null():
+    """ALL_TABLES.NUM_ROWS is NULL when DBMS_STATS has never gathered
+    statistics for a table - rendering "~None rows" would be actively
+    misleading, so that table is skipped rather than shown."""
+    conn, cursor = make_fake_pg_connection(_schema_responses(
+        table_names=[("FRESH_TABLE", None)],
+        columns_rows=[("FRESH_TABLE", "ID", "NUMBER", "N")],
+    ))
+    backend = OracleBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "Row count estimates:" not in schema
+
+
+def test_get_schema_shallow_routines_render_signature_without_body():
+    conn, cursor = make_fake_pg_connection(_schema_responses(
+        table_names=["ORDERS"],
+        columns_rows=[("ORDERS", "ID", "NUMBER", "N")],
+        routines=[
+            ("GET_TOTAL", "FUNCTION", None, "NUMBER", 0),
+            ("GET_TOTAL", "FUNCTION", "P1", "NUMBER", 1),
+        ],
+    ))
+    backend = OracleBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "Routines:" in schema
+    assert "GET_TOTAL(P1 NUMBER) -> NUMBER" in schema
+
+
+def test_get_schema_shallow_procedure_routine_has_no_return_arrow():
+    conn, cursor = make_fake_pg_connection(_schema_responses(
+        table_names=["ORDERS"],
+        columns_rows=[("ORDERS", "ID", "NUMBER", "N")],
+        routines=[
+            ("BUMP_COUNTER", "PROCEDURE", "P1", "NUMBER", 1),
+            ("BUMP_COUNTER", "PROCEDURE", "P2", "VARCHAR2", 2),
+        ],
+    ))
+    backend = OracleBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "BUMP_COUNTER(P1 NUMBER, P2 VARCHAR2)" in schema
+    assert "->" not in [l for l in schema.splitlines() if "BUMP_COUNTER" in l][0]
+
+
+def test_get_schema_shallow_routines_scoped_to_standalone_procedures():
+    """procedure_name IS NULL excludes package members - regression guard
+    pinning that filter, since ALL_PROCEDURES also lists each package
+    member with its own non-NULL PROCEDURE_NAME."""
+    conn, cursor = make_fake_pg_connection(_schema_responses(
+        table_names=["ORDERS"],
+        columns_rows=[("ORDERS", "ID", "NUMBER", "N")],
+    ))
+    backend = OracleBackend()
+    backend.get_schema_shallow(conn)
+    routines_sql, _ = cursor.calls[5]
+    assert "procedure_name IS NULL" in routines_sql
+    assert "all_procedures" in routines_sql
+    assert "all_arguments" in routines_sql
+
+
+def test_get_schema_shallow_session_facts_render():
+    conn, cursor = make_fake_pg_connection(_schema_responses(
+        table_names=["ORDERS"],
+        columns_rows=[("ORDERS", "ID", "NUMBER", "N")],
+        session_facts=("-05:00", "AMERICA", "BINARY_CI"),
+    ))
+    backend = OracleBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "Session: timezone=-05:00; territory=AMERICA; sort=BINARY_CI" in schema
+
+
+def test_get_schema_shallow_grants_render():
+    conn, cursor = make_fake_pg_connection(_schema_responses(
+        table_names=["ORDERS"],
+        columns_rows=[("ORDERS", "ID", "NUMBER", "N")],
+        grants=[("APP_USER", "ORDERS", "SELECT")],
+    ))
+    backend = OracleBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "Grants:" in schema
+    assert "Grant SELECT on ORDERS to APP_USER" in schema
+
+
+def test_get_schema_shallow_grants_section_absent_when_no_grants():
+    conn, cursor = make_fake_pg_connection(_schema_responses(
+        table_names=["ORDERS"],
+        columns_rows=[("ORDERS", "ID", "NUMBER", "N")],
+    ))
+    backend = OracleBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "Grants:" not in schema
+
+
+def test_get_schema_survives_grants_query_failure():
+    """Best-effort, mirrors every other new optional section: a role that
+    can't evaluate ALL_TAB_PRIVS still gets every other section, not a
+    failed schema fetch. See backends/oracle.py's Grants section comment
+    for why this was added now (rather than left deferred, as
+    Indexes/Triggers still are)."""
+    class RaisingCursor:
+        def __init__(self):
+            self.calls = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def execute(self, sql, params=None):
+            self.calls.append((sql, params))
+            if "all_tab_privs" in sql:
+                raise Exception("permission denied on ALL_TAB_PRIVS")
+
+        def fetchall(self):
+            sql = self.calls[-1][0]
+            if "all_tables" in sql:
+                return [("ORDERS", None)]
+            if "all_tab_columns" in sql:
+                return [("ORDERS", "ID", "NUMBER", "N", None)]
+            return []
+
+        def fetchone(self):
+            return None
+
+    class RaisingConnection:
+        def cursor(self):
+            return RaisingCursor()
+
+    backend = OracleBackend()
+    schema = backend.get_schema_shallow(RaisingConnection())
+    assert "Table: ORDERS" in schema
+    assert "Grants:" not in schema
+
+
+def test_get_schema_shallow_external_tables_render():
+    conn, cursor = make_fake_pg_connection(_schema_responses(
+        table_names=["EXT_LOGS"],
+        columns_rows=[("EXT_LOGS", "ID", "NUMBER", "N")],
+        external_tables=[("EXT_LOGS",)],
+    ))
+    backend = OracleBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "External tables:" in schema
+    assert "EXT_LOGS: [external table]" in schema
+
+
+def test_get_schema_shallow_never_renders_an_rls_section():
+    """Documents the deliberate skip: Oracle's RLS (VPD) is session/policy-
+    based, not a simple catalog flag the way Postgres's
+    pg_class.relrowsecurity is - see backends/oracle.py's External-tables
+    section comment. No query is ever issued for it, so this is really
+    pinning "no such section exists", not a live behavior toggle."""
+    conn, cursor = make_fake_pg_connection(_schema_responses(
+        table_names=["ORDERS"],
+        columns_rows=[("ORDERS", "ID", "NUMBER", "N")],
+        external_tables=[("ORDERS",)],
+    ))
+    backend = OracleBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "RLS" not in schema
+    assert "Row-level security" not in schema
+
+
+# --- get_schema_shallow() must never include Phase 2 (deep-only) content ---------
+
+def test_get_schema_shallow_excludes_full_view_body_and_phase2_sections():
+    conn, cursor = make_fake_pg_connection(_schema_responses(
+        table_names=["ORDERS"],
+        columns_rows=[
+            ("ORDERS", "ID", "NUMBER", "N"),
+            ("ORDERS", "STATUS", "VARCHAR2", "N"),
+        ],
+        views=[("CUSTOMER_ORDERS", "SELECT * FROM ORDERS JOIN CUSTOMERS ...")],
+    ))
+    backend = OracleBackend()
+    schema = backend.get_schema_shallow(conn)
+    assert "View CUSTOMER_ORDERS" in schema
+    assert "SELECT * FROM ORDERS JOIN CUSTOMERS" not in schema
+    assert "View definitions:" not in schema
+    assert "Live row counts:" not in schema
+    assert "Column value samples:" not in schema
+    assert "Likely relationships" not in schema
+    # Exactly the nine Phase 1 queries - no Phase 2 query was ever issued.
+    assert len(cursor.calls) == 9
+
+
+# --- get_schema() (deep): Phase 2 additions on top of the shallow content --------
+
+def _base_deep_responses():
+    return _schema_responses(
+        table_names=[("ORDERS", 500)],
+        columns_rows=[
+            ("ORDERS", "ID", "NUMBER", "N"),
+            ("ORDERS", "STATUS", "VARCHAR2", "N"),
+        ],
+        views=[("V", "SELECT * FROM ORDERS")],
+    )
+
+
+def _phase2_sampling_responses():
+    return [
+        ([("ORDERS", "STATUS", 5)], None, -1),                 # num_distinct (low cardinality)
+        ([(42,)], None, -1),                                    # live count for ORDERS
+        ([(1, 100)], None, -1),                                 # min/max for ID
+        ([("ACTIVE", 30), ("INACTIVE", 12)], None, -1),         # frequent values for STATUS
+    ]
+
+
+def test_get_schema_deep_is_superset_of_shallow_plus_phase2_sampling():
+    conn, cursor = make_fake_pg_connection(_base_deep_responses() + _phase2_sampling_responses())
+    backend = OracleBackend()
+    schema = backend.get_schema(conn)
+
+    # Shallow content still present (Phase 1 catalog-only sections).
+    assert "Table: ORDERS" in schema
+    assert "View V" in schema
+    assert "~500 rows (estimate)" in schema
+
+    # Phase 2 additions on top.
+    assert "View definitions:" in schema and "View V: SELECT * FROM ORDERS" in schema
+    assert "Live row counts:" in schema and "ORDERS: 42 rows (live, authoritative)" in schema
+    assert "Column value samples:" in schema
+    assert "ID: range [1 .. 100]" in schema
+    assert "STATUS: frequent values = ACTIVE (30), INACTIVE (12)" in schema
+
+    assert len(cursor.calls) == 9 + 4
+
+
+def test_get_schema_deep_skips_frequent_values_for_near_unique_column():
+    """ALL_TAB_COL_STATISTICS.NUM_DISTINCT close to ALL_TABLES.NUM_ROWS
+    means the column is nearly unique - sampling "frequent values" for it
+    wouldn't be meaningful, so that column's GROUP BY query must never even
+    be issued. See _is_near_unique_column's docstring for the ratio math
+    (num_distinct / num_rows >= 0.5, using num_rows=500 from
+    _base_deep_responses)."""
+    responses = _base_deep_responses() + [
+        ([("ORDERS", "STATUS", 480)], None, -1),   # 480/500 = 0.96 -> near-unique
+        ([(42,)], None, -1),                         # live count
+        ([(1, 100)], None, -1),                      # min/max for ID
+        # no frequent-value response queued - it must not be requested
+    ]
+    conn, cursor = make_fake_pg_connection(responses)
+    backend = OracleBackend()
+    schema = backend.get_schema(conn)
+    assert "Column value samples:" in schema
+    assert "ID: range [1 .. 100]" in schema
+    assert "frequent values" not in schema
+    assert len(cursor.calls) == 9 + 3
+
+
+def test_get_schema_deep_naming_convention_relationships_section():
+    responses = _schema_responses(
+        table_names=["CUSTOMERS", "ORDERS"],
+        columns_rows=[
+            ("CUSTOMERS", "ID", "NUMBER", "N"),
+            ("ORDERS", "CUSTOMER_ID", "NUMBER", "N"),
+        ],
+    )
+    conn, cursor = make_fake_pg_connection(responses)
+    backend = OracleBackend()
+
+    deep = backend.get_schema(conn)
+    assert "Likely relationships (naming convention, unconfirmed):" in deep
+    assert "ORDERS.CUSTOMER_ID -> likely relationship (unconfirmed): references CUSTOMERS" in deep
+
+    # The shallow fetch (fresh cursor/queue) must not include this section.
+    conn2, cursor2 = make_fake_pg_connection(_schema_responses(
+        table_names=["CUSTOMERS", "ORDERS"],
+        columns_rows=[
+            ("CUSTOMERS", "ID", "NUMBER", "N"),
+            ("ORDERS", "CUSTOMER_ID", "NUMBER", "N"),
+        ],
+    ))
+    shallow = backend.get_schema_shallow(conn2)
+    assert "Likely relationships" not in shallow
+
+
+def test_get_schema_deep_skips_sampling_for_wide_tables_but_keeps_live_count():
+    """A table with more columns than MAX_COLUMNS_FOR_SAMPLING still gets a
+    live row count, just no per-column sampling - bounding the "explosion of
+    tiny queries" the cap exists to prevent."""
+    from backends.oracle import MAX_COLUMNS_FOR_SAMPLING
+
+    columns_rows = [
+        ("WIDE", f"COL_{i}", "NUMBER", "N")
+        for i in range(MAX_COLUMNS_FOR_SAMPLING + 1)
+    ]
+    responses = _schema_responses(
+        table_names=["WIDE"],
+        columns_rows=columns_rows,
+    ) + [
+        ([], None, -1),        # num_distinct
+        ([(7,)], None, -1),    # live count for WIDE
+        # no min/max response queued - it must not be requested
+    ]
+    conn, cursor = make_fake_pg_connection(responses)
+    backend = OracleBackend()
+    schema = backend.get_schema(conn)
+    assert "Live row counts:" in schema and "WIDE: 7 rows (live, authoritative)" in schema
+    assert "Column value samples:" not in schema
+    assert len(cursor.calls) == 9 + 2
+
+
+def test_get_schema_deep_no_routine_definitions_section_ever():
+    """Oracle has no reusable routine-body text (see
+    _build_shallow_schema_parts' Routines section comment) - unlike Views,
+    there is no Phase 2 "Routine definitions" counterpart at all, even when
+    routines exist."""
+    conn, cursor = make_fake_pg_connection(_schema_responses(
+        table_names=["ORDERS"],
+        columns_rows=[("ORDERS", "ID", "NUMBER", "N")],
+        routines=[("GET_TOTAL", "FUNCTION", None, "NUMBER", 0)],
+    ))
+    backend = OracleBackend()
+    schema = backend.get_schema(conn)
+    assert "Routines:" in schema
+    assert "Routine definitions:" not in schema
 
 
 # --- execute ---------------------------------------------------------------------

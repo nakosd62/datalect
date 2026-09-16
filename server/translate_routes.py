@@ -327,7 +327,7 @@ SUMMARY_RESULTS_MAX_ROWS = int(os.environ.get("SUMMARY_RESULTS_MAX_ROWS", 1000))
 # MAX_TRANSLATION_ATTEMPTS/TRANSLATION_RETRY_DELAY_SECONDS are configurable
 # via env vars (e.g. to tune retry behavior for a noisier rollout without a
 # code change) - same int()/float()-on-getenv pattern as
-# SCHEMA_CACHE_TTL_SECONDS in schema_cache.py. Formerly named
+# backends/base.py's SCHEMA_SHARD_MIN_GROUP_SIZE. Formerly named
 # MAX_GEMINI_ATTEMPTS/GEMINI_RETRY_DELAY_SECONDS - renamed now that they
 # govern both providers' transient-error retries, not just Gemini's; there's
 # no back-compat alias, so an existing deployment setting the old names
@@ -2111,93 +2111,85 @@ def _run_phase_b_fanout(selected_entries, prompts, histories, provider, model, u
 # customer table full of German city/product names) can pull a model's
 # output toward THAT language instead, regardless of how many times the
 # prompt says not to - this has been observed concretely, and reported as
-# happening consistently, with real production traffic. The two functions
-# below add a second, independent layer that doesn't rely on the model
-# choosing to comply: detect the question's actual language up front (so
-# the reminder can name it concretely, e.g. "Respond in German." instead
-# of the vaguer "same language as the question"), and, after the model
-# responds, verify the response is actually in that language - if it
-# isn't, _summarize_with_retry (below) discards the response and retries
-# with an even more forceful, explicit correction rather than silently
-# handing the user a summary in the wrong language.
+# happening consistently, with real production traffic. detect_language/
+# describe_language below (imported from language_detect.py - see that
+# module's own docstring for why this lives in a separate, shared module
+# rather than inline here) add a second, independent layer that doesn't
+# rely on the model choosing to comply: detect the question's actual
+# language up front (so the reminder can name it concretely, e.g. "Respond
+# in German." instead of the vaguer "same language as the question"), and,
+# after the model responds, verify the response is actually in that
+# language - if it isn't, _summarize_with_retry (below) discards the
+# response and retries with an even more forceful, explicit correction
+# rather than silently handing the user a summary in the wrong language.
 #
-# py3langid (a maintained fork of the older, now broken-on-modern-
-# setuptools langid.py/langdetect) is used for this - pure Python, no
-# network access needed at runtime (its language model ships as package
-# data), and fast enough (~0.2ms/call once its model is loaded) to run on
-# every summarization call with no perceptible latency added. Loading its
-# model takes a real ~1s, so it's done exactly ONCE, at import time, via
-# the module-level _LANGUAGE_IDENTIFIER below, not per-request.
-try:
-    from py3langid.langid import LanguageIdentifier as _LangIdentifier, MODEL_FILE as _LANGID_MODEL_FILE
-    # norm_probs=True turns py3langid's raw per-class scores into an
-    # actual normalized probability distribution across all languages it
-    # knows, so `_MIN_LANGUAGE_CONFIDENCE` below is a real, comparable
-    # threshold rather than an arbitrary raw-score cutoff - without this,
-    # a short/degenerate input (e.g. "1", or a bare "SELECT 1") can still
-    # report a "top" language with a raw score that looks confident but
-    # isn't, since the raw scores aren't on a 0-1 scale at all.
-    _LANGUAGE_IDENTIFIER = _LangIdentifier.from_model_file(_LANGID_MODEL_FILE, norm_probs=True)
-except Exception:  # pragma: no cover - defensive only; see _detect_language's docstring
-    logger.warning("py3langid failed to load - summarization language verification disabled", exc_info=True)
-    _LANGUAGE_IDENTIFIER = None
-
-# Deliberately non-exhaustive - just enough of py3langid's ~97 supported
-# codes to give the model a readable name for the languages this app's
-# users are actually likely to write questions in. _describe_language()
-# falls back to the bare code for anything not listed here, which is
-# still meaningful to a model even when it's not friendly to a human
-# skimming logs.
-_LANGUAGE_NAMES = {
-    "en": "English", "es": "Spanish", "de": "German", "fr": "French", "it": "Italian",
-    "pt": "Portuguese", "nl": "Dutch", "sv": "Swedish", "da": "Danish", "no": "Norwegian",
-    "fi": "Finnish", "pl": "Polish", "ru": "Russian", "uk": "Ukrainian", "cs": "Czech",
-    "sk": "Slovak", "ro": "Romanian", "hu": "Hungarian", "el": "Greek", "tr": "Turkish",
-    "ar": "Arabic", "he": "Hebrew", "hi": "Hindi", "bn": "Bengali", "ja": "Japanese",
-    "ko": "Korean", "zh": "Chinese", "vi": "Vietnamese", "th": "Thai", "id": "Indonesian",
-    "bg": "Bulgarian", "hr": "Croatian", "sr": "Serbian", "lt": "Lithuanian", "lv": "Latvian",
-    "et": "Estonian", "fa": "Persian",
-}
-
-# Below this confidence (on py3langid's normalized 0-1 scale), a
-# detection is treated as "unknown" rather than acted on - short or
-# ambiguous text (a two-word question, a bare "SELECT 1", an empty
-# string) genuinely can't be classified reliably, and guessing wrong here
-# would either steer generation toward the wrong language or reject a
-# perfectly correct response, so both call sites below skip the check
-# entirely rather than trust a low-confidence guess.
-_MIN_LANGUAGE_CONFIDENCE = 0.5
+# The exact same gap existed - unfixed, until now - for two OTHER free-text
+# call sites: this file's own main NL-to-SQL translation call (the
+# '*** NO SQL ***' free-text branch - see _no_sql_language_mismatch below
+# and its call site in stream_translation()'s single-connection path), and
+# connection_router.py's triage_all_mode_question ("answer"/"message" -
+# see that function's own use of language_detect.detect_language/
+# describe_language). Both were previously relying on nothing but
+# _COMMON_FORMAT_RULES'/_TRIAGE_SYSTEM_INSTRUCTION's own "write this in the
+# user's language" instruction line, with no verification behind it at all
+# - the identical unverified-instruction gap the summarization fix above
+# was built to close, just never extended to these two call sites until
+# now.
+from language_detect import detect_language as _detect_language, describe_language as _describe_language
 
 
-def _detect_language(text):
-    """Best-effort language code for `text` (py3langid's own code space -
-    mostly ISO 639-1, a handful of 639-3 for languages with no 2-letter
-    code), or None when detection isn't possible: py3langid itself failed
-    to load (see the try/except above - degrades this whole feature to a
-    no-op rather than crashing summarization), `text` is empty/whitespace-
-    only, or the top result's confidence is below _MIN_LANGUAGE_CONFIDENCE."""
-    if _LANGUAGE_IDENTIFIER is None:
+def _no_sql_language_mismatch(generated_sql, expected_language_code):
+    """Returns the language code the free-text portion of `generated_sql`
+    is actually written in, when that confidently differs from
+    `expected_language_code` - or None when there's nothing to flag.
+
+    Added alongside the language-verification machinery above
+    (_detect_language/_summarize_with_retry, originally built for the two
+    post-execution summarization calls - see the section comment above)
+    to close the same gap for the ORIGINAL NL-to-SQL translation call
+    itself: a '*** NO SQL ***'-prefixed free-text reply (a general-
+    knowledge answer, a help-popup request, an error explanation - see
+    _COMMON_FORMAT_RULES) is exactly the kind of prose that can drift into
+    the wrong language under the same "foreign-language data pulls the
+    model along" failure mode the summarization fix was built for - but
+    until this was added, this call site had only a bare system-prompt
+    instruction telling the model to match the user's language, with
+    nothing verifying it actually did. (connection_router.py's
+    triage_all_mode_question has the identical need for its own "answer"/
+    "message" free text, but calls language_detect.detect_language
+    directly rather than through this function - see that module's own
+    docstring for why it can't import from this file at all.)
+
+    Deliberately narrow: only ever checks free text that's already been
+    identified as such by the caller (the '*** NO SQL ***'-stripped
+    portion of a translation response) - it does NOT try to detect whether
+    `generated_sql` itself is a '*** NO SQL ***' reply; the caller
+    (stream_translation()'s single-connection path, which also generates
+    plain SQL with no free text to check at all) checks _NO_SQL_PREFIX_RE
+    itself first. Ordinary generated SQL is never a valid `generated_sql`
+    argument here for that reason - running _detect_language on a SELECT
+    statement is meaningless. SQL comments the model was asked to add
+    (_COMMON_FORMAT_RULES' other named "write this in the user's language"
+    case) are also NOT covered - reliably isolating just the comment text
+    out of a whole SQL script for language detection is separate work;
+    this closes the far more common and more visibly reported gap (a whole
+    free-text reply coming back in the wrong language), not every corner
+    _COMMON_FORMAT_RULES' instruction touches.
+
+    Returns None whenever there's nothing actionable to say:
+    `expected_language_code` is None (detection unavailable/low-confidence
+    on the user's own prompt - see _detect_language's own docstring),
+    `generated_sql` is empty, detection on it is itself unavailable/
+    low-confidence, or it already matches `expected_language_code`."""
+    if expected_language_code is None:
         return None
-    text = (text or "").strip()
+    text = (generated_sql or "").strip()
     if not text:
         return None
-    ranked = _LANGUAGE_IDENTIFIER.rank(text)
-    if not ranked:
-        return None
-    code, confidence = ranked[0]
-    return code if confidence >= _MIN_LANGUAGE_CONFIDENCE else None
-
-
-def _describe_language(code):
-    """Human-readable English name for a _detect_language() code, e.g.
-    "de" -> "German" - used to give the model a concrete, named target
-    ("Respond in German.") instead of only the indirect "same language as
-    the question" framing already in _SUMMARY_SYSTEM_INSTRUCTION/
-    _SINGLE_SUMMARY_SYSTEM_INSTRUCTION. Falls back to the raw code for
-    anything not in the (deliberately non-exhaustive) _LANGUAGE_NAMES map."""
-    if not code:
-        return None
-    return _LANGUAGE_NAMES.get(code.lower(), code)
+    actual_language_code = _detect_language(text)
+    if actual_language_code is not None and actual_language_code != expected_language_code:
+        return actual_language_code
+    return None
 
 
 _SUMMARY_SYSTEM_INSTRUCTION = (
@@ -4313,7 +4305,12 @@ def translate_query():
             # build_llm_input's docstring and each subclass's own).
             new_prompt_content = f"User Request: {prompt}\n\nSQL Query:"
 
-            llm_input = provider.build_llm_input(history, schema_block, new_prompt_content)
+            # Computed once, up front, off the user's own prompt - see
+            # _no_sql_language_mismatch's docstring for the full picture.
+            # None (detection unavailable or too low-confidence) disables
+            # the check entirely below, exactly like every other call site
+            # that threads this through.
+            expected_language_code = _detect_language(prompt)
 
             # The key-ROTATION retry budget (see LlmProvider.
             # supports_key_rotation's docstring) - sized to how many keys
@@ -4350,119 +4347,209 @@ def translate_query():
             start_time = time.perf_counter()
             generated_sql = ""
             usage_info = {}
-            # transient_attempt tracks the SHARED, both-providers budget for
-            # same-key/after-a-delay retries (MAX_TRANSLATION_ATTEMPTS) -
-            # it's advanced only by the "else" (non-rotate) branch below.
-            # The Gemini-only key-rotation budget above is tracked
-            # separately via tried_llm_keys/gemini_key_pool_size, so a run
-            # of 429s doesn't eat into this counter at all, and vice versa.
-            transient_attempt = 1
-            try:
-                while True:
-                    try:
-                        generated_sql, usage_info = provider.call(client, llm_model, llm_input, system_instruction)
-                        break
-                    except Exception as e:
-                        retry_action = provider.classify_error(e)
-                        if retry_action is None:
-                            raise LlmCallFailed(format_llm_error_for_user(provider, llm_model, e, using_byok=bool(byok_key))) from e
-
-                        if retry_action["rotate_key"]:
-                            # Key-rotation budget: one attempt per configured
-                            # key. Checked BEFORE picking the next key (rather
-                            # than relying on pick_api_key's own fallback-to-
-                            # full-pool behavior) so exhaustion is decided here,
-                            # not masked by that fallback.
-                            if len(tried_llm_keys) >= key_pool_size:
+            # Bounded 2-attempt outer loop, same "1 real attempt + 1
+            # corrective retry" budget _summarize_with_retry uses for the
+            # exact same reason (see its own docstring, and
+            # _no_sql_language_mismatch's) - closes the language-
+            # verification gap for THIS call's own free-text replies
+            # ('*** NO SQL ***' answers/help-popup/error text), which
+            # previously had only _COMMON_FORMAT_RULES' bare instruction
+            # and nothing checking whether the model actually followed it.
+            # Ordinary generated SQL (no '*** NO SQL ***' prefix) never
+            # enters the language-mismatch branch below at all - see
+            # _no_sql_language_mismatch's docstring for why that check is
+            # deliberately scoped to free text only.
+            for language_attempt in range(2):
+                llm_input = provider.build_llm_input(history, schema_block, new_prompt_content)
+                # transient_attempt tracks the SHARED, both-providers budget
+                # for same-key/after-a-delay retries (MAX_TRANSLATION_ATTEMPTS)
+                # - it's advanced only by the "else" (non-rotate) branch
+                # below, and reset fresh on each language_attempt: a
+                # language-mismatch retry is a brand new call, not a
+                # continuation of whatever transient-error budget the
+                # previous attempt happened to consume. The Gemini-only
+                # key-rotation budget above is tracked separately via
+                # tried_llm_keys/gemini_key_pool_size, so a run of 429s
+                # doesn't eat into this counter at all, and vice versa.
+                transient_attempt = 1
+                try:
+                    while True:
+                        try:
+                            generated_sql, usage_info = provider.call(client, llm_model, llm_input, system_instruction)
+                            break
+                        except Exception as e:
+                            retry_action = provider.classify_error(e)
+                            if retry_action is None:
                                 raise LlmCallFailed(format_llm_error_for_user(provider, llm_model, e, using_byok=bool(byok_key))) from e
-                            next_key = provider.pick_api_key(exclude=tried_llm_keys)
-                            if next_key != api_key:
-                                api_key = next_key
-                                client = provider.make_client(api_key)
-                            tried_llm_keys.add(api_key)
-                            # No "in %ds" here - a key-rotation retry always
-                            # fires immediately (see _classify_gemini_error's
-                            # comment for why waiting doesn't make sense when
-                            # the next attempt already uses a different key).
+
+                            if retry_action["rotate_key"]:
+                                # Key-rotation budget: one attempt per configured
+                                # key. Checked BEFORE picking the next key (rather
+                                # than relying on pick_api_key's own fallback-to-
+                                # full-pool behavior) so exhaustion is decided here,
+                                # not masked by that fallback.
+                                if len(tried_llm_keys) >= key_pool_size:
+                                    raise LlmCallFailed(format_llm_error_for_user(provider, llm_model, e, using_byok=bool(byok_key))) from e
+                                next_key = provider.pick_api_key(exclude=tried_llm_keys)
+                                if next_key != api_key:
+                                    api_key = next_key
+                                    client = provider.make_client(api_key)
+                                tried_llm_keys.add(api_key)
+                                # No "in %ds" here - a key-rotation retry always
+                                # fires immediately (see _classify_gemini_error's
+                                # comment for why waiting doesn't make sense when
+                                # the next attempt already uses a different key).
+                                logger.warning(
+                                    "%s call failed (%d/%d configured keys tried), rotating API key and retrying immediately: %s",
+                                    provider.name, len(tried_llm_keys), key_pool_size, e
+                                )
+                                # Told to the client before continuing, so
+                                # "retrying..." is visible even though there's no
+                                # delay to speak of.
+                                yield json.dumps({
+                                    "status": "retrying",
+                                    "attempt": len(tried_llm_keys),
+                                    "maxAttempts": key_pool_size,
+                                    "delaySeconds": 0,
+                                    "rotatedKey": True,
+                                }) + "\n"
+                                continue
+
+                            # Shared transient-error budget (both providers).
+                            if transient_attempt >= MAX_TRANSLATION_ATTEMPTS:
+                                raise LlmCallFailed(format_llm_error_for_user(provider, llm_model, e, using_byok=bool(byok_key))) from e
                             logger.warning(
-                                "%s call failed (%d/%d configured keys tried), rotating API key and retrying immediately: %s",
-                                provider.name, len(tried_llm_keys), key_pool_size, e
+                                "%s call failed (attempt %d/%d), retrying in %ds: %s",
+                                provider.name, transient_attempt, MAX_TRANSLATION_ATTEMPTS, retry_action["delay"], e
                             )
-                            # Told to the client before continuing, so
-                            # "retrying..." is visible even though there's no
-                            # delay to speak of.
+                            # Told to the client before sleeping, not after, so
+                            # "retrying..." is visible for the full delay instead of
+                            # appearing right as the next attempt actually fires.
                             yield json.dumps({
                                 "status": "retrying",
-                                "attempt": len(tried_llm_keys),
-                                "maxAttempts": key_pool_size,
-                                "delaySeconds": 0,
-                                "rotatedKey": True,
+                                "attempt": transient_attempt + 1,
+                                "maxAttempts": MAX_TRANSLATION_ATTEMPTS,
+                                "delaySeconds": retry_action["delay"],
+                                "rotatedKey": False,
                             }) + "\n"
+                            transient_attempt += 1
+                            if retry_action["delay"]:
+                                time.sleep(retry_action["delay"])
                             continue
+                except LlmCallFailed as e:
+                    # Every attempt (and, for Gemini, every configured key) is
+                    # exhausted - this is the ONE exception type raised only
+                    # from inside this retry loop, so reaching here means the
+                    # LLM genuinely was called and genuinely never returned
+                    # usable SQL, as opposed to e.g. a schema-fetch failure
+                    # before this loop even started (those fall through to the
+                    # generic `except Exception` below, unlogged, since no LLM
+                    # call was ever attempted for them). A real API failure
+                    # like this is never retried for language reasons - it
+                    # fails outright here exactly as it always has, on either
+                    # language_attempt.
+                    #
+                    # duration is measured from the SAME start_time the success
+                    # path uses (captured once, before this whole outer loop) -
+                    # so, same as a successful later-attempt call, it already
+                    # includes every attempt's own call time plus every
+                    # inter-attempt wait/rotation (transient AND, now,
+                    # language-driven), and nothing from before the loop
+                    # (schema fetch, prompt building) or after it - i.e. only
+                    # time actually spent waiting on the LLM.
+                    duration = round(1000 * (time.perf_counter() - start_time))
+                    error_message = str(e)
+                    # No usage_info was ever populated (it's only ever assigned
+                    # on a successful provider.call() return above), so every
+                    # token count here is a real, honest 0 - not a placeholder
+                    # standing in for tokens that were actually spent.
+                    record_translation(
+                        user_identity, conn_str, prompt, f"TRANSLATION_ERROR ({error_message})", llm_model, duration,
+                        0, 0, 0, 0, 0,
+                    )
+                    yield json.dumps({
+                        'status': 'done',
+                        'success': False,
+                        'error': error_message,
+                    }) + "\n"
+                    return
 
-                        # Shared transient-error budget (both providers).
-                        if transient_attempt >= MAX_TRANSLATION_ATTEMPTS:
-                            raise LlmCallFailed(format_llm_error_for_user(provider, llm_model, e, using_byok=bool(byok_key))) from e
+                if generated_sql.startswith("```"):
+                    lines = generated_sql.splitlines()
+                    if lines[0].startswith("```"):
+                        lines = lines[1:]
+                    if lines and lines[-1].startswith("```"):
+                        lines = lines[:-1]
+                    generated_sql = "\n".join(lines).strip()
+
+                # Language verification - see _no_sql_language_mismatch's
+                # docstring for exactly what this does and doesn't cover.
+                # Only a '*** NO SQL ***' free-text reply is ever checked;
+                # plain generated SQL always falls straight through to
+                # `break` below, unchanged from before this loop existed.
+                stripped_sql = generated_sql.strip()
+                if _NO_SQL_PREFIX_RE.match(stripped_sql):
+                    free_text = _strip_no_sql_prefix(stripped_sql)
+                    actual_language_code = _no_sql_language_mismatch(free_text, expected_language_code)
+                    if actual_language_code is not None:
+                        expected_name = _describe_language(expected_language_code)
+                        actual_name = _describe_language(actual_language_code)
+                        if language_attempt + 1 < 2:
+                            logger.warning(
+                                "Translation free-text reply came back in %s instead of the prompt's own %s "
+                                "(attempt %d/2) - discarding, retrying with an explicit correction",
+                                actual_name, expected_name, language_attempt + 1,
+                            )
+                            # Same "name the mistake and the fix directly"
+                            # shape as _summarize_with_retry's own correction
+                            # addendum - simply re-asking with the identical
+                            # prompt would likely just reproduce the same
+                            # wrong-language answer, since whatever pulled
+                            # the model toward actual_name (usually
+                            # foreign-language schema/data in view) is still
+                            # there.
+                            new_prompt_content = (
+                                f"{new_prompt_content}\n\nCORRECTION: your previous free-text reply to this "
+                                f"exact request was written in {actual_name}, which is WRONG - the request was "
+                                f"in {expected_name}, so any free-text reply (not real generated SQL itself, "
+                                f"which is unaffected) must be written entirely in {expected_name}. Write your "
+                                f"full response again, from scratch, entirely in {expected_name} this time."
+                            )
+                            continue
+                        # The one corrective retry is exhausted and the
+                        # reply STILL came back in the wrong language -
+                        # mirrors _summarize_with_retry's own "never
+                        # knowingly serve a response in the wrong language"
+                        # guarantee: this turn fails outright (an honest,
+                        # specific error) rather than silently showing text
+                        # already confirmed to be in the wrong language.
                         logger.warning(
-                            "%s call failed (attempt %d/%d), retrying in %ds: %s",
-                            provider.name, transient_attempt, MAX_TRANSLATION_ATTEMPTS, retry_action["delay"], e
+                            "Translation free-text reply still came back in %s instead of %s after "
+                            "retrying - failing this turn rather than serving a known-wrong-language response",
+                            actual_name, expected_name,
                         )
-                        # Told to the client before sleeping, not after, so
-                        # "retrying..." is visible for the full delay instead of
-                        # appearing right as the next attempt actually fires.
+                        duration = round(1000 * (time.perf_counter() - start_time))
+                        error_message = (
+                            f"The response kept coming back in {actual_name} instead of {expected_name}, "
+                            f"even after retrying. Try rephrasing your question."
+                        )
+                        # Unlike the LlmCallFailed path above, real usage WAS
+                        # spent (the call itself succeeded, twice) - logged
+                        # honestly rather than as 0s.
+                        record_translation(
+                            user_identity, conn_str, prompt, f"TRANSLATION_ERROR ({error_message})", llm_model,
+                            duration, usage_info.get("input_tokens", 0), usage_info.get("output_tokens", 0),
+                            usage_info.get("total_tokens", 0), usage_info.get("thinking_tokens", 0),
+                            usage_info.get("cached_content_tokens", 0),
+                        )
                         yield json.dumps({
-                            "status": "retrying",
-                            "attempt": transient_attempt + 1,
-                            "maxAttempts": MAX_TRANSLATION_ATTEMPTS,
-                            "delaySeconds": retry_action["delay"],
-                            "rotatedKey": False,
+                            'status': 'done',
+                            'success': False,
+                            'error': error_message,
                         }) + "\n"
-                        transient_attempt += 1
-                        if retry_action["delay"]:
-                            time.sleep(retry_action["delay"])
-                        continue
-            except LlmCallFailed as e:
-                # Every attempt (and, for Gemini, every configured key) is
-                # exhausted - this is the ONE exception type raised only
-                # from inside this retry loop, so reaching here means the
-                # LLM genuinely was called and genuinely never returned
-                # usable SQL, as opposed to e.g. a schema-fetch failure
-                # before this loop even started (those fall through to the
-                # generic `except Exception` below, unlogged, since no LLM
-                # call was ever attempted for them).
-                #
-                # duration is measured from the SAME start_time the success
-                # path uses (captured right before this loop's first
-                # attempt) - so, same as a successful 2nd-attempt call, it
-                # already includes every attempt's own call time plus every
-                # inter-attempt wait/rotation, and nothing from before the
-                # loop (schema fetch, prompt building) or after it - i.e.
-                # only time actually spent waiting on the LLM.
-                duration = round(1000 * (time.perf_counter() - start_time))
-                error_message = str(e)
-                # No usage_info was ever populated (it's only ever assigned
-                # on a successful provider.call() return above), so every
-                # token count here is a real, honest 0 - not a placeholder
-                # standing in for tokens that were actually spent.
-                record_translation(
-                    user_identity, conn_str, prompt, f"TRANSLATION_ERROR ({error_message})", llm_model, duration,
-                    0, 0, 0, 0, 0,
-                )
-                yield json.dumps({
-                    'status': 'done',
-                    'success': False,
-                    'error': error_message,
-                }) + "\n"
-                return
+                        return
+                break
             end_time = time.perf_counter()
-
-            if generated_sql.startswith("```"):
-                lines = generated_sql.splitlines()
-                if lines[0].startswith("```"):
-                    lines = lines[1:]
-                if lines and lines[-1].startswith("```"):
-                    lines = lines[:-1]
-                generated_sql = "\n".join(lines).strip()
 
             duration = round(1000 * (end_time - start_time))
             input_tokens = usage_info.get("input_tokens", 0)

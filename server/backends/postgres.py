@@ -43,7 +43,83 @@ from .base import (
     Backend, SqlExecutionError, SCHEMA_MAX_TABLE_NAMES_SCANNED, SCHEMA_MAX_TABLES,
     DB_CONNECT_TIMEOUT_SECONDS, materialize_ca_cert_tempfile,
     group_date_sharded_tables, cap_kept_tables, cap_schema_text, fetch_capped_rows,
+    find_naming_convention_relationships,
 )
+
+
+def _quote_ident(name):
+    """Double-quotes a Postgres identifier for interpolation into a plain
+    SQL string (escaping an embedded '"' the way Postgres itself expects),
+    for the Phase 2 per-table live-query section below (backends/postgres.py's
+    connect() already has a psycopg2.sql.Identifier-based equivalent for a
+    single SET statement, but the Phase 2 queries below build a handful of
+    genuinely dynamic per-table/per-column statements where a plain string
+    keeps the code readable rather than composing psycopg2.sql.Composed
+    trees). `name` always comes from information_schema/pg_catalog data this
+    same connection already queried (kept_names / column names Phase 1 just
+    fetched) - never from raw user input - so this only needs to be correct,
+    not defend against adversarial identifiers."""
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+# Phase 2 (deep-only) sampling: which information_schema.columns.data_type
+# strings are worth a MIN()/MAX() range query (numeric/date-ish) vs a
+# frequent-value GROUP BY (bounded/categorical-ish) - see get_schema()'s
+# "Column value samples" section below. Deliberately conservative/small
+# lists rather than "everything that isn't the other list" - a data_type
+# this doesn't recognize (e.g. "jsonb", "bytea", an array type, a custom
+# domain/enum) is simply skipped for sampling rather than guessed at, since
+# an ill-fitting MIN()/MAX() or GROUP BY on the wrong shape of column is
+# more likely to error or produce noise than a useful hint.
+NUMERIC_OR_DATE_TYPES = frozenset({
+    "smallint", "integer", "bigint", "decimal", "numeric", "real", "double precision",
+    "date", "timestamp without time zone", "timestamp with time zone",
+    "time without time zone", "time with time zone",
+})
+CATEGORICAL_TYPES = frozenset({"character varying", "character", "text", "boolean", "uuid"})
+
+# Bounds on Phase 2's per-table sampling cost, all deliberately small - see
+# get_schema()'s "Column value samples" section for how each is used.
+# MAX_COLUMNS_FOR_SAMPLING: a table with more columns than this is skipped
+# for sampling entirely (still gets a live row count) - a very wide table
+# sampled column-by-column is exactly the "explosion of tiny queries" this
+# guards against.
+MAX_COLUMNS_FOR_SAMPLING = 25
+# MAX_NUMERIC_COLUMNS_FOR_MINMAX: numeric/date columns beyond this many (in
+# column order) are left out of the single combined MIN()/MAX() query for a
+# table, bounding how wide that one query's SELECT list can get.
+MAX_NUMERIC_COLUMNS_FOR_MINMAX = 15
+# MAX_CATEGORICAL_SAMPLE_COLUMNS_PER_TABLE: at most this many categorical
+# columns (in column order, after the pg_stats near-unique gate below) get
+# their own "frequent values" GROUP BY query per table - each is a separate
+# query (unlike the combined MIN()/MAX() query), so this is what actually
+# bounds query count on a table with many text-ish columns.
+MAX_CATEGORICAL_SAMPLE_COLUMNS_PER_TABLE = 3
+# Matches the "GROUP BY ... ORDER BY COUNT(*) DESC LIMIT 15" shape called
+# for in the plan this implements.
+FREQUENT_VALUES_LIMIT = 15
+
+
+def _is_near_unique_n_distinct(n_distinct):
+    """Gate for whether a categorical column's "frequent values" sample is
+    worth rendering at all, using Postgres's own already-computed planner
+    statistic (`pg_stats.n_distinct`) instead of a live COUNT(DISTINCT ...)
+    scan - see the plan's Phase 2 "Cardinality/distinct-value gating" line.
+    Per Postgres's own documented meaning for this column: a non-negative
+    value is an absolute estimated distinct-value count; a negative value is
+    the negative of the ratio of distinct values to total rows (e.g. -0.9
+    means ~90% of rows have a distinct value - i.e. the column is close to
+    unique). `None` (no ANALYZE has ever run for this column) is treated as
+    "not near-unique" - permissive by design, since the alternative (always
+    skipping an unanalyzed column) would silently hide sampling for a
+    freshly created table forever, and pg_stats itself may never populate on
+    a role that lacks SELECT on the underlying table anyway (in which case
+    the query below already returns nothing for it)."""
+    if n_distinct is None:
+        return False
+    if n_distinct < 0:
+        return n_distinct <= -0.5
+    return n_distinct > 1000
 
 
 def _url_already_specifies_sslrootcert(url):
@@ -157,12 +233,13 @@ class PostgresBackend(Backend):
         different customers' instances) - without the host/port, both
         would resolve to the same schema_cache.py entry, and whichever
         server's schema got fetched first would silently be served back
-        for the *other* server's /api/translate calls too, for up to
-        SCHEMA_CACHE_TTL_SECONDS. Username is still included too (not
-        redundant with host:port/dbname): two different users against the
-        exact same database can legitimately see different
-        information_schema results if their grants differ, so a schema
-        fetched as one user must not be served back for another.
+        for the *other* server's /api/translate calls too, indefinitely
+        (schema_cache.py has no TTL/expiry at all - see its own module
+        docstring), not just for some bounded window. Username is still
+        included too (not redundant with host:port/dbname): two different
+        users against the exact same database can legitimately see
+        different information_schema results if their grants differ, so a
+        schema fetched as one user must not be served back for another.
         Port defaults to Postgres's standard 5432 when the URL omits it
         (e.g. "postgresql://user@host/db") - same default psycopg2/libpq
         themselves fall back to - so an explicit ":5432" and an omitted
@@ -203,8 +280,33 @@ class PostgresBackend(Backend):
                 db_name, username = row[0], row[1]
         return db_name, username
 
-    def get_schema(self, connection):
+    def _build_shallow_schema_parts(self, connection):
+        """Phase 1 (catalog-only, no live queries): every query both
+        get_schema_shallow() and get_schema() (deep) need, run exactly once
+        here and shared by both - see the module-level docstring's note on
+        the two-phase split and backends/base.py's Backend.get_schema()/
+        get_schema_shallow() docstrings for why this split exists at all.
+
+        Returns None if the connection's current_schema() has no BASE TABLE
+        at all (mirrors get_schema()'s old "return None" for that case).
+        Otherwise returns (schema_parts, table_columns, phase2_ctx):
+          - schema_parts: the ordered list of text sections, not yet joined/
+            capped - identical in kind to what get_schema() used to build
+            directly, just returned before the final cap_schema_text() call.
+          - table_columns: {table_name: [column_name, ...]}, scoped to the
+            same bounded kept_names set schema_parts describes - handed to
+            the shared find_naming_convention_relationships() helper by
+            get_schema()'s Phase 2 pass (no extra query needed for that).
+          - phase2_ctx: a dict of raw, already-fetched data Phase 2 wants to
+            reuse without re-querying - kept_names/column_types (for
+            deciding what to sample), and the raw views/routines rows (so
+            get_schema() can render their full body text without a second
+            trip to the database; see the "Views"/"Routines" sections below
+            for why only the *name* is rendered here).
+        """
         schema_parts = []
+        table_columns = {}
+        column_types = {}
 
         with connection.cursor() as cursor:
             # Phase 1: cheap - just the distinct table names, bounded so a
@@ -246,13 +348,20 @@ class PostgresBackend(Backend):
             }
 
             # 1. Tables and Columns - scoped to the bounded kept_names set.
+            # is_identity/identity_generation (new) mark a column as an
+            # auto-generated identity column (Postgres's modern replacement
+            # for the old serial/sequence-default pattern) - see the
+            # "IDENTITY" marker appended to each column's rendered line
+            # below.
             cursor.execute("""
                 SELECT
                     c.table_name,
                     c.column_name,
                     c.data_type,
                     c.is_nullable,
-                    c.column_default
+                    c.column_default,
+                    c.is_identity,
+                    c.identity_generation
                 FROM information_schema.columns c
                 WHERE c.table_schema = current_schema()
                   AND c.table_name = ANY(%s)
@@ -261,12 +370,22 @@ class PostgresBackend(Backend):
             columns_data = cursor.fetchall()
 
             tables = {}
-            for table_name, col_name, data_type, is_nullable, col_default in columns_data:
-                if table_name not in tables:
-                    tables[table_name] = []
+            for row in columns_data:
+                (table_name, col_name, data_type, is_nullable,
+                 col_default, is_identity, identity_generation) = row
+                tables.setdefault(table_name, [])
+                table_columns.setdefault(table_name, []).append(col_name)
+                column_types.setdefault(table_name, {})[col_name] = data_type
                 default_str = f" DEFAULT {col_default}" if col_default else ""
                 null_str = "NULL" if is_nullable == "YES" else "NOT NULL"
-                tables[table_name].append(f"  {col_name} {data_type} {null_str}{default_str}")
+                identity_str = ""
+                if is_identity == "YES":
+                    identity_str = (
+                        f" IDENTITY ({identity_generation})" if identity_generation else " IDENTITY"
+                    )
+                tables[table_name].append(
+                    f"  {col_name} {data_type} {null_str}{default_str}{identity_str}"
+                )
 
             for table_name in kept_names:
                 col_defs = tables.get(table_name)
@@ -350,6 +469,13 @@ class PostgresBackend(Backend):
             # sharded *view* families aren't a thing BigQuery/Postgres users
             # actually do), so leaving this unbounded is intentional, not
             # an oversight.
+            #
+            # Shallow rendering is name-only (no view_definition body) - the
+            # raw rows (including each view's body) are still fetched here
+            # (one query, reused by both phases) and threaded through via
+            # phase2_ctx below so get_schema() (deep) can render the full
+            # body without a second query - see get_schema()'s "View
+            # definitions" section.
             cursor.execute("""
                 SELECT
                     table_name,
@@ -359,17 +485,7 @@ class PostgresBackend(Backend):
             """)
             views = cursor.fetchall()
             if views:
-                # view_definition legitimately comes back NULL from Postgres
-                # (not just an empty string) when the connected role lacks
-                # the privilege to see a given view's definition - the bare
-                # v[1].strip() this used to be raised AttributeError on
-                # that None and aborted schema fetch for the WHOLE
-                # database, not just this one view. `(v[1] or '').strip()`
-                # matches every other backend's own views-section guard
-                # (bigquery.py/databricks.py/mssql.py/mysql.py/oracle.py/
-                # redshift.py/snowflake.py all already do exactly this) -
-                # postgres.py was the one outlier missing it.
-                view_lines = [f"  View {v[0]}: {(v[1] or '').strip()}" for v in views]
+                view_lines = [f"  View {v[0]}" for v in views]
                 schema_parts.append("Views:\n" + "\n".join(view_lines))
 
             # 5. Role Grants
@@ -403,6 +519,315 @@ class PostgresBackend(Backend):
             if triggers:
                 trig_lines = [f"  [{t[0]}] {t[1]} ({t[2]}): {t[3]}" for t in triggers]
                 schema_parts.append("Triggers:\n" + "\n".join(trig_lines))
+
+            # 7. Comments (new) - table and column comments via Postgres's
+            # own catalog-description functions. Best-effort/try-except,
+            # like every new optional section below (mirrors
+            # backends/bigquery.py's own try/except-guarded optional
+            # sections): a role that somehow can't evaluate these still
+            # gets every other section, rather than losing the whole
+            # schema fetch over one cosmetic addition.
+            try:
+                cursor.execute("""
+                    SELECT * FROM (
+                        SELECT c.relname AS table_name, NULL::text AS column_name,
+                               obj_description(c.oid, 'pg_class') AS comment
+                        FROM pg_class c
+                        JOIN pg_namespace n ON n.oid = c.relnamespace
+                        WHERE n.nspname = current_schema() AND c.relname = ANY(%s)
+                        UNION ALL
+                        SELECT c.relname, a.attname, col_description(c.oid, a.attnum)
+                        FROM pg_class c
+                        JOIN pg_namespace n ON n.oid = c.relnamespace
+                        JOIN pg_attribute a ON a.attrelid = c.oid
+                          AND a.attnum > 0 AND NOT a.attisdropped
+                        WHERE n.nspname = current_schema() AND c.relname = ANY(%s)
+                    ) sub
+                    ORDER BY table_name, column_name NULLS FIRST;
+                """, (kept_names, kept_names))
+                comment_lines = []
+                for tbl, col, comment in cursor.fetchall():
+                    if not comment:
+                        continue
+                    if col:
+                        comment_lines.append(f"  [column] {tbl}.{col}: {comment}")
+                    else:
+                        comment_lines.append(f"  [table] {tbl}: {comment}")
+                if comment_lines:
+                    schema_parts.append("Comments:\n" + "\n".join(comment_lines))
+            except Exception:
+                pass
+
+            # 8. Row count estimate (new) - pg_class.reltuples, a free
+            # planner statistic (last ANALYZE's estimate, not a live scan -
+            # see get_schema()'s "Live row counts" section for the
+            # authoritative, deep-only counterpart). A never-analyzed table
+            # reports -1 here (or NULL on very old server versions this app
+            # doesn't otherwise support) - skipped rather than shown as a
+            # misleading "~-1 rows".
+            try:
+                cursor.execute("""
+                    SELECT c.relname, c.reltuples
+                    FROM pg_class c
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = current_schema() AND c.relname = ANY(%s);
+                """, (kept_names,))
+                estimate_lines = []
+                for tbl, reltuples in cursor.fetchall():
+                    if reltuples is None or reltuples < 0:
+                        continue
+                    estimate_lines.append(f"  {tbl}: ~{int(round(reltuples))} rows (estimate)")
+                if estimate_lines:
+                    schema_parts.append("Row count estimates:\n" + "\n".join(estimate_lines))
+            except Exception:
+                pass
+
+            # 9. Routines (new) - existence + signature only, no body (see
+            # get_schema()'s "Routine definitions" section for the full-body
+            # deep-only counterpart, reusing routine_definition fetched here
+            # rather than re-querying it). Not scoped to kept_names (like
+            # Views above) - routines aren't tables and current_schema()
+            # alone already bounds this to the connection's own schema.
+            routines = []
+            try:
+                cursor.execute("""
+                    SELECT r.routine_name,
+                           COALESCE(string_agg(
+                               p.parameter_name || ' ' || p.data_type, ', '
+                               ORDER BY p.ordinal_position
+                           ), '') AS signature,
+                           r.data_type AS return_type,
+                           r.routine_definition
+                    FROM information_schema.routines r
+                    LEFT JOIN information_schema.parameters p
+                      ON p.specific_schema = r.specific_schema
+                     AND p.specific_name = r.specific_name
+                    WHERE r.specific_schema = current_schema()
+                    GROUP BY r.routine_name, r.specific_name, r.data_type, r.routine_definition
+                    ORDER BY r.routine_name;
+                """)
+                routines = cursor.fetchall()
+                if routines:
+                    routine_lines = [f"  {r[0]}({r[1]}) -> {r[2]}" for r in routines]
+                    schema_parts.append("Routines:\n" + "\n".join(routine_lines))
+            except Exception:
+                pass
+
+            # 10. Session timezone / default collation (new) - one line for
+            # the whole connection, not per-table. current_setting('TimeZone')
+            # is the session's effective timezone (what TIMESTAMP WITHOUT
+            # TIME ZONE arithmetic and now()/CURRENT_TIMESTAMP resolve
+            # against); the database's datcollate is its default collation
+            # (affects text ordering/comparison).
+            try:
+                cursor.execute("""
+                    SELECT current_setting('TimeZone'),
+                           (SELECT datcollate FROM pg_database WHERE datname = current_database());
+                """)
+                row = cursor.fetchone()
+                if row:
+                    tz, collation = row[0], row[1]
+                    schema_parts.append(f"Session: timezone={tz}; default collation={collation}")
+            except Exception:
+                pass
+
+            # 11. RLS / federation flags (new) - row-level security (with a
+            # note when it's enabled but has no policies defined, which
+            # means "deny all" rather than "no restriction") and foreign
+            # tables (relkind='f' - an external/federated table, e.g. via
+            # postgres_fdw). Deliberately silent (no line at all) for a
+            # table where every flag is false/absent, per the plan's
+            # "don't render anything ... to avoid noise" instruction.
+            try:
+                cursor.execute("""
+                    SELECT c.relname, c.relrowsecurity, c.relkind,
+                           EXISTS (
+                               SELECT 1 FROM pg_policies p
+                               WHERE p.schemaname = n.nspname AND p.tablename = c.relname
+                           ) AS has_policies
+                    FROM pg_class c
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = current_schema() AND c.relname = ANY(%s);
+                """, (kept_names,))
+                rls_lines = []
+                for tbl, rls_enabled, relkind, has_policies in cursor.fetchall():
+                    annotations = []
+                    if rls_enabled:
+                        annotations.append(
+                            "[RLS enabled, no policies - effectively deny-all]"
+                            if not has_policies else "[RLS enabled]"
+                        )
+                    if relkind == 'f':
+                        annotations.append("[foreign table]")
+                    if annotations:
+                        rls_lines.append(f"  {tbl}: {' '.join(annotations)}")
+                if rls_lines:
+                    schema_parts.append("Row-level security / federation:\n" + "\n".join(rls_lines))
+            except Exception:
+                pass
+
+        phase2_ctx = {
+            "kept_names": kept_names,
+            "column_types": column_types,
+            "views": views,
+            "routines": routines,
+        }
+        return schema_parts, table_columns, phase2_ctx
+
+    def get_schema_shallow(self, connection):
+        built = self._build_shallow_schema_parts(connection)
+        if built is None:
+            return None
+        schema_parts, _table_columns, _phase2_ctx = built
+        if not schema_parts:
+            return None
+        return cap_schema_text("\n\n".join(schema_parts))
+
+    def get_schema(self, connection):
+        built = self._build_shallow_schema_parts(connection)
+        if built is None:
+            return None
+        schema_parts, table_columns, phase2_ctx = built
+        schema_parts = list(schema_parts)
+
+        kept_names = phase2_ctx["kept_names"]
+        column_types = phase2_ctx["column_types"]
+        views = phase2_ctx["views"]
+        routines = phase2_ctx["routines"]
+
+        # Phase 2 (deep-only): full view/routine bodies, reusing the raw
+        # rows _build_shallow_schema_parts already fetched - no re-query.
+        if views:
+            view_lines = [f"  View {v[0]}: {(v[1] or '').strip()}" for v in views]
+            # view_definition legitimately comes back NULL from Postgres
+            # (not just an empty string) when the connected role lacks the
+            # privilege to see a given view's definition - `(v[1] or
+            # '').strip()` matches every other backend's own views-section
+            # guard (see the historical note this replaces, still true
+            # here: a bare v[1].strip() would raise AttributeError on that
+            # None and abort schema fetch for the WHOLE database).
+            schema_parts.append("View definitions:\n" + "\n".join(view_lines))
+
+        routine_body_lines = [
+            f"  {r[0]}: {(r[3] or '').strip()}" for r in routines if (r[3] or "").strip()
+        ]
+        if routine_body_lines:
+            schema_parts.append("Routine definitions:\n" + "\n".join(routine_body_lines))
+
+        with connection.cursor() as cursor:
+            # Cardinality gate for the frequent-value sampling below -
+            # pg_stats.n_distinct is a planner statistic already computed by
+            # Postgres (no live scan) - see _is_near_unique_n_distinct()'s
+            # docstring for exactly what this gates and why.
+            distinct_stats = {}
+            try:
+                cursor.execute("""
+                    SELECT tablename, attname, n_distinct
+                    FROM pg_stats
+                    WHERE schemaname = current_schema()
+                      AND tablename = ANY(%s);
+                """, (kept_names,))
+                for tbl, col, n_distinct in cursor.fetchall():
+                    distinct_stats.setdefault(tbl, {})[col] = n_distinct
+            except Exception:
+                pass
+
+            live_count_lines = []
+            sample_blocks = []
+            for table_name in kept_names:
+                col_types = column_types.get(table_name) or {}
+                if not col_types:
+                    # A kept_names entry cap_kept_tables dropped columns for
+                    # (shouldn't normally happen - kept_names and
+                    # column_types are built from the same query - but
+                    # guards against an empty/omitted table cleanly).
+                    continue
+
+                # Fresh/live row count - authoritative, unlike the Phase 1
+                # reltuples estimate above (which is free but can be stale
+                # until the next ANALYZE/autovacuum).
+                try:
+                    cursor.execute(f"SELECT COUNT(*) FROM {_quote_ident(table_name)};")
+                    row = cursor.fetchone()
+                    if row is not None:
+                        live_count_lines.append(f"  {table_name}: {row[0]} rows (live, authoritative)")
+                except Exception:
+                    pass
+
+                if len(col_types) > MAX_COLUMNS_FOR_SAMPLING:
+                    # Table too wide to sample column-by-column without an
+                    # explosion of tiny queries - still gets its live count
+                    # above, just no per-column sampling below.
+                    continue
+
+                numeric_cols = [
+                    c for c, t in col_types.items() if t in NUMERIC_OR_DATE_TYPES
+                ][:MAX_NUMERIC_COLUMNS_FOR_MINMAX]
+                categorical_cols = [c for c, t in col_types.items() if t in CATEGORICAL_TYPES]
+
+                table_sample_lines = []
+
+                # Min/max, all eligible numeric/date columns in one combined
+                # query per table (bounded by MAX_NUMERIC_COLUMNS_FOR_MINMAX)
+                # rather than one query per column.
+                if numeric_cols:
+                    try:
+                        select_parts = ", ".join(
+                            f'MIN({_quote_ident(c)}) AS "{c}__min", MAX({_quote_ident(c)}) AS "{c}__max"'
+                            for c in numeric_cols
+                        )
+                        cursor.execute(f"SELECT {select_parts} FROM {_quote_ident(table_name)};")
+                        row = cursor.fetchone()
+                        if row is not None:
+                            for i, c in enumerate(numeric_cols):
+                                min_v, max_v = row[2 * i], row[2 * i + 1]
+                                table_sample_lines.append(f"    {c}: range [{min_v} .. {max_v}]")
+                    except Exception:
+                        pass
+
+                # Frequent values - one query per eligible categorical
+                # column (capped at MAX_CATEGORICAL_SAMPLE_COLUMNS_PER_TABLE
+                # per table), skipping any column pg_stats says is close to
+                # unique (see _is_near_unique_n_distinct).
+                eligible_categorical = []
+                for c in categorical_cols:
+                    n_distinct = distinct_stats.get(table_name, {}).get(c)
+                    if _is_near_unique_n_distinct(n_distinct):
+                        continue
+                    eligible_categorical.append(c)
+                    if len(eligible_categorical) >= MAX_CATEGORICAL_SAMPLE_COLUMNS_PER_TABLE:
+                        break
+
+                for c in eligible_categorical:
+                    try:
+                        cursor.execute(
+                            f"SELECT {_quote_ident(c)}, COUNT(*) FROM {_quote_ident(table_name)} "
+                            f"GROUP BY {_quote_ident(c)} ORDER BY COUNT(*) DESC LIMIT {FREQUENT_VALUES_LIMIT};"
+                        )
+                        freq_rows = cursor.fetchall()
+                        if freq_rows:
+                            freq_text = ", ".join(f"{val} ({cnt})" for val, cnt in freq_rows)
+                            table_sample_lines.append(f"    {c}: frequent values = {freq_text}")
+                    except Exception:
+                        pass
+
+                if table_sample_lines:
+                    sample_blocks.append(f"  Table: {table_name}\n" + "\n".join(table_sample_lines))
+
+            if live_count_lines:
+                schema_parts.append("Live row counts:\n" + "\n".join(live_count_lines))
+            if sample_blocks:
+                schema_parts.append("Column value samples:\n" + "\n\n".join(sample_blocks))
+
+        # Naming-convention relationship pass (shared helper, no new SQL) -
+        # pure heuristic over table_columns, which _build_shallow_schema_parts
+        # already assembled from Phase 1's own column query.
+        relationships = find_naming_convention_relationships(table_columns)
+        if relationships:
+            schema_parts.append(
+                "Likely relationships (naming convention, unconfirmed):\n"
+                + "\n".join(f"  {r}" for r in relationships)
+            )
 
         if not schema_parts:
             return None

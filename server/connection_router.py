@@ -42,6 +42,13 @@ import re
 import time
 
 from app_config import logger, MAX_IN_SCOPE_CONNECTIONS, MAX_TRANSLATION_ATTEMPTS, TRANSLATION_RETRY_DELAY_SECONDS
+# Shared with translate_routes.py's own language-verification machinery
+# (_no_sql_language_mismatch/_summarize_with_retry there) - see
+# language_detect.py's own module docstring for why this lives in its own
+# standalone module rather than either file importing from the other
+# (translate_routes.py already imports FROM this module, so the reverse
+# would be circular).
+from language_detect import detect_language, describe_language
 
 # How many of a session's in-scope connections a single question's Phase A
 # routing may ever select at once - the same MAX_IN_SCOPE_CONNECTIONS cap
@@ -553,11 +560,21 @@ def triage_all_mode_question(candidate_summaries, user_question, provider, clien
     calls format_llm_error_for_user() itself (it returns the raw
     exception via "error" instead - see above), so unlike that function
     it has nothing else to do with the flag."""
-    llm_input = provider.build_llm_input(
-        history or [],
-        _build_candidate_schema_block(candidate_summaries),
-        _build_candidate_question_prompt(user_question),
-    )
+    # Mutable - a language-mismatch retry (see below) appends a correction
+    # onto this exact string for the next attempt, same "rebuild the
+    # prompt content, not just re-ask unchanged" approach translate_routes.py's
+    # _summarize_with_retry/stream_translation() use for the identical gap.
+    question_prompt_content = _build_candidate_question_prompt(user_question)
+    schema_block = _build_candidate_schema_block(candidate_summaries)
+
+    # Computed once, up front, off the user's own question - see
+    # language_detect.detect_language's own docstring, and
+    # translate_routes.py's _no_sql_language_mismatch (this function's
+    # sibling fix for the exact same previously-unverified-instruction gap)
+    # for the fuller picture. None (detection unavailable or too
+    # low-confidence) disables the check below entirely, same as every
+    # other call site that threads this through.
+    expected_language_code = detect_language(user_question)
 
     if api_key is None:
         api_key = provider.pick_api_key()
@@ -568,6 +585,13 @@ def triage_all_mode_question(candidate_summaries, user_question, provider, clien
     last_error = None
     api_error = False
     for attempt in range(2):
+        # Rebuilt every attempt (cheap - just string formatting) rather
+        # than once up front, so a language-mismatch retry's corrected
+        # question_prompt_content actually reaches the model - an
+        # unparseable-response retry rebuilds an unchanged llm_input here
+        # too, which is harmless (functionally identical to the old
+        # build-once behavior for that case).
+        llm_input = provider.build_llm_input(history or [], schema_block, question_prompt_content)
         text = None
         transient_attempt = 1
         while True:
@@ -639,8 +663,70 @@ def triage_all_mode_question(candidate_summaries, user_question, provider, clien
 
         parsed = _parse_triage_response(text, len(candidate_summaries), max_connections)
         if parsed is not None:
-            parsed["usage"] = usage
-            return parsed
+            # Language verification - mirrors translate_routes.py's
+            # _no_sql_language_mismatch for triage's own free text:
+            # "answer" for outcome 1, "message" for outcome 2
+            # ("database_prompts" is internal, per-connection instructions
+            # the end user never sees - never checked here, see
+            # _TRIAGE_SYSTEM_INSTRUCTION). A "route" outcome's "message"
+            # being None (the model omitted it - _parse_triage_response
+            # already tolerates that) has no free text to check at all, so
+            # it's never flagged - the caller already has its own
+            # server-built fallback sentence for exactly that case.
+            free_text = parsed["answer"] if parsed["outcome"] == "answer" else parsed.get("message")
+            actual_language_code = None
+            if free_text and expected_language_code is not None:
+                detected = detect_language(free_text)
+                if detected is not None and detected != expected_language_code:
+                    actual_language_code = detected
+
+            if actual_language_code is None:
+                parsed["usage"] = usage
+                return parsed
+
+            expected_name = describe_language(expected_language_code)
+            actual_name = describe_language(actual_language_code)
+            if attempt + 1 < 2:
+                logger.warning(
+                    "Connection triage response came back in %s instead of the question's own %s "
+                    "(attempt %d/2) - discarding, retrying with an explicit correction",
+                    actual_name, expected_name, attempt + 1,
+                )
+                last_error = f"response was written in {actual_name} instead of {expected_name}"
+                api_error = False
+                # Same "name the mistake and the fix directly" shape as
+                # _summarize_with_retry's/stream_translation()'s own
+                # correction addendum - simply re-asking with the identical
+                # prompt would likely just reproduce the same wrong-
+                # language answer, since whatever pulled the model toward
+                # actual_name (usually foreign-language table/dialect names
+                # in the candidate list) is still there.
+                question_prompt_content = (
+                    f"{question_prompt_content}\n\nCORRECTION: your previous response to this exact "
+                    f"question was written in {actual_name}, which is WRONG - the question was in "
+                    f"{expected_name}, so your \"answer\"/\"message\" free text must be written entirely "
+                    f"in {expected_name} this time (this applies only to that free text - \"indices\"/"
+                    f"\"database_prompts\" are unaffected). Write your full response again, from "
+                    f"scratch, entirely in {expected_name} this time."
+                )
+                continue
+            # The one corrective retry is exhausted and the response STILL
+            # came back in the wrong language - mirrors
+            # _summarize_with_retry's/stream_translation()'s own "never
+            # knowingly serve a response in the wrong language" guarantee:
+            # counts as an overall triage failure (the caller's existing
+            # fixed apology text, api_error=False - same "genuinely nothing
+            # more useful to try" bucket the unparseable-both-times case
+            # already uses) rather than silently returning text already
+            # confirmed to be in the wrong language.
+            logger.warning(
+                "Connection triage response still came back in %s instead of %s after retrying - "
+                "failing triage rather than serving a known-wrong-language response",
+                actual_name, expected_name,
+            )
+            last_error = f"response was still written in {actual_name} instead of {expected_name} after retrying"
+            api_error = False
+            break
         last_error = f"unparseable triage response: {text!r}"
         api_error = False
 

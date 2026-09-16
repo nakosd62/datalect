@@ -47,9 +47,8 @@ web app backed by a small Flask API.
 1. You type a question into the **NL prompt** box (or click one of the
    **Quick prompts** chips to try it immediately).
 2. The server introspects your target database's `public` schema
-   (cached indefinitely per connection, per process — see
-   [Schema caching](#schema-caching)) and sends it, your prompt, and
-   recent chat history to whichever LLM
+   (cached for a few minutes — see [`SCHEMA_CACHE_TTL_SECONDS`](#configuration))
+   and sends it, your prompt, and recent chat history to whichever LLM
    provider/model your session currently has selected — Gemini by
    default, or Claude/OpenAI if you've switched (see
    [Model selection UI](#model-selection-ui)).
@@ -337,37 +336,6 @@ those are saved per-user (see [Data persistence](#data-persistence)) and
 are **not** available to anonymous users. There's currently no admin-preset
 path for Snowflake — see `config_routes.py`'s module docstring.
 
-### Schema caching
-
-Every connection's introspected schema is cached **indefinitely** once
-fetched — there's no TTL/expiry env var to tune (`schema_cache.py` has no
-expiry concept at all). A connection's schema only ever changes via:
-
-- **A server restart**, which warms and caches every admin-configured
-  preset's schema again at startup (see `db.py`'s
-  `prefetch_all_preset_schemas()`), on a background thread so the server
-  starts accepting requests immediately rather than waiting on it (see
-  `server.py`'s own comment above that call) — a request that picks a
-  preset before its own prefetch has run just fetches (and caches) it live
-  instead, exactly like a custom connection's first use. A preset that's
-  briefly unreachable at boot just gets fetched (and cached) on its first
-  successful real request instead, with no separate action needed.
-- **Saving a custom connection whose config actually changes** — editing
-  an existing connection's fields, or switching the active connection to
-  a different one — immediately drops the old cached entry and refetches
-  a fresh one as part of that same `/api/config` save (see
-  `config_routes.py`'s "the DB connection is changing" branch), rather
-  than waiting for the next `/api/translate` call to warm it lazily. If
-  that refetch fails, nothing is cached for it — never the old, no-longer
-  -applicable schema.
-- **The "Refresh Schema" button** next to a saved custom connection in the
-  DB connections dialog, which force-fetches and re-caches it on the spot.
-- **The in-conversation "refresh schema" checkbox** in a translate
-  request, for either a preset or a custom connection.
-
-All of these replace the cached entry outright; whatever's fetched then
-stays cached until the next explicit refresh or restart.
-
 ### Multi-database question answering
 
 The connection badge is a radio choice between a **single active
@@ -485,6 +453,7 @@ recycled at any time — see the `RuntimeError` in
 | Variable | Default | Purpose |
 |---|---|---|
 | `LOG_LEVEL` | `INFO` | Log level for the app's own `"ydyl"` logger. Third-party library loggers stay at `WARNING` regardless. |
+| `SCHEMA_CACHE_TTL_SECONDS` | `300` | How long introspected schema text is cached per connection before being re-fetched. |
 | `CRBOT_HOSTNAME` | `0.0.0.0` | Host to bind when running via `python server/server.py` directly. |
 | `CRBOT_PORT` | `3000` | Port to bind when running via `python server/server.py` directly. |
 
