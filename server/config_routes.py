@@ -644,6 +644,38 @@ _CUSTOM_MONGODB_SQL_MISSING_FIELDS_ERROR = (
 )
 
 
+def _timeout_override_kwargs(source):
+    """Returns {"connect_timeout_seconds": ..., "execute_timeout_seconds": ...}
+    - only the keys `source` (a POST body's top-level fields, or one item
+    of its `custom_databases` list) actually supplied a non-blank value
+    for - meant to be spread (**_timeout_override_kwargs(...)) directly
+    into whichever dialect-specific config/db_config dict literal a caller
+    below is building, the same "optional, dialect-agnostic, spread into
+    every branch's own dict" role app_config.py's DATABASE_PRESETS_FILE
+    loader's include_in_all_mode plays for CONFIGURED_DBS entries.
+
+    These are the one custom-connection-side counterpart to that presets-
+    file feature (see its own comment for the full explanation): a
+    per-dataset override for backends/base.py's DB_CONNECT_TIMEOUT_SECONDS
+    and execute_routes.py's SQL_EXECUTE_TIMEOUT_SECONDS, for a user's own
+    saved connection to a database known to be reliably slower (or that
+    should fail faster) than every other one they've configured. Left as
+    whatever raw value the request body held (a JSON number, in practice,
+    from the config modal's own <input type="number">) rather than
+    coerced/validated here - backends/base.py's resolve_timeout_seconds()
+    is the single place that actually parses either value, at the point
+    of use, falling back silently to the shared env var default for
+    anything blank or unparseable. Never raises."""
+    overrides = {}
+    connect_timeout_seconds = source.get('connect_timeout_seconds')
+    if connect_timeout_seconds not in (None, ''):
+        overrides['connect_timeout_seconds'] = connect_timeout_seconds
+    execute_timeout_seconds = source.get('execute_timeout_seconds')
+    if execute_timeout_seconds not in (None, ''):
+        overrides['execute_timeout_seconds'] = execute_timeout_seconds
+    return overrides
+
+
 def _parse_incoming_connection(data, user_identity):
     """Builds (db_type, db_url, db_config, error) from a POST body's
     top-level active-connection fields, for a user's own CUSTOM connection
@@ -669,6 +701,15 @@ def _parse_incoming_connection(data, user_identity):
     required account/user/warehouse/database and/or a credential (see
     module docstring)."""
     db_type = (data.get('database_type') or 'postgres').strip().lower()
+    # Optional, dialect-agnostic per-connection overrides for the two
+    # app-wide timeouts (backends/base.py's DB_CONNECT_TIMEOUT_SECONDS,
+    # execute_routes.py's SQL_EXECUTE_TIMEOUT_SECONDS) - see
+    # _timeout_override_kwargs()'s own docstring. Computed once here (not
+    # per-branch) and spread (**timeout_overrides) into every branch's own
+    # db_config dict literal below, the same "read once, apply everywhere"
+    # treatment app_config.py's DATABASE_PRESETS_FILE loader gives its own
+    # dialect-agnostic optional fields.
+    timeout_overrides = _timeout_override_kwargs(data)
 
     if db_type == 'bigquery':
         project_id = (data.get('project_id') or '').strip()
@@ -676,7 +717,7 @@ def _parse_incoming_connection(data, user_identity):
         if not (project_id and dataset):
             return db_type, None, {}, None
         db_url = _bigquery_identity(project_id, dataset)
-        db_config = {"project_id": project_id, "dataset": dataset}
+        db_config = {"project_id": project_id, "dataset": dataset, **timeout_overrides}
 
         # A user's own connection: both fields are required, always
         # explicit, never inferred from the other or from a preset/app
@@ -707,7 +748,10 @@ def _parse_incoming_connection(data, user_identity):
         if not (account and user and warehouse and database):
             return db_type, None, {}, None
         db_url = _snowflake_identity(account, database, schema)
-        db_config = {"account": account, "user": user, "warehouse": warehouse, "database": database}
+        db_config = {
+            "account": account, "user": user, "warehouse": warehouse, "database": database,
+            **timeout_overrides,
+        }
         if schema:
             db_config["schema"] = schema
         if role:
@@ -742,7 +786,7 @@ def _parse_incoming_connection(data, user_identity):
         if not (server_hostname and http_path):
             return db_type, None, {}, None
         db_url = _databricks_identity(server_hostname, http_path)
-        db_config = {"server_hostname": server_hostname, "http_path": http_path}
+        db_config = {"server_hostname": server_hostname, "http_path": http_path, **timeout_overrides}
         if catalog:
             db_config["catalog"] = catalog
         if schema:
@@ -784,7 +828,7 @@ def _parse_incoming_connection(data, user_identity):
             port = 1521
         service_name_or_sid = service_name or sid
         db_url = _oracle_identity(host, port, service_name_or_sid)
-        db_config = {"host": host, "port": port, "user": user}
+        db_config = {"host": host, "port": port, "user": user, **timeout_overrides}
         if service_name:
             db_config["service_name"] = service_name
         else:
@@ -829,7 +873,7 @@ def _parse_incoming_connection(data, user_identity):
         except (TypeError, ValueError):
             port = 5439
         db_url = _redshift_identity(host, port, database)
-        db_config = {"host": host, "port": port, "database": database, "user": user}
+        db_config = {"host": host, "port": port, "database": database, "user": user, **timeout_overrides}
         if schema:
             db_config["schema"] = schema
 
@@ -867,7 +911,7 @@ def _parse_incoming_connection(data, user_identity):
         except (TypeError, ValueError):
             port = 1433
         db_url = _mssql_identity(host, port, database)
-        db_config = {"host": host, "port": port, "database": database, "user": user}
+        db_config = {"host": host, "port": port, "database": database, "user": user, **timeout_overrides}
         if schema:
             db_config["schema"] = schema
         if use_encrypt is not None:
@@ -909,7 +953,7 @@ def _parse_incoming_connection(data, user_identity):
         if not spreadsheet_id:
             return db_type, None, {}, None
         db_url = _sheets_identity(spreadsheet_id, tab_name)
-        db_config = {"spreadsheet_id": spreadsheet_id, "tab_name": tab_name}
+        db_config = {"spreadsheet_id": spreadsheet_id, "tab_name": tab_name, **timeout_overrides}
         # Optional, unlike every other credentialed dialect above: a
         # missing credential here is the normal public-sheet case, not an
         # error - see backends/sheets.py's module docstring. Unconditional
@@ -943,7 +987,7 @@ def _parse_incoming_connection(data, user_identity):
         # above.
         if not (url and database and user):
             return db_type, None, {}, None
-        db_config = {"database": database, "user": user}
+        db_config = {"database": database, "user": user, **timeout_overrides}
 
         # Same policy as Oracle's/Redshift's/SQL Server's custom
         # connections: every field explicit, nothing inferred, nothing
@@ -981,7 +1025,7 @@ def _parse_incoming_connection(data, user_identity):
         # credentials_json above there's no "leave blank to keep the saved
         # one" resolver needed: it's either present in this request or it
         # isn't, same treatment as Oracle's "schema" or Redshift's "schema".
-        db_config = {}
+        db_config = dict(timeout_overrides)
         ca_cert_pem = (data.get('ca_cert_pem') or '').strip()
         if ca_cert_pem:
             db_config["ca_cert_pem"] = ca_cert_pem
@@ -1001,7 +1045,7 @@ def _parse_incoming_connection(data, user_identity):
     # against "public" with no code-side default needed (see
     # backends/postgres.py's module docstring and app_config.py's mirrored
     # preset-side implementation of this same feature).
-    db_config = {}
+    db_config = dict(timeout_overrides)
     ca_cert_pem = (data.get('ca_cert_pem') or '').strip()
     if ca_cert_pem:
         db_config["ca_cert_pem"] = ca_cert_pem
@@ -1047,6 +1091,12 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
     merged = []
     for db in custom_databases_in:
         db_type = (db.get('type') or 'postgres').strip().lower()
+        # See _timeout_override_kwargs()'s own docstring - same
+        # dialect-agnostic per-connection timeout overrides
+        # _parse_incoming_connection above spreads into its own db_config
+        # literals, spread into this row's own config literal below
+        # instead.
+        timeout_overrides = _timeout_override_kwargs(db)
         if db_type == 'bigquery':
             project_id = (db.get('project_id') or '').strip()
             dataset = (db.get('dataset') or '').strip()
@@ -1066,6 +1116,7 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
                 "dataset": dataset,
                 "credentials_json": credentials_json,
                 "billing_project_id": billing_project_id,
+                **timeout_overrides,
             }
             name = db.get("name") or dataset or "Custom BigQuery"
             merged.append({
@@ -1097,7 +1148,10 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
             if not (password or private_key):
                 # Incomplete - not ready to save yet (see docstring above).
                 continue
-            config = {"account": account, "user": user, "warehouse": warehouse, "database": database}
+            config = {
+                "account": account, "user": user, "warehouse": warehouse, "database": database,
+                **timeout_overrides,
+            }
             if schema:
                 config["schema"] = schema
             if role:
@@ -1131,7 +1185,10 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
             if not access_token:
                 # Incomplete - not ready to save yet (see docstring above).
                 continue
-            config = {"server_hostname": server_hostname, "http_path": http_path, "access_token": access_token}
+            config = {
+                "server_hostname": server_hostname, "http_path": http_path, "access_token": access_token,
+                **timeout_overrides,
+            }
             if catalog:
                 config["catalog"] = catalog
             if schema:
@@ -1167,7 +1224,7 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
             if not password:
                 # Incomplete - not ready to save yet (see docstring above).
                 continue
-            config = {"host": host, "port": port, "user": user}
+            config = {"host": host, "port": port, "user": user, **timeout_overrides}
             if service_name:
                 config["service_name"] = service_name
             else:
@@ -1205,7 +1262,7 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
             if not password:
                 # Incomplete - not ready to save yet (see docstring above).
                 continue
-            config = {"host": host, "port": port, "database": database, "user": user}
+            config = {"host": host, "port": port, "database": database, "user": user, **timeout_overrides}
             if schema:
                 config["schema"] = schema
             config["password"] = password
@@ -1238,7 +1295,7 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
             if not password:
                 # Incomplete - not ready to save yet (see docstring above).
                 continue
-            config = {"host": host, "port": port, "database": database, "user": user}
+            config = {"host": host, "port": port, "database": database, "user": user, **timeout_overrides}
             if schema:
                 config["schema"] = schema
             if use_encrypt is not None:
@@ -1267,7 +1324,7 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
                 user_identity, spreadsheet_id, tab_name, db.get('credentials_json'),
                 name=name,
             )
-            config = {"spreadsheet_id": spreadsheet_id, "tab_name": tab_name}
+            config = {"spreadsheet_id": spreadsheet_id, "tab_name": tab_name, **timeout_overrides}
             if credentials_json:
                 config["credentials_json"] = credentials_json
             # credentials_json folded into the key (may be None) - unlike
@@ -1302,7 +1359,7 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
             if not password:
                 # Incomplete - not ready to save yet (see docstring above).
                 continue
-            config = {"database": database, "user": user, "password": password}
+            config = {"database": database, "user": user, "password": password, **timeout_overrides}
             name = db.get("name") or database or "Custom MongoDB"
             merged.append({
                 # password folded directly into the key (not via url,
@@ -1335,7 +1392,7 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
             # through as-is, never folded into connection_key (unlike a
             # real credential, it doesn't need to distinguish two
             # otherwise-identical connections from each other).
-            config = {}
+            config = dict(timeout_overrides)
             ca_cert_pem = (db.get('ca_cert_pem') or '').strip()
             if ca_cert_pem:
                 config["ca_cert_pem"] = ca_cert_pem

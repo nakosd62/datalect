@@ -197,6 +197,28 @@ def test_connect_passes_url_and_timeout(monkeypatch):
     assert calls[-1]["autocommit"] is True
 
 
+# Regression coverage for a real bug found while fixing the identical issue
+# in backends/postgres.py/backends/redshift.py: a per-dataset
+# "connect_timeout_seconds" override (resolve_timeout_seconds() - see
+# backends/base.py) always returns a float when an override is actually
+# set, but pyodbc.connect()'s "timeout" kwarg is handled by its C extension
+# via a strict Python int check - passing a float raises "TypeError:
+# 'float' object cannot be interpreted as an integer" before ever
+# attempting to connect. An equality check alone (`== 60`) would NOT have
+# caught this, since 60 == 60.0 in Python - this asserts the actual type
+# pyodbc receives, not just its numeric value.
+def test_connect_timeout_override_is_passed_as_a_real_int_not_a_float(monkeypatch):
+    backend = MongoSqlBackend()
+    calls = _install_fake_pyodbc_connect(monkeypatch, _FakeConnection())
+    backend.connect({
+        "type": "MongoDB", "url": "mongodb://h/?ssl=true",
+        "database": "d", "user": "u", "password": "p",
+        "connect_timeout_seconds": 60,
+    })
+    assert calls[-1]["timeout"] == 60
+    assert isinstance(calls[-1]["timeout"], int)
+
+
 def test_connect_still_accepts_an_older_all_in_one_packed_url(monkeypatch):
     # Backward compatibility: an older saved custom connection/preset from
     # before this dialect had separate database/user/password fields still

@@ -66,7 +66,12 @@ def test_connect_performs_no_http_request(monkeypatch):
 def test_connect_returns_stripped_fields(monkeypatch):
     backend, harness = _sheets(monkeypatch)
     conn = backend.connect({"spreadsheet_id": "  abc123  ", "tab_name": "  Sheet1  "})
-    assert conn == {"spreadsheet_id": "abc123", "tab_name": "Sheet1"}
+    # _connect_timeout_seconds is connect()'s own stashed resolution of the
+    # shared DB_CONNECT_TIMEOUT_SECONDS default (see backends/base.py's
+    # resolve_timeout_seconds()) - present on every connection dict since
+    # this dialect has no separate connect-phase call of its own to attach
+    # a per-dataset override to directly (see connect()'s own comment).
+    assert conn == {"spreadsheet_id": "abc123", "tab_name": "Sheet1", "_connect_timeout_seconds": 10}
 
 
 def test_connect_raises_when_spreadsheet_id_missing(monkeypatch):

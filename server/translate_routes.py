@@ -267,8 +267,8 @@ _COMMON_FORMAT_RULES = (
 # tokens - this is what tripped Claude's 1M-token request limit. This caps
 # how many rows of a PAST turn's results get serialized back into the LLM
 # prompt; it has no effect on what the current turn's results show in the
-# UI. Override via env var if 50 is too aggressive/lenient for your data.
-HISTORY_RESULT_MAX_ROWS = int(os.environ.get("HISTORY_RESULT_MAX_ROWS", 50))
+# UI. Override via env var if 10 is too aggressive/lenient for your data.
+HISTORY_RESULT_MAX_ROWS = int(os.environ.get("HISTORY_RESULT_MAX_ROWS", 10))
 
 # How many conversational turns of history are sent back to the LLM. A
 # "turn" here is a user message + the model's reply to it - 2 entries in
@@ -290,8 +290,8 @@ HISTORY_MAX_TURNS = int(os.environ.get("HISTORY_MAX_TURNS", 10))
 # very wide) query (e.g. a bare `SELECT * FROM huge_table`) could otherwise
 # blow the prompt out to an enormous token count on a single turn, with no
 # history multiplier even needed to get there. Override via env var if
-# 1000 is too aggressive/lenient for your data.
-SUMMARY_RESULTS_MAX_ROWS = int(os.environ.get("SUMMARY_RESULTS_MAX_ROWS", 1000))
+# 100 is too aggressive/lenient for your data.
+SUMMARY_RESULTS_MAX_ROWS = int(os.environ.get("SUMMARY_RESULTS_MAX_ROWS", 100))
 
 # There are two, INDEPENDENT retry mechanisms below, each with its own
 # budget - they used to share one counter (MAX_GEMINI_ATTEMPTS), which

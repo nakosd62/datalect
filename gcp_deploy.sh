@@ -6,6 +6,6 @@ gcloud run deploy ydyl \
 --env-vars-file=env.yaml \
 --service-account=cloudrun-bigquery-sa@grand-cosmos-716.iam.gserviceaccount.com \
 --add-cloudsql-instances=mysql-506101:us-east1:free-trial-first-project \
---cpu=1 --memory=2Gi \
---concurrency=5 --min-instances=1 --max-instances=4 \
+--cpu=1 --memory=1Gi \
+--concurrency=5 --min-instances=1 --max-instances=1 \
 --session-affinity

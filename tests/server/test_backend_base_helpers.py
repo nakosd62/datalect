@@ -22,6 +22,7 @@ from backends.base import (
     schema_text_was_truncated, schema_text_has_omitted_tables,
     find_naming_convention_relationships,
     normalize_cell_value, fetch_capped_rows,
+    resolve_timeout_seconds,
 )
 
 
@@ -478,3 +479,55 @@ def test_fetch_capped_rows_applies_normalize_cell_value_to_every_cell():
     columns, rows, truncated = fetch_capped_rows(cursor, max_rows=10)
     assert rows == [{"price": 9.99, "d": "2024-01-01"}]
     assert isinstance(rows[0]["price"], float)
+
+
+# --- resolve_timeout_seconds() -----------------------------------------------
+# Per-dataset overrides for the two app-wide connection-behavior timeouts
+# (backends/base.py's own DB_CONNECT_TIMEOUT_SECONDS, execute_routes.py's
+# SQL_EXECUTE_TIMEOUT_SECONDS) - see that function's own docstring for the
+# full reasoning. Pure function, no I/O - every case here is exercised
+# directly against a plain dict descriptor.
+
+def test_resolve_timeout_seconds_falls_back_to_default_when_field_missing():
+    assert resolve_timeout_seconds({"type": "postgres"}, "connect_timeout_seconds", 10) == 10
+
+
+def test_resolve_timeout_seconds_falls_back_to_default_for_none_descriptor():
+    assert resolve_timeout_seconds(None, "connect_timeout_seconds", 10) == 10
+
+
+def test_resolve_timeout_seconds_falls_back_to_default_for_blank_string():
+    assert resolve_timeout_seconds({"connect_timeout_seconds": ""}, "connect_timeout_seconds", 10) == 10
+
+
+def test_resolve_timeout_seconds_uses_a_valid_positive_override():
+    assert resolve_timeout_seconds({"connect_timeout_seconds": 25}, "connect_timeout_seconds", 10) == 25
+
+
+def test_resolve_timeout_seconds_accepts_a_numeric_string_override():
+    # A hand-edited DATABASE_PRESETS_FILE entry, or a custom-connection
+    # payload field that happened to arrive as a string rather than a
+    # JSON number - both should resolve the same way a real number does.
+    assert resolve_timeout_seconds({"execute_timeout_seconds": "45"}, "execute_timeout_seconds", 30) == 45.0
+
+
+def test_resolve_timeout_seconds_falls_back_to_default_for_non_numeric_override():
+    assert resolve_timeout_seconds({"connect_timeout_seconds": "soon"}, "connect_timeout_seconds", 10) == 10
+
+
+def test_resolve_timeout_seconds_falls_back_to_default_for_zero_override():
+    # Unlike SQL_EXECUTE_TIMEOUT_SECONDS's own env-var-level "0 disables
+    # the timeout" convention, a per-dataset override of 0/negative isn't
+    # "disable it for this dataset" - it's treated as unset, same as a
+    # blank/missing value.
+    assert resolve_timeout_seconds({"execute_timeout_seconds": 0}, "execute_timeout_seconds", 30) == 30
+
+
+def test_resolve_timeout_seconds_falls_back_to_default_for_negative_override():
+    assert resolve_timeout_seconds({"connect_timeout_seconds": -5}, "connect_timeout_seconds", 10) == 10
+
+
+def test_resolve_timeout_seconds_reads_only_the_requested_field_name():
+    descriptor = {"connect_timeout_seconds": 25, "execute_timeout_seconds": 90}
+    assert resolve_timeout_seconds(descriptor, "connect_timeout_seconds", 10) == 25
+    assert resolve_timeout_seconds(descriptor, "execute_timeout_seconds", 30) == 90

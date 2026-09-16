@@ -211,6 +211,50 @@ const test = isolatedTest.extend({
         body: JSON.stringify({ success: true, buckets: [] }),
       });
     });
+    // requestSingleModeResultsSummary()/requestAllModeResultsSummary()
+    // (client.js) each fire a real POST automatically right after every
+    // successful execute - single-connection mode calls /api/summarize-
+    // result (singular), "all databases" mode calls /api/summarize-results
+    // (plural) - regardless of whether a given spec cares about the
+    // results-summary feature at all. Same "automatic background call
+    // needs a harmless default" reasoning as /api/ping and /api/execute
+    // above: left unmocked, this hits the real server, which makes a real
+    // model call that fails in this environment (no real API key) - slow,
+    // and its NDJSON response still lands and mutates the DOM (prepending
+    // a "Summary" tab, tearing down and re-rendering the results area)
+    // whenever a test's own assertions run long enough for that real
+    // round trip to resolve mid-test. That's exactly what made
+    // translate-execute.spec.js's column-sort test fail deterministically
+    // (several sequential clicks gave the real call time to land and
+    // replace the table out from under an in-flight locator.click(),
+    // surfacing as Playwright's generic "element was detached from the
+    // DOM" retry loop) despite the sort feature itself having no bug.
+    // Both bodies are single NDJSON lines with no "summary"/"error" key,
+    // so readNdjsonStream() resolves them to data with neither field set -
+    // requestSingleModeResultsSummary()/requestAllModeResultsSummary()
+    // both already treat that as "nothing to show" and no-op (no tab
+    // prepended), same harmless-no-op spirit as /api/execute's empty
+    // `results: []` default above. A spec that DOES care about the
+    // results-summary feature (e.g. multi-database.spec.js,
+    // analytics.spec.js) registers its own page.route() for these same
+    // URLs afterward, which - same override precedent as mockTranslate/
+    // mockExecute - always wins over this default.
+    await page.route('**/api/summarize-result', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/x-ndjson',
+        body: JSON.stringify({ success: false }) + '\n',
+      });
+    });
+    await page.route('**/api/summarize-results', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/x-ndjson',
+        body: JSON.stringify({ success: false }) + '\n',
+      });
+    });
     await use(page);
   },
 });

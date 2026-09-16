@@ -26,7 +26,7 @@ strings/credentials never end up in the translation-history table.
 import concurrent.futures
 import threading
 
-from app_config import DEFAULT_DESCRIPTOR, CONFIGURED_DBS, state_store, logger
+from app_config import DEFAULT_DESCRIPTOR, CONFIGURED_DBS, DATABASE_PRESETS_FILE, state_store, logger
 from backends import get_backend
 from backends.base import (
     extract_entry_names_from_schema_text, schema_text_was_truncated, schema_text_has_omitted_tables,
@@ -767,8 +767,26 @@ def prefetch_all_preset_schemas():
     have no equivalent of this FATAL-exclusion behavior - a custom
     connection that fails is just left as the user's own problem to fix
     via "Refresh Schema", same as always; there's no shared "list of
-    presets" for an individual custom connection to be removed from.)"""
-    if not CONFIGURED_DBS:
+    presets" for an individual custom connection to be removed from.)
+
+    Deliberately a full no-op - no prefetch, no fatal-exclusion - when
+    DATABASE_PRESETS_FILE isn't set at all. In that case CONFIGURED_DBS is
+    never actually empty: app_config.py falls back to a single synthetic
+    "Default DB" preset wrapping DEFAULT_CONN (a plain env-derived
+    connection string, e.g. DATABASE_URL) purely so the connections dialog
+    always has something to show. That placeholder is not an admin's
+    deliberate preset choice - nothing "wrong" with it should ever
+    permanently drop it from the list the way a genuinely bad admin-
+    configured preset should. Concretely, this also fixes a real bug: the
+    e2e suite runs with no DATABASE_PRESETS_FILE, so its synthetic default
+    connection previously got schema-prefetched at startup like a real
+    preset, hit a fast DNS-resolution failure against its intentionally
+    bogus host (classified FATAL, not TIMEOUT - see
+    SCHEMA_FETCH_FAILURE_REASON_FATAL above), and was excluded from
+    visible_configured_dbs() before a single test ever ran - collapsing
+    "configured_databases" to [] for the rest of that server process and
+    failing every test that expected a selectable preset to exist."""
+    if not DATABASE_PRESETS_FILE or not CONFIGURED_DBS:
         return
 
     def _prefetch_one(db):

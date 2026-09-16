@@ -630,11 +630,18 @@ def test_prefetch_all_preset_schemas_swallows_a_single_preset_failure(app_factor
     assert any(r.levelname == "ERROR" for r in caplog.records)
 
 
-def test_prefetch_all_preset_schemas_covers_the_local_dev_default_fallback_preset(app_factory, monkeypatch):
+def test_prefetch_all_preset_schemas_skips_the_local_dev_default_fallback_preset(app_factory, monkeypatch):
     # No DATABASE_PRESETS_FILE configured -> app_config.py synthesizes a
     # single "Default DB" fallback preset (see its own "if not
-    # CONFIGURED_DBS:" line) rather than leaving CONFIGURED_DBS empty -
-    # prefetch must still cover that one entry, not skip it.
+    # CONFIGURED_DBS:" line) purely so the connections dialog always has
+    # something to show - it's not an admin's deliberate preset choice, so
+    # prefetch (and the fatal-exclusion it can trigger) must be a full
+    # no-op here, not treat it like a real preset. This was flipped from
+    # the feature's original behavior (which prefetched this fallback too)
+    # after it caused a real bug: the e2e suite runs with no
+    # DATABASE_PRESETS_FILE, so its synthetic default's intentionally
+    # bogus host got fatally excluded at every startup, collapsing
+    # "configured_databases" to [] before any test ran.
     app_factory()
     import db as db_module
 
@@ -646,7 +653,7 @@ def test_prefetch_all_preset_schemas_covers_the_local_dev_default_fallback_prese
 
     db_module.prefetch_all_preset_schemas()
 
-    assert len(calls) == 1
+    assert len(calls) == 0
 
 
 # --- a preset that fails startup prefetch just gets cached on its next real success --

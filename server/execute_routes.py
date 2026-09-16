@@ -68,7 +68,7 @@ from flask import Blueprint, request, jsonify
 from app_config import logger
 from auth import get_or_create_session_id, get_current_user_identity, apply_session_cookie
 from db import resolve_conn_str, resolve_descriptor_by_reference
-from backends import get_backend, SqlExecutionError
+from backends import get_backend, SqlExecutionError, resolve_timeout_seconds
 import cancel_registry
 from concurrency_guard import EXECUTE_GUARD, guarded_route
 from rate_limiter import execute_rate_limit
@@ -99,10 +99,16 @@ execute_bp = Blueprint('execute', __name__)
 SQL_EXECUTE_TIMEOUT_SECONDS = float(os.environ.get("SQL_EXECUTE_TIMEOUT_SECONDS", 30))
 
 
-def _execute_with_timeout(backend, conn, sql_text):
+def _execute_with_timeout(backend, conn, sql_text, descriptor=None):
     """Runs backend.execute(conn, sql_text), bounded by
     SQL_EXECUTE_TIMEOUT_SECONDS (see that constant's docstring for why this
-    is a generic thread-race rather than a per-backend driver setting).
+    is a generic thread-race rather than a per-backend driver setting) -
+    or by `descriptor`'s own "execute_timeout_seconds" override, if it has
+    one (see backends/base.py's resolve_timeout_seconds()). `descriptor`
+    is optional (defaults to None, which just means "no override possible"
+    - resolve_timeout_seconds() treats a None/{} descriptor the same as
+    one with no override key at all) so every existing caller that has no
+    descriptor handy keeps working unchanged.
 
     This can only bound how long the CALLER waits, not truly cancel work
     already in flight against the database - the executing thread is simply
@@ -120,17 +126,20 @@ def _execute_with_timeout(backend, conn, sql_text):
     (a real SqlExecutionError or any other backend.execute() exception) -
     only a timeout gets a new, friendlier TimeoutError raised in its place.
     """
-    if SQL_EXECUTE_TIMEOUT_SECONDS <= 0:
+    execute_timeout_seconds = resolve_timeout_seconds(
+        descriptor, "execute_timeout_seconds", SQL_EXECUTE_TIMEOUT_SECONDS,
+    )
+    if execute_timeout_seconds <= 0:
         return backend.execute(conn, sql_text)
 
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
         future = pool.submit(backend.execute, conn, sql_text)
         try:
-            return future.result(timeout=SQL_EXECUTE_TIMEOUT_SECONDS)
+            return future.result(timeout=execute_timeout_seconds)
         except concurrent.futures.TimeoutError:
             raise TimeoutError(
-                f"Query execution timed out after {SQL_EXECUTE_TIMEOUT_SECONDS:g} seconds"
+                f"Query execution timed out after {execute_timeout_seconds:g} seconds"
             ) from None
     finally:
         # wait=False, always - see docstring: the whole point of this
@@ -251,7 +260,9 @@ def _execute_one_group(kind, ref_id, concatenated_sql, user_identity, session_id
         backend = get_backend(descriptor)
         conn = backend.connect(descriptor)
         cancel_token, cancel_handle = cancel_registry.register(session_id, lambda: backend.close(conn))
-        group_results = _execute_with_timeout(backend, conn, _strip_database_marker_lines(concatenated_sql))
+        group_results = _execute_with_timeout(
+            backend, conn, _strip_database_marker_lines(concatenated_sql), descriptor,
+        )
         for r in group_results:
             r["database"] = {"kind": kind, "id": ref_id, "name": name}
         return {"results": group_results, "failure": None}
@@ -470,7 +481,7 @@ def execute_query():
         conn = backend.connect(descriptor)
         cancel_token, cancel_handle = cancel_registry.register(session_id, lambda: backend.close(conn))
 
-        results = _execute_with_timeout(backend, conn, raw_query)
+        results = _execute_with_timeout(backend, conn, raw_query, descriptor)
         total_row_count = sum(r.get('rowCount', 0) for r in results)
 
         execution_time_ms = round((time.time() - start_time) * 1000)
@@ -558,7 +569,7 @@ def ping():
     try:
         backend = get_backend(descriptor)
         conn = backend.connect(descriptor)
-        _execute_with_timeout(backend, conn, backend.liveness_sql)
+        _execute_with_timeout(backend, conn, backend.liveness_sql, descriptor)
         resp = jsonify({'success': True})
         return apply_session_cookie(resp, session_id)
     except Exception as e:

@@ -251,6 +251,39 @@ DEFAULT_CONN = "postgresql://postgres:password@host:23456/defaultdb?sslmode=veri
 # excluded from "All" mode regardless of this flag (see
 # _resolve_all_configured_descriptors' own docstring) - this only ever
 # narrows the PRESET pool further, it doesn't change that.
+# Every object may also carry "connect_timeout_seconds" and/or
+# "execute_timeout_seconds" (plain numbers, in seconds) to override, for
+# just this one preset, the two app-wide connection-behavior timeouts:
+# backends/base.py's DB_CONNECT_TIMEOUT_SECONDS env var (how long connect()
+# may block dialing/handshaking out to this preset's real host) and
+# execute_routes.py's SQL_EXECUTE_TIMEOUT_SECONDS env var (how long a
+# statement may run against an already-open connection to it). Both are
+# optional and dialect-agnostic, same treatment as "include_in_all_mode"
+# above - omitted (the common case) means this preset just uses whichever
+# value the shared env var currently has, exactly as before either field
+# existed. Use these for a specific dataset known to be reliably slower (or
+# that should fail faster) than every other configured database, without
+# having to raise or lower either shared env var - and therefore every
+# OTHER preset's own budget too - just to accommodate this one outlier.
+# "connect_timeout_seconds" is a no-op for a "databricks" preset (its
+# driver has no connect-only timeout knob to hook into - see
+# backends/databricks.py's connect() docstring) and for a "bigquery" preset
+# (its client construction doesn't dial out synchronously at all - see
+# backends/bigquery.py's connect() docstring); "execute_timeout_seconds"
+# works identically for every dialect regardless, since it's enforced
+# generically around the whole execute() call (see execute_routes.py's
+# _execute_with_timeout), not via a per-dialect driver kwarg. A blank/
+# missing/non-numeric/non-positive value for either field falls back to
+# the shared env var's own value, exactly as if the field were omitted -
+# see backends/base.py's resolve_timeout_seconds() for the exact fallback
+# logic. Example:
+#   {
+#     "type": "snowflake",
+#     "name": "Slow Analytics Warehouse",
+#     ...,
+#     "connect_timeout_seconds": 20,
+#     "execute_timeout_seconds": 120
+#   }
 # The rest of each object's shape is dialect-specific:
 #   Postgres:  {"type": "postgres", "name": "...", "url": "postgresql://...",
 #               "schema": "..."} ("schema" optional - see below)
@@ -578,6 +611,20 @@ if raw_db_presets.strip():
         # never touched this field, matching every existing test's exact-
         # equality assertion on CONFIGURED_DBS/configured_databases shapes.
         exclude_from_all_mode = not entry.get("include_in_all_mode", True)
+
+        # Optional, dialect-agnostic, same "read once here, apply after
+        # dispatch" treatment as include_in_all_mode above - see this
+        # file's DATABASE_PRESETS_FILE comment for what these two do and
+        # backends/base.py's resolve_timeout_seconds() for how a blank/
+        # invalid value here just falls back to the shared env var, same
+        # as if the field were never set. Left as whatever raw value the
+        # JSON happened to hold (int, float, or string) rather than
+        # coerced/validated here - resolve_timeout_seconds() is the single
+        # place that actually parses it, at the point of use, the same
+        # "defer validation to point of use" treatment "port" gets in the
+        # dialect branches below.
+        connect_timeout_seconds = entry.get("connect_timeout_seconds")
+        execute_timeout_seconds = entry.get("execute_timeout_seconds")
         _dbs_len_before_dispatch = len(CONFIGURED_DBS)
 
         if db_type == "postgres":
@@ -1005,8 +1052,16 @@ if raw_db_presets.strip():
         # and a future eleventh dialect added here would silently forget
         # this one-line addition if it had to be repeated per-branch - this
         # single, branch-independent check can't be missed that way.
-        if exclude_from_all_mode and len(CONFIGURED_DBS) > _dbs_len_before_dispatch:
-            CONFIGURED_DBS[-1]["include_in_all_mode"] = False
+        if len(CONFIGURED_DBS) > _dbs_len_before_dispatch:
+            if exclude_from_all_mode:
+                CONFIGURED_DBS[-1]["include_in_all_mode"] = False
+            # Same "blank/omitted = not stored at all" treatment as
+            # include_in_all_mode above - a preset that never set either
+            # field keeps a completely unchanged shape.
+            if connect_timeout_seconds not in (None, ""):
+                CONFIGURED_DBS[-1]["connect_timeout_seconds"] = connect_timeout_seconds
+            if execute_timeout_seconds not in (None, ""):
+                CONFIGURED_DBS[-1]["execute_timeout_seconds"] = execute_timeout_seconds
 
 
 # Ensure at least one default fallback exists

@@ -151,6 +151,16 @@ class BigQueryBackend(Backend):
     dialect_name = "BigQuery Standard SQL"
 
     def connect(self, descriptor):
+        # No connect-only timeout kwarg here - see backends/base.py's
+        # DB_CONNECT_TIMEOUT_SECONDS docstring for why BigQuery doesn't need
+        # one (bigquery.Client() construction below doesn't dial out
+        # synchronously the way a real TCP connect() does). A descriptor's
+        # own per-dataset "connect_timeout_seconds" override therefore has
+        # nothing to attach to and is silently a no-op for this dialect -
+        # its "execute_timeout_seconds" counterpart still works normally,
+        # enforced generically by execute_routes.py's _execute_with_timeout
+        # around the whole execute() call (job submission + polling), not
+        # via any client-construction kwarg here.
         project_id = (descriptor or {}).get("project_id") or ""
         dataset = (descriptor or {}).get("dataset") or ""
         credentials_json = (descriptor or {}).get("credentials_json")

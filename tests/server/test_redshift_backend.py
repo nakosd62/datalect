@@ -133,6 +133,28 @@ def test_connect_defaults_port_to_5439_when_omitted(monkeypatch):
     assert harness.calls[-1]["port"] == 5439
 
 
+# Regression coverage for a real bug a user hit against a live Redshift
+# Serverless workgroup: a per-dataset "connect_timeout_seconds" override
+# (resolve_timeout_seconds() - see backends/base.py) always returns a float
+# when an override is actually set, and psycopg2 stringifies whatever's
+# passed as connect_timeout straight into the DSN it hands libpq - which
+# then rejects a float like "60.0" outright with "invalid integer value ...
+# for connection option \"connect_timeout\"" before ever dialing out (see
+# backends/postgres.py's identical fix and test - this dialect shares
+# psycopg2/libpq underneath). An equality check alone (`== 60`) would NOT
+# have caught this, since 60 == 60.0 in Python - this asserts the actual
+# type psycopg2 receives, not just its numeric value.
+def test_connect_timeout_override_is_passed_as_a_real_int_not_a_float(monkeypatch):
+    backend, harness = _rs(monkeypatch)
+    backend.connect({
+        "type": "redshift", "host": "h", "database": "dev", "user": "alice", "password": "x",
+        "connect_timeout_seconds": 60,
+    })
+    call = harness.calls[-1]
+    assert call["connect_timeout"] == 60
+    assert isinstance(call["connect_timeout"], int)
+
+
 def test_connect_sets_autocommit_true(monkeypatch):
     backend, harness = _rs(monkeypatch)
     connection = backend.connect({

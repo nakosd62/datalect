@@ -19,7 +19,7 @@
 # confirmation before firing anything (skip it with CONFIRM=1).
 #
 # Usage:
-#   ./run_cloud_stress_test.sh <service-url> [whoami|burst|sustained|fairness|all]
+#   ./run_cloud_stress_test.sh <service-url> [whoami|burst|sustained|fairness|history|all]
 #
 # Find your service URL with:
 #   gcloud run services describe ydyl --region=<your-region> --format='value(status.url)'
@@ -28,6 +28,17 @@
 # this file:
 #   DATALECT_MODEL=gemini-3.5-flash-lite ./run_cloud_stress_test.sh <url> burst
 #   CONFIRM=1 ./run_cloud_stress_test.sh <url> all
+#
+# `history` mode covers a dimension none of the others do: every call
+# above starts from an EMPTY conversation history, but server/
+# translate_routes.py reads `history` straight from each /api/translate
+# request body (conversation history is client-held, not server-side
+# session state), so a real, already-chatting user's request is much
+# bigger than anything burst/sustained/fairness ever send. `history`
+# mode sizes its synthetic history to THIS deployment's own configured
+# env.yaml caps (HISTORY_MAX_TURNS=5, HISTORY_RESULT_MAX_ROWS=10) and
+# fires many of them concurrently - watch Cloud Run's own Memory
+# utilization graph while it runs, not just the status codes it prints.
 
 set -euo pipefail
 
@@ -43,7 +54,7 @@ URL="${1:-}"
 MODE="${2:-all}"
 
 if [ -z "$URL" ]; then
-  echo "Usage: $0 <cloud-run-service-url> [whoami|burst|sustained|fairness|all]" >&2
+  echo "Usage: $0 <cloud-run-service-url> [whoami|burst|sustained|fairness|history|all]" >&2
   echo "Find your URL with: gcloud run services describe ydyl --region=<region> --format='value(status.url)'" >&2
   exit 1
 fi
@@ -137,14 +148,40 @@ run_fairness() {
   echo
 }
 
+run_history() {
+  # Sized to THIS deployment's own configured caps (env.yaml:
+  # HISTORY_MAX_TURNS=5, HISTORY_RESULT_MAX_ROWS=10) - the heaviest
+  # payload a well-behaved client can legitimately send, not an arbitrary
+  # guess. Concurrency matters more than any single payload's size here:
+  # 10 users all mid-conversation at once is what actually stacks up in
+  # the container's memory at a single moment, so this leans on `fairness`
+  # (independent sessions - nothing funnels them onto one instance the
+  # way --session-affinity does for a single user) rather than `burst`.
+  # Only 50 total translate calls (10 users x 5 each) on the cheap model,
+  # to keep this affordable - raise --users if 1-2 instances absorb this
+  # without visibly moving Cloud Run's Memory utilization graph.
+  echo "=== history: fairness, translate, 10 users x 5 calls, history growing to a full 5-turn/10-row-per-turn payload each (watch Cloud Run's Memory utilization graph while this runs) ==="
+  python3 "$STRESS_PY" --url "$URL" --mode fairness \
+    --endpoint translate --users 10 --calls-per-user 5 --interval 3 --model "$MODEL" \
+    --history-turns 5 --history-rows 10 --history-cols 8 --history-cell-bytes 24
+  echo
+
+  echo "=== history: burst, translate, n=5, each ALREADY carrying a full 5-turn history (simulates 5 concurrent users all mid-conversation at once) ==="
+  python3 "$STRESS_PY" --url "$URL" --mode burst \
+    --endpoint translate --n 5 --model "$MODEL" \
+    --history-turns 5 --history-rows 10 --history-cols 8 --history-cell-bytes 24
+  echo
+}
+
 case "$MODE" in
   whoami)    run_whoami ;;
   burst)     run_whoami; run_burst ;;
   sustained) run_whoami; run_sustained ;;
   fairness)  run_whoami; run_fairness ;;
-  all)       run_whoami; run_burst; run_sustained; run_fairness ;;
+  history)   run_whoami; run_history ;;
+  all)       run_whoami; run_burst; run_sustained; run_fairness; run_history ;;
   *)
-    echo "Usage: $0 <cloud-run-service-url> [whoami|burst|sustained|fairness|all]" >&2
+    echo "Usage: $0 <cloud-run-service-url> [whoami|burst|sustained|fairness|history|all]" >&2
     exit 1
     ;;
 esac

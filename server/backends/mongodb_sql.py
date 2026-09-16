@@ -104,7 +104,7 @@ import sqlparse
 
 from .base import (
     Backend, SqlExecutionError, SCHEMA_MAX_TABLE_NAMES_SCANNED, SCHEMA_MAX_TABLES,
-    DB_CONNECT_TIMEOUT_SECONDS, cap_kept_tables, cap_schema_text, fetch_capped_rows,
+    DB_CONNECT_TIMEOUT_SECONDS, resolve_timeout_seconds, cap_kept_tables, cap_schema_text, fetch_capped_rows,
     find_naming_convention_relationships,
 )
 
@@ -250,7 +250,20 @@ class MongoSqlBackend(Backend):
         # pyodbc's own connect-phase timeout kwarg - bounds dialing/
         # handshake only, same contract as every other backend's use of
         # DB_CONNECT_TIMEOUT_SECONDS (see backends/base.py's docstring).
-        conn = pyodbc.connect(full_conn_str, timeout=DB_CONNECT_TIMEOUT_SECONDS, autocommit=True)
+        # resolve_timeout_seconds() lets this preset/custom connection's own
+        # "connect_timeout_seconds" override that shared default. Wrapped in
+        # int(round(...)) because pyodbc.connect()'s "timeout" kwarg is
+        # handled in its C extension via a strict Python int check - a float
+        # override (resolve_timeout_seconds() always returns one when a
+        # per-dataset override is actually set) raises "TypeError: 'float'
+        # object cannot be interpreted as an integer" before ever attempting
+        # to connect, same class of bug as backends/postgres.py's/
+        # backends/redshift.py's identical fix for psycopg2's connect_timeout.
+        conn = pyodbc.connect(
+            full_conn_str,
+            timeout=int(round(resolve_timeout_seconds(descriptor, "connect_timeout_seconds", DB_CONNECT_TIMEOUT_SECONDS))),
+            autocommit=True,
+        )
         return conn
 
     def close(self, connection):

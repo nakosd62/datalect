@@ -1,0 +1,27 @@
+[
+  {
+    "name": "Baseball (BigQuery)",
+    "preset_id": "bigquery-baseball",
+    "sql": "SELECT * FROM schedules LIMIT 1000"
+  },
+  {
+    "name": "Employees (mySQL)",
+    "preset_id": "mysql-employees",
+    "sql": "SELECT * FROM employees LIMIT 1000"
+  },
+  {
+    "name": "Golf Stats (Postgres)",
+    "preset_id": "postgres-golf-stats",
+    "sql": "SELECT * FROM golf_player_performance LIMIT 1000"
+  },
+  {
+    "name": "Movie Rentals (Postgres)",
+    "preset_id": "postgres-movie-rentals",
+    "sql": "SELECT * FROM film LIMIT 1000"
+  },
+  {
+    "name": "Movie Rentals (Postgres)",
+    "preset_id": "postgres-movie-rentals",
+    "sql": "SELECT * FROM film LIMIT 1000"
+  }  
+]

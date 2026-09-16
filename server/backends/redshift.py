@@ -164,7 +164,7 @@ import sqlparse
 
 from .base import (
     Backend, SqlExecutionError, SCHEMA_MAX_TABLE_NAMES_SCANNED, SCHEMA_MAX_TABLES,
-    DB_CONNECT_TIMEOUT_SECONDS,
+    DB_CONNECT_TIMEOUT_SECONDS, resolve_timeout_seconds,
     group_date_sharded_tables, cap_kept_tables, cap_schema_text, fetch_capped_rows,
     find_naming_convention_relationships,
 )
@@ -297,9 +297,18 @@ class RedshiftBackend(Backend):
         # DB_CONNECT_TIMEOUT_SECONDS docstring (this is the exact dialect/
         # failure mode - a Redshift Serverless workgroup with a closed
         # security group or bad DNS record - that motivated adding it).
+        # Wrapped in int(round(...)) because libpq's connect_timeout is a
+        # strict integer connection option - see backends/postgres.py's
+        # identical connect_timeout kwarg for the full explanation (this
+        # dialect shares psycopg2/libpq underneath, and shares the exact
+        # same bug a real user hit: an unrounded float override like 60.0
+        # stringifies to "60.0", which libpq rejects outright as an
+        # "invalid integer value" before ever dialing out).
         connection = psycopg2.connect(
             host=host, port=port, dbname=database, user=user, password=password,
-            sslmode="require", connect_timeout=DB_CONNECT_TIMEOUT_SECONDS,
+            sslmode="require", connect_timeout=int(round(resolve_timeout_seconds(
+                descriptor, "connect_timeout_seconds", DB_CONNECT_TIMEOUT_SECONDS,
+            ))),
         )
         # Set once up front (rather than only inside execute() the way
         # Postgres/Oracle do it) so the SET search_path statement right

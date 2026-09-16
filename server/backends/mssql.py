@@ -166,7 +166,7 @@ from cryptography.x509.oid import ExtensionOID as _ExtensionOID, NameOID as _Nam
 
 from .base import (
     Backend, SqlExecutionError, SCHEMA_MAX_TABLE_NAMES_SCANNED, SCHEMA_MAX_TABLES,
-    DB_CONNECT_TIMEOUT_SECONDS,
+    DB_CONNECT_TIMEOUT_SECONDS, resolve_timeout_seconds,
     group_date_sharded_tables, cap_kept_tables, cap_schema_text, fetch_capped_rows,
     find_naming_convention_relationships,
 )
@@ -410,11 +410,20 @@ class MssqlBackend(Backend):
         # which only expose it as a settable post-connect property), so
         # there's no separate "connection.autocommit = True" statement
         # needed in execute() below the way there is for those two.
+        # resolve_timeout_seconds() lets this preset/custom connection's own
+        # "connect_timeout_seconds" override the shared DB_CONNECT_TIMEOUT_SECONDS
+        # default - computed once and reused for both the driver's own
+        # login_timeout kwarg AND _connect_with_hard_timeout's external
+        # deadline below, so the two stay in sync (see that function's own
+        # docstring for why pytds needs both).
+        connect_timeout = resolve_timeout_seconds(
+            descriptor, "connect_timeout_seconds", DB_CONNECT_TIMEOUT_SECONDS,
+        )
         kwargs = {
             "server": host, "port": port, "database": database,
             "user": user, "password": password,
             "autocommit": True,
-            "login_timeout": DB_CONNECT_TIMEOUT_SECONDS,
+            "login_timeout": connect_timeout,
         }
         if use_encrypt:
             # See module docstring: pytds only attempts TLS at all when
@@ -424,7 +433,7 @@ class MssqlBackend(Backend):
             # box with a certificate chaining to a public root).
             kwargs["cafile"] = certifi.where()
 
-        connection = _connect_with_hard_timeout(kwargs, DB_CONNECT_TIMEOUT_SECONDS)
+        connection = _connect_with_hard_timeout(kwargs, connect_timeout)
         # Stashed on the connection itself, not threaded through as a
         # get_schema() parameter - the Backend ABC's get_schema(connection)
         # signature (shared by all 8 dialects) takes only a connection, not

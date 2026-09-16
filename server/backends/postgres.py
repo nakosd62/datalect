@@ -41,7 +41,7 @@ import sqlparse
 
 from .base import (
     Backend, SqlExecutionError, SCHEMA_MAX_TABLE_NAMES_SCANNED, SCHEMA_MAX_TABLES,
-    DB_CONNECT_TIMEOUT_SECONDS, materialize_ca_cert_tempfile,
+    DB_CONNECT_TIMEOUT_SECONDS, resolve_timeout_seconds, materialize_ca_cert_tempfile,
     group_date_sharded_tables, cap_kept_tables, cap_schema_text, fetch_capped_rows,
     find_naming_convention_relationships,
 )
@@ -157,7 +157,21 @@ class PostgresBackend(Backend):
         # timeout. Passed as a kwarg alongside the DSN string rather than
         # appended to the URL itself - psycopg2 lets both coexist, and a
         # kwarg here always wins over anything already in descriptor["url"].
-        kwargs = {"connect_timeout": DB_CONNECT_TIMEOUT_SECONDS}
+        # resolve_timeout_seconds() lets this preset/custom connection's own
+        # "connect_timeout_seconds" override the shared default - see that
+        # function's docstring. Wrapped in int(round(...)) because libpq's
+        # connect_timeout is a strict integer connection option - psycopg2
+        # stringifies whatever's passed here straight into the DSN, and a
+        # float override (resolve_timeout_seconds() always returns one when
+        # a per-dataset override is actually set) produces a string like
+        # "60.0", which libpq rejects outright with "invalid integer value
+        # ... for connection option \"connect_timeout\"" before ever
+        # attempting to dial out - a real bug this app shipped and a real
+        # user hit. The no-override path was never affected: it returns
+        # DB_CONNECT_TIMEOUT_SECONDS (already an int) unchanged.
+        kwargs = {"connect_timeout": int(round(resolve_timeout_seconds(
+            descriptor, "connect_timeout_seconds", DB_CONNECT_TIMEOUT_SECONDS,
+        )))}
 
         # ca_cert_pem is only ever used when the URL doesn't already name
         # its own sslrootcert - see _url_already_specifies_sslrootcert's

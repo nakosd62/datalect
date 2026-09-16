@@ -110,6 +110,62 @@ SCHEMA_MAX_CHARS = int(os.environ.get("SCHEMA_MAX_SCHEMA_CHARS", 100_000))
 # real TCP connect() does).
 DB_CONNECT_TIMEOUT_SECONDS = int(os.environ.get("DB_CONNECT_TIMEOUT_SECONDS", 10))
 
+
+def resolve_timeout_seconds(descriptor, field_name, default_seconds):
+    """Returns the effective timeout (seconds, float) for one connection
+    descriptor: its own per-dataset override at `field_name` if present
+    and a valid positive number, else `default_seconds` unchanged.
+
+    This is what lets a single admin-configured preset or a single user's
+    custom connection override either of this app's two global,
+    env-configurable timeout knobs - DB_CONNECT_TIMEOUT_SECONDS above (via
+    a descriptor's own "connect_timeout_seconds") or execute_routes.py's
+    SQL_EXECUTE_TIMEOUT_SECONDS (via "execute_timeout_seconds") - for just
+    that one dataset, e.g. a data warehouse that's reliably slower to
+    dial or to run a query against than every other configured database,
+    without having to raise either shared knob (and therefore every OTHER
+    dataset's own budget) app-wide just to accommodate the one slow
+    outlier. See app_config.py's DATABASE_PRESETS_FILE comment and
+    config_routes.py's module docstring for how an admin/user actually
+    sets either field - both ultimately land as plain keys directly on
+    the descriptor dict this function reads, exactly like every other
+    per-connection field (url, schema, ca_cert_pem, ...).
+
+    Every caller passes its own already-resolved global default in
+    (DB_CONNECT_TIMEOUT_SECONDS for a connect()-time call, execute_routes.py's
+    module-level SQL_EXECUTE_TIMEOUT_SECONDS for an execute()-time call)
+    rather than this function importing either itself, so this stays a
+    single, dependency-free helper both backends/*.py (connect-time) and
+    execute_routes.py (execute-time) can share with no import-direction
+    concerns between the two.
+
+    A blank/missing override (the overwhelming common case - nobody sets
+    this) falls through to `default_seconds` unchanged, exactly as if
+    this function didn't exist. An override that doesn't parse as a
+    number at all (a stray non-numeric string from a hand-edited presets
+    file - the frontend's own <input type="number"> already guards
+    against this in practice for a custom connection) is treated the same
+    as "not set" - silently falling back to the shared default - rather
+    than raising and taking the whole connect()/execute() attempt down
+    over a typo in an optional field. A parsed value that isn't positive
+    (0 or negative) is ALSO treated as "not set", falling back to
+    `default_seconds` - unlike SQL_EXECUTE_TIMEOUT_SECONDS's own env-var-
+    level "0 disables the timeout entirely" convention, a per-dataset
+    override exists to make one dataset's timeout DIFFERENT from the
+    shared default, not to let one dataset opt out of having a timeout at
+    all; a deployment that actually wants no execute timeout anywhere
+    still does that via the shared SQL_EXECUTE_TIMEOUT_SECONDS env var,
+    unaffected by anything a preset/custom connection sets here."""
+    override = (descriptor or {}).get(field_name)
+    if override is None or override == "":
+        return default_seconds
+    try:
+        value = float(override)
+    except (TypeError, ValueError):
+        return default_seconds
+    return value if value > 0 else default_seconds
+
+
 # Hard cap on how many table/tab names extract_entry_names_from_schema_text
 # (below) returns for one connection's schema - independent of
 # SCHEMA_MAX_TABLES (which bounds the full, column-level schema text this
@@ -441,7 +497,7 @@ def find_naming_convention_relationships(table_columns):
 # env-configurable knob rather than a per-dialect constant, same posture as
 # DB_CONNECT_TIMEOUT_SECONDS above - the failure mode is identical
 # regardless of which dialect a preset happens to be.
-EXECUTE_RESULTS_MAX_ROWS = int(os.environ.get("EXECUTE_RESULTS_MAX_ROWS", 10_000))
+EXECUTE_RESULTS_MAX_ROWS = int(os.environ.get("EXECUTE_RESULTS_MAX_ROWS", 500))
 
 
 def normalize_cell_value(val):

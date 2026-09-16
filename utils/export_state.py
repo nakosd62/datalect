@@ -6,7 +6,7 @@ from datetime import datetime
 import pandas as pd
 
 
-VALID_TABLES = ["translations", "sessions", "db_connections"]
+VALID_TABLES = ["translations", "sessions", "db_connections", "chat_history"]
 
 
 # ==========================================
@@ -108,7 +108,7 @@ def fetch_datastore(target_table, namespace=None):
 
         # Determine target kinds (case-insensitive matching)
         if target_table == "all":
-            kinds_to_export = existing_kinds if existing_kinds else ["Translations", "Sessions", "db_connections"]
+            kinds_to_export = existing_kinds if existing_kinds else ["Translations", "Sessions", "db_connections", "chat_history"]
         else:
             matched = [k for k in existing_kinds if k.lower() == target_table.lower()]
             kinds_to_export = matched if matched else [target_table]
@@ -290,7 +290,7 @@ def main():
         "--table",
         choices=VALID_TABLES + ["all"],
         default="all",
-        help="Target table/collection to export (translations, sessions, db_connections, or all). Default: 'all'."
+        help="Target table/collection to export (translations, sessions, db_connections, chat_history, or all). Default: 'all'."
     )
 
     parser.add_argument(

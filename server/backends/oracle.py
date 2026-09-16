@@ -114,7 +114,7 @@ import sqlparse
 
 from .base import (
     Backend, SqlExecutionError, SCHEMA_MAX_TABLE_NAMES_SCANNED, SCHEMA_MAX_TABLES,
-    DB_CONNECT_TIMEOUT_SECONDS,
+    DB_CONNECT_TIMEOUT_SECONDS, resolve_timeout_seconds,
     group_date_sharded_tables, cap_kept_tables, cap_schema_text, fetch_capped_rows,
     find_naming_convention_relationships,
 )
@@ -427,7 +427,9 @@ class OracleBackend(Backend):
         # host needs to fail fast here rather than hanging indefinitely.
         kwargs = {
             "host": host, "port": port, "user": user, "password": password,
-            "tcp_connect_timeout": float(DB_CONNECT_TIMEOUT_SECONDS),
+            "tcp_connect_timeout": float(resolve_timeout_seconds(
+                descriptor, "connect_timeout_seconds", DB_CONNECT_TIMEOUT_SECONDS,
+            )),
         }
         if service_name:
             kwargs["service_name"] = service_name

@@ -778,7 +778,7 @@ def _make_history_with_results(rows, row_count):
 
 
 def test_gemini_history_result_not_truncated_when_it_fits_under_the_default_cap(app_env):
-    """Default HISTORY_RESULT_MAX_ROWS is 50 - a 5-row result passes
+    """Default HISTORY_RESULT_MAX_ROWS is 10 - a 5-row result passes
     through untouched, with the header reporting the same count twice
     (the real rowCount, and how many are shown - equal since nothing was
     cut)."""

@@ -108,7 +108,7 @@ import requests
 from google.oauth2 import service_account
 from google.auth.transport import requests as google_requests  # same alias auth.py uses
 
-from .base import Backend, DB_CONNECT_TIMEOUT_SECONDS, cap_schema_text, EXECUTE_RESULTS_MAX_ROWS
+from .base import Backend, DB_CONNECT_TIMEOUT_SECONDS, resolve_timeout_seconds, cap_schema_text, EXECUTE_RESULTS_MAX_ROWS
 from sheets_util import column_letter
 
 
@@ -234,6 +234,15 @@ class SheetsBackend(Backend):
             raise ValueError("Google Sheets connection requires a tab name - none was provided.")
 
         connection = {"spreadsheet_id": spreadsheet_id, "tab_name": tab_name}
+        # Stashed here (there's no separate connect-phase network call to
+        # apply it to directly - see this method's own docstring) so
+        # _fetch()'s requests.get() below, which only ever receives
+        # `connection` (never the original descriptor), can still honor a
+        # per-dataset "connect_timeout_seconds" override - same contract as
+        # every other backend's use of resolve_timeout_seconds().
+        connection["_connect_timeout_seconds"] = resolve_timeout_seconds(
+            descriptor, "connect_timeout_seconds", DB_CONNECT_TIMEOUT_SECONDS,
+        )
 
         # Explicit per-connection credential always wins; the ambient,
         # app-wide one (if configured) is only ever a fallback - see the
@@ -312,7 +321,14 @@ class SheetsBackend(Backend):
                 headers=request_headers,
                 # (connect_timeout, read_timeout) tuple, not a single float -
                 # see SHEETS_READ_TIMEOUT_SECONDS's comment above for why.
-                timeout=(DB_CONNECT_TIMEOUT_SECONDS, SHEETS_READ_TIMEOUT_SECONDS),
+                # The connect_timeout half honors this connection's own
+                # per-dataset override, if any - see connect()'s own comment
+                # for why it's read off `connection` rather than resolved
+                # fresh here (this method never sees the original descriptor).
+                timeout=(
+                    connection.get("_connect_timeout_seconds", DB_CONNECT_TIMEOUT_SECONDS),
+                    SHEETS_READ_TIMEOUT_SECONDS,
+                ),
             )
         except requests.exceptions.RequestException as e:
             raise RuntimeError(f"Couldn't reach this spreadsheet: {e}") from e

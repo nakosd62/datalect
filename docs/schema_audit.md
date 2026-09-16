@@ -126,3 +126,102 @@ The two-phase triage architecture already built for "all databases" mode (`conne
 ## Priority, roughly in order of value for the effort involved
 
 Frequent/sample values for likely-categorical columns and min/max for date columns come first — this is the gap most directly responsible for confidently-wrong queries today, on every backend, and no other item here touches that specific failure mode at all. Table and column comments come second, purely on cost: several backends (Snowflake, BigQuery specifically) expose them almost for free, and even a partial hit rate (schemas that do have some comments) is pure upside with no query-generation downside. Precision/scale/timezone-awareness on column types and the auto-generated-column marker are next — small, cheap, uniformly available additions that close specific, well-understood classes of type-mismatch mistakes. The naming-convention "likely relationship, unconfirmed" pass follows — meaningfully valuable on exactly the backends whose real FK coverage is weakest, but needs care in how it's labeled so a guess never reads as confirmed fact. BigQuery's partition/clustering/required-filter metadata is worth pulling forward ahead of the general partitioning item given it's a correctness constraint rather than a performance hint, and is reachable through the same `INFORMATION_SCHEMA` querying style the backend already uses everywhere else. Everything in the two boundary-case sections — RLS/masking awareness, external-table flagging — is worth doing opportunistically wherever it's cheap, but shouldn't block or compete for effort against the items above it, since neither changes whether the generated SQL itself is correct.
+
+
+
+
+
+
+
+# A two-phase model for schema introspection: broad/shallow, then narrow/deep
+
+## The existing pattern, precisely — and where it stops today
+
+"All databases" mode already has a two-phase shape: `connection_router.py`'s `triage_all_mode_question` (Phase A) sees a compact summary of every in-scope connection and decides which ones are actually relevant, and only those selected connections go on to `translate_routes.py`'s `_run_phase_b_fanout`/`generate_sql_for_connection` (Phase B) for real SQL generation. That's the pattern this proposal generalizes — but it's worth being exact about what today's version actually narrows, because it's narrower than it looks in two specific ways, and both matter for what comes next.
+
+First, Phase A's "shallow" summary (`db.py`'s `build_router_candidate_summaries`, rendered by `_build_candidate_schema_block`) is `{"name", "dialect", "table_names"}` per connection — table names and dialect only, deliberately no column-level detail at all, by design (its own docstring says so directly). That's genuinely shallow content. But it's not cheap to produce: it's built by calling the exact same `get_database_schema()` every other code path uses — the full, TTL-cached, column/constraint/index/view/grant/trigger schema text — and then reducing that already-fully-introspected text down to table names via `extract_entry_names_from_schema_text`. So today's "Phase 1" pays Phase-2-level introspection cost for every in-scope connection, including the ones triage is about to discard, and only saves prompt tokens, not introspection work. That's fine as far as it goes — the underlying `get_schema()` calls are catalog-only queries, not live-data sampling, so the cost that's being paid redundantly is real but bounded — but it means today's version doesn't demonstrate the actual savings this proposal is after, and any new attribute that IS expensive (a live `GROUP BY`, an aggregate scan) cannot be allowed to ride along the same "fetch everything, trim after" path or the whole point of a shallow phase is lost.
+
+Second, and more directly relevant to what you asked: today's narrowing only ever operates at the connection level. Once a connection is selected, Phase B fetches that connection's entire schema — every table in it, up to `SCHEMA_MAX_TABLES` (200) — with no further narrowing to the specific tables the question actually concerns. There is no table-level triage anywhere in this codebase today, in either mode: single-connection mode has never had any narrowing step at all (prompt goes straight to the full cached schema), and all-dbs mode's Phase A stops at "which connections," never asking "which tables within them." Extending the two-phase pattern to schema *attributes* — sample values, comments, cardinality, and everything else the prior recommendations covered — genuinely requires adding this table-level narrowing step, because most of what belongs in a deep, expensive phase only makes sense scoped to a small, specific set of tables. That's a real, new piece of architecture, not a relabeling of something that already exists, and this proposal says so explicitly rather than implying it's already half-built.
+
+## What actually decides an attribute's phase
+
+Two independent factors turn out to collapse into the same split for almost every attribute, which is why a clean two-way division works at all rather than needing three or four tiers.
+
+Cost is the first and most obvious: does producing this attribute require only a catalog/metadata lookup (a join against `information_schema`-style system views, or a session-level setting), or does it require a live query against the table's actual data (a `GROUP BY`, a `MIN`/`MAX` scan, a fresh `COUNT`)? Catalog-only lookups are cheap and safe to run broadly, across every table in every in-scope connection, on the existing schema-cache refresh cycle — there's no reason to gate them behind a narrowing decision at all. Live-data lookups are exactly the ones that must not run broadly: multiplied across every column of every table in a large schema, they're both a real latency cost and, on usage-billed engines (BigQuery's bytes-scanned pricing being the sharpest case), a real recurring dollar cost for tables that were never going to be queried.
+
+Prompt-character budget is the second factor, and it's the reason a few attributes split into "broad, but only a pointer" versus "narrow, but the full thing," even though the underlying catalog query for both halves is equally cheap. A view's full SQL body, or a stored procedure's full body, costs nothing extra to fetch from the catalog whether or not that view ends up relevant — but including every view's complete body for all 200 tables in the base schema block would blow through `SCHEMA_MAX_CHARS` for content that's dead weight on every question except the rare one that actually needs it. So the cheap-to-fetch/expensive-to-include split still lands the same way as the cost split above, just for a different reason: existence and a short signature are worth including broadly; the full body is worth including only once a table or routine is confirmed relevant.
+
+One attribute is worth naming as the genuine exception, because it doesn't fit either factor cleanly: the naming-convention "likely relationship, unconfirmed" heuristic proposed in the prior document (a `customer_id` column matched against another table's primary key by name/type, absent a real FK constraint) needs Phase 1's breadth as its *input* — you can't tell whether a column's name plausibly matches another table's key without having already seen that other table's columns — but its *output* is only worth rendering into the prompt for the narrow set of tables actually in play, exactly like a view body. It's computed from data Phase 1 already collected, at essentially zero extra query cost, but it belongs in Phase 2's rendered output for the same character-budget reason a view body does.
+
+## Phase 1 — broad, shallow: every table, every in-scope connection, catalog-only
+
+This is what stays on the existing schema-cache TTL and gets computed for the full breadth of tables `SCHEMA_MAX_TABLES` already allows through, in every connection currently in scope — not just the ones a question turns out to need, because at this point no question has narrowed anything yet. Everything here is a metadata/catalog lookup; nothing here ever touches a row of real data.
+
+Structural: table and column names, column types including precision/scale/length and timezone-awareness (already sitting one column away from what today's `information_schema.COLUMNS`-style queries select, per the prior document), nullability and default values, PK/FK/unique constraints, indexes where the engine has them, views (existence, not body), triggers, and an explicit auto-generated/identity marker per column — this is essentially today's `get_schema()` output plus the "column semantics beyond the raw type name" additions from the prior document, none of which need a live query.
+
+Comments: table and column comments, wherever the catalog exposes them — this is squarely Phase 1 because it's cheap and because it's plausibly useful for making the narrowing decision itself, not just for the eventual generation step. A comment that says "legacy, replaced by orders_v2" is exactly the kind of signal that should influence which table gets selected in the first place, not just how it gets described once selected.
+
+Row-count estimates from maintained catalog stats — `pg_class.reltuples`, `information_schema.TABLES.TABLE_ROWS`, `ALL_TABLES.NUM_ROWS`, Redshift's `SVV_TABLE_INFO.tbl_rows` (already queried in that same view for DISTKEY/SORTKEY, so this is a free column addition, not a new query), Snowflake's `INFORMATION_SCHEMA.TABLES.ROW_COUNT`. Same reasoning as comments: cheap, and directly useful as narrowing signal (disambiguating a populated table from an empty or near-empty one with a similar name), not merely descriptive.
+
+Routine existence and signatures: stored procedure/function/UDF names and parameter signatures, without full bodies — cheap catalog reads, and knowing a function named `calculate_churn` exists at all is exactly the kind of thing that should be available when deciding whether a question can be answered by reusing it, which is a narrowing-relevant decision, not just a generation-time nicety.
+
+Scale/physical-layout signals: distribution and sort keys (Redshift), clustering keys (Snowflake, Databricks), partition columns and, specifically for BigQuery, the required-partition-filter setting — all catalog-level facts with no live query involved. BigQuery's required-filter flag in particular belongs in Phase 1 without exception: it can determine whether a table is even a viable candidate for a given question (an aggregate-without-filter question against a required-filter table needs to be ruled out or handled specially before any SQL gets generated at all), so deferring it to a narrow phase would be actively harmful, not just suboptimal.
+
+Session/connection-level facts, each contributing one line rather than one per table: effective timezone, default collation, and — reframed from the audit's general grants gap — the current session's own effective read access per table (filtered to `current_user`/current role, not a full grantee audit), all catalog or session-variable lookups with no per-row cost regardless of table count.
+
+Governance flags: whether a row-level-security or column-masking policy applies to a table, and whether a table is external/federated rather than native — both a cheap boolean/flag read off the catalog, worth including broadly since, like the BigQuery filter requirement, a policy or an external-table's different performance profile can matter before a table is even chosen as a candidate.
+
+Existence-only pointer for expensive content: view and routine names get a "this exists" line in Phase 1 even though their full bodies are Phase 2 — the pointer costs nothing and lets the narrowing step (or the model doing the narrowing) know a deep artifact is available to ask for.
+
+## Phase 2 — narrow, deep: only the tables a question actually reaches
+
+Everything here either requires a live query against actual data, or is cheap to fetch but too large to justify including broadly. It only runs for the small set of tables (and connections) that survive the narrowing step described below, and it is the layer this codebase does not have any equivalent of today, for either mode.
+
+Live-data-dependent, the core of the prior document's biggest single recommendation: frequent/sample values for columns that look categorical, and min/max for date and numeric columns. Both require an actual `GROUP BY`/`MIN`/`MAX` against the table, which is exactly the kind of query that must never run against all 200 tables in a schema — this is the clearest, highest-value case for narrowing to exist at all.
+
+Cardinality/distinct-value checks used to decide whether frequent-value sampling is even worth attempting for a given column (`pg_stats.n_distinct`, `APPROX_COUNT_DISTINCT`) — technically a catalog-adjacent, cheap-per-call lookup, but it only has a reason to run at all once a table is already narrowed, since its only purpose is gating the Phase-2 sampling decision above; running it broadly would just be paying for a gate nobody's about to walk through.
+
+Fresh/live row counts, where a stale catalog estimate genuinely isn't good enough for the question at hand — this is the one Phase 1 attribute that has a live-query Phase 2 counterpart, and the two should be presented as complementary rather than duplicated: Phase 1's estimate answers "is this table plausibly relevant," Phase 2's live count (fetched only for tables already selected, and only when needed) answers a question that actually depends on precision.
+
+Full view and stored-procedure/function bodies — cheap queries individually, but only worth their character cost for the specific artifacts a narrowed question is actually touching, per the character-budget reasoning above. Oracle's `TEXT_VC` truncation issue (flagged in both prior documents) matters most here: a body worth including in full should actually be fetched in full, via `DBMS_METADATA.GET_DDL` or the equivalent, precisely because Phase 2 is the one place a body's full text was judged worth its cost.
+
+The naming-convention "likely relationship, unconfirmed" pass, rendered only for the narrowed table set, computed from Phase 1 data already in hand (no new query, just a comparison over metadata already fetched broadly) — the one attribute, as noted above, whose placement is about render cost rather than compute cost.
+
+Anything genuinely deep on the governance/federation boundary cases from the prior document — e.g., actually characterizing what a row-level-security policy filters, rather than just flagging that one exists — stays low-priority and belongs here if it's ever built at all, since it would need per-row or per-policy detail no broad pass could produce cheaply.
+
+## Making table-level narrowing exist at all
+
+Phase 2 has nowhere to attach without a "which tables" decision, and today only "which connections" exists, and only in all-dbs mode. Two things need to be added, and they're different problems, not one problem in two modes.
+
+For all-dbs mode, the natural extension is widening `triage_all_mode_question`'s existing JSON contract rather than inventing a parallel mechanism: it already asks the model for per-selected-connection `database_prompts` (a rewritten question per connection, keyed by index, validated leniently — `_clean_database_prompts` tolerates a missing or malformed entry for any index without failing the whole triage attempt). A sibling field — `relevant_tables: {int_index: [table_name, ...]}` — follows the identical shape and the identical tolerance: a missing or malformed entry for some connection just means Phase 2 enrichment is skipped for that connection's tables (falling back to Phase-1-only content, today's actual behavior), never a reason to fail or retry the whole triage call. This reuses a validated pattern already in production rather than adding a new one.
+
+Single-connection mode has no triage call to extend at all — prompt goes straight to schema-plus-generation — so it needs a new, small step rather than an extension of anything existing: a lightweight table-relevance pass over that one connection's own Phase 1 table list (the same kind of cheap classification `triage_all_mode_question` already does, just scoped to one connection's tables instead of a cross-connection list, or even a non-LLM keyword/name-overlap heuristic against the prompt text if an extra model call per turn isn't worth it). This is worth flagging plainly as new work with no existing equivalent to lean on, rather than implying it's a small extension the way the all-dbs side is.
+
+Both modes want the same escape hatch for small schemas: below some table-count threshold (a natural reuse of the existing `SCHEMA_MAX_TABLES`-style knobs, just a smaller one — a schema of, say, 15 tables has no meaningful "narrow" subset distinct from "broad" at all), skip the narrowing decision entirely and just run Phase 2 enrichment for every table. This avoids paying for a triage/relevance step whose answer would be "all of them anyway" on the common case of a small, single-purpose database.
+
+## Caching Phase 2 without losing the point of narrowing it
+
+`schema_cache.py` is deliberately a generic, tiny `key -> (text, expiry)` store — its own `get`/`set`/`invalidate` don't know or care what the key represents, only that it's a stable string. Phase 1 keeps using it exactly as today, keyed per connection. Phase 2 needs its own entries, not a bigger version of the same one: a composite key such as `f"{connection_cache_key}::{table_name}"`, populated lazily only as tables actually get selected by the narrowing step, reusing the exact same `get`/`set`/`invalidate` calls with no changes to that module at all. This preserves the actual point of narrowing — a table that's never selected never gets a cache entry and never pays a live-query cost, cold or warm — while still letting a repeatedly-asked-about "hot" table benefit from caching its sample values/min-max/live count the same way Phase 1 content already benefits today. A separate, shorter TTL for Phase 2 entries is worth considering independently of Phase 1's: sample-value/row-count data drifts differently than structural metadata does, and the two don't need to expire on the same schedule just because they happen to share the same cache module.
+
+## Summary table
+
+| Attribute | Phase | Why |
+|---|---|---|
+| Table/column names, types, precision/scale/length, timezone-awareness | 1 | Catalog-only; needed just to describe a table at all |
+| PK/FK/unique constraints, indexes, triggers | 1 | Catalog-only; today's existing `get_schema()` content |
+| Auto-generated/identity column marker | 1 | Catalog-only, cheap per column |
+| Table/column comments | 1 | Catalog-only, and useful as narrowing signal |
+| Row-count estimates (catalog stats) | 1 | Catalog-only, and useful as narrowing signal |
+| View/routine existence + signature | 1 | Cheap; full body deferred (see Phase 2) |
+| Distribution/sort/clustering/partition keys | 1 | Catalog-only |
+| BigQuery required-partition-filter flag | 1 | Correctness-gating; must be known before a table is even a candidate |
+| Session timezone, default collation | 1 | One fact per connection, session-level lookup |
+| Current-user effective table access | 1 | Catalog/session lookup, narrowed to current user already |
+| RLS/masking policy flag, external/federated flag | 1 | Cheap boolean; can affect candidacy itself |
+| Frequent/sample values for categorical columns | 2 | Requires a live `GROUP BY` |
+| Min/max for date/numeric columns | 2 | Requires a live scan |
+| Cardinality/distinct-value checks | 2 | Only meaningful as a gate once a table is already selected |
+| Fresh/live row counts | 2 | Live query; Phase 1's estimate already covers the broad case |
+| Full view/routine bodies | 2 | Cheap query, but a character-budget cost only worth paying once relevant |
+| Naming-convention "likely relationship" pass | 2 | Computed from Phase 1 data; rendered only for the narrowed set (character budget, not query cost) |
+| Detailed RLS/masking policy effects, external-source freshness detail | 2 (low priority) | Needs per-policy/per-row depth no broad pass could produce cheaply |

@@ -95,6 +95,27 @@ def test_connect_passes_url_as_dsn_and_sets_connect_timeout(monkeypatch):
     assert kwargs["connect_timeout"] == DB_CONNECT_TIMEOUT_SECONDS
 
 
+# Regression coverage for a real bug a user hit in production: a per-dataset
+# "connect_timeout_seconds" override (resolve_timeout_seconds() - see
+# backends/base.py) always returns a float when an override is actually set,
+# and psycopg2 stringifies whatever's passed as connect_timeout straight into
+# the DSN it hands libpq - which then rejects a float like "60.0" outright
+# with "invalid integer value ... for connection option \"connect_timeout\""
+# before ever dialing out. An equality check alone (`== 60`) would NOT have
+# caught this, since 60 == 60.0 in Python - this asserts the actual type
+# psycopg2 receives, not just its numeric value.
+def test_connect_timeout_override_is_passed_as_a_real_int_not_a_float(monkeypatch):
+    harness = install_fake_postgres_connect(monkeypatch)
+    backend = PostgresBackend()
+    backend.connect({
+        "type": "postgres", "url": "postgresql://alice:secret@host:5432/mydb",
+        "connect_timeout_seconds": 60,
+    })
+    dsn, kwargs = harness.calls[0]
+    assert kwargs["connect_timeout"] == 60
+    assert isinstance(kwargs["connect_timeout"], int)
+
+
 # --- connect(): ca_cert_pem -> sslrootcert ----------------------------------
 # Coverage for the "verify-ca"/"verify-full" CA-certificate support added to
 # connect() - see backends/postgres.py's module docstring. sslmode itself is

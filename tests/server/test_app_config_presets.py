@@ -241,6 +241,60 @@ def test_preset_include_in_all_mode_does_not_affect_other_dialect_branches(app_f
     assert db["include_in_all_mode"] is False
 
 
+# --- connect_timeout_seconds / execute_timeout_seconds (dialect-agnostic -
+# see the DATABASE_PRESETS_FILE comment above these two fields' parsing in
+# app_config.py) ---------------------------------------------------------
+
+def test_preset_timeout_overrides_omitted_are_not_stored(app_factory, tmp_path):
+    # The common case (a preset that's never heard of either field) must
+    # leave CONFIGURED_DBS' shape completely unchanged, same reasoning as
+    # include_in_all_mode above.
+    path = write_database_presets_file(tmp_path, [
+        {"type": "postgres", "name": "Shop", "url": "postgresql://u:p@h/db"},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    db = env.app_config.CONFIGURED_DBS[0]
+    assert "connect_timeout_seconds" not in db
+    assert "execute_timeout_seconds" not in db
+
+
+def test_preset_timeout_overrides_are_recorded(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [{
+        "type": "postgres", "name": "Shop", "url": "postgresql://u:p@h/db",
+        "connect_timeout_seconds": 20, "execute_timeout_seconds": 120,
+    }])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    db = env.app_config.CONFIGURED_DBS[0]
+    assert db["connect_timeout_seconds"] == 20
+    assert db["execute_timeout_seconds"] == 120
+
+
+def test_preset_timeout_overrides_can_be_set_independently(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [{
+        "type": "postgres", "name": "Shop", "url": "postgresql://u:p@h/db",
+        "connect_timeout_seconds": 20,
+    }])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    db = env.app_config.CONFIGURED_DBS[0]
+    assert db["connect_timeout_seconds"] == 20
+    assert "execute_timeout_seconds" not in db
+
+
+def test_preset_timeout_overrides_do_not_affect_other_dialect_branches(app_factory, tmp_path):
+    # Parsed once, generically, before the type dispatch (see app_config.py)
+    # - proven here against a non-Postgres dialect too, not just the one
+    # every other test above happens to use.
+    path = write_database_presets_file(tmp_path, [{
+        "type": "bigquery", "name": "Trends", "project_id": "bigquery-public-data",
+        "dataset": "google_trends", "connect_timeout_seconds": 5, "execute_timeout_seconds": 60,
+    }])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    db = env.app_config.CONFIGURED_DBS[0]
+    assert db["type"] == "bigquery"
+    assert db["connect_timeout_seconds"] == 5
+    assert db["execute_timeout_seconds"] == 60
+
+
 def test_bigquery_preset_with_explicit_billing_project_id(app_factory, tmp_path):
     path = write_database_presets_file(tmp_path, [{
         "type": "bigquery", "name": "Trends", "project_id": "bigquery-public-data",

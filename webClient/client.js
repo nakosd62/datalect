@@ -2902,6 +2902,31 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (radio) radio.checked = true;
     }
 
+    // Shared, dialect-agnostic tail every custom connection type's own
+    // field block ends with (see each isX branch below) - per-dataset
+    // overrides for the two app-wide connection-behavior timeouts
+    // (backends/base.py's DB_CONNECT_TIMEOUT_SECONDS, execute_routes.py's
+    // SQL_EXECUTE_TIMEOUT_SECONDS), read straight off cfg like every other
+    // already-saved config field (schema, ca_cert_pem, ...) and re-sent as
+    // plain numbers - see triggerConfigSave()'s custom_databases mapping
+    // and top-level payload below for where these values are read back
+    // out. Both optional; left blank means "use this app's shared
+    // default" - see config_routes.py's _timeout_override_kwargs().
+    function customDbTimeoutFieldsHtml(index, cfg) {
+      return `
+          <div class="custom-db-field-row">
+            <div class="custom-db-field">
+              <label class="custom-db-field-label" for="custom-db-connect-timeout-${index}">Connect Timeout (seconds): <span class="optional-hint">(optional)</span></label>
+              <input type="number" min="0" step="1" id="custom-db-connect-timeout-${index}" class="config-input custom-db-connect-timeout" data-index="${index}" placeholder="Default" value="${cfg.connect_timeout_seconds != null ? cfg.connect_timeout_seconds : ''}" autocomplete="off">
+            </div>
+            <div class="custom-db-field">
+              <label class="custom-db-field-label" for="custom-db-execute-timeout-${index}">Execute Timeout (seconds): <span class="optional-hint">(optional)</span></label>
+              <input type="number" min="0" step="1" id="custom-db-execute-timeout-${index}" class="config-input custom-db-execute-timeout" data-index="${index}" placeholder="Default" value="${cfg.execute_timeout_seconds != null ? cfg.execute_timeout_seconds : ''}" autocomplete="off">
+            </div>
+          </div>
+      `;
+    }
+
     let html = '';
     customDatabases.forEach((db, index) => {
       const cfg = db.config || {};
@@ -3014,6 +3039,7 @@ document.addEventListener('DOMContentLoaded', async () => {
               <textarea id="custom-db-bq-creds-${index}" class="config-input custom-db-bq-creds" data-index="${index}" placeholder="${db.has_custom_credentials ? 'Key saved - leave blank to keep it, or paste a new one to replace it' : 'Service-account key (JSON)'}" rows="3" autocomplete="off"></textarea>
             </div>
           </div>
+          ${customDbTimeoutFieldsHtml(index, cfg)}
           ` : isSnowflake ? `
           <div class="custom-db-field-row">
             <div class="custom-db-field">
@@ -3071,6 +3097,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             </div>
           </div>
           `}
+          ${customDbTimeoutFieldsHtml(index, cfg)}
           ` : isDatabricks ? `
           <div class="custom-db-field-row">
             <div class="custom-db-field wide">
@@ -3100,6 +3127,7 @@ document.addEventListener('DOMContentLoaded', async () => {
               <input type="password" id="custom-db-dbx-token-${index}" class="config-input custom-db-dbx-token" data-index="${index}" placeholder="${db.has_custom_credentials ? 'Token saved - leave blank to keep it, or paste a new one to replace it' : 'Personal access token'}" autocomplete="off">
             </div>
           </div>
+          ${customDbTimeoutFieldsHtml(index, cfg)}
           ` : isOracle ? `
           <div class="custom-db-field-row">
             <div class="custom-db-field">
@@ -3143,6 +3171,7 @@ document.addEventListener('DOMContentLoaded', async () => {
               </label>
             </div>
           </div>
+          ${customDbTimeoutFieldsHtml(index, cfg)}
           ` : isRedshift ? `
           <div class="custom-db-field-row">
             <div class="custom-db-field">
@@ -3174,6 +3203,7 @@ document.addEventListener('DOMContentLoaded', async () => {
               <input type="password" id="custom-db-rs-password-${index}" class="config-input custom-db-rs-password" data-index="${index}" placeholder="${db.has_custom_credentials ? 'Password saved - leave blank to keep it, or type a new one to replace it' : 'Password'}" autocomplete="off">
             </div>
           </div>
+          ${customDbTimeoutFieldsHtml(index, cfg)}
           ` : isSqlServer ? `
           <div class="custom-db-field-row">
             <div class="custom-db-field">
@@ -3213,6 +3243,7 @@ document.addEventListener('DOMContentLoaded', async () => {
               </label>
             </div>
           </div>
+          ${customDbTimeoutFieldsHtml(index, cfg)}
           ` : isSheets ? `
           <div class="custom-db-field-row">
             <div class="custom-db-field wide">
@@ -3237,6 +3268,7 @@ document.addEventListener('DOMContentLoaded', async () => {
               <span class="optional-hint">Leave the key blank for a public sheet ("Anyone with the link can view"). For a private sheet, share it with a service account's email and paste that account's JSON key above.</span>
             </div>
           </div>
+          ${customDbTimeoutFieldsHtml(index, cfg)}
           ` : isMongoSql ? `
           <div class="custom-db-field-row">
             <div class="custom-db-field wide">
@@ -3265,6 +3297,7 @@ document.addEventListener('DOMContentLoaded', async () => {
               <span class="optional-hint custom-db-mongo-hint">Get these values from the ODBC connection string Atlas gave you when enabling the SQL Interface on your cluster. Note: the interface supports one read operations.</span>
             </div>
           </div>
+          ${customDbTimeoutFieldsHtml(index, cfg)}
           ` : `
           <div class="custom-db-field-row">
             <div class="custom-db-field wide">
@@ -3286,6 +3319,7 @@ document.addEventListener('DOMContentLoaded', async () => {
               <textarea id="custom-db-cacert-${index}" class="config-input custom-db-cacert" data-index="${index}" placeholder="Paste a PEM-encoded CA certificate here to verify the server (not needed for sslmode=require)" rows="3" autocomplete="off">${cfg.ca_cert_pem || ''}</textarea>
             </div>
           </div>
+          ${customDbTimeoutFieldsHtml(index, cfg)}
           `) : ''}
         </div>
       `;
@@ -3427,6 +3461,35 @@ document.addEventListener('DOMContentLoaded', async () => {
         // search_path default", not a credential so no masking/"leave
         // blank to keep it" convention applies here.
         customDatabases[index].config.schema = input.value.trim();
+      });
+    });
+
+    // Shared across every dialect (see customDbTimeoutFieldsHtml() above,
+    // and this row's own field-generation blocks below) - one wiring block
+    // covers all of them rather than repeating it in each dialect-specific
+    // block, since the field id/behavior is completely dialect-agnostic.
+    // Stored as a plain number (not a string) when non-blank, matching how
+    // the server always receives them (see config_routes.py's
+    // _timeout_override_kwargs()); a blank value deletes the key entirely
+    // rather than storing an empty string, so it round-trips through
+    // isCompleteX()'s own truthiness checks and the server's "blank means
+    // unset" treatment identically to every other optional field here.
+    container.querySelectorAll('.custom-db-connect-timeout, .custom-db-execute-timeout').forEach(input => {
+      const index = parseInt(input.dataset.index);
+      const radio = container.querySelector(`input[value="custom-${index}"]`);
+      const configKey = input.classList.contains('custom-db-connect-timeout')
+        ? 'connect_timeout_seconds' : 'execute_timeout_seconds';
+      input.addEventListener('focus', () => { if (radio) selectDbConnectionRow(radio, index); });
+      input.addEventListener('input', () => {
+        if (radio) selectDbConnectionRow(radio, index);
+        if (!customDatabases[index].config) customDatabases[index].config = {};
+        const trimmed = input.value.trim();
+        if (trimmed === '') {
+          delete customDatabases[index].config[configKey];
+        } else {
+          const parsed = Number(trimmed);
+          if (!Number.isNaN(parsed)) customDatabases[index].config[configKey] = parsed;
+        }
       });
     });
 
@@ -4208,6 +4271,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     // blank, but never the same variable.
     let dbSheetsCredentialsJson = null;
     let dbEncrypt = null;
+    // Dialect-agnostic (see customDbTimeoutFieldsHtml() and its wiring
+    // above) - unlike every field above this, set generically right after
+    // `chosen` is resolved below rather than inside each isCompleteX()
+    // branch, since the same two optional fields apply identically no
+    // matter which dialect this row turns out to be.
+    let dbConnectTimeoutSeconds = null;
+    let dbExecuteTimeoutSeconds = null;
     let isCustomOption = false;
     // Set only for anonymous users picking a preset by its stable id (see
     // renderDbRadioButtons()) - the server resolves the real connection
@@ -4336,6 +4406,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         const index = parseInt(effectiveSelectionValue.split('-')[1]);
         const selectedDb = customDatabases[index];
         const chosen = isCompleteCustomDb(selectedDb) ? selectedDb : customDatabases.find(isCompleteCustomDb);
+        // Read once here, generically, rather than inside each isCompleteX()
+        // branch below - see the docstring on this variable's declaration
+        // above.
+        if (chosen && chosen.config) {
+          if (chosen.config.connect_timeout_seconds != null) dbConnectTimeoutSeconds = chosen.config.connect_timeout_seconds;
+          if (chosen.config.execute_timeout_seconds != null) dbExecuteTimeoutSeconds = chosen.config.execute_timeout_seconds;
+        }
 
         if (isCompleteBigQuery(chosen)) {
           dbType = 'bigquery';
@@ -4497,6 +4574,17 @@ document.addEventListener('DOMContentLoaded', async () => {
       dbNameValue = "Default DB";
     }
 
+    // Dialect-agnostic (see customDbTimeoutFieldsHtml() and its wiring
+    // above) - applied once here to whichever dialect-specific object
+    // literal each branch below just built, rather than repeating
+    // "connect_timeout_seconds: d.config.connect_timeout_seconds ||
+    // undefined" in all nine of those branches individually.
+    function withTimeoutOverrides(obj, d) {
+      if (d.config && d.config.connect_timeout_seconds != null) obj.connect_timeout_seconds = d.config.connect_timeout_seconds;
+      if (d.config && d.config.execute_timeout_seconds != null) obj.execute_timeout_seconds = d.config.execute_timeout_seconds;
+      return obj;
+    }
+
     const payload = {
       database_name: dbNameValue,
       database_type: dbType,
@@ -4505,17 +4593,17 @@ document.addEventListener('DOMContentLoaded', async () => {
         .filter(d => isCompleteBigQuery(d) || isCompleteSnowflake(d) || isCompleteDatabricks(d) || isCompleteOracle(d) || isCompleteRedshift(d) || isCompleteMssql(d) || isCompleteSheets(d) || isCompleteMongo(d) || isCompleteSimpleUrlDb(d))
         .map(d => {
           if (isCompleteBigQuery(d)) {
-            return {
+            return withTimeoutOverrides({
               type: 'bigquery',
               name: d.name,
               project_id: d.config.project_id,
               dataset: d.config.dataset,
               billing_project_id: d.config.billing_project_id,
               credentials_json: d.config.credentials_json || undefined
-            };
+            }, d);
           }
           if (isCompleteSnowflake(d)) {
-            return {
+            return withTimeoutOverrides({
               type: 'snowflake',
               name: d.name,
               account: d.config.account,
@@ -4527,10 +4615,10 @@ document.addEventListener('DOMContentLoaded', async () => {
               password: d.config.password || undefined,
               private_key: d.config.private_key || undefined,
               private_key_passphrase: d.config.private_key_passphrase || undefined,
-            };
+            }, d);
           }
           if (isCompleteDatabricks(d)) {
-            return {
+            return withTimeoutOverrides({
               type: 'databricks',
               name: d.name,
               server_hostname: d.config.server_hostname,
@@ -4538,10 +4626,10 @@ document.addEventListener('DOMContentLoaded', async () => {
               catalog: d.config.catalog || undefined,
               schema: d.config.schema || undefined,
               access_token: d.config.access_token || undefined,
-            };
+            }, d);
           }
           if (isCompleteOracle(d)) {
-            return {
+            return withTimeoutOverrides({
               type: 'oracle',
               name: d.name,
               host: d.config.host,
@@ -4552,10 +4640,10 @@ document.addEventListener('DOMContentLoaded', async () => {
               schema: d.config.schema || undefined,
               password: d.config.password || undefined,
               ssl: d.config.ssl || undefined,
-            };
+            }, d);
           }
           if (isCompleteRedshift(d)) {
-            return {
+            return withTimeoutOverrides({
               type: 'redshift',
               name: d.name,
               host: d.config.host,
@@ -4564,10 +4652,10 @@ document.addEventListener('DOMContentLoaded', async () => {
               user: d.config.user,
               schema: d.config.schema || undefined,
               password: d.config.password || undefined,
-            };
+            }, d);
           }
           if (isCompleteMssql(d)) {
-            return {
+            return withTimeoutOverrides({
               type: 'mssql',
               name: d.name,
               host: d.config.host,
@@ -4584,10 +4672,10 @@ document.addEventListener('DOMContentLoaded', async () => {
               // itself defaults to True only when the key is missing
               // entirely) - so this must never collapse to undefined.
               encrypt: d.config.encrypt !== false,
-            };
+            }, d);
           }
           if (isCompleteSheets(d)) {
-            return {
+            return withTimeoutOverrides({
               type: 'sheets',
               name: d.name,
               spreadsheet_url: d.config.spreadsheet_url,
@@ -4598,17 +4686,17 @@ document.addEventListener('DOMContentLoaded', async () => {
               // already-saved key server-side (_resolve_sheets_credentials
               // falls back to the saved one only when nothing is provided).
               credentials_json: d.config.credentials_json || undefined,
-            };
+            }, d);
           }
           if (isCompleteMongo(d)) {
-            return {
+            return withTimeoutOverrides({
               type: 'MongoDB',
               name: d.name,
               url: d.url,
               database: d.config.database,
               user: d.config.user,
               password: d.config.password || undefined,
-            };
+            }, d);
           }
           const simpleUrlType = d.type === 'mysql' ? 'mysql' : 'postgres';
           const simpleUrlOut = { type: simpleUrlType, name: d.name, url: d.url };
@@ -4626,7 +4714,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           if (simpleUrlType === 'postgres' && d.config && d.config.schema) {
             simpleUrlOut.schema = d.config.schema;
           }
-          return simpleUrlOut;
+          return withTimeoutOverrides(simpleUrlOut, d);
         }),
     };
     if (presetId !== null) {
@@ -4703,6 +4791,17 @@ document.addEventListener('DOMContentLoaded', async () => {
       // schema is Postgres-only (optional) - MySQL has no separate schema
       // concept of its own (see backends/mysql.py's module docstring).
       if (dbSchema && dbType === 'postgres') payload.schema = dbSchema;
+    }
+    // Dialect-agnostic (see this variable's own declaration comment above)
+    // - added once here, after every dialect branch above has finished
+    // setting its own fields, rather than repeated in each one. Only for
+    // an actual custom-connection save (presetId === null); a preset
+    // selection never reaches _parse_incoming_connection at all server-side
+    // (see config_routes.py's module docstring), so these would be ignored
+    // there anyway.
+    if (presetId === null) {
+      if (dbConnectTimeoutSeconds != null) payload.connect_timeout_seconds = dbConnectTimeoutSeconds;
+      if (dbExecuteTimeoutSeconds != null) payload.execute_timeout_seconds = dbExecuteTimeoutSeconds;
     }
 
     const configSaveErrorEl = document.getElementById('configSaveError');

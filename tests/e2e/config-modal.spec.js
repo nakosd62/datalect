@@ -847,10 +847,16 @@ test.describe('config modal', () => {
 
     const card = page.locator('.custom-db-card').last();
     const fieldRows = card.locator('.custom-db-field-row');
-    await expect(fieldRows).toHaveCount(3);
+    // 4th row: the shared, dialect-agnostic optional timeout-override pair
+    // (see customDbTimeoutFieldsHtml() in client.js) rendered at the
+    // bottom of every dialect's own field block.
+    await expect(fieldRows).toHaveCount(4);
     await expect(fieldRows.nth(0).locator('.custom-db-field-label')).toHaveText(['Project ID:', 'Dataset:']);
     await expect(fieldRows.nth(1).locator('.custom-db-field-label')).toHaveText(['Billing Project ID:']);
     await expect(fieldRows.nth(2).locator('.custom-db-field-label')).toHaveText(['Service Account Key:']);
+    await expect(fieldRows.nth(3).locator('.custom-db-field-label')).toHaveText([
+      'Connect Timeout (seconds): (optional)', 'Execute Timeout (seconds): (optional)',
+    ]);
   });
 
   test('a Snowflake custom row labels each field on its own line: Warehouse/Database/Schema, Account/User/Role, Authentication Method, then the credential', async ({ page }) => {
@@ -861,17 +867,24 @@ test.describe('config modal', () => {
 
     const card = page.locator('.custom-db-card').last();
     const fieldRows = card.locator('.custom-db-field-row');
-    await expect(fieldRows).toHaveCount(4);
+    // 5th row: the shared, dialect-agnostic optional timeout-override pair
+    // (see customDbTimeoutFieldsHtml() in client.js) rendered at the
+    // bottom of every dialect's own field block.
+    await expect(fieldRows).toHaveCount(5);
     await expect(fieldRows.nth(0).locator('.custom-db-field-label')).toHaveText(['Warehouse:', 'Database:', 'Schema: (optional)']);
     await expect(fieldRows.nth(1).locator('.custom-db-field-label')).toHaveText(['Account:', 'User:', 'Role: (optional)']);
     await expect(fieldRows.nth(2).locator('.custom-db-field-label')).toHaveText(['Authentication Method:']);
     await expect(fieldRows.nth(3).locator('.custom-db-field-label')).toHaveText(['Password:']);
+    await expect(fieldRows.nth(4).locator('.custom-db-field-label')).toHaveText([
+      'Connect Timeout (seconds): (optional)', 'Execute Timeout (seconds): (optional)',
+    ]);
 
     // Switching to key-pair auth swaps that last line for Private Key +
-    // Passphrase, still both on their own (fifth) line.
+    // Passphrase, still both on their own (fifth) line - the timeout row
+    // stays put as the now-sixth row.
     await page.locator('.custom-db-sf-auth-method').last().selectOption('private_key');
     const fieldRowsAfter = card.locator('.custom-db-field-row');
-    await expect(fieldRowsAfter).toHaveCount(4);
+    await expect(fieldRowsAfter).toHaveCount(5);
     await expect(fieldRowsAfter.nth(3).locator('.custom-db-field-label')).toHaveText(['Private Key:', 'Passphrase: (if key is encrypted)']);
   });
 
@@ -1206,11 +1219,17 @@ test.describe('config modal', () => {
 
     const card = page.locator('.custom-db-card').last();
     const fieldRows = card.locator('.custom-db-field-row');
-    await expect(fieldRows).toHaveCount(4);
+    // 5th row: the shared, dialect-agnostic optional timeout-override pair
+    // (see customDbTimeoutFieldsHtml() in client.js) rendered at the
+    // bottom of every dialect's own field block.
+    await expect(fieldRows).toHaveCount(5);
     await expect(fieldRows.nth(0).locator('.custom-db-field-label')).toHaveText(['Server Hostname:']);
     await expect(fieldRows.nth(1).locator('.custom-db-field-label')).toHaveText(['HTTP Path:']);
     await expect(fieldRows.nth(2).locator('.custom-db-field-label')).toHaveText(['Catalog: (optional)', 'Schema: (optional)']);
     await expect(fieldRows.nth(3).locator('.custom-db-field-label')).toHaveText(['Access Token:']);
+    await expect(fieldRows.nth(4).locator('.custom-db-field-label')).toHaveText([
+      'Connect Timeout (seconds): (optional)', 'Execute Timeout (seconds): (optional)',
+    ]);
   });
 
   test('an incomplete custom Databricks row (no HTTP path / token) is never submitted', async ({ page }) => {
@@ -1286,13 +1305,19 @@ test.describe('config modal', () => {
 
     const card = page.locator('.custom-db-card').last();
     const fieldRows = card.locator('.custom-db-field-row');
-    await expect(fieldRows).toHaveCount(4);
+    // 5th row: the shared, dialect-agnostic optional timeout-override pair
+    // (see customDbTimeoutFieldsHtml() in client.js) rendered at the
+    // bottom of every dialect's own field block.
+    await expect(fieldRows).toHaveCount(5);
     await expect(fieldRows.nth(0).locator('.custom-db-field-label')).toHaveText(['Host:', 'Port:']);
     await expect(fieldRows.nth(1).locator('.custom-db-field-label')).toHaveText([
       'Service Name:', 'SID: (legacy)', 'Schema: (optional)',
     ]);
     await expect(fieldRows.nth(2).locator('.custom-db-field-label')).toHaveText(['User:', 'Password:']);
     await expect(fieldRows.nth(3)).toContainText('Use TLS (required for Oracle Cloud)');
+    await expect(fieldRows.nth(4).locator('.custom-db-field-label')).toHaveText([
+      'Connect Timeout (seconds): (optional)', 'Execute Timeout (seconds): (optional)',
+    ]);
   });
 
   test('the Oracle "Use TLS" checkbox starts checked (by default) and toggles off on click', async ({ page }) => {
@@ -1387,10 +1412,16 @@ test.describe('config modal', () => {
 
     const card = page.locator('.custom-db-card').last();
     const fieldRows = card.locator('.custom-db-field-row');
-    await expect(fieldRows).toHaveCount(3);
+    // 4th row: the shared, dialect-agnostic optional timeout-override pair
+    // (see customDbTimeoutFieldsHtml() in client.js) rendered at the
+    // bottom of every dialect's own field block.
+    await expect(fieldRows).toHaveCount(4);
     await expect(fieldRows.nth(0).locator('.custom-db-field-label')).toHaveText(['Host:', 'Port:']);
     await expect(fieldRows.nth(1).locator('.custom-db-field-label')).toHaveText(['Database:', 'Schema: (optional)']);
     await expect(fieldRows.nth(2).locator('.custom-db-field-label')).toHaveText(['User:', 'Password:']);
+    await expect(fieldRows.nth(3).locator('.custom-db-field-label')).toHaveText([
+      'Connect Timeout (seconds): (optional)', 'Execute Timeout (seconds): (optional)',
+    ]);
   });
 
   test('an incomplete custom Redshift row (no database / password) is never submitted', async ({ page }) => {
@@ -1472,11 +1503,17 @@ test.describe('config modal', () => {
 
     const card = page.locator('.custom-db-card').last();
     const fieldRows = card.locator('.custom-db-field-row');
-    await expect(fieldRows).toHaveCount(4);
+    // 5th row: the shared, dialect-agnostic optional timeout-override pair
+    // (see customDbTimeoutFieldsHtml() in client.js) rendered at the
+    // bottom of every dialect's own field block.
+    await expect(fieldRows).toHaveCount(5);
     await expect(fieldRows.nth(0).locator('.custom-db-field-label')).toHaveText(['Host:', 'Port:']);
     await expect(fieldRows.nth(1).locator('.custom-db-field-label')).toHaveText(['Database:', 'Schema: (optional)']);
     await expect(fieldRows.nth(2).locator('.custom-db-field-label')).toHaveText(['User:', 'Password:']);
     await expect(fieldRows.nth(3)).toContainText('Encrypt Connection (required for Azure SQL Database)');
+    await expect(fieldRows.nth(4).locator('.custom-db-field-label')).toHaveText([
+      'Connect Timeout (seconds): (optional)', 'Execute Timeout (seconds): (optional)',
+    ]);
   });
 
   test('the SQL Server "Encrypt Connection" checkbox starts checked (by default) and toggles off on click', async ({ page }) => {

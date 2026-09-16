@@ -473,13 +473,19 @@ test.describe('translate + execute', () => {
     await gotoApp(page);
     await page.locator('#aiPrompt').fill('first question');
     await page.locator('#aiPrompt').press('Enter');
-    await expect.poll(() => currentSql(page)).toContain('SELECT 1');
+    // normalizedSql(), not raw currentSql() - see this file's own comment
+    // on normalizedSql() for why: sql-formatter (a CDN script) may or may
+    // not have loaded, and when it has, it pretty-prints "SELECT 1;" onto
+    // multiple lines/indentation, which a plain toContain('SELECT 1')
+    // against the unnormalized text can miss depending on exactly how it
+    // got reformatted.
+    await expect.poll(() => normalizedSql(page)).toContain('SELECT 1');
 
     await mockTranslate(page, { sql: 'SELECT 2;' });
     await mockExecute(page, { results: [{ columns: ['n'], rows: [{ n: 2 }], rowCount: 1 }] });
     await page.locator('#aiPrompt').fill('second question');
     await page.locator('#aiPrompt').press('Enter');
-    await expect.poll(() => currentSql(page)).toContain('SELECT 2');
+    await expect.poll(() => normalizedSql(page)).toContain('SELECT 2');
 
     const goBackBtn = page.locator('#goBackBtn');
     const newTurnBtn = page.locator('#newTurnBtn');
@@ -506,7 +512,7 @@ test.describe('translate + execute', () => {
 
     await page.locator('#aiPrompt').fill('third question');
     await page.locator('#aiPrompt').press('Enter');
-    await expect.poll(() => currentSql(page)).toContain('SELECT 3');
+    await expect.poll(() => normalizedSql(page)).toContain('SELECT 3');
     await executeStarted;
 
     // The SQL is already in the box (translate's own terminal line landed)

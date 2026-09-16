@@ -291,6 +291,47 @@ def test_sql_execute_timeout_disabled_when_set_to_zero(app_factory, monkeypatch)
     assert resp.get_json()['success'] is True
 
 
+def test_execute_honors_a_per_dataset_execute_timeout_override_below_the_shared_default(app_factory, monkeypatch):
+    # SQL_EXECUTE_TIMEOUT_SECONDS stays at its real (comfortably long)
+    # default - only the connection descriptor's own "execute_timeout_seconds"
+    # is tiny, proving _execute_with_timeout actually reads the per-dataset
+    # override (see backends/base.py's resolve_timeout_seconds()) rather
+    # than only ever honoring the shared env var.
+    env = app_factory()
+    fake = _FakeBackend(results=[], delay=0.3)
+    _patch_backend(monkeypatch, env, fake)
+    resp = env.client.post('/api/execute', json={
+        'sql': 'SELECT 1;',
+        'database_url': {"type": "postgres", "url": "postgresql://x/y", "execute_timeout_seconds": 0.05},
+    })
+    assert resp.status_code == 400
+    data = resp.get_json()
+    assert data['success'] is False
+    assert data['error'] == "Query execution timed out after 0.05 seconds"
+    fake.execute_finished.wait(timeout=1)
+
+
+def test_execute_per_dataset_override_of_zero_falls_back_to_the_shared_default(app_factory, monkeypatch):
+    # 0/negative isn't "disable the timeout for this dataset" (unlike
+    # SQL_EXECUTE_TIMEOUT_SECONDS's own env-var-level 0-disables convention
+    # - see resolve_timeout_seconds()'s own docstring) - it's treated as
+    # "no override", falling back to the real (comfortably long) shared
+    # default, so this query still completes instead of timing out
+    # immediately.
+    env = app_factory()
+    fake = _FakeBackend(
+        results=[{"statement": "SELECT 1", "columns": ["x"], "rows": [{"x": 1}], "rowCount": 1}],
+        delay=0.05,
+    )
+    _patch_backend(monkeypatch, env, fake)
+    resp = env.client.post('/api/execute', json={
+        'sql': 'SELECT 1;',
+        'database_url': {"type": "postgres", "url": "postgresql://x/y", "execute_timeout_seconds": 0},
+    })
+    assert resp.status_code == 200
+    assert resp.get_json()['success'] is True
+
+
 def test_ping_times_out_and_returns_success_false(app_factory, monkeypatch):
     env = app_factory(env={"SQL_EXECUTE_TIMEOUT_SECONDS": "0.05"})
     fake = _FakeBackend(results=[], delay=0.3)

@@ -204,7 +204,14 @@ class DatabricksBackend(Backend):
 
         # No connect-only timeout kwarg here, unlike every other network-
         # dialing backend (see backends/base.py's DB_CONNECT_TIMEOUT_SECONDS
-        # docstring) - deliberately, not an oversight. This connector's only
+        # docstring) - deliberately, not an oversight. This also means a
+        # descriptor's own per-dataset "connect_timeout_seconds" override
+        # (see backends/base.py's resolve_timeout_seconds()) has nothing to
+        # attach to here and is silently a no-op for this one dialect - its
+        # "execute_timeout_seconds" counterpart still works normally, since
+        # that one's enforced generically by execute_routes.py's
+        # _execute_with_timeout, not via a driver-level connect kwarg. This
+        # connector's only
         # relevant knob (undocumented "_socket_timeout") bounds socket send/
         # recv/connect for the connection's *entire* lifetime, not just the
         # initial handshake, so setting it here would also cap how long any

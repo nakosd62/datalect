@@ -1,11 +1,13 @@
 #!/bin/bash
 set -e
 
+TOP_DIR="/Users/dimitris/Coding/datalect"
+
 # Install/Update requirements
 if [ -f "requirements-dev.txt" ]; then
     echo "Installing/checking dev dependencies from requirements-dev.txt..."
-    ./venv/bin/pip install --upgrade pip > /dev/null
-    ./venv/bin/pip install -r requirements-dev.txt > /dev/null
+    $TOP_DIR/venv/bin/pip install --upgrade pip > /dev/null
+    $TOP_DIR/venv/bin/pip install -r $TOP_DIR/requirements-dev.txt > /dev/null
     if [ $? -ne 0 ]; then
         echo "Error: Failed to install dev dependencies."
         exit 1
@@ -15,18 +17,18 @@ fi
 echo "-----------------"
 echo " BACKEND TESTING "
 echo "-----------------"
-./venv/bin/python -m pytest tests/server/
+$TOP_DIR/venv/bin/python -m pytest $TOP_DIR/tests/server/
 
 echo "----------------------------"
 echo " UTILITY TESTING (utils/)   "
 echo "----------------------------"
-./venv/bin/python -m pytest tests/utils/
+$TOP_DIR/venv/bin/python -m pytest $TOP_DIR/tests/utils/
 
 
 echo "--------------------------"
 echo " E2E TESTING (Playwright) "
 echo "--------------------------"
-cd tests/e2e
+cd $TOP_DIR/tests/e2e
 if [ ! -d "node_modules" ]; then
     echo "Installing e2e dependencies..."
     npm install

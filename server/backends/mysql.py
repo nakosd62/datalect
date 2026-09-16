@@ -91,7 +91,7 @@ import sqlparse
 
 from .base import (
     Backend, SqlExecutionError, SCHEMA_MAX_TABLE_NAMES_SCANNED, SCHEMA_MAX_TABLES,
-    DB_CONNECT_TIMEOUT_SECONDS, materialize_ca_cert_tempfile,
+    DB_CONNECT_TIMEOUT_SECONDS, resolve_timeout_seconds, materialize_ca_cert_tempfile,
     group_date_sharded_tables, cap_kept_tables, cap_schema_text, fetch_capped_rows,
     find_naming_convention_relationships,
 )
@@ -231,7 +231,11 @@ class MySQLBackend(Backend):
             # this to 10 on its own, but set it explicitly here so it's tied
             # to the same single, admin-adjustable knob every other dialect
             # uses rather than to a value that happens to coincide with it.
-            "connect_timeout": DB_CONNECT_TIMEOUT_SECONDS,
+            # resolve_timeout_seconds() lets this preset/custom connection's
+            # own "connect_timeout_seconds" override that shared default.
+            "connect_timeout": resolve_timeout_seconds(
+                descriptor, "connect_timeout_seconds", DB_CONNECT_TIMEOUT_SECONDS,
+            ),
         }
         if parts["unix_socket"]:
             # Unix-socket connections (Cloud SQL) have no real TCP host at
