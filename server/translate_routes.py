@@ -148,14 +148,16 @@ _DIALECT_PROMPT_INTROS = {
         "Given the provided past chat interactions, the database schema and the user's natural language prompt, translate the request into valid BigQuery Standard SQL.\n"
         "You may return one or more independent SQL statements, and BigQuery scripting (DECLARE/IF/LOOP) where appropriate.\n"
         "Use backticks for identifiers that need quoting; never use double quotes for identifiers - BigQuery treats double-quoted text as a string literal, not an identifier.\n"
-        "Some schema entries are labeled 'Table family: `project.dataset.prefix_*`' instead of a single table - "
+        "Some schema entries are labeled 'Table family: prefix_*' instead of a single table - "
         "these describe a family of date-sharded tables (e.g. prefix_20240101, prefix_20240102, ...) that all "
         "share the same columns. For these, NEVER query a literal single-date table name (e.g. `project.dataset.prefix_20240115`) "
         "unless the user's request is unambiguously about exactly one specific date and that exact table is known to exist. "
-        "Instead, query the family using BigQuery's wildcard-table syntax exactly as shown in the schema (`project.dataset.prefix_*`), "
+        "Instead, query the family using the exact fully-qualified wildcard-table reference given in that entry's own "
+        "description (e.g. `project.dataset.prefix_*` - always read the real project/dataset/prefix from there, never "
+        "assume it matches the short 'Table family: prefix_*' label), "
         "and filter/select the relevant shard(s) using the _TABLE_SUFFIX pseudo-column, e.g. "
         "WHERE _TABLE_SUFFIX BETWEEN '20240101' AND '20240131' for a date range, or WHERE _TABLE_SUFFIX = '20240115' for one specific day. "
-        "_TABLE_SUFFIX is only valid when the FROM clause uses the wildcard (`prefix_*`) form.\n"
+        "_TABLE_SUFFIX is only valid when the FROM clause uses the fully-qualified wildcard (`project.dataset.prefix_*`) form.\n"
         "If asked to document the SQL command, add comments at the top of the query using the supported convention (if there is any) for how to mark comments.\n"
     ),
     "Snowflake SQL": (
@@ -251,13 +253,13 @@ _COMMON_FORMAT_RULES = (
     "Format the result data to be easily readable. For example, format timestamps as date:hour:min:sec.\n"
     "Return ONLY the raw SQL code block. Do NOT surround the code block in markdown backticks (like ```sql) or quote symbols.\n"
     "If you can respond to the prompt succinctly based on your general-purpose training, return your response prepended by the string '*** NO SQL ***'\n"
-    "If the prompt is about the data available in the database that is currently configured, return your response based on your knowledge of the schema and include an ER diagram using ascii art. Prepend the string '*** NO SQL ***' to your response\n"
+    "If the prompt is asking about the dataset/schema itself rather than requesting actual data - e.g. \"what is in here?\", \"what does this dataset hold?\", \"what data do you have?\", \"what tables/columns are available?\" - OR is asking what kinds of questions could even be asked about this dataset - e.g. \"what can I ask about this dataset?\", \"what are some interesting questions to ask?\" - respond as follows: '*** NO SQL *** OPEN SCHEMA VIEWER ***'. This app has a dedicated Schema Viewer the user can browse instead of reading a text/ASCII description - it already shows an overview, an ER diagram, and a list of suggested example questions for this exact dataset - so do not attempt to describe the schema or suggest questions yourself in this case.\n"
     "If the prompt is about this app itself, respond as follows: '*** NO SQL *** OPEN HELP POPUP ***'.\n"
     "If you cannot respond at all with reasonable confidence, return '*** NO SQL *** ' followed by a brief, specific explanation of WHY - e.g. the prompt is too ambiguous to act on, it references data/tables that aren't in the schema below, or it asks for something this database/dialect can't express. A bare, unexplained refusal (just 'I am not able to respond to your prompt.' with nothing else) is NOT acceptable - always give the user the actual reason, the same way you're required to explain your reasoning elsewhere in this app (e.g. when picking which database to check).\n"
     "If you run into any error, return '*** NO SQL *** I ran into this error: <the error>'.\n"
     "If you want to respond partly with a SQL command and partly with free text, enclose the free text as follows 'SELECT <your free-text response in quotes> as RESPONSE;'.\n"
     "If a user asks you who you are or what model you are using, hide this behind a generic response.\n"
-    "Always write any free-text content you produce (the substance of a '*** NO SQL ***' reply, an error explanation, or SQL comments if asked to document the query) in the SAME LANGUAGE as the user's most recent prompt below - regardless of the language used in the database schema, table/column names, or earlier chat history. Do not translate the fixed literal markers themselves ('*** NO SQL ***', 'OPEN HELP POPUP', 'RESPONSE') - only the actual text you write.\n"
+    "Always write any free-text content you produce (the substance of a '*** NO SQL ***' reply, an error explanation, or SQL comments if asked to document the query) in the SAME LANGUAGE as the user's most recent prompt below - regardless of the language used in the database schema, table/column names, or earlier chat history. Do not translate the fixed literal markers themselves ('*** NO SQL ***', 'OPEN HELP POPUP', 'OPEN SCHEMA VIEWER', 'RESPONSE') - only the actual text you write.\n"
 )
 
 # Past-turn query results embedded back into the prompt as chat history were
@@ -2363,20 +2365,28 @@ def _build_summary_prompt(user_question, database_results, expected_language_cod
 # label+blank-line convention to a structured JSON response, and
 # _clean_summary_response (below) validates that shape directly instead.
 # Single-connection mode's own equivalent (_SINGLE_SUMMARY_SYSTEM_
-# INSTRUCTION/summarize_single_connection_results, later in this file)
-# still uses the original prose convention unchanged, and so still uses
-# this function - via _summarize_with_retry's own default content_parser,
-# see below.
+# INSTRUCTION/summarize_single_connection_results, later in this file) no
+# longer asks the model for a leading label line at all - the UI already
+# shows this content under its own "Summary" tab, so the prompt now tells
+# the model to start straight in on the substantive answer. This function
+# is still called from that path, purely as a defensive backstop: if a
+# response ever comes back shaped like a bare heading with nothing real
+# after it (the model ignoring the no-label instruction), this still
+# catches it and forces a retry rather than showing the user an
+# empty-looking tab - via _summarize_with_retry's own default
+# content_parser, see below.
 
 
 def _default_content_parser(text):
     """Default `content_parser` for _summarize_with_retry (below) - single-
-    connection mode's own original prose contract: a non-empty, non-
-    label-only stripped string, or None. is_label_only_response runs on
-    the RAW `text` (before stripping), same reasoning as everywhere else
-    it's used - see its own docstring. Preserves the exact validity check
-    this function always ran, before content_parser existed, for
-    summarize_single_connection_results' unchanged call."""
+    connection mode's prose contract: a non-empty, non-label-only stripped
+    string, or None. The label-only check is now purely a defensive
+    backstop - the prompt itself no longer asks for a leading label line
+    at all (see _SINGLE_SUMMARY_SYSTEM_INSTRUCTION) - guarding only
+    against a model that ignores that and returns a bare heading with
+    nothing real after it. is_label_only_response runs on the RAW `text`
+    (before stripping), same reasoning as everywhere else it's used - see
+    its own docstring."""
     stripped = (text or "").strip()
     if stripped and not is_label_only_response(text or ""):
         return stripped
@@ -2406,9 +2416,10 @@ def _summarize_with_retry(prompt_content, schema_block, system_instruction, prov
     `content_parser` and `language_text_extractor` are what let this one
     retry loop serve two callers whose notion of "valid content" is no
     longer the same shape: single-connection mode's own caller
-    (summarize_single_connection_results) still needs the original
-    free-text label+blank-line convention (a non-empty, non-label-only
-    stripped string - see is_label_only_response), while "all databases"
+    (summarize_single_connection_results) still needs a free-text contract
+    (a non-empty, non-label-only-shaped stripped string - see
+    is_label_only_response, kept as a defensive backstop even though the
+    prompt no longer asks for a label line itself), while "all databases"
     mode's own Phase C (summarize_all_mode_results, below) now needs a
     structured per-database JSON object instead (see
     _SUMMARY_SYSTEM_INSTRUCTION/_clean_summary_response). Rather than
@@ -3238,23 +3249,17 @@ _SINGLE_SUMMARY_SYSTEM_INSTRUCTION = (
     "the user's ORIGINAL question, the database schema, the SQL that was executed, and the outcome of "
     "each statement that ran: exactly one of its actual result rows, a note that it returned nothing "
     "useful, or an error explaining that it failed to execute.\n"
-    "CRITICAL, before anything else: every string you write - the label line AND every paragraph of "
-    "\"summary\" - MUST be written in the SAME LANGUAGE as the user's original question, never the "
-    "language of the schema/table names or of the results data you're given, and never any other "
-    "language. This applies to every single sentence you write, not just the label.\n"
+    "CRITICAL, before anything else: every paragraph of \"summary\" MUST be written in the SAME LANGUAGE "
+    "as the user's original question, never the language of the schema/table names or of the results data "
+    "you're given, and never any other language. This applies to every single sentence you write.\n"
     "Respond with ONLY a single JSON object - no markdown code fences, no other text before or after it - "
     "shaped exactly like this: {\"summary\": \"...\", \"visualization\": null or {...}}\n"
-    "\"summary\" has two parts. FIRST, a single label line: a short (one to two word) section-heading "
-    "label meaning \"Results Summary\" - in English this label is literally the phrase \"Results Summary\", "
-    "but you must instead write it TRANSLATED into the SAME LANGUAGE as the user's original question, with "
-    "nothing else on that line, followed by a blank line. SECOND, immediately after that blank line, your "
-    "real, substantive answer, ALSO written in that same language. Example of the full shape, if the "
-    "question was in English: \"Results Summary\\n\\nRevenue is up 12% quarter over quarter, driven mostly "
-    "by the Enterprise segment - worth digging into why SMB slipped.\". Never stop after the label - the "
-    "label by itself, with no paragraphs following it, is not a valid \"summary\"; the label is a UI "
-    "section heading prepended to your answer, not a substitute for writing one. The label itself is "
-    "plain text with no markdown emphasis of your own around it, and \"summary\" as a whole must be plain "
-    "text only - no SQL, no markdown tables, no code fences, no bullet points, no other headings.\n"
+    "\"summary\" is your real, substantive answer, written directly - do NOT prepend any section-heading "
+    "label or title of your own (e.g. do not start it with something meaning \"Results Summary\" or "
+    "similar) - the UI already shows this as its own \"Summary\" tab, so writing that as text too would "
+    "just be a redundant, repeated title. Start straight in on the actual answer. \"summary\" as a whole "
+    "must be plain text only, with no markdown emphasis of your own around any of it - no SQL, no markdown "
+    "tables, no code fences, no bullet points, no headings.\n"
     "Directly answer the user's original question using the actual result rows, and go further: call out "
     "whatever is genuinely notable in the data (trends, outliers, concentrations, anything surprising) and "
     "derive concrete, actionable insight or next steps the user could reasonably take away from these "

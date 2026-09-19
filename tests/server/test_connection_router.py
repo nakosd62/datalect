@@ -743,6 +743,27 @@ def test_extract_entry_names_respects_max_names_cap():
     assert extract_entry_names_from_schema_text(schema, max_names=3) == ["t0", "t1", "t2"]
 
 
+def test_extract_entry_names_handles_a_table_family_description_with_a_nested_parenthetical():
+    # Regression coverage for a real bug (see test_backend_base_helpers.py's
+    # _strip_trailing_asides tests for the full story): a BigQuery
+    # "Table family" heading's own descriptive aside can contain a nested,
+    # balanced parenthetical of its own (e.g. an "(e.g. WHERE _TABLE_SUFFIX
+    # BETWEEN '...' AND '...')" clause), which used to defeat the
+    # non-nesting regex this function's own name-stripping relied on,
+    # leaving the ENTIRE multi-clause sentence as the "name" fed into
+    # connection_router.py's Phase A candidate summaries - bloating the
+    # router prompt with LLM-facing prose instead of a bare table pattern.
+    from backends.base import extract_entry_names_from_schema_text
+
+    schema = (
+        "Table family: `proj.ds.pageviews_*` (12 date-sharded tables, e.g. "
+        "pageviews_2015 .. pageviews_2026; filter via _TABLE_SUFFIX (e.g. "
+        "WHERE _TABLE_SUFFIX BETWEEN '...' AND '...'); never query a single "
+        "literal date-suffixed table name from this family)\ndatehour TIMESTAMP\n"
+    )
+    assert extract_entry_names_from_schema_text(schema) == ["`proj.ds.pageviews_*`"]
+
+
 def test_single_in_scope_never_calls_triage_and_response_has_no_connection_selection(app_factory, monkeypatch):
     env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
 

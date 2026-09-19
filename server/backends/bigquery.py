@@ -41,7 +41,9 @@ see their comments for the actual defaulting rules.
 """
 
 import json
+import logging
 
+from google.api_core import exceptions as gcloud_exceptions
 from google.cloud import bigquery
 from google.oauth2 import service_account
 import sqlparse
@@ -50,7 +52,8 @@ from .base import (
     Backend, SqlExecutionError, SCHEMA_MAX_TABLE_NAMES_SCANNED, SCHEMA_MAX_TABLES,
     group_date_sharded_tables, cap_kept_tables, cap_schema_text,
     EXECUTE_RESULTS_MAX_ROWS, normalize_cell_value,
-    find_naming_convention_relationships,
+    find_naming_convention_relationships, min_frequent_value_count, FREQUENT_VALUES_LIMIT,
+    format_dataset_size_line, format_multiline_schema_entry_body,
 )
 
 
@@ -84,7 +87,9 @@ CATEGORICAL_TYPES = frozenset({"STRING", "BOOL"})
 MAX_COLUMNS_FOR_SAMPLING = 25
 MAX_NUMERIC_COLUMNS_FOR_MINMAX = 15
 MAX_CATEGORICAL_SAMPLE_COLUMNS_PER_TABLE = 3
-FREQUENT_VALUES_LIMIT = 15
+# FREQUENT_VALUES_LIMIT now imported from backends/base.py (env-configurable
+# via SCHEMA_FREQUENT_VALUES_LIMIT) rather than defined here - see that
+# module's own comment.
 
 # TABLESAMPLE SYSTEM percentage used for the frequent-value pass on each
 # kept table (per docs/schema_context_recommendations.md's explicit
@@ -145,6 +150,51 @@ def _bigquery_partition_filter_clause(column_name, data_type):
     if data_type == "TIMESTAMP":
         return f"{ident} >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)"
     return f"{ident} IS NOT NULL"
+
+
+_logger = logging.getLogger(__name__)
+
+
+def _table_storage_failure_reason(exc):
+    """Human-readable, cause-specific tail for the two INFORMATION_SCHEMA.
+    TABLE_STORAGE warning logs below (row-count estimate and dataset-size),
+    both of which query the exact same view and can fail for the exact
+    same reasons. Originally both call sites unconditionally assumed a
+    missing bigquery.tables.list permission - real, and still the likely
+    cause for a 403 - but a 404 NotFound turned out to be a completely
+    different, unrelated situation: querying TABLE_STORAGE for a dataset
+    that lives in a DIFFERENT project than the one being billed - most
+    commonly a Google-managed public dataset (e.g. bigquery-public-data) -
+    reliably 404s, confirmed against a real connection (see this module's
+    git history for the actual log line this was root-caused from:
+    "Dataset bigquery-public-data:google_trends.INFORMATION_SCHEMA was not
+    found in location US"). That is NOT a permission gap this identity
+    could ever be granted its way out of: BigQuery does not expose
+    storage/row-count metadata cross-project for a dataset you don't own,
+    full stop, so there's no size estimate to ever recover here - unlike a
+    403, which is worth telling the user to go fix via a GRANT.
+
+    Only NotFound and Forbidden are distinguished specifically because
+    those are the two cases actually observed/documented; anything else
+    (a transient network error, a malformed query, ...) falls through to a
+    generic, cause-agnostic message rather than guessing."""
+    if isinstance(exc, gcloud_exceptions.NotFound):
+        return (
+            "BigQuery reported this dataset's INFORMATION_SCHEMA.TABLE_STORAGE "
+            "as not found - this is expected, not a permission problem, when the "
+            "dataset lives in a different project than the one being billed "
+            "(most commonly a Google-managed public dataset such as "
+            "bigquery-public-data): BigQuery does not expose storage/row-count "
+            "metadata across projects for a dataset you don't own, so no size "
+            "estimate will ever be available for this connection"
+        )
+    if isinstance(exc, gcloud_exceptions.Forbidden):
+        return (
+            "the connected identity most likely lacks the bigquery.tables.list "
+            "permission INFORMATION_SCHEMA.TABLE_STORAGE itself requires "
+            "(separate from ordinary table read access)"
+        )
+    return "reason unknown - see the exception details below"
 
 
 class BigQueryBackend(Backend):
@@ -410,9 +460,32 @@ class BigQueryBackend(Backend):
                 continue
             if table_name in shard_by_representative:
                 prefix, members = shard_by_representative[table_name]
+                # The identifier right after "Table family:" is deliberately
+                # the BARE pattern (no project/dataset qualification), same
+                # as a plain "Table: <table_name>" heading just below and
+                # the same convention every other dialect's own shard-family
+                # heading already follows (see e.g. postgres.py's "Table
+                # family: {prefix}_<date> (...)") - a UI list row, the ER
+                # diagram, and connection_router.py's Phase A summaries all
+                # key off this token (see extract_entry_names_from_schema_
+                # text()/split_schema_text_into_entries() in backends/
+                # base.py), and used to show the fully-qualified, backtick-
+                # quoted `wildcard` here instead - the only dialect of the
+                # seven that collapse shard families to do so - which is
+                # what made this family's name look "long and ugly" next to
+                # every short, bare table name beside it. The fully-
+                # qualified form BigQuery actually needs for querying a
+                # wildcard table (which, unlike every other dialect's plain
+                # "substitute the exact date" instruction, genuinely does
+                # need it - see translate_routes.py's own BigQuery prompt
+                # section) is still given explicitly, verbatim, in the
+                # parenthetical below - nothing about the LLM-facing SQL-
+                # generation guidance changes, only the leading display
+                # token does.
+                short_pattern = f"{prefix}_*"
                 wildcard = f"`{project_id}.{dataset}.{prefix}_*`"
                 heading = (
-                    f"Table family: {wildcard} ({len(members)} date-sharded tables, "
+                    f"Table family: {short_pattern} ({len(members)} date-sharded tables, "
                     f"e.g. {members[0]} .. {members[-1]}; identical columns in every "
                     f"member - query this family with the wildcard form "
                     f"{wildcard}, filtering/identifying the shard via the "
@@ -523,8 +596,25 @@ class BigQueryBackend(Backend):
             ]
             if estimate_lines:
                 schema_parts.append("Row count estimates:\n" + "\n".join(estimate_lines))
-        except Exception:
-            pass
+        except Exception as exc:
+            # Silently degrading (no per-table row-count estimates in the
+            # prompt text) is the right behavior for the user - but silently
+            # losing the REASON is not: without this, "why does my BigQuery
+            # schema never show row counts/a dataset size" is unanswerable
+            # from the logs alone (see the analogous fix in db.py's
+            # _fetch_database_schema_with_reason for the same principle
+            # applied to SCHEMA_MAX_TABLES/SCHEMA_MAX_CHARS truncation). The
+            # actual reason varies by exception type - see
+            # _table_storage_failure_reason()'s own docstring for why a 404
+            # (a cross-project/public dataset) and a 403 (a genuine missing
+            # grant) are NOT the same situation and must not share one
+            # message - the dataset-size estimate section below queries the
+            # exact same view and would fail for the exact same reason.
+            _logger.warning(
+                "BigQuery TABLE_STORAGE row-count-estimate query failed for "
+                "%s.%s - %s: %s",
+                project_id, dataset, _table_storage_failure_reason(exc), exc,
+            )
 
         # 6. Routines (new) - existence + signature only, no body (see
         # get_schema()'s "Routine definitions" section for the full-body
@@ -634,18 +724,52 @@ class BigQueryBackend(Backend):
         views = phase2_ctx["views"]
         routines = phase2_ctx["routines"]
 
+        # 7. Dataset size estimate (new, deep-only) - unlike the "Row count
+        # estimates" section above (Phase 1 / shallow, filtered to
+        # kept_names, a capped subset of at most SCHEMA_MAX_TABLES tables),
+        # this aggregates INFORMATION_SCHEMA.TABLE_STORAGE across the whole
+        # dataset (no kept_names filter), so the LLM sees the true
+        # dataset-wide size even when most tables were dropped from
+        # kept_names to stay under the cap. Same best-effort posture as the
+        # Phase 1 TABLE_STORAGE query above (see its comment).
+        try:
+            qualified = f"`{project_id}.{dataset}`"
+            size_rows = list(self._run(connection, f"""
+                SELECT SUM(total_rows) AS total_rows, SUM(total_logical_bytes) AS total_bytes, COUNT(*) AS table_count
+                FROM {qualified}.INFORMATION_SCHEMA.TABLE_STORAGE
+            """).result())
+            if size_rows:
+                r = size_rows[0]
+                if r.table_count:
+                    size_line = format_dataset_size_line(
+                        total_rows=r.total_rows, total_bytes=r.total_bytes,
+                    )
+                    if size_line:
+                        schema_parts.append(size_line)
+        except Exception as exc:
+            # See the Phase 1 TABLE_STORAGE query's own comment (above, in
+            # _build_shallow_schema_parts) and _table_storage_failure_
+            # reason()'s own docstring for why this is logged with a
+            # cause-specific reason rather than swallowed silently or
+            # assuming one fixed cause - same query, same possible causes,
+            # just aggregated dataset-wide instead of per kept table.
+            _logger.warning(
+                "BigQuery TABLE_STORAGE dataset-size query failed for %s.%s - %s: %s",
+                project_id, dataset, _table_storage_failure_reason(exc), exc,
+            )
+
         # Phase 2 (deep-only): full view/routine bodies, reusing the raw
         # rows _build_shallow_schema_parts already fetched - no re-query.
         if views:
             view_lines = [
-                f"  View {r.table_name}: {(r.view_definition or '').strip()}"
+                f"  View {r.table_name}: {format_multiline_schema_entry_body(r.view_definition)}"
                 for r in views if (r.view_definition or "").strip()
             ]
             if view_lines:
                 schema_parts.append("View definitions:\n" + "\n".join(view_lines))
 
         routine_body_lines = [
-            f"  {r['name']}: {(r['definition'] or '').strip()}"
+            f"  {r['name']}: {format_multiline_schema_entry_body(r['definition'])}"
             for r in routines if (r.get("definition") or "").strip()
         ]
         if routine_body_lines:
@@ -775,6 +899,30 @@ class BigQueryBackend(Backend):
                     if len(eligible_categorical) >= MAX_CATEGORICAL_SAMPLE_COLUMNS_PER_TABLE:
                         break
 
+            # HAVING floor - see backends/base.py's min_frequent_value_count()
+            # docstring and postgres.py's identical use of it, EXCEPT scaled
+            # down by FREQUENT_VALUES_SAMPLE_PERCENT first: `cnt` below comes
+            # from a TABLESAMPLE'd ~10% slice, not the full table, so a value
+            # that's genuinely 5% of the FULL table only shows up ~5% of THAT
+            # slice's own (much smaller) row count - roughly
+            # live_row_count * FREQUENT_VALUES_SAMPLE_PERCENT / 100 rows, not
+            # live_row_count rows. Comparing `cnt` against a floor sized off
+            # the true table's full row count would demand a value be ~10x
+            # more dominant than 5% before ever clearing it (since the
+            # sample itself only has ~10% as many rows to begin with),
+            # silently suppressing this section on BigQuery almost entirely.
+            # Sample proportions approximate full-table proportions either
+            # way (that's what TABLESAMPLE is for), so scaling the floor by
+            # the same fraction keeps the *threshold this backend actually
+            # enforces* consistent with every other dialect's plain "5% of
+            # the real table."
+            sample_size_estimate = (
+                live_row_count * FREQUENT_VALUES_SAMPLE_PERCENT / 100
+                if live_row_count else None
+            )
+            min_count = min_frequent_value_count(sample_size_estimate)
+            having_clause = f"HAVING cnt >= {min_count}" if min_count is not None else ""
+
             # Frequent values - one query per eligible categorical column
             # (capped at MAX_CATEGORICAL_SAMPLE_COLUMNS_PER_TABLE per
             # table), against a TABLESAMPLE SYSTEM slice rather than the
@@ -793,6 +941,7 @@ class BigQueryBackend(Backend):
                         FROM {query_target} TABLESAMPLE SYSTEM ({FREQUENT_VALUES_SAMPLE_PERCENT} PERCENT)
                         {partition_where}
                         GROUP BY val
+                        {having_clause}
                         ORDER BY cnt DESC
                         LIMIT {FREQUENT_VALUES_LIMIT}
                     """).result())

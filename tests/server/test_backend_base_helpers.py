@@ -23,6 +23,10 @@ from backends.base import (
     find_naming_convention_relationships,
     normalize_cell_value, fetch_capped_rows,
     resolve_timeout_seconds,
+    format_bytes_human, format_compact_count, format_dataset_size_line,
+    format_multiline_schema_entry_body,
+    extract_entry_names_from_schema_text, split_schema_text_into_entries,
+    _strip_trailing_asides,
 )
 
 
@@ -94,6 +98,35 @@ def test_supports_yyyymm_yyyy_mm_dd_and_yyyy_us_mm_us_dd_suffixes():
     names3 = ["d_2024_01_01", "d_2024_01_02", "d_2024_01_03"]
     kept3, groups3 = group_date_sharded_tables(names3, min_group_size=3)
     assert "d" in groups3
+
+
+def test_bare_year_suffixed_family_collapses():
+    # e.g. a BigQuery dataset partitioned one table per year -
+    # pageviews_2015 .. pageviews_2026 - rather than the more granular
+    # YYYYMMDD/YYYYMM shapes covered above.
+    names = [f"pageviews_{y}" for y in range(2015, 2027)]  # 12 members
+    kept, groups = group_date_sharded_tables(names, min_group_size=3)
+    assert "pageviews" in groups
+    assert groups["pageviews"] == sorted(names)
+    assert kept == [sorted(names)[-1]]  # "pageviews_2026"
+
+
+def test_bare_year_suffix_is_constrained_to_1900_2099():
+    # Not an unconstrained \d{4} - a bare 4-digit suffix is far more likely
+    # than YYYYMM/YYYYMMDD to collide with an unrelated numeric ID a table
+    # family just happens to share (e.g. sequential batch/chunk numbers)
+    # rather than an actual year, so only 19xx/20xx is treated as a year.
+    names = ["chunk_0001", "chunk_0002", "chunk_0003"]
+    kept, groups = group_date_sharded_tables(names, min_group_size=3)
+    assert groups == {}
+    assert sorted(kept) == sorted(names)
+
+    # A year-shaped 4-digit suffix outside 1900-2099 (e.g. a made-up/far-
+    # future placeholder) is likewise left uncollapsed.
+    names2 = ["events_3015", "events_3016", "events_3017"]
+    kept2, groups2 = group_date_sharded_tables(names2, min_group_size=3)
+    assert groups2 == {}
+    assert sorted(kept2) == sorted(names2)
 
 
 def test_supports_postgres_declarative_partitioning_p_prefixed_suffix():
@@ -531,3 +564,449 @@ def test_resolve_timeout_seconds_reads_only_the_requested_field_name():
     descriptor = {"connect_timeout_seconds": 25, "execute_timeout_seconds": 90}
     assert resolve_timeout_seconds(descriptor, "connect_timeout_seconds", 10) == 25
     assert resolve_timeout_seconds(descriptor, "execute_timeout_seconds", 30) == 90
+
+
+# --- format_bytes_human() ----------------------------------------------------
+# Pure formatting helper each SQL backend's format_dataset_size_line() (see
+# below) leans on for the trailing "(~X estimated storage)" parenthetical -
+# never used for anything byte-exact.
+
+def test_format_bytes_human_returns_empty_string_for_none():
+    assert format_bytes_human(None) == ""
+
+
+def test_format_bytes_human_returns_empty_string_for_negative():
+    assert format_bytes_human(-1) == ""
+
+
+def test_format_bytes_human_formats_plain_bytes_with_no_decimal():
+    assert format_bytes_human(0) == "0 bytes"
+    assert format_bytes_human(500) == "500 bytes"
+    assert format_bytes_human(1023) == "1023 bytes"
+
+
+def test_format_bytes_human_kb_boundary():
+    # Exactly 1024 bytes crosses into KB (1024 is NOT "< 1024.0", so it
+    # rolls over rather than staying "1024 bytes").
+    assert format_bytes_human(1024) == "1.0 KB"
+    assert format_bytes_human(1536) == "1.5 KB"
+
+
+def test_format_bytes_human_mb_boundary():
+    assert format_bytes_human(1024 * 1024) == "1.0 MB"
+
+
+def test_format_bytes_human_gb_boundary():
+    assert format_bytes_human(1024 ** 3) == "1.0 GB"
+
+
+def test_format_bytes_human_tb_boundary():
+    assert format_bytes_human(1024 ** 4) == "1.0 TB"
+
+
+def test_format_bytes_human_pb_is_the_terminal_unit():
+    # PB is the last unit in the ladder - the loop's "or unit == 'PB'"
+    # guard means it always returns here, however large the value.
+    assert format_bytes_human(5 * 1024 ** 5) == "5.0 PB"
+
+
+# --- format_compact_count() --------------------------------------------------
+# Shortens a large row count to K/M/B with 3 significant digits - used by
+# format_dataset_size_line() below for its own row-count figure, and mirrored
+# exactly by client.js's formatCompactCount() for the Schema Viewer's
+# per-table row-count suffix (see that function's own comment).
+
+def test_format_compact_count_stays_plain_below_1000():
+    assert format_compact_count(0) == "0"
+    assert format_compact_count(999) == "999"
+    assert format_compact_count(1234) != "1234"  # sanity: the boundary above is real
+
+
+def test_format_compact_count_k_boundary_and_precision():
+    assert format_compact_count(1000) == "1.00K"
+    assert format_compact_count(1234) == "1.23K"
+    assert format_compact_count(12345) == "12.3K"
+    assert format_compact_count(123456) == "123K"
+
+
+def test_format_compact_count_m_boundary_and_precision():
+    assert format_compact_count(1_000_000) == "1.00M"
+    assert format_compact_count(1_234_567) == "1.23M"
+    assert format_compact_count(12_345_678) == "12.3M"
+    assert format_compact_count(123_456_789) == "123M"
+
+
+def test_format_compact_count_b_is_the_terminal_unit():
+    assert format_compact_count(1_000_000_000) == "1.00B"
+    assert format_compact_count(8_500_000_000) == "8.50B"
+    # No further unit past B - a trillion-row figure would never occur in
+    # practice, but this still stays 3-significant-digit-accurate rather
+    # than raising or falling back to a raw, ungrouped number.
+    assert format_compact_count(1_234_000_000_000) == "1234B"
+
+
+def test_format_compact_count_handles_a_non_numeric_input_without_raising():
+    assert format_compact_count(None) == "None"
+    assert format_compact_count("not a number") == "not a number"
+
+
+# --- format_multiline_schema_entry_body() ------------------------------------
+# Reindents a View/Routine definitions entry's body (a view's SELECT text or a
+# routine's CREATE.../body text, straight from the database) so every line
+# after the first is guaranteed to start indented - see that function's own
+# docstring in backends/base.py for the two independent webClient parsing
+# failure modes this prevents (an entry silently truncated to its own first
+# line, or a whole "View definitions:"/"Routine definitions:" section
+# silently truncated by one badly-indented body inside it).
+
+def test_format_multiline_schema_entry_body_leaves_a_single_line_body_untouched():
+    assert format_multiline_schema_entry_body("SELECT 1 FROM orders") == "SELECT 1 FROM orders"
+
+
+def test_format_multiline_schema_entry_body_indents_every_continuation_line():
+    raw = "SELECT a.id,\na.name\nFROM a;"
+    assert format_multiline_schema_entry_body(raw) == "SELECT a.id,\n    a.name\n    FROM a;"
+
+
+def test_format_multiline_schema_entry_body_adds_onto_indentation_the_database_already_used():
+    # A dialect's own pretty-printer may already indent continuation lines
+    # by varying amounts to show real nesting (e.g. Postgres's
+    # pg_get_viewdef) - the four guaranteed spaces are ADDED on top of
+    # whatever was already there, not a flat replacement, so that relative
+    # structure survives; only the GUARANTEE (every continuation line
+    # starts with at least four spaces, whatever it started with) is new.
+    raw = "SELECT a.id,\n   a.name\n  FROM a;"
+    assert format_multiline_schema_entry_body(raw) == "SELECT a.id,\n       a.name\n      FROM a;"
+
+
+def test_format_multiline_schema_entry_body_strips_outer_whitespace_first():
+    raw = "\n  SELECT 1;\n  "
+    assert format_multiline_schema_entry_body(raw) == "SELECT 1;"
+
+
+def test_format_multiline_schema_entry_body_returns_empty_string_for_none_or_blank():
+    assert format_multiline_schema_entry_body(None) == ""
+    assert format_multiline_schema_entry_body("") == ""
+    assert format_multiline_schema_entry_body("   ") == ""
+
+
+# --- format_dataset_size_line() ----------------------------------------------
+# Assembles the single "Estimated dataset size: ..." line each SQL backend's
+# get_schema() (deep) appends to its schema text - see backends/base.py's own
+# docstring for the full contract. Deliberately just one headline figure - a
+# byte-size estimate when available, never both a row count AND a table count
+# alongside it (a caller still computes those for its own "did this query
+# actually find anything" gating, but this function doesn't render them).
+
+def test_format_dataset_size_line_returns_empty_string_when_both_totals_none():
+    assert format_dataset_size_line() == ""
+    assert format_dataset_size_line(note="ignored") == ""
+
+
+def test_format_dataset_size_line_prefers_bytes_over_rows_when_both_are_given():
+    # Rows are only ever shown when there's no byte figure at all (see the
+    # next test) - here, despite total_rows also being passed, the rendered
+    # line is bytes-only.
+    assert (
+        format_dataset_size_line(total_rows=1234567, total_bytes=3_400_000_000)
+        == "Estimated dataset size: ~3.2 GB"
+    )
+
+
+def test_format_dataset_size_line_falls_back_to_a_compact_row_count_with_no_bytes():
+    # No byte figure at all (e.g. backends/databricks.py, or a byte query
+    # that failed for a dialect that normally has one) - 1,234,567 shortens
+    # to "1.23M" via format_compact_count() (see that function's own tests
+    # above for the K/M/B ladder in isolation).
+    assert (
+        format_dataset_size_line(total_rows=1234567)
+        == "Estimated dataset size: ~1.23M rows"
+    )
+
+
+def test_format_dataset_size_line_note_appears_as_trailing_parenthetical():
+    assert (
+        format_dataset_size_line(total_rows=100, note="stats may be stale")
+        == "Estimated dataset size: ~100 rows (stats may be stale)"
+    )
+    # Same trailing-parenthetical treatment for the bytes-preferred case.
+    assert (
+        format_dataset_size_line(total_bytes=2048, note="caveat text")
+        == "Estimated dataset size: ~2.0 KB (caveat text)"
+    )
+
+
+# --- _strip_trailing_asides() ------------------------------------------------
+# Regression coverage for two real, separate bugs that both showed up as
+# the same symptom (a shard family's Schema Viewer row showing an entire
+# multi-clause sentence instead of its bare wildcard pattern), fixed one
+# after the other:
+#
+# Bug 1 - nested parens: this used to be a single non-nesting regex
+# (r'\s*\([^)]*\)\s*$'), which can never match a descriptive parenthetical
+# that itself contains a nested, balanced parenthetical - `[^)]*` can't
+# cross the inner ")" to reach the real outer one, so the whole match
+# silently fails and NOTHING gets stripped. BigQuery's own "Table family"
+# heading has exactly this shape (a "(e.g. WHERE _TABLE_SUFFIX BETWEEN
+# '...' AND '...')" aside inside the outer descriptive parenthetical -
+# see backends/bigquery.py's get_schema()). Fixed by walking the string
+# from the end and counting paren depth instead of using a regex at all
+# (the function was named _strip_trailing_parenthetical at this point).
+#
+# Bug 2 - a bracket annotation chained AFTER the parenthetical: fixing
+# bug 1 wasn't enough - a BigQuery table (or family) that's also flagged
+# external and/or require_partition_filter gets a further
+# " [external table; REQUIRES PARTITION FILTER on <col>]" appended onto
+# the SAME heading line, after its closing ")" (see get_schema()'s own
+# heading_annotations handling). Since that bracket, not a paren, is now
+# the very last character, the depth-walk from bug 1's fix bailed out
+# immediately (`stripped.endswith(")")` was False) and stripped nothing
+# at all - the exact same "whole sentence becomes the name" symptom,
+# just from a different cause, and the reason a user still saw the ugly
+# Wikipedia pageviews_* row after bug 1's fix had already shipped and a
+# fresh schema refetch had run. Fixed by renaming this function to
+# _strip_trailing_asides and generalizing it to strip EITHER bracket type
+# ("(...)" or "[...]"), repeating until neither remains, so a "(...)"
+# immediately followed by a "[...]" (today's real BigQuery shape) is
+# fully stripped down to the bare wildcard, not just partially.
+
+def test_strip_trailing_asides_removes_a_simple_trailing_aside():
+    assert _strip_trailing_asides("events (partitioned by day)") == "events"
+
+
+def test_strip_trailing_asides_removes_a_parenthetical_containing_a_nested_one():
+    text = (
+        "`proj.ds.pageviews_*` (12 date-sharded tables, e.g. pageviews_2015 "
+        ".. pageviews_2026; filter via _TABLE_SUFFIX (e.g. WHERE "
+        "_TABLE_SUFFIX BETWEEN '...' AND '...'); never query a single "
+        "literal date-suffixed table name from this family)"
+    )
+    assert _strip_trailing_asides(text) == "`proj.ds.pageviews_*`"
+
+
+def test_strip_trailing_asides_handles_multiple_levels_of_nesting():
+    assert _strip_trailing_asides("name (a (b (c) d) e)") == "name"
+
+
+def test_strip_trailing_asides_leaves_a_heading_with_no_aside_untouched():
+    assert _strip_trailing_asides("customers") == "customers"
+
+
+def test_strip_trailing_asides_leaves_unbalanced_parens_untouched():
+    # More closes than opens - can't identify a matching outer "(" to cut
+    # from, so this degrades to a no-op rather than guessing wrong.
+    assert _strip_trailing_asides("odd) trailing) parens)") == "odd) trailing) parens)"
+
+
+def test_strip_trailing_asides_ignores_a_parenthetical_not_at_the_very_end():
+    # Only a TRAILING aside is stripped - one that happens to appear
+    # mid-string, with real content after it, is left alone.
+    assert _strip_trailing_asides("a (b) c") == "a (b) c"
+
+
+def test_strip_trailing_asides_strips_a_lone_bracket_annotation_with_no_parenthetical():
+    assert _strip_trailing_asides("orders [external table]") == "orders"
+
+
+def test_strip_trailing_asides_strips_a_parenthetical_followed_by_a_bracket_annotation():
+    # The real bug 2 shape: BigQuery's heading_annotations bracket is
+    # appended AFTER the descriptive parenthetical's own closing ")",
+    # so both have to come off, in that order, to reach the bare name.
+    text = "`proj.ds.pageviews_*` (12 date-sharded tables, e.g. a .. b) [REQUIRES PARTITION FILTER on datehour]"
+    assert _strip_trailing_asides(text) == "`proj.ds.pageviews_*`"
+
+
+def test_strip_trailing_asides_strips_a_nested_parenthetical_followed_by_a_bracket_annotation():
+    # bug 1 and bug 2's fixes chained together on one real-world heading:
+    # a nested "(e.g. ...)" aside inside the outer parenthetical, THEN a
+    # bracket annotation after that - the exact shape of the Wikipedia
+    # pageviews_* family (require_partition_filter on datehour) that
+    # motivated both fixes.
+    text = (
+        "`bigquery-public-data.wikipedia.pageviews_*` (12 date-sharded "
+        "tables, e.g. pageviews_2015 .. pageviews_2026; identical columns "
+        "in every member - query this family with the wildcard form "
+        "`bigquery-public-data.wikipedia.pageviews_*`, filtering/"
+        "identifying the shard via the _TABLE_SUFFIX pseudo-column (e.g. "
+        "WHERE _TABLE_SUFFIX BETWEEN '...' AND '...'); never query a "
+        "single literal date-suffixed table name from this family) "
+        "[REQUIRES PARTITION FILTER on datehour]"
+    )
+    assert _strip_trailing_asides(text) == "`bigquery-public-data.wikipedia.pageviews_*`"
+
+
+def test_strip_trailing_asides_strips_multiple_semicolon_joined_annotations_in_one_bracket():
+    # get_schema() joins several annotations into ONE bracket
+    # ("[external table; REQUIRES PARTITION FILTER on ts]"), not one
+    # bracket per annotation - still just a single trailing aside to strip.
+    text = "`p.d.t_*` (3 date-sharded tables, e.g. t_2020 .. t_2022) [external table; REQUIRES PARTITION FILTER on ts]"
+    assert _strip_trailing_asides(text) == "`p.d.t_*`"
+
+
+# --- extract_entry_names_from_schema_text(): the nested-parenthetical /
+# bracket-annotation cases -----------------------------------------------
+# (see test_connection_router.py for this function's broader coverage
+# against every known heading convention - this is specifically the two
+# regression cases _strip_trailing_asides above exists to fix)
+
+def test_extract_entry_names_handles_a_table_family_heading_with_nested_parens():
+    schema = (
+        "Table family: `proj.ds.pageviews_*` (12 date-sharded tables, e.g. "
+        "pageviews_2015 .. pageviews_2026; filter via _TABLE_SUFFIX (e.g. "
+        "WHERE _TABLE_SUFFIX BETWEEN '...' AND '...'); never query a single "
+        "literal date-suffixed table name from this family)\n"
+        "  id INTEGER NOT NULL\n"
+    )
+    assert extract_entry_names_from_schema_text(schema) == ["`proj.ds.pageviews_*`"]
+
+
+def test_extract_entry_names_handles_a_table_family_heading_with_a_trailing_bracket_annotation():
+    schema = (
+        "Table family: `proj.ds.pageviews_*` (12 date-sharded tables, e.g. "
+        "pageviews_2015 .. pageviews_2026) [REQUIRES PARTITION FILTER on datehour]\n"
+        "  datehour TIMESTAMP NOT NULL\n"
+    )
+    assert extract_entry_names_from_schema_text(schema) == ["`proj.ds.pageviews_*`"]
+
+
+# --- split_schema_text_into_entries() ----------------------------------------
+# Backs config_routes.py's GET /api/schema (the Schema Viewer feature) -
+# unlike extract_entry_names_from_schema_text, this also needs each entry's
+# own full "heading" (parenthetical included, for the LLM-facing raw-text
+# pane) and "text" block, alongside the same stripped "name" a UI list row
+# and the ER diagram key off of (see backends/base.py's own docstring on
+# the blast radius of "name" vs "heading"/"text").
+
+def test_split_schema_text_into_entries_plain_table_heading():
+    schema = "Table: customers\n  id integer NOT NULL\n  name text NOT NULL\n"
+    entries = split_schema_text_into_entries(schema)
+    assert len(entries) == 1
+    assert entries[0]["name"] == "customers"
+    assert entries[0]["heading"] == "Table: customers"
+    assert entries[0]["text"] == schema.rstrip("\n")
+
+
+def test_split_schema_text_into_entries_multiple_plain_tables():
+    schema = "Table: customers\n  id integer NOT NULL\n\nTable: orders\n  id integer NOT NULL\n"
+    entries = split_schema_text_into_entries(schema)
+    assert [e["name"] for e in entries] == ["customers", "orders"]
+    assert entries[0]["text"] == "Table: customers\n  id integer NOT NULL"
+    assert entries[1]["text"] == "Table: orders\n  id integer NOT NULL"
+
+
+def test_split_schema_text_into_entries_table_family_name_is_the_bare_wildcard_not_the_full_sentence():
+    # Bug 1 (see _strip_trailing_asides' own comment above): before that
+    # fix existed, "name" here came back as the ENTIRE heading tail
+    # (wildcard + full multi-clause description) because the nested "(e.g.
+    # WHERE ...)" aside broke the old non-nesting regex - this is what made
+    # the Schema Viewer's table list row unusably long for a BigQuery
+    # date-sharded family. "heading" and "text" (the LLM-facing content)
+    # are untouched either way - only "name" (the UI-facing label) is
+    # affected.
+    schema = (
+        "Table family: `bigquery-public-data.wikipedia.pageviews_*` "
+        "(12 date-sharded tables, e.g. pageviews_2015 .. pageviews_2026; "
+        "identical columns in every member - query this family with the "
+        "wildcard form `bigquery-public-data.wikipedia.pageviews_*`, "
+        "filtering/identifying the shard via the _TABLE_SUFFIX "
+        "pseudo-column (e.g. WHERE _TABLE_SUFFIX BETWEEN '...' AND "
+        "'...'); never query a single literal date-suffixed table name "
+        "from this family)\n"
+        "  datehour TIMESTAMP NOT NULL\n"
+        "  title STRING NOT NULL\n"
+        "  views INTEGER NOT NULL\n"
+    )
+    entries = split_schema_text_into_entries(schema)
+    assert len(entries) == 1
+    assert entries[0]["name"] == "`bigquery-public-data.wikipedia.pageviews_*`"
+    # The full descriptive heading is still there, verbatim, for the
+    # raw-text pane and the LLM-facing schema text - only the derived
+    # "name" field (the UI list row's label) was ever wrong.
+    assert entries[0]["heading"].startswith("Table family: `bigquery-public-data.wikipedia.pageviews_*` (12 date-sharded")
+    assert "never query a single literal date-suffixed table name from this family)" in entries[0]["text"]
+    assert "datehour TIMESTAMP NOT NULL" in entries[0]["text"]
+
+
+def test_split_schema_text_into_entries_table_family_name_strips_a_trailing_require_partition_filter_annotation_too():
+    # Bug 2 (see _strip_trailing_asides' own comment above): fixing bug 1
+    # wasn't enough on its own. This was the real-world Wikipedia
+    # pageviews_* heading (require_partition_filter=true on `datehour` -
+    # see backends/bigquery.py's get_schema()) at the time, which chains a
+    # "[REQUIRES PARTITION FILTER on datehour]" bracket annotation onto
+    # the heading AFTER its closing ")" - a real user still saw the whole
+    # ugly sentence as the Schema Viewer's table name even after bug 1's
+    # fix had already shipped and a fresh schema refetch had run, because
+    # the depth-walk back then only recognized a trailing ")", not "]".
+    # (get_schema() has since ALSO started using a bare leading pattern
+    # here instead of this fully-qualified one - see the next test - but
+    # this fully-qualified/backtick-quoted shape is still worth its own
+    # coverage: it's a strictly harder input for the stripping walk than
+    # a bare pattern is, and nothing about the walk cares what precedes
+    # the parenthetical it's stripping from the end.)
+    schema = (
+        "Table family: `bigquery-public-data.wikipedia.pageviews_*` "
+        "(12 date-sharded tables, e.g. pageviews_2015 .. pageviews_2026; "
+        "identical columns in every member - query this family with the "
+        "wildcard form `bigquery-public-data.wikipedia.pageviews_*`, "
+        "filtering/identifying the shard via the _TABLE_SUFFIX "
+        "pseudo-column (e.g. WHERE _TABLE_SUFFIX BETWEEN '...' AND "
+        "'...'); never query a single literal date-suffixed table name "
+        "from this family) [REQUIRES PARTITION FILTER on datehour]\n"
+        "  datehour TIMESTAMP NOT NULL\n"
+        "  title STRING NOT NULL\n"
+        "  views INTEGER NOT NULL\n"
+    )
+    entries = split_schema_text_into_entries(schema)
+    assert len(entries) == 1
+    assert entries[0]["name"] == "`bigquery-public-data.wikipedia.pageviews_*`"
+    # The bracket annotation (and the rest of the descriptive heading) is
+    # still there, verbatim, in "heading"/"text" - the LLM (and the Schema
+    # Viewer's own raw-text pane) still needs to know this family requires
+    # a partition filter; only the derived "name" strips it.
+    assert entries[0]["heading"].endswith("[REQUIRES PARTITION FILTER on datehour]")
+    assert "[REQUIRES PARTITION FILTER on datehour]" in entries[0]["text"]
+
+
+def test_split_schema_text_into_entries_table_family_name_is_the_bare_pattern_todays_actual_bigquery_shape():
+    # Bug 3 (see backends/bigquery.py's get_schema() shard-family heading
+    # comment): fixing bugs 1 and 2 STILL wasn't enough for a user's
+    # complaint that the Wikipedia pageviews_* family's name "still
+    # appears long and ugly" - because until this fix, get_schema() itself
+    # put the fully-qualified, backtick-quoted wildcard right after
+    # "Table family:" (the two tests above), unlike every other dialect's
+    # shard-family heading (see e.g. test_postgres_backend.py's "Table
+    # family: events_<date>") and unlike this SAME dialect's own plain
+    # "Table: <table_name>" heading, both of which use a bare, unqualified
+    # name. get_schema() now puts the bare pattern there instead - this is
+    # the actual shape it emits today. The fully-qualified wildcard BigQuery
+    # genuinely needs for querying is still given, verbatim, inside the
+    # parenthetical - nothing about the LLM-facing SQL-generation guidance
+    # changed, only the leading display token this test's "name" assertion
+    # is really about.
+    schema = (
+        "Table family: pageviews_* "
+        "(12 date-sharded tables, e.g. pageviews_2015 .. pageviews_2026; "
+        "identical columns in every member - query this family with the "
+        "wildcard form `bigquery-public-data.wikipedia.pageviews_*`, "
+        "filtering/identifying the shard via the _TABLE_SUFFIX "
+        "pseudo-column (e.g. WHERE _TABLE_SUFFIX BETWEEN '...' AND "
+        "'...'); never query a single literal date-suffixed table name "
+        "from this family) [REQUIRES PARTITION FILTER on datehour]\n"
+        "  datehour TIMESTAMP NOT NULL\n"
+    )
+    entries = split_schema_text_into_entries(schema)
+    assert len(entries) == 1
+    assert entries[0]["name"] == "pageviews_*"
+    assert "`bigquery-public-data.wikipedia.pageviews_*`" in entries[0]["text"]
+    assert "[REQUIRES PARTITION FILTER on datehour]" in entries[0]["heading"]
+
+
+def test_split_schema_text_into_entries_with_no_recognizable_heading_returns_one_name_none_entry():
+    schema = "No schema description available."
+    entries = split_schema_text_into_entries(schema)
+    assert entries == [{"name": None, "heading": None, "text": schema}]
+
+
+def test_split_schema_text_into_entries_empty_schema_text_returns_empty_list():
+    assert split_schema_text_into_entries("") == []
+    assert split_schema_text_into_entries(None) == []

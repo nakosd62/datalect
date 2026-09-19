@@ -70,14 +70,25 @@ state_store.init()
 # a blocking call like state_store.init() just above. Warms every admin-
 # configured preset's schema cache - cached indefinitely, like every
 # schema fetch (see schema_cache.py) - so most requests after boot don't
-# pay a live introspection query. Running it on its own thread instead of
-# inline means the server starts accepting requests immediately rather
-# than making every request wait out however long the slowest preset
-# takes to introspect (observed to be up to about a minute with several
-# presets configured, dominated by whichever single one is slowest, since
-# a blocking call here waits for ALL of them - see
-# prefetch_all_preset_schemas()'s own docstring for why it fetches
-# concurrently across presets in the first place). The tradeoff: a
+# pay a live introspection query. Now that schema_cache.py durably
+# persists every entry (state_store.py - SQLite locally, Firestore on
+# Cloud Run), a RESTART of an already-running app usually finds this
+# thread has nothing live to do at all: prefetch_all_preset_schemas()
+# loads each preset's already-persisted schema/overview straight from
+# that durable store instead of re-querying its real database, so this
+# whole thread typically finishes in well under a second on a restart -
+# the "up to about a minute" cost described below is really a first-ever-
+# boot (nothing durable saved yet for any preset) or after-invalidation
+# cost, not a per-restart one anymore. Running it on its own thread
+# instead of inline means the server starts accepting requests
+# immediately rather than making every request wait out however long the
+# slowest preset takes to introspect (observed to be up to about a
+# minute with several presets configured on a cold/never-persisted
+# start, dominated by whichever single one is slowest, since a blocking
+# call here waits for ALL of them - see prefetch_all_preset_schemas()'s
+# own docstring for why it fetches concurrently across presets in the
+# first place, and for exactly when a preset does vs. doesn't pay a real
+# live fetch here). The tradeoff: a
 # request that picks a preset before its prefetch thread gets to it falls
 # back to fetching that one preset's schema live, inline, itself - exactly
 # the same "fetch it on first use" path a custom connection already goes

@@ -676,6 +676,148 @@ class StateStore(ABC):
         (get_session/set_session above), which already recomputes the same
         bucket_key in the common case."""
 
+    # --- Durable schema cache (the ONLY layer schema_cache.py has - see
+    # that module's own docstring for why it no longer keeps any
+    # process-local in-memory copy alongside this) --------------------
+    #
+    # Not user-scoped at all, unlike everything else in this class - a
+    # schema (re)fetch is keyed purely by db.py's get_conn_identifier(),
+    # the same non-sensitive per-connection identifier schema_cache.py
+    # already uses as its own keys (see that module's docstring: "a
+    # non-sensitive identifier ... never the raw connection string"). A
+    # preset's cached schema is the same for every user who queries it,
+    # so there's no per-user partition to add here - this is the app's
+    # global "what does this connection currently look like"
+    # cache, durable purely so it survives a process restart, not a
+    # per-user preference the way sessions/db_connections/chat_history
+    # are.
+    #
+    # Deliberately stored in plaintext, same posture the "translations"
+    # table/collection already has for nl_prompt/sql_command (see that
+    # method's own docstring) - not the "encrypt the whole blob"
+    # treatment database_config/llm_byok_keys get. Those two protect
+    # actual CREDENTIALS (a saved connection's password, a BigQuery
+    # service-account key, an LLM API key); a schema cache entry is
+    # DDL/column metadata plus a handful of real sampled column values
+    # (see backends/base.py's frequent-value sampling) - business data
+    # comparable to what a translated SQL query's own result already is,
+    # not a secret that unlocks anything, so it gets the same plaintext
+    # treatment already accepted for that.
+
+    @abstractmethod
+    def get_cached_schema(self, cache_key):
+        """Returns {"schema_text", "cached_at", "overview"} for a durably-
+        saved schema cache entry, or None if nothing has ever been saved
+        for `cache_key`. "schema_text"/"cached_at" mirror schema_cache.py's
+        own get()/get_cached_at() exactly (the same string, and the same
+        ISO 8601 UTC timestamp string, passed straight through by
+        set_cached_schema below - not recomputed here). "overview" is the
+        {"prose", "questions", "generated_at"} dict schema_cache.py's own
+        get_overview()/set_overview() already document, or None if no
+        overview has ever been durably saved for this key (same "absence
+        means nothing to report" convention every other overview lookup in
+        this app already uses) - independent of whether schema_text itself
+        is present, since the two are written by two separate calls (see
+        set_cached_schema/set_cached_schema_overview below).
+
+        This IS schema_cache.py's storage, called on every get() - not a
+        read-through layer underneath a faster in-memory cache the way it
+        used to be (see that module's own docstring for why a
+        process-local in-memory layer was actively wrong on multi-instance
+        Cloud Run, not just a missed optimization). The round trip this
+        costs is small next to both the live database introspection query
+        this cache exists to avoid and the LLM call that dominates a real
+        request's latency regardless."""
+
+    @abstractmethod
+    def set_cached_schema(self, cache_key, schema_text, cached_at):
+        """Durably saves `cache_key`'s schema_text - the write-through
+        counterpart to schema_cache.py's own set(), called from that exact
+        same place so the in-memory and durable copies never drift apart.
+        `cached_at` is the same ISO 8601 UTC timestamp string set() already
+        computed for the in-memory copy, passed through rather than
+        independently recomputed, so a later get_cached_schema() call
+        reports the exact same value regardless of which layer answered
+        it. Overwrites whatever schema_text/cached_at was previously saved
+        for this key, if anything - there's no history/versioning here,
+        matching the in-memory cache's own single-current-entry design.
+        Leaves any previously-saved overview for this key completely
+        untouched (see set_cached_schema_overview below) - a schema
+        refetch and an overview regeneration are two separate calls in
+        db.py's prime_schema_cache_with_reason(), exactly as they already
+        are for the in-memory cache's own set()/set_overview()."""
+
+    @abstractmethod
+    def set_cached_schema_overview(self, cache_key, overview):
+        """Durably saves `cache_key`'s freshly generated overview dict -
+        the write-through counterpart to schema_cache.py's own
+        set_overview(), called from the exact same place
+        (db.py's _generate_and_cache_schema_overview(), moments after a
+        successful set_cached_schema() call for the same key). Leaves any
+        previously-saved schema_text/cached_at for this key untouched."""
+
+    @abstractmethod
+    def delete_cached_schema(self, cache_key):
+        """Durably deletes `cache_key`'s entire entry (schema_text AND
+        overview together, as one unit) - the write-through counterpart to
+        schema_cache.py's own invalidate(), called from the exact same
+        place (db.py's invalidate_schema_cache()) so a durably-persisted
+        copy never outlives the invalidation it's meant to enact - without
+        this, a connection whose config just changed would keep serving
+        the OLD, now-invalid schema this call was supposed to have erased.
+        Safe to call even if nothing was ever saved for this key. Also
+        clears any fetch-pending/fetch-error status recorded for this key
+        (see mark_schema_fetch_pending/mark_schema_fetch_done below) - an
+        invalidated entry has nothing in flight and nothing to report a
+        failure about any more."""
+
+    @abstractmethod
+    def mark_schema_fetch_pending(self, cache_key):
+        """Records that a schema (re)fetch for `cache_key` has just
+        started - the write-through counterpart to schema_cache.py's own
+        mark_fetch_pending(), called from the exact same place (db.py's
+        prime_schema_cache_with_reason(), right before it does any real
+        work). Durable (not process-local) for the same reason schema_text
+        itself is: the background thread that runs a (re)fetch after a
+        config-modal Save runs on whichever instance handled that POST,
+        but the client's polling GET (/api/config/schema-fetch-status) can
+        land on a different Cloud Run instance - which must see the same
+        "yes, still fetching" answer that instance would give itself.
+        Never touches fetch_error - a fetch that's merely STARTING says
+        nothing about the outcome of the previous attempt; mark_schema_
+        fetch_done below is what records that."""
+
+    @abstractmethod
+    def mark_schema_fetch_done(self, cache_key, error=None):
+        """Records that the fetch mark_schema_fetch_pending() announced for
+        `cache_key` has finished - the write-through counterpart to
+        schema_cache.py's own mark_fetch_done(). Always clears the pending
+        flag; `error` (one of db.py's SCHEMA_FETCH_FAILURE_REASON_*
+        strings) records the failure reason if given, or clears any
+        previously-recorded one if not (a successful fetch supersedes
+        whatever failed before it)."""
+
+    @abstractmethod
+    def get_schema_fetch_status(self, cache_key):
+        """Returns {"pending": bool, "error": str|None} for `cache_key` -
+        "pending" mirrors schema_cache.py's own is_fetch_pending(), "error"
+        mirrors get_last_fetch_error() (both False/None for a key that's
+        never been fetched at all, same as one whose last fetch already
+        finished cleanly - see mark_schema_fetch_done above). A single
+        combined read (not two separate methods/round trips) since both
+        fields live in the same row/document and webClient's polling loop
+        against /api/config/schema-fetch-status wants both on every tick."""
+
+    @abstractmethod
+    def list_cached_schema_texts(self):
+        """Returns every currently durably-cached {cache_key: schema_text}
+        pair (omitting any key with no schema_text saved yet - e.g. a
+        fetch is pending but hasn't succeeded). Local-dev debugging only -
+        the one caller is config_routes.py's /api/debug/schema-cache route,
+        itself gated off entirely on Cloud Run (see that route's own
+        docstring) - so this has no latency/cost budget to respect the way
+        every other method here does."""
+
 
 # --------------------------------------------------------------------------
 # SQLite backend (local dev)
@@ -959,6 +1101,47 @@ class SqliteStateStore(StateStore):
                         PRIMARY KEY (user_id, bucket_key)
                     );
                 """)
+
+                # One row per connection - not per (user_id, ...) the way
+                # every other table here is (see StateStore's own "Durable
+                # schema cache" comment for why: this is a single global
+                # cache shared by every user who queries a given
+                # connection, not a per-user preference). "overview" is a
+                # JSON-encoded {"prose", "questions", "generated_at"} dict
+                # (a SQLite TEXT column can't hold a native nested object
+                # the way a Firestore field can - same reasoning
+                # chat_history's own "payload" column comment gives), NULL
+                # until the first successful overview generation for that
+                # key - independent of schema_text/cached_at, which are set
+                # by a separate call (see set_cached_schema vs.
+                # set_cached_schema_overview).
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS schema_cache (
+                        cache_key TEXT PRIMARY KEY,
+                        schema_text TEXT,
+                        cached_at TEXT,
+                        overview TEXT,
+                        fetch_pending INTEGER NOT NULL DEFAULT 0,
+                        fetch_error TEXT,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                """)
+
+                # Migration: fetch_pending/fetch_error added when
+                # schema_cache.py's in-flight/last-error tracking (once a
+                # process-local _pending set/_last_error dict, invisible
+                # across Cloud Run instances - see schema_cache.py's own
+                # module docstring) moved into this same durably-shared
+                # table, for the same cross-instance-visibility reason
+                # schema_text/cached_at/overview already live here.
+                cursor.execute("PRAGMA table_info(schema_cache);")
+                schema_cache_columns = [column[1] for column in cursor.fetchall()]
+                if "fetch_pending" not in schema_cache_columns:
+                    cursor.execute(
+                        "ALTER TABLE schema_cache ADD COLUMN fetch_pending INTEGER NOT NULL DEFAULT 0;"
+                    )
+                if "fetch_error" not in schema_cache_columns:
+                    cursor.execute("ALTER TABLE schema_cache ADD COLUMN fetch_error TEXT;")
 
                 # Drop table if it exists under the old schema (where user_id was
                 # the single primary key) or if the temporary custom_databases
@@ -1460,6 +1643,142 @@ class SqliteStateStore(StateStore):
         except Exception:
             logger.exception("Error saving active chat bucket to SQLite")
 
+    def get_cached_schema(self, cache_key):
+        try:
+            with self._connect() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT schema_text, cached_at, overview FROM schema_cache WHERE cache_key = ?",
+                    (cache_key,),
+                )
+                row = cursor.fetchone()
+        except Exception:
+            logger.exception("Error fetching cached schema from SQLite")
+            return None
+        if row is None:
+            return None
+        schema_text, cached_at, raw_overview = row
+        overview = None
+        if raw_overview:
+            try:
+                overview = json.loads(raw_overview)
+            except Exception:
+                # A corrupt/unparseable saved overview should never take
+                # down the whole read - same "silently unavailable, never a
+                # hard error" posture _decode_chat_turns already uses for a
+                # bad chat_history payload.
+                overview = None
+        return {"schema_text": schema_text, "cached_at": cached_at, "overview": overview}
+
+    def set_cached_schema(self, cache_key, schema_text, cached_at):
+        try:
+            with self._connect() as conn:
+                cursor = conn.cursor()
+                # ON CONFLICT only touches schema_text/cached_at, never
+                # `overview` - a schema refetch must never clobber a
+                # previously-saved overview for this same key (see
+                # set_cached_schema_overview below - a separate call from a
+                # separate, best-effort LLM step).
+                cursor.execute("""
+                    INSERT INTO schema_cache (cache_key, schema_text, cached_at, updated_at)
+                    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(cache_key) DO UPDATE SET
+                        schema_text = excluded.schema_text,
+                        cached_at = excluded.cached_at,
+                        updated_at = CURRENT_TIMESTAMP;
+                """, (cache_key, schema_text, cached_at))
+                conn.commit()
+        except Exception:
+            logger.exception("Error saving cached schema to SQLite")
+
+    def set_cached_schema_overview(self, cache_key, overview):
+        try:
+            with self._connect() as conn:
+                cursor = conn.cursor()
+                # ON CONFLICT only touches `overview`, never schema_text/
+                # cached_at - see set_cached_schema's own comment above for
+                # why these two are kept independent.
+                cursor.execute("""
+                    INSERT INTO schema_cache (cache_key, overview, updated_at)
+                    VALUES (?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(cache_key) DO UPDATE SET
+                        overview = excluded.overview,
+                        updated_at = CURRENT_TIMESTAMP;
+                """, (cache_key, json.dumps(overview)))
+                conn.commit()
+        except Exception:
+            logger.exception("Error saving cached schema overview to SQLite")
+
+    def delete_cached_schema(self, cache_key):
+        try:
+            with self._connect() as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM schema_cache WHERE cache_key = ?", (cache_key,))
+                conn.commit()
+        except Exception:
+            logger.exception("Error deleting cached schema from SQLite")
+
+    def mark_schema_fetch_pending(self, cache_key):
+        try:
+            with self._connect() as conn:
+                cursor = conn.cursor()
+                # Never touches fetch_error - see this method's own
+                # docstring in StateStore above.
+                cursor.execute("""
+                    INSERT INTO schema_cache (cache_key, fetch_pending, updated_at)
+                    VALUES (?, 1, CURRENT_TIMESTAMP)
+                    ON CONFLICT(cache_key) DO UPDATE SET
+                        fetch_pending = 1,
+                        updated_at = CURRENT_TIMESTAMP;
+                """, (cache_key,))
+                conn.commit()
+        except Exception:
+            logger.exception("Error marking schema fetch pending in SQLite")
+
+    def mark_schema_fetch_done(self, cache_key, error=None):
+        try:
+            with self._connect() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO schema_cache (cache_key, fetch_pending, fetch_error, updated_at)
+                    VALUES (?, 0, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(cache_key) DO UPDATE SET
+                        fetch_pending = 0,
+                        fetch_error = excluded.fetch_error,
+                        updated_at = CURRENT_TIMESTAMP;
+                """, (cache_key, error))
+                conn.commit()
+        except Exception:
+            logger.exception("Error marking schema fetch done in SQLite")
+
+    def get_schema_fetch_status(self, cache_key):
+        try:
+            with self._connect() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT fetch_pending, fetch_error FROM schema_cache WHERE cache_key = ?",
+                    (cache_key,),
+                )
+                row = cursor.fetchone()
+        except Exception:
+            logger.exception("Error fetching schema fetch status from SQLite")
+            return {"pending": False, "error": None}
+        if row is None:
+            return {"pending": False, "error": None}
+        pending, error = row
+        return {"pending": bool(pending), "error": error}
+
+    def list_cached_schema_texts(self):
+        try:
+            with self._connect() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT cache_key, schema_text FROM schema_cache WHERE schema_text IS NOT NULL;")
+                rows = cursor.fetchall()
+        except Exception:
+            logger.exception("Error listing cached schemas from SQLite")
+            return {}
+        return {cache_key: schema_text for cache_key, schema_text in rows}
+
 
 # --------------------------------------------------------------------------
 # Firestore backend (Cloud Run)
@@ -1827,3 +2146,135 @@ class FirestoreStateStore(StateStore):
             )
         except Exception:
             logger.exception("Error saving active chat bucket to Firestore")
+
+    def _schema_cache_doc_id(self, cache_key):
+        """Firestore document IDs are split on "/" into alternating
+        collection/document path segments when passed as a single string
+        to .document() - fine for every OTHER doc id in this module
+        (a user_id, or a hash-based key like compute_connection_key's own
+        output), but cache_key here is db.py's get_conn_identifier(),
+        which for several dialects is a literal "user@host:port/dbname"
+        (see that function's own docstring) - passing that straight
+        through would silently misinterpret it as a nested-subcollection
+        path instead of one flat document, or raise outright. Hashing it
+        into a plain hex string sidesteps that entirely; the original
+        cache_key is still stored as its own field below so a document can
+        be identified/debugged without reversing the hash."""
+        return hashlib.sha256(cache_key.encode('utf-8')).hexdigest()
+
+    def get_cached_schema(self, cache_key):
+        try:
+            doc = self.client.collection("schema_cache").document(self._schema_cache_doc_id(cache_key)).get()
+        except Exception:
+            logger.exception("Error fetching cached schema from Firestore")
+            return None
+        if not doc.exists:
+            return None
+        data = doc.to_dict() or {}
+        return {
+            "schema_text": data.get("schema_text"),
+            "cached_at": data.get("cached_at"),
+            # Stored as a native map (see save_chat_bucket's own comment on
+            # why a Firestore field never needs schema_cache.py's own
+            # JSON-string encoding SQLite's TEXT column requires) - None
+            # for a key whose overview was never saved, same "absence
+            # means nothing to report" convention as everywhere else.
+            "overview": data.get("overview"),
+        }
+
+    def set_cached_schema(self, cache_key, schema_text, cached_at):
+        try:
+            # merge=True - never touches a previously-saved "overview"
+            # field for this same doc, same independence
+            # SqliteStateStore.set_cached_schema's own ON CONFLICT clause
+            # keeps between the two columns.
+            self.client.collection("schema_cache").document(self._schema_cache_doc_id(cache_key)).set(
+                {
+                    "cache_key": cache_key,
+                    "schema_text": schema_text,
+                    "cached_at": cached_at,
+                    "updated_at": firestore.SERVER_TIMESTAMP,
+                },
+                merge=True,
+            )
+        except Exception:
+            logger.exception("Error saving cached schema to Firestore")
+
+    def set_cached_schema_overview(self, cache_key, overview):
+        try:
+            # merge=True - never touches a previously-saved schema_text/
+            # cached_at for this same doc, mirroring set_cached_schema
+            # above.
+            self.client.collection("schema_cache").document(self._schema_cache_doc_id(cache_key)).set(
+                {
+                    "cache_key": cache_key,
+                    "overview": overview,
+                    "updated_at": firestore.SERVER_TIMESTAMP,
+                },
+                merge=True,
+            )
+        except Exception:
+            logger.exception("Error saving cached schema overview to Firestore")
+
+    def delete_cached_schema(self, cache_key):
+        try:
+            self.client.collection("schema_cache").document(self._schema_cache_doc_id(cache_key)).delete()
+        except Exception:
+            logger.exception("Error deleting cached schema from Firestore")
+
+    def mark_schema_fetch_pending(self, cache_key):
+        try:
+            # merge=True - never touches a previously-saved fetch_error for
+            # this same doc, same independence set_cached_schema/
+            # set_cached_schema_overview already keep between their own
+            # fields (see this method's own docstring in StateStore above).
+            self.client.collection("schema_cache").document(self._schema_cache_doc_id(cache_key)).set(
+                {
+                    "cache_key": cache_key,
+                    "fetch_pending": True,
+                    "updated_at": firestore.SERVER_TIMESTAMP,
+                },
+                merge=True,
+            )
+        except Exception:
+            logger.exception("Error marking schema fetch pending in Firestore")
+
+    def mark_schema_fetch_done(self, cache_key, error=None):
+        try:
+            self.client.collection("schema_cache").document(self._schema_cache_doc_id(cache_key)).set(
+                {
+                    "cache_key": cache_key,
+                    "fetch_pending": False,
+                    "fetch_error": error,
+                    "updated_at": firestore.SERVER_TIMESTAMP,
+                },
+                merge=True,
+            )
+        except Exception:
+            logger.exception("Error marking schema fetch done in Firestore")
+
+    def get_schema_fetch_status(self, cache_key):
+        try:
+            doc = self.client.collection("schema_cache").document(self._schema_cache_doc_id(cache_key)).get()
+        except Exception:
+            logger.exception("Error fetching schema fetch status from Firestore")
+            return {"pending": False, "error": None}
+        if not doc.exists:
+            return {"pending": False, "error": None}
+        data = doc.to_dict() or {}
+        return {"pending": bool(data.get("fetch_pending")), "error": data.get("fetch_error")}
+
+    def list_cached_schema_texts(self):
+        try:
+            docs = self.client.collection("schema_cache").stream()
+        except Exception:
+            logger.exception("Error listing cached schemas from Firestore")
+            return {}
+        result = {}
+        for doc in docs:
+            data = doc.to_dict() or {}
+            schema_text = data.get("schema_text")
+            cache_key = data.get("cache_key")
+            if schema_text is not None and cache_key is not None:
+                result[cache_key] = schema_text
+        return result

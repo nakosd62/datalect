@@ -27,6 +27,7 @@ state_store/the API/the UI is follow-up work for when a second backend
 actually needs it.
 """
 
+import math
 import os
 import re
 import tempfile
@@ -60,6 +61,56 @@ SCHEMA_MAX_TABLE_NAMES_SCANNED = int(os.environ.get("SCHEMA_MAX_TABLE_NAMES_SCAN
 # what caused it to grow (huge column counts on a handful of tables, huge
 # view definitions, more table entries than fit even after the caps above).
 SCHEMA_MAX_CHARS = int(os.environ.get("SCHEMA_MAX_SCHEMA_CHARS", 100_000))
+
+# --- Frequent-value sampling threshold ---------------------------------------
+# Every backend's own Phase 2 "Column value samples" section picks each
+# categorical column's top FREQUENT_VALUES_LIMIT values by plain COUNT(*) -
+# used to be redefined locally as a plain `FREQUENT_VALUES_LIMIT = 15` in
+# each of the 8 backends that have this section (postgres/redshift/mysql/
+# snowflake/databricks/bigquery/mssql/oracle - mongodb_sql.py and sheets.py
+# have no equivalent sampling pass at all), identically everywhere, so it's
+# centralized here instead - same reasoning as SCHEMA_MAX_CHARS above, and
+# the same move FREQUENT_VALUE_MIN_FRACTION just below made for the
+# per-value share-of-table floor: one shared, env-configurable knob rather
+# than 8 copies of the same literal that could quietly drift out of sync.
+FREQUENT_VALUES_LIMIT = int(os.environ.get("SCHEMA_FREQUENT_VALUES_LIMIT", 15))
+
+# "sorts into the top N" and "is actually common" are different things: a
+# column with thousands of near-evenly-distributed distinct values (e.g. a
+# high-cardinality but not-quite-unique code) would still surface its top
+# FREQUENT_VALUES_LIMIT values there, each barely a fraction of a percent of
+# the table, presented to the model with no indication they're not
+# representative at all. This is a second, independent gate applied on top
+# of that existing top-N limit (a value must clear BOTH to be shown) - how
+# big a share of the table's own live row count a value's own COUNT(*) has
+# to reach before it even counts as "frequent" to begin with. Shared here
+# (like SCHEMA_MAX_CHARS above) rather than redefined per backend, so every
+# dialect applies the identical threshold and a deployment can tune it once,
+# everywhere, via the env var.
+FREQUENT_VALUE_MIN_FRACTION = float(os.environ.get("SCHEMA_FREQUENT_VALUE_MIN_FRACTION", 0.05))
+
+
+def min_frequent_value_count(row_count):
+    """The minimum COUNT(*) a value needs to clear FREQUENT_VALUE_MIN_FRACTION
+    for a table with `row_count` live rows, as a plain int suitable for a
+    HAVING COUNT(*) >= <this> clause - always at least 1 once `row_count` is
+    usable, so a zero-count value is never reported as "frequent" no matter
+    how tiny the table is.
+
+    Returns None - meaning "no HAVING floor; keep the old top-N-only
+    behavior for this table" - when `row_count` isn't a usable positive
+    number. Every backend's own live COUNT(*) query (the one that already
+    produces its "Live row counts" line) can fail or return nothing on a
+    connection hiccup, exactly as tolerated there; falling back to "no
+    minimum" here rather than e.g. treating a missing count as 0 (which
+    would make EVERY value fail the >= check and silently drop the whole
+    "Column value samples" section for that table) keeps this purely
+    additive - a table this can't compute a percentage for still gets the
+    exact same sampling it always did."""
+    if not isinstance(row_count, (int, float)) or row_count <= 0:
+        return None
+    return max(1, math.ceil(row_count * FREQUENT_VALUE_MIN_FRACTION))
+
 
 # --- Connect-time timeout ----------------------------------------------------
 # Bounds how long connect() may block dialing/handshaking out to a real
@@ -184,26 +235,36 @@ ROUTER_MAX_TABLE_NAMES_PER_CONNECTION = int(
 # date-shaped number shouldn't be swept into a "family" of one.
 SCHEMA_SHARD_MIN_GROUP_SIZE = int(os.environ.get("SCHEMA_SHARD_MIN_GROUP_SIZE", 3))
 
-# Matches <prefix>_<date> where date is YYYYMMDD, YYYYMM, YYYY-MM-DD,
-# YYYY_MM_DD, or p<YYYY>_<MM> - the common date-sharding conventions
-# (BigQuery's own docs use YYYYMMDD; the others show up often enough in
-# hand-rolled sharding to be worth covering; p<YYYY>_<MM>, e.g.
-# "payment_p2023_10", is Postgres declarative-partitioning's own common
-# naming convention for monthly range partitions - a literal "p" followed
-# by a zero-padded year_month, as opposed to the other four alternatives
-# which are all-digit). Prefix is matched non-greedily so a prefix that
-# itself contains underscores (e.g. "raw_events_20240101" -> prefix
-# "raw_events") still resolves to the longest non-date-shaped prefix via
-# backtracking, not just the text before the first underscore - this is
-# also what correctly resolves "payment_p2023_10" to prefix "payment"
-# rather than swallowing the "p2023_10" partition suffix into the prefix.
-# The month is required to be exactly 2 digits (zero-padded) so that
-# group_date_sharded_tables' plain alphabetical sort (used both to pick
-# the "most recent" representative and to order shard_groups' member
-# list) stays chronological - an unpadded "p2023_9" would otherwise sort
-# after "p2023_10" as a string, even though September precedes October.
+# Matches <prefix>_<date> where date is YYYYMMDD, YYYYMM, a bare YYYY
+# (year 1900-2099 only - see below), YYYY-MM-DD, YYYY_MM_DD, or
+# p<YYYY>_<MM> - the common date-sharding conventions (BigQuery's own docs
+# use YYYYMMDD; the others show up often enough in hand-rolled sharding to
+# be worth covering; p<YYYY>_<MM>, e.g. "payment_p2023_10", is Postgres
+# declarative-partitioning's own common naming convention for monthly
+# range partitions - a literal "p" followed by a zero-padded year_month,
+# as opposed to the other alternatives which are all-digit). Prefix is
+# matched non-greedily so a prefix that itself contains underscores (e.g.
+# "raw_events_20240101" -> prefix "raw_events") still resolves to the
+# longest non-date-shaped prefix via backtracking, not just the text
+# before the first underscore - this is also what correctly resolves
+# "payment_p2023_10" to prefix "payment" rather than swallowing the
+# "p2023_10" partition suffix into the prefix. The month is required to be
+# exactly 2 digits (zero-padded) so that group_date_sharded_tables' plain
+# alphabetical sort (used both to pick the "most recent" representative
+# and to order shard_groups' member list) stays chronological - an
+# unpadded "p2023_9" would otherwise sort after "p2023_10" as a string,
+# even though September precedes October.
+#
+# The bare-YYYY alternative is deliberately constrained to (19|20)\d{2}
+# (1900-2099), not an unconstrained \d{4}: a 4-digit suffix is far more
+# likely than a 6- or 8-digit one to collide with an unrelated numeric ID
+# a table family just happens to be suffixed with (e.g. "chunk_0001" ..
+# "chunk_0099") - the extra two digits in YYYYMM/YYYYMMDD already make
+# those far less ambiguous on their own. Yearly-partitioned tables (e.g. a
+# BigQuery dataset's pageviews_2015 .. pageviews_2026) are exactly what
+# this alternative exists to catch.
 _DATE_SHARD_RE = re.compile(
-    r'^(?P<prefix>.+?)_(?P<date>\d{8}|\d{6}|\d{4}-\d{2}-\d{2}|\d{4}_\d{2}_\d{2}|p\d{4}_\d{2})$'
+    r'^(?P<prefix>.+?)_(?P<date>\d{8}|\d{6}|(?:19|20)\d{2}|\d{4}-\d{2}-\d{2}|\d{4}_\d{2}_\d{2}|p\d{4}_\d{2})$'
 )
 
 
@@ -344,6 +405,135 @@ def schema_text_was_truncated(text):
     server logs to see how often a given connection's schema actually hits
     the ceiling."""
     return bool(text) and _SCHEMA_TRUNCATION_MARKER in text
+
+
+def format_bytes_human(num_bytes):
+    """Formats a byte count as a short human string (e.g. "3.2 GB"), used
+    only for display within a schema's own "Estimated dataset size" line
+    (see format_dataset_size_line() below) - never for anything a query
+    plan or byte-exact calculation depends on. Returns '' for None or a
+    negative input rather than raising, since every caller treats this as
+    a best-effort decoration on an already best-effort estimate."""
+    if num_bytes is None or num_bytes < 0:
+        return ""
+    value = float(num_bytes)
+    for unit in ("bytes", "KB", "MB", "GB", "TB", "PB"):
+        if value < 1024.0 or unit == "PB":
+            return f"{int(value)} {unit}" if unit == "bytes" else f"{value:.1f} {unit}"
+        value /= 1024.0
+    return ""  # pragma: no cover - unreachable, PB branch above always returns
+
+
+def format_compact_count(n):
+    """Shortens a large count to K/M/B with 3 significant digits (e.g.
+    1234 -> "1.23K", 12345 -> "12.3K", 123456 -> "123K", 8500000 -> "8.50M") -
+    used for the row count in format_dataset_size_line() below, which can
+    otherwise run to 8+ digits for a genuinely large table and read as
+    visual noise next to the rest of that line. Mirrors client.js's own
+    formatCompactCount() (used there for the Schema Viewer's per-table row-
+    count suffix) so a large row count reads the same way whether it's
+    rendered server-side (this function, in the schema text handed to the
+    LLM) or client-side - one shared convention, not two independently
+    tuned ones. A plain, comma-grouped integer below 1000, where a unit
+    suffix wouldn't save space and would just read oddly (e.g. "0.42K")."""
+    try:
+        num = float(n)
+    except (TypeError, ValueError):
+        return str(n)
+    abs_num = abs(num)
+    for unit_value, suffix in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if abs_num >= unit_value:
+            scaled = num / unit_value
+            scaled_abs = abs(scaled)
+            decimals = 0 if scaled_abs >= 100 else (1 if scaled_abs >= 10 else 2)
+            return f"{scaled:.{decimals}f}{suffix}"
+    return f"{int(round(num)):,}"
+
+
+def format_multiline_schema_entry_body(body):
+    """Reindents a View/Routine definitions entry's body text - a view's
+    SELECT text (e.g. Postgres's pg_get_viewdef()/information_schema.views.
+    view_definition) or a routine's CREATE.../body text, straight from the
+    database, exactly as that dialect's own formatter produced it - so
+    every line after the first is guaranteed to start with at least four
+    spaces of leading whitespace, regardless of whatever indentation (if
+    any, and it varies a lot: some dialects pretty-print with consistent
+    indentation, others hand back the original, arbitrarily-formatted
+    CREATE statement verbatim) the database itself used.
+
+    This matters for two independent reasons on the webClient Schema
+    Viewer side (client.js): (1) parseSchemaViews()/parseSchemaRoutines()
+    identify each entry by its own "  View <name>: "/"  <name>: " header
+    line and treat every following line that does NOT look like a new
+    entry's header as part of the CURRENT entry's body - a body line that
+    itself happened to start at column zero would end that entry early and
+    silently drop the rest of its own text; (2) isTopLevelSchemaSectionLine()
+    (used to find where a top-level section like "View definitions:" itself
+    ENDS) treats ANY column-zero line as the start of the NEXT section - a
+    raw, unindented line buried inside one view's own multi-line SQL would
+    truncate the whole section early, silently dropping every view/routine
+    listed after it too, not just the one whose body caused it.
+
+    Called on every backend's own view_lines/routine_body_lines
+    construction (e.g. backends/postgres.py's "  View {name}: {...}" f-
+    string) - the caller still owns the "  View {name}: "/"  {name}: "
+    header prefix and the empty-body case (a NULL/empty definition, e.g. a
+    role lacking the privilege to see it - see backends/postgres.py's own
+    view_definition NULL comment); this only ever touches what comes after
+    that prefix. Returns '' unchanged for an empty/None body - never turns
+    "nothing to show" into a non-empty string."""
+    body = (body or "").strip()
+    if not body:
+        return ""
+    lines = body.split("\n")
+    return "\n".join([lines[0]] + [f"    {line}" for line in lines[1:]])
+
+
+def format_dataset_size_line(total_rows=None, total_bytes=None, note=None):
+    """Builds the single "Estimated dataset size: ..." line each SQL
+    backend's get_schema() (deep fetch) appends to its own schema_parts,
+    from whatever subset of (schema-wide row count, schema-wide storage
+    bytes) that backend's dialect can cheaply provide via catalog/metadata
+    statistics - deliberately never a live per-table COUNT(*) scan across
+    the whole schema (get_schema()'s existing per-table "live,
+    authoritative" counts already do that, but only for the capped/kept
+    subset of tables shown in the prompt text - a schema-wide total needs
+    an aggregate that doesn't scan actual rows).
+
+    Deliberately just the one headline figure, nothing more: a plain
+    byte-size estimate (e.g. "~3.2 GB") when total_bytes is available -
+    the row count a caller computed for its own gating logic (only calling
+    this at all once it knows at least one table was found) is NOT also
+    rendered here alongside a table count, since "~1.23M rows across 42
+    tables (~3.2 GB estimated storage)" is more detail than this one-line
+    summary needs. Falls back to a compact row count (e.g. "~1.23M rows")
+    only when no byte figure exists at all for this call - see backends/
+    databricks.py, which has no cheap byte source on any call, or a byte
+    query that failed for a dialect that normally has one (e.g. backends/
+    oracle.py's separate, independently-failable USER_SEGMENTS query).
+
+    Returns '' (nothing to append) when there's truly nothing to report -
+    total_rows and total_bytes both None - so every caller can
+    unconditionally do `if line: schema_parts.append(line)` without its
+    own "did we get anything" branch first. This is the right outcome for
+    a dialect with no cheap schema-wide source at all (see backends/
+    mongodb_sql.py, backends/sheets.py) - a missing line reads as "not
+    available for this connection type", never a misleading zero.
+
+    `note`, when given, is appended as a trailing parenthetical caveat
+    specific to that dialect's own source for this number (e.g. "stats may
+    be stale since last ANALYZE", or Databricks' "live count of shown
+    tables only, not a schema-wide estimate" - see individual backends).
+    """
+    if total_bytes is not None:
+        bytes_human = format_bytes_human(total_bytes)
+        if bytes_human:
+            line = f"Estimated dataset size: ~{bytes_human}"
+            return f"{line} ({note})" if note else line
+    if total_rows is not None:
+        line = f"Estimated dataset size: ~{format_compact_count(total_rows)} rows"
+        return f"{line} ({note})" if note else line
+    return ""
 
 
 # Column-name suffixes that conventionally mark a foreign-key-shaped column
@@ -571,13 +761,73 @@ def fetch_capped_rows(cursor, max_rows=EXECUTE_RESULTS_MAX_ROWS):
 # contract, not inventing a new coupling.
 _ENTRY_HEADING_RE = re.compile(r'^(?:Table family|Table|Tab):\s*(.+)$', re.MULTILINE)
 
-# A heading's descriptive parenthetical, when present (every "Table family"/
-# "Tab" heading has one; a plain "Table:" heading never does) - e.g.
-# " (12 date-sharded tables, e.g. ...)" or " (query this as the implicit
-# data source ...)". Stripped so router candidate summaries show just the
-# bare name/pattern, not the full explanatory text meant for the SQL-
-# generation prompt.
-_HEADING_PARENTHETICAL_RE = re.compile(r'\s*\([^)]*\)\s*$')
+
+_ASIDE_BRACKETS = {")": "(", "]": "["}
+
+
+def _strip_trailing_asides(text):
+    """Strips every trailing "aside" chained onto the end of a heading,
+    repeating until none are left - a descriptive parenthetical (every
+    "Table family"/"Tab" heading has one, e.g. " (12 date-sharded tables,
+    e.g. ...)" or " (query this as the implicit data source ...)"), a
+    bracketed annotation (BigQuery's own get_schema() appends
+    " [external table]" and/or " [REQUIRES PARTITION FILTER on <col>]"
+    onto a heading that already ends in its own descriptive parenthetical -
+    see that module's own heading_annotations handling), or both chained
+    one after the other, in either order. A plain "Table: <name>" heading
+    has neither and is returned completely unchanged. This is what lets a
+    UI list row, the ER diagram's node label, and connection_router.py's
+    Phase A candidate summaries all show just the bare name/pattern, never
+    the full explanatory text (and now never a "[...]" annotation either)
+    that's meant for the SQL-generation prompt - still available verbatim
+    via split_schema_text_into_entries()'s own "heading"/"text" fields,
+    untouched by this.
+
+    Walks the string from the end counting bracket depth for whichever of
+    ")"/"]" it currently ends with, rather than a single non-nesting regex
+    (the earlier `\\([^)]*\\)$` this replaced) - a descriptive parenthetical
+    can itself contain a nested, balanced parenthetical (BigQuery's own
+    "Table family" heading does: "... filtering/identifying the shard via
+    the _TABLE_SUFFIX pseudo-column (e.g. WHERE _TABLE_SUFFIX BETWEEN
+    '...' AND '...'); never query a single literal date-suffixed table
+    name from this family)" has a "(e.g. ...)" aside inside the outer
+    parenthetical), which a non-nesting regex can never match at all -
+    `[^)]*` can't cross the inner ")" to reach the real outer one, so the
+    whole match fails and NOTHING gets stripped, leaving the full sentence
+    as the "name". This walks the closing bracket back to its own matching
+    opener by depth, however much nesting of THAT SAME bracket type is in
+    between, and strips from there - then repeats, since a heading can end
+    in a "(...)" immediately followed by a "[...]" (or, in principle, the
+    other order), each its own separate, self-contained aside (BigQuery's
+    heading_annotations bracket never contains a literal "(" or ")", and
+    the descriptive parenthetical never contains a literal "[" or "]", so
+    each pass only ever tracks the one bracket type it started with).
+
+    Returns whatever's left unchanged (rather than guessing) as soon as it
+    no longer ends in ")" or "]" at all, or the first time the bracket it
+    does end with turns out unbalanced (more closes than opens) - the
+    latter should never happen for a heading text any backend here
+    actually emits, but this degrades to a no-op on the remaining text
+    instead of stripping the wrong span if one someday does."""
+    result = text
+    while True:
+        stripped = result.rstrip()
+        if not stripped or stripped[-1] not in _ASIDE_BRACKETS:
+            return result
+        close_ch = stripped[-1]
+        open_ch = _ASIDE_BRACKETS[close_ch]
+        depth = 0
+        for i in range(len(stripped) - 1, -1, -1):
+            ch = stripped[i]
+            if ch == close_ch:
+                depth += 1
+            elif ch == open_ch:
+                depth -= 1
+                if depth == 0:
+                    result = stripped[:i].rstrip()
+                    break
+        else:
+            return result
 
 
 def extract_entry_names_from_schema_text(schema_text, max_names=ROUTER_MAX_TABLE_NAMES_PER_CONNECTION):
@@ -611,12 +861,75 @@ def extract_entry_names_from_schema_text(schema_text, max_names=ROUTER_MAX_TABLE
         return []
     names = []
     for match in _ENTRY_HEADING_RE.finditer(schema_text):
-        name = _HEADING_PARENTHETICAL_RE.sub("", match.group(1)).strip()
+        name = _strip_trailing_asides(match.group(1)).strip()
         if name:
             names.append(name)
         if len(names) >= max_names:
             break
     return names
+
+
+def split_schema_text_into_entries(schema_text):
+    """Splits a full get_schema()/get_schema_shallow() text into one entry
+    per table/table-family/tab, using the exact same heading convention
+    extract_entry_names_from_schema_text (above) already recognizes -
+    "Table: <name>", "Table family: <pattern> (...)", "Tab: <name> (...)"
+    as the first line of each entry's block (see _ENTRY_HEADING_RE's own
+    comment for the underlying contract every backend commits to). Written
+    for the schema-viewer feature (config_routes.py's GET /api/schema),
+    which needs each entry's own full text block (not just its bare name,
+    which is all extract_entry_names_from_schema_text ever returns), but
+    reuses that same regex rather than inventing a second, subtly
+    different parsing pass over the same convention.
+
+    Returns a list of {"name", "heading", "text"} dicts, in the order
+    entries appear in schema_text (already alphabetical - see
+    cap_kept_tables): "name" is the bare entry name/pattern with its
+    descriptive parenthetical stripped (identical to what
+    extract_entry_names_from_schema_text returns for the same heading),
+    "heading" is the raw heading line as-is (parenthetical included, e.g.
+    "Table family: events_<date> (12 date-sharded tables, e.g. ...)"), and
+    "text" is this entry's complete block - its heading line through (but
+    not including) the next entry's heading, trailing blank lines
+    stripped - i.e. exactly the slice of schema_text a reader would need
+    to see everything this one backend said about this one table (columns,
+    types, constraints, indexes, sample values, live row counts,
+    naming-convention relationships, or whichever subset that backend's
+    get_schema() includes).
+
+    Any text before the first heading is returned as one leading entry
+    with name=None, heading=None - no backend emits a schema-level
+    preamble before its first table today, so this is purely defensive;
+    a caller building a browsable table list should skip entries with
+    name=None, while a caller wanting the complete original text back
+    unchanged can still reconstruct it by joining every entry's "text" in
+    original order (interposing the blank lines this function strips is
+    the one thing that join wouldn't exactly reproduce - immaterial for
+    display, since a schema viewer renders one entry at a time).
+
+    Never raises - a schema_text with no recognizable heading at all (the
+    "No schema description available." failure placeholder from db.py, or
+    a future backend that changes this convention) yields a single entry
+    with name=None holding the complete text, same as the "preamble" case
+    above - callers should treat name=None as "nothing structured to
+    show", not as an error, and fall back to displaying "text" as-is."""
+    if not schema_text:
+        return []
+    matches = list(_ENTRY_HEADING_RE.finditer(schema_text))
+    if not matches:
+        return [{"name": None, "heading": None, "text": schema_text}]
+    entries = []
+    if matches[0].start() > 0:
+        preamble = schema_text[:matches[0].start()].rstrip("\n")
+        if preamble:
+            entries.append({"name": None, "heading": None, "text": preamble})
+    for i, match in enumerate(matches):
+        start = match.start()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(schema_text)
+        block = schema_text[start:end].rstrip("\n")
+        name = _strip_trailing_asides(match.group(1)).strip()
+        entries.append({"name": name or None, "heading": match.group(0), "text": block})
+    return entries
 
 
 def materialize_ca_cert_tempfile(ca_cert_pem):

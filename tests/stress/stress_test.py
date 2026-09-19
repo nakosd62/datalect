@@ -76,6 +76,23 @@ MODES
              deliberately decoupled (not chained SQL-from-translate ->
              execute) in this mode.
 
+  conversation  Runs --users independent simulated users concurrently,
+             SUSTAINED over wall-clock --duration, each running a REAL
+             CLOSED-LOOP conversation: pick a dataset from --datasets-file,
+             ask an opening question, let /api/translate actually generate
+             the SQL, run THAT real SQL via /api/execute, summarize the
+             real result via /api/summarize-result, ask a followup
+             question carrying the growing real history, and so on for
+             --turns-per-conversation turns - then start a brand-new
+             conversation (fresh history) against the NEXT dataset in the
+             pool, cycling through every dataset you list over the course
+             of the run. This is the "user connects, picks a dataset,
+             asks a question, gets real SQL/results/summary, asks a
+             follow-up, ..." scenario end to end - see CONVERSATION MODE
+             below for the prompt pools, the dataset-rotation scheme, and
+             an important warning about running real LLM-generated SQL
+             against your real data.
+
 HISTORY PAYLOAD (--history-turns, translate endpoint only)
 
   Every mode above defaults to an EMPTY `history` on every /api/translate
@@ -166,6 +183,117 @@ user, multi-dataset load)
   network calls - use it to sanity-check a run's real cost/shape before
   firing it at a real, billed deployment.
 
+CONVERSATION MODE (--mode conversation - real closed-loop translate ->
+execute -> summarize -> translate chains, across ALL your datasets)
+
+  --datasets-file here only needs {"preset_id": "...", "name": "<optional
+  label>"} per entry - no "sql" required (conversation mode ignores it if
+  present, so the SAME file soak mode uses also works here, or write a
+  separate one). See conversation_datasets.json next to this script for a
+  ready-to-use pool built from this deployment's own real, currently
+  ACTIVE presets (i.e. every entry in presets.json whose id/type isn't
+  prefixed "_paused_").
+
+  Each simulated user runs a SEQUENCE of conversations back to back for
+  the whole --duration, not one fixed dataset the whole time: conversation
+  number c (0, 1, 2, ...) for user u picks datasets[(u + c) % len(datasets)]
+  - staggered so users don't all start on the same dataset, and cycling
+  every user through the FULL pool as their run goes on (with enough
+  --duration/--turns-per-conversation, "each user does this against all
+  available preset datasets" - your own framing for this mode). Each new
+  conversation pins that dataset (POST /api/config) and starts with a
+  completely FRESH `history` - a real user picking a different dataset
+  starts a new train of thought, not one that drags in a previous,
+  unrelated schema's turns.
+
+  Per turn: prompts rotate through a pool - by default QUICK_PROMPTS
+  (QUICK_PROMPTS[turn % len(QUICK_PROMPTS)]), the app's own real,
+  already-tested "quick prompt" chips from webClient/index.html's
+  #examplePrompts, not made-up questions, so results reflect prompts this
+  app is actually designed to handle well. Two of the four are, by the
+  app's own system prompt rules, sometimes legitimately answered with a
+  "*** NO SQL ***"-prefixed prose reply instead of real SQL (a schema/
+  "what's in here" question, or "what should I ask" - see
+  translate_routes.py's _COMMON_FORMAT_RULES) - _extract_sql() recognizes
+  and skips these exactly like any other "no real SQL this turn" case
+  (see _NO_SQL_PREFIX_RE), rather than trying to execute the prose as SQL.
+  Pass --prompts-file to use your own pool instead (one prompt per line,
+  '#' comments allowed - see conversation_prompts.example.txt, seeded
+  with QUICK_PROMPTS, for a ready-to-edit starting point for your own,
+  e.g. deliberately worst-case, prompts). --prompt-order controls how the
+  pool is walked: "roundrobin" (default, in order, same as QUICK_PROMPTS'
+  own behavior) or "random" (a fresh pick each turn).
+
+  Each turn: /api/translate runs for real with that prompt + the
+  conversation's growing history; if it returns SQL (the terminal NDJSON
+  line's "sql" field - see _extract_sql()), THAT SQL is what actually runs
+  via /api/execute (not a canned query); if that execute succeeds,
+  /api/summarize-result summarizes the real result; the real result then
+  gets folded into history for the next turn. UNLIKE soak mode's
+  --history-rows-capped _append_real_turn_to_history(), conversation mode
+  never trims rows itself - it forwards the REAL, uncapped execute result
+  (see _extract_capped_results(), called with max_rows=0 here) to both
+  the summarize request and the next turn's history, exactly like the
+  real client (webClient/client.js's summarizeResultForHistory() doesn't
+  trim rows either - the server already capped what execute returned via
+  EXECUTE_RESULTS_MAX_ROWS, and translate_routes.py does its own
+  HISTORY_RESULT_MAX_ROWS trim when it builds the LLM prompt). This
+  matters for memory-pressure testing specifically: capping here made
+  every conversation-mode request payload smaller than a real user's ever
+  would be.
+
+  A failed translate (guard rejection, LLM error, no parseable SQL) skips
+  execute/summarize for that turn and leaves history unchanged - nothing
+  real happened yet to record. A failed EXECUTE, though, still gets
+  folded into history, matching the real client's own rule ("a concluded
+  turn's results or errors must be added to history" - see
+  webClient/client.js): a multi-statement script (semicolon-separated
+  SQL) that fails partway through still summarizes and records whatever
+  statements succeeded before the failure, PLUS the failure itself, as
+  one turn with multiple result-set entries (see
+  _statement_results_for_history()) - exactly the "multiple queries, each
+  its own tab, all fed back into history" case a real multi-statement
+  query produces. A bare execute failure with nothing partial to show
+  (an EXECUTE_GUARD 503, a bad first/only statement) still summarizes and
+  records a single {"error": ...} entry the same way. Only a genuine
+  request-level failure (client timeout, dropped connection - no HTTP
+  response at all) has nothing to build a turn from and is skipped, same
+  as the real client's own fetch()-catch path. Either way, one bad turn
+  never aborts that user's whole run.
+
+  IMPORTANT - this is real, LLM-proposed SQL running against your real
+  data, not a reviewed, fixed query: the model could occasionally propose
+  something expensive (e.g. a full-table scan with no LIMIT) on a dataset
+  it hasn't seen before. This deployment's own TRANSLATION_TIMEOUT_SECONDS
+  and SQL_EXECUTE_TIMEOUT_SECONDS (env.yaml, currently 60s each) already
+  bound how long any single call can run server-side, but per-call cost
+  (LLM tokens, DB compute) is otherwise whatever the model actually
+  proposes each turn - start with --users/--duration modest here even
+  more than with soak mode, and watch the output before scaling up.
+
+  --turns-per-conversation (default 4) caps how many prompt/translate/
+  execute/summarize cycles happen before that user starts a fresh
+  conversation on the next dataset - lower it to rotate through your
+  dataset pool faster, raise it for longer, more realistic single
+  conversations. This is independent of the outgoing `history` array's own
+  turn count, though: at run start, this mode does one GET /api/config -
+  the same call the real client's own fetchBackendConfig() makes on page
+  load - and uses its `history_max_turns` field to cap `history` the same
+  way client.js's own chatStore.pushTurn() does (`history.slice(
+  -maxEntries)` after every push - see fetch_history_max_turns()'s own
+  docstring). That client-side cap, not just the server's own defensive
+  HISTORY_MAX_TURNS slice in translate_routes.py, is what limits how many
+  turns ever show up in the real app's UI too - a real browser's
+  `history` payload never actually holds more turns than that in the
+  first place. So --turns-per-conversation CAN be set higher than the
+  server's real cap - older turns just roll off the front as the
+  conversation goes on, exactly like a real long conversation would,
+  rather than growing an ever-larger, unrealistic payload. If the GET
+  /api/config probe fails, this run falls back to uncapped growth (a
+  printed warning says so) - the server's own defensive slice still
+  protects the actual LLM prompt either way, so this can't cause a bad
+  call, only a less realistic outgoing payload shape.
+
 EXAMPLES
 
   python3 stress_test.py --url https://ydyl-xxxxx.a.run.app --mode whoami
@@ -183,10 +311,21 @@ EXAMPLES
   python3 stress_test.py --url https://ydyl-xxxxx.a.run.app --mode soak \
       --datasets-file soak_datasets.example.json --users 5 --duration 1800 \
       --interval 3 --model gemini-3.5-flash-lite --soak-summarize --dry-run
+
+  python3 stress_test.py --url https://ydyl-xxxxx.a.run.app --mode conversation \
+      --datasets-file conversation_datasets.json --users 3 --duration 900 \
+      --interval 5 --turns-per-conversation 4 --model gemini-3.5-flash-lite --dry-run
+
+  python3 stress_test.py --url https://ydyl-xxxxx.a.run.app --mode conversation \
+      --datasets-file conversation_datasets.json --prompts-file conversation_prompts.example.txt \
+      --prompt-order random --users 20 --duration 900 --interval 5 \
+      --turns-per-conversation 4 --model gemini-3.5-flash-lite
 """
 
 import argparse
 import json
+import random
+import re
 import statistics
 import threading
 import time
@@ -232,9 +371,12 @@ def build_synthetic_history(turns, rows_per_turn, cols_per_row, cell_bytes):
     return history
 
 
-def build_payload(endpoint, model, database_url, history=None, sql=None, exec_results=None):
+def build_payload(endpoint, model, database_url, history=None, sql=None, exec_results=None, prompt=None):
     if endpoint == "translate":
-        payload = {"prompt": CHEAP_PROMPT}
+        # prompt lets conversation mode rotate through the app's own real
+        # quick prompts each turn (see QUICK_PROMPTS) instead of every
+        # other mode's fixed CHEAP_PROMPT.
+        payload = {"prompt": prompt or CHEAP_PROMPT}
         # history is client-held conversation state (see
         # build_synthetic_history()'s docstring) - only ever meaningful
         # for /api/translate, which is the only route that reads it.
@@ -242,16 +384,18 @@ def build_payload(endpoint, model, database_url, history=None, sql=None, exec_re
             payload["history"] = history
     elif endpoint == "execute":
         # sql lets soak mode run a real, substantial, dataset-specific
-        # query (from --datasets-file) instead of every other mode's
-        # trivial CHEAP_SQL - see cmd_soak().
+        # query (from --datasets-file), or conversation mode run the
+        # REAL SQL translate just generated, instead of every other
+        # mode's trivial CHEAP_SQL - see cmd_soak()/cmd_conversation().
         payload = {"sql": sql or CHEAP_SQL}
     elif endpoint == "summarize":
-        # exec_results lets soak mode summarize a REAL execute result
-        # (already shaped like /api/execute's own `results` array - see
-        # _extract_capped_results()) instead of the trivial 1-row
-        # payload every other mode uses.
+        # exec_results lets soak/conversation mode summarize a REAL
+        # execute result (already shaped like /api/execute's own
+        # `results` array - see _extract_capped_results()) instead of
+        # the trivial 1-row payload every other mode uses; prompt mirrors
+        # the same real question conversation mode's translate call used.
         payload = {
-            "prompt": CHEAP_PROMPT,
+            "prompt": prompt or CHEAP_PROMPT,
             "sql": (sql or CHEAP_SQL) + ";",
             "results": exec_results if exec_results is not None else [{"columns": ["1"], "rows": [[1]], "rowCount": 1}],
         }
@@ -273,9 +417,9 @@ ENDPOINT_PATHS = {
 STREAMED_ENDPOINTS = {"translate", "summarize"}
 
 
-def fire_one(session, base_url, endpoint, model, database_url, timeout, history=None, sql=None, exec_results=None):
+def fire_one(session, base_url, endpoint, model, database_url, timeout, history=None, sql=None, exec_results=None, prompt=None):
     path = ENDPOINT_PATHS[endpoint]
-    payload = build_payload(endpoint, model, database_url, history=history, sql=sql, exec_results=exec_results)
+    payload = build_payload(endpoint, model, database_url, history=history, sql=sql, exec_results=exec_results, prompt=prompt)
     is_streamed = endpoint in STREAMED_ENDPOINTS
     started = time.monotonic()
     try:
@@ -287,16 +431,31 @@ def fire_one(session, base_url, endpoint, model, database_url, timeout, history=
         )
         body = None
         if is_streamed:
-            # Drain fully so elapsed time reflects the whole response and
-            # the connection is released cleanly back to the pool.
-            for _ in resp.iter_lines():
-                pass
+            # translate/summarize stream NDJSON progress lines ending in
+            # one terminal {"status": "done", "success": ..., ...} line
+            # (see translate_routes.py's stream_translation()/
+            # stream_summarize_result()) - or, for an early-validation/
+            # guard-rejection response, a single plain JSON object with
+            # no "status" key at all (same shape client.js's own
+            # readNdjsonStream already handles uniformly - see that
+            # route's own comments). Keep the LAST well-formed line as
+            # `body`: conversation mode reads its "sql"/"summary" back out
+            # (see _extract_sql()); other modes never read this key.
+            last_line = None
+            for line in resp.iter_lines():
+                if not line:
+                    continue
+                try:
+                    last_line = json.loads(line)
+                except ValueError:
+                    continue
+            body = last_line
         else:
             # execute returns one plain JSON body (see execute_routes.py:
             # {'success', 'results', 'rowCount', 'executionTimeMs'}) -
-            # capture it so soak mode can fold REAL results into its
-            # growing history (see _extract_capped_results()). Unused by
-            # burst/sustained/fairness, which never read this key.
+            # capture it so soak/conversation mode can fold REAL results
+            # into their growing history (see _extract_capped_results()).
+            # Unused by burst/sustained/fairness.
             try:
                 body = resp.json()
             except ValueError:
@@ -316,7 +475,26 @@ def print_result(label, r):
     if r.get("retry_after"):
         bits.append(f"Retry-After={r['retry_after']}")
     if r.get("error"):
+        # A request-level failure (connection dropped, client timeout) -
+        # never overlaps with body_error below (no HTTP response body
+        # exists at all on this path).
         bits.append(f"error={r['error']}")
+    else:
+        body = r.get("body")
+        if isinstance(body, dict) and body.get("error"):
+            # The real, specific reason a non-2xx (or "success": false)
+            # response failed - e.g. execute_routes.py deliberately
+            # returns the RAW DATABASE error message (bad column, syntax
+            # error, dialect-incompatible construct, ...) as HTTP 400 -
+            # "this endpoint runs SQL the user themselves supplied, so
+            # the backend's error IS the feedback they need" (see that
+            # route's own comment). Equally, translate/summarize's
+            # {"success": false, "error": ...} shape surfaces the real
+            # LLM/provider error the same way. Without this, a 400/503
+            # here shows only an opaque status code with no way to tell
+            # "bad generated SQL" apart from "guard busy" apart from
+            # "provider down."
+            bits.append(f"body_error={body['error']!r}")
     print(f"  {label}: " + " ".join(bits))
 
 
@@ -481,14 +659,19 @@ def cmd_fairness(args):
         summarize_results(results)
 
 
-def _load_datasets(path):
+def _load_datasets(path, require_sql=False):
     """Loads --datasets-file: a non-empty JSON list of
-    {"preset_id": "...", "sql": "...", "name": "<optional>"} objects, one
-    per real dataset a soak-mode user gets pinned to. A JSON file rather
-    than a CLI flag - a genuinely substantial SQL query easily contains
+    {"preset_id": "...", "name": "<optional>", "sql": "<optional unless
+    require_sql>"} objects, one per real dataset. A JSON file rather than
+    a CLI flag - a genuinely substantial SQL query easily contains
     commas/quotes/newlines that would be painful and error-prone to pack
-    into a comma-separated CLI argument. See soak_datasets.example.json
-    next to this script for the exact shape."""
+    into a comma-separated CLI argument. Only "preset_id" is universally
+    required: soak mode passes require_sql=True (it always runs a fixed,
+    reviewed query - see cmd_soak()), while conversation mode leaves it
+    False (it runs whatever SQL translate itself generates each turn, so
+    "sql" is unused even if present - see cmd_conversation()). See
+    soak_datasets.example.json / conversation_datasets.json next to this
+    script for the exact shape each mode expects."""
     try:
         with open(path) as f:
             data = json.load(f)
@@ -499,8 +682,10 @@ def _load_datasets(path):
     if not isinstance(data, list) or not data:
         raise SystemExit(f"--datasets-file {path!r} must contain a non-empty JSON list")
     for i, d in enumerate(data):
-        if not isinstance(d, dict) or not d.get("preset_id") or not d.get("sql"):
-            raise SystemExit(f"--datasets-file entry {i} must be an object with at least 'preset_id' and 'sql'")
+        if not isinstance(d, dict) or not d.get("preset_id"):
+            raise SystemExit(f"--datasets-file entry {i} must be an object with at least 'preset_id'")
+        if require_sql and not d.get("sql"):
+            raise SystemExit(f"--datasets-file entry {i} ({d['preset_id']!r}) is missing 'sql', required for --mode soak")
     return data
 
 
@@ -528,23 +713,73 @@ def pin_preset(session, base_url, preset_id, timeout):
         return False
 
 
-def _extract_capped_results(exec_result, max_rows):
-    """Pulls the `results` array out of a fire_one(endpoint="execute")
-    return value's captured JSON body (see fire_one()'s own comment),
-    trimming each result set's rows to at most max_rows (0/None = no
-    cap) - mirrors the server's own HISTORY_RESULT_MAX_ROWS trimming.
-    Returns None if the call failed or came back in an unexpected shape
-    (e.g. a non-200, or a partial-failure body with no `results` key) -
-    callers decide their own fallback."""
-    body = exec_result.get("body") if isinstance(exec_result, dict) else None
-    if not isinstance(body, dict):
+def fetch_history_max_turns(base_url, timeout):
+    """GET /api/config once - the exact same call the real client's own
+    fetchBackendConfig() makes on page load - and returns its
+    `history_max_turns` field (config_routes.py: 'history_max_turns':
+    HISTORY_MAX_TURNS, this deployment's live env var value).
+
+    This matters because the real client does NOT just send an
+    ever-growing `history` array and trust the server to trim it: its own
+    chatStore (createChatHistoryStore()/pushTurn()/setMaxTurns() in
+    client.js) caps its in-memory history to this exact value BEFORE ever
+    building a request - `history.slice(-maxEntries)` on every pushTurn(),
+    re-applied via setMaxTurns() the moment /api/config's response is in.
+    That client-side cap is also what limits how many turns ever show up
+    in the UI - not merely the server's own defensive
+    `history[-(HISTORY_MAX_TURNS*2):]` slice in translate_routes.py, which
+    a real browser's request essentially never needs, since it never
+    arrives holding more than HISTORY_MAX_TURNS turns in the first place.
+
+    Returns None on any failure (unreachable, unexpected shape, missing/
+    non-positive field) - callers should treat that as "couldn't confirm
+    the real cap" and fall back to NOT capping turns client-side, same as
+    this script's behavior before this fix existed. That fallback can't
+    cause a bad LLM call either way: the server's own defensive slice
+    still protects the actual /api/translate prompt regardless of what
+    arrives - a failed fetch here only risks sending a larger, less
+    realistic `history` payload than a real browser ever would, not a
+    broken run."""
+    try:
+        resp = requests.get(base_url.rstrip("/") + "/api/config", timeout=timeout)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        n = data.get("history_max_turns") if isinstance(data, dict) else None
+        return int(n) if isinstance(n, (int, float)) and n > 0 else None
+    except (requests.exceptions.RequestException, ValueError):
         return None
-    raw = body.get("results")
-    if not isinstance(raw, list):
-        return None
+
+
+def _cap_result_rows(raw, max_rows):
+    """Shapes a plain list of statement-result dicts (whatever shape a
+    fire_one(endpoint="execute") body's `results` array, or
+    _statement_results_for_history()'s own synthesized list, uses) into
+    the {"columns", "rowCount", "rows"} (or {"isError": True, "error",
+    ...}) shape history/summarize calls expect, trimming each result
+    set's rows to at most max_rows (0/None = no cap) - mirrors the
+    server's own HISTORY_RESULT_MAX_ROWS trimming.
+
+    A per-statement failure comes back shaped {"error": ..., "statement"?,
+    "database"?} rather than {"columns", "rows", "rowCount"} - preserved
+    as-is (as {"isError": True, "error": ..., ...}), mirroring
+    webClient/client.js's own summarizeResultForHistory(), which carries
+    this exact fix in its own comment: silently running this entry
+    through the columns/rows/rowCount shape instead collapses a real
+    error into a fake "0-row success" - the error text just vanishes
+    instead of reaching history (or, for conversation mode, the next
+    turn's translate call). Non-dict entries are skipped."""
     capped = []
     for r in raw:
         if not isinstance(r, dict):
+            continue
+        if r.get("error") is not None:
+            entry = {"isError": True, "error": r["error"]}
+            if r.get("statement") is not None:
+                entry["statement"] = r["statement"]
+            if r.get("database") is not None:
+                entry["database"] = r["database"]
+            capped.append(entry)
             continue
         rows = r.get("rows") or []
         capped.append({
@@ -553,6 +788,85 @@ def _extract_capped_results(exec_result, max_rows):
             "rows": rows[:max_rows] if max_rows else rows,
         })
     return capped
+
+
+def _extract_capped_results(exec_result, max_rows):
+    """Pulls the `results` array out of a fire_one(endpoint="execute")
+    return value's captured JSON body (see fire_one()'s own comment) and
+    runs it through _cap_result_rows(). Soak mode's own helper - it only
+    ever calls this on a successful (200) execute result (see
+    _append_real_turn_to_history() and cmd_soak's own --soak-summarize
+    branch), so it doesn't need to handle a failure response's shape -
+    see _statement_results_for_history() for the more general version
+    conversation mode uses, which folds a failed execute's partial/error
+    results into history too, matching the real client.
+
+    Returns None if the call failed or came back in an unexpected shape
+    (e.g. a non-200, or a body with no `results` key) - callers decide
+    their own fallback."""
+    body = exec_result.get("body") if isinstance(exec_result, dict) else None
+    if not isinstance(body, dict):
+        return None
+    raw = body.get("results")
+    if not isinstance(raw, list):
+        return None
+    return _cap_result_rows(raw, max_rows)
+
+
+def _statement_results_for_history(exec_r):
+    """Given a fire_one(endpoint="execute") return value of ANY status
+    (success, partial multi-statement failure, or a bare failure like an
+    EXECUTE_GUARD 503 or a syntax error), returns the raw list of
+    statement-result dicts conversation mode should feed to
+    _cap_result_rows() for BOTH the /api/summarize-result call and the
+    next turn's history entry - or None when there's truly nothing to
+    build a turn from at all (a request-level failure with no HTTP
+    response, e.g. a client timeout or dropped connection).
+
+    This mirrors webClient/client.js's own execute-response handling
+    (see its comment: "a concluded turn's 'results or errors' must be
+    added to history") - the real client does NOT stop at "execute
+    wasn't a 200": it still summarizes and persists a turn for a partial
+    multi-statement failure (results = the statements that succeeded
+    before the failure, PLUS one trailing {"error": ...} entry for the
+    one that didn't - see execute_routes.py's SqlExecutionError shape:
+    {"results": [...], "failedStatement": ..., "error": ...}), and for a
+    bare failure with no partial results at all (e.g. EXECUTE_GUARD's
+    503 body, {"success": False, "error": "..."})  it still summarizes
+    and persists a single {"error": ...} entry. Before this function
+    existed, this script treated ANY non-200 execute as "nothing to
+    summarize or fold into history," silently dropping every completed
+    statement's real data whenever the LAST statement in a script failed,
+    and never recording a bare execute failure (guard-busy, bad SQL) into
+    history at all - understating exactly the "multiple resultsets across
+    several tabs" case conversation mode is supposed to exercise
+    faithfully."""
+    status = exec_r.get("status") if isinstance(exec_r, dict) else None
+    if status is None:
+        # Request-level failure (timeout/connection drop, see fire_one()'s
+        # own except branch) - no HTTP response, and so no `data` object
+        # for the real client to have built a turn from either.
+        return None
+    body = exec_r.get("body")
+    if status == 200:
+        raw = body.get("results") if isinstance(body, dict) else None
+        return raw if isinstance(raw, list) else []
+    if not isinstance(body, dict):
+        # A non-200 with no parseable JSON body at all (shouldn't happen
+        # against this server - every failure branch in execute_routes.py
+        # returns JSON - but defensively still worth a turn, same as the
+        # real client's bare-failure branch).
+        return [{"error": f"HTTP {status} with no parseable response body"}]
+    if isinstance(body.get("results"), list) or body.get("failedStatement") is not None:
+        # SqlExecutionError's partial-failure shape (execute_routes.py:
+        # {"results": [statements that succeeded before the failure],
+        # "failedStatement": ..., "error": ...}) - client.js's
+        # `statementResults = [...data.results, {error: errMsg}]`.
+        return list(body.get("results") or []) + [{"error": body.get("error")}]
+    # A bare failure with nothing else to show alongside it (EXECUTE_GUARD's
+    # 503, a connect() failure, a single-statement script's own error) -
+    # client.js's `[{error: errMsg}]`.
+    return [{"error": body.get("error", f"HTTP {status} with no error message")}]
 
 
 def _append_real_turn_to_history(history, sql, exec_result, max_turns, max_rows_per_turn):
@@ -601,7 +915,7 @@ def _print_soak_plan(args, datasets):
 def cmd_soak(args):
     if not args.datasets_file:
         raise SystemExit("--mode soak requires --datasets-file (see this script's SOAK MODE docstring section)")
-    datasets = _load_datasets(args.datasets_file)
+    datasets = _load_datasets(args.datasets_file, require_sql=True)
 
     if args.dry_run:
         _print_soak_plan(args, datasets)
@@ -669,12 +983,420 @@ def cmd_soak(args):
                 summarize_results(subset)
 
 
+# Pulled verbatim from webClient/index.html's own "#examplePrompts" quick-
+# prompt chips (the single-connection "data-prompt" wording, not the
+# "data-prompt-all" variant used only in all-databases mode - see that
+# file's own comment on why the two are kept separate) - these are the
+# ACTUAL, already-tested-by-hand prompts this app ships to real users,
+# not ones this script made up. Deliberately excludes that same element's
+# commented-out "Write Data" chip (create a table/insert a record) - it's
+# disabled in the real UI for a reason, and running writes against real
+# production data as part of a load test would be actively harmful, not
+# just unrepresentative.
+#
+# Two of these four are, BY THE APP'S OWN DESIGN, sometimes answered with
+# a "*** NO SQL ***"-prefixed prose reply instead of real SQL - see
+# translate_routes.py's _COMMON_FORMAT_RULES: a schema/"what's in
+# here"-type question is explicitly one of the cases the model is told to
+# answer from its knowledge of the schema alone, no query needed. That's
+# not a failure (see _extract_sql()'s own handling of this sentinel) - a
+# real user clicking that same chip in the real app gets the same kind of
+# answer. --turns-per-conversation worth of rotation through all four
+# means some turns legitimately produce no execute/summarize call at all,
+# by design, same as the real UI.
+QUICK_PROMPTS = [
+    "What tables are in this dataset and how are they related?",
+    "Show me a few records from a couple of tables that you find most interesting.",
+    "Analyze this dataset and give me a couple of insights from it with supporting data.",
+    "What are a few interesting questions to ask about the data",
+]
+
+
+def _load_prompts(path):
+    """Loads a --prompts-file for --mode conversation: one prompt per
+    non-blank line, '#'-prefixed lines treated as comments and ignored -
+    see conversation_prompts.example.txt next to this script, seeded
+    with QUICK_PROMPTS above as a starting point to edit/extend with
+    your own (e.g. deliberately worst-case) prompts. Plain text rather
+    than JSON specifically so you can type/paste prompts containing
+    quotes, apostrophes, etc. without needing to escape anything.
+    Raises SystemExit if the file has no usable prompts left after
+    stripping blanks/comments, or can't be read at all - a --mode
+    conversation run with zero prompts would just hang doing nothing
+    useful, so this fails fast instead."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError as exc:
+        raise SystemExit(f"--prompts-file {path!r} could not be read: {exc}")
+    prompts = [line.strip() for line in lines]
+    prompts = [line for line in prompts if line and not line.startswith("#")]
+    if not prompts:
+        raise SystemExit(
+            f"--prompts-file {path!r} contained no usable prompts "
+            "(blank lines and lines starting with # are treated as comments and skipped)"
+        )
+    return prompts
+
+
+# Mirrors translate_routes.py's own _NO_SQL_PREFIX_RE exactly: the app's
+# system prompt explicitly tells the model to prepend this literal marker
+# whenever it answers in prose instead of generating a real query - a
+# from-training-knowledge answer, a schema/ER-diagram question, a
+# question about the app itself, an ambiguous/out-of-scope request, or a
+# translation error all use this same convention (see
+# translate_routes.py's _COMMON_FORMAT_RULES). Critically, the terminal
+# NDJSON line's own "success" is still `true` in every one of these cases
+# - translate did its job correctly - so "success: true" alone does NOT
+# mean the "sql" field is real, executable SQL. Blindly executing a
+# "*** NO SQL *** <explanation>" string is exactly what produced the wall
+# of syntax errors ('Unexpected "**"', 'syntax error near "***"', a MySQL
+# 1064) across every dialect in an earlier run of this script.
+_NO_SQL_PREFIX_RE = re.compile(r'^\*\*\*\s*NO\s*SQL\s*\*\*\*\s*', re.IGNORECASE)
+
+
+def _extract_sql(trans_result):
+    """Pulls the real, LLM-generated SQL out of a
+    fire_one(endpoint="translate") return value's captured NDJSON body
+    (see fire_one()'s own comment) - the terminal
+    {"status": "done", "success": true, "sql": ...} line (see
+    translate_routes.py's stream_translation()). Returns None (rather
+    than raising) on a guard rejection, an LLM/translation failure, a
+    legitimate "*** NO SQL ***" prose answer (see _NO_SQL_PREFIX_RE above),
+    or any unexpected shape - cmd_conversation() treats all of these
+    identically as "skip execute/summarize this turn," never as a reason
+    to abort the run."""
+    body = trans_result.get("body") if isinstance(trans_result, dict) else None
+    if not isinstance(body, dict) or not body.get("success"):
+        return None
+    sql = body.get("sql")
+    if not isinstance(sql, str) or not sql.strip():
+        return None
+    if _NO_SQL_PREFIX_RE.match(sql.strip()):
+        return None
+    return sql
+
+
+def _no_sql_reason(trans_r):
+    """Explains WHY _extract_sql(trans_r) came back None - for the
+    diagnostic print in cmd_conversation()'s per-turn loop. Important
+    distinction this exists to surface: fire_one()'s "status" is the
+    STREAMED HTTP RESPONSE's transport status, not whether translation
+    itself succeeded - translate_routes.py's stream_translation() sends
+    HTTP 200 as soon as it starts streaming (before the LLM has even been
+    called), so a real content-level failure (LLM error, timeout,
+    provider quota) still shows up as "status=200" in fire_one()'s own
+    result dict, with success/failure only visible in the parsed NDJSON
+    body's own "success"/"error" fields (see that route's own terminal
+    yield). Without this, a run can look like every translate call
+    "succeeded" (200) while zero of them ever actually produced SQL."""
+    body = trans_r.get("body") if isinstance(trans_r, dict) else None
+    if isinstance(body, dict):
+        if body.get("success") is False:
+            return f"translate itself failed: {body.get('error')!r}"
+        if body.get("success") is True:
+            sql = body.get("sql")
+            if isinstance(sql, str) and _NO_SQL_PREFIX_RE.match(sql.strip()):
+                explanation = _NO_SQL_PREFIX_RE.sub("", sql.strip())
+                return f"translate answered in prose instead of real SQL ('*** NO SQL ***'): {explanation[:150]!r}"
+            return f"translate reported success but returned no usable 'sql' field (body keys: {sorted(body.keys())})"
+        if "error" in body:
+            # Early-validation/guard-rejection shape ({"error": ...}, no
+            # "success" key at all) - see translate_query()'s own comment
+            # on why that shape has no "success" key.
+            return f"request rejected before streaming: {body.get('error')!r}"
+        return f"unrecognized response shape (body keys: {sorted(body.keys())})"
+    if trans_r.get("error"):
+        return f"request-level failure (timeout/connection error): {trans_r['error']}"
+    return "no parseable response body captured (empty or non-JSON body)"
+
+
+def _print_conversation_plan(args, datasets, prompts):
+    approx_conversations_per_user = max(int(args.duration // (args.interval * args.turns_per_conversation)), 1) if args.interval else 1
+    print("Conversation plan (--dry-run, no network calls made):")
+    print(f"  {args.users} users, {len(datasets)} dataset(s) in the pool, {args.turns_per_conversation} turns/conversation")
+    for u in range(min(args.users, len(datasets))):
+        dataset = datasets[u % len(datasets)]
+        label = dataset.get("name") or dataset["preset_id"]
+        print(f"  user {u} starts on: {label!r} (preset_id={dataset['preset_id']!r}), then rotates through the rest of the pool")
+    prompts_source = f"--prompts-file {args.prompts_file!r}" if args.prompts_file else "the app's own QUICK_PROMPTS"
+    print(f"  prompts: {len(prompts)} loaded from {prompts_source}, order={args.prompt_order!r}")
+    for i, pr in enumerate(prompts):
+        print(f"    [{i}] {pr!r}")
+    print(
+        f"  duration={args.duration}s, interval={args.interval}s between turns -> "
+        f"~{approx_conversations_per_user} conversations/user over the run "
+        f"(each conversation touches a new dataset, fresh history)"
+    )
+    print(
+        f"  up to 3 calls/turn (translate, + execute/summarize only when translate/execute succeed) "
+        f"x {args.turns_per_conversation} turns/conversation x ~{approx_conversations_per_user} conversations "
+        f"x {args.users} users"
+    )
+    print(
+        "  history/summarize payloads carry the REAL execute result uncapped (matching the real "
+        "client - see _extract_capped_results()'s own docstring), not trimmed to --history-rows "
+        "(that knob is soak-mode only)"
+    )
+    print(
+        "  history TURN COUNT is capped to match the real client's own chatStore (see "
+        "fetch_history_max_turns()'s own docstring) - fetched live via GET /api/config at run start, "
+        "so it isn't known yet in --dry-run (no network calls made here)"
+    )
+    print("  WARNING: execute runs whatever SQL translate actually generates - see this script's CONVERSATION MODE docstring section")
+
+
+def cmd_conversation(args):
+    if not args.datasets_file:
+        raise SystemExit("--mode conversation requires --datasets-file (see this script's CONVERSATION MODE docstring section)")
+    datasets = _load_datasets(args.datasets_file, require_sql=False)
+    prompts = _load_prompts(args.prompts_file) if args.prompts_file else QUICK_PROMPTS
+
+    if args.dry_run:
+        _print_conversation_plan(args, datasets, prompts)
+        return
+
+    print(
+        f"Conversation test: {args.users} users cycling through {len(datasets)} dataset(s), "
+        f"sustained for {args.duration}s ({args.turns_per_conversation} turns/conversation, "
+        f"{args.interval}s between turns)..."
+    )
+
+    # One GET /api/config up front - same call the real client's own
+    # fetchBackendConfig() makes on page load - so this run caps its own
+    # outgoing `history` the same way a real browser's chatStore does
+    # (see fetch_history_max_turns()'s own docstring for the full
+    # reasoning). Fetched once here, not per-user: it's live server
+    # config, not per-session state, so one probe speaks for the whole
+    # run.
+    history_max_turns = fetch_history_max_turns(args.url, args.timeout)
+    if history_max_turns:
+        print(
+            f"  history cap: {history_max_turns} turns (live from GET /api/config's 'history_max_turns' "
+            f"- matches the real client's own chatStore cap)"
+        )
+        if args.turns_per_conversation > history_max_turns:
+            print(
+                f"  note: --turns-per-conversation ({args.turns_per_conversation}) exceeds this cap - "
+                f"conversations will run that long, but history will roll off older turns past "
+                f"{history_max_turns}, exactly like a real long conversation would, rather than growing "
+                f"past what a real browser client could ever actually send"
+            )
+    else:
+        print(
+            "  history cap: could not be confirmed via GET /api/config - history will grow uncapped per "
+            f"conversation (up to --turns-per-conversation={args.turns_per_conversation} turns), which may "
+            "exceed what a real browser client would ever actually send"
+        )
+
+    per_user_results = {}
+    lock = threading.Lock()
+
+    def run_user(u):
+        # Every network call inside this loop (fire_one, pin_preset)
+        # already catches requests.exceptions.RequestException itself and
+        # returns an error dict rather than raising - see those functions'
+        # own docstrings - so a busy/rate-limited/down LLM provider or
+        # database, a guard 503, a client-side timeout, or a dropped
+        # connection all show up as an ordinary per-turn result (status
+        # None or 5xx) and just cause that ONE turn to be skipped (see the
+        # `if sql is None`/`if exec_r.get("status") != 200` branches
+        # below) - never an exception. This outer try/except exists only
+        # for the one call this loop makes that DOESN'T already catch its
+        # own errors - prime_session()'s initial /api/auth/me priming
+        # call - plus any other genuinely unexpected failure, so a crash
+        # there logs clearly and still reports whatever partial results
+        # this user gathered, instead of that user silently vanishing
+        # from the final report while the other users' threads carry on
+        # unaffected.
+        who = {}
+        results = []
+        try:
+            session = requests.Session()
+            who = prime_session(session, args.url)
+            conversation_num = 0
+            deadline = time.monotonic() + args.duration
+
+            while time.monotonic() < deadline:
+                dataset = datasets[(u + conversation_num) % len(datasets)]
+                label = dataset.get("name") or dataset["preset_id"]
+                pinned = pin_preset(session, args.url, dataset["preset_id"], args.timeout)
+                if not pinned:
+                    print(f"  [user {u}] WARNING: failed to pin preset {dataset['preset_id']!r} - this conversation may hit the wrong dataset")
+
+                # Fresh history per conversation/dataset - a real user
+                # picking a different dataset starts a new train of
+                # thought, not one dragging in a previous, unrelated
+                # schema's turns (see CONVERSATION MODE's own docstring
+                # section).
+                history = []
+                for turn in range(args.turns_per_conversation):
+                    if time.monotonic() >= deadline:
+                        break
+                    # Rotate through `prompts` (the app's own QUICK_PROMPTS,
+                    # or your own --prompts-file pool). --prompt-order
+                    # defaults to "roundrobin" (deterministic, in order -
+                    # keeps runs comparable to each other); "random" picks
+                    # a fresh one each turn instead, which is more likely
+                    # to surface worst-case combinations if your prompts
+                    # file has more entries than --turns-per-conversation.
+                    if args.prompt_order == "random":
+                        prompt_text = random.choice(prompts)
+                    else:
+                        prompt_text = prompts[turn % len(prompts)]
+
+                    trans_r = fire_one(session, args.url, "translate", args.model, None, args.timeout, history=history, prompt=prompt_text)
+                    results.append(("translate", trans_r))
+                    print_result(f"user {u} [{label}] conv {conversation_num} turn {turn} translate ({prompt_text[:40]!r}...)", trans_r)
+
+                    sql = _extract_sql(trans_r)
+                    if sql is None:
+                        # No usable SQL this turn - a busy/rate-limited
+                        # LLM provider, a TRANSLATE_GUARD 503, a client
+                        # timeout, or an outright LLM/parse failure all
+                        # land here identically (see _extract_sql()'s own
+                        # docstring) - skip execute/summarize and leave
+                        # history untouched rather than polluting it with
+                        # a fabricated turn. This turn still counts
+                        # against --turns-per-conversation (it isn't
+                        # retried), so a run with a lot of busy responses
+                        # simply ends up with shorter real history per
+                        # conversation, not a stuck or crashed user.
+                        print(f"    -> skipping execute/summarize this turn: {_no_sql_reason(trans_r)}")
+                        time.sleep(args.interval)
+                        continue
+
+                    exec_r = fire_one(session, args.url, "execute", None, None, args.timeout, sql=sql)
+                    results.append(("execute", exec_r))
+                    print_result(f"user {u} [{label}] conv {conversation_num} turn {turn} execute", exec_r)
+
+                    # A multi-statement script (semicolon-separated SQL -
+                    # see execute_routes.py's own docstring) can produce
+                    # MULTIPLE result sets from ONE execute call - the
+                    # real client shows each as its own tab. Whether the
+                    # whole thing succeeded (HTTP 200, N/N result sets),
+                    # failed partway through (HTTP 400 SqlExecutionError,
+                    # the statements before the failure PLUS the failure
+                    # itself), or failed outright with nothing partial to
+                    # show (an EXECUTE_GUARD 503, a bad first statement),
+                    # _statement_results_for_history() returns the exact
+                    # list of statement-result dicts to carry forward -
+                    # see its own docstring for why ALL of these, not just
+                    # a clean 200, still need to reach history: the real
+                    # client's own rule is "a concluded turn's results or
+                    # errors must be added to history," and it summarizes/
+                    # persists a failed execute too, not just a successful
+                    # one. Only a genuine request-level failure (timeout,
+                    # dropped connection - no HTTP response at all) has
+                    # truly nothing to build a turn from, same as the real
+                    # client's own fetch()-catch path.
+                    raw_results = _statement_results_for_history(exec_r)
+                    if raw_results is None:
+                        print(f"    -> skipping summarize/history this turn: execute request-level failure: {exec_r.get('error')}")
+                        time.sleep(args.interval)
+                        continue
+                    if exec_r.get("status") != 200:
+                        print(f"    -> execute did not return 200, but still summarizing/folding {len(raw_results)} statement result(s) (including the failure) into history, matching the real client")
+
+                    # Conversation mode's whole point is mirroring the real
+                    # client end to end (see this script's own CONVERSATION
+                    # MODE docstring section). The real client
+                    # (webClient/client.js's summarizeResultForHistory())
+                    # never trims rows itself before sending either the
+                    # summarize request body or the next turn's history -
+                    # /api/execute already capped what it returned
+                    # (EXECUTE_RESULTS_MAX_ROWS), and translate_routes.py
+                    # does its own HISTORY_RESULT_MAX_ROWS trim when it
+                    # builds the LLM prompt from whatever history arrives.
+                    # Capping here too (as this used to do, via
+                    # --history-rows) made every conversation-mode request
+                    # payload smaller than a real user's ever would be -
+                    # understating exactly the memory pressure --mode soak
+                    # exists to probe. --history-rows remains a deliberate,
+                    # soak-mode-only knob (see _append_real_turn_to_history
+                    # and cmd_soak's own --soak-summarize branch) -
+                    # conversation mode always forwards the real, uncapped
+                    # execute result(s), max_rows=0 meaning "no cap" (see
+                    # _cap_result_rows()'s own docstring).
+                    capped = _cap_result_rows(raw_results, max_rows=0)
+                    summ_r = fire_one(
+                        session, args.url, "summarize", args.model, None, args.timeout,
+                        sql=sql, exec_results=capped, prompt=prompt_text,
+                    )
+                    results.append(("summarize", summ_r))
+                    print_result(f"user {u} [{label}] conv {conversation_num} turn {turn} summarize", summ_r)
+
+                    # A busy/failed SUMMARIZE call (summ_r not 200) does
+                    # NOT block history growth - the history entry is
+                    # built from the real, already-captured execute
+                    # result(s) (success, partial, or bare failure - see
+                    # raw_results above), not from summarize's own text
+                    # output, so a momentarily-busy summarizer degrades
+                    # gracefully exactly like it would for a real user
+                    # still seeing their query results without a summary.
+                    history = history + [
+                        {"role": "user", "text": prompt_text},
+                        {"role": "model", "text": sql, "results": capped},
+                    ]
+                    # Mirrors client.js's own chatStore.pushTurn(), which
+                    # runs `history = history.slice(-maxEntries)` after
+                    # EVERY push, not just occasionally - the real client
+                    # never lets its outgoing `history` grow past
+                    # history_max_turns turns in the first place (see
+                    # fetch_history_max_turns()'s own docstring). Without
+                    # this, --turns-per-conversation set higher than the
+                    # server's real HISTORY_MAX_TURNS would send a bigger,
+                    # ever-growing `history` payload than any real browser
+                    # client could ever actually produce - not a faithful
+                    # stress of a long real conversation, just an
+                    # unrealistic shape. A None/0 history_max_turns (the
+                    # GET /api/config probe at the top of this command
+                    # failed) leaves growth uncapped, same as before this
+                    # fix existed.
+                    if history_max_turns:
+                        history = history[-(history_max_turns * 2):]
+                    time.sleep(args.interval)
+
+                conversation_num += 1
+        except Exception as exc:
+            print(f"  [user {u}] CRASHED (unexpected, not a normal per-turn busy/failure): {exc!r} - this user's run stopped early; other users are unaffected.")
+        finally:
+            with lock:
+                per_user_results[u] = (who.get("user_id"), results)
+
+    threads = [threading.Thread(target=run_user, args=(u,)) for u in range(args.users)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    for u in sorted(per_user_results):
+        identity, results = per_user_results[u]
+        print(f"\n--- user {u} ({identity}) ---")
+        for endpoint in ("translate", "execute", "summarize"):
+            subset = [r for (ep, r) in results if ep == endpoint]
+            if subset:
+                print(f"  {endpoint}:")
+                summarize_results(subset)
+                if endpoint == "translate":
+                    # A translate call's HTTP status alone (what
+                    # summarize_results() just printed) can't tell you
+                    # whether execute ever ran - see _no_sql_reason()'s
+                    # own docstring for why "status=200" doesn't imply
+                    # usable SQL came back. This is the quantified answer:
+                    # how many of these 200s actually had a real 'sql' to
+                    # hand to execute.
+                    with_sql = sum(1 for r in subset if _extract_sql(r) is not None)
+                    print(f"    -> {with_sql}/{len(subset)} translate calls actually produced usable SQL "
+                          f"(the rest skipped execute/summarize - see the '-> skipping...' lines above for why)")
+
+
 def main():
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     p.add_argument("--url", required=True, help="Deployed Cloud Run service base URL")
-    p.add_argument("--mode", required=True, choices=["whoami", "burst", "sustained", "fairness", "soak"])
+    p.add_argument("--mode", required=True, choices=["whoami", "burst", "sustained", "fairness", "soak", "conversation"])
     p.add_argument("--endpoint", default="translate", choices=["translate", "execute", "summarize"])
     p.add_argument("--model", default=None, help="Override model - use your cheapest configured one")
     p.add_argument("--database-url", default=None, help="Override target DB preset (default: server's DATABASE_DEFAULT)")
@@ -690,7 +1412,12 @@ def main():
              "this many turns (0 = no history for burst/sustained/fairness, but UNCAPPED growth for soak - "
              "see this script's own HISTORY PAYLOAD and SOAK MODE sections above)",
     )
-    p.add_argument("--history-rows", type=int, default=10, help="Rows per synthetic history turn's result set")
+    p.add_argument(
+        "--history-rows", type=int, default=10,
+        help="[soak only] Rows per synthetic/real history turn's result set (0 = uncapped). Not used by "
+             "conversation mode, which always forwards the real, uncapped execute result - matching the "
+             "real client - regardless of this flag.",
+    )
     p.add_argument("--history-cols", type=int, default=8, help="Columns per synthetic history turn's result row")
     p.add_argument(
         "--history-cell-bytes", type=int, default=24,
@@ -698,16 +1425,36 @@ def main():
     )
     p.add_argument(
         "--datasets-file", default=None,
-        help="[soak] JSON file listing real {preset_id, sql, name?} datasets - see soak_datasets.example.json "
-             "and this script's own SOAK MODE docstring section",
+        help="[soak/conversation] JSON file listing real datasets - {preset_id, sql, name?} for soak "
+             "(soak_datasets.example.json), {preset_id, name?} for conversation (conversation_datasets.json) - "
+             "see this script's own SOAK MODE / CONVERSATION MODE docstring sections",
     )
     p.add_argument(
         "--soak-summarize", action="store_true",
         help="[soak] also fire /api/summarize-result each cycle using that cycle's real execute result",
     )
     p.add_argument(
+        "--turns-per-conversation", type=int, default=4,
+        help="[conversation] prompt/translate/execute/summarize cycles per conversation before that user "
+             "moves on to a fresh conversation on the next dataset",
+    )
+    p.add_argument(
+        "--prompts-file", default=None,
+        help="[conversation] plain text file, one prompt per line ('#' lines are comments) - your own "
+             "prompt pool instead of the app's QUICK_PROMPTS. See conversation_prompts.example.txt next "
+             "to this script (seeded with QUICK_PROMPTS) to copy and extend with your own, e.g. "
+             "deliberately worst-case, prompts.",
+    )
+    p.add_argument(
+        "--prompt-order", default="roundrobin", choices=["roundrobin", "random"],
+        help="[conversation] 'roundrobin' (default) rotates through the prompt pool in order, one per "
+             "turn, same prompt pool position every run - deterministic and easy to compare across runs. "
+             "'random' picks a fresh prompt each turn instead - more likely to surface worst-case "
+             "combinations when your --prompts-file has more entries than --turns-per-conversation.",
+    )
+    p.add_argument(
         "--dry-run", action="store_true",
-        help="[soak] print the resolved plan and exit without making any network calls",
+        help="[soak/conversation] print the resolved plan and exit without making any network calls",
     )
     args = p.parse_args()
 
@@ -717,6 +1464,7 @@ def main():
         "sustained": cmd_sustained,
         "fairness": cmd_fairness,
         "soak": cmd_soak,
+        "conversation": cmd_conversation,
     }[args.mode](args)
 
 

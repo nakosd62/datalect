@@ -414,6 +414,10 @@ class SheetsBackend(Backend):
     def get_schema(self, connection):
         """No separate deep layer for this backend - see
         get_schema_shallow()'s docstring for why."""
+        # Deliberately no "Estimated dataset size" line here (see
+        # backends/base.py's format_dataset_size_line()) - the GViz
+        # interface this backend talks to has no metadata endpoint to get
+        # row/byte totals from, cheaply or otherwise.
         return self.get_schema_shallow(connection)
 
     def execute(self, connection, sql_text):

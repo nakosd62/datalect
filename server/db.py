@@ -24,6 +24,9 @@ strings/credentials never end up in the translation-history table.
 """
 
 import concurrent.futures
+import datetime
+import json
+import re
 import threading
 
 from app_config import DEFAULT_DESCRIPTOR, CONFIGURED_DBS, DATABASE_PRESETS_FILE, state_store, logger
@@ -555,10 +558,11 @@ _SHALLOW_CACHE_KEY_SUFFIX = "::shallow"
 def get_database_schema(conn_str=None, user_id=None, force_refresh=False, deep=True):
     """
     Returns the schema introspection text for the resolved connection,
-    using an in-memory cache (see schema_cache.py) so repeated
-    /api/translate calls in the same chat session - or across an entire
-    process's lifetime - don't re-run the backend's introspection queries
-    every time.
+    using a durable cache (see schema_cache.py, backed by state_store.py -
+    SQLite locally, Firestore on Cloud Run) so repeated /api/translate
+    calls in the same chat session - or across an entire connection's
+    lifetime, restarts and Cloud Run instances included - don't re-run the
+    backend's introspection queries every time.
 
     Every successful fetch is cached indefinitely (schema_cache.py has no
     TTL/expiry concept at all - see its own module docstring): a
@@ -567,10 +571,11 @@ def get_database_schema(conn_str=None, user_id=None, force_refresh=False, deep=T
     "Refresh Schema" button, or /api/translate's own in-conversation
     refresh_schema checkbox - see prime_schema_cache()/
     prefetch_all_preset_schemas() below and config_routes.py's
-    /api/config/refresh-schema) or a process restart. force_refresh=True
-    bypasses the cached read and re-fetches, and that fresh result is
-    cached indefinitely too, exactly the same as any other successful
-    fetch - there's no "temporary" cache tier to fall back to.
+    /api/config/refresh-schema) or invalidate_schema_cache() being called
+    on it. force_refresh=True bypasses the cached read and re-fetches, and
+    that fresh result is cached indefinitely too, exactly the same as any
+    other successful fetch - there's no "temporary" cache tier to fall
+    back to.
 
     deep=True (default - every pre-existing caller keeps getting exactly
     this) returns the full Phase 1 + Phase 2 ("deep") schema text, cached
@@ -686,12 +691,194 @@ def prime_schema_cache_with_reason(descriptor, user_id=None):
     if the deep fetch succeeded; a shallow-only failure never downgrades
     an otherwise-successful deep fetch back to an overall failure (and
     never produces its own reason - only the deep fetch's outcome is ever
-    reported)."""
-    deep_text, reason = get_database_schema_with_reason(descriptor, user_id, force_refresh=True, deep=True)
-    success = deep_text != _SCHEMA_FETCH_FAILED
-    if success:
-        get_database_schema(descriptor, user_id, force_refresh=True, deep=False)
-    return success, (reason if not success else None)
+    reported).
+
+    Also (best-effort, never affecting this function's own return value)
+    regenerates this connection's cached schema OVERVIEW - a short LLM-
+    written {"prose", "questions"} pair, see
+    _generate_and_cache_schema_overview() below and schema_cache.py's own
+    module docstring for the full design. Runs once per successful deep
+    fetch here, alongside every one of this function's own three callers
+    (startup prefetch, connection-config-changed, Refresh Schema), so the
+    overview is always regenerated in lockstep with the schema text
+    itself rather than needing its own separate trigger.
+
+    Also brackets the whole attempt with schema_cache.mark_fetch_pending()/
+    mark_fetch_done() (same cache_key a caller would compute via
+    get_conn_identifier(descriptor) themselves - see that helper's own
+    docstring) so a caller that doesn't want to block on this (config_routes.py's
+    connection-config-changed branch, run on its own background thread since
+    this can take several seconds) can instead poll
+    schema_cache.is_fetch_pending()/get_last_fetch_error() to learn when it's
+    done and how it went. mark_fetch_done() always runs, success or failure
+    (including an unexpected exception), via `finally`, so a key can never
+    get stuck reporting "pending" forever."""
+    cache_key = get_conn_identifier(descriptor)
+    schema_cache.mark_fetch_pending(cache_key)
+    # Defaults to FATAL so an unexpected exception raised before `reason` is
+    # even assigned below (a real bug, not a normal fetch failure) still
+    # reports SOME failure rather than mark_fetch_done() silently clearing
+    # a previous error or leaving the dot stuck - then re-raises past this
+    # function exactly as before this change (this function has never caught
+    # exceptions from its own two schema calls; that's unchanged).
+    fetch_error = SCHEMA_FETCH_FAILURE_REASON_FATAL
+    try:
+        deep_text, reason = get_database_schema_with_reason(descriptor, user_id, force_refresh=True, deep=True)
+        success = deep_text != _SCHEMA_FETCH_FAILED
+        if success:
+            get_database_schema(descriptor, user_id, force_refresh=True, deep=False)
+            _generate_and_cache_schema_overview(descriptor, user_id, deep_text)
+        fetch_error = None if success else reason
+        return success, (reason if not success else None)
+    finally:
+        schema_cache.mark_fetch_done(cache_key, error=fetch_error)
+
+
+# --- Schema overview (prose + suggested questions) --------------------------
+# Replaces the old per-PROMPT "*** NO SQL *** ... include an ER diagram
+# using ascii art" convention (translate_routes.py's _COMMON_FORMAT_RULES)
+# for a "what's in this dataset?"-style question: that used to cost a real
+# LLM call on every single such chat turn, produced throwaway ASCII art
+# because a chat reply had no better rendering option, and was never
+# cached. Now that question just opens webClient's Schema Viewer (see
+# _COMMON_FORMAT_RULES' current wording), whose new "Overview" entry shows
+# this cached prose + a handful of suggested example questions, plus a
+# real ER diagram - built client-side, deterministically, from the same
+# Constraints/naming-convention-relationship data already parsed out of
+# the plain schema text (see buildSchemaErDiagram() in client.js), NOT
+# generated by an LLM at all, so it can never hallucinate a relationship
+# or get a cardinality wrong the way free-form model output occasionally
+# can. The LLM is only asked for the two things a deterministic pass
+# genuinely can't produce well: a natural-language description of the
+# dataset's likely purpose, and specific, interesting example questions.
+
+_SCHEMA_OVERVIEW_SYSTEM_INSTRUCTION = (
+    "You are analyzing a database schema to prepare a short overview for "
+    "someone about to explore this dataset in a database exploration tool.\n"
+    "Respond with ONLY a single JSON object - no markdown code fences, no "
+    "text before or after it - of exactly this shape:\n"
+    '{"prose": "<2-4 sentence plain-English description of what this '
+    'dataset is likely about and anything structurally notable>", '
+    '"questions": ["<question 1>", "<question 2>", "<question 3>", '
+    '"<question 4>"]}\n'
+    "\"prose\" should read naturally and describe the dataset's likely "
+    "purpose/domain at a glance - NOT a table-by-table listing (the tables "
+    "and their exact columns are already shown separately in this tool, so "
+    "do not repeat them here).\n"
+    "\"questions\" should contain 3 to 5 specific, genuinely interesting "
+    "natural-language questions a user could actually ask about THIS "
+    "dataset - referencing its real table/column names where it reads "
+    "naturally - each one concrete enough that it could be translated "
+    "into a real query, not generic questions that could apply to any "
+    "database.\n"
+    "Write both fields in English regardless of the language any table/"
+    "column names happen to use.\n"
+)
+
+
+def _resolve_overview_llm_call(user_id):
+    """Picks the (provider, model, api_key) triple for the schema-overview
+    LLM call (see _generate_and_cache_schema_overview() below) - deferred
+    import of translate_routes.get_llm_provider (see that function's own
+    docstring for why this must be a deferred, not top-level, import).
+
+    user_id present (a real request - the "Refresh Schema" button, or the
+    connection-config-changed branch, both always run inside a request
+    with a resolved user identity) resolves the SAME provider/model that
+    user's own chat turns already use (state_store.get_session(), the
+    identical lookup /api/translate itself performs), so the overview's
+    quality/cost tracks whatever model they've already chosen for
+    everything else, including their own BYOK key if they've set one.
+
+    user_id absent (the startup preset prefetch - prefetch_all_preset_schemas()
+    always calls with user_id=None, since presets have no per-user
+    identity to look one up for) has no session to read a preference from
+    at all, so it falls back to this app's ONE fleet-wide default (see
+    get_llm_provider(None)/LlmProvider.default_model - honors the
+    DEFAULT_MODEL env var when set) - exactly the "no user involved, use
+    DEFAULT_MODEL" behavior asked for."""
+    from translate_routes import get_llm_provider
+    if user_id:
+        session_data = state_store.get_session(user_id)
+        provider = get_llm_provider(session_data.get('llm_provider'))
+        model = session_data.get('llm_model') or provider.default_model
+        api_key = state_store.get_llm_byok_key(user_id, provider.name) or provider.pick_api_key()
+    else:
+        provider = get_llm_provider(None)
+        model = provider.default_model
+        api_key = provider.pick_api_key()
+    return provider, model, api_key
+
+
+def _parse_schema_overview_response(raw_text):
+    """Parses the schema-overview LLM call's raw text response into
+    {"prose": str, "questions": [str, ...]}, or None if it doesn't match
+    that shape at all (a non-JSON reply, a refusal, a missing/blank
+    "prose" field, ...) - _generate_and_cache_schema_overview() below
+    treats None as "nothing to cache this time," never as an error to
+    surface anywhere. Strips a wrapping ```json ... ``` markdown fence
+    first, in case the model adds one despite being told not to - models
+    do this even when explicitly instructed otherwise, the same real-
+    world behavior _COMMON_FORMAT_RULES' own "do NOT surround the code
+    block in markdown backticks" instruction exists to work around for
+    actual SQL generation. "questions" defaults to an empty list (rather
+    than failing the whole parse) if it's missing or malformed - a
+    usable "prose" with no suggested questions is still worth caching."""
+    text = (raw_text or "").strip()
+    fence_match = re.match(r'^```(?:json)?\s*(.*?)\s*```$', text, re.DOTALL)
+    if fence_match:
+        text = fence_match.group(1).strip()
+    try:
+        parsed = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    prose = parsed.get("prose")
+    if not isinstance(prose, str) or not prose.strip():
+        return None
+    questions = parsed.get("questions")
+    if not isinstance(questions, list):
+        questions = []
+    questions = [q.strip() for q in questions if isinstance(q, str) and q.strip()]
+    return {"prose": prose.strip(), "questions": questions}
+
+
+def _generate_and_cache_schema_overview(descriptor, user_id, schema_text):
+    """Best-effort: generates and caches a short LLM-written {"prose",
+    "questions"} pair describing `schema_text` - see this section's own
+    header comment and schema_cache.py's module docstring for the full
+    design. Called once per successful deep fetch from
+    prime_schema_cache_with_reason() above - never on a plain cache hit
+    (get_database_schema() alone never calls this), so this is paid once
+    per connection per explicit refresh, not once per chat turn.
+
+    Deliberately swallows every failure (no API key configured for the
+    resolved provider, a transient LLM error, a response that doesn't
+    parse into the expected shape, ...) rather than raising: a schema
+    refresh that successfully updated the real schema text must never be
+    reported as failed to the user just because this purely-additive
+    enhancement's own LLM call had a bad moment. A failure here simply
+    leaves whichever overview (if any) was already cached in place -
+    webClient's Schema Viewer treats a missing overview as "nothing to
+    show yet," never as an error, so there's no user-visible harm in
+    quietly retrying on the next refresh instead."""
+    cache_key = get_conn_identifier(descriptor)
+    try:
+        provider, model, api_key = _resolve_overview_llm_call(user_id)
+        if not api_key:
+            return
+        client = provider.make_client(api_key)
+        schema_block = f"Database Schema:\n{schema_text}\n\n"
+        llm_input = provider.build_llm_input([], schema_block, "Produce the JSON now.")
+        raw_text, _usage = provider.call(client, model, llm_input, _SCHEMA_OVERVIEW_SYSTEM_INSTRUCTION)
+        overview = _parse_schema_overview_response(raw_text)
+        if overview is None:
+            return
+        overview["generated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        schema_cache.set_overview(cache_key, overview)
+    except Exception:
+        logger.exception("Schema overview generation failed for %s", cache_key)
 
 
 def prefetch_all_preset_schemas():
@@ -759,6 +946,56 @@ def prefetch_all_preset_schemas():
       without going back to blocking startup on every preset finishing
       first (see server.py's own comment on why that tradeoff was made).
 
+    Since schema_cache.py's schema-cache entries are durable (state_store-
+    backed, surviving restarts and shared across every Cloud Run instance -
+    see that module's own docstring), this function no longer unconditionally
+    force-refreshes every preset on every single restart/redeploy - see
+    _prefetch_one's own comment below for exactly why. In short: if a
+    preset already has a durably-persisted schema (from an earlier run of
+    this same process, or a previous server lifetime before whatever just
+    restarted it), that's loaded and this preset is done - no live DB
+    query, no schema-overview LLM call, paid again just because the
+    process happened to restart. There is deliberately NO invalidate_schema_
+    cache() call anywhere tied to editing DATABASE_PRESETS_FILE itself -
+    unlike a user's own custom connection (whose config-modal Save
+    explicitly invalidates on change - see config_routes.py's connection-
+    changed branch), a preset is a static file this app only ever reads
+    once, at startup (app_config.py builds CONFIGURED_DBS at import time,
+    with no live-reload) - there's no runtime "this preset's definition
+    just changed" event for anything to hook an invalidation onto. What
+    actually happens on the next restart after editing a preset depends on
+    WHICH fields changed, because this function's own durable-cache check
+    above keys on cache_key = get_conn_identifier(descriptor), which is
+    derived from a preset's real connection-identity fields (per dialect -
+    e.g. Postgres/MySQL: user@host:port/dbname; BigQuery: project.dataset;
+    see each backend's own cache_key() docstring), NEVER from the preset's
+    "id" or "name" in DATABASE_PRESETS_FILE (those are stripped out before
+    a cache_key is ever computed - see _prefetch_one below):
+      - Editing a field that IS part of cache_key() (a different host,
+        port, database, project, account, etc.) makes this preset resolve
+        to a brand-new cache_key on the next restart - nothing durable
+        exists yet under THAT key, so it's fetched live and cached fresh,
+        functionally equivalent to an explicit invalidation even though
+        none actually happened. The OLD cache_key's durable row is not
+        deleted, just permanently orphaned (nothing will ever look it up
+        again unless the preset is reverted) - harmless, but not cleaned
+        up either.
+      - Editing a field that is NOT part of cache_key() (credentials - a
+        password, a service-account key; a CA cert; the preset's own "id"/
+        "name"; ...) leaves the cache_key unchanged, so the existing durably-
+        cached schema keeps being served as-is, un-refreshed, on the
+        assumption that the underlying database itself hasn't changed
+        (usually true - rotating a password doesn't change a schema). If
+        the actual schema genuinely did change independently of any
+        preset-definition edit at all (a column added, a table dropped),
+        that's picked up only via the existing "Refresh Schema" button -
+        deliberately: a restart is no longer treated as its own implicit
+        refresh trigger, matching this cache's existing no-TTL, refetch-
+        only-when-asked design everywhere else (see schema_cache.py's own
+        module docstring), preferring the cost savings (real DB load and
+        Gemini token spend, on every restart, forever) over an automatic
+        refresh tied to server restarts.
+
     Custom connections are deliberately NOT covered here - see this
     task's plan for why ("presets only" was the chosen scope): each
     user's own custom connections still warm up lazily on first use,
@@ -792,7 +1029,25 @@ def prefetch_all_preset_schemas():
     def _prefetch_one(db):
         descriptor = {k: v for k, v in db.items() if k not in ("id", "name")}
         preset_label = db.get("name") or db.get("id")
+        cache_key = get_conn_identifier(descriptor)
         try:
+            # schema_cache.get() reads the durable store directly (see that
+            # module's own docstring) - a non-None result here means
+            # "something was durably saved for this preset already," from
+            # an earlier server lifetime or another still-running Cloud Run
+            # instance's own prefetch. Loading that instead of
+            # force-refetching live is
+            # the whole point of this function no longer unconditionally
+            # calling prime_schema_cache_with_reason() below - see this
+            # function's own docstring for the full reasoning. Also warms
+            # the shallow entry the same way, if one was durably saved for
+            # it too (it always is, in the common case - both are written
+            # together by a single successful prime_schema_cache_with_
+            # reason() call, see that function's own docstring) - fetched
+            # separately here since it's a genuinely separate cache_key.
+            if schema_cache.get(cache_key) is not None:
+                schema_cache.get(cache_key + _SHALLOW_CACHE_KEY_SUFFIX)
+                return
             ok, reason = prime_schema_cache_with_reason(descriptor, user_id=None)
             if ok:
                 return

@@ -365,6 +365,28 @@ def test_get_schema_builds_text_from_catalog_functions():
     assert "Table: customers" in schema
 
 
+def test_get_schema_never_includes_dataset_size_estimate_line():
+    # Regression guard: this backend deliberately has no "Estimated dataset
+    # size" line (see backends/mongodb_sql.py's get_schema() comment) - this
+    # ODBC-based connection to MongoDB Atlas SQL has no metadata catalog for
+    # document/byte totals and no native pymongo driver to fall back on, so
+    # a successful schema fetch must never grow one.
+    conn = _FakeConnection(
+        tables_rows=[_FakeRow(table_name="orders"), _FakeRow(table_name="customers")],
+        columns_by_table={
+            "orders": [
+                _FakeRow(column_name="_id", type_name="VARCHAR", is_nullable="NO"),
+                _FakeRow(column_name="total", type_name="DOUBLE", is_nullable="YES"),
+            ],
+            "customers": [
+                _FakeRow(column_name="_id", type_name="VARCHAR", is_nullable="NO"),
+            ],
+        },
+    )
+    schema = MongoSqlBackend().get_schema(conn)
+    assert "Estimated dataset size" not in schema
+
+
 def test_get_schema_caps_at_schema_max_tables(monkeypatch):
     monkeypatch.setattr(mongodb_sql_module, "SCHEMA_MAX_TABLES", 2)
     conn = _FakeConnection(

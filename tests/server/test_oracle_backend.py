@@ -847,7 +847,17 @@ def _base_deep_responses():
             ("ORDERS", "STATUS", "VARCHAR2", "N"),
         ],
         views=[("V", "SELECT * FROM ORDERS")],
-    )
+    ) + [
+        # New (deep-only): schema-wide dataset size's byte-count query
+        # (SUM(bytes) FROM user_segments), issued right after phase2_ctx is
+        # unpacked and before any Phase 2 query. Unlike mssql/snowflake,
+        # the row-count total needs no query of its own (pure Python sum
+        # over num_rows_by_table, already built during Phase 1's ALL_TABLES
+        # scan) - only the byte size is a fresh best-effort query, and its
+        # response is a single (bytes,) 1-column row, matching
+        # size_row[0] in backends/oracle.py's get_schema().
+        ([(2_000_000,)], None, -1),
+    ]
 
 
 def _phase2_sampling_responses():
@@ -876,7 +886,13 @@ def test_get_schema_deep_is_superset_of_shallow_plus_phase2_sampling():
     assert "ID: range [1 .. 100]" in schema
     assert "STATUS: frequent values = ACTIVE (30), INACTIVE (12)" in schema
 
-    assert len(cursor.calls) == 9 + 4
+    # New (deep-only): schema-wide "Estimated dataset size" line. Row count
+    # (500) is the pure-Python sum over num_rows_by_table - here just
+    # {"ORDERS": 500}, since _base_deep_responses() scans/keeps one table -
+    # and bytes (2,000,000) is the new query's response.
+    assert "Estimated dataset size: ~1.9 MB" in schema
+
+    assert len(cursor.calls) == 9 + 1 + 4
 
 
 def test_get_schema_deep_skips_frequent_values_for_near_unique_column():
@@ -898,7 +914,7 @@ def test_get_schema_deep_skips_frequent_values_for_near_unique_column():
     assert "Column value samples:" in schema
     assert "ID: range [1 .. 100]" in schema
     assert "frequent values" not in schema
-    assert len(cursor.calls) == 9 + 3
+    assert len(cursor.calls) == 9 + 1 + 3
 
 
 def test_get_schema_deep_naming_convention_relationships_section():
@@ -942,6 +958,7 @@ def test_get_schema_deep_skips_sampling_for_wide_tables_but_keeps_live_count():
         table_names=["WIDE"],
         columns_rows=columns_rows,
     ) + [
+        ([(1_000,)], None, -1),  # new: schema-wide byte size query
         ([], None, -1),        # num_distinct
         ([(7,)], None, -1),    # live count for WIDE
         # no min/max response queued - it must not be requested
@@ -951,7 +968,70 @@ def test_get_schema_deep_skips_sampling_for_wide_tables_but_keeps_live_count():
     schema = backend.get_schema(conn)
     assert "Live row counts:" in schema and "WIDE: 7 rows (live, authoritative)" in schema
     assert "Column value samples:" not in schema
-    assert len(cursor.calls) == 9 + 2
+    assert len(cursor.calls) == 9 + 1 + 2
+
+
+def test_get_schema_deep_dataset_size_sums_full_num_rows_by_table_not_just_kept_names():
+    """The "Estimated dataset size" row-count total must reflect every
+    table Phase 1 scanned into num_rows_by_table (up to
+    SCHEMA_MAX_TABLE_NAMES_SCANNED), not just the capped/collapsed
+    kept_names subset actually described in the prompt text. Unlike
+    mssql/snowflake (a single fresh aggregate query, easy to prove is
+    schema-wide by its lack of a table filter), Oracle's row-count total
+    needs no query at all - it's a pure Python sum - so this proves the
+    same thing by construction instead: five date-sharded members collapse
+    into a single kept_names representative (see
+    test_get_schema_collapses_date_sharded_family above), but all five
+    still carry their own NUM_ROWS in num_rows_by_table and must all be
+    summed. The byte query is deliberately made to fail here (see
+    test_get_schema_deep_dataset_size_bytes_query_failure_still_renders_rows_only_line
+    for that behavior's own dedicated test) purely so the row total this
+    test actually cares about is what ends up rendered -
+    format_dataset_size_line() prefers a byte figure over rows whenever
+    both are available (see its own docstring), which would otherwise hide
+    the very number this test needs to check."""
+    members = [f"EVENTS_2024010{i}" for i in range(1, 6)]
+    row_counts = [100, 200, 300, 400, 500]
+    conn, cursor = make_fake_pg_connection(_schema_responses(
+        table_names=list(zip(members, row_counts)),
+        columns_rows=[(members[-1], "ID", "NUMBER", "N")],
+    ) + [
+        Exception("ORA-00942: table or view does not exist"),  # byte size query fails
+        ([], None, -1),               # num_distinct (no categorical cols)
+        ([(42,)], None, -1),           # live count for the kept representative
+        ([(1, 999)], None, -1),        # min/max for ID
+    ])
+    backend = OracleBackend()
+    schema = backend.get_schema(conn)
+    assert "Table family: EVENTS_<date>" in schema
+    # Sum across all 5 scanned members (1500), not just the 1 kept
+    # representative's own NUM_ROWS (500).
+    assert "Estimated dataset size: ~1.50K rows" in schema
+
+
+def test_get_schema_deep_dataset_size_bytes_query_failure_still_renders_rows_only_line():
+    """Only the bytes half of Oracle's dataset-size line depends on a live
+    query (SUM(bytes) FROM user_segments) - the row-count half is a pure
+    Python sum that can't fail from a DB call. So a failure here must not
+    take down the whole line the way it would for mssql/snowflake (a
+    single combined query) - format_dataset_size_line's total_bytes=None
+    handling means a rows-only line still renders, and the rest of the
+    schema stays complete and uncorrupted."""
+    responses = _base_deep_responses()
+    responses[-1] = Exception("ORA-00942: table or view does not exist")
+    responses = responses + _phase2_sampling_responses()
+    conn, cursor = make_fake_pg_connection(responses)
+    backend = OracleBackend()
+    schema = backend.get_schema(conn)
+
+    assert "Table: ORDERS" in schema
+    assert "View definitions:" in schema and "View V: SELECT * FROM ORDERS" in schema
+    assert "Live row counts:" in schema and "ORDERS: 42 rows (live, authoritative)" in schema
+    assert "Column value samples:" in schema
+    assert "ID: range [1 .. 100]" in schema
+    assert "STATUS: frequent values = ACTIVE (30), INACTIVE (12)" in schema
+    # Rows-only line: no byte figure at all since that query failed.
+    assert "Estimated dataset size: ~500 rows" in schema
 
 
 def test_get_schema_deep_no_routine_definitions_section_ever():

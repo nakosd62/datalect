@@ -644,7 +644,13 @@ def _base_deep_responses():
         views=[("V", "SELECT 1 FROM ORDERS")],
         functions=[("GET_TOTAL", "P1 NUMBER", "NUMBER", "SELECT 1;")],
         table_metadata=[("ORDERS", None, 500, None)],
-    )
+    ) + [
+        # New (deep-only): schema-wide dataset size aggregate over
+        # information_schema.tables, issued right after phase2_ctx is
+        # unpacked and before any Phase 2 query - 1 table, ~500 rows,
+        # ~2MB, matching format_dataset_size_line(500, 2_000_000, 1).
+        ([(500, 2_000_000, 1)], None, -1),
+    ]
 
 
 def test_get_schema_deep_is_superset_of_shallow_plus_phase2_sampling():
@@ -671,7 +677,11 @@ def test_get_schema_deep_is_superset_of_shallow_plus_phase2_sampling():
     assert "ID: range [1 .. 100]" in schema
     assert "STATUS: frequent values = ACTIVE (30), INACTIVE (12)" in schema
 
-    assert len(cursor.calls) == 13 + 3
+    # New (deep-only): schema-wide "Estimated dataset size" line, built from
+    # the same numbers _base_deep_responses() queues for the new query.
+    assert "Estimated dataset size: ~1.9 MB" in schema
+
+    assert len(cursor.calls) == 13 + 1 + 3
 
 
 def test_get_schema_deep_skips_frequent_values_for_near_unique_column():
@@ -690,7 +700,7 @@ def test_get_schema_deep_skips_frequent_values_for_near_unique_column():
     assert "Column value samples:" in schema
     assert "ID: range [1 .. 100]" in schema
     assert "frequent values" not in schema
-    assert len(cursor.calls) == 13 + 2
+    assert len(cursor.calls) == 13 + 1 + 2
 
 
 def test_get_schema_deep_naming_convention_relationships_section():
@@ -737,6 +747,7 @@ def test_get_schema_deep_skips_sampling_for_wide_tables_but_keeps_live_count():
         table_names=["WIDE"],
         columns_rows=columns_rows,
     ) + [
+        ([(7, 1000, 1)], None, -1),  # new: schema-wide dataset size aggregate
         ([(7,)], None, -1),   # plain COUNT(*) for WIDE - too wide for sampling
         # no min/max or frequent-value response queued - must not be requested
     ]
@@ -745,7 +756,55 @@ def test_get_schema_deep_skips_sampling_for_wide_tables_but_keeps_live_count():
     schema = backend.get_schema(conn)
     assert "Live row counts:" in schema and "WIDE: 7 rows (live, authoritative)" in schema
     assert "Column value samples:" not in schema
-    assert len(cursor.calls) == 13 + 1
+    assert len(cursor.calls) == 13 + 1 + 1
+
+
+def test_get_schema_deep_dataset_size_query_is_schema_wide_not_scoped_to_kept_names():
+    """The new information_schema.tables aggregate must have no per-table
+    filter at all - unlike the neighboring Phase 1 "Table metadata" query
+    against the same view, which is deliberately scoped to kept_names (a
+    capped subset). Scoping the new query the same way would just re-total
+    the same capped subset, defeating its whole "true schema-wide size even
+    when most tables got capped out" purpose."""
+    phase2_responses = [
+        ([(42, 2)], None, -1),
+        ([(1, 100)], None, -1),
+        ([("ACTIVE", 30), ("INACTIVE", 12)], None, -1),
+    ]
+    conn, cursor = make_fake_pg_connection(_base_deep_responses() + phase2_responses)
+    backend = SnowflakeBackend()
+    backend.get_schema(conn)
+
+    size_sql = [c for c, _p in cursor.calls if "table_type = 'BASE TABLE'" in c][0]
+    assert "table_name IN" not in size_sql
+
+    metadata_sql = [c for c, _p in cursor.calls if "clustering_key" in c][0]
+    assert "table_name IN" in metadata_sql
+
+
+def test_get_schema_deep_dataset_size_query_failure_leaves_rest_of_schema_intact():
+    """A failure in the new best-effort dataset-size query must not corrupt
+    or truncate anything else in the schema - just omit the "Estimated
+    dataset size" line."""
+    responses = _base_deep_responses()
+    responses[-1] = Exception("insufficient privileges on information_schema.tables")
+    responses = responses + [
+        ([(42, 2)], None, -1),
+        ([(1, 100)], None, -1),
+        ([("ACTIVE", 30), ("INACTIVE", 12)], None, -1),
+    ]
+    conn, cursor = make_fake_pg_connection(responses)
+    backend = SnowflakeBackend()
+    schema = backend.get_schema(conn)
+
+    assert "Table: ORDERS" in schema
+    assert "View definitions:" in schema and "View V: SELECT 1 FROM ORDERS" in schema
+    assert "Routine definitions:" in schema and "GET_TOTAL: SELECT 1;" in schema
+    assert "Live row counts:" in schema and "ORDERS: 42 rows (live, authoritative)" in schema
+    assert "Column value samples:" in schema
+    assert "ID: range [1 .. 100]" in schema
+    assert "STATUS: frequent values = ACTIVE (30), INACTIVE (12)" in schema
+    assert "Estimated dataset size" not in schema
 
 
 # --- execute -------------------------------------------------------------------

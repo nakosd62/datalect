@@ -104,6 +104,35 @@ test.describe('first-run onboarding', () => {
     }).toPass({ timeout: 2000 });
   });
 
+  test('the tour includes a step spotlighting the "i" schema-info icon nested in the DB badge', async ({ page }) => {
+    await page.goto('/');
+    await expect(page.locator('#tourOverlay')).not.toHaveClass(/hidden/);
+
+    // Same "click Next until the title shows up" approach as the
+    // model-badge test below - getTourSteps() places this step right
+    // after the DB connection badge one, at every viewport (it's not part
+    // of the narrow-header combined more-menu step, which only folds in
+    // Help/History/Preferences/sign-in/feedback).
+    const title = page.locator('#tourTooltipTitle');
+    for (let i = 0; i < 10; i++) {
+      if ((await title.textContent())?.includes('Peek at its schema')) break;
+      await page.locator('#tourNextBtn').click();
+    }
+    await expect(title).toHaveText('Peek at its schema anytime');
+    await expect(page.locator('#tourTooltipBody')).toContainText('"i" inside the badge');
+
+    // The spotlight is actually positioned over the small nested info
+    // button, not the whole badge behind it - same regression guard as
+    // the model-badge/gear-button tests below, and specifically the point
+    // of this step: it should call out the icon as its own target.
+    const iconBox = await page.locator('#datasetSchemaViewerBtn').boundingBox();
+    await expect(async () => {
+      const spotlightBox = await page.locator('#tourSpotlight').boundingBox();
+      expect(Math.abs(spotlightBox.x - iconBox.x)).toBeLessThan(10);
+      expect(Math.abs(spotlightBox.y - iconBox.y)).toBeLessThan(10);
+    }).toPass({ timeout: 2000 });
+  });
+
   test('the tour includes a step spotlighting the Preferences gear button', async ({ page }) => {
     await page.goto('/');
     await expect(page.locator('#tourOverlay')).not.toHaveClass(/hidden/);
@@ -255,5 +284,33 @@ test.describe('first-run onboarding', () => {
     const events = await trackedEvents(page, 'tour_exited');
     expect(events.length).toBe(1);
     expect(events[0].step).toBe(totalSteps);
+  });
+
+  // Regression guard for a removed feature: this tour used to include a
+  // dedicated step spotlighting the "Sample prompts" chip row above the
+  // prompt box - removed when that whole section was removed from the app
+  // (see app-shell.spec.js's own removal-guard test for the section
+  // itself). getTourSteps() in client.js no longer builds that step at
+  // all, but this walks every step's actual rendered title/body text as a
+  // belt-and-braces check that nothing still references it by name, rather
+  // than just trusting the step list was edited correctly.
+  test('no step in the guided tour mentions the removed sample-prompts section', async ({ page }) => {
+    await page.goto('/');
+    await expect(page.locator('#tourOverlay')).not.toHaveClass(/hidden/);
+
+    const nextBtn = page.locator('#tourNextBtn');
+    const seenText = [];
+    for (let i = 0; i < 20; i++) {
+      seenText.push(await page.locator('#tourTooltipTitle').textContent());
+      seenText.push(await page.locator('#tourTooltipBody').textContent());
+      if ((await nextBtn.textContent()) === 'Done') break;
+      await nextBtn.click();
+    }
+
+    expect(seenText.length).toBeGreaterThan(0);
+    const combined = seenText.join(' ').toLowerCase();
+    expect(combined).not.toContain('sample prompt');
+    expect(combined).not.toContain('quick prompt');
+    expect(combined).not.toContain('example prompt');
   });
 });

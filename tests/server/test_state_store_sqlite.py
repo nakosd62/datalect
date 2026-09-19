@@ -676,6 +676,256 @@ def test_one_corrupt_bucket_does_not_prevent_other_buckets_from_loading(tmp_path
     assert result["buckets"] == {"all": [{"role": "user", "text": "also good"}]}
 
 
+# --- schema_cache (the only storage schema_cache.py has - see that module's
+# own docstring for why it no longer keeps any process-local copy alongside
+# this) ---------------------------------------------------------------------
+# See schema_cache.py's own module docstring and state_store.py's "Durable
+# schema cache" section for the full design. cache_key here is whatever
+# db.py's get_conn_identifier() produced for a real connection - opaque to
+# this store, just a TEXT primary key - so these tests use plain
+# recognizable strings rather than reconstructing a real one.
+
+def test_get_cached_schema_returns_none_when_no_row_exists(tmp_path):
+    store = make_store(tmp_path)
+    assert store.get_cached_schema("u@host:5432/db") is None
+
+
+def test_set_then_get_cached_schema_round_trips_text_and_cached_at(tmp_path):
+    store = make_store(tmp_path)
+    store.set_cached_schema("u@host:5432/db", "Table: t\n  id integer NOT NULL", "2026-01-01T00:00:00+00:00")
+    row = store.get_cached_schema("u@host:5432/db")
+    assert row["schema_text"] == "Table: t\n  id integer NOT NULL"
+    assert row["cached_at"] == "2026-01-01T00:00:00+00:00"
+    assert row["overview"] is None  # never set - "nothing to show yet", not an error
+
+
+def test_set_cached_schema_again_replaces_text_and_cached_at(tmp_path):
+    store = make_store(tmp_path)
+    store.set_cached_schema("k1", "FIRST", "2026-01-01T00:00:00+00:00")
+    store.set_cached_schema("k1", "SECOND", "2026-02-02T00:00:00+00:00")
+    row = store.get_cached_schema("k1")
+    assert row["schema_text"] == "SECOND"
+    assert row["cached_at"] == "2026-02-02T00:00:00+00:00"
+
+
+def test_set_cached_schema_never_clobbers_a_previously_saved_overview(tmp_path):
+    # A live schema refetch (a new set_cached_schema call) must never wipe
+    # out an overview an earlier, separate LLM call already generated and
+    # saved for this same key - see set_cached_schema's own "ON CONFLICT
+    # only touches schema_text/cached_at" comment in state_store.py.
+    store = make_store(tmp_path)
+    store.set_cached_schema("k1", "FIRST", "2026-01-01T00:00:00+00:00")
+    store.set_cached_schema_overview("k1", {"prose": "A sales dataset.", "questions": ["Top region?"]})
+
+    store.set_cached_schema("k1", "SECOND", "2026-02-02T00:00:00+00:00")
+
+    row = store.get_cached_schema("k1")
+    assert row["schema_text"] == "SECOND"
+    assert row["overview"] == {"prose": "A sales dataset.", "questions": ["Top region?"]}
+
+
+def test_set_cached_schema_overview_round_trips_and_never_touches_schema_text_or_cached_at(tmp_path):
+    store = make_store(tmp_path)
+    store.set_cached_schema("k1", "Table: t", "2026-01-01T00:00:00+00:00")
+
+    store.set_cached_schema_overview("k1", {"prose": "desc", "questions": ["q1", "q2"]})
+
+    row = store.get_cached_schema("k1")
+    assert row["overview"] == {"prose": "desc", "questions": ["q1", "q2"]}
+    assert row["schema_text"] == "Table: t"  # untouched
+    assert row["cached_at"] == "2026-01-01T00:00:00+00:00"  # untouched
+
+
+def test_set_cached_schema_overview_before_any_schema_text_exists_still_works(tmp_path):
+    # Order independence: nothing today calls this before set_cached_schema
+    # for the same key, but nothing stops it either (a raw INSERT, not an
+    # UPDATE-only statement) - schema_text/cached_at just come back None
+    # until a real set_cached_schema call eventually arrives for this key.
+    store = make_store(tmp_path)
+    store.set_cached_schema_overview("k1", {"prose": "desc", "questions": []})
+    row = store.get_cached_schema("k1")
+    assert row["overview"] == {"prose": "desc", "questions": []}
+    assert row["schema_text"] is None
+    assert row["cached_at"] is None
+
+
+def test_set_cached_schema_overview_again_replaces_the_previous_overview(tmp_path):
+    store = make_store(tmp_path)
+    store.set_cached_schema_overview("k1", {"prose": "old", "questions": []})
+    store.set_cached_schema_overview("k1", {"prose": "new", "questions": ["q1"]})
+    assert store.get_cached_schema("k1")["overview"] == {"prose": "new", "questions": ["q1"]}
+
+
+def test_get_cached_schema_survives_a_corrupt_saved_overview_by_returning_none_for_it(tmp_path):
+    # A hand-corrupted (or pre-JSON-era) row must never take down the whole
+    # read - same "silently unavailable, never a hard error" posture
+    # _decode_chat_turns already uses for a bad chat_history payload (see
+    # get_cached_schema's own comment in state_store.py).
+    store = make_store(tmp_path)
+    store.set_cached_schema("k1", "Table: t", "2026-01-01T00:00:00+00:00")
+    with sqlite3.connect(str(tmp_path / "state.db")) as conn:
+        conn.execute("UPDATE schema_cache SET overview = ? WHERE cache_key = ?", ("not valid json{{{", "k1"))
+        conn.commit()
+    row = store.get_cached_schema("k1")
+    assert row["schema_text"] == "Table: t"  # the rest of the row is unaffected
+    assert row["overview"] is None
+
+
+def test_delete_cached_schema_removes_the_row(tmp_path):
+    store = make_store(tmp_path)
+    store.set_cached_schema("k1", "Table: t", "2026-01-01T00:00:00+00:00")
+    store.delete_cached_schema("k1")
+    assert store.get_cached_schema("k1") is None
+
+
+def test_delete_cached_schema_for_a_never_cached_key_is_a_no_op(tmp_path):
+    store = make_store(tmp_path)
+    store.delete_cached_schema("never-cached")  # must not raise
+
+
+def test_cached_schema_entries_are_isolated_per_cache_key(tmp_path):
+    store = make_store(tmp_path)
+    store.set_cached_schema("k1", "SCHEMA ONE", "2026-01-01T00:00:00+00:00")
+    store.set_cached_schema("k2", "SCHEMA TWO", "2026-01-02T00:00:00+00:00")
+    assert store.get_cached_schema("k1")["schema_text"] == "SCHEMA ONE"
+    assert store.get_cached_schema("k2")["schema_text"] == "SCHEMA TWO"
+
+    store.delete_cached_schema("k1")
+    assert store.get_cached_schema("k1") is None
+    assert store.get_cached_schema("k2")["schema_text"] == "SCHEMA TWO"  # unaffected
+
+
+# --- schema_cache fetch-pending/fetch-error status --------------------------
+# Durable now for the same cross-instance-visibility reason schema_text
+# itself is (see schema_cache.py's own module docstring): a background
+# refetch's in-flight status must be visible to a poll landing on a
+# different process/Cloud Run instance than the one running the fetch.
+
+def test_get_schema_fetch_status_for_a_never_fetched_key_is_not_pending_no_error(tmp_path):
+    store = make_store(tmp_path)
+    assert store.get_schema_fetch_status("k1") == {"pending": False, "error": None}
+
+
+def test_mark_schema_fetch_pending_then_get_schema_fetch_status_reports_it(tmp_path):
+    store = make_store(tmp_path)
+    store.mark_schema_fetch_pending("k1")
+    assert store.get_schema_fetch_status("k1") == {"pending": True, "error": None}
+
+
+def test_mark_schema_fetch_pending_never_touches_a_previously_recorded_error(tmp_path):
+    # A fetch that's merely STARTING says nothing about the outcome of the
+    # previous attempt - the poller only stops trusting fetch_error once
+    # this same key is no longer pending (see config_routes.py's
+    # /api/config/schema-fetch-status).
+    store = make_store(tmp_path)
+    store.mark_schema_fetch_done("k1", error="FATAL")
+    store.mark_schema_fetch_pending("k1")
+    assert store.get_schema_fetch_status("k1") == {"pending": True, "error": "FATAL"}
+
+
+def test_mark_schema_fetch_done_with_no_error_clears_pending_and_any_previous_error(tmp_path):
+    store = make_store(tmp_path)
+    store.mark_schema_fetch_pending("k1")
+    store.mark_schema_fetch_done("k1", error="TIMEOUT")
+    assert store.get_schema_fetch_status("k1")["error"] == "TIMEOUT"
+
+    store.mark_schema_fetch_pending("k1")
+    store.mark_schema_fetch_done("k1")  # this attempt succeeded
+    assert store.get_schema_fetch_status("k1") == {"pending": False, "error": None}
+
+
+def test_mark_schema_fetch_pending_and_done_never_touch_schema_text_or_overview(tmp_path):
+    store = make_store(tmp_path)
+    store.set_cached_schema("k1", "Table: t", "2026-01-01T00:00:00+00:00")
+    store.set_cached_schema_overview("k1", {"prose": "desc", "questions": []})
+
+    store.mark_schema_fetch_pending("k1")
+    store.mark_schema_fetch_done("k1", error="EMPTY")
+
+    row = store.get_cached_schema("k1")
+    assert row["schema_text"] == "Table: t"
+    assert row["overview"] == {"prose": "desc", "questions": []}
+
+
+def test_delete_cached_schema_also_clears_fetch_status(tmp_path):
+    store = make_store(tmp_path)
+    store.mark_schema_fetch_pending("k1")
+    store.mark_schema_fetch_done("k1", error="FATAL")
+
+    store.delete_cached_schema("k1")
+
+    assert store.get_schema_fetch_status("k1") == {"pending": False, "error": None}
+
+
+def test_fetch_status_is_isolated_per_cache_key(tmp_path):
+    store = make_store(tmp_path)
+    store.mark_schema_fetch_pending("k1")
+    store.mark_schema_fetch_done("k2", error="FATAL")
+    assert store.get_schema_fetch_status("k1") == {"pending": True, "error": None}
+    assert store.get_schema_fetch_status("k2") == {"pending": False, "error": "FATAL"}
+
+
+# --- list_cached_schema_texts() (local-dev /api/debug/schema-cache) --------
+
+def test_list_cached_schema_texts_is_empty_when_nothing_is_cached(tmp_path):
+    store = make_store(tmp_path)
+    assert store.list_cached_schema_texts() == {}
+
+
+def test_list_cached_schema_texts_returns_every_cached_entry(tmp_path):
+    store = make_store(tmp_path)
+    store.set_cached_schema("k1", "SCHEMA ONE", "2026-01-01T00:00:00+00:00")
+    store.set_cached_schema("k2", "SCHEMA TWO", "2026-01-02T00:00:00+00:00")
+    assert store.list_cached_schema_texts() == {"k1": "SCHEMA ONE", "k2": "SCHEMA TWO"}
+
+
+def test_list_cached_schema_texts_omits_a_key_with_no_schema_text_yet(tmp_path):
+    # A key that only has a pending fetch, or only an overview, has nothing
+    # worth listing as "cached schema".
+    store = make_store(tmp_path)
+    store.mark_schema_fetch_pending("pending-only")
+    store.set_cached_schema_overview("overview-only", {"prose": "x", "questions": []})
+    store.set_cached_schema("k1", "SCHEMA ONE", "2026-01-01T00:00:00+00:00")
+    assert store.list_cached_schema_texts() == {"k1": "SCHEMA ONE"}
+
+
+def test_init_migrates_schema_cache_table_predating_fetch_status_columns(tmp_path):
+    # A schema_cache table created before fetch_pending/fetch_error existed
+    # (the original four-column shape: cache_key/schema_text/cached_at/
+    # overview) must gain both columns via a plain ALTER ADD COLUMN, with
+    # its existing rows surviving untouched - mirrors the db_connections/
+    # sessions migration tests below for the same "add a column, don't lose
+    # data" shape.
+    db_path = str(tmp_path / "state.db")
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("""
+            CREATE TABLE schema_cache (
+                cache_key TEXT PRIMARY KEY,
+                schema_text TEXT,
+                cached_at TEXT,
+                overview TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        conn.execute(
+            "INSERT INTO schema_cache (cache_key, schema_text, cached_at) VALUES (?, ?, ?)",
+            ("k1", "OLD SCHEMA", "2025-01-01T00:00:00+00:00"),
+        )
+        conn.commit()
+
+    store = SqliteStateStore(db_path)
+    store.init()  # must not raise
+
+    row = store.get_cached_schema("k1")
+    assert row["schema_text"] == "OLD SCHEMA"  # pre-existing data survives
+    assert row["cached_at"] == "2025-01-01T00:00:00+00:00"
+    assert store.get_schema_fetch_status("k1") == {"pending": False, "error": None}
+
+    # And the new columns are fully usable going forward, not just present.
+    store.mark_schema_fetch_pending("k1")
+    assert store.get_schema_fetch_status("k1")["pending"] is True
+
+
 # --- init() migrations: legacy schema upgrade paths ----------------------------
 
 def test_init_migrates_sessions_table_predating_llm_fields(tmp_path):

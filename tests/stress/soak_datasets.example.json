@@ -18,10 +18,5 @@
     "name": "Movie Rentals (Postgres)",
     "preset_id": "postgres-movie-rentals",
     "sql": "SELECT * FROM film LIMIT 1000"
-  },
-  {
-    "name": "Movie Rentals (Postgres)",
-    "preset_id": "postgres-movie-rentals",
-    "sql": "SELECT * FROM film LIMIT 1000"
-  }  
+  }
 ]

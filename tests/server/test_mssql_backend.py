@@ -871,7 +871,13 @@ def _base_deep_responses():
         views=[("v", "SELECT 1 FROM orders")],
         routines=[("get_total", "SQL_SCALAR_FUNCTION", "p1", 1, "int", "SELECT 1;")],
         row_count_estimates=[("orders", 500)],
-    )
+    ) + [
+        # New (deep-only): schema-wide dataset size aggregate over
+        # sys.dm_db_partition_stats, issued right after phase2_ctx is
+        # unpacked and before any Phase 2 query - 1 table, ~500 rows,
+        # ~2MB, matching format_dataset_size_line(500, 2_000_000, 1).
+        ([(500, 2_000_000, 1)], None, -1),
+    ]
 
 
 def _phase2_sampling_responses():
@@ -902,7 +908,11 @@ def test_get_schema_deep_is_superset_of_shallow_plus_phase2_sampling():
     assert "id: range [1 .. 100]" in schema
     assert "status: frequent values = active (30), inactive (12)" in schema
 
-    assert len(cursor.calls) == 12 + 4
+    # New (deep-only): schema-wide "Estimated dataset size" line, built from
+    # the same numbers _base_deep_responses() queues for the new query.
+    assert "Estimated dataset size: ~1.9 MB" in schema
+
+    assert len(cursor.calls) == 12 + 1 + 4
 
 
 def test_get_schema_deep_skips_frequent_values_for_near_unique_column():
@@ -923,7 +933,7 @@ def test_get_schema_deep_skips_frequent_values_for_near_unique_column():
     assert "Column value samples:" in schema
     assert "id: range [1 .. 100]" in schema
     assert "frequent values" not in schema
-    assert len(cursor.calls) == 12 + 3
+    assert len(cursor.calls) == 12 + 1 + 3
 
 
 def test_get_schema_deep_naming_convention_relationships_section():
@@ -975,6 +985,7 @@ def test_get_schema_deep_skips_sampling_for_wide_tables_but_keeps_live_count():
         table_names=["wide"],
         columns_rows=columns_rows,
     ) + [
+        ([(7, 1000, 1)], None, -1),  # new: schema-wide dataset size aggregate
         ([(7,)], None, -1),   # live count for wide
         # no min/max or gate/frequent-value response queued - must not be requested
     ]
@@ -983,7 +994,7 @@ def test_get_schema_deep_skips_sampling_for_wide_tables_but_keeps_live_count():
     schema = backend.get_schema(conn)
     assert "Live row counts:" in schema and "wide: 7 rows (live, authoritative)" in schema
     assert "Column value samples:" not in schema
-    assert len(cursor.calls) == 12 + 1
+    assert len(cursor.calls) == 12 + 1 + 1
 
 
 def test_get_schema_deep_qualifies_live_row_count_and_sample_lines_when_schema_configured():
@@ -995,6 +1006,7 @@ def test_get_schema_deep_qualifies_live_row_count_and_sample_lines_when_schema_c
         table_names=["orders"],
         columns_rows=[("orders", "id", "int", "NO", None)],
     ) + [
+        ([(5, 1000, 1)], None, -1),  # new: schema-wide dataset size aggregate
         ([(5,)], None, -1),     # live count
         ([(1, 5)], None, -1),   # min/max for id
     ]
@@ -1005,6 +1017,45 @@ def test_get_schema_deep_qualifies_live_row_count_and_sample_lines_when_schema_c
     assert "Table: reporting.orders" in schema
     live_count_sql = [c for c, _p in cursor.calls if c.startswith("SELECT COUNT(*)")][0]
     assert "[reporting].[orders]" in live_count_sql
+
+
+def test_get_schema_deep_dataset_size_query_is_schema_wide_not_scoped_to_kept_names():
+    """The new sys.dm_db_partition_stats aggregate must have no per-table
+    filter at all - unlike the neighboring Phase 1 "Row count estimates"
+    query against the same DMV, which is deliberately scoped to
+    kept_names (a capped subset). Scoping the new query the same way would
+    just re-total the same capped subset, defeating its whole "true
+    schema-wide size even when most tables got capped out" purpose."""
+    conn, cursor = make_fake_mssql_connection(_base_deep_responses() + _phase2_sampling_responses())
+    backend = MssqlBackend()
+    backend.get_schema(conn)
+
+    size_sql = [c for c, _p in cursor.calls if "COUNT(DISTINCT t.object_id)" in c][0]
+    assert "t.name IN" not in size_sql
+
+    estimate_sql = [c for c, _p in cursor.calls if c.strip().startswith("SELECT t.name, SUM(ps.row_count)")][0]
+    assert "t.name IN" in estimate_sql
+
+
+def test_get_schema_deep_dataset_size_query_failure_leaves_rest_of_schema_intact():
+    """A failure in the new best-effort dataset-size query (e.g. missing
+    VIEW SERVER STATE permission) must not corrupt or truncate anything
+    else in the schema - just omit the "Estimated dataset size" line."""
+    responses = _base_deep_responses()
+    responses[-1] = Exception("VIEW SERVER STATE permission denied")
+    responses = responses + _phase2_sampling_responses()
+    conn, cursor = make_fake_mssql_connection(responses)
+    backend = MssqlBackend()
+    schema = backend.get_schema(conn)
+
+    assert "Table: orders" in schema
+    assert "View definitions:" in schema and "View v: SELECT 1 FROM orders" in schema
+    assert "Routine definitions:" in schema and "get_total: SELECT 1;" in schema
+    assert "Live row counts:" in schema and "orders: 42 rows (live, authoritative)" in schema
+    assert "Column value samples:" in schema
+    assert "id: range [1 .. 100]" in schema
+    assert "status: frequent values = active (30), inactive (12)" in schema
+    assert "Estimated dataset size" not in schema
 
 
 # --- execute ---------------------------------------------------------------------

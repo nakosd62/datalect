@@ -1,0 +1,56 @@
+# conversation_prompts.example.txt
+#
+# --mode conversation's own prompt pool - used via:
+#   --prompts-file tests/stress/conversation_prompts.example.txt
+#
+# Format: one prompt per line. Blank lines and lines starting with '#'
+# are ignored, so you can freely comment things out or leave notes like
+# this one. No quoting/escaping needed - unlike a JSON file, apostrophes,
+# quotes, commas, etc. inside a prompt are just literal characters here.
+#
+# --prompt-order controls how this pool is walked each turn:
+#   roundrobin (default) - in order, one per turn, wraps around. Same
+#                           position every run, so runs are directly
+#                           comparable to each other.
+#   random                - a fresh pick each turn. Better for surfacing
+#                           worst-case COMBINATIONS if you have more
+#                           prompts below than --turns-per-conversation,
+#                           since roundrobin would only ever exercise the
+#                           first N of them per conversation.
+#
+# The four lines below are seeded from the app's own real, already-
+# tested "quick prompt" chips (webClient/index.html's #examplePrompts) -
+# QUICK_PROMPTS in stress_test.py itself, used automatically when
+# --prompts-file isn't given at all. They're a safe, known-working
+# starting point. Add your own below them - the point of this file is
+# to let you push toward deliberately WORST-CASE prompts per dataset,
+# e.g.:
+#   - ones likely to make the model return a big result set (no LIMIT,
+#     a wide SELECT *, "show me everything in...") - stresses
+#     EXECUTE_RESULTS_MAX_ROWS/HISTORY_RESULT_MAX_ROWS and the payload
+#     sizes this test now forwards uncapped through history/summarize
+#   - ones that invite multi-table joins or aggregations across most of
+#     the schema at once
+#   - ambiguous or schema-agnostic questions the model has to reason
+#     about rather than pattern-match ("find anything unusual in this
+#     data", "compare X across every Y")
+#   - long, multi-clause prompts (more input tokens per translate call)
+#   - follow-ups that build on a large prior turn's results still sitting
+#     in history ("now break that down by month", "do the same for the
+#     other regions")
+#
+# Remember --turns-per-conversation cycles through THIS pool per
+# conversation (roundrobin) or samples from it (random) - a longer list
+# than --turns-per-conversation means roundrobin never reaches your later
+# entries within one conversation; --prompt-order random does.
+
+What tables are in this dataset and how are they related?
+Show me a few records from a couple of tables that you find most interesting.
+Analyze this dataset and give me a couple of insights from it with supporting data.
+What are a few interesting questions to ask about the data
+
+# --- add your own worst-case prompts below ---
+Show me all records from a table that you find most interesting.
+Show me 100 records from all tables in this dataset.
+Show me 20 records from as many tables as possible in this dataset.  
+Show me the sum of all numeric values iun a table of your choice.

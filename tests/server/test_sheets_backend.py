@@ -361,6 +361,20 @@ def test_get_schema_lists_letter_label_type_and_samples(monkeypatch):
     assert "ONLY by the letter" in schema
 
 
+def test_get_schema_never_includes_dataset_size_estimate_line(monkeypatch):
+    # Regression guard: this backend deliberately has no "Estimated dataset
+    # size" line (see backends/sheets.py's get_schema() comment) - the GViz
+    # interface has no metadata endpoint to get row/byte totals from,
+    # cheaply or otherwise, so a successful schema fetch must never grow one.
+    backend, harness = _sheets(monkeypatch)
+    harness.queue_table(
+        cols=[{"label": "Name", "type": "string"}, {"label": "Age", "type": "number"}],
+        rows=[["Reza", 28], ["Amy", 34]],
+    )
+    schema = backend.get_schema(_conn())
+    assert "Estimated dataset size" not in schema
+
+
 def test_get_schema_uses_f_for_date_like_samples(monkeypatch):
     backend, harness = _sheets(monkeypatch)
     harness.queue_table(

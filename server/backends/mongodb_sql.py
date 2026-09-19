@@ -409,6 +409,11 @@ class MongoSqlBackend(Backend):
         routine bodies) applies to this backend at all (no views/routines
         concept, and a live per-collection scan isn't worth adding given
         how narrow this ODBC surface already is)."""
+        # Deliberately no "Estimated dataset size" line here (see
+        # backends/base.py's format_dataset_size_line()) - this ODBC-based
+        # connection to MongoDB Atlas SQL has no metadata catalog for
+        # document/byte totals, and there's no native pymongo driver
+        # available through this connection type to fall back on.
         schema_parts, table_columns = self._build_shallow_schema_parts(connection)
         if not schema_parts:
             return None

@@ -25,17 +25,30 @@ test.describe('app shell', () => {
     await expect(page.locator('#connDbName')).not.toHaveText('');
   });
 
-  test('example prompt chips are present and fill the prompt box', async ({ page }) => {
+  // Regression guard for a removed feature: this app used to show a
+  // dismissible "Sample prompts" chip row above the prompt box (#examplePrompts,
+  // .example-chip buttons carrying a data-prompt), plus a "Restore quick
+  // prompts" button in the Help modal to bring that row back once
+  // dismissed - both were removed entirely (product decision: the section
+  // was judged not worth its screen space). This used to be
+  // 'example prompt chips are present and fill the prompt box', which
+  // exercised that feature directly; it's rewritten here to instead guard
+  // against either piece quietly coming back, rather than just skipping
+  // itself forever now that the feature is gone (as it silently did once
+  // .example-chip's count dropped to 0 - see this test's own git history).
+  test('the removed sample-prompts section stays removed, from both the prompt box and the Help modal', async ({ page }) => {
     await gotoApp(page);
-    const chips = page.locator('.example-chip');
-    const count = await chips.count();
-    test.skip(count === 0, 'no example chips configured');
-    // Clicking a chip both fills #aiPrompt AND immediately fires a real
-    // translate call - avoid actually clicking here (that would hit the
-    // real, unmocked /api/translate) and just confirm the chip carries a
-    // usable prompt.
-    const firstPrompt = await chips.first().getAttribute('data-prompt');
-    expect(firstPrompt).toBeTruthy();
+    await expect(page.locator('#examplePrompts')).toHaveCount(0);
+    await expect(page.locator('.example-chip')).toHaveCount(0);
+
+    await page.locator('#helpBtn').click();
+    await expect(page.locator('#helpModal')).not.toHaveClass(/hidden/);
+    await expect(page.locator('#restoreQuickPromptsBtn')).toHaveCount(0);
+    // #replayTourBtn is a distinct, still-live feature that happens to
+    // share the old .restore-quick-prompts-btn CSS class as a styling
+    // hook - that class surviving on IT is fine; only the dedicated
+    // sample-prompts-restore button (a separate id) is asserted gone above.
+    await expect(page.locator('#replayTourBtn')).toBeVisible();
   });
 
   test('help modal opens and closes', async ({ page }) => {

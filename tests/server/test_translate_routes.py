@@ -3144,6 +3144,30 @@ def test_single_summary_prompt_instructs_explaining_an_error_not_just_reporting_
     assert "address both" in instruction.lower()
 
 
+# --- Single-connection summary prompt no longer asks for a leading label line --
+# Regression coverage for the "Results Summary" heading redundancy fix:
+# webClient's Summary tab already shows its own static "Summary" label in
+# the tab strip (see prependSingleModeSummaryTab() in client.js), so this
+# instruction used to ALSO ask the model to prepend a translated "Results
+# Summary" line - duplicating it right inside the tab body. Contrast with
+# test_summary_prompt_requires_a_leading_translated_results_summary_line
+# above, which asserts the exact OPPOSITE for _SUMMARY_SYSTEM_INSTRUCTION
+# (the "all databases" mode equivalent) - that one is untouched by this
+# fix and must keep requiring its own label line.
+def test_single_summary_prompt_no_longer_asks_for_a_leading_label_line(app_env):
+    instruction = app_env.translate_routes._SINGLE_SUMMARY_SYSTEM_INSTRUCTION
+    assert "do NOT prepend any section-heading label or title of your own" in instruction
+    assert "the UI already shows this as its own \"Summary\" tab" in instruction
+    assert "redundant, repeated title" in instruction
+    assert "Start straight in on the actual answer" in instruction
+    # The old two-part "label line, then a blank line, then the real
+    # answer" convention's own instructional language must be gone
+    # entirely, not just de-emphasized.
+    assert "\"summary\" has two parts" not in instruction
+    assert "FIRST, a single label line" not in instruction
+    assert "followed by a blank line" not in instruction
+
+
 def test_summarize_single_connection_results_returns_stripped_text_and_usage_on_success(app_env):
     from test_connection_router import _FakeProvider
 

@@ -93,7 +93,8 @@ from .base import (
     Backend, SqlExecutionError, SCHEMA_MAX_TABLE_NAMES_SCANNED, SCHEMA_MAX_TABLES,
     DB_CONNECT_TIMEOUT_SECONDS, resolve_timeout_seconds, materialize_ca_cert_tempfile,
     group_date_sharded_tables, cap_kept_tables, cap_schema_text, fetch_capped_rows,
-    find_naming_convention_relationships,
+    find_naming_convention_relationships, min_frequent_value_count, FREQUENT_VALUES_LIMIT,
+    format_dataset_size_line, format_multiline_schema_entry_body,
 )
 
 
@@ -144,9 +145,9 @@ MAX_CATEGORICAL_SAMPLE_COLUMNS_PER_TABLE = 3
 # table with many categorical columns that all happen to be near-unique
 # would still cost one live query per column just to rule each one out.
 MAX_CATEGORICAL_COLUMNS_CHECKED_PER_TABLE = 10
-# Matches the "GROUP BY ... ORDER BY COUNT(*) DESC LIMIT 15" shape called
-# for in the plan this implements.
-FREQUENT_VALUES_LIMIT = 15
+# FREQUENT_VALUES_LIMIT now imported from backends/base.py (env-configurable
+# via SCHEMA_FREQUENT_VALUES_LIMIT) rather than defined here - see that
+# module's own comment.
 
 
 def _is_near_unique_distinct_count(distinct_count, row_count):
@@ -747,14 +748,45 @@ class MySQLBackend(Backend):
         views = phase2_ctx["views"]
         routines = phase2_ctx["routines"]
 
+        # Dataset size summary (new) - schema-wide totals, unlike the
+        # per-table "Row count estimates" (Phase 1, kept_names-only,
+        # InnoDB TABLE_ROWS estimate) and "Live row counts" (Phase 2 below,
+        # kept_names-only, authoritative but a live COUNT(*) per table)
+        # sections nearby: kept_names is a capped subset of this schema's
+        # tables (see cap_kept_tables), so neither of those reflects the
+        # database's true overall size. This queries
+        # information_schema.TABLES once for every base table in
+        # DATABASE() - still just a free catalog/statistics lookup, never a
+        # live scan - to give the LLM a sense of overall scale (row count,
+        # storage, table count) even when most tables were capped out of
+        # the detailed sections below.
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    SELECT SUM(TABLE_ROWS), SUM(DATA_LENGTH + INDEX_LENGTH), COUNT(*)
+                    FROM information_schema.TABLES
+                    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE';
+                """)
+                row = cursor.fetchone()
+                if row is not None:
+                    total_rows, total_bytes, table_count = row
+                    if table_count and table_count > 0:
+                        size_line = format_dataset_size_line(
+                            total_rows=total_rows, total_bytes=total_bytes,
+                        )
+                        if size_line:
+                            schema_parts.append(size_line)
+        except Exception:
+            pass
+
         # Phase 2 (deep-only): full view/routine bodies, reusing the raw
         # rows _build_shallow_schema_parts already fetched - no re-query.
         if views:
-            view_lines = [f"  View {v[0]}: {(v[1] or '').strip()}" for v in views]
+            view_lines = [f"  View {v[0]}: {format_multiline_schema_entry_body(v[1])}" for v in views]
             schema_parts.append("View definitions:\n" + "\n".join(view_lines))
 
         routine_body_lines = [
-            f"  {r[0]}: {(r[3] or '').strip()}" for r in routines if (r[3] or "").strip()
+            f"  {r[0]}: {format_multiline_schema_entry_body(r[3])}" for r in routines if (r[3] or "").strip()
         ]
         if routine_body_lines:
             schema_parts.append("Routine definitions:\n" + "\n".join(routine_body_lines))
@@ -843,10 +875,20 @@ class MySQLBackend(Backend):
                         continue
                     eligible_count += 1
 
+                    # HAVING floor - see backends/base.py's
+                    # min_frequent_value_count() docstring and postgres.py's
+                    # identical use of it. row_counts already holds this
+                    # table's live count (see _is_near_unique_distinct_count's
+                    # own call just above), so there's no separate variable
+                    # to thread through here the way postgres.py/redshift.py
+                    # need one.
+                    min_count = min_frequent_value_count(row_counts.get(table_name))
+                    having_clause = f"HAVING COUNT(*) >= {min_count} " if min_count is not None else ""
                     try:
                         cursor.execute(
                             f"SELECT {_quote_ident(c)}, COUNT(*) FROM {_quote_ident(table_name)} "
-                            f"GROUP BY {_quote_ident(c)} ORDER BY COUNT(*) DESC LIMIT {FREQUENT_VALUES_LIMIT};"
+                            f"GROUP BY {_quote_ident(c)} {having_clause}"
+                            f"ORDER BY COUNT(*) DESC LIMIT {FREQUENT_VALUES_LIMIT};"
                         )
                         freq_rows = cursor.fetchall()
                         if freq_rows:

@@ -218,6 +218,7 @@ still reaches a private sheet in practice.
 
 import json
 import re
+import threading
 from urllib.parse import urlparse
 
 from flask import Blueprint, request, jsonify
@@ -235,7 +236,12 @@ from auth import (
 from db import (
     get_conn_identifier, resolve_active_descriptor, invalidate_schema_cache,
     prime_schema_cache, prime_schema_cache_with_reason, SCHEMA_FETCH_FAILURE_REASON_EMPTY,
-    visible_configured_dbs,
+    SCHEMA_FETCH_FAILURE_REASON_TIMEOUT, visible_configured_dbs,
+    get_database_schema_with_reason, resolve_descriptor_by_reference,
+)
+from backends import get_backend
+from backends.base import (
+    split_schema_text_into_entries, schema_text_was_truncated, schema_text_has_omitted_tables,
 )
 import schema_cache
 from state_store import compute_connection_key, LLM_BYOK_PROVIDER_NAMES
@@ -384,6 +390,62 @@ def _credential_for_key(config):
         config.get("credentials_json") or config.get("password")
         or config.get("private_key") or config.get("access_token")
     )
+
+
+# Mirrors state_store.py's own _CREDENTIAL_CONFIG_FIELDS (kept as a separate
+# copy rather than imported, since this one exists purely for the log-line
+# redaction below - a diagnostic concern local to this module - not for
+# state_store.py's own credential-stripping/key-derivation logic) - used
+# only to keep an actual secret value out of the "why did this connection
+# get treated as changed" log line below, never to decide what gets
+# persisted or returned to the frontend.
+_CREDENTIAL_FIELDS_FOR_DIFF_LOGGING = {
+    "credentials_json", "password", "private_key", "private_key_passphrase", "access_token",
+}
+
+
+def _describe_config_diff(prior_config, new_config):
+    """One-line, human-readable summary of exactly which config key(s)
+    differ between `prior_config` (this exact connection's own last-saved
+    config, matched by connection_key - see the "DB connection is
+    changing" branch below for why it's matched this way, not via
+    resolve_active_descriptor) and `new_config` (what this request's
+    _parse_incoming_connection just produced) - for the diagnostic log line
+    right before that branch decides to invalidate+refetch. Exists because
+    that decision used to be a black box: a report of "reselecting an
+    unmodified connection still triggers a live refetch every time" is
+    otherwise impossible to root-cause from the logs alone. Two real,
+    confirmed bugs were found this way so far: the raw-identity-string-vs-
+    None comparison for the 7 structured dialects (see new_db_url_to_
+    persist's own comment above), and comparing against whatever
+    connection was previously ACTIVE instead of against this same
+    connection's own prior state (see the branch below's own comment) -
+    if reselecting still triggers this branch for some OTHER reason not
+    covered by either fix, this line says exactly which key(s) actually
+    differ, on the very next real occurrence, rather than requiring
+    another round of guessing.
+
+    Never includes an actual credential value on either side - only
+    whether a credential-bearing key was added/removed/changed, since
+    those keys' real values must never reach a log line."""
+    prior_config = prior_config or {}
+    new_config = new_config or {}
+
+    def _fmt(present, value, redact):
+        if not present:
+            return "<absent>"
+        return "<redacted>" if redact else repr(value)
+
+    all_keys = sorted(set(prior_config) | set(new_config))
+    parts = []
+    for k in all_keys:
+        old_present, new_present = k in prior_config, k in new_config
+        old_val, new_val = prior_config.get(k), new_config.get(k)
+        if old_val == new_val and old_present == new_present:
+            continue
+        redact = k in _CREDENTIAL_FIELDS_FOR_DIFF_LOGGING
+        parts.append(f"{k}: {_fmt(old_present, old_val, redact)} -> {_fmt(new_present, new_val, redact)}")
+    return "; ".join(parts) if parts else "(no config key differs - url alone changed)"
 
 
 def _resolve_bigquery_credentials(user_identity, project_id, dataset, provided_credentials_json, name=None):
@@ -1418,84 +1480,93 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
 
 @config_bp.route('/api/config/refresh-schema', methods=['POST'])
 def handle_refresh_schema():
-    """Forces a fresh schema introspection for one of the current user's
-    own saved custom connections, and pins the result (infinite TTL - see
-    db.py's prime_schema_cache()) so it doesn't silently go stale again
-    until the next explicit refresh or a server restart - the same
-    treatment prefetch_all_preset_schemas() gives every preset at
-    startup. Presets aren't refreshable here by design (see that
-    function's docstring): they can only be re-fetched via a server
-    restart.
+    """Forces a fresh schema introspection for one connection - a preset
+    or one of the current user's own saved custom connections - and pins
+    the result (infinite TTL - see db.py's prime_schema_cache()) so it
+    doesn't silently go stale again until the next explicit refresh or a
+    server restart - the same treatment prefetch_all_preset_schemas()
+    gives every preset at startup. Presets used to be refreshable only via
+    a server restart; that restriction was specific to this route, not to
+    prime_schema_cache_with_reason() itself (already the exact function
+    prefetch_all_preset_schemas() uses for every preset), so lifting it
+    here was just a matter of resolving a preset reference the same way
+    /api/schema already does, below.
 
-    Client identifies the connection by connection_key (never a raw
-    descriptor/credentials - same convention as everywhere else a single
-    custom connection is addressed, e.g. resolve_descriptor_by_reference
-    in db.py), looked up via state_store.get_db_connections() scoped to
-    this request's own user_identity - a user can only ever refresh their
-    own saved connections, never another user's, since the lookup below
-    never sees any other user's rows.
+    The connection is addressed via {kind, id} - kind="preset"|"custom",
+    id=<preset id>|<connection_key> - resolved through the same
+    resolve_descriptor_by_reference() /api/schema uses (db.py), which
+    already scopes a "custom" lookup to this request's own user_identity's
+    own saved connections (a user can never refresh another user's
+    connection this way) and builds a preset's descriptor from
+    visible_configured_dbs(), with credentials either way. The legacy
+    {connection_key} body shape (webClient's own custom-db-row-level
+    Refresh Schema button in the connection config dialog - see
+    handleRefreshSchemaClick() in client.js) still works unchanged, as
+    sugar for kind="custom"/id=connection_key.
 
     This is a deliberately blocking, synchronous call (per the frontend's
-    own "Refresh Schema" button - see webClient/client.js) - no background
-    job/polling here, the request just takes as long as the introspection
-    itself does.
+    own "Refresh Schema" buttons - see webClient/client.js) - no
+    background job/polling here, the request just takes as long as the
+    introspection itself does.
     """
     session_id = get_or_create_session_id()
     user_identity = get_current_user_identity(session_id)
     data = request.get_json(silent=True) or {}
-    connection_key = (data.get('connection_key') or '').strip()
-    if not connection_key:
-        resp = jsonify({'success': False, 'error': 'Missing connection_key.'})
+    kind = (data.get('kind') or '').strip()
+    ref_id = (data.get('id') or '').strip()
+    if not kind:
+        # Legacy shape - see this route's own docstring.
+        kind, ref_id = 'custom', (data.get('connection_key') or '').strip()
+
+    if kind not in ('preset', 'custom') or not ref_id:
+        resp = jsonify({'success': False, 'error': 'Missing connection_key, or kind/id.'})
         return apply_session_cookie(resp, session_id), 400
 
-    for db in state_store.get_db_connections(user_identity, include_credentials=True):
-        if db.get('connection_key') == connection_key:
-            descriptor = {"type": db.get("type") or "postgres", "url": db.get("url")}
-            descriptor.update(db.get("config") or {})
-            try:
-                ok, reason = prime_schema_cache_with_reason(descriptor, user_identity)
-            except Exception:
-                logger.exception("Error refreshing schema for connection %r", connection_key)
-                ok, reason = False, None
-            if ok:
-                resp = jsonify({'success': True})
-                return apply_session_cookie(resp, session_id), 200
-            # Two very different situations collapse to "ok=False" here,
-            # and they read very differently to a user clicking "Refresh
-            # Schema": the connection genuinely couldn't be reached/
-            # queried (bad host, expired credentials, a query error) vs.
-            # it connected and queried FINE but there's simply nothing to
-            # describe (a views-only schema, a genuinely empty database,
-            # or a role with no table-level privileges - see db.py's
-            # _fetch_database_schema_with_reason()'s own "no schema text"
-            # warning, which is exactly what produces this reason). The
-            # old, single generic message ("Check that it is reachable and
-            # its credentials are still valid") is actively misleading for
-            # the second case - the connection is fine, so telling someone
-            # to go check its reachability/credentials sends them looking
-            # in the wrong place entirely.
-            if reason == SCHEMA_FETCH_FAILURE_REASON_EMPTY:
-                error_message = (
-                    "Connected successfully, but this connection has no tables to "
-                    "describe - it may be empty, contain only views, or the "
-                    "configured user may not have been granted access to any tables. "
-                    "Double-check it's pointed at the right database."
-                )
-            else:
-                error_message = (
-                    "Could not fetch schema for this connection. Check that it is "
-                    "reachable and its credentials are still valid."
-                )
-            resp = jsonify({'success': False, 'error': error_message})
-            return apply_session_cookie(resp, session_id), 502
+    descriptor, _name = resolve_descriptor_by_reference(kind, ref_id, user_identity)
+    if descriptor is None:
+        resp = jsonify({'success': False, 'error': 'Connection not found.'})
+        return apply_session_cookie(resp, session_id), 404
 
-    resp = jsonify({'success': False, 'error': 'Connection not found.'})
-    return apply_session_cookie(resp, session_id), 404
+    try:
+        ok, reason = prime_schema_cache_with_reason(descriptor, user_identity)
+    except Exception:
+        logger.exception("Error refreshing schema for %s %r", kind, ref_id)
+        ok, reason = False, None
+    if ok:
+        resp = jsonify({'success': True})
+        return apply_session_cookie(resp, session_id), 200
+    # Two very different situations collapse to "ok=False" here, and they
+    # read very differently to a user clicking "Refresh Schema": the
+    # connection genuinely couldn't be reached/queried (bad host, expired
+    # credentials, a query error) vs. it connected and queried FINE but
+    # there's simply nothing to describe (a views-only schema, a genuinely
+    # empty database, or a role with no table-level privileges - see
+    # db.py's _fetch_database_schema_with_reason()'s own "no schema text"
+    # warning, which is exactly what produces this reason). The old,
+    # single generic message ("Check that it is reachable and its
+    # credentials are still valid") is actively misleading for the second
+    # case - the connection is fine, so telling someone to go check its
+    # reachability/credentials sends them looking in the wrong place
+    # entirely.
+    if reason == SCHEMA_FETCH_FAILURE_REASON_EMPTY:
+        error_message = (
+            "Connected successfully, but this connection has no tables to "
+            "describe - it may be empty, contain only views, or the "
+            "configured user may not have been granted access to any tables. "
+            "Double-check it's pointed at the right database."
+        )
+    else:
+        error_message = (
+            "Could not fetch schema for this connection. Check that it is "
+            "reachable and its credentials are still valid."
+        )
+    resp = jsonify({'success': False, 'error': error_message})
+    return apply_session_cookie(resp, session_id), 502
 
 
 @config_bp.route('/api/debug/schema-cache', methods=['GET'])
 def handle_debug_schema_cache():
-    """Local-dev-only introspection endpoint dumping the entire in-memory
+    """Local-dev-only introspection endpoint dumping the entire durable
     schema_cache.py cache (schema_cache.dump()'s own docstring explains
     why that's the one and only caller of dump()) - added on request
     while spot-checking the startup-prefetch/fatal-exclusion feature
@@ -1550,6 +1621,198 @@ def handle_debug_schema_cache():
     }), 200
 
 
+@config_bp.route('/api/schema', methods=['GET'])
+def handle_get_schema():
+    """Read-only schema-viewer endpoint (webClient's Schema Viewer feature
+    - see client.js's openSchemaViewer()): returns one connection's schema,
+    split into one entry per table/table-family/tab via backends/base.py's
+    split_schema_text_into_entries(). Deliberately built on the EXACT same
+    get_database_schema_with_reason() call and cached schema_text every
+    real /api/translate prompt already uses (see db.py) - a viewer built on
+    a separately-maintained "for display only" introspection pass could
+    silently drift from what the model actually sees; reusing the one real
+    pipeline is what guarantees these are always the same, byte for byte.
+
+    The connection to describe is addressed via optional kind/id query
+    params, mirroring resolve_descriptor_by_reference's own {kind, id}
+    convention (kind="preset"|"custom", id=<preset id>|<connection_key>) -
+    the same reference shape the multi-database "pin" mechanism and
+    `-- database:` markers already use elsewhere (see db.py's module
+    docstring). Omitting both falls back to this session's own active
+    connection (resolve_active_descriptor) - "just show me what I'm
+    currently connected to" needs no extra params, and is what the viewer
+    requests when it first opens.
+
+    Deliberately never force-refreshes itself: this is a plain read of
+    whatever's already cached (triggering db.py's normal fetch-and-cache
+    path on a miss, exactly like any other get_database_schema()/
+    _with_reason() caller). Either kind's schema, if the user wants a
+    genuinely fresh look, is refreshed via the existing POST /api/config/
+    refresh-schema route first (the viewer's own header "Refresh Schema"
+    button does exactly this, then re-GETs here - see client.js) rather
+    than this endpoint growing its own separate force_refresh param that
+    would have to duplicate - and could drift from - that route's own
+    resolution logic.
+
+    Response also includes 'cached_at' (an ISO 8601 UTC timestamp string,
+    or null) - when this entry was last set() into schema_cache.py, purely
+    informational (the viewer's own "Last refreshed: ..." display), never
+    part of the freshness decision above.
+
+    Also includes 'overview' (an {"prose", "questions", "generated_at"}
+    object, or null) - the cached, LLM-written dataset summary/example-
+    questions pair db.py's _generate_and_cache_schema_overview() produces
+    once per successful schema refresh (see that function's own docstring,
+    and schema_cache.py's module docstring for the full design). null
+    whenever no overview has been generated yet for this connection (a
+    brand-new connection whose schema hasn't been explicitly refreshed
+    since this feature shipped, or every generation attempt so far has
+    failed) - webClient's Schema Viewer renders that as "nothing to show
+    yet" rather than an error. The ER diagram itself is never part of this
+    response at all - it's built client-side from `entries`/the parsed
+    Constraints text, not generated or cached server-side.
+    """
+    session_id = get_or_create_session_id()
+    user_identity = get_current_user_identity(session_id)
+
+    kind = (request.args.get('kind') or '').strip()
+    ref_id = (request.args.get('id') or '').strip()
+
+    if kind or ref_id:
+        if kind not in ('preset', 'custom') or not ref_id:
+            resp = jsonify({'success': False, 'error': 'Invalid kind/id.'})
+            return apply_session_cookie(resp, session_id), 400
+        descriptor, name = resolve_descriptor_by_reference(kind, ref_id, user_identity)
+        if descriptor is None:
+            resp = jsonify({'success': False, 'error': 'Connection not found.'})
+            return apply_session_cookie(resp, session_id), 404
+    else:
+        descriptor, _missing = resolve_active_descriptor(state_store.get_session(user_identity), user_identity)
+        name = None
+        kind = ''
+        ref_id = ''
+
+    try:
+        dialect = get_backend(descriptor).dialect_name
+    except Exception:
+        dialect = "SQL"
+
+    schema_text, reason = get_database_schema_with_reason(descriptor, user_identity, deep=True)
+    if reason is not None:
+        # Same EMPTY-vs-everything-else split /api/config/refresh-schema's
+        # own error messaging already makes (see that route's docstring) -
+        # "connected fine, nothing to describe" reads very differently to
+        # a user opening the viewer than "couldn't connect/query at all".
+        if reason == SCHEMA_FETCH_FAILURE_REASON_EMPTY:
+            error_message = (
+                "Connected successfully, but this connection has no tables to "
+                "describe - it may be empty, contain only views, or the "
+                "configured user may not have been granted access to any tables."
+            )
+        elif reason == SCHEMA_FETCH_FAILURE_REASON_TIMEOUT:
+            error_message = "Timed out trying to reach this connection. It may be temporarily unreachable."
+        else:
+            error_message = "Could not fetch schema for this connection. Check that it is reachable and its credentials are still valid."
+        resp = jsonify({'success': False, 'error': error_message, 'kind': kind, 'id': ref_id, 'name': name})
+        return apply_session_cookie(resp, session_id), 502
+
+    entries = split_schema_text_into_entries(schema_text)
+    # Informational only (webClient's "Last refreshed: ..." display under
+    # the Schema Viewer's own Refresh Schema button - see schema_cache.py's
+    # get_cached_at() docstring) - looked up under the same deep cache key
+    # get_database_schema_with_reason(deep=True) above just read from/wrote
+    # to (db.py's own cache_key = get_conn_identifier(descriptor), no
+    # shallow suffix for deep=True). None for a connection whose schema was
+    # cached before this field existed, or - vanishingly briefly - one
+    # whose entry was invalidated between the read above and this one.
+    cached_at = schema_cache.get_cached_at(get_conn_identifier(descriptor))
+    # See this route's own docstring for the full "overview" shape/design -
+    # None whenever nothing has been generated (or cached) for this
+    # connection yet, same "informational, never blocking" posture as
+    # cached_at just above.
+    overview = schema_cache.get_overview(get_conn_identifier(descriptor))
+    resp = jsonify({
+        'success': True,
+        'kind': kind,
+        'id': ref_id,
+        'name': name,
+        'dialect': dialect,
+        'truncated': schema_text_was_truncated(schema_text),
+        'has_omitted_tables': schema_text_has_omitted_tables(schema_text),
+        'entries': entries,
+        'cached_at': cached_at,
+        'overview': overview,
+    })
+    return apply_session_cookie(resp, session_id), 200
+
+
+@config_bp.route('/api/config/schema-fetch-status', methods=['GET'])
+def handle_schema_fetch_status():
+    """Lightweight polling target for webClient's header status dot, used
+    only after a config-modal Save that changed the active connection (see
+    handle_config()'s "DB connection is changing" branch above, which now
+    kicks off that fetch on a background thread instead of blocking the
+    Save itself - and returns 'schema_fetch_pending': True in that case so
+    the client knows to start polling here).
+
+    The connection to check is addressed via the same required kind/id
+    query params handle_get_schema() above accepts optionally (kind=
+    "preset"|"custom", id=<preset id>|<connection_key>) - required here,
+    not optional, since a poll always targets one specific just-saved
+    connection rather than "whatever's currently active" (which could have
+    changed again by the time a slow poll response comes back).
+
+    Deliberately reads ONLY schema_cache.py's own bookkeeping
+    (is_fetch_pending()/get_last_fetch_error(), set/cleared by db.py's
+    prime_schema_cache_with_reason() around the exact same fetch this is
+    watching) - never get_database_schema()/_with_reason() themselves,
+    which would trigger a brand-new synchronous fetch of their own on a
+    cache miss and entirely defeat the point of backgrounding the original
+    one. A connection this has never heard of at all (never fetched, never
+    started) simply reports pending=False, error=None - indistinguishable
+    from "already finished successfully a while ago"; the poller only ever
+    calls this once it already knows a fetch was just started for this
+    exact connection, so that ambiguity never actually matters in practice.
+
+    error is None both when the fetch is still pending (nothing to report
+    yet) and when it last succeeded - only a genuinely failed last attempt
+    (SCHEMA_FETCH_FAILURE_REASON_TIMEOUT or _FATAL) produces a message.
+    SCHEMA_FETCH_FAILURE_REASON_EMPTY deliberately does NOT count as an
+    error here, unlike handle_get_schema()'s/handle_refresh_schema()'s own
+    user-facing messaging: a connection that's reachable but simply has no
+    tables to describe is still a working connection - the header dot's
+    job is to say "we could/couldn't reach it", not "there's something to
+    look at", so EMPTY should read as connected (green), not failed (red).
+    """
+    session_id = get_or_create_session_id()
+    user_identity = get_current_user_identity(session_id)
+
+    kind = (request.args.get('kind') or '').strip()
+    ref_id = (request.args.get('id') or '').strip()
+    if kind not in ('preset', 'custom') or not ref_id:
+        resp = jsonify({'success': False, 'error': 'Missing kind/id.'})
+        return apply_session_cookie(resp, session_id), 400
+
+    descriptor, _name = resolve_descriptor_by_reference(kind, ref_id, user_identity)
+    if descriptor is None:
+        resp = jsonify({'success': False, 'error': 'Connection not found.'})
+        return apply_session_cookie(resp, session_id), 404
+
+    cache_key = get_conn_identifier(descriptor)
+    pending = schema_cache.is_fetch_pending(cache_key)
+    reason = None if pending else schema_cache.get_last_fetch_error(cache_key)
+
+    error_message = None
+    if reason is not None and reason != SCHEMA_FETCH_FAILURE_REASON_EMPTY:
+        if reason == SCHEMA_FETCH_FAILURE_REASON_TIMEOUT:
+            error_message = "Timed out trying to reach this connection."
+        else:
+            error_message = "Could not fetch schema for this connection."
+
+    resp = jsonify({'success': True, 'pending': pending, 'error': error_message})
+    return apply_session_cookie(resp, session_id), 200
+
+
 @config_bp.route('/api/config', methods=['GET', 'POST'])
 def handle_config():
     # session_id resolved first and passed into get_current_user_identity()
@@ -1561,6 +1824,12 @@ def handle_config():
     is_authenticated = bool(
         user_identity and user_identity != session_id and not is_anonymous_user(user_identity)
     )
+    # Defined out here (not just inside the POST branch below) so a plain
+    # GET - which never touches a connection's schema at all - still has it
+    # for the shared response built at the end of this function; only the
+    # POST "DB connection is changing" branch further down ever flips this
+    # to True.
+    schema_fetch_pending = False
 
     if request.method == 'POST':
         data = request.get_json() or {}
@@ -1870,11 +2139,72 @@ def handle_config():
 
             if new_db_url or new_auto_sql_execute is not None:
                 if new_db_url:
-                    prior_descriptor, _prior_missing = resolve_active_descriptor(
-                        state_store.get_session(user_identity), user_identity
+                    # Compare against THIS connection's own previously-saved
+                    # state (matched by connection_key, i.e. active_
+                    # connection_key computed above) - NOT against whatever
+                    # connection happened to be ACTIVE a moment ago
+                    # (resolve_active_descriptor's job, and what this branch
+                    # used to compare against). Those are two entirely
+                    # different questions once more than one saved
+                    # connection exists: merely switching AWAY from this
+                    # connection to a different one (a preset, or another
+                    # saved custom connection) and then back is not "this
+                    # connection changing" at all - it's normal navigation -
+                    # even though the session's ACTIVE descriptor obviously
+                    # differed while that other connection was selected in
+                    # between. The old comparison (against
+                    # resolve_active_descriptor's result) got this backwards:
+                    # it invalidated and live-refetched THIS connection's
+                    # already-cached, still-perfectly-valid schema every
+                    # single time the user returned to it after visiting
+                    # ANY other connection - a real, confirmed regression
+                    # (see the "Connection-changed check tripped" log lines
+                    # from a real repro: switching Postgres preset -> custom
+                    # BigQuery -> Oracle preset -> the SAME custom BigQuery
+                    # connection again logged two separate "tripped" events
+                    # for that one unmodified BigQuery connection, one per
+                    # return visit, each triggering its own full live
+                    # schema fetch). Matching by connection_key instead
+                    # means a genuine field edit (which changes
+                    # active_connection_key whenever name/url/credential are
+                    # part of what changed, and otherwise still shows up in
+                    # the config comparison below since connection_key
+                    # doesn't cover every field - see compute_connection_
+                    # key's own docstring) is still caught correctly, while
+                    # simply reselecting an unmodified connection - whether
+                    # or not something else was active in between - never
+                    # is.
+                    existing_saved = next(
+                        (
+                            db for db in state_store.get_db_connections(user_identity, include_credentials=True)
+                            if db.get("connection_key") and db.get("connection_key") == active_connection_key
+                        ),
+                        None,
                     )
-                    prior_config = {k: v for k, v in prior_descriptor.items() if k not in ("type", "url")}
-                    if new_db_url != prior_descriptor.get("url") or new_db_config != prior_config:
+                    existing_url = existing_saved.get("url") if existing_saved else None
+                    existing_config = (existing_saved.get("config") or {}) if existing_saved else {}
+                    if existing_saved is None or new_db_url_to_persist != existing_url or new_db_config != existing_config:
+                        # Diagnostic only (see _describe_config_diff's own
+                        # docstring for why this exists) - logs exactly
+                        # which field tripped this branch, every time it
+                        # fires, so a report of "reselecting an unmodified
+                        # connection still refetches every time" can be
+                        # root-caused straight from the logs on its very
+                        # next occurrence instead of requiring another
+                        # from-scratch reproduction. Cheap enough to leave
+                        # unconditional (a handful of dict comparisons plus
+                        # one string join, and this whole branch is already
+                        # about to kick off a multi-second live schema
+                        # fetch) - not gated behind an isEnabledFor check.
+                        logger.info(
+                            "Connection-changed check tripped for %r (%s): "
+                            "%s; url %r -> %r; config diff: %s",
+                            db_name_to_save, new_db_type,
+                            "no previously-saved row for this connection_key" if existing_saved is None
+                            else "this connection's own saved fields differ",
+                            existing_url, new_db_url_to_persist,
+                            _describe_config_diff(existing_config, new_db_config),
+                        )
                         # The DB connection is changing - drop any cached
                         # schema for the connection we're switching to, and
                         # immediately refetch a fresh one, rather than
@@ -1920,20 +2250,50 @@ def handle_config():
                             "type": new_db_type, "url": new_db_url_to_persist, **new_db_config,
                         }
                         invalidate_schema_cache(get_conn_identifier(changed_descriptor))
-                        try:
-                            if not prime_schema_cache(changed_descriptor, user_identity):
-                                logger.warning(
-                                    "Schema refetch failed after connection config "
-                                    "changed for %r - no schema is cached for it "
-                                    "until the next successful fetch",
-                                    db_name_to_save,
+                        # Backgrounded (was a plain synchronous call here
+                        # before this change) - a full deep+shallow schema
+                        # fetch plus the schema-overview LLM call
+                        # (prime_schema_cache_with_reason() in db.py) can
+                        # take several seconds, and this whole /api/config
+                        # POST used to block on it, leaving the config
+                        # modal's Save button - and dataset selection, and
+                        # the modal's own dismissal - stuck waiting the
+                        # entire time. Mirrors server.py's own
+                        # startup-schema-prefetch thread (same daemon=True
+                        # fire-and-forget pattern, same accepted trade-off:
+                        # a real request touching this connection during
+                        # the fetch window may trigger its own redundant
+                        # live fetch rather than waiting on this one - see
+                        # that thread's own docstring in server.py).
+                        # schema_fetch_pending=True on this response tells
+                        # webClient to poll GET /api/config/schema-fetch-
+                        # status (schema_cache.py's is_fetch_pending()/
+                        # get_last_fetch_error(), set/cleared by
+                        # prime_schema_cache_with_reason() itself around
+                        # this same call) rather than assume the badge's
+                        # status dot is already showing the final word on
+                        # this connection.
+                        def _prime_schema_in_background(descriptor=changed_descriptor, name=db_name_to_save):
+                            try:
+                                if not prime_schema_cache(descriptor, user_identity):
+                                    logger.warning(
+                                        "Schema refetch failed after connection config "
+                                        "changed for %r - no schema is cached for it "
+                                        "until the next successful fetch",
+                                        name,
+                                    )
+                            except Exception:
+                                logger.exception(
+                                    "Error refetching schema after connection config "
+                                    "changed for %r",
+                                    name,
                                 )
-                        except Exception:
-                            logger.exception(
-                                "Error refetching schema after connection config "
-                                "changed for %r",
-                                db_name_to_save,
-                            )
+                        threading.Thread(
+                            target=_prime_schema_in_background,
+                            name=f"schema-prime-{db_name_to_save or 'connection'}",
+                            daemon=True,
+                        ).start()
+                        schema_fetch_pending = True
 
                 state_store.set_session(
                     user_identity, connection_id=active_connection_key, is_custom=True,
@@ -2245,6 +2605,15 @@ def handle_config():
         'active_preset_id': active_preset_id,
         'active_connection_missing': connection_missing,
         'active_connection_missing_message': active_connection_missing_message,
+        # True only when this POST just kicked off a background schema
+        # (re)fetch for a newly-changed connection (see the "DB connection
+        # is changing" branch above) - tells webClient to poll GET
+        # /api/config/schema-fetch-status (using this same connection's own
+        # {kind, id} - active_is_custom/active_custom_connection_key or
+        # active_preset_id, right below) rather than assume the header
+        # dot's current state is already the final word. Always False on a
+        # plain GET, or a POST that didn't actually change the connection.
+        'schema_fetch_pending': schema_fetch_pending,
         # The real default connection string is never sent to ANY visitor,
         # anywhere - it's an admin-configured preset's own credential like
         # any other (see configured_dbs above), not tied to whether this

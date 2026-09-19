@@ -147,16 +147,52 @@
           <div id="configTriggerBadge" class="status-badge connected clickable-badge" title="Connection Info (Click to configure)">
             <span id="connDbDot" class="status-dot"></span>
             <span id="connDbName" class="conn-badge-text"></span>
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="conn-badge-icon">
-              <path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"></path>
-            </svg>
+            <!--
+              Opens the Schema Viewer for whichever connection is CURRENTLY
+              ACTIVE (see the click handler next to configTriggerBadge's own
+              in client.js). Nested inside the dataset badge itself (rather
+              than sitting beside it as its own separate control) so it
+              reads as "this badge has a schema/info affordance" instead of
+              an unrelated icon floating next to it - its own click handler
+              calls stopPropagation() so clicking it doesn't also fire
+              configTriggerBadge's own click-to-configure handler. Because
+              this button only ever addresses the active connection, it
+              replaces the old per-row "?" buttons that used to live inside
+              the DB connection config dialog (one per preset/custom row,
+              addressing THAT row's connection regardless of what was
+              active) - those let the Schema Viewer be opened for a dataset
+              other than the one a chat prompt would actually run against,
+              and opened it on top of the config dialog besides. A single
+              button tied to "whatever is active right now" can't have
+              either problem: there is no other connection it could mean,
+              and it's not launched from inside another modal.
+
+              A vertical divider (schema-info-divider) sits right before it,
+              with margin on both sides so it reads as "name, then a
+              separated action" rather than one continuous run of text and
+              icon - see that span's own CSS for why this exists (it used
+              to be one unbroken run with no visual break between the name
+              and this button at all). The glyph itself is Feather's
+              "info" icon (a circle, a vertical stroke, a dot above it -
+              reading as a lowercase "i") rather than "help-circle" (a
+              circle with a curved "?" stroke) - "?" reads as "get help/
+              what is this", which is too close to configTriggerBadge's
+              own "click to configure" affordance; "i" reads more
+              specifically as "view info about this", which is what this
+              button actually does.
+            -->
+            <span class="schema-info-divider" aria-hidden="true"></span>
+            <button type="button" id="datasetSchemaViewerBtn" class="schema-info-btn dataset-schema-viewer-btn" title="View schema for this dataset">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="10"></circle>
+                <line x1="12" y1="16" x2="12" y2="12"></line>
+                <line x1="12" y1="8" x2="12.01" y2="8"></line>
+              </svg>
+            </button>
           </div>
 
           <div id="modelTriggerBadge" class="status-badge connected clickable-badge" title="Model Info (Click to configure)">
             <span id="modelBadgeName" class="conn-badge-text"></span>
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="conn-badge-icon">
-              <path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"></path>
-            </svg>
           </div>
 
           <button id="helpBtn" class="help-btn" title="Help">
@@ -241,26 +277,6 @@
                 </button>
               </div>
             </div>
-            <!-- Quick prompts: each chip's LABEL (the visible button text)
-                 never changes between modes. The PROMPT TEXT that actually
-                 gets submitted does: data-prompt is used when one specific
-                 connection is selected, data-prompt-all is used instead
-                 when "All databases" mode is selected (see client.js's
-                 isAllConnectionsSelected()) - "all" mode routes the
-                 question through a triage step that may pick a DIFFERENT
-                 database than the single-connection wording assumes (e.g.
-                 "this database" doesn't make sense when there could be
-                 several), so its own phrasing can be edited independently
-                 right here without touching the single-connection text. -->
-            <div id="examplePrompts" class="example-prompts">
-              <button type="button" id="dismissExamplePromptsBtn" class="example-prompts-dismiss" title="Hide quick prompts">&times;</button>
-              <span class="example-prompts-label">Quick prompts:</span>
-              <button type="button" class="example-chip" data-prompt="What tables are in this dataset and how are they related?" data-prompt-all="What tables are in these databases?">What's in here</button>
-              <button type="button" class="example-chip" data-prompt="Show me a few records from a couple of tables that you find most interesting." data-prompt-all="Show me a few records from a couple of tables in different datasets that you find most interesting.">Sample Data</button>
-              <button type="button" class="example-chip" data-prompt="Analyze this dataset and give me a couple of insights from it with supporting data." data-prompt-all="Select a couple datasets that seem comparable and compare the data-driven insights your gather from each.">Data Analysis</button>
-              <!-- <button type="button" class="example-chip" data-prompt="Write something in the database (like create a table or insert a record) and tell me if you succeeded. If you succeed in writing something, make sure you delete what you added." data-prompt-all="Write something in each database (like create a table or insert a record) and tell me if you succeeded. If you succeed in writing something, make sure you delete what you added.">Write Data</button> -->
-              <button type="button" class="example-chip" data-prompt="What are a few interesting questions to ask about the data" data-prompt-all="What are a few interesting questions to ask about the data in each of these datasets">What to ask</button>
-            </div>
             <div class="input-row">
               <div class="speech-bubble-wrapper sql-bubble">
                 <div class="sql-overlay-actions">
@@ -301,8 +317,29 @@
           </div>
           <div id="resultsTabsNav" class="results-tabs-nav hidden"></div>
           <div id="resultsViewToggle" class="results-view-toggle hidden">
-            <button type="button" class="results-view-toggle-btn" data-view="table">Table</button>
-            <button type="button" class="results-view-toggle-btn" data-view="chart">Chart</button>
+            <div id="resultsViewToggleButtons" class="results-view-toggle-buttons hidden">
+              <button type="button" class="results-view-toggle-btn" data-view="table">Table</button>
+              <button type="button" class="results-view-toggle-btn" data-view="chart">Chart</button>
+            </div>
+            <div id="resultsDownloadGroup" class="results-download-group">
+              <button type="button" id="resultsDownloadBtn" class="results-download-btn" title="Download this result as CSV">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                  <polyline points="7 10 12 15 17 10"></polyline>
+                  <line x1="12" y1="15" x2="12" y2="3"></line>
+                </svg>
+                <span>CSV</span>
+              </button>
+              <button type="button" id="resultsDownloadCaretBtn" class="results-download-caret-btn" title="More download formats" aria-haspopup="true" aria-expanded="false">
+                <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <polyline points="6 9 12 15 18 9"></polyline>
+                </svg>
+              </button>
+              <div id="resultsDownloadMenu" class="results-download-menu hidden">
+                <button type="button" class="results-download-menu-item" data-format="csv">Download as CSV</button>
+                <button type="button" class="results-download-menu-item" data-format="json">Download as JSON</button>
+              </div>
+            </div>
           </div>
           <div id="resultsTruncatedNotice" class="results-truncated-notice hidden"></div>
           <div id="resultsTableWrapper" class="results-table-wrapper">
@@ -340,7 +377,6 @@
       </div>
       <div class="help-modal-actions">
         <button type="button" id="replayTourBtn" class="restore-quick-prompts-btn">&#8635; Replay guided tour</button>
-        <button type="button" id="restoreQuickPromptsBtn" class="restore-quick-prompts-btn hidden">&#8635; Show quick prompts again</button>
       </div>
       <div id="helpModalBody" class="modal-body help-dialog-body">
         <p class="text-muted">Loading documentation...</p>
@@ -373,6 +409,108 @@
         <ul id="chatHistoryBucketList" class="chat-history-bucket-list">
           <li class="chat-history-bucket-row chat-history-bucket-row--empty text-center text-muted py-8">Loading...</li>
         </ul>
+      </div>
+    </div>
+  </div>
+
+  <div id="schemaViewerModal" class="modal-overlay hidden">
+    <div class="modal-card modal-card-large schema-viewer-card">
+      <div class="modal-header">
+        <div class="schema-viewer-title-block">
+          <h2 class="modal-title mb-0">
+            <svg class="history-title-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <ellipse cx="12" cy="5" rx="9" ry="3"></ellipse>
+              <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"></path>
+              <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"></path>
+            </svg>
+            <!-- Set to "<name> in <dialect>" once GET
+                 /api/schema resolves (see loadSchemaViewerConnection() in
+                 client.js) - starts as just the dataset's own name (passed
+                 in by openSchemaViewer(), before the dialect is known) so
+                 the title isn't blank while loading. This modal is always
+                 opened for one specific, already-identified dataset (the
+                 "?" button next to its name in the DB connection dialog -
+                 see renderPresetOption()/renderCustomDbRows()), so the
+                 title names it directly rather than the generic "Schema
+                 Viewer" label a connection picker inside the dialog used
+                 to need. -->
+            <span id="schemaViewerModalTitleText">Schema Viewer</span>
+          </h2>
+        </div>
+        <!-- Refresh Schema lives in the header, next to the close button,
+             rather than in the body toolbar an earlier version put it in -
+             see the click handler in client.js for the full "blocking
+             call, disables both buttons, re-enables them when it returns"
+             behavior. Works for both presets and custom connections (see
+             POST /api/config/refresh-schema's own docstring in
+             config_routes.py). schemaViewerRefreshStatus underneath shows
+             either this connection's last-refreshed time (once a load
+             succeeds - see loadSchemaViewerConnection()) or a refresh
+             failure's error message, whichever was most recently true. -->
+        <div class="schema-viewer-header-actions">
+          <div class="schema-viewer-refresh-block">
+            <button type="button" id="schemaViewerRefreshBtn" class="btn history-action-btn schema-viewer-refresh-btn hidden" title="Re-fetch this connection's schema (bypasses the cache)">
+              <span id="schemaViewerRefreshBtnLabel">&#8635; Refresh Schema</span>
+            </button>
+            <div id="schemaViewerRefreshStatus" class="schema-viewer-refresh-status hidden"></div>
+          </div>
+          <button id="schemaViewerModalCloseBtn" class="modal-close-btn" type="button">&times;</button>
+        </div>
+      </div>
+      <div id="schemaViewerBody" class="modal-body schema-viewer-body">
+        <div id="schemaViewerNotice" class="schema-viewer-notice hidden"></div>
+        <div class="schema-viewer-panes">
+          <div class="schema-viewer-list-pane">
+            <ul id="schemaViewerEntryList" class="schema-viewer-entry-list">
+              <li class="schema-viewer-entry-empty text-center text-muted py-8">Loading...</li>
+            </ul>
+          </div>
+          <div class="schema-viewer-detail-pane">
+            <!-- Row count (see schemaViewerRowCountSuffix() in client.js)
+                 renders as a "(N rows)" suffix right on this heading (and
+                 on the table's own row in the tree to the left) rather
+                 than as a separate line - the live/authoritative count
+                 when the deep fetch has one, otherwise the free planner
+                 estimate. Never both: once an authoritative count exists,
+                 the estimate next to it would be pure noise. -->
+            <div id="schemaViewerDetailHeading" class="schema-viewer-detail-heading"></div>
+            <!-- Pinned "Overview" entry's content (see
+                 renderSchemaViewerOverviewDetail() in client.js): the
+                 cached LLM-written prose + suggested questions, and a
+                 deterministically-built (never LLM-generated) ER diagram
+                 rendered via Mermaid - filled in/emptied entirely by JS,
+                 this is just the mount point. Hidden whenever any other
+                 entry (a table/view/index/routine) is selected instead. -->
+            <div id="schemaViewerOverviewWrap" class="schema-viewer-overview-wrap hidden"></div>
+            <!-- Structured column table (see parseSchemaEntryColumns() in
+                 client.js) - hidden whenever the selected entry's text
+                 doesn't fit the parser's name/type/nullable/attributes
+                 line convention (e.g. a Google Sheets dataset, or the "No
+                 schema description available." fallback), in which case
+                 the raw text below is all there is to show. Its
+                 "Constraints" and "Sample values" columns are filled in
+                 from the "Constraints:"/"Column value samples:" sections
+                 (see parseSchemaConstraints()/parseSchemaColumnSamples())
+                 whenever that dialect's fetch found one for a given
+                 column. -->
+            <div id="schemaViewerColumnsWrap" class="schema-viewer-columns-wrap hidden">
+              <table class="schema-viewer-columns-table">
+                <thead>
+                  <tr>
+                    <th>Column</th>
+                    <th>Type</th>
+                    <th>Nullable</th>
+                    <th>Attributes</th>
+                    <th>Constraints</th>
+                    <th>Sample values</th>
+                  </tr>
+                </thead>
+                <tbody id="schemaViewerColumnsBody"></tbody>
+              </table>
+            </div>
+            <pre id="schemaViewerDetailText" class="schema-viewer-detail-text"></pre>
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -590,6 +728,13 @@
        CDN script-tag pattern already used for sql-formatter/CodeMirror
        above. -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.js"></script>
+  <!-- ER diagram for the Schema Viewer's "Overview" entry (see
+       renderSchemaErDiagram()/buildSchemaErDiagram() in client.js) - a
+       deterministically-built erDiagram, never LLM-generated, rendered
+       via Mermaid's own UMD build. Same unbundled CDN script-tag pattern
+       as sql-formatter/CodeMirror/Chart.js above; mermaid.initialize() is
+       called from client.js just before each render, not here. -->
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
   <script src="client.js"></script>
 
 </body>

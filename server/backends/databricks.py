@@ -82,7 +82,8 @@ import sqlparse
 from .base import (
     Backend, SqlExecutionError, SCHEMA_MAX_TABLE_NAMES_SCANNED, SCHEMA_MAX_TABLES,
     group_date_sharded_tables, cap_kept_tables, cap_schema_text, fetch_capped_rows,
-    find_naming_convention_relationships,
+    find_naming_convention_relationships, min_frequent_value_count, FREQUENT_VALUES_LIMIT,
+    format_dataset_size_line, format_multiline_schema_entry_body,
 )
 
 
@@ -159,7 +160,9 @@ MAX_CATEGORICAL_SAMPLE_COLUMNS_PER_TABLE = 3
 # APPROX_COUNT_DISTINCT probe itself to a small, fixed-size candidate pool
 # rather than running it against every categorical column on a wide table.
 CARDINALITY_CANDIDATE_COLUMNS_PER_TABLE = 8
-FREQUENT_VALUES_LIMIT = 15
+# FREQUENT_VALUES_LIMIT now imported from backends/base.py (env-configurable
+# via SCHEMA_FREQUENT_VALUES_LIMIT) rather than defined here - see that
+# module's own comment.
 # Cardinality gate thresholds for _is_near_unique_approx below - a column
 # whose approx-distinct count is either an outright large number or a large
 # fraction of the table's own (already-fetched) live row count is treated as
@@ -648,7 +651,7 @@ class DatabricksBackend(Backend):
         # Phase 2 (deep-only): full view/routine bodies, reusing the raw
         # rows _build_shallow_schema_parts already fetched - no re-query.
         if views:
-            view_lines = [f"  View {v[0]}: {(v[1] or '').strip()}" for v in views]
+            view_lines = [f"  View {v[0]}: {format_multiline_schema_entry_body(v[1])}" for v in views]
             # view_definition can legitimately come back NULL (not just an
             # empty string) when the connected role lacks the privilege to
             # see a given view's definition - `(v[1] or '').strip()` guards
@@ -657,7 +660,7 @@ class DatabricksBackend(Backend):
             schema_parts.append("View definitions:\n" + "\n".join(view_lines))
 
         routine_body_lines = [
-            f"  {r[0]}: {(r[3] or '').strip()}" for r in routines if (r[3] or "").strip()
+            f"  {r[0]}: {format_multiline_schema_entry_body(r[3])}" for r in routines if (r[3] or "").strip()
         ]
         if routine_body_lines:
             schema_parts.append("Routine definitions:\n" + "\n".join(routine_body_lines))
@@ -751,11 +754,21 @@ class DatabricksBackend(Backend):
                     except Exception:
                         pass
 
+                # HAVING floor - see backends/base.py's
+                # min_frequent_value_count() docstring and postgres.py's
+                # identical use of it. Reads live_counts directly (not the
+                # `live_count` local above, which only exists inside the
+                # "if candidate_categorical:" branch and is never set at
+                # all when that table had no categorical candidates to
+                # begin with).
+                min_count = min_frequent_value_count(live_counts.get(table_name))
+                having_clause = f"HAVING COUNT(*) >= {min_count} " if min_count is not None else ""
                 for c in eligible_categorical:
                     try:
                         cursor.execute(
                             f"SELECT {_quote_ident(c)}, COUNT(*) FROM {_quote_ident(table_name)} "
-                            f"GROUP BY {_quote_ident(c)} ORDER BY COUNT(*) DESC LIMIT {FREQUENT_VALUES_LIMIT};"
+                            f"GROUP BY {_quote_ident(c)} {having_clause}"
+                            f"ORDER BY COUNT(*) DESC LIMIT {FREQUENT_VALUES_LIMIT};"
                         )
                         freq_rows = cursor.fetchall()
                         if freq_rows:
@@ -771,6 +784,31 @@ class DatabricksBackend(Backend):
                 schema_parts.append("Live row counts:\n" + "\n".join(live_count_lines))
             if sample_blocks:
                 schema_parts.append("Column value samples:\n" + "\n\n".join(sample_blocks))
+
+        # Estimated dataset size (deep-only, best-effort) - weaker
+        # guarantee here than every other SQL backend's own version of this
+        # line: see _build_shallow_schema_parts' "Deliberately no
+        # row-count-estimate section" comment above for why there's no
+        # cheap, catalog-only, schema-wide row-count source on Databricks
+        # to sum instead. This reuses live_counts, the per-table live
+        # COUNT(*) results the "Live row counts" loop above already ran -
+        # no extra query - so unlike snowflake.py/etc. this total is
+        # neither schema-wide (only kept_names, the same capped subset
+        # already shown above, is covered) nor a catalog estimate (it's a
+        # live scan). The `note` argument makes that gap visible directly
+        # in the rendered line rather than only in this comment.
+        if live_counts:
+            total_rows = sum(live_counts.values())
+            size_line = format_dataset_size_line(
+                total_rows=total_rows,
+                note=(
+                    "live count of the tables shown here only, not a "
+                    "schema-wide total - Databricks has no cheap "
+                    "catalog-only row-count statistic"
+                ),
+            )
+            if size_line:
+                schema_parts.append(size_line)
 
         # Naming-convention relationship pass (shared helper, no new SQL) -
         # pure heuristic over table_columns, which _build_shallow_schema_parts

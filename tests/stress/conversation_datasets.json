@@ -1,0 +1,13 @@
+[
+  {"name": "E-Comm Store (Postgres)", "preset_id": "postgres-ec-store"},
+  {"name": "Movie Rentals (Postgres)", "preset_id": "postgres-movie-rentals"},
+  {"name": "Golf Stats (Postgres)", "preset_id": "postgres-golf-stats"},
+  {"name": "Employees (mySQL)", "preset_id": "mysql-employees"},
+  {"name": "HR Database (Oracle)", "preset_id": "oracle-hr-database"},
+  {"name": "Baseball (BigQuery)", "preset_id": "bigquery-baseball"},
+  {"name": "E-Commerce (Snowflake)", "preset_id": "snowflake-e-commerce"},
+  {"name": "NYC Taxi Rides (Databricks)", "preset_id": "databricks-nyctaxi"},
+  {"name": "TICKIT (Redshift)", "preset_id": "redshift-tickit"},
+  {"name": "US Sensus (Google Sheets)", "preset_id": "sheets-us-sensus"},
+  {"name": "MFlix (MongoDB)", "preset_id": "mongodb-mflix"}
+]

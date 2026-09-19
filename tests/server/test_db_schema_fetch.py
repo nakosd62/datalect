@@ -630,6 +630,104 @@ def test_prefetch_all_preset_schemas_swallows_a_single_preset_failure(app_factor
     assert any(r.levelname == "ERROR" for r in caplog.records)
 
 
+def test_prefetch_all_preset_schemas_skips_live_fetch_when_a_durable_copy_already_exists(app_factory, monkeypatch, tmp_path):
+    # The whole point of schema_cache.py's durable (state_store-backed) L2
+    # layer, for presets specifically: a restart/redeploy that finds an
+    # already-durably-cached schema for a preset must NOT pay a live fetch
+    # (plus the schema-overview LLM call) all over again - see this
+    # function's own docstring. Simulates that exact scenario: nothing in
+    # THIS process's own memory yet (a fresh process, like right after a
+    # restart), but a durable store that already has both the deep AND
+    # shallow entries from an earlier process lifetime.
+    from helpers import write_database_presets_file
+    presets_path = write_database_presets_file(tmp_path, [
+        {"id": "pg-a", "name": "Postgres A", "type": "postgres", "url": "postgresql://u:p@h/a"},
+    ])
+    app_factory(env={"DATABASE_PRESETS_FILE": presets_path})
+    import db as db_module
+
+    descriptor = {"type": "postgres", "url": "postgresql://u:p@h/a"}
+    cache_key = db_module.get_conn_identifier(descriptor)
+    shallow_key = cache_key + db_module._SHALLOW_CACHE_KEY_SUFFIX
+
+    class _FakeDurableStore:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def get_cached_schema(self, key):
+            return self.rows.get(key)
+
+        def set_cached_schema(self, key, schema_text, cached_at):
+            raise AssertionError("must not write through - nothing was fetched live")
+
+        def set_cached_schema_overview(self, key, overview):
+            raise AssertionError("must not write through - nothing was fetched live")
+
+        def delete_cached_schema(self, key):
+            raise AssertionError("must not delete anything during a prefetch")
+
+    durable = _FakeDurableStore({
+        cache_key: {"schema_text": "DURABLE DEEP TEXT", "cached_at": "2026-01-01T00:00:00+00:00", "overview": None},
+        shallow_key: {"schema_text": "DURABLE SHALLOW TEXT", "cached_at": "2026-01-01T00:00:00+00:00", "overview": None},
+    })
+    monkeypatch.setattr(db_module.schema_cache, "_state_store", lambda: durable)
+
+    calls = []
+    monkeypatch.setattr(
+        db_module, "prime_schema_cache_with_reason",
+        lambda descriptor, user_id=None: (calls.append(descriptor), (True, None))[1],
+    )
+
+    db_module.prefetch_all_preset_schemas()
+
+    assert calls == []  # no live fetch, no LLM overview call, at all
+    # Both entries are now warm in THIS process's own memory, read through
+    # from the durable store - proving the "also warms the shallow entry"
+    # half of this function's own docstring, not just the deep one.
+    assert db_module.schema_cache.get(cache_key) == "DURABLE DEEP TEXT"
+    assert db_module.schema_cache.get(shallow_key) == "DURABLE SHALLOW TEXT"
+
+
+def test_prefetch_all_preset_schemas_fetches_live_when_nothing_durable_exists_yet(app_factory, monkeypatch, tmp_path):
+    # The other half of the same behavior, as a direct contrast: a
+    # genuinely new preset (or one whose durable entry was explicitly
+    # invalidated) has nothing for schema_cache.get() to find, so it must
+    # still fall through to a real live fetch exactly as before this
+    # durable-aware check existed.
+    from helpers import write_database_presets_file
+    presets_path = write_database_presets_file(tmp_path, [
+        {"id": "pg-a", "name": "Postgres A", "type": "postgres", "url": "postgresql://u:p@h/a"},
+    ])
+    app_factory(env={"DATABASE_PRESETS_FILE": presets_path})
+    import db as db_module
+
+    class _EmptyDurableStore:
+        def get_cached_schema(self, key):
+            return None
+
+        def set_cached_schema(self, key, schema_text, cached_at):
+            pass
+
+        def set_cached_schema_overview(self, key, overview):
+            pass
+
+        def delete_cached_schema(self, key):
+            pass
+
+    monkeypatch.setattr(db_module.schema_cache, "_state_store", lambda: _EmptyDurableStore())
+
+    calls = []
+    monkeypatch.setattr(
+        db_module, "prime_schema_cache_with_reason",
+        lambda descriptor, user_id=None: (calls.append(descriptor), (True, None))[1],
+    )
+
+    db_module.prefetch_all_preset_schemas()
+
+    assert len(calls) == 1
+    assert calls[0]["url"] == "postgresql://u:p@h/a"
+
+
 def test_prefetch_all_preset_schemas_skips_the_local_dev_default_fallback_preset(app_factory, monkeypatch):
     # No DATABASE_PRESETS_FILE configured -> app_config.py synthesizes a
     # single "Default DB" fallback preset (see its own "if not

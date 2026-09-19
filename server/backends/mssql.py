@@ -168,7 +168,8 @@ from .base import (
     Backend, SqlExecutionError, SCHEMA_MAX_TABLE_NAMES_SCANNED, SCHEMA_MAX_TABLES,
     DB_CONNECT_TIMEOUT_SECONDS, resolve_timeout_seconds,
     group_date_sharded_tables, cap_kept_tables, cap_schema_text, fetch_capped_rows,
-    find_naming_convention_relationships,
+    find_naming_convention_relationships, min_frequent_value_count, FREQUENT_VALUES_LIMIT,
+    format_dataset_size_line, format_multiline_schema_entry_body,
 )
 
 
@@ -195,10 +196,10 @@ CATEGORICAL_TYPES = frozenset({
 MAX_COLUMNS_FOR_SAMPLING = 25
 MAX_NUMERIC_COLUMNS_FOR_MINMAX = 15
 MAX_CATEGORICAL_SAMPLE_COLUMNS_PER_TABLE = 3
-# Matches the "GROUP BY ... ORDER BY COUNT(*) DESC TOP 15" shape called for
-# in the plan this implements - MSSQL's TOP is used in place of LIMIT (see
+# FREQUENT_VALUES_LIMIT now imported from backends/base.py (env-configurable
+# via SCHEMA_FREQUENT_VALUES_LIMIT) rather than defined here - see that
+# module's own comment. MSSQL's TOP is used in place of LIMIT (see
 # get_schema()'s own frequent-values query below).
-FREQUENT_VALUES_LIMIT = 15
 # Cardinality gate for "is this categorical column worth sampling frequent
 # values for at all" - unlike Postgres (pg_stats.n_distinct, a planner
 # statistic, no live scan needed), SQL Server has no equivalently cheap,
@@ -971,6 +972,33 @@ class MssqlBackend(Backend):
         views = phase2_ctx["views"]
         routines = phase2_ctx["routines"]
 
+        # 11. Dataset size estimate (new, deep-only) - unlike the "Row count
+        # estimates" block above (Phase 1 / shallow, scoped to kept_names,
+        # a capped subset of at most SCHEMA_MAX_TABLES tables), this totals
+        # sys.dm_db_partition_stats across every table in the schema, so the
+        # LLM sees the true schema-wide size even when most tables were
+        # dropped from kept_names to stay under the cap.
+        try:
+            with connection.cursor() as size_cursor:
+                size_cursor.execute("""
+                    SELECT SUM(ps.row_count), SUM(ps.used_page_count) * 8192, COUNT(DISTINCT t.object_id)
+                    FROM sys.dm_db_partition_stats ps
+                    JOIN sys.tables t ON ps.object_id = t.object_id
+                    JOIN sys.schemas s ON t.schema_id = s.schema_id
+                    WHERE ps.index_id IN (0, 1) AND s.name = COALESCE(%s, SCHEMA_NAME());
+                """, (connection.mssql_schema,))
+                size_row = size_cursor.fetchone()
+                if size_row is not None:
+                    total_rows, total_bytes, total_tables = size_row
+                    if total_tables:
+                        size_line = format_dataset_size_line(
+                            total_rows=total_rows, total_bytes=total_bytes,
+                        )
+                        if size_line:
+                            schema_parts.append(size_line)
+        except Exception:
+            pass
+
         # Phase 2 (deep-only): full view/routine bodies, reusing the raw
         # rows _build_shallow_schema_parts already fetched - no re-query.
         # VIEW_DEFINITION/sys.sql_modules.definition can legitimately come
@@ -979,11 +1007,11 @@ class MssqlBackend(Backend):
         # from raising and simply omits that one entry rather than aborting
         # the whole schema fetch.
         if views:
-            view_lines = [f"  View {schema_prefix}{v[0]}: {(v[1] or '').strip()}" for v in views]
+            view_lines = [f"  View {schema_prefix}{v[0]}: {format_multiline_schema_entry_body(v[1])}" for v in views]
             schema_parts.append("View definitions:\n" + "\n".join(view_lines))
 
         routine_body_lines = [
-            f"  {name}: {(r['definition'] or '').strip()}"
+            f"  {name}: {format_multiline_schema_entry_body(r['definition'])}"
             for name, r in routines.items() if (r['definition'] or '').strip()
         ]
         if routine_body_lines:
@@ -1074,6 +1102,11 @@ class MssqlBackend(Backend):
                 # backends/postgres.py's own gate takes for an unanalyzed
                 # column.
                 total_rows = row_counts_by_table.get(table_name)
+                # HAVING floor - see backends/base.py's
+                # min_frequent_value_count() docstring and postgres.py's
+                # identical use of it.
+                min_count = min_frequent_value_count(total_rows)
+                having_clause = f"HAVING COUNT(*) >= {min_count} " if min_count is not None else ""
                 for c in categorical_cols:
                     distinct_count = None
                     try:
@@ -1093,7 +1126,8 @@ class MssqlBackend(Backend):
                     try:
                         cursor.execute(
                             f"SELECT TOP {FREQUENT_VALUES_LIMIT} {_quote_ident(c)}, COUNT(*) "
-                            f"FROM {table_ref} GROUP BY {_quote_ident(c)} ORDER BY COUNT(*) DESC;"
+                            f"FROM {table_ref} GROUP BY {_quote_ident(c)} {having_clause}"
+                            f"ORDER BY COUNT(*) DESC;"
                         )
                         freq_rows = cursor.fetchall()
                         if freq_rows:

@@ -70,7 +70,8 @@ from .base import (
     Backend, SqlExecutionError, SCHEMA_MAX_TABLE_NAMES_SCANNED, SCHEMA_MAX_TABLES,
     DB_CONNECT_TIMEOUT_SECONDS, resolve_timeout_seconds,
     group_date_sharded_tables, cap_kept_tables, cap_schema_text, fetch_capped_rows,
-    find_naming_convention_relationships,
+    find_naming_convention_relationships, min_frequent_value_count, FREQUENT_VALUES_LIMIT,
+    format_dataset_size_line, format_multiline_schema_entry_body,
 )
 
 # Imported lazily-by-name (module-level, not inside connect()) so tests can
@@ -140,7 +141,9 @@ CATEGORICAL_TYPES = frozenset({"TEXT", "VARCHAR", "CHAR", "STRING", "BOOLEAN"})
 MAX_COLUMNS_FOR_SAMPLING = 25
 MAX_NUMERIC_COLUMNS_FOR_MINMAX = 15
 MAX_CATEGORICAL_SAMPLE_COLUMNS_PER_TABLE = 3
-FREQUENT_VALUES_LIMIT = 15
+# FREQUENT_VALUES_LIMIT now imported from backends/base.py (env-configurable
+# via SCHEMA_FREQUENT_VALUES_LIMIT) rather than defined here - see that
+# module's own comment.
 
 
 def _is_near_unique_ratio(approx_distinct, live_count):
@@ -693,10 +696,41 @@ class SnowflakeBackend(Backend):
         procedures = phase2_ctx["procedures"]
         functions = phase2_ctx["functions"]
 
+        # Estimated dataset size (deep-only, best-effort): a single
+        # schema-wide aggregate over information_schema.tables, NOT scoped
+        # to kept_names (that's a capped subset of tables actually
+        # described above; this is meant to answer "how big is this
+        # schema, really" even when most tables got capped out). Uses the
+        # same row_count/bytes columns the kept_names-scoped query above
+        # reads per-table, just summed across every base table in the
+        # schema instead of filtered to a specific IN (...) list. Wrapped
+        # in its own try/except, independent of the kept_names-scoped
+        # block above, so a privilege or catalog-shape problem here can't
+        # take down anything else in this method. Only rendered when
+        # table_count > 0 - COUNT(*) returning 0 (or the whole row coming
+        # back NULL on some failure mode) would otherwise produce a
+        # misleading "~0 rows across 0 tables" line.
+        try:
+            with connection.cursor() as size_cursor:
+                size_cursor.execute("""
+                    SELECT SUM(row_count), SUM(bytes), COUNT(*)
+                    FROM information_schema.tables
+                    WHERE table_schema = CURRENT_SCHEMA() AND table_type = 'BASE TABLE';
+                """)
+                total_rows, total_bytes, table_count = size_cursor.fetchone()
+            if table_count:
+                size_line = format_dataset_size_line(
+                    total_rows=total_rows, total_bytes=total_bytes,
+                )
+                if size_line:
+                    schema_parts.append(size_line)
+        except Exception:
+            pass
+
         # Phase 2 (deep-only): full view/routine bodies, reusing the raw
         # rows _build_shallow_schema_parts already fetched - no re-query.
         if views:
-            view_lines = [f"  View {v[0]}: {(v[1] or '').strip()}" for v in views]
+            view_lines = [f"  View {v[0]}: {format_multiline_schema_entry_body(v[1])}" for v in views]
             # view_definition legitimately comes back NULL (not just an
             # empty string) when the connected role lacks the privilege to
             # see a given view's definition - `(v[1] or '').strip()`
@@ -704,10 +738,10 @@ class SnowflakeBackend(Backend):
             schema_parts.append("View definitions:\n" + "\n".join(view_lines))
 
         routine_body_lines = [
-            f"  [procedure] {name}: {(body or '').strip()}"
+            f"  [procedure] {name}: {format_multiline_schema_entry_body(body)}"
             for (name, _sig, _ret, body) in procedures if (body or "").strip()
         ] + [
-            f"  [function] {name}: {(body or '').strip()}"
+            f"  [function] {name}: {format_multiline_schema_entry_body(body)}"
             for (name, _sig, _ret, body) in functions if (body or "").strip()
         ]
         if routine_body_lines:
@@ -806,11 +840,19 @@ class SnowflakeBackend(Backend):
                     if len(eligible_categorical) >= MAX_CATEGORICAL_SAMPLE_COLUMNS_PER_TABLE:
                         break
 
+                # HAVING floor - see backends/base.py's
+                # min_frequent_value_count() docstring and postgres.py's
+                # identical use of it. live_count (from the combined
+                # COUNT(*)/APPROX_COUNT_DISTINCT query above) is this
+                # table's own row count already.
+                min_count = min_frequent_value_count(live_count)
+                having_clause = f"HAVING COUNT(*) >= {min_count} " if min_count is not None else ""
                 for c in eligible_categorical:
                     try:
                         cursor.execute(
                             f"SELECT {_quote_ident(c)}, COUNT(*) FROM {_quote_ident(table_name)} "
-                            f"GROUP BY {_quote_ident(c)} ORDER BY COUNT(*) DESC LIMIT {FREQUENT_VALUES_LIMIT};"
+                            f"GROUP BY {_quote_ident(c)} {having_clause}"
+                            f"ORDER BY COUNT(*) DESC LIMIT {FREQUENT_VALUES_LIMIT};"
                         )
                         freq_rows = cursor.fetchall()
                         if freq_rows:

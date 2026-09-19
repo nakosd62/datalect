@@ -8,6 +8,7 @@ state_store.py's FirestoreStateStore.set_session comment for the full
 story).
 """
 
+import hashlib
 import sys
 import types
 
@@ -480,3 +481,207 @@ def test_one_corrupt_bucket_does_not_prevent_other_buckets_from_loading():
     client._collections["chat_history"]["alice_preset:1"]["schema_version"] = 999
     result = store.get_chat_history("alice")
     assert result["buckets"] == {"all": [{"role": "user", "text": "also good"}]}
+
+
+# --- schema_cache (the only storage schema_cache.py has - see that module's
+# own docstring for why it no longer keeps any process-local copy alongside
+# this) ---------------------------------------------------------------------
+# cache_key here is whatever db.py's get_conn_identifier() produced for a
+# real connection - for several dialects (Postgres/MySQL, in particular)
+# that's a literal "user@host:port/dbname", containing "/" - the exact
+# shape _schema_cache_doc_id() exists to hash into a plain hex string
+# rather than pass straight to .document(), which would otherwise split it
+# into alternating collection/document path segments (see that method's
+# own docstring in state_store.py). Every test below uses a cache_key
+# containing "/" specifically so it can't silently pass by accident.
+
+def test_get_cached_schema_returns_none_for_an_unknown_key():
+    store, client = make_store()
+    assert store.get_cached_schema("alice@host:5432/db") is None
+
+
+def test_set_then_get_cached_schema_round_trips_text_and_cached_at():
+    store, client = make_store()
+    store.set_cached_schema("alice@host:5432/db", "Table: t\n  id integer NOT NULL", "2026-01-01T00:00:00+00:00")
+    row = store.get_cached_schema("alice@host:5432/db")
+    assert row["schema_text"] == "Table: t\n  id integer NOT NULL"
+    assert row["cached_at"] == "2026-01-01T00:00:00+00:00"
+    assert row["overview"] is None
+
+
+def test_cache_key_containing_a_slash_is_stored_under_a_hashed_document_id_not_the_raw_key():
+    store, client = make_store()
+    cache_key = "alice@host:5432/db"
+    store.set_cached_schema(cache_key, "Table: t", "2026-01-01T00:00:00+00:00")
+
+    expected_doc_id = hashlib.sha256(cache_key.encode("utf-8")).hexdigest()
+    coll = client._collections["schema_cache"]
+    assert expected_doc_id in coll
+    assert cache_key not in coll  # never used as the raw document id
+    # The original cache_key is still stored as a plain field, so a saved
+    # document can be identified/debugged without reversing the hash.
+    assert coll[expected_doc_id]["cache_key"] == cache_key
+
+
+def test_two_different_cache_keys_that_both_contain_slashes_do_not_collide():
+    store, client = make_store()
+    store.set_cached_schema("alice@host:5432/db_one", "SCHEMA ONE", "2026-01-01T00:00:00+00:00")
+    store.set_cached_schema("bob@host:5432/db_two", "SCHEMA TWO", "2026-01-02T00:00:00+00:00")
+    assert store.get_cached_schema("alice@host:5432/db_one")["schema_text"] == "SCHEMA ONE"
+    assert store.get_cached_schema("bob@host:5432/db_two")["schema_text"] == "SCHEMA TWO"
+
+
+def test_set_cached_schema_never_clobbers_a_previously_saved_overview():
+    # merge=True semantics: a later set_cached_schema() call for the same
+    # key must never wipe out an overview a separate, earlier LLM call
+    # already saved - see set_cached_schema's own comment in state_store.py.
+    store, client = make_store()
+    cache_key = "alice@host:5432/db"
+    store.set_cached_schema(cache_key, "FIRST", "2026-01-01T00:00:00+00:00")
+    store.set_cached_schema_overview(cache_key, {"prose": "A sales dataset.", "questions": ["Top region?"]})
+
+    store.set_cached_schema(cache_key, "SECOND", "2026-02-02T00:00:00+00:00")
+
+    row = store.get_cached_schema(cache_key)
+    assert row["schema_text"] == "SECOND"
+    assert row["overview"] == {"prose": "A sales dataset.", "questions": ["Top region?"]}
+
+
+def test_set_cached_schema_overview_never_clobbers_schema_text_or_cached_at():
+    store, client = make_store()
+    cache_key = "alice@host:5432/db"
+    store.set_cached_schema(cache_key, "Table: t", "2026-01-01T00:00:00+00:00")
+
+    store.set_cached_schema_overview(cache_key, {"prose": "desc", "questions": ["q1"]})
+
+    row = store.get_cached_schema(cache_key)
+    assert row["overview"] == {"prose": "desc", "questions": ["q1"]}
+    assert row["schema_text"] == "Table: t"
+    assert row["cached_at"] == "2026-01-01T00:00:00+00:00"
+
+
+def test_set_cached_schema_overview_before_any_schema_text_exists_still_works():
+    store, client = make_store()
+    cache_key = "alice@host:5432/db"
+    store.set_cached_schema_overview(cache_key, {"prose": "desc", "questions": []})
+    row = store.get_cached_schema(cache_key)
+    assert row["overview"] == {"prose": "desc", "questions": []}
+    assert row["schema_text"] is None
+    assert row["cached_at"] is None
+
+
+def test_delete_cached_schema_removes_the_document():
+    store, client = make_store()
+    cache_key = "alice@host:5432/db"
+    store.set_cached_schema(cache_key, "Table: t", "2026-01-01T00:00:00+00:00")
+
+    store.delete_cached_schema(cache_key)
+
+    assert store.get_cached_schema(cache_key) is None
+    doc_id = hashlib.sha256(cache_key.encode("utf-8")).hexdigest()
+    assert doc_id not in client._collections.get("schema_cache", {})
+
+
+def test_delete_cached_schema_for_a_never_cached_key_is_a_no_op():
+    store, client = make_store()
+    store.delete_cached_schema("never@cached:5432/db")  # must not raise
+
+
+# --- schema_cache fetch-pending/fetch-error status --------------------------
+# Durable now for the same cross-instance-visibility reason schema_text
+# itself is (see schema_cache.py's own module docstring): a background
+# refetch's in-flight status must be visible to a poll landing on a
+# different Cloud Run instance than the one running the fetch.
+
+def test_get_schema_fetch_status_for_a_never_fetched_key_is_not_pending_no_error():
+    store, client = make_store()
+    assert store.get_schema_fetch_status("alice@host:5432/db") == {"pending": False, "error": None}
+
+
+def test_mark_schema_fetch_pending_then_get_schema_fetch_status_reports_it():
+    store, client = make_store()
+    cache_key = "alice@host:5432/db"
+    store.mark_schema_fetch_pending(cache_key)
+    assert store.get_schema_fetch_status(cache_key) == {"pending": True, "error": None}
+
+
+def test_mark_schema_fetch_pending_never_touches_a_previously_recorded_error():
+    store, client = make_store()
+    cache_key = "alice@host:5432/db"
+    store.mark_schema_fetch_done(cache_key, error="FATAL")
+    store.mark_schema_fetch_pending(cache_key)
+    assert store.get_schema_fetch_status(cache_key) == {"pending": True, "error": "FATAL"}
+
+
+def test_mark_schema_fetch_done_with_no_error_clears_pending_and_any_previous_error():
+    store, client = make_store()
+    cache_key = "alice@host:5432/db"
+    store.mark_schema_fetch_pending(cache_key)
+    store.mark_schema_fetch_done(cache_key, error="TIMEOUT")
+    assert store.get_schema_fetch_status(cache_key)["error"] == "TIMEOUT"
+
+    store.mark_schema_fetch_pending(cache_key)
+    store.mark_schema_fetch_done(cache_key)  # this attempt succeeded
+    assert store.get_schema_fetch_status(cache_key) == {"pending": False, "error": None}
+
+
+def test_mark_schema_fetch_pending_and_done_never_touch_schema_text_or_overview():
+    # merge=True semantics, same guarantee set_cached_schema/set_cached_
+    # schema_overview already give each other (see this file's own tests
+    # above) - a fetch-status write must never clobber the actual schema
+    # content living in the same document.
+    store, client = make_store()
+    cache_key = "alice@host:5432/db"
+    store.set_cached_schema(cache_key, "Table: t", "2026-01-01T00:00:00+00:00")
+    store.set_cached_schema_overview(cache_key, {"prose": "desc", "questions": []})
+
+    store.mark_schema_fetch_pending(cache_key)
+    store.mark_schema_fetch_done(cache_key, error="EMPTY")
+
+    row = store.get_cached_schema(cache_key)
+    assert row["schema_text"] == "Table: t"
+    assert row["overview"] == {"prose": "desc", "questions": []}
+
+
+def test_delete_cached_schema_also_clears_fetch_status():
+    store, client = make_store()
+    cache_key = "alice@host:5432/db"
+    store.mark_schema_fetch_pending(cache_key)
+    store.mark_schema_fetch_done(cache_key, error="FATAL")
+
+    store.delete_cached_schema(cache_key)
+
+    assert store.get_schema_fetch_status(cache_key) == {"pending": False, "error": None}
+
+
+def test_fetch_status_is_isolated_per_cache_key():
+    store, client = make_store()
+    store.mark_schema_fetch_pending("alice@host:5432/db_one")
+    store.mark_schema_fetch_done("bob@host:5432/db_two", error="FATAL")
+    assert store.get_schema_fetch_status("alice@host:5432/db_one") == {"pending": True, "error": None}
+    assert store.get_schema_fetch_status("bob@host:5432/db_two") == {"pending": False, "error": "FATAL"}
+
+
+# --- list_cached_schema_texts() (local-dev /api/debug/schema-cache) --------
+
+def test_list_cached_schema_texts_is_empty_when_nothing_is_cached():
+    store, client = make_store()
+    assert store.list_cached_schema_texts() == {}
+
+
+def test_list_cached_schema_texts_returns_every_cached_entry():
+    store, client = make_store()
+    store.set_cached_schema("alice@host:5432/db_one", "SCHEMA ONE", "2026-01-01T00:00:00+00:00")
+    store.set_cached_schema("bob@host:5432/db_two", "SCHEMA TWO", "2026-01-02T00:00:00+00:00")
+    assert store.list_cached_schema_texts() == {
+        "alice@host:5432/db_one": "SCHEMA ONE",
+        "bob@host:5432/db_two": "SCHEMA TWO",
+    }
+
+
+def test_list_cached_schema_texts_omits_a_key_with_no_schema_text_yet():
+    store, client = make_store()
+    store.mark_schema_fetch_pending("pending@host:5432/db")
+    store.set_cached_schema_overview("overview-only@host:5432/db", {"prose": "x", "questions": []})
+    store.set_cached_schema("alice@host:5432/db", "SCHEMA ONE", "2026-01-01T00:00:00+00:00")
+    assert store.list_cached_schema_texts() == {"alice@host:5432/db": "SCHEMA ONE"}

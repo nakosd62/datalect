@@ -5,7 +5,7 @@
 // comment for the full list: translate_submitted, sql_executed,
 // error_shown, report_submitted, database_selected, model_selected,
 // help_viewed, history_viewed, history_nav_clicked, preferences_viewed,
-// login, logout, mic_used, quick_prompt_clicked).
+// login, logout, mic_used).
 //
 // Rather than stubbing/spying on window.gtag itself, these tests read
 // window.dataLayer directly - index.html's own inline snippet defines
@@ -311,25 +311,16 @@ test.describe('analytics: query flow', () => {
     expect(events[0].message.length).toBeGreaterThan(0);
   });
 
-  test('quick_prompt_clicked fires with the chip label and prompt, and still submits a translation', async ({ page }) => {
-    await mockTranslate(page, { sql: 'SELECT 1;' });
-    await gotoApp(page);
-
-    const chip = page.locator('.example-chip').first();
-    const chipLabel = (await chip.textContent()).trim();
-    await chip.click();
-    await expect.poll(() => currentSql(page)).toContain('SELECT');
-
-    const events = await trackedEvents(page, 'quick_prompt_clicked');
-    expect(events.length).toBe(1);
-    expect(events[0].chip_label).toBe(chipLabel);
-    expect(events[0].prompt.length).toBeGreaterThan(0);
-
-    // The chip click still drives a real translation - one submitted event
-    // downstream of it, same as typing the prompt in by hand would.
-    const submitted = await trackedEvents(page, 'translate_submitted');
-    expect(submitted.length).toBe(1);
-  });
+  // There used to be a test here for quick_prompt_clicked, fired by
+  // clicking one of the "Sample prompts" example-chip buttons above the
+  // prompt box. That whole section (#examplePrompts/.example-chip) was
+  // removed from the app entirely (see app-shell.spec.js's own removal-
+  // guard test), and nothing in client.js fires quick_prompt_clicked any
+  // more - so there's deliberately no replacement coverage for this event
+  // now. Left this comment specifically because the old test didn't fail
+  // outright once the chips disappeared - it just hung waiting on a
+  // selector that would never appear, timing out instead of failing fast,
+  // which is what actually surfaced this gap.
 });
 
 // "All databases" mode fans a single NL prompt out into one real translate

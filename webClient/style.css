@@ -301,14 +301,6 @@ body {
   text-overflow: ellipsis;
 }
 
-.status-badge .conn-badge-icon {
-  margin-left: 2px;
-  margin-right: 3px;
-  color: var(--accent-cyan);
-  width: clamp(10px, 1.5vw, 14px);
-  height: clamp(10px, 1.5vw, 14px);
-}
-
 /* Layout Vertical */
 .vertical-layout {
   display: flex;
@@ -430,6 +422,20 @@ textarea:focus {
 }
 
 .btn-primary:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* While a config-modal save is in flight (see configSaveBtn's own click
+   handler in client.js), every field/button in the form is disabled so
+   nothing changes out from under the request - .btn-secondary and the
+   plain <input>/<select> fields have no disabled look of their own
+   otherwise (unlike .btn-primary above), so without this they'd just stop
+   responding to clicks with no visual sign anything is locked. */
+#configForm button:disabled,
+#configForm input:disabled,
+#configForm select:disabled,
+#configForm textarea:disabled {
   opacity: 0.6;
   cursor: not-allowed;
 }
@@ -1265,6 +1271,14 @@ textarea:focus {
   opacity: 1;
 }
 
+/* Same "locked while saving" treatment as #configForm's own controls (see
+   that rule's comment) - modalCloseBtn lives in .modal-header, a sibling
+   of #configForm, so it isn't covered by that selector and needs its own. */
+.modal-close-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
 /* ===========================================================================
    GUIDED TOUR (first-run onboarding)
    =========================================================================== */
@@ -1352,9 +1366,8 @@ textarea:focus {
   color: var(--text-secondary);
 }
 
-/* Shown inside the Help modal only when the "Quick prompts" row has been
-   dismissed - the real UI path back to it (see restoreQuickPrompts() in
-   client.js), so nobody has to reach for devtools/localStorage. */
+/* Action row at the top of the Help modal (currently just "Replay guided
+   tour" - see replayTourBtn in client.js). */
 .help-modal-actions {
   display: flex;
   flex-wrap: wrap;
@@ -1727,6 +1740,12 @@ textarea.report-issue-preview:focus {
   cursor: pointer;
   user-select: none;
   white-space: nowrap;
+  /* Needed now that this is a direct flex item of .preset-column (column
+     flex-direction) rather than nested inside the old .radio-option-row
+     wrapper, which used to carry this for it - without it, a flex item's
+     default min-width:auto would size to its content and defeat the
+     ellipsis truncation on .radio-option span below for a long name. */
+  min-width: 0;
 }
 
 /* Also applies to the radio inside .custom-db-header-row (each custom
@@ -1749,6 +1768,91 @@ textarea.report-issue-preview:focus {
   word-break: normal;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* Schema Viewer "?" (help-circle) button. Used to exist once per preset
+   and once per saved custom connection inside the DB connection config
+   dialog (letting the Schema Viewer be opened for a connection other than
+   whichever one was actually active, and always stacked on top of that
+   dialog besides) - both of those are gone now. The one surviving copy
+   (#datasetSchemaViewerBtn, see index.html) lives NESTED inside
+   configTriggerBadge itself (the dataset badge), right after its name
+   text, rather than floating beside it as a separate, unlabeled icon -
+   that placement was ambiguous about which dataset it referred to. Its
+   own click handler in client.js calls stopPropagation() so clicking it
+   doesn't also fire the badge's own click-to-configure handler, and it
+   only ever opens the Schema Viewer for the currently ACTIVE connection,
+   so there's no other connection it could mean and no config dialog
+   underneath it to get stuck behind. */
+.schema-info-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  background: transparent;
+  border: 1px solid var(--surface-3);
+  border-radius: 50%;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: var(--transition);
+}
+
+.schema-info-btn:hover {
+  background: var(--overlay-2);
+  color: var(--accent-cyan);
+  border-color: var(--accent-cyan);
+}
+
+/* Sized down and border-less by default when nested inside the dataset
+   badge (see this button's own comment above) so it reads as part of the
+   pill rather than a second button glued onto it - the hover state above
+   (background + border appearing) is what signals it's independently
+   clickable, without needing a visible border at rest to look "attached".
+   No margin-left of its own any more - the divider right before it (see
+   .schema-info-divider below) is what supplies its spacing from the name
+   now, on both sides, instead of this button nudging itself away alone. */
+.status-badge .schema-info-btn {
+  width: 18px;
+  height: 18px;
+  border-color: transparent;
+}
+
+/* Sits between the dataset name and the info button (see index.html's
+   own comment on it): a couple of spaces, a thin vertical bar, then a
+   couple more spaces, so the two feel like separate, deliberately spaced
+   controls rather than one continuous run of text-then-icon. The margin
+   here is on top of .status-badge's own 0.35rem inter-child flex gap, so
+   the actual visual gap on each side of the bar is larger than the gap
+   between any other two items in the pill (dot-to-name, for instance) -
+   that asymmetry is deliberate: it's what visually calls out "there are
+   two separate targets here" without needing the info button itself to
+   look like a whole second pill. */
+.schema-info-divider {
+  width: 1px;
+  height: 12px;
+  background: var(--surface-3);
+  margin: 0 0.35rem;
+  flex-shrink: 0;
+}
+
+/* Same "grayed out, not clickable right now" treatment as
+   .status-badge.badge-disabled (see that rule's own comment) - reused
+   here via the same class (toggled by the same setButtonsDisabled() call)
+   since #datasetSchemaViewerBtn isn't a .status-badge itself and so isn't
+   covered by that selector. */
+.schema-info-btn.badge-disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+  filter: grayscale(1);
+}
+
+.schema-info-btn.badge-disabled:hover {
+  background: transparent;
+  color: var(--text-secondary);
+  border-color: var(--surface-3);
 }
 
 /* "All Pre-Configured Datasets" (see renderDbRadioButtons() in client.js) now
@@ -1827,45 +1931,15 @@ textarea.report-issue-preview:focus {
 }
 
 .custom-db-toggle-btn,
-.custom-db-remove-btn,
-.custom-db-refresh-btn {
+.custom-db-remove-btn {
   /* Doubled from the original 0.15rem 0.6rem padding / 0.7rem font-size -
-     these are the only way to expand/collapse, delete, or refresh the
-     schema of a saved custom connection, so they need to read as clearly
-     clickable rather than blend into the row alongside the type/name
-     fields. */
+     these are the only way to expand/collapse or delete a saved custom
+     connection, so they need to read as clearly clickable rather than
+     blend into the row alongside the type/name fields. */
   flex: 0 0 auto;
   padding: 0.3rem 1.2rem;
   line-height: 1;
   font-size: 1.4rem;
-}
-
-.custom-db-refresh-btn {
-  /* Holds an inline SVG icon rather than a text glyph like its siblings -
-     centers it the same way padding centers their text/unicode content. */
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.custom-db-refresh-btn:disabled,
-.custom-db-remove-btn:disabled {
-  /* Shared with the refresh button: the remove ("x") button is also
-     disabled (see renderCustomDbRows()'s isRefreshing) for as long as
-     that row's own schema refresh is in flight, so it needs the same
-     greyed-out treatment. */
-  opacity: 0.5;
-  cursor: default;
-}
-
-.custom-db-refresh-btn svg.animate-spin {
-  /* Explicit, rather than relying on each browser's own default
-     transform-box for an inline SVG - belt-and-suspenders so the icon
-     spins in place around its own center instead of visibly drifting/
-     wobbling around some other origin while .animate-spin's rotation
-     (style.css's shared @keyframes spin) is running. */
-  transform-box: fill-box;
-  transform-origin: center;
 }
 
 .custom-db-field-row {
@@ -2286,34 +2360,28 @@ textarea.report-issue-preview:focus {
 }
 
 /* The Summary tab's "View as chart" nudge (see client.js's
-   summaryChartCalloutHtml()/jumpToChartableResultTab()) - sits directly
-   under the summary text and above .summary-feedback-row (primary action
-   before secondary feedback, see the ordering comment at that insertion
-   point in renderTableResult()). An outlined pill (tinted background,
-   colored text and border) rather than a solid-fill button, matching
-   .summary-feedback-btn--up's own transparent-background-plus-tinted-hover
-   convention - there's no --on-secondary contrast token defined in this
-   file to pair with a solid --secondary fill. */
-.summary-chart-callout {
-  margin-top: 0.75rem;
-}
-
-.summary-chart-callout-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.4rem;
-  padding: 0.35rem 0.75rem;
-  border: 1px solid rgba(var(--secondary-rgb), 0.4);
-  border-radius: 999px;
-  background-color: rgba(var(--secondary-rgb), 0.08);
+   summaryChartInlineLinkHtml()/jumpToChartableResultTab()) - appended
+   straight onto the tail end of the summary text itself (inside the same
+   <p>, not a separate element below it), so it reads as a plain inline
+   text link continuing the prose rather than a standalone UI control. An
+   earlier version used a separate outlined pill button sitting under the
+   text; that read as out-of-context clutter, so this is deliberately
+   unstyled as a "button" (no border/background/pill) and instead just
+   looks like clickable text, matching how a link would sit inline. */
+.summary-chart-inline-link {
+  display: inline;
+  padding: 0;
+  border: none;
+  background: none;
   color: var(--secondary);
-  font-size: 0.8rem;
+  font-size: inherit;
+  font-family: inherit;
+  text-decoration: underline;
+  text-underline-offset: 0.15em;
   cursor: pointer;
 }
 
-.summary-chart-callout-btn:hover {
-  background-color: rgba(var(--secondary-rgb), 0.16);
-  border-color: var(--secondary);
+.summary-chart-inline-link:hover {
   color: var(--secondary-hover);
 }
 
@@ -2592,10 +2660,23 @@ tr.report-issue-row td {
 .results-view-toggle {
   flex-shrink: 0;
   display: flex;
+  align-items: center;
   gap: 4px;
   padding: 6px 8px;
   background-color: var(--surface-2);
   border-bottom: 1px solid var(--surface-3);
+}
+
+/* Wraps just the Table/Chart pair (see renderTableResult()'s own comment
+   on why this is now a separate sub-group from .results-view-toggle
+   itself): that row is shown for EVERY non-empty tabular result now (the
+   download controls below need to be reachable even when there's nothing
+   to chart), but the Table/Chart pills specifically still only apply to
+   the one result per turn the LLM/server actually validated as
+   chartable. */
+.results-view-toggle-buttons {
+  display: flex;
+  gap: 4px;
 }
 
 .results-view-toggle-btn {
@@ -2620,6 +2701,84 @@ tr.report-issue-row td {
   background-color: var(--accent-cyan);
   border-color: var(--accent-cyan);
   color: var(--on-accent-cyan);
+}
+
+/* Download (CSV primary + JSON via the caret menu) - see this feature's
+   own section comment in client.js above handleResultDownload().
+   margin-left: auto pins it to the right end of .results-view-toggle
+   regardless of whether .results-view-toggle-buttons is shown next to it
+   or hidden (a non-chartable result, the common case). */
+.results-download-group {
+  position: relative;
+  display: flex;
+  margin-left: auto;
+}
+
+.results-download-btn,
+.results-download-caret-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.3rem 0.6rem;
+  font-size: 0.75rem;
+  font-weight: 500;
+  font-family: inherit;
+  color: var(--text-secondary);
+  background: transparent;
+  border: 1px solid var(--surface-3);
+  cursor: pointer;
+  transition: var(--transition);
+}
+
+.results-download-btn {
+  /* Sits flush against the caret button, sharing one pill-shaped outline
+     rather than looking like two unrelated buttons - the caret is a
+     secondary affordance on the same control, not its own action. */
+  border-radius: 999px 0 0 999px;
+  border-right: none;
+}
+
+.results-download-caret-btn {
+  border-radius: 0 999px 999px 0;
+  padding: 0.3rem 0.4rem;
+}
+
+.results-download-btn:hover,
+.results-download-caret-btn:hover {
+  background-color: var(--surface-3);
+  color: var(--text-table-strong);
+}
+
+.results-download-menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 6px);
+  background-color: var(--surface-1);
+  border: 1px solid var(--bg-card-border);
+  border-radius: 8px;
+  box-shadow: 0 10px 25px rgba(0, 0, 0, 0.4);
+  min-width: 170px;
+  z-index: 100;
+  padding: 0.35rem 0;
+}
+
+.results-download-menu-item {
+  display: block;
+  width: 100%;
+  padding: 0.5rem 1rem;
+  background: transparent;
+  border: none;
+  color: var(--text-primary);
+  font-size: 0.8rem;
+  font-family: var(--font-sans);
+  text-align: left;
+  cursor: pointer;
+  transition: var(--transition);
+}
+
+.results-download-menu-item:hover {
+  background-color: var(--overlay-2);
+  color: var(--primary);
 }
 
 /* Shown whenever the currently-displayed tab's result was cut off by
@@ -2673,69 +2832,6 @@ tr.report-issue-row td {
   align-items: center;
   gap: 0.75rem;
   min-height: 52px;
-}
-
-/* Zero-state guidance: clickable example prompts shown above the SQL box
-   so a first-time user with a blank prompt field has something concrete
-   to click instead of guessing what the app can do. */
-.example-prompts {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 0.5rem;
-  padding: 0 0.25rem;
-}
-
-.example-prompts-label {
-  font-size: 0.8rem;
-  color: var(--text-muted);
-  margin-right: 0.15rem;
-}
-
-.example-chip {
-  background: var(--overlay-2);
-  border: 1px solid var(--bg-card-border);
-  color: var(--text-secondary);
-  padding: 0.3rem 0.75rem;
-  border-radius: 999px;
-  font-size: 0.8rem;
-  cursor: pointer;
-  transition: var(--transition);
-  white-space: nowrap;
-}
-
-.example-chip:hover {
-  background: var(--primary-glow);
-  border-color: var(--primary);
-  color: var(--primary-hover);
-}
-
-.example-chip:disabled {
-  opacity: 0.45;
-  cursor: not-allowed;
-}
-
-.example-chip:disabled:hover {
-  background: var(--overlay-2);
-  border-color: var(--bg-card-border);
-  color: var(--text-secondary);
-}
-
-.example-prompts-dismiss {
-  background: transparent;
-  border: none;
-  color: var(--text-muted);
-  font-size: 1.1rem;
-  line-height: 1;
-  cursor: pointer;
-  padding: 0.15rem 0.4rem;
-  border-radius: 4px;
-  transition: var(--transition);
-}
-
-.example-prompts-dismiss:hover {
-  color: var(--text-primary);
-  background: var(--overlay-3);
 }
 
 /* Action Buttons Column */
@@ -3486,4 +3582,602 @@ tr.report-issue-row td {
 /* Adjust textarea padding to prevent text overlap with the inline controls & mic */
 .speech-bubble-wrapper textarea#aiPrompt {
   padding-right: 125px !important;
+}
+
+/* ===========================================================================
+   SCHEMA VIEWER (#schemaViewerModal - see client.js's own section comment
+   above openSchemaViewer() for the full feature design: a connection
+   picker, a searchable table/tab list on the left, and the selected
+   entry's full schema-text block on the right, fed by GET /api/schema -
+   the exact same schema text and Table:/Table family:/Tab: entry
+   convention every real /api/translate prompt already uses (see
+   backends/base.py's split_schema_text_into_entries), never a separately
+   maintained "for display only" introspection pass.
+   =========================================================================== */
+
+/* Same #configForm.modal-body override pattern used elsewhere in this file
+   (see that rule's own comment): the generic .modal-body's own padding/
+   flex/scroll behavior would scroll the WHOLE body (toolbar included) as
+   one unit once the entry list/detail text grows tall - this pins the
+   toolbar and notice in place and hands scrolling to the two panes below
+   instead, each independently. */
+#schemaViewerModal .modal-body.schema-viewer-body {
+  padding: 1.25rem;
+  gap: 0.75rem;
+  overflow: hidden;
+  min-height: 0;
+}
+
+.schema-viewer-card {
+  /* Tall enough that a real multi-table schema doesn't need to scroll the
+     list AND the detail pane down to a sliver each - .modal-card's own
+     max-height: 85vh (style.css) still caps this on a short viewport. */
+  height: 80vh;
+}
+
+/* Wraps the modal title alone now (the "Session:" line that used to grow
+   underneath it - see the old #schemaViewerSessionInfo - moved into the
+   Overview tab's own stats block, .schema-viewer-overview-stats below,
+   alongside the dataset-size/schema-size facts it's now shown with) so
+   .modal-header's own space-between/align-items: center layout still
+   treats the title as one flex child, with the close button staying put
+   on the right. */
+.schema-viewer-title-block {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  min-width: 0;
+}
+
+/* Groups Refresh Schema (plus its status line underneath) with the close
+   button, as .modal-header's own space-between/align-items: center's
+   second flex child (schema-viewer-title-block above is the first) - see
+   index.html's own comment on why Refresh Schema lives in the header now
+   rather than the body toolbar an earlier version put it in.
+   align-items: flex-start (not center, .modal-header's own default)
+   because the refresh block can grow to two lines (button + status) while
+   the close button stays one - center would drift the close button
+   downward as that second line appears/disappears. */
+.schema-viewer-header-actions {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.75rem;
+  flex-shrink: 0;
+}
+
+.schema-viewer-refresh-block {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.3rem;
+}
+
+/* This button only ever had .btn (layout only, no color - see that
+   rule's own comment) plus .history-action-btn (more layout) applied to
+   it, with no -primary/-secondary color variant ever added - it was
+   rendering with the browser's unstyled default button chrome (a flat
+   light grey, near-black text) entirely by omission. Given its own
+   explicit look here, matching .btn-secondary's existing app-wide
+   convention, both so it reads as an intentional part of the UI and so
+   its disabled/"Refreshing..." state below has real, known colors to
+   apply enough contrast against - dimming an already-unstyled default via
+   opacity alone (the bug this whole rule exists to fix) has no reliable
+   floor to stop at. */
+.schema-viewer-refresh-btn {
+  flex-shrink: 0;
+  background-color: var(--overlay-2);
+  color: var(--text-primary);
+  border: 1px solid var(--bg-card-border);
+}
+
+.schema-viewer-refresh-btn:hover:not(:disabled) {
+  background-color: var(--overlay-3);
+}
+
+/* Disabled for the whole duration of the blocking refresh call (see the
+   click handler in client.js), while showing "Refreshing..." - a status
+   the user is meant to actually read, not just a dimmed-into-illegibility
+   inert control. A flat opacity: 0.5 here (the previous treatment, shared
+   with the close button below) reads fine on the close button's single
+   glyph, but nearly erases this button's own multi-word label, especially
+   given the near-white default background it was accidentally rendering
+   with beforehand. Kept at full opacity with its own muted-but-legible
+   color pairing instead. */
+.schema-viewer-refresh-btn:disabled {
+  opacity: 1;
+  cursor: default;
+  background-color: var(--overlay-3);
+  color: var(--text-secondary);
+  border-color: var(--bg-card-border);
+}
+
+/* The close button's own disabled treatment (a single "x" glyph, not a
+   status message) - a plain opacity dim remains the right, simpler
+   treatment here, unlike the refresh button's own rule above. */
+#schemaViewerModalCloseBtn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* The "Last refreshed: ..." time (or, briefly, a refresh failure's own
+   error - see setSchemaViewerRefreshStatus()'s own comment in client.js)
+   under the Refresh Schema button. Right-aligned under it (via the parent
+   .schema-viewer-refresh-block's align-items: flex-end) since it's a
+   small aside about that one button's own action, not body copy. */
+.schema-viewer-refresh-status {
+  max-width: 260px;
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.schema-viewer-refresh-status--error {
+  color: var(--danger);
+}
+
+/* Notice banner - same visual language as .results-truncated-notice (see
+   that rule's own comment) for the same reason: a warning about
+   incomplete/stale information sitting directly above the content it
+   describes. Doubles as the error state (a failed fetch - connection
+   unreachable, credentials invalid, nothing to describe) by adding
+   .schema-viewer-notice--error, which swaps the warning-amber treatment
+   for --danger so a hard failure doesn't read as a mere caution. */
+.schema-viewer-notice {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  background-color: rgba(var(--warning-rgb), 0.12);
+  border: 1px solid rgba(var(--warning-rgb), 0.3);
+  border-radius: 8px;
+  color: var(--warning);
+  font-size: 0.8rem;
+}
+
+.schema-viewer-notice--error {
+  background-color: rgba(var(--danger-rgb), 0.12);
+  border-color: rgba(var(--danger-rgb), 0.3);
+  color: var(--danger);
+}
+
+.schema-viewer-panes {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  gap: 1rem;
+}
+
+/* Fixed 25%/75% split with the detail pane below - NOT content- or
+   modal-width-dependent like the old flex: 0 0 260px used to be (260px
+   was a bigger fraction of a narrow modal than a wide one, so the split
+   visibly shifted as the modal resized). Percentage flex-basis resolves
+   against .schema-viewer-panes' own content-box width, and flex-grow/
+   shrink are both 0, so this pane is always exactly one quarter of that
+   width no matter how wide the modal is or how long an entry name gets.
+   min-width: 0 is load-bearing here for that last part: a flex item's
+   default automatic min-width is its content's min-content size, and a
+   long, unbroken table/view name several levels down in the tree (an
+   .schema-viewer-entry-item button, white-space: nowrap so it CAN
+   truncate with an ellipsis - see that rule below) still counts toward
+   that min-content size even though the button's own overflow: hidden
+   clips it visually, because its width: 100% is ignored for intrinsic
+   sizing. Without min-width: 0 here, a single long enough name would
+   silently grow this pane (and shrink the detail pane) well past its
+   intended 25%, instead of the name itself truncating as designed. */
+.schema-viewer-list-pane {
+  flex: 0 0 25%;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding-right: 1rem;
+  border-right: 1px solid var(--bg-card-border);
+}
+
+.schema-viewer-entry-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.schema-viewer-entry-item {
+  display: block;
+  width: 100%;
+  padding: 0.45rem 0.6rem;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  color: var(--text-primary);
+  font-size: 0.82rem;
+  font-family: var(--font-mono);
+  text-align: left;
+  cursor: pointer;
+  transition: var(--transition);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.schema-viewer-entry-item:hover {
+  background-color: var(--overlay-2);
+}
+
+.schema-viewer-entry-item.active {
+  background-color: var(--accent-cyan);
+  color: var(--on-accent-cyan);
+}
+
+/* The left-hand list's 2-level tree (see SCHEMA_VIEWER_GROUPS/
+   renderSchemaViewerEntryList() in client.js): one collapsible
+   .schema-viewer-tree-group per top-level group (Tables/Views/Indexes/
+   Routines), each a .schema-viewer-group-header button (name + live item
+   count) followed by a .schema-viewer-group-children list of ordinary
+   .schema-viewer-entry-item leaves, indented under it. */
+.schema-viewer-tree-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.schema-viewer-group-header {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  width: 100%;
+  padding: 0.35rem 0.6rem;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  color: var(--text-secondary);
+  font-weight: 600;
+  font-size: 0.78rem;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: var(--transition);
+}
+
+.schema-viewer-group-header:hover {
+  background-color: var(--overlay-2);
+  color: var(--text-primary);
+}
+
+.schema-viewer-group-caret {
+  flex-shrink: 0;
+  transition: transform 0.15s ease;
+}
+
+/* Points right when collapsed, down when expanded - the same convention
+   as a native <details> disclosure triangle. */
+.schema-viewer-group-header.expanded .schema-viewer-group-caret {
+  transform: rotate(90deg);
+}
+
+.schema-viewer-group-children {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.schema-viewer-group-children .schema-viewer-entry-item {
+  padding-left: 1.6rem;
+}
+
+/* Takes whatever's left after the list pane's fixed 25% and the 1rem gap
+   - i.e. the other 75%, less that gap. flex-basis: 0% (rather than auto)
+   means this pane's own content never influences its share, matching the
+   list pane's own fixed-percentage comment above. min-width: 0 is load-
+   bearing: a flex item's default min-width is its content's min-content
+   size, which would otherwise stop the columns table below from ever
+   triggering its own horizontal scrollbar and instead push this pane
+   (and the whole modal) wider than intended. */
+.schema-viewer-detail-pane {
+  flex: 1 1 0%;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.schema-viewer-detail-heading {
+  flex-shrink: 0;
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+
+.schema-viewer-detail-text {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  margin: 0;
+  padding: 0.85rem 1rem;
+  background: var(--overlay-2);
+  border: 1px solid var(--bg-card-border);
+  border-radius: 8px;
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  line-height: 1.5;
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* The structured columns table at the top of the detail pane (see
+   parseSchemaEntryColumns() in client.js) - a quick-scan summary of every
+   column's name/type/nullability/attributes, parsed best-effort from the
+   same schema text .schema-viewer-detail-text shows whatever's left of
+   below it. flex: 1 1 auto (same as .schema-viewer-detail-text) lets it
+   grow to fill the whole pane by itself in the common case where there's
+   no leftover raw text to show (that sibling is then .hidden, so this is
+   the only flex child and claims 100% of the space) - only a column list
+   long enough to still overflow that full height scrolls internally
+   (overflow: auto below). When a last entry's leftover text IS showing
+   alongside it, the two flex children split the pane's height evenly.
+   .hidden (shared app-wide utility class) is toggled on this wrap
+   directly when a given entry's text doesn't fit the parser's convention
+   at all (e.g. a Google Sheets dataset's own column format, or the "No
+   schema description available." fallback), so there's nothing to show
+   but the raw text. */
+.schema-viewer-columns-wrap {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid var(--bg-card-border);
+  border-radius: 8px;
+  background: var(--overlay-2);
+}
+
+/* table-layout: fixed + an explicit equal width per column (below) is
+   what makes all 6 columns genuinely equal-width instead of the browser's
+   default content-based auto-sizing, which is what used to let a long
+   Sample values/Constraints value visually "steal" width from its
+   neighbors and squeeze Column/Type/Nullable's headers into wrapping.
+   min-width keeps that equal split from ever being squeezed so tight
+   that a header would have to wrap: it's sized so "Sample values" - the
+   longest of the 6 headers - comfortably fits, unwrapped, in a single
+   16.6667% share (~130px) including this table's own cell padding. Below
+   that width, .schema-viewer-columns-wrap's own overflow: auto is what
+   gives the table a horizontal scrollbar instead of shrinking further. */
+.schema-viewer-columns-table {
+  width: 100%;
+  min-width: 780px;
+  table-layout: fixed;
+  border-collapse: collapse;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+}
+
+.schema-viewer-columns-table th,
+.schema-viewer-columns-table td {
+  width: 16.6667%;
+  padding: 0.4rem 0.65rem;
+  text-align: left;
+  border-bottom: 1px solid var(--bg-card-border);
+}
+
+/* Headers never wrap - table-layout: fixed plus the equal 16.6667% width
+   and this table's own min-width (both above) already guarantee every
+   one of the 6 headers has comfortable, identical room. */
+.schema-viewer-columns-table th {
+  white-space: nowrap;
+}
+
+/* Cell CONTENT is a different story: Type ("STRUCT<...>" on BigQuery),
+   Attributes (DEFAULT/IDENTITY/AUTO_INCREMENT/...), Constraints (can
+   include a full "FOREIGN KEY -> other_table(other_column)" reference)
+   and Sample values (a frequent-values list) can all get arbitrarily
+   long, so body cells wrap instead of forcing their column wider than
+   its equal 16.6667% share (which, with table-layout: fixed, would
+   distort every other column's width too, not just this one's). */
+.schema-viewer-columns-table td {
+  white-space: normal;
+  word-break: break-word;
+}
+
+.schema-viewer-columns-table thead th {
+  position: sticky;
+  top: 0;
+  background: var(--overlay-2);
+  color: var(--text-secondary);
+  font-weight: 600;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.schema-viewer-columns-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+/* Pinned "Overview" tree row (see renderSchemaViewerEntryList() in
+   client.js) - a slightly bolder weight than an ordinary
+   .schema-viewer-entry-item leaf, closer to .schema-viewer-group-header's
+   own weight, so it visually reads as the tree's own top/default entry
+   rather than just another table name. Sits above every collapsible
+   group, outside .schema-viewer-group-children, so it's never affected
+   by any group's own expand/collapse state. */
+.schema-viewer-overview-item {
+  font-weight: 600;
+  font-family: inherit;
+}
+
+/* Mount point for the pinned "Overview" entry's content (see
+   renderSchemaViewerOverviewDetail() in client.js) - prose, then the ER
+   diagram, then suggested questions, stacked top to bottom. Occupies the
+   same flex slot .schema-viewer-columns-wrap/.schema-viewer-detail-text
+   occupy for every other entry (only one of the three is ever visible at
+   once - see that function's own hidden/shown toggling), scrollable as
+   one unit since the diagram can get tall for a schema with many
+   relationships. */
+.schema-viewer-overview-wrap {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+/* Facts-and-warnings block pinned to the top of the Overview tab (see
+   renderSchemaViewerStatsBlockHtml() in client.js) - the connection-wide
+   "Session:" line (moved here from the old #schemaViewerSessionInfo under
+   the modal title), the schema's own text size, and the best-effort total
+   dataset size the deep fetch computed (backends/base.py's
+   format_dataset_size_line() - omitted entirely for a dialect with no
+   cheap way to estimate it), plus a warning row whenever this connection
+   is actually hitting the SCHEMA_MAX_TABLES or SCHEMA_MAX_SCHEMA_CHARS
+   limit (formerly surfaced only in the dismissable notice bar - see
+   loadSchemaViewerConnection()'s own comment on data.truncated/
+   data.has_omitted_tables). Rendered above the AI-written prose (or the
+   "nothing generated yet" message) since none of this depends on that
+   overview ever having been generated. */
+.schema-viewer-overview-stats {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  padding: 0.7rem 1rem;
+  background: var(--overlay-2);
+  border: 1px solid var(--bg-card-border);
+  border-radius: 8px;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+}
+
+.schema-viewer-overview-stats-row {
+  overflow-wrap: anywhere;
+}
+
+/* The dataset-size/schema-character-count row - two independent size
+   figures shown side by side (space-between, wrapping to its own line
+   each on a narrow modal) rather than stacked on separate rows, since
+   both are just answers to "how big is this". */
+.schema-viewer-overview-stats-row-split {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  column-gap: 1.5rem;
+  row-gap: 0.3rem;
+}
+
+.schema-viewer-overview-warning {
+  color: var(--warning);
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+
+.schema-viewer-overview-prose {
+  margin: 0;
+  padding: 0.85rem 1rem;
+  background: var(--overlay-2);
+  border: 1px solid var(--bg-card-border);
+  border-radius: 8px;
+  font-size: 0.88rem;
+  line-height: 1.55;
+  color: var(--text-primary);
+}
+
+.schema-viewer-overview-empty {
+  margin: 0;
+  padding: 0.85rem 1rem;
+}
+
+.schema-viewer-overview-diagram-wrap {
+  flex-shrink: 0;
+  border: 1px solid var(--bg-card-border);
+  border-radius: 8px;
+  background: var(--overlay-2);
+  padding: 0.75rem;
+  overflow: auto;
+}
+
+.schema-viewer-overview-diagram {
+  display: flex;
+  justify-content: center;
+}
+
+.schema-viewer-overview-diagram svg {
+  max-width: 100%;
+  height: auto;
+}
+
+.schema-viewer-overview-questions-block {
+  flex-shrink: 0;
+}
+
+.schema-viewer-overview-questions-title {
+  font-weight: 600;
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  margin-bottom: 0.5rem;
+}
+
+.schema-viewer-overview-questions {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+/* "Fill the prompt box and go" behavior (see
+   renderSchemaViewerOverviewDetail() in client.js) - styled as a chip/pill
+   since these are one-click actions, not plain body text. */
+.schema-viewer-suggested-question {
+  display: block;
+  width: 100%;
+  padding: 0.55rem 0.8rem;
+  background: var(--overlay-2);
+  border: 1px solid var(--bg-card-border);
+  border-radius: 8px;
+  color: var(--text-primary);
+  font-size: 0.85rem;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: var(--transition);
+}
+
+.schema-viewer-suggested-question:hover {
+  background-color: var(--overlay-3);
+  border-color: var(--accent-cyan);
+  color: var(--accent-cyan);
+}
+
+.schema-viewer-columns-table tbody tr:hover {
+  background-color: var(--overlay-3, rgba(255, 255, 255, 0.04));
+}
+
+.schema-viewer-col-name {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.schema-viewer-not-null {
+  color: var(--warning);
+  font-weight: 600;
+}
+
+/* Supplementary, not structural (unlike Attributes/Constraints) - a
+   sampled peek at real data, so it's toned down relative to the rest of
+   the row rather than competing with it visually. */
+.schema-viewer-col-samples {
+  color: var(--text-secondary);
+  font-style: italic;
 }

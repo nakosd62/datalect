@@ -52,7 +52,7 @@ if SERVER_DIR not in sys.path:
     sys.path.insert(0, SERVER_DIR)
 
 from backends.databricks import DatabricksBackend
-from backends.base import SqlExecutionError
+from backends.base import SqlExecutionError, format_dataset_size_line
 from helpers import install_fake_databricks_connect, make_fake_pg_connection
 
 
@@ -714,6 +714,64 @@ def test_get_schema_deep_naming_convention_relationships_section():
     ))
     shallow = backend.get_schema_shallow(conn2)
     assert "Likely relationships" not in shallow
+
+
+# --- get_schema() (deep): "Estimated dataset size" line ----------------------
+# Reuses live_counts (the per-table live COUNT(*) results the "Live row
+# counts" loop just gathered) rather than any new query - see
+# backends/databricks.py's own comment on why this is a live scan of only
+# the shown/kept tables, never a true schema-wide catalog estimate, and why
+# the `note` argument exists to make that caveat visible in the line itself.
+
+def test_get_schema_deep_dataset_size_line_sums_live_counts():
+    # "binary" keeps each table's Phase 2 pass to just its live COUNT(*)
+    # query (no min/max or cardinality-gate queries) - see
+    # test_get_schema_deep_naming_convention_relationships_section's own
+    # comment for why.
+    responses = _schema_responses(
+        table_names=["customers", "orders"],
+        columns_rows=[
+            ("customers", "id", "binary", "NO"),
+            ("orders", "customer_id", "binary", "NO"),
+        ],
+    ) + [
+        ([(10,)], None, -1),  # live count: customers
+        ([(32,)], None, -1),  # live count: orders
+    ]
+    conn, cursor = make_fake_pg_connection(responses)
+    backend = DatabricksBackend()
+    schema = backend.get_schema(conn)
+
+    expected_line = format_dataset_size_line(
+        total_rows=42,
+        note=(
+            "live count of the tables shown here only, not a "
+            "schema-wide total - Databricks has no cheap "
+            "catalog-only row-count statistic"
+        ),
+    )
+    assert expected_line in schema
+    # The caveat text must actually be visible in the rendered line, not
+    # just correctly assembled by format_dataset_size_line() in isolation.
+    assert "not a schema-wide total" in schema
+
+
+def test_get_schema_deep_omits_dataset_size_line_when_every_live_count_fails():
+    responses = _schema_responses(
+        table_names=["customers", "orders"],
+        columns_rows=[
+            ("customers", "id", "binary", "NO"),
+            ("orders", "customer_id", "binary", "NO"),
+        ],
+    ) + [
+        Exception("live count failed"),  # customers
+        Exception("live count failed"),  # orders
+    ]
+    conn, cursor = make_fake_pg_connection(responses)
+    backend = DatabricksBackend()
+    schema = backend.get_schema(conn)
+    assert "Live row counts:" not in schema
+    assert "Estimated dataset size" not in schema
 
 
 def test_get_schema_deep_skips_sampling_for_wide_tables_but_keeps_live_count():

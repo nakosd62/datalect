@@ -11,8 +11,7 @@
 //   8. Results rendering helpers
 //   9. Translate (NL -> SQL) and Execute SQL
 //  10. Input wiring: NL prompt box, translate/execute buttons
-//  11. Quick prompts: dismiss / restore
-//  12. History navigation (back/forward through turns), purge, final init
+//  11. History navigation (back/forward through turns), purge, final init
 // =============================================================================
 document.addEventListener('DOMContentLoaded', async () => {
   // ===========================================================================
@@ -711,14 +710,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   let customDbUrl = "";
   let customDbName = "";
   let customDatabases = [];
-  // Which saved custom connections currently have a "Refresh Schema"
-  // request in flight - keyed by connection_key (stable across a row's
-  // array index shifting from an add/remove elsewhere), not by button/DOM
-  // reference, specifically so renderCustomDbRows() can look this up fresh
-  // on every re-render (see its own refresh-button-rendering comment) and
-  // handleRefreshSchemaClick (below) can guard against firing a second,
-  // fully concurrent request for a connection that's already mid-refresh.
-  let refreshingConnectionKeys = new Set();
   let autoSqlExecuteEnabled = true;
   // True when running on Cloud Run and the current request has no verified
   // login (i.e. the backend resolved it to a per-session "anonymous:..."
@@ -953,8 +944,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   // full list: translate_submitted, sql_executed, error_shown,
   // report_submitted, database_selected, model_selected, help_viewed,
   // history_viewed, history_nav_clicked, history_purge_clicked,
-  // preferences_viewed, login, logout, mic_used, quick_prompt_clicked,
-  // tour_exited. Custom, app-specific names
+  // preferences_viewed, login, logout, mic_used, tour_exited. Custom,
+  // app-specific names
   // throughout (not GA4's own recommended-event vocabulary) - per explicit
   // request. Deliberately kept to this small, fixed set of names, even
   // where a new distinction was worth adding (see trackAllModeFanoutTranslate()/
@@ -1215,9 +1206,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   const configModal = document.getElementById('configModal');
   const configTriggerBadge = document.getElementById('configTriggerBadge');
   const modalCloseBtn = document.getElementById('modalCloseBtn');
+  const configForm = document.getElementById('configForm');
   const configSaveBtn = document.getElementById('configSaveBtn');
   const connDbName = document.getElementById('connDbName');
   const connDbDot = document.getElementById('connDbDot');
+  const datasetSchemaViewerBtn = document.getElementById('datasetSchemaViewerBtn');
 
   // DOM Elements - Model Selection Modal & Badge (mirrors the DB connection
   // badge/modal pair above - see updateModelBadge()/renderModelRadioButtons()).
@@ -1339,7 +1332,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (!helpModal) return;
     helpModal.classList.remove('hidden');
     bringModalToFront(helpModal);
-    updateRestoreQuickPromptsVisibility();
     if (!helpModalBody) return;
     loadHelpContent()
       .then(html => {
@@ -1364,6 +1356,22 @@ document.addEventListener('DOMContentLoaded', async () => {
   const chatHistoryBucketList = document.getElementById('chatHistoryBucketList');
   const deleteAllChatHistoryBtn = document.getElementById('deleteAllChatHistoryBtn');
 
+  // DOM Elements - Schema Viewer Modal (see this feature's own section
+  // comment above openSchemaViewer(), near section 6, for the full design)
+  const schemaViewerModal = document.getElementById('schemaViewerModal');
+  const schemaViewerModalTitleText = document.getElementById('schemaViewerModalTitleText');
+  const schemaViewerModalCloseBtn = document.getElementById('schemaViewerModalCloseBtn');
+  const schemaViewerRefreshBtn = document.getElementById('schemaViewerRefreshBtn');
+  const schemaViewerRefreshBtnLabel = document.getElementById('schemaViewerRefreshBtnLabel');
+  const schemaViewerRefreshStatus = document.getElementById('schemaViewerRefreshStatus');
+  const schemaViewerNotice = document.getElementById('schemaViewerNotice');
+  const schemaViewerEntryList = document.getElementById('schemaViewerEntryList');
+  const schemaViewerDetailHeading = document.getElementById('schemaViewerDetailHeading');
+  const schemaViewerOverviewWrap = document.getElementById('schemaViewerOverviewWrap');
+  const schemaViewerColumnsWrap = document.getElementById('schemaViewerColumnsWrap');
+  const schemaViewerColumnsBody = document.getElementById('schemaViewerColumnsBody');
+  const schemaViewerDetailText = document.getElementById('schemaViewerDetailText');
+
   // DOM Elements - New Version Banner (see fetchClientBuildId()/
   // checkForNewClientVersion() below)
   const newVersionBanner = document.getElementById('newVersionBanner');
@@ -1384,9 +1392,16 @@ document.addEventListener('DOMContentLoaded', async () => {
   // just above it) - single-connection mode only, see this feature's own
   // section comment above requestSingleModeResultsSummary().
   const resultsViewToggle = document.getElementById('resultsViewToggle');
+  const resultsViewToggleButtons = document.getElementById('resultsViewToggleButtons');
   const resultsTableWrapper = document.getElementById('resultsTableWrapper');
   const resultsChartWrapper = document.getElementById('resultsChartWrapper');
   const resultsChartCanvas = document.getElementById('resultsChartCanvas');
+  // Download (CSV/JSON) - see this feature's own section comment above
+  // handleResultDownload(), near summarizeTabularResultForReport().
+  const resultsDownloadGroup = document.getElementById('resultsDownloadGroup');
+  const resultsDownloadBtn = document.getElementById('resultsDownloadBtn');
+  const resultsDownloadCaretBtn = document.getElementById('resultsDownloadCaretBtn');
+  const resultsDownloadMenu = document.getElementById('resultsDownloadMenu');
   // Visible counterpart to a result's own "truncated" flag (see
   // backends/base.py's EXECUTE_RESULTS_MAX_ROWS/fetch_capped_rows) - a
   // query that genuinely matched more rows than that cap gets its data
@@ -1955,15 +1970,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       sqlEditor.setOption('readOnly', disabled);
       sqlEditor.getWrapperElement().classList.toggle('cm-readonly', disabled);
     }
-    // Example prompt chips: queried live (rather than via the
-    // examplePromptButtons closure declared further down) so this works
-    // regardless of where in the file setButtonsDisabled is called from.
-    // Without this, clicking one chip while its translation is still in
-    // flight let someone click a second (or third) chip and stack up
-    // overlapping requests.
-    document.querySelectorAll('.example-chip').forEach(btn => {
-      btn.disabled = disabled;
-    });
     document.body.style.cursor = disabled ? 'wait' : 'default';
     // Cancel button: only ever shown/enabled while something's actually in
     // flight - it's the inverse of every other control toggled above.
@@ -1986,16 +1992,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     // active connection, model, or any state an in-flight turn depends on.
     if (configTriggerBadge) configTriggerBadge.classList.toggle('badge-disabled', disabled);
     if (modelTriggerBadge) modelTriggerBadge.classList.toggle('badge-disabled', disabled);
+    if (datasetSchemaViewerBtn) datasetSchemaViewerBtn.classList.toggle('badge-disabled', disabled);
 
     // Sign-in/sign-out control: signing in or out mid-turn tears down the
     // whole active turn out from under it (see auth-disabled's own comment
     // in style.css for exactly what renderAuthUI()'s sign-in callback and
     // handleLogout() each do) - previously fully clickable throughout, with
     // "unpredictable" results. Queried live rather than cached at the top
-    // of the file - same reasoning as the example-chip lookup above: this
-    // container's own node persists for the page's whole life (only its
-    // innerHTML is rebuilt, by renderAuthUI()), but querying it fresh here
-    // means this still works regardless of where in the file
+    // of the file: this container's own node persists for the page's whole
+    // life (only its innerHTML is rebuilt, by renderAuthUI()), but querying
+    // it fresh here means this still works regardless of where in the file
     // setButtonsDisabled() is called from.
     const authContainer = document.getElementById('g_id_signin');
     if (authContainer) authContainer.classList.toggle('auth-disabled', disabled);
@@ -2395,8 +2401,26 @@ document.addEventListener('DOMContentLoaded', async () => {
   // visible/closing it. Now the modal opens/closes immediately and this
   // keeps running in the background, updating the dot in place once it's
   // done - same end result, just never blocking the UI on it.
+  // Shared race-guard between checkDbStatus() (the pre-existing /api/ping
+  // liveness check, just below) and pollSchemaFetchStatus() (further down) -
+  // both resolve asynchronously to the SAME connDbDot element, and a
+  // connection-changing config-modal Save now kicks off both around the same
+  // time (updateConnectionDetails() calls checkDbStatus() as it always has;
+  // triggerConfigSave() also calls pollSchemaFetchStatus() right after, when
+  // the save response says a background schema fetch just started - see that
+  // call site's own comment). Each captures the current value into its own
+  // `myToken` the moment IT starts (making it the dot's current "owner") and
+  // only ever applies a result to the dot if that captured value still
+  // matches when the result is ready - so whichever of the two started LAST
+  // wins, and a stale result from the one that started first is silently
+  // dropped instead of clobbering the newer one's answer. Same pattern as
+  // schemaViewerRequestToken/schemaErDiagramRenderToken elsewhere in this
+  // file.
+  let dbDotStateToken = 0;
+
   async function checkDbStatus() {
     if (!connDbDot) return;
+    const myToken = ++dbDotStateToken;
 
     // Immediate feedback that a (re)check is now in flight, rather than
     // leaving the previous connected/disconnected state up for however
@@ -2426,6 +2450,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       });
 
       const data = await response.json();
+      if (myToken !== dbDotStateToken) return; // superseded by a newer check/poll
       if (response.ok && data.success) {
         connDbDot.className = 'status-dot connected';
       } else {
@@ -2437,6 +2462,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         trackDbConnectionError(data.error);
       }
     } catch (err) {
+      if (myToken !== dbDotStateToken) return; // superseded by a newer check/poll
       connDbDot.className = 'status-dot disconnected';
       // Same tracking as the non-throwing failure branch above, just for
       // the case where the /api/ping fetch itself never came back at all
@@ -2444,6 +2470,75 @@ document.addEventListener('DOMContentLoaded', async () => {
       // err.message stands in for data.error here since there's no
       // response body to read one from.
       trackDbConnectionError(err && err.message);
+    }
+  }
+
+  // Poll cadence for pollSchemaFetchStatus() below - tentative values chosen
+  // to comfortably cover a full deep+shallow schema fetch plus the schema-
+  // overview LLM call (prime_schema_cache_with_reason() in db.py) for a
+  // normal-sized connection, while still noticing quickly once it's done.
+  const SCHEMA_FETCH_POLL_INTERVAL_MS = 1500;
+  const SCHEMA_FETCH_POLL_MAX_ATTEMPTS = 40; // ~60s ceiling before giving up
+
+  // Tracks a just-saved connection's background schema (re)fetch to
+  // completion (see triggerConfigSave()'s own call to this, right after a
+  // save whose response says `schema_fetch_pending: true` - config_routes.py
+  // now backgrounds that fetch instead of blocking the save on it). Drives
+  // connDbDot through the SAME checking/connected/disconnected states
+  // checkDbStatus() above already uses, rather than inventing a second
+  // visual language for "still working on it" - see dbDotStateToken's own
+  // comment for how the two are kept from clobbering each other when both
+  // are in flight around the same Save. `kind`/`id` address the connection
+  // to watch the same {kind, id} way datasetSchemaViewerBtn's click handler
+  // and the chat "OPEN SCHEMA VIEWER" dispatch already do.
+  async function pollSchemaFetchStatus(kind, id) {
+    if (!connDbDot || !id) return;
+    const myToken = ++dbDotStateToken;
+    connDbDot.className = 'status-dot checking';
+
+    for (let attempt = 0; attempt < SCHEMA_FETCH_POLL_MAX_ATTEMPTS; attempt++) {
+      if (attempt > 0) {
+        await new Promise((resolve) => setTimeout(resolve, SCHEMA_FETCH_POLL_INTERVAL_MS));
+      }
+      if (myToken !== dbDotStateToken) return; // superseded by a newer check/poll
+
+      try {
+        const response = await fetch(
+          `/api/config/schema-fetch-status?kind=${encodeURIComponent(kind)}&id=${encodeURIComponent(id)}`,
+          { method: 'GET', headers: getApiHeaders(), credentials: 'same-origin' }
+        );
+        const data = await response.json();
+        if (myToken !== dbDotStateToken) return; // superseded by a newer check/poll
+
+        if (!response.ok || !data.success) {
+          // Couldn't even ask (a transient error hitting the status route
+          // itself, not the connection being polled about) - treat like any
+          // other liveness failure rather than leaving the dot stuck on
+          // "checking" over it.
+          connDbDot.className = 'status-dot disconnected';
+          return;
+        }
+        if (data.pending) {
+          continue; // still working on it - keep polling
+        }
+        connDbDot.className = data.error ? 'status-dot disconnected' : 'status-dot connected';
+        if (data.error) trackDbConnectionError(data.error);
+        return;
+      } catch (err) {
+        if (myToken !== dbDotStateToken) return; // superseded by a newer check/poll
+        connDbDot.className = 'status-dot disconnected';
+        trackDbConnectionError(err && err.message);
+        return;
+      }
+    }
+
+    // Exhausted the polling ceiling without ever seeing pending:false (an
+    // unusually slow fetch, or one that's somehow wedged) - fall back to a
+    // real liveness check rather than leaving the dot stuck on "checking"
+    // indefinitely. checkDbStatus() claims dbDotStateToken for itself the
+    // moment it runs, so this is a clean handoff, not a race with itself.
+    if (myToken === dbDotStateToken) {
+      checkDbStatus();
     }
   }
 
@@ -2963,26 +3058,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       // re-renders since it lives on the object itself rather than index.
       const isExpanded = db._expanded !== undefined ? db._expanded : !db.connection_key;
 
-      // Looked up from refreshingConnectionKeys (a Set keyed by
-      // connection_key, declared alongside customDatabases) rather than
-      // from any per-row/per-index flag, specifically so it survives this
-      // function's own re-renders - renderCustomDbRows() rebuilds every
-      // row's HTML from scratch on ANY change (toggling a totally
-      // unrelated row's expand arrow, removing a different connection,
-      // ...), which would otherwise silently wipe out a plain DOM
-      // btn.disabled. Used below both to keep the refresh button itself
-      // disabled+spinning and to disable this row's OWN remove ("x")
-      // button for as long as its schema fetch is in flight - deleting a
-      // connection whose refresh is mid-request doesn't corrupt anything
-      // (the fetch just keeps running against whatever the server still
-      // has persisted, and prime_schema_cache()/get_database_schema() only
-      // ever touch the in-memory schema cache - see this feature's own
-      // design notes), but it can produce a confusing "Failed to refresh
-      // schema for X: Connection not found" popup later for a connection
-      // the user already intentionally removed - simplest to just not let
-      // the two race in the first place.
-      const isRefreshing = Boolean(db.connection_key) && refreshingConnectionKeys.has(db.connection_key);
-
       // Row 1 (all types): selection radio, dialect select, and Name -
       // dialect-specific fields live on their own dedicated rows below,
       // never crowding this first line.
@@ -3007,14 +3082,7 @@ document.addEventListener('DOMContentLoaded', async () => {
               <input type="text" id="custom-db-name-${index}" class="config-input custom-db-name-input" data-index="${index}" placeholder="e.g. My Database" value="${db.name || ''}" autocomplete="off">
             </div>
             <button type="button" class="btn btn-secondary custom-db-toggle-btn" data-index="${index}" aria-expanded="${isExpanded}" title="${isExpanded ? 'Hide connection details' : 'Show connection details'}">${isExpanded ? '▾' : '▸'}</button>
-            ${db.connection_key ? `<button type="button" class="btn btn-secondary custom-db-refresh-btn" data-index="${index}" title="${isRefreshing ? 'Refreshing schema…' : 'Refresh Schema'}" ${isRefreshing ? 'disabled' : ''}>
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="${isRefreshing ? 'animate-spin' : ''}">
-                <polyline points="23 4 23 10 17 10"></polyline>
-                <polyline points="1 20 1 14 7 14"></polyline>
-                <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
-              </svg>
-            </button>` : ''}
-            <button type="button" class="btn btn-secondary custom-db-remove-btn" data-index="${index}" title="${isRefreshing ? 'Wait for the schema refresh to finish before removing this connection' : 'Remove this connection'}" ${isRefreshing ? 'disabled' : ''}>&times;</button>
+            <button type="button" class="btn btn-secondary custom-db-remove-btn" data-index="${index}" title="Remove this connection">&times;</button>
           </div>
           ${isExpanded ? (isBigQuery ? `
           <div class="custom-db-field-row">
@@ -3354,13 +3422,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         const index = parseInt(btn.dataset.index);
         customDatabases.splice(index, 1);
         renderCustomDbRows(activeUrl);
-      });
-    });
-
-    container.querySelectorAll('.custom-db-refresh-btn').forEach(btn => {
-      btn.addEventListener('click', () => {
-        const index = parseInt(btn.dataset.index);
-        handleRefreshSchemaClick(customDatabases[index], activeUrl);
       });
     });
 
@@ -3748,66 +3809,6 @@ document.addEventListener('DOMContentLoaded', async () => {
           if (last) last.focus();
         });
       });
-    }
-  }
-
-  // "Refresh Schema" (see renderCustomDbRows()'s new .custom-db-refresh-btn
-  // above, only rendered for an already-saved custom connection) - a
-  // blocking call scoped to just this one connection, not the whole config
-  // modal (no existing modal-wide disable helper covers #configModal; see
-  // setButtonsDisabled(), which is scoped to the main chat/translate
-  // controls only). On success, just re-renders back to normal - no success
-  // message. On failure, shows a popup dialog (showAlertDialog, below) -
-  // a deliberate departure from this app's usual inline-#configSaveError
-  // convention, per how this feature was specified.
-  //
-  // In-flight state lives in refreshingConnectionKeys (declared alongside
-  // customDatabases), not in a plain btn.disabled flip - a bare DOM flag
-  // would get silently reset the moment ANY unrelated change re-renders
-  // this row (see renderCustomDbRows()'s refresh-button comment), which is
-  // exactly how this used to let a user fire off several fully concurrent
-  // refresh requests for the very same connection: click, then toggle/
-  // expand a different row (or remove one, or add a new blank one) while
-  // the fetch is still pending, and the re-render handed back a fresh,
-  // enabled button with no memory of the request still running. Guarding
-  // on the Set here - checked BEFORE anything else, and populated before
-  // the very first re-render - closes that regardless of how many times
-  // this row happens to get rebuilt while a request is outstanding.
-  //
-  // Refreshing two DIFFERENT connections at once is fine and intentional -
-  // each is its own independent /api/config/refresh-schema call against
-  // its own connection_key, exactly like clicking "Refresh Schema" on two
-  // separate rows always has been. Only a second click on the SAME
-  // still-in-flight connection is what this guards against.
-  async function handleRefreshSchemaClick(db, activeUrl) {
-    if (!db || !db.connection_key || refreshingConnectionKeys.has(db.connection_key)) return;
-    const displayName = db.name || 'this connection';
-    refreshingConnectionKeys.add(db.connection_key);
-    renderCustomDbRows(activeUrl);
-    try {
-      const response = await fetch('/api/config/refresh-schema', {
-        method: 'POST',
-        headers: getApiHeaders(),
-        body: JSON.stringify({ connection_key: db.connection_key }),
-      });
-      if (!response.ok) {
-        let errorMessage = 'Failed to refresh schema.';
-        try {
-          const errData = await response.json();
-          if (errData && errData.error) errorMessage = errData.error;
-        } catch (parseErr) { /* non-JSON error body - keep the generic message */ }
-        // Named explicitly - a bare "Failed to refresh schema." gives no
-        // way to tell which of several saved connections it was about,
-        // especially once the button itself has already gone back to its
-        // normal (non-spinning) state by the time this dialog is dismissed.
-        await showAlertDialog(`Failed to refresh schema for "${displayName}": ${errorMessage}`);
-      }
-    } catch (err) {
-      console.error(`Failed to refresh schema for "${displayName}":`, err);
-      await showAlertDialog(`Failed to refresh schema for "${displayName}". Check your connection and try again.`);
-    } finally {
-      refreshingConnectionKeys.delete(db.connection_key);
-      renderCustomDbRows(activeUrl);
     }
   }
 
@@ -4940,6 +4941,23 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
 
         await updateConnectionDetails(data);
+        if (data.schema_fetch_pending) {
+          // The connection this save just switched to is having its schema
+          // (re)fetched on the server in the background right now (see
+          // config_routes.py's handle_config() - this no longer blocks the
+          // save itself, so this response/the modal dismissal below/the
+          // dataset selection above all already happened). Track that
+          // fetch to completion via the SAME {kind, id} addressing the
+          // Schema Viewer's own "?" button and the chat "OPEN SCHEMA
+          // VIEWER" dispatch already use, resolved from the ACTIVE_* fields
+          // updateConnectionDetails() just updated above - not awaited:
+          // this runs on its own, updating connDbDot as it goes, while the
+          // rest of this function (and the user) moves on immediately.
+          pollSchemaFetchStatus(
+            ACTIVE_IS_CUSTOM ? 'custom' : 'preset',
+            ACTIVE_IS_CUSTOM ? ACTIVE_CUSTOM_CONNECTION_KEY : ACTIVE_PRESET_ID,
+          );
+        }
         // Read from the badge (just refreshed by updateConnectionDetails()
         // above) rather than any of this function's own dbNameValue-shaped
         // locals - correct across every dialect/preset/custom-connection
@@ -4980,6 +4998,18 @@ document.addEventListener('DOMContentLoaded', async () => {
         // badge can't confirm it's reachable either.
         trackDbConnectionError(err && err.message);
       }
+      // Previously silent here (console.error only) other than the badge
+      // going red behind this modal - the user would see the dialog just
+      // close on them (closeModal defaults true and nothing below reset
+      // it for this path) with no clue the save actually failed. Now shown
+      // the same way an ordinary !response.ok failure already is (see the
+      // sibling `else` branch above), and the modal is kept open so
+      // there's something to actually retry against.
+      if (configSaveErrorEl) {
+        configSaveErrorEl.textContent = 'Failed to save configuration: could not reach the server.';
+        configSaveErrorEl.style.display = '';
+      }
+      closeModal = false;
     }
 
     if (closeModal) {
@@ -5029,6 +5059,37 @@ document.addEventListener('DOMContentLoaded', async () => {
     modalCloseBtn.addEventListener('click', closeConfigModal);
   }
 
+  // Opens the Schema Viewer for whichever connection is currently ACTIVE -
+  // same {kind, id} addressing, and the same active-connection fields, as
+  // the "OPEN SCHEMA VIEWER" chat sentinel's own dispatch (see its comment
+  // a bit further down in this file). This button lives NESTED INSIDE
+  // configTriggerBadge (see index.html's own comment on it) rather than
+  // inside the config modal on purpose: it replaced that modal's old
+  // per-row "?" buttons, which could open the Schema Viewer for a
+  // connection other than the active one (so a suggested-question prompt
+  // fired from it could run against the wrong dataset) and always opened
+  // on top of the config modal (so the user had to dismiss two dialogs to
+  // see their results). A button that only ever means "the active
+  // connection" can't have either problem - and living inside the dataset
+  // badge itself (rather than floating beside it as an unrelated icon)
+  // makes it obvious at a glance which dataset it's asking about.
+  if (datasetSchemaViewerBtn) {
+    datasetSchemaViewerBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      // Required now that this button is NESTED inside configTriggerBadge
+      // rather than a sibling of it - without this, the click would also
+      // bubble up and fire configTriggerBadge's own click-to-configure
+      // handler right after this one runs.
+      e.stopPropagation();
+      if (datasetSchemaViewerBtn.classList.contains('badge-disabled')) return;
+      const schemaKind = ACTIVE_IS_CUSTOM ? 'custom' : 'preset';
+      const schemaId = ACTIVE_IS_CUSTOM ? ACTIVE_CUSTOM_CONNECTION_KEY : ACTIVE_PRESET_ID;
+      if (schemaKind && schemaId) {
+        openSchemaViewer(schemaKind, schemaId, connDbName ? connDbName.textContent : '');
+      }
+    });
+  }
+
   // ===========================================================================
   // GUIDED TOUR (first-run onboarding walkthrough)
   // ===========================================================================
@@ -5051,8 +5112,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     const resultsCard = document.querySelector('.table-card');
     const historyNav = document.querySelector('.inline-history-nav');
     const authContainer = googleAuthEnabled ? document.getElementById('g_id_signin') : null;
-    const quickPrompts = document.getElementById('examplePrompts');
-    const quickPromptsVisible = quickPrompts && !quickPrompts.classList.contains('hidden');
     // Under the narrow-header breakpoint, historyBtn/authContainer/helpBtn/
     // sendFeedbackBtn are CSS-hidden (collapsed into the triple-dot
     // #moreMenuBtn - see the MORE MENU section above) - they'd still exist
@@ -5071,11 +5130,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         target: promptWrapper,
         title: 'Ask your question here',
         body: "Type what you want to know in plain English or any other language and hit Enter."
-      },
-      {
-        target: quickPromptsVisible ? quickPrompts : null,
-        title: 'Not sure what to ask?',
-        body: 'Click one of these example prompts to see the whole flow in action, from question to SQL to results.'
       },
       {
         target: sqlWrapper,
@@ -5098,6 +5152,11 @@ document.addEventListener('DOMContentLoaded', async () => {
         body: "Click this badge to switch to any pre-configured database or connect to your own."
       },
       {
+        target: datasetSchemaViewerBtn,
+        title: 'Peek at its schema anytime',
+        body: 'Click the "i" inside the badge to see this dataset\'s tables, columns, and an ER diagram - without switching which dataset you\'re connected to.'
+      },
+      {
         target: modelTriggerBadge,
         title: "This is the AI model translating your questions",
         body: "Click this badge to switch between the available models, grouped by provider (Google, Anthropic, OpenAI)."
@@ -5116,8 +5175,8 @@ document.addEventListener('DOMContentLoaded', async () => {
       },
       {
         target: historyBtn,
-        title: 'Past queries, saved',
-        body: 'Every translation you run is saved here so you can revisit or reuse it later.'
+        title: 'Reset your conversations',
+        body: 'Review your past conversation and delete past turns for any dataset whenever you want a clean slate.'
       },
       {
         target: authContainer,
@@ -5306,9 +5365,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
-  // "Replay guided tour" - lives inside the Help modal (next to "Show
-  // quick prompts again") so anyone - not just during development - can
-  // re-run the walkthrough without digging through localStorage.
+  // "Replay guided tour" - lives inside the Help modal so anyone - not
+  // just during development - can re-run the walkthrough without digging
+  // through localStorage.
   const replayTourBtn = document.getElementById('replayTourBtn');
   if (replayTourBtn && helpModal) {
     replayTourBtn.addEventListener('click', () => {
@@ -5373,10 +5432,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // OK-only variant of showConfirmDialog() above, for the failure case -
   // this app otherwise shows errors inline (e.g. #configSaveError), but
-  // the "Refresh Schema" button (handleRefreshSchemaClick, above) is
-  // specified to show a real popup on failure instead. Nothing to
-  // confirm/cancel here, only to acknowledge, so OK, the close button,
-  // and clicking outside the modal all just dismiss it the same way.
+  // some flows are specified to show a real popup on failure instead.
+  // Nothing to confirm/cancel here, only to acknowledge, so OK, the close
+  // button, and clicking outside the modal all just dismiss it the same way.
   function showAlertDialog(message) {
     return new Promise((resolve) => {
       const modal = document.getElementById('alertModal');
@@ -5817,8 +5875,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         const direction = summaryFeedbackTrigger.dataset.summaryFeedbackTrigger;
         openReportIssueModal({ category: direction === 'up' ? 'summary_thumbs_up' : 'summary_thumbs_down' });
       }
-      // The Summary tab's "View as chart" callout (see
-      // summaryChartCalloutHtml()/jumpToChartableResultTab()) - same
+      // The Summary tab's "View as chart" inline link (see
+      // summaryChartInlineLinkHtml()/jumpToChartableResultTab()) - same
       // delegated-listener reasoning as the two triggers above.
       const viewChartTrigger = e.target.closest('[data-view-chart-trigger]');
       if (viewChartTrigger) jumpToChartableResultTab();
@@ -6113,9 +6171,1401 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
+  // ===========================================================================
+  // SCHEMA VIEWER (#schemaViewerModal) - a read-only browser for ONE
+  // already-identified dataset's schema: a left-hand list of every
+  // table/table-family/tab entry, and the selected entry's schema on the
+  // right - a structured table of columns/types/nullability/attributes at
+  // the top (see parseSchemaEntryColumns() below), with any raw text the
+  // parser didn't account for underneath. Fed entirely by GET /api/schema
+  // (config_routes.py), which returns the SAME cached schema_text and
+  // Table:/Table family:/Tab: entries every real /api/translate prompt
+  // already sees (backends/base.py's split_schema_text_into_entries) -
+  // deliberately not a second, separately-maintained introspection pass
+  // that could drift from what the model actually gets to see.
+  //
+  // Entry point: a small "?" (help-circle) icon button next to each
+  // dataset's name in the DB connection dialog - one per preset
+  // (renderPresetOption() below) and one per saved custom connection
+  // (renderCustomDbRows() below, gated on db.connection_key the same way
+  // that row's own Refresh Schema button already is - an unsaved new row
+  // has no schema to show yet). There is deliberately no in-dialog
+  // connection picker any more (an earlier version had one) - each "?"
+  // button already identifies exactly which dataset it's for, so the
+  // modal always opens already scoped to one, named by its own title.
+  //
+  // No search box on the left-hand list for now (an earlier version had
+  // one, filtering by name and body text) - just a plain, full list of
+  // every entry.
+  //
+  // The list itself is a 2-level tree: up to four top-level groups
+  // (Tables/Views/Indexes/Routines, each labeled with its own item count
+  // and collapsible - see schemaViewerExpanded below), each holding the
+  // matching items parsed out of this connection's schema text. Tables
+  // come from the same Table:/Table family:/Tab: entries the columns
+  // table (etc.) already uses; Views/Indexes/Routines come from their own
+  // global sections (see parseSchemaViews()/parseSchemaIndexes()/
+  // parseSchemaRoutines() below) the same way Row count estimates/
+  // Constraints/Column value samples do. A group this dialect/connection
+  // has none of (most dialects have no Indexes section at all - see
+  // parseSchemaIndexes()'s own comment) is left out of the tree entirely
+  // (see renderSchemaViewerEntryList()) rather than shown as an empty,
+  // non-expandable "(0)" row.
+  // ===========================================================================
+
+  // This request's own connection reference ({kind: 'preset'|'custom', id})
+  // and the entries GET /api/schema last returned for it - module-scoped
+  // so the entry selection and the Refresh button can both read/re-render
+  // off the same last-fetched result without threading it through every
+  // function's parameters.
+  let schemaViewerCurrentRef = { kind: '', id: '' };
+  let schemaViewerEntries = [];
+  // { category: 'tables'|'views'|'indexes'|'routines'|null, index: number }
+  // - which single leaf in the tree is selected, if any. Replaces a bare
+  // index now that the list holds four separate item arrays rather than
+  // just schemaViewerEntries.
+  let schemaViewerSelected = { category: null, index: -1 };
+  // Which top-level groups are expanded - reset on every fresh load (see
+  // loadSchemaViewerConnection()) rather than persisted across
+  // connections, since a group that made sense to collapse/expand for one
+  // dataset has no bearing on the next one opened. All four start
+  // collapsed - the dialog opens landed on the pinned "Overview" entry
+  // instead (see renderSchemaViewerEntryList()'s default-selection logic),
+  // so there's no need for any group's own contents to already be
+  // unfurled underneath it.
+  let schemaViewerExpanded = { tables: false, views: false, indexes: false, routines: false };
+  // Views/Indexes/Routines parsed once per load (see parseSchemaViews()/
+  // parseSchemaIndexes()/parseSchemaRoutines() below) - lists in the same
+  // spirit as schemaViewerEntries above, just for these other three tree
+  // groups. schemaViewerViews: [{ name, definition }]. schemaViewerIndexes:
+  // [{ table, name, kind, detail }]. schemaViewerRoutines: [{ name,
+  // signature, returnType, body }].
+  let schemaViewerViews = [];
+  let schemaViewerIndexes = [];
+  let schemaViewerRoutines = [];
+  // Per-table metadata parsed once per load out of the "Row count
+  // estimates:"/"Live row counts:"/"Column value samples:"/"Constraints:"
+  // global sections (see parseSchemaRowCounts()/parseSchemaColumnSamples()/
+  // parseSchemaConstraints() below) and looked up by table name for
+  // whichever entry is selected - NOT scoped to one entry, since those
+  // sections describe every table in the connection at once, keyed by
+  // name, regardless of which single entry's raw text they happened to
+  // end up appended to (see this feature's own section comment above for
+  // why that's always the last one). schemaViewerRowCounts: {
+  // [tableName]: { live: {count, note}?, estimate: {count, note}? } }.
+  // schemaViewerSamples/schemaViewerConstraints: { [tableName]: {
+  // [columnName]: text } }.
+  let schemaViewerRowCounts = {};
+  let schemaViewerSamples = {};
+  let schemaViewerConstraints = {};
+  // This connection's cached, LLM-written {"prose", "questions",
+  // "generated_at"} pair (see GET /api/schema's own "overview" field,
+  // config_routes.py) - null whenever nothing has been generated (or
+  // cached) for it yet, rendered by renderSchemaViewerOverviewDetail()
+  // below as "nothing to show yet" rather than an error. Never fetched
+  // separately - it rides along on the same /api/schema response the
+  // rest of this load already uses.
+  let schemaViewerOverview = null;
+  // Facts about the whole connection, parsed/derived once per load and
+  // rendered together at the top of the Overview tab (see
+  // renderSchemaViewerStatsBlockHtml() below) rather than under the modal
+  // title the way schemaViewerSessionInfoText alone used to be shown -
+  // none of these are specific to any one table/view/index/routine.
+  // schemaViewerSessionInfoText: the "Session: ..." one-liner (see
+  // parseSchemaSessionInfo() below), '' when a dialect emits none (e.g.
+  // backends/databricks.py) - rendered under an "Other settings:" label,
+  // not "Session:" (see renderSchemaViewerStatsBlockHtml()).
+  // schemaViewerDatasetSizeLine: the "Estimated dataset size: ..."
+  // one-liner the deep fetch appends when its dialect can cheaply
+  // estimate one (see parseSchemaDatasetSizeLine() below and
+  // backends/base.py's format_dataset_size_line()), '' when a dialect has
+  // no cheap way to (e.g. backends/mongodb_sql.py, backends/sheets.py) -
+  // shown side by side with schemaViewerSchemaCharCount on one row.
+  // schemaViewerSchemaCharCount: fullText.length - the raw schema text
+  // size actually sent to the LLM, in characters. schemaViewerDialect:
+  // GET /api/schema's own "dialect" field, used for the modal title (see
+  // loadSchemaViewerConnection()). schemaViewerLimitWarnings: plain-text
+  // warning lines for whichever of SCHEMA_MAX_TABLES/SCHEMA_MAX_SCHEMA_
+  // CHARS this connection is actually hitting right now (mirrors data.
+  // truncated/data.has_omitted_tables - see loadSchemaViewerConnection()'s
+  // own comment; these used to only show in the dismissable notice bar).
+  let schemaViewerSessionInfoText = '';
+  let schemaViewerDatasetSizeLine = '';
+  let schemaViewerSchemaCharCount = 0;
+  let schemaViewerDialect = '';
+  let schemaViewerLimitWarnings = [];
+  // Real FK constraints and naming-convention-guessed relationships,
+  // parsed once per load (parseSchemaForeignKeys()/
+  // parseSchemaNamingRelationships() below) purely to feed the ER
+  // diagram (buildSchemaErDiagram()/renderSchemaErDiagram() below) -
+  // deterministic, built entirely client-side from data already in the
+  // fetched schema text, never from an LLM. [{ table, column, refTable,
+  // refColumn? }].
+  let schemaViewerForeignKeys = [];
+  let schemaViewerNamingRelationships = [];
+  // Guards against a slow fetch for connection A resolving AFTER the user
+  // has already switched the picker to connection B and gotten B's
+  // (faster) response back - without this, A's stale response would
+  // silently overwrite B's already-rendered result. Bumped on every new
+  // fetch; a response only renders if it's still the most recent one
+  // requested by the time it comes back, mirroring the same
+  // request-token guard pattern used elsewhere in this file for
+  // in-flight-request races (e.g. translatePrompt's own).
+  let schemaViewerRequestToken = 0;
+
+  // Matches one column's rendered line, in the "  {name} {type} {NULL|NOT
+  // NULL}[ {whatever the dialect appends next}]" shape essentially every
+  // SQL-family backend's get_schema()/get_schema_shallow() commits to for
+  // every column it emits (see e.g. backends/postgres.py, backends/
+  // mysql.py, backends/mssql.py, and so on - confirmed the same across
+  // every dialect that isn't backends/sheets.py's spreadsheet-column
+  // format). Only the "{name} {type} {NULL|NOT NULL}" prefix is assumed;
+  // whatever a given dialect appends after that (" DEFAULT ...",
+  // " IDENTITY", " AUTO_INCREMENT", some combination of those, or
+  // nothing at all) is captured as one free-form "attributes" group
+  // rather than trying to pick apart every dialect's own suffix format.
+  // The type group is non-greedy so a multi-word type name (Postgres's
+  // "character varying", for instance) is still captured whole - it just
+  // expands token by token until the NULL/NOT NULL keyword is found,
+  // which is exactly the one fixed anchor every dialect's line shares.
+  const SCHEMA_COLUMN_LINE_RE = /^ {2}(\S+)\s+(.+?)\s+(NOT NULL|NULL)(?:\s+(\S.*))?$/;
+
+  // Splits one entry's text into its parsed column rows (if any) and
+  // whatever text is left over. Line 0 is always the entry's own heading
+  // line (Table:/Table family:/Tab: ...) and is never treated as a
+  // column. Parsing stops at the first line that doesn't fit the column
+  // shape - either because the columns have simply ended, or (for
+  // whichever entry happens to be LAST - see split_schema_text_into_
+  // entries()'s own docstring in backends/base.py) because a global,
+  // non-per-table section like "Constraints:"/"Indexes:"/"Views:" has no
+  // heading of its own and so gets folded onto the end of that one
+  // entry's block. Either way, everything from that point on is left for
+  // the raw-text area below the table rather than guessed at further.
+  // Never throws - a dialect that doesn't follow this convention at all
+  // (backends/sheets.py, or the "No schema description available."
+  // fallback sentinel) just yields zero columns, and the caller shows the
+  // full raw text with no table.
+  function parseSchemaEntryColumns(entryText) {
+    const lines = (entryText || '').split('\n');
+    const columns = [];
+    let i = 1;
+    for (; i < lines.length; i++) {
+      const m = SCHEMA_COLUMN_LINE_RE.exec(lines[i]);
+      if (!m) break;
+      columns.push({ name: m[1], type: m[2], nullable: m[3] === 'NULL', attributes: m[4] || '' });
+    }
+    return { columns, remainder: lines.slice(i).join('\n').replace(/^\n+/, '') };
+  }
+
+  // A line at column 0 (no leading whitespace) marks the start of a new
+  // top-level section (a "Header:" line, or occasionally a bare one-line
+  // section with no body of its own, like the Session line get_schema()
+  // emits) - every other schema_parts section (backends/*.py's own numbered
+  // comments describe the full list: Constraints, Indexes, Views, Grants,
+  // Triggers, Comments, Row count estimates, Live row counts, Column value
+  // samples, and so on) renders exclusively blank or 2-/4-space-indented
+  // lines underneath its own header. This is the same "what marks a
+  // section boundary" question split_schema_text_into_entries() answers
+  // for Table:/Table family:/Tab: headings specifically (backends/base.py)
+  // - this is the generic version, for the un-headed global sections that
+  // get folded onto the last table entry (see this feature's own section
+  // comment above).
+  function isTopLevelSchemaSectionLine(line) {
+    return line !== '' && !/^\s/.test(line);
+  }
+
+  // Isolates one named top-level section's body text (everything between
+  // its own "{headerName}:" line and the next top-level line, or end of
+  // text) out of a block of schema text. Returns null if that header isn't
+  // present at all. `headerName` is used literally in a RegExp, so callers
+  // only ever pass fixed strings, never anything derived from schema data.
+  function extractNamedSchemaSection(fullText, headerName) {
+    const lines = (fullText || '').split('\n');
+    // \b...\.* rather than an exact "{headerName}:" match, because a few
+    // dialects append their own caveat straight into the header line
+    // itself rather than the body - e.g. Redshift's "Constraints
+    // (declared only - Redshift never enforces these at write time):" or
+    // MSSQL's "Constraints (enforced at write time):" vs. every other
+    // backend's plain "Constraints:". The section name itself is still a
+    // fixed literal per caller; only what's between it and the trailing
+    // colon is allowed to vary.
+    const headerRe = new RegExp(`^${headerName}\\b.*:\\s*$`);
+    let start = -1;
+    for (let i = 0; i < lines.length; i++) {
+      if (headerRe.test(lines[i])) { start = i + 1; break; }
+    }
+    if (start === -1) return null;
+    let end = lines.length;
+    for (let i = start; i < lines.length; i++) {
+      if (isTopLevelSchemaSectionLine(lines[i])) { end = i; break; }
+    }
+    const body = lines.slice(start, end).join('\n').replace(/\n+$/, '');
+    return body || null;
+  }
+
+  // Removes one or more named top-level sections (header line + body)
+  // entirely from a block of schema text, once their content has been
+  // promoted into a structured field elsewhere (row counts, column
+  // samples) and would otherwise be shown twice. Everything else is left
+  // untouched, including sections not named here - later rounds can
+  // promote more of those without this function changing. Collapses the
+  // blank-line gaps left behind so removed sections don't leave stray
+  // empty paragraphs.
+  function stripNamedSchemaSections(text, headerNames) {
+    const lines = (text || '').split('\n');
+    // Same \b...\.* header matching as extractNamedSchemaSection() above -
+    // see its own comment on why (Redshift/MSSQL's own caveat wording
+    // inside the "Constraints" header line itself).
+    const headerRes = headerNames.map((h) => new RegExp(`^${h}\\b.*:\\s*$`));
+    const kept = [];
+    let i = 0;
+    while (i < lines.length) {
+      if (headerRes.some((re) => re.test(lines[i]))) {
+        i++;
+        while (i < lines.length && !isTopLevelSchemaSectionLine(lines[i])) i++;
+        continue;
+      }
+      kept.push(lines[i]);
+      i++;
+    }
+    return kept.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  }
+
+  // Parses the "Row count estimates:"/"Live row counts:" global sections
+  // (backends/*.py's own Phase 1/Phase 2 row-count queries - see e.g.
+  // postgres.py's pg_class.reltuples estimate vs. its live SELECT COUNT(*)
+  // pass) into { [tableName]: { live: {count, note}?, estimate: {count,
+  // note}? } }. Both line formats share a "{tbl}: {~}{N} rows (...)"
+  // shape; the leading "~" (estimate only) and the exact parenthetical
+  // wording vary slightly per dialect (MySQL/Redshift append their own
+  // extra caveats - staleness, which storage engine, etc.), which is why
+  // this only requires it starts with "estimate"/"live" and keeps
+  // whatever follows as a free-form `note` rather than pattern-matching
+  // every dialect's own wording.
+  function parseSchemaRowCounts(fullText) {
+    const result = {};
+    const estimateBody = extractNamedSchemaSection(fullText, 'Row count estimates');
+    if (estimateBody) {
+      const re = /^ {2}(\S+):\s*~([\d,]+)\s*rows\s*\((estimate[^)]*)\)(.*)$/;
+      estimateBody.split('\n').forEach((line) => {
+        const m = re.exec(line);
+        if (!m) return;
+        result[m[1]] = result[m[1]] || {};
+        result[m[1]].estimate = { count: m[2], note: `${m[3]}${m[4] || ''}`.trim() };
+      });
+    }
+    const liveBody = extractNamedSchemaSection(fullText, 'Live row counts');
+    if (liveBody) {
+      const re = /^ {2}(\S+):\s*([\d,]+)\s*rows\s*\((live[^)]*)\)$/;
+      liveBody.split('\n').forEach((line) => {
+        const m = re.exec(line);
+        if (!m) return;
+        result[m[1]] = result[m[1]] || {};
+        result[m[1]].live = { count: m[2], note: m[3].trim() };
+      });
+    }
+    return result;
+  }
+
+  // Parses the "Column value samples:" global section (backends/*.py's
+  // Phase 2 min/max + frequent-value queries, gated by MAX_COLUMNS_FOR_
+  // SAMPLING/cardinality checks in each backend) into { [tableName]: {
+  // [columnName]: sampleText } } - the raw line for a numeric/date column
+  // reads "range [1 .. 500]" and a categorical one "frequent values =
+  // active (120), inactive (30)", but those "range"/"frequent values ="
+  // labels are only needed in the raw schema text itself (where they're
+  // the only cue distinguishing the two kinds of sample, including for the
+  // LLM prompts that raw text feeds into) - once shown in this dialog's
+  // own "Sample values" COLUMN of the columns table, the column header
+  // already says what it is, so repeating the label in every cell was
+  // just noise. Stripped here, at parse time, rather than in the raw
+  // schema text itself, so the LLM-facing text keeps its own labels intact.
+  const SAMPLE_TEXT_LABEL_RE = /^(?:range\s+|frequent values\s*=\s*)/i;
+
+  function parseSchemaColumnSamples(fullText) {
+    const result = {};
+    const body = extractNamedSchemaSection(fullText, 'Column value samples');
+    if (!body) return result;
+    const tableHeaderRe = /^ {2}Table: (\S+)$/;
+    const colLineRe = /^ {4}(\S+):\s*(.+)$/;
+    body.split(/\n{2,}/).forEach((block) => {
+      const blockLines = block.split('\n');
+      const headerMatch = tableHeaderRe.exec(blockLines[0] || '');
+      if (!headerMatch) return;
+      const cols = {};
+      for (let i = 1; i < blockLines.length; i++) {
+        const m = colLineRe.exec(blockLines[i]);
+        if (m) cols[m[1]] = m[2].replace(SAMPLE_TEXT_LABEL_RE, '');
+      }
+      result[headerMatch[1]] = cols;
+    });
+    return result;
+  }
+
+  // Parses the "Constraints:" global section - also matched under a
+  // dialect's own variant wording, e.g. Redshift's "Constraints (declared
+  // only - Redshift never enforces these at write time):" or MSSQL's
+  // "Constraints (enforced at write time):" (see extractNamedSchemaSection()'s
+  // own comment - the body format itself is identical either way) - into
+  // { [tableName]: { [columnName]: description } }, e.g. "PRIMARY KEY" or
+  // "FOREIGN KEY -> orders(id)". A constraint with no single column of its
+  // own (a composite CHECK expression, say) has nothing to attach to one
+  // column's row and is skipped here - not lost, just not yet promoted
+  // anywhere (there's no table-level-constraints area yet). A column with
+  // more than one constraint (e.g. both a UNIQUE and a CHECK) gets both,
+  // comma-joined.
+  function parseSchemaConstraints(fullText) {
+    const result = {};
+    const body = extractNamedSchemaSection(fullText, 'Constraints');
+    if (!body) return result;
+    const re = /^ {2}\[(\S+)\] \S+ \(([^)]+)\)(?::\s*(.+))?$/;
+    body.split('\n').forEach((line) => {
+      const m = re.exec(line);
+      if (!m) return;
+      const [, tbl, cType, rest] = m;
+      if (!rest) return; // table-level - no single column to attach this to
+      const arrowSplit = rest.split(' -> ');
+      const col = arrowSplit[0];
+      const desc = arrowSplit.length > 1 ? `${cType} -> ${arrowSplit[1]}` : cType;
+      result[tbl] = result[tbl] || {};
+      result[tbl][col] = result[tbl][col] ? `${result[tbl][col]}, ${desc}` : desc;
+    });
+    return result;
+  }
+
+  // Parses the "Constraints:" section's FOREIGN KEY entries specifically -
+  // used only to build the ER diagram (see buildSchemaErDiagram() below).
+  // parseSchemaConstraints() above already extracts a flattened per-column
+  // description string (for the columns table's own "Constraints"
+  // column) but collapses the FK target's table and column into one
+  // string - the diagram needs them kept separate to draw a real edge
+  // between two entities. Returns [{ table, column, refTable, refColumn }]
+  // - one entry per FK column (a composite FK spanning multiple columns
+  // still yields one edge per column, which is enough for a big-picture
+  // diagram; it doesn't need to be a perfectly normalized ER model).
+  function parseSchemaForeignKeys(fullText) {
+    const result = [];
+    const body = extractNamedSchemaSection(fullText, 'Constraints');
+    if (!body) return result;
+    const re = /^ {2}\[(\S+)\] \S+ \(FOREIGN KEY\): (\S+) -> (\S+)\((\S+)\)$/;
+    body.split('\n').forEach((line) => {
+      const m = re.exec(line);
+      if (!m) return;
+      const [, table, column, refTable, refColumn] = m;
+      result.push({ table, column, refTable, refColumn });
+    });
+    return result;
+  }
+
+  // Parses the "Likely relationships (naming convention, unconfirmed):"
+  // global section (backends/base.py's find_naming_convention_relationships())
+  // for the ER diagram's own dashed/"unconfirmed" edges. Only heuristic
+  // 1's "references <table>" lines (a column name matching another
+  // table's own name) give one clear target table to draw an edge to;
+  // heuristic 2's "same column name also appears in ..." lines (which can
+  // list several other tables at once, with no single obvious "parent")
+  // are intentionally skipped here as too ambiguous to draw as one edge -
+  // they're still visible as plain text elsewhere; this only affects the
+  // diagram. Returns [{ table, column, refTable }].
+  function parseSchemaNamingRelationships(fullText) {
+    const result = [];
+    const body = extractNamedSchemaSection(fullText, 'Likely relationships');
+    if (!body) return result;
+    const re = /^ {2}(\S+)\.(\S+) -> likely relationship \(unconfirmed\): references (\S+),/;
+    body.split('\n').forEach((line) => {
+      const m = re.exec(line);
+      if (!m) return;
+      const [, table, column, refTable] = m;
+      result.push({ table, column, refTable });
+    });
+    return result;
+  }
+
+  // Builds a Mermaid erDiagram source string from this connection's own
+  // already-parsed schema data - deterministic, no LLM involved (see
+  // schema_cache.py's own module docstring for the full "why"): a real FK
+  // constraint becomes a solid "identifying" edge, a naming-convention-
+  // only match becomes a dashed "non-identifying" edge (Mermaid's own
+  // `..` line style), captioned "(unconfirmed)" so it never reads with
+  // the same confidence as a real FK. A naming-convention match between a
+  // pair of tables a real FK already connects (in either direction) is
+  // dropped - it adds nothing once a confirmed relationship already links
+  // them. Only tables that appear in at least one edge are drawn - an
+  // isolated table with no detected relationship is left out of the
+  // diagram entirely (it's still fully visible, with its own columns, in
+  // the Tables tree) rather than added as a bare, unconnected box, which
+  // would need a separate "declare an entity with no relationship" syntax
+  // this deliberately avoids relying on. Returns null (never an empty/
+  // header-only diagram) when nothing was found to draw - the caller
+  // shows a plain "no relationships detected" message instead.
+  //
+  // Entity ids are sanitized (non [A-Za-z0-9_] characters replaced with
+  // "_", prefixed with "t_" if the result wouldn't otherwise start with a
+  // letter/underscore) since Mermaid entity names can't contain arbitrary
+  // characters - a schema-qualified name like "reporting.customers" would
+  // otherwise break the diagram source. The sanitized id is also what's
+  // DISPLAYED on the diagram (no separate alias) - a deliberate, safer
+  // choice over relying on a display-alias syntax that isn't reliably
+  // supported across Mermaid versions; the real, unsanitized name is
+  // always still visible in the Tables tree/detail pane right next to it.
+  function buildSchemaErDiagram(tableNames, foreignKeys, namingRelationships) {
+    const known = new Set(tableNames);
+    const idFor = new Map();
+    const idOf = (name) => {
+      if (!idFor.has(name)) {
+        const cleaned = String(name).replace(/[^A-Za-z0-9_]/g, '_');
+        idFor.set(name, /^[A-Za-z_]/.test(cleaned) ? cleaned : `t_${cleaned}`);
+      }
+      return idFor.get(name);
+    };
+
+    const lines = [];
+    const seenEdges = new Set();
+    (foreignKeys || []).forEach((fk) => {
+      if (!known.has(fk.table) || !known.has(fk.refTable) || fk.table === fk.refTable) return;
+      const edgeKey = `${fk.refTable}::${fk.table}::${fk.column}`;
+      if (seenEdges.has(edgeKey)) return;
+      seenEdges.add(edgeKey);
+      lines.push(`  ${idOf(fk.refTable)} ||--o{ ${idOf(fk.table)} : "${fk.column.replace(/"/g, "'")}"`);
+    });
+    (namingRelationships || []).forEach((rel) => {
+      if (!known.has(rel.table) || !known.has(rel.refTable) || rel.table === rel.refTable) return;
+      const alreadyConfirmed = (foreignKeys || []).some((fk) =>
+        (fk.table === rel.table && fk.refTable === rel.refTable)
+        || (fk.table === rel.refTable && fk.refTable === rel.table));
+      if (alreadyConfirmed) return;
+      const edgeKey = `${rel.refTable}::${rel.table}::${rel.column}::naming`;
+      if (seenEdges.has(edgeKey)) return;
+      seenEdges.add(edgeKey);
+      lines.push(`  ${idOf(rel.refTable)} ||..o{ ${idOf(rel.table)} : "${rel.column.replace(/"/g, "'")} (unconfirmed)"`);
+    });
+
+    if (lines.length === 0) return null;
+    return ['erDiagram', ...lines].join('\n');
+  }
+
+  // Renders (or re-renders) the ER diagram into #schemaViewerErDiagram
+  // from this load's own parsed foreign keys/naming relationships - see
+  // buildSchemaErDiagram() above. Called only when the Overview entry is
+  // actually selected (not on every load), since Mermaid's own render()
+  // isn't free and the diagram is only ever visible there.
+  // schemaErDiagramRenderToken guards the same "a slower render from a
+  // previous selection/load resolving after a newer one" race every other
+  // async render in this file guards against (see schemaViewerRequestToken).
+  let schemaErDiagramRenderToken = 0;
+  async function renderSchemaErDiagram() {
+    const container = document.getElementById('schemaViewerErDiagram');
+    if (!container) return;
+    const tableNames = schemaViewerEntries.filter((e) => e.name !== null).map((e) => e.name);
+    const diagramSource = buildSchemaErDiagram(tableNames, schemaViewerForeignKeys, schemaViewerNamingRelationships);
+    if (!diagramSource) {
+      container.innerHTML = '<p class="text-muted schema-viewer-overview-empty">No table relationships were detected to diagram.</p>';
+      return;
+    }
+    if (typeof window.mermaid === 'undefined') {
+      container.innerHTML = '<p class="text-muted schema-viewer-overview-empty">Diagram library failed to load.</p>';
+      return;
+    }
+    const myToken = ++schemaErDiagramRenderToken;
+    const renderId = `schema-er-diagram-${Date.now()}`;
+    try {
+      window.mermaid.initialize({
+        startOnLoad: false,
+        theme: document.documentElement.getAttribute('data-theme') === 'light' ? 'default' : 'dark',
+        securityLevel: 'strict',
+      });
+      const { svg } = await window.mermaid.render(renderId, diagramSource);
+      if (myToken !== schemaErDiagramRenderToken) return; // superseded by a newer selection/load
+      container.innerHTML = svg;
+    } catch (err) {
+      console.error('Failed to render ER diagram:', err);
+      if (myToken !== schemaErDiagramRenderToken) return;
+      container.innerHTML = '<p class="text-muted schema-viewer-overview-empty">Could not render the ER diagram for this schema.</p>';
+    }
+  }
+
+  // Parses a "View definitions:"/"Routine definitions:" section body
+  // (already isolated by extractNamedSchemaSection) into {name: body}
+  // pairs, where a real definition is very often NOT just one line - a
+  // view's SELECT text or a routine's CREATE.../body text, straight from
+  // the database, normally spans several (see backends/base.py's
+  // format_multiline_schema_entry_body(), which guarantees every
+  // continuation line starts indented so it can never be confused for the
+  // start of a new top-level schema section - see that function's own
+  // docstring). `headerRe` must match only an entry's own "  <name>: "
+  // header line (exactly two leading spaces, per that same formatting
+  // convention) and capture the name in group 1 and the rest of that
+  // first line in group 2; every line that ISN'T itself a new header -
+  // regardless of its own indentation - is appended to whichever entry is
+  // currently open, exactly like a real multi-line SQL body needs. A
+  // naive per-line regex match here (matching `headerRe` against every
+  // line independently, keeping only the ones that match) is the bug this
+  // replaces: it silently truncated every real, multi-line definition
+  // down to just its own first line - "SELECT a.id," and nothing else -
+  // rather than dropping the WHOLE definition, which is why that bug
+  // could look, at a glance, like a real value that just happened to be
+  // short, not a parsing failure.
+  function parseMultilineDefinitionSection(defBody, headerRe) {
+    const result = {};
+    if (!defBody) return result;
+    let currentName = null;
+    let currentLines = [];
+    const flush = () => {
+      if (currentName !== null) result[currentName] = currentLines.join('\n').trim();
+    };
+    defBody.split('\n').forEach((line) => {
+      const m = headerRe.exec(line);
+      if (m) {
+        flush();
+        currentName = m[1];
+        currentLines = m[2] ? [m[2]] : [];
+      } else if (currentName !== null) {
+        currentLines.push(line);
+      }
+    });
+    flush();
+    return result;
+  }
+
+  // Parses the "Views:" (shallow, name-only) and "View definitions:"
+  // (deep-only, full body) global sections into one list: [{ name,
+  // definition }]. The name list normally comes from "Views:" (present on
+  // both a shallow and a deep fetch); "View definitions:" is consulted
+  // only for its body text, keyed by name (see
+  // parseMultilineDefinitionSection() above for why that body can safely
+  // span multiple lines), and as a fallback source of names on the off
+  // chance a dialect ever emitted one without the other. A view whose
+  // definition isn't available (the connected role lacks the privilege to
+  // see it - see e.g. backends/postgres.py's own view_definition NULL
+  // handling) simply gets an empty definition.
+  function parseSchemaViews(fullText) {
+    const defBody = extractNamedSchemaSection(fullText, 'View definitions');
+    const definitions = parseMultilineDefinitionSection(defBody, /^ {2}View (\S+): ?(.*)$/);
+    const names = [];
+    const shallowBody = extractNamedSchemaSection(fullText, 'Views');
+    if (shallowBody) {
+      const re = /^ {2}View (\S+)$/;
+      shallowBody.split('\n').forEach((line) => {
+        const m = re.exec(line);
+        if (m) names.push(m[1]);
+      });
+    }
+    const allNames = names.length > 0 ? names : Object.keys(definitions);
+    return allNames.map((name) => ({ name, definition: definitions[name] || '' }));
+  }
+
+  // The RHS fallback message for a view whose definition came back empty -
+  // dialect-specific, since "the connected role may lack the privilege" is
+  // vague to the point of unhelpful when the real, nameable cause differs
+  // by dialect and is usually NOT the same "SELECT on this object" grant a
+  // connection already needs to query the view's DATA in the first place:
+  // Postgres's information_schema.views.view_definition (superseded by
+  // pg_get_viewdef() server-side, but this message still covers a
+  // genuinely revoked case) needs the role to at least see the view's
+  // pg_class row; MySQL's INFORMATION_SCHEMA.VIEWS.VIEW_DEFINITION/SHOW
+  // CREATE VIEW specifically needs the separate SHOW VIEW privilege (a
+  // real SELECT grant on the view's data does NOT imply this); SQL
+  // Server's INFORMATION_SCHEMA.VIEWS.VIEW_DEFINITION/sys.sql_modules
+  // specifically needs VIEW DEFINITION permission on that object (same
+  // "SELECT doesn't imply this" gap) - naming the actual missing grant
+  // turns this from an unfalsifiable catch-all into something an admin can
+  // go check/fix. Every other dialect keeps the generic wording, since
+  // none of the SQL backends here has an equivalent named, separate
+  // privilege for this.
+  function schemaViewerNoViewDefinitionMessage() {
+    const dialect = (schemaViewerDialect || '').toLowerCase();
+    if (dialect.includes('mysql')) {
+      return '(No view definition available - the connected user needs the SHOW VIEW privilege for this. Having SELECT on the view itself is not enough.)';
+    }
+    if (dialect.includes('sql server')) {
+      return '(No view definition available - the connected login needs VIEW DEFINITION permission on this view. Having SELECT on the view itself is not enough.)';
+    }
+    return '(No view definition available - the connected role may lack the privilege to see it.)';
+  }
+
+  // Parses the "Indexes:" global section - only backends/postgres.py and
+  // backends/mysql.py ever emit one (every other dialect here is either a
+  // cloud warehouse with no user-managed indexes, or - Redshift - has none
+  // at all; see redshift.py's own docstring), so an empty result here is
+  // normal for most connections, not a parsing failure. Handles both
+  // known line shapes generically: postgres's "[tbl] name: indexdef" and
+  // mysql's "[tbl] name (kind): col1, col2" - `kind` is simply absent for
+  // postgres's own lines. Returns [{ table, name, kind, detail }].
+  function parseSchemaIndexes(fullText) {
+    const indexes = [];
+    const body = extractNamedSchemaSection(fullText, 'Indexes');
+    if (!body) return indexes;
+    const re = /^ {2}\[(\S+)\] (\S+)(?: \(([^)]+)\))?: (.+)$/;
+    body.split('\n').forEach((line) => {
+      const m = re.exec(line);
+      if (!m) return;
+      indexes.push({ table: m[1], name: m[2], kind: m[3] || '', detail: m[4] });
+    });
+    return indexes;
+  }
+
+  // Parses the "Routines:" (shallow, signature-only) and "Routine
+  // definitions:" (deep-only, full body) global sections into one list:
+  // [{ name, signature, returnType, body }] - mirrors parseSchemaViews()'s
+  // own shallow-list-plus-deep-bodies structure, including using
+  // parseMultilineDefinitionSection() above for the same reason: a real
+  // routine body is normally several lines, not one. returnType is empty
+  // for a procedure with no return value (some dialects render those with
+  // no "-> type" suffix at all - see e.g. backends/mysql.py's own
+  // PROCEDURE vs. FUNCTION branch). Oracle has no "Routine definitions"
+  // section at all (no per-backend-supported way to fetch PL/SQL bodies),
+  // so its routines always end up with an empty body here - same "not
+  // available" outcome as a view's own missing definition.
+  function parseSchemaRoutines(fullText) {
+    const defBody = extractNamedSchemaSection(fullText, 'Routine definitions');
+    const bodies = parseMultilineDefinitionSection(defBody, /^ {2}(\S+): ?(.*)$/);
+    const routines = [];
+    const shallowBody = extractNamedSchemaSection(fullText, 'Routines');
+    if (shallowBody) {
+      const re = /^ {2}(\S+)\(([^)]*)\)(?: -> (.+))?$/;
+      shallowBody.split('\n').forEach((line) => {
+        const m = re.exec(line);
+        if (m) routines.push({ name: m[1], signature: m[2] || '', returnType: m[3] || '', body: bodies[m[1]] || '' });
+      });
+    } else {
+      Object.keys(bodies).forEach((name) => routines.push({ name, signature: '', returnType: '', body: bodies[name] }));
+    }
+    return routines;
+  }
+
+  // The "Session:" line (backends/*.py's own one-liner - session
+  // timezone/default collation/territory/sort order, wording and exact
+  // fields vary per dialect) is the one global section that's a single
+  // bare line rather than a "Header:\n  body" block (extractNamedSchemaSection
+  // doesn't apply here), and describes the whole connection rather than
+  // any one table - shown once at the top of the Overview tab (see
+  // renderSchemaViewerStatsBlockHtml()), not per selected entry. Not every
+  // dialect emits one (e.g. backends/databricks.py has no equivalent), in
+  // which case this returns ''.
+  function parseSchemaSessionInfo(fullText) {
+    const m = /^Session: (.+)$/m.exec(fullText || '');
+    return m ? m[1] : '';
+  }
+
+  // Same shape as parseSchemaSessionInfo() above, for the "Estimated
+  // dataset size: ..." bare line a SQL backend's get_schema() (deep
+  // fetch) appends when its dialect has a cheap, catalog/metadata-based
+  // way to estimate the whole connection's total size (see backends/
+  // base.py's format_dataset_size_line() for exactly what it can contain -
+  // rows, bytes, table count, any combination). Returns the full line
+  // (including its "Estimated dataset size:" prefix, unlike
+  // parseSchemaSessionInfo's capture-group-only return) since this one's
+  // wording already reads naturally on its own. '' when a dialect has no
+  // such source (e.g. backends/mongodb_sql.py, backends/sheets.py) - never
+  // shown as a misleading zero/blank statistic.
+  function parseSchemaDatasetSizeLine(fullText) {
+    const m = /^Estimated dataset size:.*$/m.exec(fullText || '');
+    return m ? m[0] : '';
+  }
+
+  // Removes the "Session:"/"Estimated dataset size:" bare lines specifically
+  // (see parseSchemaSessionInfo()/parseSchemaDatasetSizeLine() above for why
+  // they need their own, simpler removal rather than
+  // stripNamedSchemaSections() - each is one bare line, not a header+body
+  // section) from the last table entry's leftover raw text, once they've
+  // been promoted to the Overview tab's stats block.
+  function stripSchemaGlobalBareLines(text) {
+    return (text || '').split('\n')
+      .filter((line) => !/^Session: /.test(line) && !/^Estimated dataset size:/.test(line))
+      .join('\n')
+      .replace(/\n{3,}/g, '\n\n').trim();
+  }
+
+  function setSchemaViewerNotice(message, isError) {
+    if (!schemaViewerNotice) return;
+    if (!message) {
+      schemaViewerNotice.classList.add('hidden');
+      schemaViewerNotice.textContent = '';
+      schemaViewerNotice.classList.remove('schema-viewer-notice--error');
+      return;
+    }
+    schemaViewerNotice.textContent = message;
+    schemaViewerNotice.classList.remove('hidden');
+    schemaViewerNotice.classList.toggle('schema-viewer-notice--error', !!isError);
+  }
+
+  // The small status line under the header's Refresh Schema button -
+  // either this connection's last-refreshed time (see loadSchemaViewer
+  // Connection(), which sets this on every successful load) or, briefly,
+  // a refresh attempt's own error (see the button's click handler below) -
+  // whichever was most recently true. Never both at once: a fresh load
+  // right after a failed refresh (the user tries again and it works, or
+  // just reopens the viewer) naturally overwrites the error with a real
+  // timestamp the next time this is called.
+  function setSchemaViewerRefreshStatus(message, isError) {
+    if (!schemaViewerRefreshStatus) return;
+    if (!message) {
+      schemaViewerRefreshStatus.classList.add('hidden');
+      schemaViewerRefreshStatus.textContent = '';
+      schemaViewerRefreshStatus.classList.remove('schema-viewer-refresh-status--error');
+      return;
+    }
+    schemaViewerRefreshStatus.textContent = message;
+    schemaViewerRefreshStatus.classList.remove('hidden');
+    schemaViewerRefreshStatus.classList.toggle('schema-viewer-refresh-status--error', !!isError);
+  }
+
+  // Formats GET /api/schema's own "cached_at" field (an ISO 8601 UTC
+  // timestamp - see schema_cache.py's get_cached_at()) into a locale-
+  // appropriate "last refreshed" display. Returns '' for anything that
+  // isn't a valid timestamp - a connection whose schema was cached before
+  // this field existed has no cached_at at all, which is a normal,
+  // expected case (see get_cached_at()'s own comment), not an error.
+  function formatSchemaCachedAt(isoString) {
+    if (!isoString) return '';
+    const d = new Date(isoString);
+    if (Number.isNaN(d.getTime())) return '';
+    return d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+  }
+
+  // The " (N rows)" suffix for a table name - live (authoritative) count
+  // wins outright over the estimate when both exist (once a real SELECT
+  // COUNT(*) has run, the free planner statistic next to it is just
+  // noise, not a second data point worth showing); only when there's no
+  // live count (a very wide table skips Phase 2's per-table queries
+  // entirely - see e.g. postgres.py's own MAX_COLUMNS_FOR_SAMPLING gate)
+  // does the estimate stand in alone, clearly labeled as such. '' when
+  // this table has neither (schemaViewerRowCounts has nothing for it).
+  // Shown next to the name everywhere a table name appears - the tree
+  // list (SCHEMA_VIEWER_GROUPS below) and the detail pane's own heading
+  // (selectSchemaViewerEntry) - rather than as a separate line, so
+  // "Department (9 rows)" reads as one fact about one table, not two.
+  // Shortens a large row count to K/M/B with 3 significant digits (e.g.
+  // 1234 -> "1.23K", 12345 -> "12.3K", 123456 -> "123K", 8500000 -> "8.50M") -
+  // a plain, comma-grouped number stays a plain number below 1000, where a
+  // unit suffix wouldn't save anything and would just look odd ("0.42K").
+  // Used for per-table row counts (schemaViewerRowCountSuffix below), which
+  // can otherwise run to 8+ digits for a genuinely large table and dominate
+  // the tree/detail heading text they're a small aside within.
+  function formatCompactCount(n) {
+    const num = Number(n);
+    if (!Number.isFinite(num)) return String(n);
+    const abs = Math.abs(num);
+    const UNITS = [[1e9, 'B'], [1e6, 'M'], [1e3, 'K']];
+    for (const [unitValue, suffix] of UNITS) {
+      if (abs >= unitValue) {
+        const scaled = num / unitValue;
+        const scaledAbs = Math.abs(scaled);
+        const decimals = scaledAbs >= 100 ? 0 : scaledAbs >= 10 ? 1 : 2;
+        return `${scaled.toFixed(decimals)}${suffix}`;
+      }
+    }
+    return num.toLocaleString();
+  }
+
+  function schemaViewerRowCountSuffix(tableName) {
+    const counts = tableName ? schemaViewerRowCounts[tableName] : null;
+    const chosen = counts?.live || counts?.estimate;
+    if (!chosen) return '';
+    const formatted = formatCompactCount(Number(chosen.count.replace(/,/g, '')));
+    return counts.live ? ` (${formatted} rows)` : ` (~${formatted} rows, estimated)`;
+  }
+
+  // The four top-level tree groups, in display order. `items()` returns
+  // this load's array for that group; `label()` renders one item's own
+  // tree-row text (every group but Indexes just uses its plain name -
+  // Indexes are qualified by table, since an index name alone doesn't say
+  // which table it belongs to; Tables also gets its row-count suffix, see
+  // schemaViewerRowCountSuffix() above).
+  const SCHEMA_VIEWER_GROUPS = [
+    { key: 'tables', title: 'Tables', items: () => schemaViewerEntries.filter((e) => e.name !== null), label: (item) => `${item.name}${schemaViewerRowCountSuffix(item.name)}` },
+    { key: 'views', title: 'Views', items: () => schemaViewerViews, label: (item) => item.name },
+    { key: 'indexes', title: 'Indexes', items: () => schemaViewerIndexes, label: (item) => `${item.table}.${item.name}` },
+    { key: 'routines', title: 'Routines', items: () => schemaViewerRoutines, label: (item) => item.name },
+  ];
+
+  function renderSchemaViewerEntryList() {
+    if (!schemaViewerEntryList) return;
+    // A group this dialect/connection simply has none of (most
+    // non-Postgres/MySQL dialects have no Indexes section at all - see
+    // parseSchemaIndexes()'s own comment) is left out of the tree
+    // entirely, rather than shown as an empty, non-expandable "(0)" row -
+    // there's nothing useful to click into, so it'd just be clutter.
+    const groups = SCHEMA_VIEWER_GROUPS.map((g) => ({ ...g, list: g.items() })).filter((g) => g.list.length > 0);
+
+    if (groups.length === 0) {
+      schemaViewerEntryList.innerHTML = '<li class="schema-viewer-entry-empty text-center text-muted py-8">No schema loaded.</li>';
+      return;
+    }
+
+    // Pinned "Overview" row - always shown (regardless of whether an
+    // overview has actually been generated yet - see
+    // renderSchemaViewerOverviewDetail()'s own "nothing to show yet"
+    // fallback), above every collapsible group and never itself
+    // collapsible, since it's meant to be the dialog's default landing
+    // spot (see the "stillValid" default-selection logic below).
+    const overviewItem = `
+      <li>
+        <button type="button" class="schema-viewer-entry-item schema-viewer-overview-item${schemaViewerSelected.category === 'overview' ? ' active' : ''}" data-category="overview" data-index="0" title="Overview">
+          Overview
+        </button>
+      </li>`;
+
+    const groupsHtml = groups.map((g) => {
+      const expanded = schemaViewerExpanded[g.key];
+      const children = expanded ? g.list.map((item, index) => `
+        <li>
+          <button type="button" class="schema-viewer-entry-item${schemaViewerSelected.category === g.key && schemaViewerSelected.index === index ? ' active' : ''}" data-category="${g.key}" data-index="${index}" title="${escapeHtml(g.label(item))}">
+            ${escapeHtml(g.label(item))}
+          </button>
+        </li>`).join('') : '';
+      return `
+        <li class="schema-viewer-tree-group">
+          <button type="button" class="schema-viewer-group-header${expanded ? ' expanded' : ''}" data-group="${g.key}" aria-expanded="${expanded}">
+            <svg class="schema-viewer-group-caret" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 6 15 12 9 18"></polyline></svg>
+            <span>${escapeHtml(g.title)} (${g.list.length})</span>
+          </button>
+          ${expanded && g.list.length > 0 ? `<ul class="schema-viewer-group-children">${children}</ul>` : ''}
+        </li>`;
+    }).join('');
+
+    schemaViewerEntryList.innerHTML = overviewItem + groupsHtml;
+
+    schemaViewerEntryList.querySelectorAll('.schema-viewer-group-header').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const key = btn.dataset.group;
+        schemaViewerExpanded[key] = !schemaViewerExpanded[key];
+        renderSchemaViewerEntryList();
+      });
+    });
+    schemaViewerEntryList.querySelectorAll('.schema-viewer-entry-item').forEach((btn) => {
+      btn.addEventListener('click', () => selectSchemaViewerEntry(btn.dataset.category, Number(btn.dataset.index)));
+    });
+
+    // If nothing is selected yet (a fresh load), or the previous
+    // selection no longer exists in this load's data, default to the
+    // pinned Overview row - the "big picture" landing spot this feature
+    // is meant to open on (see this section's own header comment) -
+    // rather than the first table, the way this used to default before
+    // Overview existed.
+    const stillValid = schemaViewerSelected.category === 'overview'
+      || (schemaViewerSelected.category
+        && groups.find((g) => g.key === schemaViewerSelected.category)?.list[schemaViewerSelected.index] !== undefined);
+    if (!stillValid) {
+      selectSchemaViewerEntry('overview', 0);
+    }
+  }
+
+  // Fills the detail pane's heading + plain-text body for a Views/Indexes/
+  // Routines selection - none of those get the Tables-only column table/
+  // row-count treatment, just a heading and whatever descriptive text is
+  // available.
+  function renderSchemaViewerSimpleDetail(heading, text) {
+    if (schemaViewerDetailHeading) {
+      schemaViewerDetailHeading.textContent = heading || '';
+      schemaViewerDetailHeading.title = '';
+    }
+    if (schemaViewerOverviewWrap) schemaViewerOverviewWrap.classList.add('hidden');
+    if (schemaViewerColumnsWrap) schemaViewerColumnsWrap.classList.add('hidden');
+    if (schemaViewerColumnsBody) schemaViewerColumnsBody.innerHTML = '';
+    if (schemaViewerDetailText) {
+      schemaViewerDetailText.textContent = text || '';
+      schemaViewerDetailText.classList.toggle('hidden', !(text || '').trim());
+    }
+  }
+
+  // Fills the detail pane for the pinned "Overview" entry: the cached
+  // LLM-written prose, the deterministically-built ER diagram (rendered
+  // via Mermaid - see renderSchemaErDiagram() above), and the cached
+  // suggested example questions, each as a clickable chip that fills the
+  // main prompt box with that exact question and submits it immediately -
+  // a "fill and go" chip, sourced from this connection's own cached
+  // questions rather than any fixed, generic set. Falls back to a plain
+  // "nothing generated
+  // yet" message when this connection has no cached overview at all (a
+  // brand-new connection, or a generation attempt that failed - see
+  // db.py's _generate_and_cache_schema_overview()) - pointing at the
+  // Refresh Schema button above, which is what actually triggers
+  // generation.
+  // Builds the small facts-and-warnings block shown at the top of the
+  // Overview tab, above the AI-written prose (or the "nothing generated
+  // yet" message) - the best-effort total dataset size the deep fetch
+  // computed (see parseSchemaDatasetSizeLine()/backends/base.py's
+  // format_dataset_size_line()) and the schema's own text size share ONE
+  // row (side by side, via the -split modifier below, since both are
+  // just size figures about this same connection), followed by the
+  // connection-wide "Session:" line - relabeled "Other settings:" here,
+  // since "Session:" reads like a login/connection-session concept to a
+  // viewer rather than what it actually is (timezone/collation/sort-order
+  // metadata) - on its own row underneath, then a warning row for either
+  // SCHEMA_MAX_TABLES or SCHEMA_MAX_SCHEMA_CHARS this connection is
+  // actually exceeding right now. Each row is independently optional
+  // (most of this is unavailable for at least one real dialect - see
+  // backends/sheets.py, backends/mongodb_sql.py, backends/databricks.py),
+  // so this returns '' rather than an empty box when there's truly
+  // nothing to show (a fresh connection with no schema loaded yet, e.g.).
+  function renderSchemaViewerStatsBlockHtml() {
+    const rows = [];
+    // Dataset size + schema character count: two independent figures
+    // about "how big is this" that read naturally side by side rather
+    // than stacked - shown as one row with as many of the two as are
+    // actually available (a dialect with no cheap size estimate at all,
+    // e.g. MongoDB Atlas SQL/Google Sheets, still gets its schema
+    // character count shown alone here).
+    const sizeParts = [];
+    if (schemaViewerDatasetSizeLine) sizeParts.push(escapeHtml(schemaViewerDatasetSizeLine));
+    if (schemaViewerSchemaCharCount > 0) {
+      sizeParts.push(`Schema size: ${schemaViewerSchemaCharCount.toLocaleString()} characters`);
+    }
+    if (sizeParts.length > 0) {
+      rows.push(`<div class="schema-viewer-overview-stats-row schema-viewer-overview-stats-row-split">${sizeParts.map((p) => `<span>${p}</span>`).join('')}</div>`);
+    }
+    if (schemaViewerSessionInfoText) {
+      rows.push(`<div class="schema-viewer-overview-stats-row">Other settings: ${escapeHtml(schemaViewerSessionInfoText)}</div>`);
+    }
+    const warningsHtml = schemaViewerLimitWarnings
+      .map((w) => `<div class="schema-viewer-overview-warning">${escapeHtml(w)}</div>`)
+      .join('');
+    if (rows.length === 0 && !warningsHtml) return '';
+    return `
+      <div class="schema-viewer-overview-stats">
+        ${rows.join('')}
+        ${warningsHtml}
+      </div>
+    `;
+  }
+
+  function renderSchemaViewerOverviewDetail() {
+    if (schemaViewerDetailHeading) {
+      schemaViewerDetailHeading.textContent = 'Overview';
+      schemaViewerDetailHeading.title = '';
+    }
+    if (schemaViewerColumnsWrap) schemaViewerColumnsWrap.classList.add('hidden');
+    if (schemaViewerColumnsBody) schemaViewerColumnsBody.innerHTML = '';
+    if (schemaViewerDetailText) {
+      schemaViewerDetailText.textContent = '';
+      schemaViewerDetailText.classList.add('hidden');
+    }
+    if (!schemaViewerOverviewWrap) return;
+    schemaViewerOverviewWrap.classList.remove('hidden');
+
+    // Facts-and-warnings block (session info, schema/dataset size,
+    // limit warnings) - see renderSchemaViewerStatsBlockHtml()'s own
+    // comment. Rendered whether or not an AI overview has been generated
+    // yet, since none of it depends on that.
+    const statsHtml = renderSchemaViewerStatsBlockHtml();
+
+    if (!schemaViewerOverview) {
+      schemaViewerOverviewWrap.innerHTML = `${statsHtml}<p class="text-muted schema-viewer-overview-empty">No overview has been generated yet for this connection. Click &ldquo;Refresh Schema&rdquo; above to generate one.</p>`;
+      return;
+    }
+
+    const questions = schemaViewerOverview.questions || [];
+    const questionsHtml = questions.map((q) => `
+      <li><button type="button" class="schema-viewer-suggested-question" data-question="${escapeHtml(q)}">${escapeHtml(q)}</button></li>
+    `).join('');
+
+    // Whether there's actually a diagram to show - computed up front
+    // (same inputs/logic renderSchemaErDiagram() below uses) so the whole
+    // "diagram-wrap" block, not just its inner placeholder text, can be
+    // left out entirely when there's nothing to diagram, rather than
+    // rendering an empty-looking box with a "no relationships" message
+    // inside it.
+    const tableNames = schemaViewerEntries.filter((e) => e.name !== null).map((e) => e.name);
+    const hasDiagram = !!buildSchemaErDiagram(tableNames, schemaViewerForeignKeys, schemaViewerNamingRelationships);
+
+    schemaViewerOverviewWrap.innerHTML = `
+      ${statsHtml}
+      <p class="schema-viewer-overview-prose">${escapeHtml(schemaViewerOverview.prose || '')}</p>
+      ${hasDiagram ? `
+        <div class="schema-viewer-overview-diagram-wrap">
+          <div class="schema-viewer-overview-diagram" id="schemaViewerErDiagram"><p class="text-muted schema-viewer-overview-empty">Rendering diagram...</p></div>
+        </div>` : ''}
+      ${questions.length > 0 ? `
+        <div class="schema-viewer-overview-questions-block">
+          <div class="schema-viewer-overview-questions-title">Questions you could ask</div>
+          <ul class="schema-viewer-overview-questions">${questionsHtml}</ul>
+        </div>` : ''}
+    `;
+
+    schemaViewerOverviewWrap.querySelectorAll('.schema-viewer-suggested-question').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const question = btn.dataset.question || '';
+        if (!question || !aiPrompt) return;
+        // The Schema Viewer is now only ever opened for the ACTIVE
+        // connection (see datasetSchemaViewerBtn's and the "OPEN SCHEMA
+        // VIEWER" sentinel's own click handlers - the old per-row "?"
+        // buttons that could open it for a connection other than the
+        // active one are gone), so translatePrompt() below is guaranteed
+        // to run this question against the same dataset the user was just
+        // looking at. closeConfigModal() is defensive/cheap insurance in
+        // case it happened to be open underneath - it used to be the
+        // actual cause of a second dialog blocking the results view back
+        // when this dialog could be launched from inside it.
+        closeSchemaViewer();
+        closeConfigModal();
+        aiPrompt.value = question;
+        setSqlQuery('');
+        translatePrompt();
+      });
+    });
+
+    // Only bother actually rendering (a real, non-trivial Mermaid call)
+    // when the diagram-wrap block above was actually included -
+    // renderSchemaErDiagram() would otherwise just no-op on a missing
+    // #schemaViewerErDiagram container anyway, but skipping the call
+    // entirely makes that "nothing to do here" explicit at the call site
+    // rather than implicit in a function most readers would expect to
+    // always find a container.
+    if (hasDiagram) renderSchemaErDiagram();
+  }
+
+  function selectSchemaViewerEntry(category, index) {
+    schemaViewerSelected = { category, index };
+    schemaViewerEntryList?.querySelectorAll('.schema-viewer-entry-item').forEach((btn) => {
+      btn.classList.toggle('active', btn.dataset.category === category && Number(btn.dataset.index) === index);
+    });
+
+    if (category === 'overview') {
+      return renderSchemaViewerOverviewDetail();
+    }
+    if (category === 'views') {
+      const view = schemaViewerViews[index];
+      if (!view) return renderSchemaViewerSimpleDetail('', '');
+      return renderSchemaViewerSimpleDetail(
+        view.name,
+        view.definition || schemaViewerNoViewDefinitionMessage(),
+      );
+    }
+    if (category === 'indexes') {
+      const idx = schemaViewerIndexes[index];
+      if (!idx) return renderSchemaViewerSimpleDetail('', '');
+      return renderSchemaViewerSimpleDetail(`${idx.table}.${idx.name}`, [idx.kind, idx.detail].filter(Boolean).join('\n'));
+    }
+    if (category === 'routines') {
+      const r = schemaViewerRoutines[index];
+      if (!r) return renderSchemaViewerSimpleDetail('', '');
+      const heading = `${r.name}(${r.signature})${r.returnType ? ` -> ${r.returnType}` : ''}`;
+      return renderSchemaViewerSimpleDetail(heading, r.body || '(No body available for this routine.)');
+    }
+
+    // category === 'tables' (or an unrecognized/stale ref) - the original,
+    // fuller detail: row count, the structured columns table (with its
+    // Constraints/Sample values columns), and whatever raw text is left.
+    const entry = schemaViewerEntries.filter((e) => e.name !== null)[index];
+    if (!entry) {
+      return renderSchemaViewerSimpleDetail('', '');
+    }
+    if (schemaViewerDetailHeading) {
+      schemaViewerDetailHeading.textContent = entry.name ? `${entry.name}${schemaViewerRowCountSuffix(entry.name)}` : '';
+      const counts = entry.name ? schemaViewerRowCounts[entry.name] : null;
+      schemaViewerDetailHeading.title = (counts?.live || counts?.estimate)?.note || '';
+    }
+    if (schemaViewerOverviewWrap) schemaViewerOverviewWrap.classList.add('hidden');
+
+    const { columns, remainder } = parseSchemaEntryColumns(entry.text || '');
+    const samplesForTable = (entry.name && schemaViewerSamples[entry.name]) || {};
+    const constraintsForTable = (entry.name && schemaViewerConstraints[entry.name]) || {};
+    if (schemaViewerColumnsWrap && schemaViewerColumnsBody) {
+      if (columns.length > 0) {
+        schemaViewerColumnsBody.innerHTML = columns.map((col) => `
+          <tr>
+            <td class="schema-viewer-col-name">${escapeHtml(col.name)}</td>
+            <td>${escapeHtml(col.type)}</td>
+            <td>${col.nullable ? 'NULL' : '<span class="schema-viewer-not-null">NOT NULL</span>'}</td>
+            <td>${escapeHtml(col.attributes)}</td>
+            <td>${escapeHtml(constraintsForTable[col.name] || '')}</td>
+            <td class="schema-viewer-col-samples">${escapeHtml(samplesForTable[col.name] || '')}</td>
+          </tr>`).join('');
+        schemaViewerColumnsWrap.classList.remove('hidden');
+      } else {
+        schemaViewerColumnsBody.innerHTML = '';
+        schemaViewerColumnsWrap.classList.add('hidden');
+      }
+    }
+    if (schemaViewerDetailText) {
+      // Once the columns table (plus the row-count line above it) is
+      // showing them, don't also repeat that information as raw text
+      // below - strip those specific sections out (plus the "Session:"/
+      // "Estimated dataset size:" one-liners, now shown at the top of the
+      // Overview tab instead - see stripSchemaGlobalBareLines()'s own
+      // comment) and show only whatever is genuinely left (Grants/
+      // Triggers/Comments/... - not yet promoted to their own structured
+      // field, or their own tree group) or nothing at all. A dialect the
+      // column parser doesn't recognize (no columns found) still falls
+      // back to the complete, untouched raw text, same as before this
+      // table existed.
+      const shownText = columns.length > 0
+        ? stripSchemaGlobalBareLines(stripNamedSchemaSections(remainder, [
+          'Row count estimates', 'Live row counts', 'Column value samples', 'Constraints',
+          'Indexes', 'Views', 'View definitions', 'Routines', 'Routine definitions',
+        ]))
+        : (entry.text || '');
+      schemaViewerDetailText.textContent = shownText;
+      schemaViewerDetailText.classList.toggle('hidden', !shownText.trim());
+    }
+  }
+
+  // Fetches GET /api/schema for one connection reference (kind: 'preset'
+  // or 'custom', id: the preset id or connection_key) and renders the
+  // result. Shared by the initial load (openSchemaViewer) and the Refresh
+  // button's re-fetch after a successful POST /api/config/refresh-schema.
+  async function loadSchemaViewerConnection(kind, id) {
+    schemaViewerCurrentRef = { kind: kind || '', id: id || '' };
+    // Both presets and custom connections can be refreshed here now -
+    // POST /api/config/refresh-schema resolves either kind (see its own
+    // docstring in config_routes.py) - so this only hides for a
+    // completely unresolved reference (shouldn't normally happen once a
+    // load has actually started).
+    schemaViewerRefreshBtn?.classList.toggle('hidden', !kind || !id);
+
+    const myToken = ++schemaViewerRequestToken;
+    setSchemaViewerNotice('');
+    schemaViewerEntries = [];
+    schemaViewerViews = [];
+    schemaViewerIndexes = [];
+    schemaViewerRoutines = [];
+    schemaViewerRowCounts = {};
+    schemaViewerSamples = {};
+    schemaViewerConstraints = {};
+    schemaViewerOverview = null;
+    schemaViewerForeignKeys = [];
+    schemaViewerNamingRelationships = [];
+    schemaViewerSelected = { category: null, index: -1 };
+    // See this variable's own top-of-file declaration comment for why
+    // every group starts collapsed.
+    schemaViewerExpanded = { tables: false, views: false, indexes: false, routines: false };
+    if (schemaViewerEntryList) {
+      schemaViewerEntryList.innerHTML = '<li class="schema-viewer-entry-empty text-center text-muted py-8">Loading...</li>';
+    }
+    if (schemaViewerDetailHeading) schemaViewerDetailHeading.textContent = '';
+    if (schemaViewerColumnsWrap) schemaViewerColumnsWrap.classList.add('hidden');
+    if (schemaViewerColumnsBody) schemaViewerColumnsBody.innerHTML = '';
+    if (schemaViewerDetailText) schemaViewerDetailText.innerHTML = '';
+    schemaViewerSessionInfoText = '';
+    schemaViewerDatasetSizeLine = '';
+    schemaViewerSchemaCharCount = 0;
+    schemaViewerDialect = '';
+    schemaViewerLimitWarnings = [];
+    setSchemaViewerRefreshStatus('');
+
+    try {
+      const params = `?kind=${encodeURIComponent(kind)}&id=${encodeURIComponent(id)}`;
+      const response = await fetch(`/api/schema${params}`, { headers: getApiHeaders(), credentials: 'same-origin' });
+      const data = await response.json().catch(() => ({}));
+      if (myToken !== schemaViewerRequestToken) return; // superseded by a newer selection
+
+      if (!response.ok || !data.success) {
+        setSchemaViewerNotice(data.error || `Server returned status ${response.status}`, true);
+        renderSchemaViewerEntryList();
+        return;
+      }
+
+      schemaViewerEntries = data.entries || [];
+      if (schemaViewerEntries.length > 0 && schemaViewerEntries.every((e) => e.name === null)) {
+        // No backend heading convention was recognized at all (see
+        // split_schema_text_into_entries()'s own "never raises" fallback
+        // in backends/base.py) - in practice this should never happen for
+        // a successful fetch (every real backend's get_schema() already
+        // commits to the Table:/Table family:/Tab: heading convention),
+        // but falls back to one single browsable entry holding the
+        // complete raw text rather than an empty "no tables match" list
+        // for a schema this route genuinely fetched successfully.
+        schemaViewerEntries = [{
+          name: 'Full schema text', heading: null,
+          text: schemaViewerEntries.map((e) => e.text).join('\n\n'),
+        }];
+      }
+      // These two limit warnings used to only show in the notice bar
+      // above; now they're anchored at the top of the Overview tab too
+      // (see renderSchemaViewerStatsBlockHtml()), right next to the
+      // dataset-size/schema-size stats they explain, since both are about
+      // this same connection actually hitting a configured size limit
+      // (SCHEMA_MAX_SCHEMA_CHARS / SCHEMA_MAX_TABLES - see backends/
+      // base.py). Collected into schemaViewerLimitWarnings rather than
+      // called through setSchemaViewerNotice() so they aren't dismissed
+      // by the next unrelated notice (e.g. a later refresh failure).
+      schemaViewerLimitWarnings = [];
+      if (data.truncated) {
+        schemaViewerLimitWarnings.push('This schema was truncated to fit the size limit (SCHEMA_MAX_SCHEMA_CHARS) - some tables/columns may not be shown.');
+      }
+      if (data.has_omitted_tables) {
+        schemaViewerLimitWarnings.push('This connection has more tables than the configured limit (SCHEMA_MAX_TABLES) - some are not shown.');
+      }
+      // The row-count/sample sections these parse are global (one section
+      // covering every table, keyed by name) rather than per-entry, so
+      // this only needs to run once per load - not per selected entry -
+      // over the full reconstructed text (every entry's own text, back in
+      // order; see this feature's own section comment above for why only
+      // the last one actually carries these sections in practice).
+      const fullText = schemaViewerEntries.map((e) => e.text || '').join('\n\n');
+      // Overview-tab stats block inputs (see renderSchemaViewerStatsBlock
+      // Html()) - the raw character count is exactly what's sent to the
+      // LLM as schema context, so it's measured directly off fullText
+      // rather than trusting any one entry's own text length.
+      schemaViewerSchemaCharCount = fullText.length;
+      schemaViewerDatasetSizeLine = parseSchemaDatasetSizeLine(fullText);
+      schemaViewerDialect = data.dialect || '';
+      schemaViewerRowCounts = parseSchemaRowCounts(fullText);
+      schemaViewerSamples = parseSchemaColumnSamples(fullText);
+      schemaViewerConstraints = parseSchemaConstraints(fullText);
+      schemaViewerViews = parseSchemaViews(fullText);
+      schemaViewerIndexes = parseSchemaIndexes(fullText);
+      schemaViewerRoutines = parseSchemaRoutines(fullText);
+      // Deterministic ER-diagram inputs (see buildSchemaErDiagram() above) -
+      // parsed once per load the same way every other global section is.
+      schemaViewerForeignKeys = parseSchemaForeignKeys(fullText);
+      schemaViewerNamingRelationships = parseSchemaNamingRelationships(fullText);
+      // The cached LLM-written overview (see GET /api/schema's own
+      // "overview" field, config_routes.py) - null whenever nothing has
+      // been generated yet; renderSchemaViewerOverviewDetail() shows a
+      // "nothing to show yet" message in that case rather than an error.
+      schemaViewerOverview = data.overview || null;
+      schemaViewerSessionInfoText = parseSchemaSessionInfo(fullText);
+      // Now that the dialect is known, upgrade the modal title from the
+      // plain dataset name openSchemaViewer() set as an interim (before
+      // this fetch resolved) to "<name> in <dialect>" - data.name is used
+      // here (not whatever name openSchemaViewer() was originally called
+      // with) since it's this same response's own source of truth for
+      // both fields together.
+      if (schemaViewerModalTitleText) {
+        const dsName = data.name || 'this connection';
+        schemaViewerModalTitleText.textContent = data.dialect
+          ? `${dsName} in ${data.dialect}`
+          : dsName;
+      }
+      // "cached_at" is informational for ANY connection (a preset's own
+      // schema was still cached at some point - at startup, via
+      // prefetch_all_preset_schemas() - even though it has no Refresh
+      // button of its own here), not only a just-refreshed custom one, so
+      // this isn't gated on kind === 'custom'. A connection cached before
+      // this field existed just has no timestamp to show (see
+      // formatSchemaCachedAt()'s own comment).
+      const cachedAtLabel = formatSchemaCachedAt(data.cached_at);
+      setSchemaViewerRefreshStatus(cachedAtLabel ? `Last refreshed: ${cachedAtLabel}` : '');
+      renderSchemaViewerEntryList();
+    } catch (err) {
+      if (myToken !== schemaViewerRequestToken) return;
+      console.error('Failed to fetch schema:', err);
+      setSchemaViewerNotice(err.message || 'Failed to reach the backend service.', true);
+      renderSchemaViewerEntryList();
+    }
+  }
+
+  // kind: 'preset'|'custom', id: the preset id or connection_key, name:
+  // the dataset's own display name - used verbatim as an interim modal
+  // title (see index.html's own comment on schemaViewerModalTitleText)
+  // until loadSchemaViewerConnection() below upgrades it to "<name> in
+  // <dialect>" once GET /api/schema resolves and the dialect is actually
+  // known. Every caller (the "?" button next to a preset, or next to a
+  // saved custom connection) already knows exactly which dataset this is
+  // for.
+  function openSchemaViewer(kind, id, name) {
+    if (!schemaViewerModal || !kind || !id) return;
+    trackEvent('schema_viewer_viewed', { kind });
+    if (schemaViewerModalTitleText) schemaViewerModalTitleText.textContent = name || 'Schema Viewer';
+    schemaViewerModal.classList.remove('hidden');
+    bringModalToFront(schemaViewerModal);
+    loadSchemaViewerConnection(kind, id);
+  }
+
+  function closeSchemaViewer() {
+    // Guards the backdrop-click path too, not just the close button's own
+    // disabled state (which already stops its click handler from firing
+    // at all) - a blocking refresh in flight (see the Refresh Schema
+    // click handler below) should mean the dialog genuinely can't be
+    // dismissed by any route until that request returns, not just via
+    // this one button.
+    if (schemaViewerRefreshBtn?.disabled) return;
+    schemaViewerModal?.classList.add('hidden');
+  }
+
+  if (schemaViewerModalCloseBtn) {
+    schemaViewerModalCloseBtn.addEventListener('click', closeSchemaViewer);
+  }
+
+  if (schemaViewerModal) {
+    schemaViewerModal.addEventListener('click', (e) => {
+      if (e.target === schemaViewerModal) closeSchemaViewer();
+    });
+  }
+
+  // Both presets and custom connections can be refreshed here (see POST
+  // /api/config/refresh-schema's own docstring in config_routes.py -
+  // resolves either kind via the same {kind, id} reference this viewer
+  // already addresses connections by everywhere else).
+  //
+  // Deliberately blocking, matching the POST route's own docstring on why
+  // it's synchronous rather than a background job: both this button AND
+  // the close button are disabled for the call's whole duration (a stale
+  // in-flight refresh racing a dialog close - or the user mashing the
+  // button again mid-request - isn't worth guarding against with request
+  // tokens when just disabling the controls is simpler and just as
+  // correct), and both re-enable the moment it returns, success or not -
+  // there's no reason closing the dialog should stay blocked any longer
+  // than the request itself takes.
+  if (schemaViewerRefreshBtn) {
+    schemaViewerRefreshBtn.addEventListener('click', async () => {
+      const { kind, id } = schemaViewerCurrentRef;
+      if (!kind || !id) return;
+      schemaViewerRefreshBtn.disabled = true;
+      if (schemaViewerModalCloseBtn) schemaViewerModalCloseBtn.disabled = true;
+      if (schemaViewerRefreshBtnLabel) schemaViewerRefreshBtnLabel.textContent = 'Refreshing...';
+      setSchemaViewerRefreshStatus('');
+      try {
+        const response = await fetch('/api/config/refresh-schema', {
+          method: 'POST',
+          headers: getApiHeaders(),
+          body: JSON.stringify({ kind, id }),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || !data.success) {
+          setSchemaViewerRefreshStatus(data.error || 'Failed to refresh schema.', true);
+          return;
+        }
+        // Reloads this connection's entries so the columns table/tree
+        // reflect the just-refreshed schema, and also picks up the new
+        // cached_at timestamp for the status line below the button -
+        // no separate success message needed, the fresh "Last refreshed:"
+        // time IS the confirmation.
+        await loadSchemaViewerConnection(kind, id);
+      } catch (err) {
+        console.error('Failed to refresh schema:', err);
+        setSchemaViewerRefreshStatus(err.message || 'Failed to reach the backend service.', true);
+      } finally {
+        schemaViewerRefreshBtn.disabled = false;
+        if (schemaViewerModalCloseBtn) schemaViewerModalCloseBtn.disabled = false;
+        if (schemaViewerRefreshBtnLabel) schemaViewerRefreshBtnLabel.textContent = '↻ Refresh Schema';
+      }
+    });
+  }
+
   if (configSaveBtn) {
     configSaveBtn.addEventListener('click', async () => {
-      await triggerConfigSave({ closeModal: true });
+      // Saving a freshly-added custom connection now does real, deeper
+      // schema introspection server-side before responding (see
+      // prime_schema_cache_with_reason()'s deep fetch in db.py) - it can
+      // take several seconds where it used to be near-instant, and until
+      // now the button just sat there with no feedback for that whole
+      // stretch. Guard against a double-click re-entering triggerConfigSave()
+      // while the first request is still in flight (it has no re-entrancy
+      // guard of its own), disable every field/button in the form so
+      // nothing else can change out from under the in-flight save, and
+      // swap the button's own label to "Saving..." so it's obvious
+      // something is happening. Restored in `finally` regardless of
+      // outcome - on success the modal is about to close anyway (closeModal:
+      // true), but on a validation error (see triggerConfigSave()'s own
+      // configSaveErrorEl handling, right above this button in the DOM) the
+      // modal stays open and the user needs everything usable again to fix
+      // and retry.
+      if (configSaveBtn.disabled) return;
+      const originalLabel = configSaveBtn.textContent;
+      const formControls = configForm ? Array.from(configForm.querySelectorAll('input, select, textarea, button')) : [];
+      formControls.forEach((el) => { el.disabled = true; });
+      if (modalCloseBtn) modalCloseBtn.disabled = true;
+      configSaveBtn.textContent = 'Saving...';
+      try {
+        await triggerConfigSave({ closeModal: true });
+      } finally {
+        configSaveBtn.textContent = originalLabel;
+        formControls.forEach((el) => { el.disabled = false; });
+        if (modalCloseBtn) modalCloseBtn.disabled = false;
+      }
     });
   }
 
@@ -6259,6 +7709,140 @@ document.addEventListener('DOMContentLoaded', async () => {
       lines.push(`... (${allRows.length - shown.length} more rows not shown)`);
     }
     return lines.join('\n');
+  }
+
+  // ===========================================================================
+  // RESULT DOWNLOAD (CSV/JSON) - the CSV-primary + JSON-via-caret-menu button
+  // pair in .results-view-toggle (see index.html/style.css), wired up near
+  // the Table/Chart toggle's own listener below. Client-side only - the data
+  // is already in `result` by the time a tab is on screen, so no server
+  // round-trip is needed to build the file.
+  // ===========================================================================
+
+  // Escapes one CSV field per RFC 4180: quote it (doubling any embedded
+  // quote) only when it contains a comma, quote, or newline - left bare
+  // otherwise so the common case (plain numbers/short strings) stays
+  // human-readable in the raw file.
+  function csvEscapeField(value) {
+    const needsQuoting = /[",\n\r]/.test(value);
+    const escaped = value.replace(/"/g, '""');
+    return needsQuoting ? `"${escaped}"` : escaped;
+  }
+
+  // Normalizes one cell value for export - shared by both formats so a
+  // NULL or a nested value is handled identically regardless of which
+  // button was clicked.
+  //
+  // NULL/undefined becomes a genuinely empty/absent value here, NOT the
+  // literal "NULL" text the on-screen table shows (see
+  // buildResultDataRow() above) - a spreadsheet or a JSON consumer
+  // (pandas, jq, Excel) treats blank/null as "missing," not as the
+  // four-character string "NULL," and exporting the on-screen display
+  // convention instead would silently corrupt a nullable numeric column
+  // for anyone who imports this file and starts computing on it.
+  //
+  // An object/array cell value - nothing produces one today (see this
+  // feature's own research notes on backends/base.py's
+  // normalize_cell_value()), but nothing in the frontend rules one out
+  // either - is JSON-stringified rather than left to fall through to
+  // JS's default toString() coercion (a bare "[object Object]", the same
+  // way buildResultDataRow()'s plain `td.textContent = val` would render
+  // it on screen), so the actual structure survives into the file
+  // instead of a useless placeholder string.
+  function downloadCellValue(value) {
+    if (value === null || value === undefined) return null;
+    if (typeof value === 'object') return JSON.stringify(value);
+    return value;
+  }
+
+  function resultToCsv(result) {
+    const cols = result.columns || [];
+    const rows = result.rows || [];
+    const lines = [cols.map((c) => csvEscapeField(String(c))).join(',')];
+    rows.forEach((row) => {
+      lines.push(cols.map((c) => {
+        const val = downloadCellValue(row[c]);
+        return val === null ? '' : csvEscapeField(String(val));
+      }).join(','));
+    });
+    // CRLF - the RFC 4180/Excel convention. Every other reasonable CSV
+    // reader (pandas, Google Sheets, `open`+csv module) is equally happy
+    // with CRLF, so this is "be liberal for the pickiest reader," not a
+    // compatibility trade-off against anything else.
+    return lines.join('\r\n');
+  }
+
+  function resultToJson(result) {
+    const cols = result.columns || [];
+    const rows = result.rows || [];
+    const objects = rows.map((row) => {
+      const obj = {};
+      cols.forEach((c) => { obj[c] = downloadCellValue(row[c]); });
+      return obj;
+    });
+    return JSON.stringify(objects, null, 2);
+  }
+
+  // Builds a meaningful, collision-resistant filename from what's already
+  // on screen: the active dataset name (connDbName - the same source
+  // every "database_name" field elsewhere in this file already reads),
+  // or (in "all databases" mode) the specific connection THIS tab is
+  // tagged with (result.database.name - see buildResultsTabsNav()'s own
+  // dbLabel), plus which tab this was and a timestamp - so downloading
+  // more than one tab from the same turn produces distinct files instead
+  // of one silently overwriting the last.
+  function buildDownloadFilename(result, extension) {
+    const dbLabel = (result && result.database && result.database.name)
+      ? result.database.name
+      : (connDbName ? connDbName.textContent : '');
+    const tabLabel = `query-${activeResultIndex + 1}`;
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const slugify = (s) => (s || '').toString().trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+    const parts = [slugify(dbLabel) || 'datalect', slugify(tabLabel), timestamp].filter(Boolean);
+    return `${parts.join('_')}.${extension}`;
+  }
+
+  function triggerBlobDownload(content, filename, mimeType) {
+    const blob = new Blob([content], { type: mimeType });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    // Deferred, not immediate: revoking the object URL synchronously -
+    // before the click's own download has actually started - can abort
+    // it in some browsers. A short delay is the standard, safe pattern
+    // for a same-tick createObjectURL()+click().
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  // Entry point for both the primary CSV button and either item in the
+  // caret menu. Confirms first, ON THE SPOT, if this tab's result was cut
+  // off by EXECUTE_RESULTS_MAX_ROWS (see resultsTruncatedNotice's own
+  // banner in renderTableResult()) - downloading a truncated result
+  // silently would let someone walk away believing their file holds the
+  // FULL result set when it only has however many rows the server ever
+  // sent down. A complete result skips this entirely - only truncation
+  // warrants the extra click (per this feature's own design discussion).
+  async function handleResultDownload(format) {
+    const result = currentResultsList[activeResultIndex];
+    if (!result || !result.rows || !result.rows.length) return;
+
+    if (result.truncated) {
+      const proceed = await showConfirmDialog(
+        `This result was cut off at ${result.rowCount.toLocaleString()} rows — the query matched more rows than ` +
+        `that. The download will only include what's shown here, not the full result set. Download anyway?`
+      );
+      if (!proceed) return;
+    }
+
+    if (format === 'json') {
+      triggerBlobDownload(resultToJson(result), buildDownloadFilename(result, 'json'), 'application/json');
+    } else {
+      triggerBlobDownload(resultToCsv(result), buildDownloadFilename(result, 'csv'), 'text/csv');
+    }
   }
 
   // In-browser column sort for a results table (see currentTableSortState's
@@ -6435,11 +8019,21 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Same "reset first, let only the one branch that needs it turn it back
     // on" posture as setReportContext(null) just above - only the
     // successful, non-empty tabular branch at the very bottom of this
-    // function ever shows the toggle/chart at all (see this feature's own
-    // section comment above requestSingleModeResultsSummary()), so every
-    // other branch (isPending/isText/isError/no-dataset/0-rows) simply
-    // inherits this hidden-table-wrapper-visible, chart-destroyed default.
+    // function ever shows the toggle row (download controls, plus the
+    // Table/Chart pills when chartable) at all, so every other branch
+    // (isPending/isText/isError/no-dataset/0-rows) simply inherits this
+    // hidden-table-wrapper-visible, chart-destroyed default - there's
+    // nothing to download or chart for any of those.
     if (resultsViewToggle) resultsViewToggle.classList.add('hidden');
+    // Table/Chart pills specifically (see this sub-group's own comment in
+    // style.css) - reset separately from the row itself, since the row
+    // now also hosts the download controls and stays visible for every
+    // non-empty result regardless of whether THIS one is chartable.
+    if (resultsViewToggleButtons) resultsViewToggleButtons.classList.add('hidden');
+    // A tab switch/re-render must not leave a PREVIOUS tab's open download
+    // menu floating over the new one's content.
+    if (resultsDownloadMenu) resultsDownloadMenu.classList.add('hidden');
+    if (resultsDownloadCaretBtn) resultsDownloadCaretBtn.setAttribute('aria-expanded', 'false');
     if (resultsChartWrapper) resultsChartWrapper.classList.add('hidden');
     if (resultsTableWrapper) resultsTableWrapper.classList.remove('hidden');
     destroyResultsChart();
@@ -6510,9 +8104,23 @@ document.addEventListener('DOMContentLoaded', async () => {
       // renderMarkdownLiteSummaryTab()'s own docstring) - a "Note" tab
       // (Phase B's own per-database '*** NO SQL ***' reply) never does,
       // so it's rendered plain like any other free-text reply.
-      p.innerHTML = result.tabLabel === 'Summary'
+      let summaryHtml = result.tabLabel === 'Summary'
         ? renderMarkdownLiteSummaryTab(result.text || '')
         : renderMarkdownLite(result.text || '');
+      // The chart-discoverability link (see summaryChartInlineLinkHtml()'s
+      // own docstring) - appended straight onto the end of the summary
+      // text itself, as a trailing inline continuation of the prose
+      // ("...worth digging into. 📊 View as chart"), rather than a
+      // separate boxed callout sitting apart from the text underneath it.
+      // Rendered whenever THIS turn has a chartable tab somewhere. Gated
+      // on `!result.summaryPending` since "all databases" mode's Summary
+      // tab can render before Phase C - and therefore before any tab's
+      // own visualization - has actually arrived.
+      if (result.tabLabel === 'Summary' && !result.summaryPending
+        && currentResultsList && currentResultsList.some((r) => r && r.visualization)) {
+        summaryHtml += summaryChartInlineLinkHtml();
+      }
+      p.innerHTML = summaryHtml;
       td.appendChild(p);
 
       // Thumbs up/down feedback on the SUMMARY tab specifically (never a
@@ -6534,20 +8142,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       // Summary tab (prependSingleModeSummaryTab) is only ever created
       // already fully formed, so it never sets this flag at all -
       // `undefined` is falsy, so it's unaffected by this gate.
-      // The chart-discoverability callout (see summaryChartCalloutHtml()'s
-      // own docstring) - rendered whenever THIS turn has a chartable tab
-      // somewhere, primary action first (directly under the summary text,
-      // before the secondary thumbs-up/down feedback row), same reasoning
-      // as the ordering of every other action in this tab. Gated on
-      // `!result.summaryPending` for the same reason as the feedback row
-      // above: "all databases" mode's Summary tab can render before Phase
-      // C - and therefore before any tab's own visualization - has
-      // actually arrived.
-      if (result.tabLabel === 'Summary' && !result.summaryPending
-        && currentResultsList && currentResultsList.some((r) => r && r.visualization)) {
-        td.insertAdjacentHTML('beforeend', summaryChartCalloutHtml());
-      }
-
       if (result.tabLabel === 'Summary' && !result.summaryPending) {
         td.insertAdjacentHTML('beforeend', summaryFeedbackButtonsHtml());
       }
@@ -6719,6 +8313,11 @@ document.addEventListener('DOMContentLoaded', async () => {
         const tr = buildResultDataRow(result.columns, row);
         resultsBody.appendChild(tr);
       });
+      // Toolbar row (download controls, plus the Table/Chart pills below
+      // when chartable) - shown for every non-empty result, not just
+      // chartable ones, since the download controls it now also hosts
+      // apply regardless of visualization.
+      if (resultsViewToggle) resultsViewToggle.classList.remove('hidden');
       setReportContext({
         category: 'wrong_result',
         databaseName: reportDatabaseName,
@@ -6743,8 +8342,8 @@ document.addEventListener('DOMContentLoaded', async () => {
       // was chartable; every other successful result reaches this same
       // branch with `result.visualization` simply absent, and stays a
       // plain table, exactly as before this feature existed.
-      if (result.visualization && resultsViewToggle && resultsChartWrapper && resultsTableWrapper && typeof Chart !== 'undefined') {
-        resultsViewToggle.classList.remove('hidden');
+      if (result.visualization && resultsViewToggleButtons && resultsChartWrapper && resultsTableWrapper && typeof Chart !== 'undefined') {
+        resultsViewToggleButtons.classList.remove('hidden');
         // Defaults to the chart view the LLM itself decided on - `false`
         // is the only way to land on the table instead, set exclusively by
         // the user's own toggle click (see setActiveResultChartView) and
@@ -6786,11 +8385,12 @@ document.addEventListener('DOMContentLoaded', async () => {
       const isError = !!res.isError;
       const isText = !!res.isText;
       const isPending = !!res.isPending;
-      // Chart discoverability (see summaryChartCalloutHtml()'s own
+      // Chart discoverability (see summaryChartInlineLinkHtml()'s own
       // docstring above): a subtle, persistent tag on whichever tab
       // actually carries a validated visualization, so a user who never
-      // clicks the Summary tab's callout - or comes back to this turn
-      // later - can still tell at a glance from the tab strip alone.
+      // clicks the Summary tab's own inline chart link - or comes back to
+      // this turn later - can still tell at a glance from the tab strip
+      // alone.
       const isChartable = !!res.visualization;
       btn.className = `result-tab-btn ${idx === activeResultIndex ? 'active' : ''} ${isError ? 'result-tab-btn--error' : ''} ${isPending ? 'result-tab-btn--pending' : ''} ${isChartable ? 'result-tab-btn--chartable' : ''}`.trim();
 
@@ -7785,7 +9385,36 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
-  // --- Chart discoverability: Summary tab callout + tab-strip badge ---
+  // Download button + caret menu - same toggle-on-click / close-on-outside-
+  // click idiom as moreMenuBtn/moreMenuDropdown above (section 6): a
+  // static pair wired up once here, not rebuilt per render, since neither
+  // element's own markup ever changes - only which result handleResultDownload()
+  // reads (currentResultsList[activeResultIndex]) changes per tab/turn.
+  if (resultsDownloadBtn) {
+    resultsDownloadBtn.addEventListener('click', () => handleResultDownload('csv'));
+  }
+  if (resultsDownloadCaretBtn && resultsDownloadMenu && resultsDownloadGroup) {
+    resultsDownloadCaretBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const isHidden = resultsDownloadMenu.classList.toggle('hidden');
+      resultsDownloadCaretBtn.setAttribute('aria-expanded', String(!isHidden));
+    });
+    resultsDownloadMenu.querySelectorAll('.results-download-menu-item').forEach((item) => {
+      item.addEventListener('click', () => {
+        resultsDownloadMenu.classList.add('hidden');
+        resultsDownloadCaretBtn.setAttribute('aria-expanded', 'false');
+        handleResultDownload(item.dataset.format);
+      });
+    });
+    document.addEventListener('click', (e) => {
+      if (!resultsDownloadMenu.classList.contains('hidden') && !resultsDownloadGroup.contains(e.target)) {
+        resultsDownloadMenu.classList.add('hidden');
+        resultsDownloadCaretBtn.setAttribute('aria-expanded', 'false');
+      }
+    });
+  }
+
+  // --- Chart discoverability: Summary tab inline link + tab-strip badge ---
   //
   // The Summary tab becomes the active tab the instant it's created (see
   // prependSingleModeSummaryTab()) - the model's own answer is the first
@@ -7794,10 +9423,13 @@ document.addEventListener('DOMContentLoaded', async () => {
   // happens to click around the tab strip on their own. Two things fix
   // that, together: buildResultsTabsNav() below tags that tab's own label
   // with a small chart badge (persistently visible whenever the user DOES
-  // look at the tab strip), and summaryChartCalloutHtml()/
-  // jumpToChartableResultTab() here put an explicit, clickable nudge
-  // directly under the Summary text itself - exactly where the user's
-  // attention already is the moment it matters.
+  // look at the tab strip), and summaryChartInlineLinkHtml()/
+  // jumpToChartableResultTab() here append an explicit, clickable nudge
+  // onto the tail end of the Summary text itself - a plain inline link
+  // that reads as a continuation of the prose, not a separate boxed
+  // callout sitting apart from it (an earlier version of this feature
+  // used a standalone button below the text; it read as out-of-context
+  // clutter, so it was folded into the text itself instead).
 
   // Jumps straight to whichever result tab in the CURRENT turn carries a
   // validated visualization, and makes sure it lands showing the chart
@@ -7818,20 +9450,20 @@ document.addEventListener('DOMContentLoaded', async () => {
     renderTableResult(entry);
   }
 
-  // Rendered directly under the Summary tab's own text (see
-  // renderTableResult()'s isText branch) whenever this turn's results
-  // include a chartable tab. data-view-chart-trigger is handled by the
-  // same delegated #resultsBody click listener as the Report/feedback
-  // buttons below, for the same "rebuilt fresh on every render, so a
-  // persistent per-element listener would never survive a re-render"
-  // reason.
-  function summaryChartCalloutHtml() {
-    return `
-      <div class="summary-chart-callout">
-        <button type="button" class="summary-chart-callout-btn" data-view-chart-trigger>
-          <span aria-hidden="true">📊</span> View as chart
-        </button>
-      </div>`;
+  // Appended directly onto the end of the Summary tab's own rendered text
+  // (see renderTableResult()'s isText branch, which concatenates this
+  // onto the same HTML string before it's ever assigned to the
+  // paragraph's innerHTML) whenever this turn's results include a
+  // chartable tab - a plain inline <button> styled as a text link (see
+  // .summary-chart-inline-link in style.css), so it reads as a natural
+  // trailing continuation of the summary itself rather than a UI control
+  // bolted on afterward. data-view-chart-trigger is handled by the same
+  // delegated #resultsBody click listener as the Report/feedback buttons
+  // below, for the same "rebuilt fresh on every render, so a persistent
+  // per-element listener would never survive a re-render" reason. Leading
+  // space keeps it from running into the summary's own last word.
+  function summaryChartInlineLinkHtml() {
+    return ' <button type="button" class="summary-chart-inline-link" data-view-chart-trigger>📊 View as chart</button>';
   }
 
   // --- Single-connection mode's own post-execution results summarization ---
@@ -7881,7 +9513,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       });
       if (response.ok && data && data.success && data.summary) {
         return {
-          summaryText: SUMMARY_TAB_BLOCK_MARKER + stripNoSqlPrefix(data.summary),
+          summaryText: stripNoSqlPrefix(data.summary),
           visualization: data.visualization || null,
         };
       } else if (data && data.error) {
@@ -8947,6 +10579,13 @@ document.addEventListener('DOMContentLoaded', async () => {
       } else if (response && response.ok && data && data.sql) {
         const trimmedSql = data.sql.trim();
         const isOpenHelp = trimmedSql.toUpperCase().includes('OPEN HELP POPUP');
+        // Same convention as isOpenHelp/OPEN HELP POPUP above (see
+        // _COMMON_FORMAT_RULES in translate_routes.py) - a metadata
+        // question about the currently configured dataset itself ("what's
+        // in here?", "what data do you have?") now opens the Schema
+        // Viewer instead of asking the model to describe the schema back
+        // in free text/ASCII-art.
+        const isOpenSchema = trimmedSql.toUpperCase().includes('OPEN SCHEMA VIEWER');
         const isNoSql = trimmedSql.startsWith('*** NO SQL ***');
 
         const modelEntry = { role: 'model', text: data.sql };
@@ -8960,6 +10599,31 @@ document.addEventListener('DOMContentLoaded', async () => {
 
           if (helpModal) {
             openHelpModal();
+          }
+        } else if (isOpenSchema) {
+          setSqlQuery('');
+          chatStore.clearPending();
+          clearResultsDisplay();
+
+          // Same {kind, id} addressing the Schema Viewer's own "?" buttons
+          // use (see openSchemaViewer()'s own comment) - sourced from the
+          // active connection's own fields (kept in sync by
+          // fetchBackendConfig(); the same ones getActiveDatabaseType()/
+          // trackDbConnectionError() already read), not from anything this
+          // response itself carries, since "OPEN SCHEMA VIEWER" is about
+          // whichever connection this prompt was just asked against.
+          // Falls back to the plain NO-SQL text render when there's no
+          // addressable connection (an ad hoc custom connection typed as a
+          // raw URL, never saved - see ACTIVE_CUSTOM_CONNECTION_KEY's own
+          // declaration comment) - openSchemaViewer() itself no-ops on a
+          // missing kind/id, which would otherwise silently leave the user
+          // with no response at all.
+          const schemaKind = ACTIVE_IS_CUSTOM ? 'custom' : 'preset';
+          const schemaId = ACTIVE_IS_CUSTOM ? ACTIVE_CUSTOM_CONNECTION_KEY : ACTIVE_PRESET_ID;
+          if (schemaKind && schemaId) {
+            openSchemaViewer(schemaKind, schemaId, connDbName ? connDbName.textContent : '');
+          } else {
+            renderNoSqlResponse(data.sql, { hasLabel: IN_SCOPE_MODE === 'all' });
           }
         } else if (isNoSql) {
           setSqlQuery('');
@@ -9836,101 +11500,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
-  // ===========================================================================
-  // 11. QUICK PROMPTS: DISMISS / RESTORE
-  // ===========================================================================
-  // Example prompt chips: a permanent "Quick prompts" shortcut row, not
-  // onboarding-only - it stays in the UI for every visit until the user
-  // explicitly dismisses it via dismissExamplePromptsBtn, at which point
-  // that choice is remembered on this browser. Distinct from
-  // ONBOARDING_SEEN_KEY, which only tracks whether Help has been opened.
-  // Once dismissed, restoreQuickPromptsBtn (shown inside the Help modal -
-  // see updateRestoreQuickPromptsVisibility(), called from openHelpModal())
-  // is the real UI path back, so nobody has to reach for devtools/localStorage.
-  const EXAMPLE_PROMPTS_DISMISSED_KEY = 'ydylQuickPromptsDismissed';
-  const examplePrompts = document.getElementById('examplePrompts');
-  const dismissExamplePromptsBtn = document.getElementById('dismissExamplePromptsBtn');
-  const restoreQuickPromptsBtn = document.getElementById('restoreQuickPromptsBtn');
-  function hasQuickPromptsDismissed() {
-    try {
-      return localStorage.getItem(EXAMPLE_PROMPTS_DISMISSED_KEY) === '1';
-    } catch (e) {
-      return false; // localStorage unavailable - just leave the row showing
-    }
-  }
-  function dismissQuickPrompts() {
-    try {
-      localStorage.setItem(EXAMPLE_PROMPTS_DISMISSED_KEY, '1');
-    } catch (e) { /* ignore */ }
-    if (examplePrompts) examplePrompts.classList.add('hidden');
-    updateRestoreQuickPromptsVisibility();
-  }
-  function restoreQuickPrompts() {
-    try {
-      localStorage.removeItem(EXAMPLE_PROMPTS_DISMISSED_KEY);
-    } catch (e) { /* ignore */ }
-    if (examplePrompts) examplePrompts.classList.remove('hidden');
-    updateRestoreQuickPromptsVisibility();
-  }
-  // Keeps the "Show quick prompts again" row (inside the Help modal) in
-  // sync with actual dismissed state - only relevant while it's dismissed.
-  function updateRestoreQuickPromptsVisibility() {
-    if (!restoreQuickPromptsBtn) return;
-    restoreQuickPromptsBtn.classList.toggle('hidden', !hasQuickPromptsDismissed());
-  }
-  if (hasQuickPromptsDismissed() && examplePrompts) {
-    examplePrompts.classList.add('hidden');
-  }
-  if (dismissExamplePromptsBtn) {
-    dismissExamplePromptsBtn.addEventListener('click', dismissQuickPrompts);
-  }
-  if (restoreQuickPromptsBtn) {
-    restoreQuickPromptsBtn.addEventListener('click', restoreQuickPrompts);
-  }
-
   if (translateBtn) translateBtn.addEventListener('click', translatePrompt);
   if (runBtn) runBtn.addEventListener('click', () => executeSql());
   if (stopBtn) stopBtn.addEventListener('click', cancelInFlightQuery);
 
-  // Example prompt chips (zero-state guidance for first-time users): fill
-  // the NL prompt box with a working example and immediately run it, so
-  // someone who has never used the app can see the whole prompt -> SQL ->
-  // results flow without having to guess what to type first.
-  //
-  // Each chip's LABEL is fixed (see index.html), but the PROMPT TEXT it
-  // submits depends on the mode: data-prompt-all is used instead of
-  // data-prompt whenever "All databases" mode is selected (see
-  // isAllConnectionsSelected()) - "all" mode routes the question through
-  // a triage step that may pick a different connection than the single-
-  // connection wording assumes, so the two need independently editable
-  // text (see index.html's data-prompt/data-prompt-all comment for where
-  // to change the actual wording). Falls back to data-prompt if a chip
-  // has no data-prompt-all set at all, so this never regresses to an
-  // empty prompt for a chip that hasn't been given "all"-mode wording.
-  const examplePromptButtons = document.querySelectorAll('.example-chip');
-  if (examplePromptButtons.length && aiPrompt) {
-    examplePromptButtons.forEach(btn => {
-      btn.addEventListener('click', () => {
-        const promptText = isAllConnectionsSelected()
-          ? (btn.dataset.promptAll || btn.dataset.prompt || '')
-          : (btn.dataset.prompt || '');
-        trackEvent('quick_prompt_clicked', {
-          chip_label: (btn.textContent || '').trim(),
-          prompt: truncateForAnalytics(promptText),
-        });
-        aiPrompt.value = promptText;
-        // Setting .value directly doesn't fire the 'input' event, so the
-        // listener above (which clears stale SQL as the user types) never
-        // runs here - clear it explicitly so a chip click doesn't leave
-        // a previous prompt's SQL sitting in the editor.
-        setSqlQuery('');
-        translatePrompt();
-      });
-    });
-  }
-
   // ===========================================================================
-  // 12. HISTORY NAVIGATION (back/forward through turns), PURGE, FINAL INIT
+  // 11. HISTORY NAVIGATION (back/forward through turns), PURGE, FINAL INIT
   // ===========================================================================
   function restoreLatestTurn() {
     const turn = chatStore.lastTurn();

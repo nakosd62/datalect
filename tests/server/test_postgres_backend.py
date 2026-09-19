@@ -334,6 +334,34 @@ def test_get_schema_survives_view_with_null_definition():
     assert "View customer_orders: SELECT * FROM orders" in schema
 
 
+def test_get_schema_reindents_a_multiline_view_definition_rather_than_leaving_it_as_is():
+    # pg_get_viewdef(oid, true) (what this now queries - see get_schema's
+    # own comment on switching away from information_schema.views.
+    # view_definition) pretty-prints real views across several lines, not
+    # one - format_multiline_schema_entry_body() (backends/base.py) must
+    # reindent every continuation line so webClient's Schema Viewer can
+    # tell it apart from the start of the NEXT top-level schema section
+    # (see that function's own docstring). A raw, un-reindented multi-line
+    # body would still render here today (this backend doesn't parse its
+    # own output back apart), but the exact reindented shape is what makes
+    # the client-side parsing round-trip correctly - see
+    # tests/e2e/schema-viewer.spec.js's own multi-line view definition
+    # test for that half of this fix.
+    raw_definition = "SELECT a.id,\n   a.name\n  FROM a;"
+    conn, cursor = make_fake_pg_connection(_schema_responses(
+        table_names=["a"],
+        columns_rows=[("a", "id", "integer", "NO", None)],
+        views=[("v", raw_definition)],
+    ))
+    backend = PostgresBackend()
+    schema = backend.get_schema(conn)
+    # Each continuation line keeps its own original indentation, plus the
+    # four guaranteed extra spaces format_multiline_schema_entry_body()
+    # adds on top of it (see that function's own test coverage in
+    # test_backend_base_helpers.py) - not flattened to one fixed amount.
+    assert "View v: SELECT a.id,\n       a.name\n      FROM a;" in schema
+
+
 def test_get_schema_includes_constraints_indexes_grants_triggers():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["orders"],
@@ -611,7 +639,9 @@ def _base_deep_responses():
         views=[("v", "SELECT 1 FROM orders")],
         routines=[("get_total", "p1 integer", "integer", "SELECT 1;")],
         row_count_estimates=[("orders", 500.0)],
-    )
+    ) + [
+        ([(500.0, 2_000_000, 1)], None, -1),  # new schema-wide dataset-size query
+    ]
 
 
 def _phase2_sampling_responses():
@@ -642,7 +672,10 @@ def test_get_schema_deep_is_superset_of_shallow_plus_phase2_sampling():
     assert "id: range [1 .. 100]" in schema
     assert "status: frequent values = active (30), inactive (12)" in schema
 
-    assert len(cursor.calls) == 12 + 4
+    # New schema-wide dataset-size line (Dataset size summary section).
+    assert "Estimated dataset size: ~1.9 MB" in schema
+
+    assert len(cursor.calls) == 1 + 12 + 4
 
 
 def test_get_schema_deep_skips_frequent_values_for_near_unique_column():
@@ -661,7 +694,7 @@ def test_get_schema_deep_skips_frequent_values_for_near_unique_column():
     assert "Column value samples:" in schema
     assert "id: range [1 .. 100]" in schema
     assert "frequent values" not in schema
-    assert len(cursor.calls) == 12 + 3
+    assert len(cursor.calls) == 1 + 12 + 3
 
 
 def test_get_schema_deep_naming_convention_relationships_section():
@@ -672,6 +705,7 @@ def test_get_schema_deep_naming_convention_relationships_section():
             ("orders", "customer_id", "bytea", "NO", None),
         ],
     ) + [
+        ([(30.0, 3_000, 2)], None, -1),  # new schema-wide dataset-size query
         ([], None, -1),        # n_distinct (no categorical/numeric cols to gate)
         ([(10,)], None, -1),   # live count: customers
         ([(20,)], None, -1),   # live count: orders
@@ -709,6 +743,7 @@ def test_get_schema_deep_skips_sampling_for_wide_tables_but_keeps_live_count():
         table_names=["wide"],
         columns_rows=columns_rows,
     ) + [
+        ([(7.0, 1_000, 1)], None, -1),  # new schema-wide dataset-size query
         ([], None, -1),       # n_distinct
         ([(7,)], None, -1),   # live count for wide
         # no min/max response queued - it must not be requested
@@ -718,7 +753,67 @@ def test_get_schema_deep_skips_sampling_for_wide_tables_but_keeps_live_count():
     schema = backend.get_schema(conn)
     assert "Live row counts:" in schema and "wide: 7 rows (live, authoritative)" in schema
     assert "Column value samples:" not in schema
-    assert len(cursor.calls) == 12 + 2
+    assert len(cursor.calls) == 1 + 12 + 2
+
+
+def test_get_schema_deep_dataset_size_line_uses_schema_wide_totals_not_kept_names_scope():
+    """The new dataset-size query aggregates over EVERY base table in
+    current_schema() (pg_class/pg_namespace, no table-name filter) - unlike
+    the neighboring per-table "Row count estimates" query (Phase 1), which
+    is deliberately scoped to kept_names (the capped/bounded subset of
+    tables). Asserts on the actual SQL text/params executed rather than
+    behavior alone, since a kept_names-scoped total would still "work" but
+    silently misreport genuine schema-wide scale for any schema where table
+    capping kicked in."""
+    conn, cursor = make_fake_pg_connection(_base_deep_responses() + _phase2_sampling_responses())
+    backend = PostgresBackend()
+    backend.get_schema(conn)
+
+    dataset_size_calls = [c for c in cursor.calls if "pg_total_relation_size" in c[0]]
+    assert len(dataset_size_calls) == 1
+    sql_text, params = dataset_size_calls[0]
+    assert params is None
+    assert "ANY(%s)" not in sql_text
+
+    # Contrast with the neighboring per-table row-count-estimate query
+    # (Phase 1), which DOES filter by table name via kept_names.
+    row_estimate_calls = [c for c in cursor.calls if "c.relname, c.reltuples" in c[0]]
+    assert len(row_estimate_calls) == 1
+    row_estimate_sql, row_estimate_params = row_estimate_calls[0]
+    assert "ANY(%s)" in row_estimate_sql
+    assert row_estimate_params is not None
+
+
+def test_get_schema_deep_dataset_size_query_failure_does_not_break_the_rest_of_the_fetch():
+    """The dataset-size query is best-effort (try/except-wrapped) - a
+    failure there must not take down the rest of the deep fetch, and must
+    simply produce no "Estimated dataset size:" line rather than a partial
+    or garbled one."""
+    schema_responses = _schema_responses(
+        table_names=["orders"],
+        columns_rows=[
+            ("orders", "id", "integer", "NO", None),
+            ("orders", "status", "character varying", "NO", None),
+        ],
+        views=[("v", "SELECT 1 FROM orders")],
+        routines=[("get_total", "p1 integer", "integer", "SELECT 1;")],
+        row_count_estimates=[("orders", 500.0)],
+    )
+    responses = schema_responses + [Exception("boom")] + _phase2_sampling_responses()
+    conn, cursor = make_fake_pg_connection(responses)
+    backend = PostgresBackend()
+    schema = backend.get_schema(conn)
+
+    # Every other section is still present and complete.
+    assert "Table: orders" in schema
+    assert "View v" in schema
+    assert "View definitions:" in schema and "View v: SELECT 1 FROM orders" in schema
+    assert "Routine definitions:" in schema and "get_total: SELECT 1;" in schema
+    assert "Live row counts:" in schema and "orders: 42 rows (live, authoritative)" in schema
+    assert "Column value samples:" in schema
+
+    # ...but no dataset-size line at all.
+    assert "Estimated dataset size" not in schema
 
 
 # --- cache_key ---------------------------------------------------------------

@@ -43,7 +43,8 @@ from .base import (
     Backend, SqlExecutionError, SCHEMA_MAX_TABLE_NAMES_SCANNED, SCHEMA_MAX_TABLES,
     DB_CONNECT_TIMEOUT_SECONDS, resolve_timeout_seconds, materialize_ca_cert_tempfile,
     group_date_sharded_tables, cap_kept_tables, cap_schema_text, fetch_capped_rows,
-    find_naming_convention_relationships,
+    find_naming_convention_relationships, min_frequent_value_count, FREQUENT_VALUES_LIMIT,
+    format_dataset_size_line, format_multiline_schema_entry_body,
 )
 
 
@@ -96,8 +97,12 @@ MAX_NUMERIC_COLUMNS_FOR_MINMAX = 15
 # bounds query count on a table with many text-ish columns.
 MAX_CATEGORICAL_SAMPLE_COLUMNS_PER_TABLE = 3
 # Matches the "GROUP BY ... ORDER BY COUNT(*) DESC LIMIT 15" shape called
-# for in the plan this implements.
-FREQUENT_VALUES_LIMIT = 15
+# for in the plan this implements. Now imported from backends/base.py
+# (env-configurable via SCHEMA_FREQUENT_VALUES_LIMIT) rather than defined
+# here, so every dialect shares the same value - see that module's own
+# comment. A value also has to clear the separate min_frequent_value_count()
+# share-of-table floor (also backends/base.py) to be included at all - this
+# just bounds how many of the ones that DO clear it get shown.
 
 
 def _is_near_unique_n_distinct(n_distinct):
@@ -490,12 +495,32 @@ class PostgresBackend(Backend):
             # phase2_ctx below so get_schema() (deep) can render the full
             # body without a second query - see get_schema()'s "View
             # definitions" section.
+            #
+            # pg_catalog.pg_get_viewdef(oid, true), NOT information_schema.
+            # views.view_definition - deliberately. The information_schema
+            # column is NULL for any role that doesn't OWN the view, per the
+            # SQL standard's own visibility rule for that view - a role with
+            # full, explicitly-granted SELECT on the view (the normal setup
+            # for a least-privilege reporting/app user connecting to a
+            # schema it didn't create) still gets NULL back, even though it
+            # can query the view just fine. pg_get_viewdef() has no such
+            # restriction: it only needs the caller to be able to see the
+            # view's pg_class row at all (the same visibility a plain SELECT
+            # against it already implies), which is exactly why psql's own
+            # `\d+ viewname` uses this same function rather than
+            # information_schema. This is a real, common false-negative for
+            # this exact "connected as a non-owning read-only role" setup,
+            # not a fallback for something the view-lines code below still
+            # has to handle - see its own view_definition-can-be-NULL
+            # comment for the (now rarer, e.g. an actually revoked USAGE)
+            # case that's still possible even via pg_get_viewdef.
             cursor.execute("""
                 SELECT
-                    table_name,
-                    view_definition
-                FROM information_schema.views
-                WHERE table_schema = current_schema();
+                    c.relname,
+                    pg_get_viewdef(c.oid, true)
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = current_schema() AND c.relkind = 'v';
             """)
             views = cursor.fetchall()
             if views:
@@ -709,21 +734,55 @@ class PostgresBackend(Backend):
         views = phase2_ctx["views"]
         routines = phase2_ctx["routines"]
 
+        # Dataset size summary (new) - schema-wide totals, unlike the
+        # per-table "Row count estimates" (Phase 1, kept_names-only, free
+        # reltuples estimate) and "Live row counts" (Phase 2 below,
+        # kept_names-only, authoritative but a live COUNT(*) per table)
+        # sections nearby: kept_names is a capped subset of this schema's
+        # tables (see cap_kept_tables), so neither of those reflects the
+        # database's true overall size. This queries pg_class/pg_namespace
+        # once for every table in current_schema() - still just a free
+        # catalog/statistics lookup, never a live scan - to give the LLM a
+        # sense of overall scale (row count, storage, table count) even
+        # when most tables were capped out of the detailed sections below.
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    SELECT COALESCE(SUM(c.reltuples), 0), COALESCE(SUM(pg_total_relation_size(c.oid)), 0), COUNT(*)
+                    FROM pg_class c
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = current_schema() AND c.relkind = 'r';
+                """)
+                row = cursor.fetchone()
+                if row is not None:
+                    total_rows, total_bytes, table_count = row
+                    if table_count and table_count > 0:
+                        size_line = format_dataset_size_line(
+                            total_rows=total_rows, total_bytes=total_bytes,
+                        )
+                        if size_line:
+                            schema_parts.append(size_line)
+        except Exception:
+            pass
+
         # Phase 2 (deep-only): full view/routine bodies, reusing the raw
         # rows _build_shallow_schema_parts already fetched - no re-query.
         if views:
-            view_lines = [f"  View {v[0]}: {(v[1] or '').strip()}" for v in views]
-            # view_definition legitimately comes back NULL from Postgres
-            # (not just an empty string) when the connected role lacks the
-            # privilege to see a given view's definition - `(v[1] or
-            # '').strip()` matches every other backend's own views-section
-            # guard (see the historical note this replaces, still true
-            # here: a bare v[1].strip() would raise AttributeError on that
-            # None and abort schema fetch for the WHOLE database).
+            view_lines = [f"  View {v[0]}: {format_multiline_schema_entry_body(v[1])}" for v in views]
+            # pg_get_viewdef() can still legitimately come back NULL/empty
+            # (not just an empty string) in rarer cases than
+            # information_schema.views.view_definition used to hit (see the
+            # query above's own comment on why this switched away from
+            # that column) - e.g. USAGE on the schema itself actually
+            # revoked, not just SELECT on individual tables.
+            # format_multiline_schema_entry_body() already guards the
+            # None-vs-string handling that used to live here directly (a
+            # bare v[1].strip() would raise AttributeError on that None and
+            # abort schema fetch for the WHOLE database).
             schema_parts.append("View definitions:\n" + "\n".join(view_lines))
 
         routine_body_lines = [
-            f"  {r[0]}: {(r[3] or '').strip()}" for r in routines if (r[3] or "").strip()
+            f"  {r[0]}: {format_multiline_schema_entry_body(r[3])}" for r in routines if (r[3] or "").strip()
         ]
         if routine_body_lines:
             schema_parts.append("Routine definitions:\n" + "\n".join(routine_body_lines))
@@ -759,12 +818,18 @@ class PostgresBackend(Backend):
 
                 # Fresh/live row count - authoritative, unlike the Phase 1
                 # reltuples estimate above (which is free but can be stale
-                # until the next ANALYZE/autovacuum).
+                # until the next ANALYZE/autovacuum). Kept as `row_count`
+                # (not just inlined into the log line below) so the
+                # "frequent values" sampling further down can size its own
+                # min_frequent_value_count() floor off the same number -
+                # None if this query fails, same as before this existed.
+                row_count = None
                 try:
                     cursor.execute(f"SELECT COUNT(*) FROM {_quote_ident(table_name)};")
                     row = cursor.fetchone()
                     if row is not None:
-                        live_count_lines.append(f"  {table_name}: {row[0]} rows (live, authoritative)")
+                        row_count = row[0]
+                        live_count_lines.append(f"  {table_name}: {row_count} rows (live, authoritative)")
                 except Exception:
                     pass
 
@@ -812,11 +877,20 @@ class PostgresBackend(Backend):
                     if len(eligible_categorical) >= MAX_CATEGORICAL_SAMPLE_COLUMNS_PER_TABLE:
                         break
 
+                # HAVING floor (see min_frequent_value_count()'s own
+                # docstring) - a value must clear BOTH this share-of-table
+                # gate AND the plain top-FREQUENT_VALUES_LIMIT cut to show
+                # up at all; None (row_count unavailable) omits the clause
+                # entirely, falling back to the old top-N-only behavior for
+                # just this table.
+                min_count = min_frequent_value_count(row_count)
+                having_clause = f"HAVING COUNT(*) >= {min_count} " if min_count is not None else ""
                 for c in eligible_categorical:
                     try:
                         cursor.execute(
                             f"SELECT {_quote_ident(c)}, COUNT(*) FROM {_quote_ident(table_name)} "
-                            f"GROUP BY {_quote_ident(c)} ORDER BY COUNT(*) DESC LIMIT {FREQUENT_VALUES_LIMIT};"
+                            f"GROUP BY {_quote_ident(c)} {having_clause}"
+                            f"ORDER BY COUNT(*) DESC LIMIT {FREQUENT_VALUES_LIMIT};"
                         )
                         freq_rows = cursor.fetchall()
                         if freq_rows:

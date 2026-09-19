@@ -116,7 +116,8 @@ from .base import (
     Backend, SqlExecutionError, SCHEMA_MAX_TABLE_NAMES_SCANNED, SCHEMA_MAX_TABLES,
     DB_CONNECT_TIMEOUT_SECONDS, resolve_timeout_seconds,
     group_date_sharded_tables, cap_kept_tables, cap_schema_text, fetch_capped_rows,
-    find_naming_convention_relationships,
+    find_naming_convention_relationships, min_frequent_value_count, FREQUENT_VALUES_LIMIT,
+    format_dataset_size_line, format_multiline_schema_entry_body,
 )
 
 # CLOB/BLOB columns are fetched as LOB locator objects (requiring .read())
@@ -312,10 +313,11 @@ def _is_numeric_or_date_type(data_type):
 MAX_COLUMNS_FOR_SAMPLING = 25
 MAX_NUMERIC_COLUMNS_FOR_MINMAX = 15
 MAX_CATEGORICAL_SAMPLE_COLUMNS_PER_TABLE = 3
-# Oracle 12c+ "FETCH FIRST n ROWS ONLY" (this file's table-name-scan query
-# already relies on this same syntax for scan_limit) rather than a LIMIT
-# clause, which Oracle has no equivalent of.
-FREQUENT_VALUES_LIMIT = 15
+# FREQUENT_VALUES_LIMIT now imported from backends/base.py (env-configurable
+# via SCHEMA_FREQUENT_VALUES_LIMIT) rather than defined here - see that
+# module's own comment. Oracle 12c+ "FETCH FIRST n ROWS ONLY" (this file's
+# table-name-scan query already relies on this same syntax for scan_limit)
+# is used in place of a LIMIT clause, which Oracle has no equivalent of.
 
 
 def _quote_ident(name):
@@ -959,6 +961,37 @@ class OracleBackend(Backend):
         num_rows_by_table = phase2_ctx["num_rows_by_table"]
         views = phase2_ctx["views"]
 
+        # Dataset size estimate (new, deep-only) - unlike the per-table
+        # "Live row counts" section below (scoped to kept_names, a capped
+        # subset of at most SCHEMA_MAX_TABLES tables), this covers the
+        # whole schema. Row count needs no new query/try-except: Phase 1
+        # already scanned every table (up to SCHEMA_MAX_TABLE_NAMES_SCANNED)
+        # into num_rows_by_table via ALL_TABLES, so summing that dict (pure
+        # Python, can't fail from a DB call) gives the true schema-wide
+        # total. Byte size has no equivalent free Phase-1 value, so it's a
+        # separate best-effort query - USER_SEGMENTS access/contents can
+        # vary by grants, hence its own try/except.
+        total_rows = sum(v for v in num_rows_by_table.values() if v is not None)
+        total_tables = len(num_rows_by_table)
+        if total_tables:
+            total_bytes = None
+            try:
+                with connection.cursor() as cursor_size:
+                    cursor_size.execute("""
+                        SELECT SUM(bytes) FROM user_segments
+                        WHERE segment_type IN ('TABLE', 'TABLE PARTITION')
+                    """)
+                    size_row = cursor_size.fetchone()
+                    if size_row is not None:
+                        total_bytes = size_row[0]
+            except Exception:
+                pass
+            size_line = format_dataset_size_line(
+                total_rows=total_rows, total_bytes=total_bytes,
+            )
+            if size_line:
+                schema_parts.append(size_line)
+
         # Full view bodies (deep-only) - reusing the raw rows
         # _build_shallow_schema_parts already fetched (TEXT_VC, possibly
         # truncated per the module docstring's accepted tradeoff) - no
@@ -967,7 +1000,7 @@ class OracleBackend(Backend):
         if views:
             schema_parts.append(
                 "View definitions:\n" + "\n".join(
-                    f"  View {t}: {(d or '').strip()}" for (t, d) in views
+                    f"  View {t}: {format_multiline_schema_entry_body(d)}" for (t, d) in views
                 )
             )
 
@@ -1007,12 +1040,19 @@ class OracleBackend(Backend):
 
                 # Fresh/live row count - authoritative, unlike the Phase 1
                 # NUM_ROWS estimate above (free but stale until the next
-                # DBMS_STATS run).
+                # DBMS_STATS run). Kept as `row_count` - see postgres.py's
+                # identical comment - so the "frequent values" sampling
+                # further down can size its min_frequent_value_count()
+                # floor off this fresh count rather than the possibly-stale
+                # num_rows_by_table estimate already used for the near-
+                # unique gate just below.
+                row_count = None
                 try:
                     cursor.execute(f"SELECT COUNT(*) FROM {_quote_ident(table_name)}")
                     row = cursor.fetchone()
                     if row is not None:
-                        live_count_lines.append(f"  {table_name}: {row[0]} rows (live, authoritative)")
+                        row_count = row[0]
+                        live_count_lines.append(f"  {table_name}: {row_count} rows (live, authoritative)")
                 except Exception:
                     pass
 
@@ -1060,11 +1100,17 @@ class OracleBackend(Backend):
                     if len(eligible_categorical) >= MAX_CATEGORICAL_SAMPLE_COLUMNS_PER_TABLE:
                         break
 
+                # HAVING floor - see backends/base.py's
+                # min_frequent_value_count() docstring and postgres.py's
+                # identical use of it.
+                min_count = min_frequent_value_count(row_count)
+                having_clause = f"HAVING COUNT(*) >= {min_count} " if min_count is not None else ""
                 for c in eligible_categorical:
                     try:
                         cursor.execute(
                             f"SELECT {_quote_ident(c)}, COUNT(*) FROM {_quote_ident(table_name)} "
-                            f"GROUP BY {_quote_ident(c)} ORDER BY COUNT(*) DESC "
+                            f"GROUP BY {_quote_ident(c)} {having_clause}"
+                            f"ORDER BY COUNT(*) DESC "
                             f"FETCH FIRST {FREQUENT_VALUES_LIMIT} ROWS ONLY"
                         )
                         freq_rows = cursor.fetchall()

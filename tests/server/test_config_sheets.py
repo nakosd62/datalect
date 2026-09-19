@@ -103,6 +103,21 @@ def test_execute_reaches_the_resolved_spreadsheet_and_tab(app_env, sheets_harnes
         "spreadsheet_url": "https://docs.google.com/spreadsheets/d/1AbCdEf2345/edit",
         "tab_name": "Sheet1", "database_name": "My Sheet", "is_custom": True,
     })
+    # That save is a genuine "new connection" event, so it kicks off a
+    # BACKGROUND schema-priming fetch (see config_routes.py's "connection
+    # is changing" branch) that also calls into sheets_harness - racing it
+    # against the queue_table()/execute below (both share the same
+    # sheets_harness queue) would non-deterministically let the priming
+    # fetch consume the response meant for /api/execute instead. Waiting
+    # for that background fetch's own request to land first (it always
+    # makes exactly one - see backends/sheets.py's get_schema_shallow())
+    # removes that race, same fix applied to the equivalent
+    # background-thread races in test_config_schema_refetch.py.
+    import time
+    deadline = time.monotonic() + 2.0
+    while len(sheets_harness.calls) < 1 and time.monotonic() < deadline:
+        time.sleep(0.01)
+
     sheets_harness.queue_table(cols=[{"label": "A", "type": "string"}], rows=[["x"]])
     resp = app_env.client.post('/api/execute', json={"sql": "select A"})
     assert resp.status_code == 200

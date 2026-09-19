@@ -339,6 +339,34 @@ def test_get_schema_distribution_sort_keys_section():
     assert "[orders] DISTSTYLE KEY(customer_id), SORTKEY(order_date)" in schema
 
 
+def test_get_schema_svv_table_info_query_failure_is_logged_not_swallowed(caplog):
+    # Distribution/Sort Keys and Row count estimates both come from this
+    # one svv_table_info query (Phase 1) - a failure here must not break
+    # the rest of the fetch (matches the constraints/routines/grants
+    # query-failure tests elsewhere in this file), but it must also not be
+    # swallowed silently: svv_table_info defaults to superuser-only
+    # visibility in real Redshift, so the real, actionable cause (a
+    # missing GRANT) is worth surfacing in the server logs rather than
+    # discarding.
+    responses = _schema_responses(
+        table_names=["orders"],
+        columns_rows=[("orders", "id", "integer", "NO", None)],
+    )
+    responses[3] = Exception("permission denied for relation svv_table_info")
+    conn, cursor = make_fake_pg_connection(responses)
+    backend = RedshiftBackend()
+    with caplog.at_level("WARNING"):
+        schema = backend.get_schema_shallow(conn)
+    assert "Table: orders" in schema
+    assert "Distribution/Sort Keys" not in schema
+    assert "Row count estimates:" not in schema
+    assert any(
+        "svv_table_info query failed" in r.getMessage()
+        and "GRANT SELECT ON svv_table_info" in r.getMessage()
+        for r in caplog.records
+    )
+
+
 def test_get_schema_has_no_indexes_or_triggers_sections():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["t"],
@@ -672,7 +700,9 @@ def _base_deep_responses():
         views=[("v", "SELECT 1 FROM orders")],
         routines=[("get_total", "p1 integer", "integer", "SELECT 1;")],
         layout=[("orders", "KEY(id)", "id", 500, 0)],
-    )
+    ) + [
+        ([(500, 2_000_000, 1)], None, -1),  # new schema-wide dataset-size query
+    ]
 
 
 def _phase2_sampling_responses():
@@ -703,7 +733,10 @@ def test_get_schema_deep_is_superset_of_shallow_plus_phase2_sampling():
     assert "id: range [1 .. 100]" in schema
     assert "status: frequent values = active (30), inactive (12)" in schema
 
-    assert len(cursor.calls) == 10 + 4
+    # New schema-wide dataset-size line (Dataset size summary section).
+    assert "Estimated dataset size: ~1.9 MB" in schema
+
+    assert len(cursor.calls) == 1 + 10 + 4
 
 
 def test_get_schema_deep_skips_frequent_values_for_near_unique_column():
@@ -719,7 +752,7 @@ def test_get_schema_deep_skips_frequent_values_for_near_unique_column():
     assert "Column value samples:" in schema
     assert "id: range [1 .. 100]" in schema
     assert "frequent values" not in schema
-    assert len(cursor.calls) == 10 + 3
+    assert len(cursor.calls) == 1 + 10 + 3
 
 
 def test_get_schema_deep_naming_convention_relationships_section():
@@ -730,6 +763,7 @@ def test_get_schema_deep_naming_convention_relationships_section():
             ("orders", "customer_id", "bigint", "NO", None),
         ],
     ) + [
+        ([(30, 3_000, 2)], None, -1),  # new schema-wide dataset-size query
         ([], None, -1),        # n_distinct (no categorical cols to gate)
         ([(10,)], None, -1),   # live count: customers
         ([(1, 10)], None, -1),  # min/max: customers.id
@@ -767,6 +801,7 @@ def test_get_schema_deep_skips_sampling_for_wide_tables_but_keeps_live_count():
         table_names=["wide"],
         columns_rows=columns_rows,
     ) + [
+        ([(7, 1_000, 1)], None, -1),  # new schema-wide dataset-size query
         ([], None, -1),       # n_distinct
         ([(7,)], None, -1),   # live count for wide
         # no min/max response queued - it must not be requested
@@ -776,7 +811,77 @@ def test_get_schema_deep_skips_sampling_for_wide_tables_but_keeps_live_count():
     schema = backend.get_schema(conn)
     assert "Live row counts:" in schema and "wide: 7 rows (live, authoritative)" in schema
     assert "Column value samples:" not in schema
-    assert len(cursor.calls) == 10 + 2
+    assert len(cursor.calls) == 1 + 10 + 2
+
+
+def test_get_schema_deep_dataset_size_line_uses_schema_wide_totals_not_kept_names_scope():
+    """The new dataset-size query aggregates svv_table_info over EVERY
+    table in current_schema() (no table-name filter) - unlike the
+    neighboring "diststyle/sortkey1/tbl_rows" layout query (Phase 1), which
+    is deliberately scoped to kept_names (the capped/bounded subset of
+    tables) via `"table" = ANY(%s)`. Asserts on the actual SQL text/params
+    executed rather than behavior alone, since a kept_names-scoped total
+    would still "work" but silently misreport genuine schema-wide scale for
+    any schema where table capping kicked in."""
+    conn, cursor = make_fake_pg_connection(_base_deep_responses() + _phase2_sampling_responses())
+    backend = RedshiftBackend()
+    backend.get_schema(conn)
+
+    dataset_size_calls = [c for c in cursor.calls if "CAST(size AS BIGINT)" in c[0]]
+    assert len(dataset_size_calls) == 1
+    sql_text, params = dataset_size_calls[0]
+    assert params is None
+    assert "ANY(%s)" not in sql_text
+
+    # Contrast with the neighboring per-table layout/row-count-estimate
+    # query (Phase 1), which DOES filter by table name via kept_names.
+    layout_calls = [c for c in cursor.calls if "diststyle, sortkey1" in c[0]]
+    assert len(layout_calls) == 1
+    layout_sql, layout_params = layout_calls[0]
+    assert "ANY(%s)" in layout_sql
+    assert layout_params is not None
+
+
+def test_get_schema_deep_dataset_size_query_failure_does_not_break_the_rest_of_the_fetch(caplog):
+    """The dataset-size query is best-effort (try/except-wrapped) - a
+    failure there must not take down the rest of the deep fetch, and must
+    simply produce no "Estimated dataset size:" line rather than a partial
+    or garbled one. It must also not be swallowed silently - same
+    real-world cause (svv_table_info needing an explicit GRANT) and same
+    logging as the Phase 1 svv_table_info query failure covered by
+    test_get_schema_svv_table_info_query_failure_is_logged_not_swallowed
+    above, just for this separate schema-wide aggregate query."""
+    schema_responses = _schema_responses(
+        table_names=["orders"],
+        columns_rows=[
+            ("orders", "id", "integer", "NO", None),
+            ("orders", "status", "character varying", "NO", None),
+        ],
+        views=[("v", "SELECT 1 FROM orders")],
+        routines=[("get_total", "p1 integer", "integer", "SELECT 1;")],
+        layout=[("orders", "KEY(id)", "id", 500, 0)],
+    )
+    responses = schema_responses + [Exception("boom")] + _phase2_sampling_responses()
+    conn, cursor = make_fake_pg_connection(responses)
+    backend = RedshiftBackend()
+    with caplog.at_level("WARNING"):
+        schema = backend.get_schema(conn)
+
+    # Every other section is still present and complete.
+    assert "Table: orders" in schema
+    assert "View v" in schema
+    assert "View definitions:" in schema and "View v: SELECT 1 FROM orders" in schema
+    assert "Routine definitions:" in schema and "get_total: SELECT 1;" in schema
+    assert "Live row counts:" in schema and "orders: 42 rows (live, authoritative)" in schema
+    assert "Column value samples:" in schema
+
+    # ...but no dataset-size line at all.
+    assert "Estimated dataset size" not in schema
+    assert any(
+        "svv_table_info dataset-size query failed" in r.getMessage()
+        and "GRANT SELECT ON svv_table_info" in r.getMessage()
+        for r in caplog.records
+    )
 
 
 # --- execute() ---------------------------------------------------------------

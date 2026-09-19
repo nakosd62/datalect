@@ -9,6 +9,7 @@ from decimal import Decimal
 from datetime import date
 
 import pytest
+from google.api_core import exceptions as gcloud_exceptions
 
 from helpers import SERVER_DIR
 
@@ -16,7 +17,7 @@ if SERVER_DIR not in sys.path:
     sys.path.insert(0, SERVER_DIR)
 
 from backends.bigquery import BigQueryBackend
-from backends.base import SqlExecutionError
+from backends.base import SqlExecutionError, format_dataset_size_line
 from helpers import (
     install_fake_bigquery, schema_query_handler, make_service_account_key_json,
     FakeBQQueryJob,
@@ -125,7 +126,17 @@ def test_get_schema_collapses_shard_family_into_wildcard_table_syntax(monkeypatc
     ))
     conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
     schema = backend.get_schema(conn)
-    assert "Table family: `p.d.events_*`" in schema
+    # The heading's own leading label is the bare pattern - same
+    # convention as a plain "Table: <name>" heading, and the same one
+    # every other dialect's own shard-family heading already follows
+    # (see e.g. test_postgres_backend.py's "Table family: events_<date>").
+    # BigQuery is the one dialect that also needs a fully-qualified,
+    # backtick-quoted wildcard form to actually query the family (unlike
+    # every other dialect's plain "substitute the exact date" instruction) -
+    # that's still given verbatim in the entry's own descriptive text, just
+    # no longer duplicated as the heading's leading token too.
+    assert "Table family: events_*" in schema
+    assert "`p.d.events_*`" in schema
     assert "_TABLE_SUFFIX" in schema
     assert "Table: events_20240102" not in schema
 
@@ -278,37 +289,194 @@ def test_get_schema_shallow_includes_row_count_estimate(monkeypatch):
     assert "customers: ~12345 rows (estimate)" in schema
 
 
-def test_get_schema_survives_table_storage_query_failure(monkeypatch):
+def _bq_table_storage_handler(sql_text, exc):
+    """Shared handler builder for the three failure-mode tests below - every
+    other query (TABLES/COLUMNS/...) still succeeds normally via
+    schema_query_handler(); only TABLE_STORAGE raises `exc`."""
+    if "INFORMATION_SCHEMA.TABLES" in sql_text:
+        return FakeBQQueryJob(
+            rows=[{"table_name": "orders", "table_type": "BASE TABLE"}],
+            columns=["table_name", "table_type"],
+        )
+    if "INFORMATION_SCHEMA.COLUMNS" in sql_text:
+        return FakeBQQueryJob(
+            rows=[{
+                "table_name": "orders", "column_name": "id", "data_type": "INT64",
+                "is_nullable": "NO", "is_partitioning_column": "NO",
+                "clustering_ordinal_position": None,
+            }],
+            columns=["table_name", "column_name", "data_type", "is_nullable",
+                     "is_partitioning_column", "clustering_ordinal_position"],
+        )
+    if "INFORMATION_SCHEMA.TABLE_STORAGE" in sql_text:
+        raise exc
+    return FakeBQQueryJob(rows=[])
+
+
+def test_get_schema_survives_table_storage_query_failure(monkeypatch, caplog):
     # TABLE_STORAGE is flagged best-effort in the plan (can be slower/less
     # available than TABLES/COLUMNS) - a failure here must not break the
-    # rest of the fetch.
+    # rest of the fetch. It must also not be swallowed silently - see the
+    # module's own comment on this except block for why the real cause
+    # is now logged rather than just discarded. A 403 Forbidden here really
+    # is the missing bigquery.tables.list permission case.
     backend, harness = _bq(monkeypatch)
+    harness.set_handler(lambda sql_text, job_config: _bq_table_storage_handler(
+        sql_text, gcloud_exceptions.Forbidden("Access Denied: Permission bigquery.tables.list denied"),
+    ))
+    conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
+    with caplog.at_level("WARNING"):
+        schema = backend.get_schema(conn)
+    assert "Table: orders" in schema
+    assert "Row count estimates:" not in schema
+    assert any(
+        "TABLE_STORAGE row-count-estimate query failed" in r.getMessage()
+        and "bigquery.tables.list" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_get_schema_survives_table_storage_not_found_for_a_cross_project_dataset(monkeypatch, caplog):
+    # Root-caused against a real connection to a Google-managed public
+    # dataset (bigquery-public-data): TABLE_STORAGE 404s there, NOT 403s -
+    # querying storage/row-count metadata for a dataset owned by a
+    # different project than the one being billed simply isn't exposed,
+    # regardless of what's granted. This must NOT be reported as a missing
+    # permission (see _table_storage_failure_reason()'s own docstring) -
+    # there is nothing to grant, and the old message actively misled a real
+    # user into thinking a GRANT would fix it.
+    backend, harness = _bq(monkeypatch)
+    harness.set_handler(lambda sql_text, job_config: _bq_table_storage_handler(
+        sql_text, gcloud_exceptions.NotFound(
+            "Dataset bigquery-public-data:google_trends.INFORMATION_SCHEMA "
+            "was not found in location US"
+        ),
+    ))
+    conn = backend.connect({"type": "bigquery", "project_id": "bigquery-public-data", "dataset": "google_trends"})
+    with caplog.at_level("WARNING"):
+        schema = backend.get_schema(conn)
+    assert "Table: orders" in schema
+    assert "Row count estimates:" not in schema
+    matches = [r for r in caplog.records if "TABLE_STORAGE row-count-estimate query failed" in r.getMessage()]
+    assert len(matches) == 1
+    message = matches[0].getMessage()
+    assert "bigquery.tables.list" not in message
+    assert "different project" in message
+    assert "does not expose storage/row-count metadata" in message
+
+
+def test_get_schema_survives_table_storage_unknown_failure_with_a_generic_message(monkeypatch, caplog):
+    # Neither a 404 nor a 403 - a transient/unclassified failure still logs
+    # (never silently swallowed) but doesn't guess a specific cause it
+    # can't actually confirm.
+    backend, harness = _bq(monkeypatch)
+    harness.set_handler(lambda sql_text, job_config: _bq_table_storage_handler(
+        sql_text, TimeoutError("deadline exceeded"),
+    ))
+    conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
+    with caplog.at_level("WARNING"):
+        schema = backend.get_schema(conn)
+    assert "Table: orders" in schema
+    matches = [r for r in caplog.records if "TABLE_STORAGE row-count-estimate query failed" in r.getMessage()]
+    assert len(matches) == 1
+    message = matches[0].getMessage()
+    assert "bigquery.tables.list" not in message
+    assert "different project" not in message
+    assert "reason unknown" in message
+
+
+# --- Phase 2 (deep-only): dataset-wide size estimate ---------------------------
+# get_schema()'s own separate INFORMATION_SCHEMA.TABLE_STORAGE aggregate
+# (SUM(total_rows)/SUM(total_logical_bytes)/COUNT(*), no kept_names filter) -
+# distinct from the per-table Phase 1 TABLE_STORAGE query covered above,
+# though both queries share the "INFORMATION_SCHEMA.TABLE_STORAGE" substring
+# schema_query_handler() matches on, so these tests intercept it themselves
+# with a custom handler that delegates everything else to schema_query_handler.
+
+def test_get_schema_deep_appends_dataset_size_estimate_line(monkeypatch):
+    backend, harness = _bq(monkeypatch)
+    base_handler = schema_query_handler(
+        tables=["customers"],
+        columns=[("customers", "id", "INT64", "NO")],
+    )
 
     def handler(sql_text, job_config):
-        if "INFORMATION_SCHEMA.TABLES" in sql_text:
+        if "SUM(total_rows)" in sql_text:
+            assert "INFORMATION_SCHEMA.TABLE_STORAGE" in sql_text
             return FakeBQQueryJob(
-                rows=[{"table_name": "orders", "table_type": "BASE TABLE"}],
-                columns=["table_name", "table_type"],
+                rows=[{"total_rows": 1234567, "total_bytes": 3_400_000_000, "table_count": 42}],
+                columns=["total_rows", "total_bytes", "table_count"],
             )
-        if "INFORMATION_SCHEMA.COLUMNS" in sql_text:
-            return FakeBQQueryJob(
-                rows=[{
-                    "table_name": "orders", "column_name": "id", "data_type": "INT64",
-                    "is_nullable": "NO", "is_partitioning_column": "NO",
-                    "clustering_ordinal_position": None,
-                }],
-                columns=["table_name", "column_name", "data_type", "is_nullable",
-                         "is_partitioning_column", "clustering_ordinal_position"],
-            )
-        if "INFORMATION_SCHEMA.TABLE_STORAGE" in sql_text:
-            raise Exception("TABLE_STORAGE unavailable")
-        return FakeBQQueryJob(rows=[])
+        return base_handler(sql_text, job_config)
 
     harness.set_handler(handler)
     conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
     schema = backend.get_schema(conn)
-    assert "Table: orders" in schema
-    assert "Row count estimates:" not in schema
+    expected_line = format_dataset_size_line(
+        total_rows=1234567, total_bytes=3_400_000_000,
+    )
+    assert expected_line in schema
+
+
+def test_get_schema_deep_survives_dataset_size_estimate_query_failure(monkeypatch, caplog):
+    # Same "don't swallow the real reason" coverage as
+    # test_get_schema_survives_table_storage_query_failure above, for this
+    # separate dataset-wide aggregate query. A 403 Forbidden here really is
+    # the missing bigquery.tables.list permission case.
+    backend, harness = _bq(monkeypatch)
+    base_handler = schema_query_handler(
+        tables=["customers"],
+        columns=[("customers", "id", "INT64", "NO")],
+    )
+
+    def handler(sql_text, job_config):
+        if "SUM(total_rows)" in sql_text:
+            raise gcloud_exceptions.Forbidden("Access Denied: Permission bigquery.tables.list denied")
+        return base_handler(sql_text, job_config)
+
+    harness.set_handler(handler)
+    conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
+    with caplog.at_level("WARNING"):
+        schema = backend.get_schema(conn)
+    assert "Table: customers" in schema
+    assert "Estimated dataset size" not in schema
+    assert any(
+        "TABLE_STORAGE dataset-size query failed" in r.getMessage()
+        and "bigquery.tables.list" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_get_schema_deep_survives_dataset_size_not_found_for_a_cross_project_dataset(monkeypatch, caplog):
+    # Same cross-project/public-dataset 404 coverage as
+    # test_get_schema_survives_table_storage_not_found_for_a_cross_project_
+    # dataset above, for this separate dataset-wide aggregate query - must
+    # not blame a missing permission for something no GRANT could ever fix.
+    backend, harness = _bq(monkeypatch)
+    base_handler = schema_query_handler(
+        tables=["customers"],
+        columns=[("customers", "id", "INT64", "NO")],
+    )
+
+    def handler(sql_text, job_config):
+        if "SUM(total_rows)" in sql_text:
+            raise gcloud_exceptions.NotFound(
+                "Dataset bigquery-public-data:google_trends.INFORMATION_SCHEMA "
+                "was not found in location US"
+            )
+        return base_handler(sql_text, job_config)
+
+    harness.set_handler(handler)
+    conn = backend.connect({"type": "bigquery", "project_id": "bigquery-public-data", "dataset": "google_trends"})
+    with caplog.at_level("WARNING"):
+        schema = backend.get_schema(conn)
+    assert "Table: customers" in schema
+    assert "Estimated dataset size" not in schema
+    matches = [r for r in caplog.records if "TABLE_STORAGE dataset-size query failed" in r.getMessage()]
+    assert len(matches) == 1
+    message = matches[0].getMessage()
+    assert "bigquery.tables.list" not in message
+    assert "different project" in message
 
 
 # --- Phase 1: routines (existence + signature, no body) -----------------------

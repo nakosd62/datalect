@@ -156,6 +156,7 @@ SVV_TABLE_INFO query and every new best-effort section above as solid first
 drafts to validate before relying on them against a real cluster.
 """
 
+import logging
 import re
 
 import psycopg2
@@ -166,7 +167,8 @@ from .base import (
     Backend, SqlExecutionError, SCHEMA_MAX_TABLE_NAMES_SCANNED, SCHEMA_MAX_TABLES,
     DB_CONNECT_TIMEOUT_SECONDS, resolve_timeout_seconds,
     group_date_sharded_tables, cap_kept_tables, cap_schema_text, fetch_capped_rows,
-    find_naming_convention_relationships,
+    find_naming_convention_relationships, min_frequent_value_count, FREQUENT_VALUES_LIMIT,
+    format_dataset_size_line, format_multiline_schema_entry_body,
 )
 
 
@@ -199,6 +201,8 @@ NUMERIC_OR_DATE_TYPES = frozenset({
 })
 CATEGORICAL_TYPES = frozenset({"character varying", "character", "text", "boolean"})
 
+_logger = logging.getLogger(__name__)
+
 # Bounds on Phase 2's per-table sampling cost - identical values to
 # backends/postgres.py's own (see that module for the full rationale each
 # bound guards against; repeated here rather than imported so this file has
@@ -207,7 +211,9 @@ CATEGORICAL_TYPES = frozenset({"character varying", "character", "text", "boolea
 MAX_COLUMNS_FOR_SAMPLING = 25
 MAX_NUMERIC_COLUMNS_FOR_MINMAX = 15
 MAX_CATEGORICAL_SAMPLE_COLUMNS_PER_TABLE = 3
-FREQUENT_VALUES_LIMIT = 15
+# FREQUENT_VALUES_LIMIT now imported from backends/base.py (env-configurable
+# via SCHEMA_FREQUENT_VALUES_LIMIT) rather than defined here - see that
+# module's own comment.
 
 
 def _is_near_unique_n_distinct(n_distinct):
@@ -562,8 +568,26 @@ class RedshiftBackend(Backend):
                     )
                 if row_count_lines:
                     schema_parts.append("Row count estimates:\n" + "\n".join(row_count_lines))
-            except Exception:
-                pass
+            except Exception as exc:
+                # Silently degrading (no Distribution/Sort Keys, no Row
+                # count estimates - both come from this one query) is the
+                # right behavior for the user, but silently losing the
+                # REASON is not: svv_table_info is a Redshift SYS view that
+                # defaults to superuser-only visibility - an ordinary user
+                # needs an explicit "GRANT SELECT ON svv_table_info TO
+                # <user>;" (or membership in a group that has it) even
+                # though they can already SELECT from their own tables
+                # directly. That's the most likely cause whenever this
+                # query fails for an otherwise-working connection.
+                _logger.warning(
+                    "Redshift svv_table_info query failed for the current "
+                    "schema - the connected user most likely lacks SELECT on "
+                    "svv_table_info itself (this system view defaults to "
+                    "superuser-only visibility in Redshift; it needs an "
+                    "explicit GRANT SELECT ON svv_table_info TO <user>, "
+                    "separate from ordinary table read access): %s",
+                    exc,
+                )
 
             # 4. Views - deliberately NOT scoped to kept_names, same
             # reasoning as every other backend here: that set is built
@@ -756,10 +780,56 @@ class RedshiftBackend(Backend):
         views = phase2_ctx["views"]
         routines = phase2_ctx["routines"]
 
+        # Dataset size summary (new) - schema-wide totals, unlike the
+        # per-table "Row count estimates" (Phase 1, kept_names-only,
+        # svv_table_info tbl_rows estimate) and "Live row counts" (Phase 2
+        # below, kept_names-only, authoritative but a live COUNT(*) per
+        # table) sections nearby: kept_names is a capped subset of this
+        # schema's tables (see cap_kept_tables), so neither of those
+        # reflects the database's true overall size. This queries
+        # svv_table_info once for every table in current_schema() - still
+        # just a free catalog/statistics lookup, never a live scan - to
+        # give the LLM a sense of overall scale (row count, storage, table
+        # count) even when most tables were capped out of the detailed
+        # sections below. svv_table_info's `size` column is in 1MB blocks,
+        # hence the *1024*1024 to get a byte count for format_dataset_size_line.
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    SELECT SUM(tbl_rows), SUM(CAST(size AS BIGINT)) * 1024 * 1024, COUNT(*)
+                    FROM svv_table_info
+                    WHERE schema = current_schema();
+                """)
+                row = cursor.fetchone()
+                if row is not None:
+                    total_rows, total_bytes, table_count = row
+                    if table_count and table_count > 0:
+                        size_line = format_dataset_size_line(
+                            total_rows=total_rows, total_bytes=total_bytes,
+                        )
+                        if size_line:
+                            schema_parts.append(size_line)
+        except Exception as exc:
+            # See the Phase 1 svv_table_info query's own comment (above, in
+            # _build_shallow_schema_parts) for why this is logged rather
+            # than swallowed silently - same underlying cause (missing
+            # SELECT on svv_table_info, which defaults to superuser-only
+            # visibility in Redshift), just aggregated dataset-wide here
+            # instead of per kept table.
+            _logger.warning(
+                "Redshift svv_table_info dataset-size query failed for the "
+                "current schema - the connected user most likely lacks "
+                "SELECT on svv_table_info itself (this system view defaults "
+                "to superuser-only visibility in Redshift; it needs an "
+                "explicit GRANT SELECT ON svv_table_info TO <user>, separate "
+                "from ordinary table read access): %s",
+                exc,
+            )
+
         # Phase 2 (deep-only): full view/routine bodies, reusing the raw
         # rows _build_shallow_schema_parts already fetched - no re-query.
         if views:
-            view_lines = [f"  View {v[0]}: {(v[1] or '').strip()}" for v in views]
+            view_lines = [f"  View {v[0]}: {format_multiline_schema_entry_body(v[1])}" for v in views]
             # view_definition legitimately comes back NULL (not just an
             # empty string) when the connected role lacks the privilege to
             # see a given view's definition - (v[1] or '').strip() matches
@@ -767,7 +837,7 @@ class RedshiftBackend(Backend):
             schema_parts.append("View definitions:\n" + "\n".join(view_lines))
 
         routine_body_lines = [
-            f"  {r[0]}: {(r[3] or '').strip()}" for r in routines if (r[3] or "").strip()
+            f"  {r[0]}: {format_multiline_schema_entry_body(r[3])}" for r in routines if (r[3] or "").strip()
         ]
         if routine_body_lines:
             schema_parts.append("Routine definitions:\n" + "\n".join(routine_body_lines))
@@ -800,12 +870,17 @@ class RedshiftBackend(Backend):
                 # Fresh/live row count - authoritative, unlike the Phase 1
                 # tbl_rows estimate above (free, but only as fresh as the
                 # last ANALYZE - see the "Row count estimates" section's
-                # stats_off staleness caveat).
+                # stats_off staleness caveat). Kept as `row_count` - see
+                # postgres.py's own identical comment on this - so the
+                # "frequent values" sampling further down can size its
+                # min_frequent_value_count() floor off the same number.
+                row_count = None
                 try:
                     cursor.execute(f"SELECT COUNT(*) FROM {_quote_ident(table_name)};")
                     row = cursor.fetchone()
                     if row is not None:
-                        live_count_lines.append(f"  {table_name}: {row[0]} rows (live, authoritative)")
+                        row_count = row[0]
+                        live_count_lines.append(f"  {table_name}: {row_count} rows (live, authoritative)")
                 except Exception:
                     pass
 
@@ -846,11 +921,16 @@ class RedshiftBackend(Backend):
                     if len(eligible_categorical) >= MAX_CATEGORICAL_SAMPLE_COLUMNS_PER_TABLE:
                         break
 
+                # HAVING floor - see postgres.py's own identical comment and
+                # min_frequent_value_count()'s docstring (backends/base.py).
+                min_count = min_frequent_value_count(row_count)
+                having_clause = f"HAVING COUNT(*) >= {min_count} " if min_count is not None else ""
                 for c in eligible_categorical:
                     try:
                         cursor.execute(
                             f"SELECT {_quote_ident(c)}, COUNT(*) FROM {_quote_ident(table_name)} "
-                            f"GROUP BY {_quote_ident(c)} ORDER BY COUNT(*) DESC LIMIT {FREQUENT_VALUES_LIMIT};"
+                            f"GROUP BY {_quote_ident(c)} {having_clause}"
+                            f"ORDER BY COUNT(*) DESC LIMIT {FREQUENT_VALUES_LIMIT};"
                         )
                         freq_rows = cursor.fetchall()
                         if freq_rows:
