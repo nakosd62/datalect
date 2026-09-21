@@ -323,8 +323,8 @@ test.describe('analytics: query flow', () => {
   // which is what actually surfaced this gap.
 });
 
-// "All databases" mode fans a single NL prompt out into one real translate
-// call per selected connection (server-side, translate_routes.py's
+// Dataset group mode fans a single NL prompt out into one real translate
+// call per connection in the selected group (server-side, translate_routes.py's
 // _run_phase_b_fanout) and, with auto-execute on, one real /api/execute
 // call per connection too (client-side, executeOneAllModeConnection() in
 // client.js) - before trackAllModeFanoutTranslate()/trackAllModeFanoutExecute()
@@ -334,18 +334,24 @@ test.describe('analytics: query flow', () => {
 // Rather than invent new event names for this (per explicit request - "too
 // many different events already"), those two functions fire the SAME
 // translate_submitted/sql_executed events again, once per connection - so
-// a turn against 2 in-scope databases shows up as 3 translate_submitted
+// a turn against a 2-member dataset group shows up as 3 translate_submitted
 // events (1 generic "the prompt was submitted" + 2 real per-database
 // calls), distinguishable by `database_name`: the generic one's is the
-// "All Pre-Configured Datasets" badge text, each fan-out one's is that specific
+// group's own name badge text, each fan-out one's is that specific
 // database's own name. See trackEvent()'s own header comment in client.js
-// for the full reasoning. Config/NDJSON shapes here mirror
-// multi-database.spec.js's own "all databases" mode fixtures
-// (buildConfigState/mockConfig, the raw phase_a_route/
+// for the full reasoning. Note trackAllModeFanoutTranslate()/
+// trackAllModeFanoutExecute()'s own names, and this describe block's use of
+// "all mode"/"all-mode" as a generic internal label for this multi-candidate
+// fan-out machinery, predate and are independent of the "dataset group"
+// concept itself (see translate_routes.py's own docstring on this same
+// naming split) - only the actual user-facing config shape (in_scope_mode/
+// in_scope_group_id/configured_database_groups) changed. Config/NDJSON
+// shapes here mirror multi-database.spec.js's own dataset-group-mode
+// fixtures (buildConfigState/mockConfig, the raw phase_a_route/
 // phase_b_connection_done NDJSON bodies) rather than importing them - kept
 // local, same convention that file's own helpers already use (not exported
 // from fixtures.js).
-test.describe('analytics: "all databases" mode fan-out', () => {
+test.describe('analytics: dataset group mode fan-out', () => {
   function buildAllModeConfigState(overrides) {
     return {
       auth_enabled: false,
@@ -356,6 +362,9 @@ test.describe('analytics: "all databases" mode fan-out', () => {
       configured_databases: [
         { id: 'p-a', name: 'Sales Postgres', type: 'postgres' },
         { id: 'p-b', name: 'Marketing Postgres', type: 'postgres' },
+      ],
+      configured_database_groups: [
+        { id: 'grp-ab', name: 'Sales & Marketing', dataset_list: ['p-a', 'p-b'] },
       ],
       active_preset_id: 'p-a',
       default_database_url: '',
@@ -371,7 +380,8 @@ test.describe('analytics: "all databases" mode fan-out', () => {
       auto_sql_execute: false,
       in_scope_preset_ids: ['p-a', 'p-b'],
       in_scope_custom_connection_keys: [],
-      in_scope_mode: 'all',
+      in_scope_mode: 'group',
+      in_scope_group_id: 'grp-ab',
       max_in_scope_connections: 20,
       ...overrides,
     };
@@ -436,19 +446,19 @@ test.describe('analytics: "all databases" mode fan-out', () => {
     const events = await trackedEvents(page, 'translate_submitted');
     expect(events.length).toBe(3);
 
-    // The generic, once-per-prompt call - same "All Pre-Configured Datasets" badge
-    // text connDbName shows, and no way to know which specific database(s)
-    // will even be asked yet (translatePrompt() fires this before the
-    // request is even sent).
-    const genericEvent = events.find((e) => e.database_name === 'All Pre-Configured Datasets');
+    // The generic, once-per-prompt call - same "Sales & Marketing" group
+    // badge text connDbName shows, and no way to know which specific
+    // database(s) will even be asked yet (translatePrompt() fires this
+    // before the request is even sent).
+    const genericEvent = events.find((e) => e.database_name === 'Sales & Marketing');
     expect(genericEvent).toBeTruthy();
-    expect(genericEvent.mode).toBe('all');
+    expect(genericEvent.mode).toBe('group');
 
     // The two real per-database calls, fired once phase_a_route reveals
     // which connections the fan-out actually picked.
-    const perDatabase = events.filter((e) => e.database_name !== 'All Pre-Configured Datasets');
+    const perDatabase = events.filter((e) => e.database_name !== 'Sales & Marketing');
     expect(perDatabase.length).toBe(2);
-    expect(perDatabase.every((e) => e.mode === 'all')).toBe(true);
+    expect(perDatabase.every((e) => e.mode === 'group')).toBe(true);
     const byName = Object.fromEntries(perDatabase.map((e) => [e.database_name, e]));
     expect(byName['Sales Postgres'].database_type).toBe('postgres');
     expect(byName['Marketing Postgres'].database_type).toBe('postgres');
@@ -618,11 +628,11 @@ test.describe('analytics: "all databases" mode fan-out', () => {
     await expect.poll(async () => (await trackedEvents(page, 'sql_executed')).length).toBe(3);
     const events = await trackedEvents(page, 'sql_executed');
 
-    const genericEvent = events.find((e) => e.database_name === 'All Pre-Configured Datasets');
+    const genericEvent = events.find((e) => e.database_name === 'Sales & Marketing');
     expect(genericEvent).toBeTruthy();
     expect(genericEvent.trigger).toBe('manual');
 
-    const perDatabase = events.filter((e) => e.database_name !== 'All Pre-Configured Datasets');
+    const perDatabase = events.filter((e) => e.database_name !== 'Sales & Marketing');
     expect(perDatabase.length).toBe(2);
     expect(perDatabase.every((e) => e.trigger === 'manual')).toBe(true);
     const byName = Object.fromEntries(perDatabase.map((e) => [e.database_name, e]));

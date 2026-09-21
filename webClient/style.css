@@ -24,27 +24,66 @@
    for light text on a near-black page and don't have enough contrast for
    dark text on a light one wherever they're used as TEXT color (not just
    as a badge/button background), e.g. .status-success, .stat-card-title.
+
+   PALETTE "SIGNAL" PASS (color-scheme review, see the header/input mockups
+   this was proposed against): --accent-cyan was quietly the app's REAL
+   on-screen accent - the wordmark, footer link, mic icon, header icon
+   buttons, progress banners, and #stopBtn.btn-stop all painted with it -
+   while --primary's green only ever showed up as the status dot, and
+   --secondary's indigo didn't appear in the header/input chrome at all.
+   Fixed by making --accent-cyan/--accent-cyan-rgb/--on-accent-cyan alias
+   directly to --primary/--primary-rgb/--on-primary in both themes below,
+   rather than rewriting the 30+ call sites that reference the cyan tokens
+   by name - every one of them now renders in the app's actual green
+   without any other change. The brand mark itself (the inline header SVG,
+   logo.svg, favicon.svg and its derived rasters) was recolored the same
+   way, from its old sky-blue family to the matching emerald family, so
+   the logo now matches the accent it sits next to instead of predating
+   it. An earlier version of this pass also gave the model badge its own
+   indigo tint from --secondary to give that token a visible header job -
+   reverted after review clashed visually with the rest of the now all-
+   green header, so the model badge stays plain/neutral like the DB badge
+   beside it (both just .status-badge's default styling) and --secondary
+   keeps only its pre-existing jobs (the inline "add a chart" link, a
+   couple of secondary badges - see its call sites below). --bg-dark/
+   --surface-1 also moved apart slightly (see their own comments) since
+   they used to sit close enough in value that the results panel read as
+   flush with the page background.
    ========================================================================= */
 :root {
   --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   --font-mono: 'Fira Code', 'Courier New', Courier, monospace;
 
   /* Color Palette */
-  --bg-dark: #080b11;
-  --bg-card: rgba(15, 23, 42, 0.65);
+  /* Warmed very slightly off pure navy-black, and given a bit more
+     separation from --surface-1 below - the two used to sit close enough
+     in value that .results-container (background-color: var(--surface-1))
+     read as flush against the page rather than as its own lifted panel. */
+  --bg-dark: #0b0f14;
+  --bg-card: rgba(19, 26, 36, 0.65);
   --bg-card-border: rgba(255, 255, 255, 0.08);
-  --bg-input: rgba(5, 8, 16, 0.85);
+  --bg-input: rgba(11, 15, 20, 0.85);
 
-  --primary: #10b981; /* Glowing CockroachDB green */
-  --primary-hover: #34d399;
-  --primary-glow: rgba(16, 185, 129, 0.15);
+  /* Toned down from the original #10b981 ("Glowing CockroachDB green") in
+     two passes per explicit request, each keeping the same hue and
+     lightness (so every spot already tuned for contrast, e.g. text/badge
+     uses, keeps working) while cutting saturation further - first roughly
+     in half, then by another ~40% on top of that - for a calmer, muted
+     sage-green feel instead of the original neon emerald. */
+  --primary: #487f6d;
+  --primary-hover: #6b9f8c;
+  --primary-glow: rgba(72, 127, 109, 0.15);
   /* RGB triplets (no alpha) for the rgba(var(--x-rgb), N) glow/shadow
      accents scattered through the file - lets those keep their own
      per-instance alpha while still tracking the theme's actual hue. */
-  --primary-rgb: 16, 185, 129;
-  --primary-hover-rgb: 52, 211, 153;
+  --primary-rgb: 72, 127, 109;
+  --primary-hover-rgb: 107, 159, 140;
 
-  --secondary: #6366f1; /* Modern Indigo */
+  --secondary: #6366f1; /* Modern Indigo - the inline "add a chart" link,
+     a couple of secondary status badges (see its call sites below). Not
+     used in the header - a model-badge tint was tried and reverted (see
+     the PALETTE "SIGNAL" PASS note above) since it clashed against the
+     header's now-consistent green. */
   --secondary-hover: #818cf8;
   --secondary-rgb: 99, 102, 241;
 
@@ -76,14 +115,23 @@
   --text-primary: #f8fafc;
   --text-secondary: #94a3b8;
   --text-muted: #64748b;
+  /* Deliberately much lower contrast against --bg-dark than even
+     --text-muted above (~2:1 vs ~4:1) - the app-wide "de-emphasized but
+     still readable" tone isn't quiet enough for .app-footer's copyright
+     line, which should recede into the page rather than just read as
+     secondary text. */
+  --text-footer: #3a4756;
 
   /* Modal/dropdown/table "surface" scale - previously hardcoded slate
      hexes (#0f172a/#1e293b/#334155/#131d31) repeated throughout the
-     results table, tab bar, modal cards, and dropdown menus. */
-  --surface-1: #0f172a;
-  --surface-2: #1e293b;
-  --surface-3: #334155;
-  --surface-stripe: #131d31;
+     results table, tab bar, modal cards, and dropdown menus. --surface-1
+     (also .results-container's own background) moved a step further from
+     --bg-dark above - see that token's own comment - the rest of the
+     scale keeps its original spacing, just carried along the same shift. */
+  --surface-1: #131a24;
+  --surface-2: #1c2531;
+  --surface-3: #2b3644;
+  --surface-stripe: #161d29;
 
   /* Generic translucent-white "wash" tiers - borders/hovers/chip
      backgrounds that used to be one-off rgba(255,255,255,0.0N) literals.
@@ -104,18 +152,19 @@
   --text-table-strong: #f1f5f9;
   --chip-text: #cbd5e1;
 
-  /* Distinct decorative accent (active tab, model-badge tagline; also
-     the progress-status banner and #stopBtn.btn-stop below - the same
-     blue as the header/logo mark, not a semantic "danger"/"warning"
-     color) - kept separate from --primary so the two stay visually
-     distinguishable in both themes. */
-  --accent-cyan: #38bdf8;
-  --accent-cyan-rgb: 56, 189, 248;
-  /* Text color that sits ON TOP of a solid --accent-cyan-colored button
-     (see #stopBtn.btn-stop) - same reasoning as --on-primary/--on-warning
-     above, computed per-theme since --accent-cyan isn't reliably
-     bright/dark enough in both themes to share one constant value. */
-  --on-accent-cyan: #080b11;
+  /* Was its own distinct blue (the active tab, the progress-status banner,
+     #stopBtn.btn-stop, the header icon buttons, the mic icon, the
+     wordmark/footer link - see the PALETTE "SIGNAL" PASS note up top).
+     That made it the app's real on-screen accent while --primary's green
+     barely showed up anywhere. Aliased straight to --primary/--primary-rgb/
+     --on-primary now instead of carrying its own values, so every one of
+     those call sites renders in green without having to touch them
+     individually - kept as its own token name (rather than deleted) purely
+     so this file doesn't need a mass find-and-replace across every
+     var(--accent-cyan) use. */
+  --accent-cyan: var(--primary);
+  --accent-cyan-rgb: var(--primary-rgb);
+  --on-accent-cyan: var(--on-primary);
 
   /* Text color that sits ON TOP of a solid --primary-colored button/badge -
      constant across themes: --primary is always bright enough that a dark
@@ -140,7 +189,7 @@
      panel" background - same rgb as --bg-input's dark-theme value, but
      needs its own alpha so it stays valid once --bg-input goes solid
      (opaque, no alpha channel at all) in the light theme below. */
-  --recessed-panel-bg: rgba(5, 8, 16, 0.45);
+  --recessed-panel-bg: rgba(11, 15, 20, 0.45);
 
   --transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
 }
@@ -148,18 +197,23 @@
 /* Light theme - see the block comment above :root. Applied via
    <html data-theme="light">, set by client.js before first paint. */
 :root[data-theme="light"] {
-  --bg-dark: #eef1f6;
+  --bg-dark: #f5f7f9;
   --bg-card: rgba(255, 255, 255, 0.75);
   --bg-card-border: rgba(15, 23, 42, 0.10);
   --bg-input: #eef2f7;
 
-  --primary: #059669;
-  --primary-hover: #047857;
-  --primary-glow: rgba(5, 150, 105, 0.15);
-  --primary-rgb: 5, 150, 105;
-  --primary-hover-rgb: 4, 120, 87;
+  /* Same two-pass toned-down-saturation treatment as the dark theme's
+     --primary above, same lightness preserved for the same reason
+     (contrast on TEXT uses like .status-success/.stat-card-title - see
+     the top-of-file THEME ARCHITECTURE note on why light needed a deeper
+     shade to begin with). */
+  --primary: #356455;
+  --primary-hover: #2b5046;
+  --primary-glow: rgba(53, 100, 85, 0.15);
+  --primary-rgb: 53, 100, 85;
+  --primary-hover-rgb: 43, 80, 70;
 
-  --secondary: #4f46e5;
+  --secondary: #4f46e5; /* see the dark theme's --secondary comment above */
   --secondary-hover: #4338ca;
   --secondary-rgb: 79, 70, 229;
 
@@ -177,6 +231,10 @@
   --text-primary: #0f172a;
   --text-secondary: #475569;
   --text-muted: #64748b;
+  /* Same reasoning as the dark theme's --text-footer above - roughly the
+     same ~2:1 contrast against --bg-dark, just the light-background
+     mirror of it. */
+  --text-footer: #aab2b9;
 
   --surface-1: #ffffff;
   --surface-2: #f1f5f9;
@@ -194,9 +252,11 @@
   --text-table-strong: #0f172a;
   --chip-text: #334155;
 
-  --accent-cyan: #0284c7;
-  --accent-cyan-rgb: 2, 132, 199;
-  --on-accent-cyan: #ffffff;
+  /* Aliased to --primary here too - see the dark theme's --accent-cyan
+     comment above. */
+  --accent-cyan: var(--primary);
+  --accent-cyan-rgb: var(--primary-rgb);
+  --on-accent-cyan: var(--on-primary);
 
   --on-primary: #ffffff;
 
@@ -687,15 +747,19 @@ textarea:focus {
 .gear-btn, .help-btn, .history-btn, .feedback-btn, .more-menu-btn {
   background: var(--overlay-2);
   border: 1px solid var(--bg-card-border);
-  padding: 0.35rem;
+  /* Halved from 0.35rem, alongside the circle's own width/height below and
+     the icon size further down - all three shrunk together so the circle
+     still just barely wraps the smaller icon, rather than leaving a
+     tiny icon floating inside an unchanged, now-oversized circle. */
+  padding: 0.175rem;
   border-radius: 50%;
   cursor: pointer;
   transition: var(--transition);
   display: flex;
   align-items: center;
   justify-content: center;
-  width: clamp(36px, 4vw, 50px);
-  height: clamp(36px, 4vw, 50px);
+  width: clamp(18px, 2vw, 25px);
+  height: clamp(18px, 2vw, 25px);
   flex-shrink: 0;
 }
 
@@ -714,9 +778,14 @@ textarea:focus {
   color: var(--accent-cyan);
 }
 
+/* Halved from clamp(20px, 2.2vw, 29px) per explicit request - the
+   surrounding circular button (.gear-btn etc. above) was shrunk to match
+   (its own width/height/padding halved the same way), so the circle still
+   just wraps this smaller glyph instead of leaving it floating, tiny,
+   inside an unchanged, now-oversized circle. */
 .gear-btn svg, .help-btn svg, .history-btn svg, .feedback-btn svg, .more-menu-btn svg {
-  width: clamp(20px, 2.2vw, 29px);
-  height: clamp(20px, 2.2vw, 29px);
+  width: clamp(10px, 1.1vw, 14.5px);
+  height: clamp(10px, 1.1vw, 14.5px);
 }
 
 .gear-btn:hover {
@@ -933,7 +1002,10 @@ textarea:focus {
   position: relative;
   flex: 1;
   background: var(--surface-1);
-  border: 3px solid rgba(var(--accent-cyan-rgb), 0.35);
+  /* Border weight reduced from 3px per explicit request - was reading as a
+     heavy outline around the NL/SQL boxes; 1px keeps the accent frame
+     visible without dominating the input. */
+  border: 1px solid rgba(var(--accent-cyan-rgb), 0.35);
   border-radius: 0;
   transform: none;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4), inset 0 0 12px rgba(var(--primary-rgb), 0.08);
@@ -943,7 +1015,7 @@ textarea:focus {
 
 .speech-bubble-wrapper.sql-bubble {
   background: var(--surface-1);
-  border: 3px solid rgba(var(--accent-cyan-rgb), 0.35);
+  border: 1px solid rgba(var(--accent-cyan-rgb), 0.35);
   border-radius: 0;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4), inset 0 0 12px rgba(var(--primary-rgb), 0.08);
   height: 100px;
@@ -1636,7 +1708,12 @@ textarea.report-issue-preview:focus {
   text-align: center;
   padding: 0.35rem 0;
   border-top: 1px solid var(--bg-card-border);
-  color: var(--accent-cyan);
+  /* Was var(--accent-cyan) (the app's own bright green) - a copyright line
+     shouldn't compete for attention with anything else on the page, so
+     this now uses a dedicated, much lower-contrast token instead (see
+     --text-footer's own comment) rather than reusing --text-muted, which
+     is still meant to read as normal secondary text elsewhere. */
+  color: var(--text-footer);
   font-size: 0.825rem;
   margin-top: 0.25rem;
 }
@@ -1855,18 +1932,16 @@ textarea.report-issue-preview:focus {
   border-color: var(--surface-3);
 }
 
-/* "All Pre-Configured Datasets" (see renderDbRadioButtons() in client.js) now
-   renders as one more option inside the preset two-column list itself
-   (appended right after the last real preset, in whichever column that
-   is), not as its own separate section below the custom-connections list
-   the way it did when it still spanned both lists - see
-   db.py's _resolve_all_configured_descriptors for why it's presets-only
-   now. Bolded like a heading would be, to still read as a distinct,
-   deliberate top-level choice rather than just another preset name in
-   the column it happens to sit in. The explanation of what this option
-   does lives in its own `title` attribute (a plain on-hover tooltip, no
-   custom CSS needed) rather than as visible text in the dialog body - see
-   renderDbRadioButtons()'s ALL_OPTION_HINT. */
+/* Dataset groups (see renderDbRadioButtons() in client.js) - each admin-
+   curated group renders as its own radio, merged into the very same
+   two-column playgrounds list as every single preset (no separate
+   section/heading of its own any more). Bolded like a heading would be, so
+   it still reads as a distinct, deliberate top-level choice rather than
+   just another preset name, even sitting in the same column as one. The
+   explanation of what this option does lives in its own `title` attribute
+   (a plain on-hover tooltip, no custom CSS needed) rather than as visible
+   text in the dialog body - see renderDbRadioButtons()'s
+   GROUP_OPTION_HINT. */
 .all-databases-option {
   font-weight: 600;
   white-space: normal;
@@ -3613,20 +3688,54 @@ tr.report-issue-row td {
      list AND the detail pane down to a sliver each - .modal-card's own
      max-height: 85vh (style.css) still caps this on a short viewport. */
   height: 80vh;
+  /* 20% wider than the shared .modal-card-large's own max-width: 1000px
+     (1000px * 1.2 = 1200px) - this dialog's own 20%/80% LHS/RHS split and
+     its 6 equal-width, non-wrapping-header schema columns (see the rules
+     below) benefit from the extra room more than an ordinary modal would.
+     Two classes on the selector (.modal-card-large.schema-viewer-card)
+     rather than just .schema-viewer-card, so this reliably wins over
+     .modal-card-large's own max-width by specificity (0,2,0 vs. 0,1,0),
+     not by relying on source order - #historyModal also uses
+     .modal-card-large and must stay at 1000px, unaffected by this. */
 }
 
-/* Wraps the modal title alone now (the "Session:" line that used to grow
-   underneath it - see the old #schemaViewerSessionInfo - moved into the
-   Overview tab's own stats block, .schema-viewer-overview-stats below,
-   alongside the dataset-size/schema-size facts it's now shown with) so
-   .modal-header's own space-between/align-items: center layout still
-   treats the title as one flex child, with the close button staying put
-   on the right. */
+.modal-card-large.schema-viewer-card {
+  max-width: 1200px;
+}
+
+/* Wraps the modal title AND the facts line under it (#schemaViewerFactsLine
+   in index.html/.schema-viewer-facts-line below) so .modal-header's own
+   space-between/align-items: center layout still treats both as one flex
+   child together, with the close button staying put on the right.
+   flex-direction: column stacks the title above the facts line. (History:
+   the original "Session: ..." one-liner used to live right here on its
+   own; it was later moved into the Overview tab's own stats block
+   alongside the dataset-size/schema-size facts it was shown with; all
+   three facts are now shown together back under the title again, in
+   #schemaViewerFactsLine - see that element's own comment in index.html.) */
 .schema-viewer-title-block {
   display: flex;
   flex-direction: column;
   gap: 0.2rem;
   min-width: 0;
+}
+
+/* The short "Size: ~...; Schema: ... chars" facts line under the modal
+   title (see index.html's own comment on #schemaViewerFactsLine and
+   client.js's renderSchemaViewerFactsLine()/buildSchemaViewerFactParts())
+   - same small, muted treatment (font-size/color) the old
+   .schema-viewer-overview-stats box used for this same text when it lived
+   inside the Overview tab, but with no background/border/padding box of
+   its own here, since it's now part of the header rather than a
+   standalone panel. A single concatenated string (client.js joins the two
+   facts with "; "), not a multi-item flex row - there are only ever two
+   short facts here now, so plain text wrapping (overflow-wrap) is all
+   this needs. .hidden (index.html) hides this entirely whenever there's
+   nothing to show yet - see buildSchemaViewerFactParts(). */
+.schema-viewer-facts-line {
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
 }
 
 /* Groups Refresh Schema (plus its status line underneath) with the close
@@ -3742,21 +3851,96 @@ tr.report-issue-row td {
   color: var(--danger);
 }
 
+/* Dataset-group Schema Viewer variant (see client.js's
+   openGroupSchemaViewer()/loadGroupSchemaViewer()) - shown instead of
+   .schema-viewer-panes below, so this needs the same flex/scroll behavior
+   that rule documents (fills the remaining body height, scrolls its own
+   content rather than the whole modal body). */
+.schema-viewer-group-table-wrap {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+}
+
+/* Same font/sizing conventions as .schema-viewer-columns-table (the
+   single-connection detail pane's own columns table) below, for visual
+   consistency between the two - just 4 equal-width columns here instead
+   of 6, and no min-width forcing a horizontal scrollbar, since "Name",
+   "Type", "Data Size", "Schema Size (tokens)" comfortably fit an ordinary
+   modal width unwrapped even in four equal shares. */
+.schema-viewer-group-table {
+  width: 100%;
+  table-layout: fixed;
+  border-collapse: collapse;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+}
+
+.schema-viewer-group-table th,
+.schema-viewer-group-table td {
+  width: 25%;
+  padding: 0.4rem 0.65rem;
+  text-align: left;
+  border-bottom: 1px solid var(--bg-card-border);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.schema-viewer-group-table thead th {
+  position: sticky;
+  top: 0;
+  background: var(--overlay-2);
+  color: var(--text-secondary);
+  font-weight: 600;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.schema-viewer-group-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.schema-viewer-group-table tbody tr:hover {
+  background: var(--overlay-1);
+}
+
+/* A member whose schema fetch failed outright (db.py's
+   build_group_schema_summaries() "available": false - see
+   renderGroupSchemaViewerRow() in client.js) - dimmed, with a title
+   tooltip on the row explaining why its two size columns read "—", same
+   "something's wrong with just this one row" posture the rest of this
+   feature takes rather than failing the whole dialog over one bad member. */
+.schema-viewer-group-row--unavailable {
+  opacity: 0.55;
+}
+
+/* gap: 0 (not the 1rem this used to be) - the draggable resizer between
+   the two panes (.schema-viewer-panes-resizer below) now supplies both
+   the visual divider and the breathing room on either side of it, via its
+   own width plus each pane's own padding-right/padding-left. */
 .schema-viewer-panes {
   flex: 1 1 auto;
   min-height: 0;
   display: flex;
-  gap: 1rem;
+  gap: 0;
 }
 
-/* Fixed 25%/75% split with the detail pane below - NOT content- or
-   modal-width-dependent like the old flex: 0 0 260px used to be (260px
-   was a bigger fraction of a narrow modal than a wide one, so the split
-   visibly shifted as the modal resized). Percentage flex-basis resolves
-   against .schema-viewer-panes' own content-box width, and flex-grow/
-   shrink are both 0, so this pane is always exactly one quarter of that
-   width no matter how wide the modal is or how long an entry name gets.
-   min-width: 0 is load-bearing here for that last part: a flex item's
+/* Defaults to a fixed 20%/80% split with the detail pane, exactly like
+   before this pane became resizable - NOT content- or modal-width-
+   dependent like the old flex: 0 0 260px used to be (260px was a bigger
+   fraction of a narrow modal than a wide one, so the split visibly
+   shifted as the modal resized). Percentage flex-basis resolves against
+   .schema-viewer-panes' own content-box width, and flex-grow/shrink are
+   both 0, so this pane is always exactly one fifth of that width no
+   matter how wide the modal is - UNTIL the user drags
+   #schemaViewerPanesResizer (see initSchemaViewerPanesResizer() in
+   client.js), which sets an inline `flex-basis` in px directly on this
+   element's `style` - an inline style always wins over this class rule
+   regardless of source order/specificity, so no `!important` or extra
+   selector weight is needed here for that override to take effect.
+   min-width: 0 is load-bearing independent of any of that: a flex item's
    default automatic min-width is its content's min-content size, and a
    long, unbroken table/view name several levels down in the tree (an
    .schema-viewer-entry-item button, white-space: nowrap so it CAN
@@ -3765,16 +3949,61 @@ tr.report-issue-row td {
    clips it visually, because its width: 100% is ignored for intrinsic
    sizing. Without min-width: 0 here, a single long enough name would
    silently grow this pane (and shrink the detail pane) well past its
-   intended 25%, instead of the name itself truncating as designed. */
+   intended/dragged width, instead of the name itself truncating as
+   designed. */
 .schema-viewer-list-pane {
-  flex: 0 0 25%;
+  flex: 0 0 20%;
   min-width: 0;
   min-height: 0;
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
-  padding-right: 1rem;
-  border-right: 1px solid var(--bg-card-border);
+  padding-right: 0.5rem;
+}
+
+/* The draggable divider itself, between .schema-viewer-list-pane and
+   .schema-viewer-detail-pane (see initSchemaViewerPanesResizer() in
+   client.js for the actual drag mechanics). 9px wide so there's a
+   comfortable hit/grab area for a mouse, even though the visible line
+   (the ::after pseudo-element below) is a hairline 1px centered inside
+   it - a bare 1px element would be nearly impossible to grab reliably.
+   flex: 0 0 auto (never grows/shrinks) so its own width is never affected
+   by either pane's resizing. */
+.schema-viewer-panes-resizer {
+  flex: 0 0 auto;
+  width: 9px;
+  min-height: 0;
+  position: relative;
+  cursor: col-resize;
+  flex-shrink: 0;
+}
+
+.schema-viewer-panes-resizer::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 1px;
+  background: var(--bg-card-border);
+  transform: translateX(-50%);
+  transition: background-color 0.15s ease, width 0.15s ease;
+}
+
+/* Hover/keyboard-focus/actively-dragging all get the same "this is
+   grabbable/being grabbed" treatment - a thicker, brand-colored line -
+   .schema-viewer-panes-resizer--dragging is toggled by JS for the
+   duration of a drag (hover/focus alone don't cover the case where the
+   pointer moves faster than the resizer's own width during a fast drag). */
+.schema-viewer-panes-resizer:hover::after,
+.schema-viewer-panes-resizer:focus-visible::after,
+.schema-viewer-panes-resizer.schema-viewer-panes-resizer--dragging::after {
+  width: 3px;
+  background: var(--primary);
+}
+
+.schema-viewer-panes-resizer:focus-visible {
+  outline: none;
 }
 
 .schema-viewer-entry-list {
@@ -3875,14 +4104,15 @@ tr.report-issue-row td {
   padding-left: 1.6rem;
 }
 
-/* Takes whatever's left after the list pane's fixed 25% and the 1rem gap
-   - i.e. the other 75%, less that gap. flex-basis: 0% (rather than auto)
-   means this pane's own content never influences its share, matching the
-   list pane's own fixed-percentage comment above. min-width: 0 is load-
-   bearing: a flex item's default min-width is its content's min-content
-   size, which would otherwise stop the columns table below from ever
-   triggering its own horizontal scrollbar and instead push this pane
-   (and the whole modal) wider than intended. */
+/* Takes whatever's left after the list pane's width (default 20%, or
+   whatever the user last dragged it to - see .schema-viewer-list-pane's
+   own comment) and the resizer's own 9px. flex-basis: 0% (rather than
+   auto) means this pane's own content never influences its share,
+   matching the list pane's own fixed-percentage comment above. min-width:
+   0 is load-bearing: a flex item's default min-width is its content's
+   min-content size, which would otherwise stop the columns table below
+   from ever triggering its own horizontal scrollbar and instead push this
+   pane (and the whole modal) wider than intended. */
 .schema-viewer-detail-pane {
   flex: 1 1 0%;
   min-width: 0;
@@ -3890,6 +4120,7 @@ tr.report-issue-row td {
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
+  padding-left: 0.5rem;
 }
 
 .schema-viewer-detail-heading {
@@ -4032,19 +4263,18 @@ tr.report-issue-row td {
   gap: 1rem;
 }
 
-/* Facts-and-warnings block pinned to the top of the Overview tab (see
-   renderSchemaViewerStatsBlockHtml() in client.js) - the connection-wide
-   "Session:" line (moved here from the old #schemaViewerSessionInfo under
-   the modal title), the schema's own text size, and the best-effort total
-   dataset size the deep fetch computed (backends/base.py's
-   format_dataset_size_line() - omitted entirely for a dialect with no
-   cheap way to estimate it), plus a warning row whenever this connection
-   is actually hitting the SCHEMA_MAX_TABLES or SCHEMA_MAX_SCHEMA_CHARS
-   limit (formerly surfaced only in the dismissable notice bar - see
-   loadSchemaViewerConnection()'s own comment on data.truncated/
-   data.has_omitted_tables). Rendered above the AI-written prose (or the
-   "nothing generated yet" message) since none of this depends on that
-   overview ever having been generated. */
+/* Warnings block pinned to the top of the Overview tab (see
+   renderSchemaViewerStatsBlockHtml() in client.js) - a warning row
+   whenever this connection is actually hitting the SCHEMA_MAX_TABLES or
+   SCHEMA_MAX_SCHEMA_CHARS limit (formerly surfaced only in the
+   dismissable notice bar - see loadSchemaViewerConnection()'s own comment
+   on data.truncated/data.has_omitted_tables). Rendered above the
+   AI-written prose (or the "nothing generated yet" message) since none of
+   this depends on that overview ever having been generated. (The
+   dataset-size/schema-size/session-info facts this box used to also show
+   now live in the persistent facts line under the modal title instead -
+   see .schema-viewer-facts-line above - so this box is warnings-only and
+   simply isn't rendered at all when there are none.) */
 .schema-viewer-overview-stats {
   display: flex;
   flex-direction: column;
@@ -4055,22 +4285,6 @@ tr.report-issue-row td {
   border-radius: 8px;
   font-size: 0.8rem;
   color: var(--text-secondary);
-}
-
-.schema-viewer-overview-stats-row {
-  overflow-wrap: anywhere;
-}
-
-/* The dataset-size/schema-character-count row - two independent size
-   figures shown side by side (space-between, wrapping to its own line
-   each on a narrow modal) rather than stacked on separate rows, since
-   both are just answers to "how big is this". */
-.schema-viewer-overview-stats-row-split {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: space-between;
-  column-gap: 1.5rem;
-  row-gap: 0.3rem;
 }
 
 .schema-viewer-overview-warning {

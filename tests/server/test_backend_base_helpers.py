@@ -24,8 +24,10 @@ from backends.base import (
     normalize_cell_value, fetch_capped_rows,
     resolve_timeout_seconds,
     format_bytes_human, format_compact_count, format_dataset_size_line,
+    parse_dataset_size_line, quantize_schema_size_tokens,
     format_multiline_schema_entry_body,
     extract_entry_names_from_schema_text, split_schema_text_into_entries,
+    derive_tables_only_schema_text,
     _strip_trailing_asides,
 )
 
@@ -736,6 +738,73 @@ def test_format_dataset_size_line_note_appears_as_trailing_parenthetical():
     )
 
 
+# --- parse_dataset_size_line() -----------------------------------------------
+# The reciprocal of format_dataset_size_line() above - pulls that same line's
+# own value back out of a full schema text (see db.py's
+# build_group_schema_summaries(), the dataset-group Schema Viewer's own
+# "Data Size" column). Mirrors client.js's parseSchemaDatasetSizeLine()
+# exactly (same anchor, multiline, first match only).
+
+def test_parse_dataset_size_line_extracts_the_value_after_the_label():
+    assert parse_dataset_size_line("Estimated dataset size: ~2.4 GB") == "~2.4 GB"
+
+
+def test_parse_dataset_size_line_finds_the_line_anywhere_in_a_multiline_schema():
+    schema = (
+        "Table: deals\n  id integer NOT NULL\n\n"
+        "Session: timezone=UTC\n\n"
+        "Estimated dataset size: ~1.23M rows"
+    )
+    assert parse_dataset_size_line(schema) == "~1.23M rows"
+
+
+def test_parse_dataset_size_line_returns_none_when_no_such_line_exists():
+    assert parse_dataset_size_line("Table: deals\n  id integer NOT NULL\n") is None
+    assert parse_dataset_size_line("") is None
+    assert parse_dataset_size_line(None) is None
+
+
+def test_parse_dataset_size_line_only_matches_the_first_occurrence():
+    # Should never happen for a real schema text (each connection's deep
+    # fetch appends this line at most once) - documented here purely to
+    # pin down the "first match wins" behavior rather than leaving it
+    # implicit.
+    schema = "Estimated dataset size: ~1.0 GB\nEstimated dataset size: ~2.0 GB"
+    assert parse_dataset_size_line(schema) == "~1.0 GB"
+
+
+# --- quantize_schema_size_tokens() -------------------------------------------
+# Shared by db.py's build_group_schema_summaries() (the dataset-group Schema
+# Viewer's own "Schema Size" column) and client.js's own facts-line figure
+# (SCHEMA_VIEWER_TOKEN_QUANTUM there) - both round the raw chars-per-token
+# estimate UP to the nearest 100, per an explicit request, since it's only
+# ever a rough cost estimate.
+
+def test_quantize_schema_size_tokens_rounds_up_to_the_next_hundred():
+    assert quantize_schema_size_tokens(101) == 200
+    assert quantize_schema_size_tokens(199) == 200
+    assert quantize_schema_size_tokens(250.4) == 300
+
+
+def test_quantize_schema_size_tokens_leaves_an_exact_multiple_of_100_unchanged():
+    assert quantize_schema_size_tokens(100) == 100
+    assert quantize_schema_size_tokens(200) == 200
+
+
+def test_quantize_schema_size_tokens_floors_any_positive_value_at_100():
+    # A schema small enough to raw-estimate under 100 tokens still shows as
+    # "100 tokens" (the quantization floor), never "0 tokens" - "some
+    # tokens, but a small amount" is honest; a bare 0 for a real,
+    # non-empty schema would read as an error.
+    assert quantize_schema_size_tokens(1) == 100
+    assert quantize_schema_size_tokens(0.4) == 100
+
+
+def test_quantize_schema_size_tokens_returns_zero_for_zero_or_negative_input():
+    assert quantize_schema_size_tokens(0) == 0
+    assert quantize_schema_size_tokens(-5) == 0
+
+
 # --- _strip_trailing_asides() ------------------------------------------------
 # Regression coverage for two real, separate bugs that both showed up as
 # the same symptom (a shard family's Schema Viewer row showing an entire
@@ -1010,3 +1079,132 @@ def test_split_schema_text_into_entries_with_no_recognizable_heading_returns_one
 def test_split_schema_text_into_entries_empty_schema_text_returns_empty_list():
     assert split_schema_text_into_entries("") == []
     assert split_schema_text_into_entries(None) == []
+
+
+# --- derive_tables_only_schema_text() -----------------------------------------
+# Backs the SCHEMA_TABLES_ONLY-gated "tables_only" schema kind (see
+# translate_routes.py's get_llm_schema_text): every table/table-family/tab
+# entry kept with its full per-table detail intact, every OTHER top-level
+# schema-object section (Constraints, Indexes, Views, Grants, ...) dropped.
+# Deliberately NOT built on top of split_schema_text_into_entries - that
+# function's LAST entry runs all the way to len(schema_text), so it would
+# swallow every trailing non-table section into whichever table happened to
+# be listed last; these tests lock in the different, boundary-search
+# strategy that avoids that bug instead.
+
+def test_derive_tables_only_keeps_all_tables_and_drops_everything_after_the_first_non_table_section():
+    schema = (
+        "Table: customers\n"
+        "  id integer NOT NULL\n"
+        "  name text NOT NULL\n"
+        "\n"
+        "Table: orders\n"
+        "  id integer NOT NULL\n"
+        "  customer_id integer NOT NULL\n"
+        "\n"
+        "Constraints:\n"
+        "  orders.customer_id -> customers.id\n"
+        "\n"
+        "Indexes:\n"
+        "  orders_customer_id_idx on orders(customer_id)\n"
+        "\n"
+        "Views:\n"
+        "  Table: active_customers\n"
+        "\n"
+        "Likely relationships (naming convention, unconfirmed):\n"
+        "  orders.customer_id -> customers.id\n"
+    )
+    result = derive_tables_only_schema_text(schema)
+    assert result == (
+        "Table: customers\n"
+        "  id integer NOT NULL\n"
+        "  name text NOT NULL\n"
+        "\n"
+        "Table: orders\n"
+        "  id integer NOT NULL\n"
+        "  customer_id integer NOT NULL"
+    )
+    assert "Constraints:" not in result
+    assert "Indexes:" not in result
+    assert "Views:" not in result
+    assert "Likely relationships" not in result
+    # The nested "Table: active_customers" line inside the Views section
+    # must not fool this into thinking the Views section is itself a table
+    # entry - it's excluded because it comes after the real boundary, not
+    # because of anything special about that one line.
+
+
+def test_derive_tables_only_keeps_the_overflow_notice_since_its_about_the_tables_not_a_different_object():
+    schema = (
+        "Table: t1\n"
+        "  id integer NOT NULL\n"
+        "\n"
+        "Table: t2\n"
+        "  id integer NOT NULL\n"
+        "\n"
+        "[... 198 more table(s) not shown - schema truncated ...]\n"
+        "\n"
+        "Constraints:\n"
+        "  t2.id -> t1.id\n"
+    )
+    result = derive_tables_only_schema_text(schema)
+    assert result.endswith("[... 198 more table(s) not shown - schema truncated ...]")
+    assert "Constraints:" not in result
+
+
+def test_derive_tables_only_handles_a_table_family_heading_with_a_nested_parenthetical():
+    schema = (
+        "Table family: events_<date> "
+        "(12 date-sharded tables, e.g. events_20260101 .. events_20261231; "
+        "query via UNION ALL across the ones you need)\n"
+        "  id integer NOT NULL\n"
+        "  occurred_at timestamp NOT NULL\n"
+        "\n"
+        "Row count estimates:\n"
+        "  events_<date>: ~1000000 rows (estimate)\n"
+    )
+    result = derive_tables_only_schema_text(schema)
+    assert result == (
+        "Table family: events_<date> "
+        "(12 date-sharded tables, e.g. events_20260101 .. events_20261231; "
+        "query via UNION ALL across the ones you need)\n"
+        "  id integer NOT NULL\n"
+        "  occurred_at timestamp NOT NULL"
+    )
+    assert "Row count estimates" not in result
+
+
+def test_derive_tables_only_is_a_no_op_when_there_is_no_non_table_section_at_all():
+    # Mirrors mongodb_sql.py/sheets.py-shaped schemas, which never emit any
+    # of the non-table sections other backends do - nothing to cut, so the
+    # full (rstripped) text comes back unchanged.
+    schema = (
+        "Table: users\n"
+        "  _id ObjectId NOT NULL\n"
+        "  email string NOT NULL\n"
+        "\n"
+        "Table: sessions\n"
+        "  _id ObjectId NOT NULL\n"
+    )
+    assert derive_tables_only_schema_text(schema) == schema.rstrip()
+
+
+def test_derive_tables_only_returns_a_single_table_entry_unchanged():
+    schema = "Table: customers\n  id integer NOT NULL\n"
+    assert derive_tables_only_schema_text(schema) == schema.rstrip()
+
+
+def test_derive_tables_only_returns_empty_or_none_input_unchanged():
+    assert derive_tables_only_schema_text("") == ""
+    assert derive_tables_only_schema_text(None) is None
+
+
+def test_derive_tables_only_treats_unrecognized_text_with_no_table_heading_as_all_non_table():
+    # The "No schema description available." failure placeholder (and any
+    # future backend that abandons the heading convention) has no
+    # recognizable table heading at all, so its very first line already
+    # counts as the "first non-table top-level line" - everything is
+    # dropped, matching split_schema_text_into_entries' own treatment of
+    # this shape as "nothing structured", not an error.
+    schema = "No schema description available."
+    assert derive_tables_only_schema_text(schema) == ""

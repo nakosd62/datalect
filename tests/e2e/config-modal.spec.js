@@ -138,12 +138,9 @@ test.describe('config modal', () => {
     // client.js) - an odd total leans left by one rather than the right
     // column coming up short by more than that. All 10 rows here are the
     // same dialect (postgres) specifically to prove the split no longer
-    // depends on type at all. "All Pre-Configured Datasets" itself renders as one
-    // more option in this same two-column preset list, appended right
-    // after the very last preset - here that's the right column, since it
-    // isn't empty.
+    // depends on type at all.
     const configuredDatabases = Array.from({ length: 10 }, (_, i) => ({
-      id: `p-${i}`, name: `Playground ${i}`, type: 'postgres',
+      id: `p-${i}`, name: `Playground ${i}`, type: 'postgres', dialect_name: 'PostgreSQL',
     }));
     await page.route('**/api/config', async (route) => {
       if (route.request().method() !== 'GET') return route.fallback();
@@ -179,19 +176,20 @@ test.describe('config modal', () => {
     const columns = page.locator('.preset-column');
     await expect(columns).toHaveCount(2);
     await expect(columns.nth(0).locator('.radio-label')).toHaveText([
-      'Playground 0', 'Playground 1', 'Playground 2', 'Playground 3', 'Playground 4',
+      'Playground 0 (PostgreSQL)', 'Playground 1 (PostgreSQL)', 'Playground 2 (PostgreSQL)',
+      'Playground 3 (PostgreSQL)', 'Playground 4 (PostgreSQL)',
     ]);
     await expect(columns.nth(1).locator('.radio-label')).toHaveText([
-      'Playground 5', 'Playground 6', 'Playground 7', 'Playground 8', 'Playground 9',
-      'All Pre-Configured Datasets',
+      'Playground 5 (PostgreSQL)', 'Playground 6 (PostgreSQL)', 'Playground 7 (PostgreSQL)',
+      'Playground 8 (PostgreSQL)', 'Playground 9 (PostgreSQL)',
     ]);
   });
 
   test('an odd number of presets leans the extra one into the left column', async ({ page }) => {
     const configuredDatabases = [
-      { id: 'p-0', name: 'One', type: 'postgres' },
-      { id: 'p-1', name: 'Two', type: 'mysql' },
-      { id: 'p-2', name: 'Three', type: 'bigquery' },
+      { id: 'p-0', name: 'One', type: 'postgres', dialect_name: 'PostgreSQL' },
+      { id: 'p-1', name: 'Two', type: 'mysql', dialect_name: 'MySQL' },
+      { id: 'p-2', name: 'Three', type: 'bigquery', dialect_name: 'BigQuery Standard SQL' },
     ];
     await page.route('**/api/config', async (route) => {
       if (route.request().method() !== 'GET') return route.fallback();
@@ -225,8 +223,8 @@ test.describe('config modal', () => {
     await openConfigModal(page);
 
     const columns = page.locator('.preset-column');
-    await expect(columns.nth(0).locator('.radio-label')).toHaveText(['One', 'Two']);
-    await expect(columns.nth(1).locator('.radio-label')).toHaveText(['Three', 'All Pre-Configured Datasets']);
+    await expect(columns.nth(0).locator('.radio-label')).toHaveText(['One (PostgreSQL)', 'Two (MySQL)']);
+    await expect(columns.nth(1).locator('.radio-label')).toHaveText(['Three (BigQuery Standard SQL)']);
   });
 
   test('two presets of the same dialect split one-per-column instead of both landing on one side', async ({ page }) => {
@@ -234,8 +232,8 @@ test.describe('config modal', () => {
     // used to both land in the same (left) column under the old
     // dialect-based grouping, leaving the right column empty.
     const configuredDatabases = [
-      { id: 'p-a', name: 'Sales Postgres', type: 'postgres' },
-      { id: 'p-b', name: 'Marketing Postgres', type: 'postgres' },
+      { id: 'p-a', name: 'Sales Postgres', type: 'postgres', dialect_name: 'PostgreSQL' },
+      { id: 'p-b', name: 'Marketing Postgres', type: 'postgres', dialect_name: 'PostgreSQL' },
     ];
     await page.route('**/api/config', async (route) => {
       if (route.request().method() !== 'GET') return route.fallback();
@@ -269,17 +267,13 @@ test.describe('config modal', () => {
     await openConfigModal(page);
 
     const columns = page.locator('.preset-column');
-    await expect(columns.nth(0).locator('.radio-label')).toHaveText(['Sales Postgres']);
-    await expect(columns.nth(1).locator('.radio-label')).toHaveText(['Marketing Postgres', 'All Pre-Configured Datasets']);
+    await expect(columns.nth(0).locator('.radio-label')).toHaveText(['Sales Postgres (PostgreSQL)']);
+    await expect(columns.nth(1).locator('.radio-label')).toHaveText(['Marketing Postgres (PostgreSQL)']);
   });
 
-  test('with only one preset configured, "All Pre-Configured Datasets" lands in the (only, left) column alongside it', async ({ page }) => {
-    // Edge case in renderDbRadioButtons()'s allOptionGoesInRightColumn logic:
-    // with 0-1 total presets the right column is empty, so the "All Preset
-    // Datasets" option falls back to the left column instead of being
-    // stranded alone in an otherwise-empty right one.
+  test('with only one preset configured, it still renders alone in the (only, left) column', async ({ page }) => {
     const configuredDatabases = [
-      { id: 'p-0', name: 'Solo Postgres', type: 'postgres' },
+      { id: 'p-0', name: 'Solo Postgres', type: 'postgres', dialect_name: 'PostgreSQL' },
     ];
     await page.route('**/api/config', async (route) => {
       if (route.request().method() !== 'GET') return route.fallback();
@@ -313,37 +307,68 @@ test.describe('config modal', () => {
     await openConfigModal(page);
 
     const columns = page.locator('.preset-column');
-    await expect(columns.nth(0).locator('.radio-label')).toHaveText(['Solo Postgres', 'All Pre-Configured Datasets']);
+    await expect(columns.nth(0).locator('.radio-label')).toHaveText(['Solo Postgres (PostgreSQL)']);
     await expect(columns.nth(1).locator('.radio-label')).toHaveText([]);
   });
 
-  test('the "All Pre-Configured Datasets" explanation is an on-hover tooltip, not visible body text', async ({ page }) => {
+  test('the dataset group explanation is an on-hover tooltip, not visible body text', async ({ page }) => {
     // Previously a standalone <p class="all-databases-hint"> below the
-    // two-column grid - moved to a plain `title` attribute on the option's
-    // own <label> per explicit request to get it out of the dialog body.
+    // two-column grid, back when this was the single "All Pre-Configured
+    // Datasets" option - moved to a plain `title` attribute on each
+    // group's own <label> per explicit request to get it out of the
+    // dialog body, and now applies per dataset group (see
+    // server/app_config.py's "DATASET GROUPS" comment) rather than to one
+    // fixed "all" choice.
+    const configuredDatabases = [{ id: 'p-0', name: 'Solo Postgres', type: 'postgres', dialect_name: 'PostgreSQL' }];
+    const configuredDatabaseGroups = [
+      { id: 'grp-1', name: 'Everything', dataset_list: ['p-0'] },
+    ];
+    await page.route('**/api/config', async (route) => {
+      if (route.request().method() !== 'GET') return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          auth_enabled: false,
+          session_id: 'e2e-session',
+          user_id: 'global',
+          authenticated: false,
+          is_cloud_run: false,
+          configured_databases: configuredDatabases,
+          configured_database_groups: configuredDatabaseGroups,
+          active_preset_id: 'p-0',
+          default_database_url: '',
+          active_database_url: '',
+          active_database_type: 'postgres',
+          active_is_custom: false,
+          active_custom_connection_key: '',
+          active_uses_custom_credentials: false,
+          database_name: 'Solo Postgres',
+          custom_database_name: '',
+          custom_database_url: '',
+          custom_databases: [],
+          auto_sql_execute: false,
+        }),
+      });
+    });
+
     await gotoApp(page);
     await openConfigModal(page);
 
     await expect(page.locator('#modalDbRadioGroup')).not.toContainText('Ask a question without picking a database first');
 
-    const allOption = page.locator('.all-databases-option');
-    await expect(allOption).toHaveAttribute('title', /Ask a question without picking a database first/);
-    await expect(allOption).toHaveAttribute('title', /your own custom connections are never included/);
+    const groupOption = page.locator('.all-databases-option');
+    await expect(groupOption).toHaveAttribute('title', /Ask a question without picking a database first/);
   });
 
-  test('"All Pre-Configured Datasets" is hidden entirely when every preset has opted out via include_in_all_mode: false', async ({ page }) => {
-    // app_config.py's DATABASE_PRESETS_FILE "include_in_all_mode" field
-    // (db.py's _resolve_all_configured_descriptors) lets an admin exclude
-    // specific presets from "All" mode. Once EVERY configured preset is
-    // excluded, offering the "All" radio at all would be misleading - it
-    // would just silently fall back to the single default connection
-    // server-side (see that function's own docstring) rather than
-    // genuinely combining anything - so renderDbRadioButtons() (client.js)
-    // hides the option outright in that case. Each preset stays fully
-    // selectable individually regardless - only the combined "All" choice
-    // is affected.
+  test('no dataset-group entries appear when no groups are configured', async ({ page }) => {
+    // There is no built-in "every configured dataset" mode any more (see
+    // server/app_config.py's "DATASET GROUPS" comment) - a deployment
+    // with no dataset_group entries in DATABASE_PRESETS_FILE simply has
+    // no combined-scope option at all, not a fallback "All" choice the
+    // way the removed feature this replaces always offered one.
     const configuredDatabases = [
-      { id: 'p-0', name: 'Solo Postgres', type: 'postgres', include_in_all_mode: false },
+      { id: 'p-0', name: 'Solo Postgres', type: 'postgres', dialect_name: 'PostgreSQL' },
     ];
     await page.route('**/api/config', async (route) => {
       if (route.request().method() !== 'GET') return route.fallback();
@@ -377,17 +402,22 @@ test.describe('config modal', () => {
     await openConfigModal(page);
 
     const columns = page.locator('.preset-column');
-    await expect(columns.nth(0).locator('.radio-label')).toHaveText(['Solo Postgres']);
+    await expect(columns.nth(0).locator('.radio-label')).toHaveText(['Solo Postgres (PostgreSQL)']);
     await expect(page.locator('.all-databases-option')).toHaveCount(0);
   });
 
-  test('"All Pre-Configured Datasets" still shows when at least one preset remains eligible', async ({ page }) => {
-    // Mixed case: one preset opted out, one still eligible - "All" must
-    // still render (it would only combine the eligible one server-side,
-    // but that's still a meaningful, non-trivial choice to offer).
+  test('one radio renders per configured dataset group, merged into the same picker as the presets', async ({ page }) => {
+    // Groups no longer have any opt-in/opt-out flag on the member datasets
+    // themselves (see server/app_config.py's "DATASET GROUPS" comment) -
+    // whatever groups are configured each get their own radio, named after
+    // the group, regardless of how many datasets they each list.
     const configuredDatabases = [
-      { id: 'p-0', name: 'Quarantined Postgres', type: 'postgres', include_in_all_mode: false },
-      { id: 'p-1', name: 'Sales Postgres', type: 'postgres' },
+      { id: 'p-0', name: 'Quarantined Postgres', type: 'postgres', dialect_name: 'PostgreSQL' },
+      { id: 'p-1', name: 'Sales Postgres', type: 'postgres', dialect_name: 'PostgreSQL' },
+    ];
+    const configuredDatabaseGroups = [
+      { id: 'grp-solo', name: 'Solo Group', dataset_list: ['p-0'] },
+      { id: 'grp-both', name: 'Everything', dataset_list: ['p-0', 'p-1'] },
     ];
     await page.route('**/api/config', async (route) => {
       if (route.request().method() !== 'GET') return route.fallback();
@@ -401,6 +431,7 @@ test.describe('config modal', () => {
           authenticated: false,
           is_cloud_run: false,
           configured_databases: configuredDatabases,
+          configured_database_groups: configuredDatabaseGroups,
           active_preset_id: 'p-0',
           default_database_url: '',
           active_database_url: '',
@@ -420,7 +451,82 @@ test.describe('config modal', () => {
     await gotoApp(page);
     await openConfigModal(page);
 
-    await expect(page.locator('.all-databases-option')).toHaveCount(1);
+    // Still just the one combined block of columns - groups don't get a
+    // block of their own (see renderDbRadioButtons()'s merge comment).
+    await expect(page.locator('.preset-columns')).toHaveCount(1);
+    await expect(page.locator('.all-databases-option')).toHaveCount(2);
+    await expect(page.locator('.all-databases-option .radio-label')).toHaveText(['Solo Group (Dataset Group)', 'Everything (Dataset Group)']);
+  });
+
+  test('single-db presets and dataset groups are merged into one combined list, each labeled "name (type)"', async ({ page }) => {
+    // Single presets show their real dialect_name (config_routes.py's
+    // _redact_preset_for_client()) in parentheses; a dataset group has no
+    // dialect of its own, so it's always labeled "(Dataset Group)" instead
+    // (see renderDbRadioButtons()'s renderGroupOption()) - both kinds of
+    // entry now live in the exact same combined, balanced-column list
+    // (there is no more separate "DATASET GROUPS" heading/column below the
+    // presets - see renderDbRadioButtons()'s own comment on the merge).
+    // Two presets + one group = three entries total, split 2/1 by the same
+    // "balanced by count" rule the presets-only tests above already cover -
+    // proving the group counts as just one more entry in that same split,
+    // landing in whichever column comes next, rather than being appended
+    // in some separate block of its own.
+    const configuredDatabases = [
+      { id: 'p-a', name: 'Sales Postgres', type: 'postgres', dialect_name: 'PostgreSQL' },
+      { id: 'p-b', name: 'Marketing Warehouse', type: 'bigquery', dialect_name: 'BigQuery Standard SQL' },
+    ];
+    const configuredDatabaseGroups = [
+      { id: 'grp-ab', name: 'Sales & Marketing', dataset_list: ['p-a', 'p-b'] },
+    ];
+    await page.route('**/api/config', async (route) => {
+      if (route.request().method() !== 'GET') return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          auth_enabled: false,
+          session_id: 'e2e-session',
+          user_id: 'global',
+          authenticated: false,
+          is_cloud_run: false,
+          configured_databases: configuredDatabases,
+          configured_database_groups: configuredDatabaseGroups,
+          active_preset_id: 'p-a',
+          default_database_url: '',
+          active_database_url: '',
+          active_database_type: 'postgres',
+          active_is_custom: false,
+          active_custom_connection_key: '',
+          active_uses_custom_credentials: false,
+          database_name: 'Sales Postgres',
+          custom_database_name: '',
+          custom_database_url: '',
+          custom_databases: [],
+          auto_sql_execute: false,
+        }),
+      });
+    });
+
+    await gotoApp(page);
+    await openConfigModal(page);
+
+    // Only one combined block of columns - a leftover separate block for
+    // dataset groups (the pre-merge layout) would make this 2.
+    await expect(page.locator('.preset-columns')).toHaveCount(1);
+    // No standalone "DATASET GROUPS" heading either - just the one
+    // playgrounds heading covering presets and groups alike, same as when
+    // no groups are configured at all.
+    const radioGroup = page.locator('#modalDbRadioGroup');
+    await expect(radioGroup.locator('.radio-group-heading')).toHaveText([
+      'PRE-CONFIGURED DATASETS (PLAYGROUNDS)', 'Custom Database Connections',
+    ]);
+
+    const columns = page.locator('.preset-column');
+    await expect(columns.nth(0).locator('.radio-label')).toHaveText([
+      'Sales Postgres (PostgreSQL)', 'Marketing Warehouse (BigQuery Standard SQL)',
+    ]);
+    await expect(columns.nth(1).locator('.radio-label')).toHaveText(['Sales & Marketing (Dataset Group)']);
+    await expect(page.locator('.all-databases-option .radio-label')).toHaveText(['Sales & Marketing (Dataset Group)']);
   });
 
   test('custom connections heading has a security note that opens the Help modal', async ({ page }) => {

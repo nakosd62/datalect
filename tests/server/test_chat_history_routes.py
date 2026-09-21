@@ -275,7 +275,19 @@ def test_summary_never_echoes_the_raw_url_of_an_unsaved_custom_connection(client
     assert 'internal-db.example.com' not in str(display_fields)
 
 
-def test_summary_includes_the_all_databases_bucket_with_a_special_label(client):
+def test_summary_includes_the_all_databases_bucket_with_a_special_label_but_marks_it_unavailable(client):
+    # "all mode" (querying every pre-configured dataset combined) was
+    # removed as something a session can newly select - see
+    # _resolve_bucket_display's own "all" branch - so a bucket saved under
+    # this fixed key before that removal is exactly as unresolvable
+    # against this user's CURRENT options as a deleted preset/custom
+    # connection/dataset group: `available` is False, same as those. It
+    # still gets its special hardcoded name rather than `None`, though -
+    # see this endpoint's own docstring on why "still returned" (not
+    # dropped) and "still shown in the modal's list" are two different
+    # things now (client.js's renderChatHistoryBucketList() is what
+    # actually leaves it - and every other unavailable bucket - out of the
+    # rendered rows).
     login_as(client, "alice@example.com")
     _push_turns(client, "all", 5)
 
@@ -286,7 +298,7 @@ def test_summary_includes_the_all_databases_bucket_with_a_special_label(client):
         'kind': 'all',
         'name': 'All Pre-Configured Datasets (combined)',
         'type': None,
-        'available': True,
+        'available': False,
     }]
 
 

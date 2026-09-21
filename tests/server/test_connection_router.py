@@ -1,11 +1,13 @@
 """
-connection_router.py (Phase A of "all databases" mode - see
+connection_router.py (Phase A of dataset group mode - see
 translate_routes.py's module docstring) and its wiring into
 /api/translate's stream_translation(): a session whose in_scope_mode
-isn't "all" never calls triage_all_mode_question at all (the core
+isn't "group" never calls triage_all_mode_question at all (the core
 regression guard - single-connection sessions and an explicit
-database_url override both take that path), a session in "all" mode
-runs triage first, which decides "answer" (no real data access needed),
+database_url override both take that path; triage_all_mode_question's own
+name predates and is independent of this user-facing "group" concept -
+see that function's own docstring), a session in "group" mode runs
+triage first, which decides "answer" (no real data access needed),
 "route" (generate and execute real SQL against one or more connections,
 mechanically tagged with a stable marker server-side), or "failed" (the
 triage LLM call never produced anything usable even after a bounded
@@ -134,14 +136,15 @@ def _two_preset_env(app_factory, tmp_path, extra_env=None):
     presets_path = write_database_presets_file(tmp_path, [
         {"id": "pg-a", "name": "Sales Postgres", "type": "postgres", "url": "postgresql://u:p@host-a:5432/a"},
         {"id": "pg-b", "name": "Marketing Postgres", "type": "postgres", "url": "postgresql://u:p@host-b:5432/b"},
+        {"id": "grp-ab", "name": "Both Postgres", "type": "dataset_group", "dataset_list": ["pg-a", "pg-b"]},
     ])
     env = {"DATABASE_PRESETS_FILE": presets_path, "GEMINI_PRESET_KEYS": "fake-key-1"}
     env.update(extra_env or {})
     return app_factory(env=env)
 
 
-def _set_all_mode(client):
-    resp = client.post('/api/config', json={"in_scope_mode": "all"})
+def _set_group_mode(client, group_id="grp-ab"):
+    resp = client.post('/api/config', json={"in_scope_mode": "group", "in_scope_group_id": group_id})
     assert resp.status_code == 200
 
 
@@ -174,21 +177,21 @@ class FakeApiError(Exception):
 # docstring.
 
 def test_triage_prompt_requires_answer_and_message_to_lead_with_a_translated_label_line():
-    from connection_router import _TRIAGE_SYSTEM_INSTRUCTION
+    from connection_router import _MULTI_CANDIDATE_TRIAGE_SYSTEM_INSTRUCTION
 
-    assert "TRANSLATED into the SAME LANGUAGE as the user's own question" in _TRIAGE_SYSTEM_INSTRUCTION
-    assert "\"answer\"" in _TRIAGE_SYSTEM_INSTRUCTION and "\"message\"" in _TRIAGE_SYSTEM_INSTRUCTION
+    assert "TRANSLATED into the SAME LANGUAGE as the user's own" in _MULTI_CANDIDATE_TRIAGE_SYSTEM_INSTRUCTION
+    assert "\"answer\"" in _MULTI_CANDIDATE_TRIAGE_SYSTEM_INSTRUCTION and "\"message\"" in _MULTI_CANDIDATE_TRIAGE_SYSTEM_INSTRUCTION
     # Explicitly never required of "database_prompts" - those are internal,
     # per-connection instructions the end user never sees.
-    assert "never \"database_prompts\"" in _TRIAGE_SYSTEM_INSTRUCTION
+    assert "never \"database_prompts\"" in _MULTI_CANDIDATE_TRIAGE_SYSTEM_INSTRUCTION
     # The label is explicitly called out as insufficient on its own - see
     # is_label_only_response's own docstring comment for the real failure
     # mode this guards against.
-    assert "is not a valid" in _TRIAGE_SYSTEM_INSTRUCTION
+    assert "is not a valid" in _MULTI_CANDIDATE_TRIAGE_SYSTEM_INSTRUCTION
 
 
 def test_parse_triage_response_treats_an_answer_of_just_a_label_line_as_unparseable():
-    from connection_router import _parse_triage_response
+    from connection_router import _parse_multi_candidate_triage_response
 
     # A label line (any language - "Triage"/"Clasificación" are just
     # examples) followed by a blank line and nothing else is unparseable,
@@ -197,13 +200,13 @@ def test_parse_triage_response_treats_an_answer_of_just_a_label_line_as_unparsea
         'Triage\n\n', '  Triage  \n\n   ', '**Triage**\n\n', '__Triage__\n\n',
         'triage\n\n', 'Clasificación\n\n',
     ):
-        assert _parse_triage_response(
-            json.dumps({"action": "answer", "answer": answer}), num_candidates=2, max_connections=20,
+        assert _parse_multi_candidate_triage_response(
+            json.dumps({"action": "general", "answer": answer}), num_candidates=2, max_connections=20,
         ) is None
 
 
 def test_parse_triage_response_accepts_a_bare_answer_with_no_label_line_at_all():
-    from connection_router import _parse_triage_response
+    from connection_router import _parse_multi_candidate_triage_response
 
     # A response with no blank-line-separated leading line at all is NOT
     # label-only - it's an ordinary (if non-compliant with the label
@@ -211,25 +214,25 @@ def test_parse_triage_response_accepts_a_bare_answer_with_no_label_line_at_all()
     # rather than retrying over it - see is_label_only_response's
     # docstring for why only a VISIBLE label-then-nothing shape is
     # flagged, never a plain unlabeled response.
-    assert _parse_triage_response(
-        json.dumps({"action": "answer", "answer": "Sales Postgres has the most customers."}),
+    assert _parse_multi_candidate_triage_response(
+        json.dumps({"action": "general", "answer": "Sales Postgres has the most customers."}),
         num_candidates=2, max_connections=20,
-    ) == {"outcome": "answer", "answer": "Sales Postgres has the most customers."}
+    ) == {"outcome": "general", "answer": "Sales Postgres has the most customers."}
 
 
 def test_parse_triage_response_downgrades_a_message_of_just_a_label_line_to_none():
-    from connection_router import _parse_triage_response
+    from connection_router import _parse_multi_candidate_triage_response
 
-    # Unlike "answer" above, a label-only "message" doesn't fail the whole
+    # Unlike "general" above, a label-only "message" doesn't fail the whole
     # attempt - the routing decision (indices) is still good, and the
     # caller already has a translated-label fallback sentence for a
     # missing message (see translate_routes.py's stream_translation()).
-    parsed = _parse_triage_response(
-        json.dumps({"action": "route", "indices": [0], "message": "Triage\n\n"}),
+    parsed = _parse_multi_candidate_triage_response(
+        json.dumps({"action": "sql", "indices": [0], "message": "Triage\n\n"}),
         num_candidates=2, max_connections=20,
     )
     assert parsed == {
-        "outcome": "route", "indices": [0], "message": None, "database_prompts": {},
+        "outcome": "sql", "indices": [0], "message": None, "database_prompts": {},
     }
 
 
@@ -298,19 +301,20 @@ class _FakeProvider:
 # _FakeProvider, independent of the full /api/translate round-trip.
 
 def test_triage_all_mode_question_route_outcome_includes_per_connection_database_prompts():
-    from connection_router import triage_all_mode_question
+    from connection_router import run_triage_call
 
     provider = _FakeProvider([
-        '{"action": "route", "indices": [0, 1], "message": "Checking A and B.", '
+        '{"action": "sql", "indices": [0, 1], "message": "Checking A and B.", '
         '"database_prompts": {"0": "Give me data from one table in this database.", '
         '"1": "Give me data from a different table in this database."}}'
     ])
     candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": ["x"]},
                   {"name": "B", "dialect": "MySQL", "table_names": ["y"]}]
-    result = _drain(triage_all_mode_question(
-        candidates, "give me data from 2 tables each from a different database", provider, client=None, model="m",
+    result = _drain(run_triage_call(
+        len(candidates), "schema block", "give me data from 2 tables each from a different database",
+        provider, client=None, model="m",
     ))
-    assert result["outcome"] == "route"
+    assert result["outcome"] == "sql"
     assert result["indices"] == [0, 1]
     assert result["database_prompts"] == {
         0: "Give me data from one table in this database.",
@@ -319,22 +323,26 @@ def test_triage_all_mode_question_route_outcome_includes_per_connection_database
 
 
 def test_triage_all_mode_question_route_outcome_defaults_to_empty_dict_when_model_omits_the_field():
-    from connection_router import triage_all_mode_question
+    from connection_router import run_triage_call
 
     # No "database_prompts" key at all - the model ignored/forgot it. This
     # must not be treated as an unparseable response (no retry wasted) -
     # the routing decision is still perfectly usable, the caller just falls
     # back to the original question for every selected connection.
-    provider = _FakeProvider(['{"action": "route", "indices": [0], "message": "Checking A."}'])
+    provider = _FakeProvider(['{"action": "sql", "indices": [0], "message": "Checking A."}'])
     candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": ["x"]}]
-    result = _drain(triage_all_mode_question(candidates, "q", provider, client=None, model="m"))
-    assert result["outcome"] == "route"
+    # num_candidates is passed as 2 (not len(candidates)) so this exercises
+    # the multi-candidate "sql" outcome (indices/message/database_prompts) -
+    # num_candidates == 1 would instead take run_triage_call's single-
+    # dataset branch, which has no "database_prompts" concept at all.
+    result = _drain(run_triage_call(2, "schema block", "q", provider, client=None, model="m"))
+    assert result["outcome"] == "sql"
     assert result["database_prompts"] == {}
     assert len(provider.calls) == 1  # no wasted retry
 
 
 def test_triage_all_mode_question_route_outcome_drops_database_prompts_entries_for_indices_the_model_didnt_pick():
-    from connection_router import triage_all_mode_question
+    from connection_router import run_triage_call
 
     # The model included a rewrite for index 2, but only selected indices
     # [0, 1] - index 2 was presumably dropped by _clean_indices (out of
@@ -342,20 +350,20 @@ def test_triage_all_mode_question_route_outcome_drops_database_prompts_entries_f
     # silently discarded, not carried through to a connection Phase B was
     # never asked to contact at all.
     provider = _FakeProvider([
-        '{"action": "route", "indices": [0, 1], "message": "Checking A and B.", '
+        '{"action": "sql", "indices": [0, 1], "message": "Checking A and B.", '
         '"database_prompts": {"0": "Rewritten for A.", "1": "Rewritten for B.", '
         '"2": "Rewritten for a database not actually selected."}}'
     ])
     candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": []},
                   {"name": "B", "dialect": "MySQL", "table_names": []},
                   {"name": "C", "dialect": "MySQL", "table_names": []}]
-    result = _drain(triage_all_mode_question(candidates, "q", provider, client=None, model="m"))
+    result = _drain(run_triage_call(len(candidates), "schema block", "q", provider, client=None, model="m"))
     assert result["indices"] == [0, 1]
     assert result["database_prompts"] == {0: "Rewritten for A.", 1: "Rewritten for B."}
 
 
 def test_triage_all_mode_question_route_outcome_tolerates_malformed_database_prompts_entries():
-    from connection_router import triage_all_mode_question
+    from connection_router import run_triage_call
 
     # A non-dict "database_prompts", a non-string value, an empty/
     # whitespace-only string, and a non-numeric key must each be dropped
@@ -364,13 +372,13 @@ def test_triage_all_mode_question_route_outcome_tolerates_malformed_database_pro
     # perfectly usable; only the malformed per-connection rewrite is lost
     # (falling back to the original question for that one connection).
     provider = _FakeProvider([
-        '{"action": "route", "indices": [0, 1, 2], "message": "Checking three.", '
+        '{"action": "sql", "indices": [0, 1, 2], "message": "Checking three.", '
         '"database_prompts": {"0": "Valid rewrite for A.", "1": 42, "2": "   ", "not-a-number": "x"}}'
     ])
     candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": []},
                   {"name": "B", "dialect": "MySQL", "table_names": []},
                   {"name": "C", "dialect": "MySQL", "table_names": []}]
-    result = _drain(triage_all_mode_question(candidates, "q", provider, client=None, model="m"))
+    result = _drain(run_triage_call(len(candidates), "schema block", "q", provider, client=None, model="m"))
     assert result["indices"] == [0, 1, 2]
     assert result["database_prompts"] == {0: "Valid rewrite for A."}
 
@@ -398,7 +406,7 @@ def test_clean_database_prompts_returns_empty_dict_for_non_dict_input():
 
 
 def test_triage_answer_outcome_in_wrong_language_is_retried_and_corrected(monkeypatch):
-    from connection_router import triage_all_mode_question
+    from connection_router import run_triage_call
     import connection_router as connection_router_module
 
     monkeypatch.setattr(
@@ -410,13 +418,15 @@ def test_triage_answer_outcome_in_wrong_language_is_retried_and_corrected(monkey
         lambda code: {"de": "German", "en": "English"}.get(code, code),
     )
     provider = _FakeProvider([
-        '{"action": "answer", "answer": "Sie haben 3 Datenbanken."}',
-        '{"action": "answer", "answer": "You have 3 databases."}',
+        '{"action": "general", "answer": "Sie haben 3 Datenbanken."}',
+        '{"action": "general", "answer": "You have 3 databases."}',
     ])
     candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": []}]
-    result = _drain(triage_all_mode_question(candidates, "how many databases?", provider, client=None, model="m"))
+    result = _drain(run_triage_call(
+        len(candidates), "schema block", "how many databases?", provider, client=None, model="m",
+    ))
 
-    assert result["outcome"] == "answer"
+    assert result["outcome"] == "general"
     assert result["answer"] == "You have 3 databases."
     assert len(provider.calls) == 2
     # The retry actually carried the explicit correction, not just a
@@ -426,7 +436,7 @@ def test_triage_answer_outcome_in_wrong_language_is_retried_and_corrected(monkey
 
 
 def test_triage_route_outcome_message_in_wrong_language_is_retried_and_corrected(monkeypatch):
-    from connection_router import triage_all_mode_question
+    from connection_router import run_triage_call
     import connection_router as connection_router_module
 
     monkeypatch.setattr(
@@ -438,20 +448,25 @@ def test_triage_route_outcome_message_in_wrong_language_is_retried_and_corrected
         lambda code: {"de": "German", "en": "English"}.get(code, code),
     )
     provider = _FakeProvider([
-        '{"action": "route", "indices": [0], "message": "Prüfe die Datenbanken."}',
-        '{"action": "route", "indices": [0], "message": "Checking the databases."}',
+        '{"action": "sql", "indices": [0], "message": "Prüfe die Datenbanken."}',
+        '{"action": "sql", "indices": [0], "message": "Checking the databases."}',
     ])
     candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": []}]
-    result = _drain(triage_all_mode_question(candidates, "check the databases", provider, client=None, model="m"))
+    # num_candidates == 2 (not len(candidates)) - this test is about the
+    # multi-candidate "sql" outcome's "message" language check specifically,
+    # which only exists on that branch.
+    result = _drain(run_triage_call(
+        2, "schema block", "check the databases", provider, client=None, model="m",
+    ))
 
-    assert result["outcome"] == "route"
+    assert result["outcome"] == "sql"
     assert result["message"] == "Checking the databases."
     assert len(provider.calls) == 2
     assert "CORRECTION" in provider.calls[1]["llm_input"]
 
 
 def test_triage_still_wrong_language_after_retry_fails_without_api_error(monkeypatch):
-    from connection_router import triage_all_mode_question
+    from connection_router import run_triage_call
     import connection_router as connection_router_module
 
     # Mirrors _summarize_with_retry's/stream_translation()'s own "never
@@ -468,25 +483,28 @@ def test_triage_still_wrong_language_after_retry_fails_without_api_error(monkeyp
         lambda code: {"de": "German", "en": "English"}.get(code, code),
     )
     provider = _FakeProvider([
-        '{"action": "answer", "answer": "Sie haben 3 Datenbanken."}',
-        '{"action": "answer", "answer": "Immer noch Datenbanken."}',
+        '{"action": "general", "answer": "Sie haben 3 Datenbanken."}',
+        '{"action": "general", "answer": "Immer noch Datenbanken."}',
     ])
     candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": []}]
-    result = _drain(triage_all_mode_question(candidates, "how many databases?", provider, client=None, model="m"))
+    result = _drain(run_triage_call(
+        len(candidates), "schema block", "how many databases?", provider, client=None, model="m",
+    ))
 
     assert result == {"outcome": "failed", "api_error": False, "error": None}
     assert len(provider.calls) == 2
 
 
 def test_triage_route_outcome_with_no_message_never_triggers_a_language_check(monkeypatch):
-    from connection_router import triage_all_mode_question
+    from connection_router import run_triage_call
     import connection_router as connection_router_module
 
-    # Regression guard: a "route" outcome whose "message" the model simply
-    # omitted (_parse_triage_response already tolerates this - see
-    # test_parse_triage_response_downgrades_a_message_of_just_a_label_line_
-    # to_none above) has no free text to check at all, so detect_language
-    # must never even be called - no wasted retry, no spurious mismatch.
+    # Regression guard: a "sql" outcome whose "message" the model simply
+    # omitted (_parse_multi_candidate_triage_response already tolerates
+    # this - see test_parse_triage_response_downgrades_a_message_of_just_a_
+    # label_line_to_none above) has no free text to check at all, so
+    # detect_language must never even be called - no wasted retry, no
+    # spurious mismatch.
     detect_calls = []
 
     def _spy_detect_language(text):
@@ -494,11 +512,13 @@ def test_triage_route_outcome_with_no_message_never_triggers_a_language_check(mo
         return "en"
 
     monkeypatch.setattr(connection_router_module, "detect_language", _spy_detect_language)
-    provider = _FakeProvider(['{"action": "route", "indices": [0], "message": "\\n\\n"}'])
+    provider = _FakeProvider(['{"action": "sql", "indices": [0], "message": "\\n\\n"}'])
     candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": []}]
-    result = _drain(triage_all_mode_question(candidates, "q", provider, client=None, model="m"))
+    # num_candidates == 2 (not len(candidates)) - the multi-candidate "sql"
+    # outcome is the one that carries a "message" to check at all.
+    result = _drain(run_triage_call(2, "schema block", "q", provider, client=None, model="m"))
 
-    assert result["outcome"] == "route"
+    assert result["outcome"] == "sql"
     assert result["message"] is None
     assert len(provider.calls) == 1  # no wasted retry
     # detect_language is still called once, on the user's own question
@@ -519,21 +539,23 @@ def test_triage_route_outcome_with_no_message_never_triggers_a_language_check(mo
 
 
 def test_triage_retries_a_retryable_error_and_succeeds_on_a_rotated_key():
-    from connection_router import triage_all_mode_question
+    from connection_router import run_triage_call
 
     # First call raises, second (after rotating to the pool's other key)
     # succeeds - proves the retry loop actually recovers, which the old
     # "catch everything, retry same key, give up after 2" loop never
     # could for a genuinely per-key capacity error.
     provider = _FakeProvider(
-        [RuntimeError("rate limited"), '{"action": "answer", "answer": "42"}'],
+        [RuntimeError("rate limited"), '{"action": "general", "answer": "42"}'],
         key_pool=["key-a", "key-b"],
         classify_error=lambda exc: {"rotate_key": True, "delay": 0},
     )
     candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": []}]
-    result = _drain(triage_all_mode_question(candidates, "q", provider, client="initial-client", model="m"))
+    result = _drain(run_triage_call(
+        len(candidates), "schema block", "q", provider, client="initial-client", model="m",
+    ))
 
-    assert result["outcome"] == "answer"
+    assert result["outcome"] == "general"
     assert result["answer"] == "42"
     assert len(provider.calls) == 2
     # The retry rotated to a genuinely different key/client for the
@@ -552,15 +574,15 @@ def test_triage_yields_a_retrying_line_for_key_rotation_before_the_final_result(
     surfaced to a caller - calling this directly used to just silently
     pause (for the transient case) or immediately retry (for rotation)
     with zero observable signal that anything had happened at all."""
-    from connection_router import triage_all_mode_question
+    from connection_router import run_triage_call
 
     provider = _FakeProvider(
-        [RuntimeError("rate limited"), '{"action": "answer", "answer": "42"}'],
+        [RuntimeError("rate limited"), '{"action": "general", "answer": "42"}'],
         key_pool=["key-a", "key-b"],
         classify_error=lambda exc: {"rotate_key": True, "delay": 0},
     )
     candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": []}]
-    gen = triage_all_mode_question(candidates, "q", provider, client="initial-client", model="m")
+    gen = run_triage_call(len(candidates), "schema block", "q", provider, client="initial-client", model="m")
 
     # The generator yields the progress line BEFORE producing (or even
     # attempting) the retried call's result - next() advances it exactly
@@ -575,27 +597,27 @@ def test_triage_yields_a_retrying_line_for_key_rotation_before_the_final_result(
     # _drain resumes the SAME generator (it doesn't restart it) and runs
     # it to completion, capturing the final result via StopIteration.value.
     result = _drain(gen)
-    assert result["outcome"] == "answer"
+    assert result["outcome"] == "general"
     assert result["answer"] == "42"
 
 
 def test_triage_yields_a_retrying_line_for_a_transient_error_before_waiting(monkeypatch):
     """Same idea as the key-rotation test just above, for the OTHER retry
     branch (a same-key, wait-then-retry transient error) - both branches
-    have their own separate `yield` in triage_all_mode_question, so both
-    need their own regression guard."""
+    have their own separate `yield` in run_triage_call, so both need their
+    own regression guard."""
     import connection_router as connection_router_module
-    from connection_router import triage_all_mode_question
+    from connection_router import run_triage_call
 
     sleep_calls = []
     monkeypatch.setattr(connection_router_module.time, "sleep", lambda secs: sleep_calls.append(secs))
 
     provider = _FakeProvider(
-        [RuntimeError("temporarily unavailable"), '{"action": "answer", "answer": "42"}'],
+        [RuntimeError("temporarily unavailable"), '{"action": "general", "answer": "42"}'],
         classify_error=lambda exc: {"rotate_key": False, "delay": 2.5},
     )
     candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": []}]
-    gen = triage_all_mode_question(candidates, "q", provider, client=None, model="m")
+    gen = run_triage_call(len(candidates), "schema block", "q", provider, client=None, model="m")
 
     # Yielded BEFORE time.sleep() is called - see the "Told to the client
     # before sleeping, not after" comment on this exact line in
@@ -610,13 +632,13 @@ def test_triage_yields_a_retrying_line_for_a_transient_error_before_waiting(monk
     assert sleep_calls == []  # not yet - only after the yield resumes
 
     result = _drain(gen)
-    assert result["outcome"] == "answer"
+    assert result["outcome"] == "general"
     assert result["answer"] == "42"
     assert sleep_calls == [2.5]
 
 
 def test_triage_reports_api_error_when_key_rotation_budget_is_exhausted():
-    from connection_router import triage_all_mode_question
+    from connection_router import run_triage_call
 
     # Only ONE configured key (the common case) - a retryable/rotate-key
     # classification has nowhere to rotate to, so this must give up
@@ -628,7 +650,7 @@ def test_triage_reports_api_error_when_key_rotation_budget_is_exhausted():
         classify_error=lambda exc: {"rotate_key": True, "delay": 0},
     )
     candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": []}]
-    result = _drain(triage_all_mode_question(candidates, "q", provider, client=None, model="m"))
+    result = _drain(run_triage_call(len(candidates), "schema block", "q", provider, client=None, model="m"))
 
     assert result["outcome"] == "failed"
     assert result["api_error"] is True
@@ -641,11 +663,11 @@ def test_triage_reports_api_error_when_key_rotation_budget_is_exhausted():
 
 
 def test_triage_using_byok_forces_key_rotation_budget_to_one_even_with_multiple_keys():
-    from connection_router import triage_all_mode_question
+    from connection_router import run_triage_call
 
     # TWO configured keys - if using_byok didn't override
-    # get_key_pool_size() (see triage_all_mode_question's own docstring on
-    # the parameter), this would rotate and succeed exactly like
+    # get_key_pool_size() (see run_triage_call's own docstring on the
+    # parameter), this would rotate and succeed exactly like
     # test_triage_retries_a_retryable_error_and_succeeds_on_a_rotated_key
     # above. A "Bring Your Own Key" call has no second key of the user's
     # own to rotate to, so it must give up after the first attempt
@@ -656,8 +678,8 @@ def test_triage_using_byok_forces_key_rotation_budget_to_one_even_with_multiple_
         classify_error=lambda exc: {"rotate_key": True, "delay": 0},
     )
     candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": []}]
-    result = _drain(triage_all_mode_question(
-        candidates, "q", provider, client=None, model="m", using_byok=True,
+    result = _drain(run_triage_call(
+        len(candidates), "schema block", "q", provider, client=None, model="m", using_byok=True,
     ))
 
     assert result["outcome"] == "failed"
@@ -667,7 +689,7 @@ def test_triage_using_byok_forces_key_rotation_budget_to_one_even_with_multiple_
 
 
 def test_triage_reports_api_error_for_a_non_retryable_exception():
-    from connection_router import triage_all_mode_question
+    from connection_router import run_triage_call
 
     # classify_error returning None (the _FakeProvider default) means
     # "not retryable" - same bad-request/auth-failure/invalid-model bucket
@@ -677,7 +699,7 @@ def test_triage_reports_api_error_for_a_non_retryable_exception():
     # question."
     provider = _FakeProvider([RuntimeError("bad request")])
     candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": []}]
-    result = _drain(triage_all_mode_question(candidates, "q", provider, client=None, model="m"))
+    result = _drain(run_triage_call(len(candidates), "schema block", "q", provider, client=None, model="m"))
 
     assert result["outcome"] == "failed"
     assert result["api_error"] is True
@@ -687,7 +709,7 @@ def test_triage_reports_api_error_for_a_non_retryable_exception():
 
 
 def test_triage_unparseable_response_is_not_reported_as_api_error():
-    from connection_router import triage_all_mode_question
+    from connection_router import run_triage_call
 
     # Regression guard the other way: a call that succeeds twice but
     # returns garbage both times is genuinely "couldn't understand the
@@ -695,7 +717,7 @@ def test_triage_unparseable_response_is_not_reported_as_api_error():
     # so the caller shows _TRIAGE_FAILURE_TEXT, not _TRIAGE_API_ERROR_TEXT.
     provider = _FakeProvider(["not json", "still not json"])
     candidates = [{"name": "A", "dialect": "PostgreSQL", "table_names": []}]
-    result = _drain(triage_all_mode_question(candidates, "q", provider, client=None, model="m"))
+    result = _drain(run_triage_call(len(candidates), "schema block", "q", provider, client=None, model="m"))
 
     assert result["outcome"] == "failed"
     assert result["api_error"] is False
@@ -768,24 +790,39 @@ def test_single_in_scope_never_calls_triage_and_response_has_no_connection_selec
     env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
 
     def _boom(*a, **kw):
-        raise AssertionError("Triage should never be reached for a non-'all'-mode session")
-    monkeypatch.setattr(env.translate_routes, "triage_all_mode_question", _boom)
+        raise AssertionError("The dataset-group/multi-candidate triage path should never be reached for a non-'group'-mode session")
+    # build_router_candidate_summaries is only ever called from
+    # stream_translation()'s router_only_group_mode branch, right before it
+    # calls run_triage_call with num_candidates > 1 (dataset-group mode's
+    # own half of the now-unified triage call - see run_triage_call's
+    # docstring) - blowing this up is this test's post-merge equivalent of
+    # the old direct triage_all_mode_question monkeypatch, now that both
+    # modes' triage share one function and can no longer be distinguished
+    # by name alone.
+    monkeypatch.setattr(env.translate_routes, "build_router_candidate_summaries", _boom)
 
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(_gemini_ok("SELECT 1;"))
+    # Call 1 (triage_single_dataset_question - single-dataset mode's OWN
+    # num_candidates == 1 call into run_triage_call, distinct from the
+    # multi-candidate/group-mode call this test proves is never reached)
+    # then Call 2 (SQL-gen) - see translate_routes.py's two-call
+    # single-connection redesign.
+    harness.queue_response(_gemini_ok('{"action": "sql"}'))
+    harness.queue_response(_gemini_ok('{"sql": "SELECT 1;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'show me stuff'})
     _, data = parse_translate_stream(resp)
     assert data['success'] is True
     assert 'connection_selection' not in data
-    assert len(harness.generate_calls) == 1
+    assert len(harness.generate_calls) == 2
 
 
 # --- "all configured databases" mode: 2-phase triage -> parallel Phase B ---
 #
-# connection_router.triage_all_mode_question's system prompt asks for
-# {"action": "answer", "answer": "..."} or {"action": "route", "indices":
+# connection_router.run_triage_call's multi-candidate system prompt
+# (_MULTI_CANDIDATE_TRIAGE_SYSTEM_INSTRUCTION, num_candidates > 1) asks for
+# {"action": "general", "answer": "..."} or {"action": "sql", "indices":
 # [...], "message": "..."} (see that function's docstring).
 
 
@@ -807,15 +844,15 @@ def _schema_fetch_by_url(mapping):
     return _fetch
 
 
-def test_all_mode_answer_outcome_returns_no_sql_text_and_never_calls_phase_b(app_factory, tmp_path, monkeypatch):
+def test_group_mode_answer_outcome_returns_no_sql_text_and_never_calls_phase_b(app_factory, tmp_path, monkeypatch):
     env = _two_preset_env(app_factory, tmp_path)
     login_as(env.client, "alice@example.com")
-    _set_all_mode(env.client)
+    _set_group_mode(env.client)
 
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     harness.queue_response(_gemini_ok(
-        '{"action": "answer", "answer": "You have 2 databases configured: Sales Postgres and Marketing Postgres."}'
+        '{"action": "general", "answer": "You have 2 databases configured: Sales Postgres and Marketing Postgres."}'
     ))
 
     resp = env.client.post('/api/translate', json={'prompt': 'how many databases do I have'})
@@ -834,7 +871,7 @@ def test_all_mode_answer_outcome_returns_no_sql_text_and_never_calls_phase_b(app
     assert 'sql_blocks' not in data
 
 
-def test_all_mode_triage_call_receives_conversation_history_so_a_followup_can_resolve_which_database(app_factory, tmp_path, monkeypatch):
+def test_group_mode_triage_call_receives_conversation_history_so_a_followup_can_resolve_which_database(app_factory, tmp_path, monkeypatch):
     # Regression guard for a real user-reported gap: the FIRST triage call
     # in a conversation had always passed history=[] (see the original,
     # explicit design: "there is no past turns" for that first call) - but
@@ -846,7 +883,7 @@ def test_all_mode_triage_call_receives_conversation_history_so_a_followup_can_re
     # history, which remains empty always (unaffected by this fix).
     env = _two_preset_env(app_factory, tmp_path)
     login_as(env.client, "alice@example.com")
-    _set_all_mode(env.client)
+    _set_group_mode(env.client)
 
     import db as db_module
     monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
@@ -860,7 +897,7 @@ def test_all_mode_triage_call_receives_conversation_history_so_a_followup_can_re
     # Turn 1: a pure meta-question, answered directly - no history at all
     # yet (a brand-new conversation), matching the original design.
     harness.queue_response(_gemini_ok(
-        '{"action": "answer", "answer": "Marketing Postgres has campaign-related data."}'
+        '{"action": "general", "answer": "Marketing Postgres has campaign-related data."}'
     ))
     resp1 = env.client.post('/api/translate', json={'prompt': 'which database has campaign data'})
     _, data1 = parse_translate_stream(resp1)
@@ -871,7 +908,7 @@ def test_all_mode_triage_call_receives_conversation_history_so_a_followup_can_re
     # turns back as `history` (see client.js's translatePrompt()), so this
     # mirrors exactly what a real follow-up request sends.
     harness.queue_response(_gemini_ok(
-        '{"action": "route", "indices": [1], "message": "Checking Marketing Postgres."}'
+        '{"action": "sql", "indices": [1], "message": "Checking Marketing Postgres."}'
     ))
     harness.register_marker("campaigns", _gemini_ok("SELECT COUNT(*) FROM campaigns;"))
     resp2 = env.client.post('/api/translate', json={
@@ -894,7 +931,7 @@ def test_all_mode_triage_call_receives_conversation_history_so_a_followup_can_re
     assert "-- database: preset:pg-b (Marketing Postgres)\nSELECT COUNT(*) FROM campaigns;" in data2['sql']
 
 
-def test_all_mode_triage_candidate_summaries_precede_history_and_are_not_glued_to_the_new_prompt(
+def test_group_mode_triage_candidate_summaries_precede_history_and_are_not_glued_to_the_new_prompt(
     app_factory, tmp_path, monkeypatch,
 ):
     """Caching-efficiency fix (the design's own LLM-1 input ordering:
@@ -913,7 +950,7 @@ def test_all_mode_triage_candidate_summaries_precede_history_and_are_not_glued_t
     changes every turn, defeating prompt caching for it specifically."""
     env = _two_preset_env(app_factory, tmp_path)
     login_as(env.client, "alice@example.com")
-    _set_all_mode(env.client)
+    _set_group_mode(env.client)
 
     import db as db_module
     monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
@@ -921,12 +958,24 @@ def test_all_mode_triage_candidate_summaries_precede_history_and_are_not_glued_t
         "postgresql://u:p@host-b:5432/b": "Table: campaigns\nid INTEGER\n",
     }))
 
+    # Triage's candidate summaries now come ONLY from whatever deep schema
+    # is already sitting in schema_cache (see build_router_candidate_
+    # summaries() in db.py - it never fetches live). Warm both connections'
+    # deep entries up front, the way a preset prefetch or an earlier real
+    # generation call against them would in production, so this test's own
+    # triage calls below actually have real table names to work with -
+    # this test is about prompt ORDERING, not about cache-population
+    # mechanics (that's covered by test_db_schema_fetch.py and the
+    # dedicated triage/cache tests above).
+    db_module.get_database_schema({"type": "postgres", "url": "postgresql://u:p@host-a:5432/a"})
+    db_module.get_database_schema({"type": "postgres", "url": "postgresql://u:p@host-b:5432/b"})
+
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
 
     # Turn 1: establishes some history to check ordering against.
     harness.queue_response(_gemini_ok(
-        '{"action": "answer", "answer": "Marketing Postgres has campaign-related data."}'
+        '{"action": "general", "answer": "Marketing Postgres has campaign-related data."}'
     ))
     resp1 = env.client.post('/api/translate', json={'prompt': 'which database has campaign data'})
     _, data1 = parse_translate_stream(resp1)
@@ -935,7 +984,7 @@ def test_all_mode_triage_candidate_summaries_precede_history_and_are_not_glued_t
     # PREPENDED to the first historical content, not appended to the new
     # prompt's own content.
     harness.queue_response(_gemini_ok(
-        '{"action": "route", "indices": [1], "message": "Checking Marketing Postgres."}'
+        '{"action": "sql", "indices": [1], "message": "Checking Marketing Postgres."}'
     ))
     harness.register_marker("campaigns", _gemini_ok("SELECT COUNT(*) FROM campaigns;"))
     resp2 = env.client.post('/api/translate', json={
@@ -961,10 +1010,52 @@ def test_all_mode_triage_candidate_summaries_precede_history_and_are_not_glued_t
     assert "how large is this database" in last_text
 
 
-def test_all_mode_route_outcome_runs_phase_b_in_parallel_for_both_selected_connections(app_factory, tmp_path, monkeypatch):
+def test_group_mode_phase_b_ignores_schema_tables_only_and_always_sends_the_full_schema(
+    app_factory, tmp_path, monkeypatch,
+):
+    # SCHEMA_TABLES_ONLY (see translate_routes.py's get_llm_schema_text)
+    # is scoped ONLY to single-dataset mode's own translate path - dataset-
+    # group mode's Phase B fanout (generate_sql_for_connection, run by
+    # _run_phase_b_fanout) calls get_database_schema() directly and must
+    # keep seeing the full deep schema regardless of this flag, same as
+    # before it existed.
+    env = _two_preset_env(app_factory, tmp_path, extra_env={"SCHEMA_TABLES_ONLY": "true"})
+    login_as(env.client, "alice@example.com")
+    _set_group_mode(env.client)
+    assert env.translate_routes.SCHEMA_TABLES_ONLY is True
+
+    import db as db_module
+    monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
+        "postgresql://u:p@host-a:5432/a": "Table: deals\nid INTEGER\n\nConstraints:\n  none\n",
+        "postgresql://u:p@host-b:5432/b": "Table: campaigns\nid INTEGER\n",
+    }))
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(_gemini_ok(
+        '{"action": "sql", "indices": [0], "message": "Checking Sales Postgres."}'
+    ))
+    harness.register_marker("deals", _gemini_ok("SELECT * FROM deals;"))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'how many deals do we have'})
+    parse_translate_stream(resp)
+
+    # The triage call itself echoes "how many deals do we have" as the
+    # user question, so filtering on "deals" alone would false-match it -
+    # "Database Schema:" only ever prefixes the real per-connection
+    # generation call.
+    generation_call = next(
+        c for c in harness.generate_calls if "Database Schema:" in str(c["contents"])
+    )
+    schema_text = generation_call["contents"][0].parts[0].text
+    assert "Table: deals" in schema_text
+    assert "Constraints:" in schema_text
+
+
+def test_group_mode_route_outcome_runs_phase_b_in_parallel_for_both_selected_connections(app_factory, tmp_path, monkeypatch):
     env = _two_preset_env(app_factory, tmp_path)
     login_as(env.client, "alice@example.com")
-    _set_all_mode(env.client)
+    _set_group_mode(env.client)
 
     import db as db_module
     monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
@@ -975,7 +1066,7 @@ def test_all_mode_route_outcome_runs_phase_b_in_parallel_for_both_selected_conne
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     harness.queue_response(_gemini_ok(
-        '{"action": "route", "indices": [0, 1], "message": "Checking Sales Postgres and Marketing Postgres."}'
+        '{"action": "sql", "indices": [0, 1], "message": "Checking Sales Postgres and Marketing Postgres."}'
     ))
     # Marker-based (not FIFO) dispatch for the two Phase B calls, since
     # they genuinely race across threads - see GenaiHarness' docstring.
@@ -1029,7 +1120,7 @@ def test_all_mode_route_outcome_runs_phase_b_in_parallel_for_both_selected_conne
     ]
 
 
-def test_all_mode_route_outcome_falls_back_to_a_triage_labeled_message_when_the_model_omits_one(
+def test_group_mode_route_outcome_falls_back_to_a_triage_labeled_message_when_the_model_omits_one(
     app_factory, tmp_path, monkeypatch
 ):
     # The model's own "message" field is what normally carries the
@@ -1040,7 +1131,7 @@ def test_all_mode_route_outcome_falls_back_to_a_triage_labeled_message_when_the_
     # consistent regardless of which source the text actually came from.
     env = _two_preset_env(app_factory, tmp_path)
     login_as(env.client, "alice@example.com")
-    _set_all_mode(env.client)
+    _set_group_mode(env.client)
 
     import db as db_module
     monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
@@ -1050,7 +1141,7 @@ def test_all_mode_route_outcome_falls_back_to_a_triage_labeled_message_when_the_
 
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(_gemini_ok('{"action": "route", "indices": [0, 1]}'))
+    harness.queue_response(_gemini_ok('{"action": "sql", "indices": [0, 1]}'))
     harness.register_marker("deals", _gemini_ok("SELECT * FROM deals;"))
     harness.register_marker("campaigns", _gemini_ok("SELECT * FROM campaigns;"))
 
@@ -1061,10 +1152,10 @@ def test_all_mode_route_outcome_falls_back_to_a_triage_labeled_message_when_the_
     assert "Sales Postgres" in data['routing_message'] and "Marketing Postgres" in data['routing_message']
 
 
-def test_all_mode_route_outcome_with_one_database_returning_no_sql_note(app_factory, tmp_path, monkeypatch):
+def test_group_mode_route_outcome_with_one_database_returning_no_sql_note(app_factory, tmp_path, monkeypatch):
     env = _two_preset_env(app_factory, tmp_path)
     login_as(env.client, "alice@example.com")
-    _set_all_mode(env.client)
+    _set_group_mode(env.client)
 
     import db as db_module
     monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
@@ -1074,7 +1165,7 @@ def test_all_mode_route_outcome_with_one_database_returning_no_sql_note(app_fact
 
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(_gemini_ok('{"action": "route", "indices": [0, 1], "message": "Checking both."}'))
+    harness.queue_response(_gemini_ok('{"action": "sql", "indices": [0, 1], "message": "Checking both."}'))
     harness.register_marker("deals", _gemini_ok("SELECT * FROM deals;"))
     harness.register_marker("campaigns", _gemini_ok("*** NO SQL *** Campaigns data doesn't cover this question."))
 
@@ -1102,10 +1193,10 @@ def test_all_mode_route_outcome_with_one_database_returning_no_sql_note(app_fact
     assert data['generation_failures'] == []
 
 
-def test_all_mode_route_outcome_with_one_database_generation_failure_still_returns_the_other(app_factory, tmp_path, monkeypatch):
+def test_group_mode_route_outcome_with_one_database_generation_failure_still_returns_the_other(app_factory, tmp_path, monkeypatch):
     env = _two_preset_env(app_factory, tmp_path)
     login_as(env.client, "alice@example.com")
-    _set_all_mode(env.client)
+    _set_group_mode(env.client)
 
     import db as db_module
     monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
@@ -1115,7 +1206,7 @@ def test_all_mode_route_outcome_with_one_database_generation_failure_still_retur
 
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(_gemini_ok('{"action": "route", "indices": [0, 1], "message": "Checking both."}'))
+    harness.queue_response(_gemini_ok('{"action": "sql", "indices": [0, 1], "message": "Checking both."}'))
     harness.register_marker("deals", _gemini_ok("SELECT * FROM deals;"))
     # A plain RuntimeError has no .code/isn't a genai ServerError/timeout,
     # so _classify_gemini_error treats it as non-retryable - raised
@@ -1143,12 +1234,11 @@ def test_all_mode_route_outcome_with_one_database_generation_failure_still_retur
 
     # Each Phase B connection now gets its OWN dedicated translations-table
     # row regardless of outcome - including this one's failed connection,
-    # which used to get no row logged at all. Row 0 is Phase A's triage
-    # row (unaffected by this test), rows 1/2 are pg-a's (sql) and pg-b's
-    # (failed) own Phase B rows.
+    # which used to get no row logged at all. Phase A (triage) is never
+    # recorded at all now - only calls that generate real SQL are.
     rows = _translation_rows(env)
-    assert len(rows) == 3
-    _triage_row, pg_a_row, pg_b_row = rows
+    assert len(rows) == 2
+    pg_a_row, pg_b_row = rows
     assert pg_a_row['database_type'] == 'postgres'
     assert pg_a_row['database_name'] == 'Sales Postgres'
     assert pg_a_row['sql_command'] == "-- database: preset:pg-a (Sales Postgres)\nSELECT * FROM deals;"
@@ -1168,10 +1258,10 @@ def test_all_mode_route_outcome_with_one_database_generation_failure_still_retur
     assert pg_b_row['duration'] >= 0
 
 
-def test_all_mode_route_outcome_all_databases_fail_or_note_returns_empty_sql_but_success_true(app_factory, tmp_path, monkeypatch):
+def test_group_mode_route_outcome_all_databases_fail_or_note_returns_empty_sql_but_success_true(app_factory, tmp_path, monkeypatch):
     env = _two_preset_env(app_factory, tmp_path)
     login_as(env.client, "alice@example.com")
-    _set_all_mode(env.client)
+    _set_group_mode(env.client)
 
     import db as db_module
     monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
@@ -1181,7 +1271,7 @@ def test_all_mode_route_outcome_all_databases_fail_or_note_returns_empty_sql_but
 
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(_gemini_ok('{"action": "route", "indices": [0, 1], "message": "Checking both."}'))
+    harness.queue_response(_gemini_ok('{"action": "sql", "indices": [0, 1], "message": "Checking both."}'))
     harness.register_marker("deals", _gemini_ok("*** NO SQL *** Deals table has nothing relevant."))
     harness.register_marker("campaigns", RuntimeError("simulated failure"))
 
@@ -1212,16 +1302,17 @@ def test_all_mode_route_outcome_all_databases_fail_or_note_returns_empty_sql_but
     # producing real SQL - a "note" outcome logs with the same
     # "*** NO SQL ***" convention every other non-SQL reply in this table
     # uses, and the failed one logs TRANSLATION_ERROR(...), same as above.
+    # Phase A (triage) is never recorded at all now.
     rows = _translation_rows(env)
-    assert len(rows) == 3
-    _triage_row, pg_a_row, pg_b_row = rows
+    assert len(rows) == 2
+    pg_a_row, pg_b_row = rows
     assert pg_a_row['database_name'] == 'Sales Postgres'
     assert pg_a_row['sql_command'] == '*** NO SQL *** Deals table has nothing relevant.'
     assert pg_b_row['database_name'] == 'Marketing Postgres'
     assert pg_b_row['sql_command'] == f"TRANSLATION_ERROR ({failure['error']})"
 
 
-def test_all_mode_emits_phase_status_lines_for_schema_collection_and_routing_before_any_outcome(
+def test_group_mode_emits_phase_status_lines_for_schema_collection_and_routing_before_any_outcome(
     app_factory, tmp_path, monkeypatch,
 ):
     """Regression guard for the bug this fixes: before these two lines
@@ -1236,11 +1327,11 @@ def test_all_mode_emits_phase_status_lines_for_schema_collection_and_routing_bef
     to mask the gap."""
     env = _two_preset_env(app_factory, tmp_path)
     login_as(env.client, "alice@example.com")
-    _set_all_mode(env.client)
+    _set_group_mode(env.client)
 
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(_gemini_ok('{"action": "answer", "answer": "You have 2 databases configured."}'))
+    harness.queue_response(_gemini_ok('{"action": "general", "answer": "You have 2 databases configured."}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'how many databases do I have'})
     events = parse_translate_stream_events(resp)
@@ -1254,7 +1345,7 @@ def test_all_mode_emits_phase_status_lines_for_schema_collection_and_routing_bef
     assert events[-1]['sql'] == '*** NO SQL *** You have 2 databases configured.'
 
 
-def test_all_mode_route_outcome_streams_phase_a_route_then_phase_b_connection_done_before_terminal_done(
+def test_group_mode_route_outcome_streams_phase_a_route_then_phase_b_connection_done_before_terminal_done(
     app_factory, tmp_path, monkeypatch,
 ):
     # Progressive-rendering support (see translate_routes.py's
@@ -1267,7 +1358,7 @@ def test_all_mode_route_outcome_streams_phase_a_route_then_phase_b_connection_do
     # "done" line last, unchanged in shape.
     env = _two_preset_env(app_factory, tmp_path)
     login_as(env.client, "alice@example.com")
-    _set_all_mode(env.client)
+    _set_group_mode(env.client)
 
     import db as db_module
     monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
@@ -1278,7 +1369,7 @@ def test_all_mode_route_outcome_streams_phase_a_route_then_phase_b_connection_do
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     harness.queue_response(_gemini_ok(
-        '{"action": "route", "indices": [0, 1], "message": "Checking both."}'
+        '{"action": "sql", "indices": [0, 1], "message": "Checking both."}'
     ))
     harness.register_marker("deals", _gemini_ok("SELECT * FROM deals;"))
     harness.register_marker("campaigns", _gemini_ok("*** NO SQL *** Campaigns data doesn't cover this question."))
@@ -1330,7 +1421,7 @@ def test_all_mode_route_outcome_streams_phase_a_route_then_phase_b_connection_do
         assert events.index(e) < len(events) - 1
 
 
-def test_all_mode_route_outcome_streams_phase_b_connection_done_in_completion_order_not_original_order(
+def test_group_mode_route_outcome_streams_phase_b_connection_done_in_completion_order_not_original_order(
     app_factory, tmp_path, monkeypatch,
 ):
     # The whole point of turning _run_phase_b_fanout into a generator:
@@ -1343,7 +1434,7 @@ def test_all_mode_route_outcome_streams_phase_b_connection_done_in_completion_or
     # route-outcome tests above).
     env = _two_preset_env(app_factory, tmp_path)
     login_as(env.client, "alice@example.com")
-    _set_all_mode(env.client)
+    _set_group_mode(env.client)
 
     import db as db_module
     monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
@@ -1354,7 +1445,7 @@ def test_all_mode_route_outcome_streams_phase_b_connection_done_in_completion_or
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     harness.queue_response(_gemini_ok(
-        '{"action": "route", "indices": [0, 1], "message": "Checking both."}'
+        '{"action": "sql", "indices": [0, 1], "message": "Checking both."}'
     ))
 
     def _slow_deals_response():
@@ -1398,10 +1489,10 @@ def test_classify_generation_outcome_covers_sql_note_empty_and_failed_shapes(app
     assert classify(entry, ("failed", "boom", 42)) == {"outcome": "failed", "error": "boom"}
 
 
-def test_all_mode_failed_outcome_returns_fixed_apology_text_not_candidate_zero_fallback(app_factory, tmp_path, monkeypatch):
+def test_group_mode_failed_outcome_returns_fixed_apology_text_not_candidate_zero_fallback(app_factory, tmp_path, monkeypatch):
     env = _two_preset_env(app_factory, tmp_path)
     login_as(env.client, "alice@example.com")
-    _set_all_mode(env.client)
+    _set_group_mode(env.client)
 
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
@@ -1421,7 +1512,7 @@ def test_all_mode_failed_outcome_returns_fixed_apology_text_not_candidate_zero_f
     assert 'connection_selection' not in data
 
 
-def test_all_mode_resource_exhausted_triage_shows_honest_message_not_generic_apology(
+def test_group_mode_resource_exhausted_triage_shows_honest_message_not_generic_apology(
     app_factory, tmp_path, monkeypatch,
 ):
     """End-to-end regression guard for the actual bug report this fixes:
@@ -1434,7 +1525,7 @@ def test_all_mode_resource_exhausted_triage_shows_honest_message_not_generic_apo
     keep getting that exact text)."""
     env = _two_preset_env(app_factory, tmp_path)  # GEMINI_PRESET_KEYS: one key
     login_as(env.client, "alice@example.com")
-    _set_all_mode(env.client)
+    _set_group_mode(env.client)
 
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
@@ -1455,7 +1546,7 @@ def test_all_mode_resource_exhausted_triage_shows_honest_message_not_generic_apo
     assert 'connection_selection' not in data
 
 
-def test_all_mode_triage_recovers_by_rotating_to_a_second_configured_gemini_key(
+def test_group_mode_triage_recovers_by_rotating_to_a_second_configured_gemini_key(
     app_factory, tmp_path, monkeypatch,
 ):
     """The other half of the fix: with a SECOND configured key actually
@@ -1477,12 +1568,12 @@ def test_all_mode_triage_recovers_by_rotating_to_a_second_configured_gemini_key(
         "GEMINI_PRESET_KEYS": "fake-key-1,fake-key-2",
     })
     login_as(env.client, "alice@example.com")
-    _set_all_mode(env.client)
+    _set_group_mode(env.client)
 
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     harness.queue_error(FakeApiError(429))
-    harness.queue_response(_gemini_ok('{"action": "answer", "answer": "There are 2 databases configured."}'))
+    harness.queue_response(_gemini_ok('{"action": "general", "answer": "There are 2 databases configured."}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'how many databases do I have'})
     retry_events, data = parse_translate_stream(resp)
@@ -1501,7 +1592,7 @@ def test_all_mode_triage_recovers_by_rotating_to_a_second_configured_gemini_key(
     assert retry_events[0]["delaySeconds"] == 0
 
 
-def test_all_mode_phase_b_generation_recovers_by_rotating_to_a_second_configured_gemini_key(
+def test_group_mode_phase_b_generation_recovers_by_rotating_to_a_second_configured_gemini_key(
     app_factory, tmp_path, monkeypatch,
 ):
     """Regression guard for a real bug: _run_phase_b_fanout's per-connection
@@ -1519,12 +1610,13 @@ def test_all_mode_phase_b_generation_recovers_by_rotating_to_a_second_configured
     Phase B's two attempts)."""
     presets_path = write_database_presets_file(tmp_path, [
         {"id": "pg-a", "name": "Sales Postgres", "type": "postgres", "url": "postgresql://u:p@host-a:5432/a"},
+        {"id": "grp-a", "name": "Solo Group", "type": "dataset_group", "dataset_list": ["pg-a"]},
     ])
     env = app_factory(env={
         "DATABASE_PRESETS_FILE": presets_path, "GEMINI_PRESET_KEYS": "fake-key-1,fake-key-2",
     })
     login_as(env.client, "alice@example.com")
-    _set_all_mode(env.client)
+    _set_group_mode(env.client, "grp-a")
 
     import db as db_module
     monkeypatch.setattr(db_module, "_fetch_database_schema",
@@ -1532,7 +1624,7 @@ def test_all_mode_phase_b_generation_recovers_by_rotating_to_a_second_configured
 
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(_gemini_ok('{"action": "route", "indices": [0], "message": "Checking Sales Postgres."}'))
+    harness.queue_response(_gemini_ok('{"action": "sql", "indices": [0], "message": "Checking Sales Postgres."}'))
     harness.queue_error(FakeApiError(429))  # Phase B's first attempt
     harness.queue_response(_gemini_ok("SELECT * FROM deals;"))  # Phase B's rotated retry
 
@@ -1549,7 +1641,7 @@ def test_all_mode_phase_b_generation_recovers_by_rotating_to_a_second_configured
     assert "-- database: preset:pg-a (Sales Postgres)\nSELECT * FROM deals;" in data['sql']
 
 
-def test_all_mode_route_outcome_uses_byok_key_for_both_triage_and_phase_b(app_factory, tmp_path, monkeypatch):
+def test_group_mode_route_outcome_uses_byok_key_for_both_triage_and_phase_b(app_factory, tmp_path, monkeypatch):
     """A saved "Bring Your Own Key" (see state_store.py's get_llm_byok_key)
     is resolved ONCE in translate_query() and reused everywhere this
     request calls the LLM - the triage call AND every Phase B per-
@@ -1558,10 +1650,11 @@ def test_all_mode_route_outcome_uses_byok_key_for_both_triage_and_phase_b(app_fa
     app's own env-configured key, even though one is configured here too."""
     presets_path = write_database_presets_file(tmp_path, [
         {"id": "pg-a", "name": "Sales Postgres", "type": "postgres", "url": "postgresql://u:p@host-a:5432/a"},
+        {"id": "grp-a", "name": "Solo Group", "type": "dataset_group", "dataset_list": ["pg-a"]},
     ])
     env = app_factory(env={"DATABASE_PRESETS_FILE": presets_path, "GEMINI_PRESET_KEYS": "env-key-1"})
     login_as(env.client, "alice@example.com")
-    _set_all_mode(env.client)
+    _set_group_mode(env.client, "grp-a")
     set_llm_byok_key(env, "google", "alices-own-key", user_identity="alice@example.com")
 
     import db as db_module
@@ -1570,7 +1663,7 @@ def test_all_mode_route_outcome_uses_byok_key_for_both_triage_and_phase_b(app_fa
 
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(_gemini_ok('{"action": "route", "indices": [0], "message": "Checking Sales Postgres."}'))
+    harness.queue_response(_gemini_ok('{"action": "sql", "indices": [0], "message": "Checking Sales Postgres."}'))
     harness.queue_response(_gemini_ok("SELECT * FROM deals;"))
 
     resp = env.client.post('/api/translate', json={'prompt': 'how many deals do we have'})
@@ -1580,20 +1673,21 @@ def test_all_mode_route_outcome_uses_byok_key_for_both_triage_and_phase_b(app_fa
     assert harness.client_api_keys == ["alices-own-key", "alices-own-key"]
 
 
-def test_all_mode_with_only_one_configured_connection_still_runs_triage_and_can_route(app_factory, tmp_path, monkeypatch):
+def test_group_mode_with_only_one_configured_connection_still_runs_triage_and_can_route(app_factory, tmp_path, monkeypatch):
     # Regression guard for the REMOVED "skip the LLM call entirely when
     # only 1 connection is configured" special case: correct under the old
     # Phase-A-only stub (nothing to route between), but wrong now - even
     # with one configured connection, triage still decides "answer
     # directly" vs. "actually go query this database," so skipping it
-    # would mean a single-connection "all" session could never get real
+    # would mean a single-dataset group session could never get real
     # SQL at all.
     presets_path = write_database_presets_file(tmp_path, [
         {"id": "pg-a", "name": "Sales Postgres", "type": "postgres", "url": "postgresql://u:p@host-a:5432/a"},
+        {"id": "grp-a", "name": "Solo Group", "type": "dataset_group", "dataset_list": ["pg-a"]},
     ])
     env = app_factory(env={"DATABASE_PRESETS_FILE": presets_path, "GEMINI_PRESET_KEYS": "fake-key-1"})
     login_as(env.client, "alice@example.com")
-    _set_all_mode(env.client)
+    _set_group_mode(env.client, "grp-a")
 
     import db as db_module
     monkeypatch.setattr(db_module, "_fetch_database_schema",
@@ -1601,7 +1695,7 @@ def test_all_mode_with_only_one_configured_connection_still_runs_triage_and_can_
 
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(_gemini_ok('{"action": "route", "indices": [0], "message": "Checking Sales Postgres."}'))
+    harness.queue_response(_gemini_ok('{"action": "sql", "indices": [0], "message": "Checking Sales Postgres."}'))
     harness.register_marker("deals", _gemini_ok("SELECT * FROM deals;"))
 
     resp = env.client.post('/api/translate', json={'prompt': 'how many deals do we have'})
@@ -1616,23 +1710,27 @@ def test_all_mode_with_only_one_configured_connection_still_runs_triage_and_can_
     ]
 
 
-def test_all_mode_dynamically_includes_a_newly_added_preset(app_factory, tmp_path, monkeypatch):
-    # The whole point of "All Pre-Configured Datasets" over a frozen, save-time-
-    # computed list: a PRESET added AFTER the session already has
-    # in_scope_mode "all" must be included on the very next request, with
-    # no re-save of scope at all - db.py's _resolve_all_configured_
-    # descriptors reads CONFIGURED_DBS fresh on every call. (This used to
-    # also be true of a user's own newly-saved custom connections, back
-    # when this feature was named/framed as "All Databases" - see
-    # test_all_mode_never_includes_a_newly_saved_custom_connection below
-    # for the deliberate behavior change: presets only, now and dynamically
-    # so, customs never.)
+def test_group_mode_dynamically_reflects_a_dataset_list_update(app_factory, tmp_path, monkeypatch):
+    # A dataset group's candidate pool is resolved fresh on every request
+    # (see db.py's _resolve_group_configured_descriptors) - an admin
+    # editing an already-selected group's own "dataset_list" (in
+    # DATABASE_PRESETS_FILE) must be reflected on the very next request,
+    # with no re-save of the session's in_scope_group_id at all. Unlike
+    # the removed "all mode" this replaces, a brand-new PRESET added
+    # elsewhere in the file is NEVER automatically in scope just by
+    # existing - it only joins a group's candidate pool once some group's
+    # own "dataset_list" is updated to actually list it (see
+    # test_group_mode_never_includes_a_newly_saved_custom_connection below
+    # for the sibling guarantee: a custom connection can never join one at
+    # all, dataset_list update or not).
     presets_path = write_database_presets_file(tmp_path, [
         {"id": "pg-a", "name": "Sales Postgres", "type": "postgres", "url": "postgresql://u:p@host-a:5432/a"},
+        {"id": "pg-c", "name": "Ops Postgres", "type": "postgres", "url": "postgresql://u:p@host-c:5432/c"},
+        {"id": "grp-a", "name": "Solo Group", "type": "dataset_group", "dataset_list": ["pg-a"]},
     ])
     env = app_factory(env={"DATABASE_PRESETS_FILE": presets_path, "GEMINI_PRESET_KEYS": "fake-key-1"})
     login_as(env.client, "alice@example.com")
-    _set_all_mode(env.client)
+    _set_group_mode(env.client, "grp-a")
 
     import db as db_module
     monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
@@ -1642,7 +1740,7 @@ def test_all_mode_dynamically_includes_a_newly_added_preset(app_factory, tmp_pat
 
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(_gemini_ok('{"action": "answer", "answer": "You have 1 database configured."}'))
+    harness.queue_response(_gemini_ok('{"action": "general", "answer": "You have 1 database configured."}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'show me stuff'})
     _, data = parse_translate_stream(resp)
@@ -1650,16 +1748,15 @@ def test_all_mode_dynamically_includes_a_newly_added_preset(app_factory, tmp_pat
     assert 'connection_selection' not in data
     assert data['sql'] == '*** NO SQL *** You have 1 database configured.'
 
-    # An admin adds a second PRESET - simulated, per this codebase's
-    # established pattern (see test_config_missing_connection.py), by
-    # mutating the live CONFIGURED_DBS list in place, which db.py's own
-    # bound reference to that same list object picks up without any
-    # re-import or app restart.
-    env.config_routes.CONFIGURED_DBS.append(
-        {"id": "pg-c", "name": "Ops Postgres", "type": "postgres", "url": "postgresql://u:p@host-c:5432/c"},
-    )
+    # An admin edits this group's own dataset_list to add the second
+    # preset - simulated, per this codebase's established pattern (see
+    # test_config_missing_connection.py), by mutating the live
+    # CONFIGURED_DB_GROUPS list in place, which db.py's own bound
+    # reference to that same list object picks up without any re-import or
+    # app restart.
+    next(g for g in env.config_routes.CONFIGURED_DB_GROUPS if g["id"] == "grp-a")["dataset_list"].append("pg-c")
 
-    harness.queue_response(_gemini_ok('{"action": "route", "indices": [1], "message": "Checking Ops Postgres."}'))
+    harness.queue_response(_gemini_ok('{"action": "sql", "indices": [1], "message": "Checking Ops Postgres."}'))
     harness.register_marker("campaigns", _gemini_ok("SELECT * FROM campaigns;"))
     resp3 = env.client.post('/api/translate', json={'prompt': 'ops figures please'})
     _, data3 = parse_translate_stream(resp3)
@@ -1669,11 +1766,12 @@ def test_all_mode_dynamically_includes_a_newly_added_preset(app_factory, tmp_pat
     assert "SELECT * FROM campaigns;" in data3['sql']
 
 
-def test_all_mode_never_includes_a_newly_saved_custom_connection(app_factory, tmp_path, monkeypatch):
-    # Requirement: "All Pre-Configured Datasets" mode only ever considers presets
-    # as candidates - a user's own custom connections must never be
-    # offered to the triage LLM at all, dynamically-added or not (see
-    # db.py's _resolve_all_configured_descriptors docstring for the full
+def test_group_mode_never_includes_a_newly_saved_custom_connection(app_factory, tmp_path, monkeypatch):
+    # Requirement: a dataset group's "dataset_list" can only ever name
+    # other PRESETS in this same presets file - a user's own custom
+    # connections must never be offered to the triage LLM at all, saved
+    # before or after the group was selected (see db.py's
+    # _resolve_group_configured_descriptors docstring for the full
     # reasoning: a personal/ad hoc custom connection silently joining a
     # broad "ask across everything" question is exactly the surprise this
     # is meant to prevent). Proven directly and robustly by inspecting the
@@ -1684,10 +1782,11 @@ def test_all_mode_never_includes_a_newly_saved_custom_connection(app_factory, tm
     # silently drop, proving nothing about whether it was ever a candidate.
     presets_path = write_database_presets_file(tmp_path, [
         {"id": "pg-a", "name": "Sales Postgres", "type": "postgres", "url": "postgresql://u:p@host-a:5432/a"},
+        {"id": "grp-a", "name": "Solo Group", "type": "dataset_group", "dataset_list": ["pg-a"]},
     ])
     env = app_factory(env={"DATABASE_PRESETS_FILE": presets_path, "GEMINI_PRESET_KEYS": "fake-key-1"})
     login_as(env.client, "alice@example.com")
-    _set_all_mode(env.client)
+    _set_group_mode(env.client, "grp-a")
 
     import db as db_module
     monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
@@ -1706,7 +1805,7 @@ def test_all_mode_never_includes_a_newly_saved_custom_connection(app_factory, tm
 
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(_gemini_ok('{"action": "route", "indices": [0], "message": "Checking Sales Postgres."}'))
+    harness.queue_response(_gemini_ok('{"action": "sql", "indices": [0], "message": "Checking Sales Postgres."}'))
     harness.register_marker("deals", _gemini_ok("SELECT * FROM deals;"))
 
     resp3 = env.client.post('/api/translate', json={'prompt': 'sales figures please'})
@@ -1728,26 +1827,24 @@ def test_all_mode_never_includes_a_newly_saved_custom_connection(app_factory, tm
     assert "Marketing Postgres" not in triage_prompt_text
 
 
-def test_all_mode_excludes_a_preset_marked_include_in_all_mode_false(app_factory, tmp_path, monkeypatch):
-    # Requirement: an admin can opt a specific PRESET out of "All
-    # Pre-Configured Datasets" mode via "include_in_all_mode": false in
-    # DATABASE_PRESETS_FILE (see app_config.py's own comment on this field
-    # and db.py's _resolve_all_configured_descriptors) - it was previously
-    # hardcoded to always include every configured preset with no way to
-    # exclude one. Proven the same robust way
-    # test_all_mode_never_includes_a_newly_saved_custom_connection proves
-    # its own exclusion above: by inspecting the actual triage prompt sent
-    # to the (mocked) LLM, not by an indirect mechanism.
+def test_group_mode_excludes_a_configured_preset_not_listed_in_the_groups_dataset_list(app_factory, tmp_path, monkeypatch):
+    # Requirement: a dataset group only ever offers triage the presets its
+    # OWN "dataset_list" explicitly names (see app_config.py's "DATASET
+    # GROUPS" comment and db.py's _resolve_group_configured_descriptors) -
+    # a preset that's perfectly valid and individually selectable
+    # elsewhere, but simply never listed in this particular group, must
+    # never reach the triage LLM as a candidate. Proven the same robust
+    # way test_group_mode_never_includes_a_newly_saved_custom_connection
+    # proves its own exclusion above: by inspecting the actual triage
+    # prompt sent to the (mocked) LLM, not by an indirect mechanism.
     presets_path = write_database_presets_file(tmp_path, [
         {"id": "pg-a", "name": "Sales Postgres", "type": "postgres", "url": "postgresql://u:p@host-a:5432/a"},
-        {
-            "id": "pg-b", "name": "Quarantined Postgres", "type": "postgres",
-            "url": "postgresql://u:p@host-b:5432/b", "include_in_all_mode": False,
-        },
+        {"id": "pg-b", "name": "Quarantined Postgres", "type": "postgres", "url": "postgresql://u:p@host-b:5432/b"},
+        {"id": "grp-a", "name": "Solo Group", "type": "dataset_group", "dataset_list": ["pg-a"]},
     ])
     env = app_factory(env={"DATABASE_PRESETS_FILE": presets_path, "GEMINI_PRESET_KEYS": "fake-key-1"})
     login_as(env.client, "alice@example.com")
-    _set_all_mode(env.client)
+    _set_group_mode(env.client, "grp-a")
 
     import db as db_module
     monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
@@ -1756,7 +1853,7 @@ def test_all_mode_excludes_a_preset_marked_include_in_all_mode_false(app_factory
 
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(_gemini_ok('{"action": "route", "indices": [0], "message": "Checking Sales Postgres."}'))
+    harness.queue_response(_gemini_ok('{"action": "sql", "indices": [0], "message": "Checking Sales Postgres."}'))
     harness.register_marker("deals", _gemini_ok("SELECT * FROM deals;"))
 
     resp = env.client.post('/api/translate', json={'prompt': 'sales figures please'})
@@ -1764,9 +1861,10 @@ def test_all_mode_excludes_a_preset_marked_include_in_all_mode_false(app_factory
     assert data['success'] is True
     assert data['router_route'] is True
     assert "-- database: preset:pg-a (Sales Postgres)" in data['sql']
-    # Exactly one candidate was ever offered to triage - the eligible
-    # preset - never the one marked include_in_all_mode: false, even though
-    # it's a perfectly normal, individually-selectable preset otherwise.
+    # Exactly one candidate was ever offered to triage - the group's sole
+    # member - never the other configured preset, even though it's a
+    # perfectly normal, individually-selectable preset otherwise, simply
+    # because this group's own dataset_list never named it.
     assert data['connection_selection'] == [
         {"kind": "preset", "id": "pg-a", "name": "Sales Postgres", "type": "postgres",
          "prompt": "sales figures please"},
@@ -1778,20 +1876,31 @@ def test_all_mode_excludes_a_preset_marked_include_in_all_mode_false(app_factory
     assert "Quarantined Postgres" not in triage_prompt_text
 
 
-def test_all_mode_fetches_schema_for_every_candidate_regardless_of_cache_state(app_factory, tmp_path, monkeypatch):
-    # Triage's candidate summaries must reflect a live schema fetch for
-    # EVERY in-scope connection, not just whichever happens to already be
-    # sitting in schema_cache - e.g. right after a server restart, when the
-    # cache is empty for every connection. build_router_candidate_summaries
-    # calls the ordinary, cache-aware get_database_schema() per connection
-    # (db.py), which itself always fetches fresh on a cache miss - this test
-    # proves that live fetch actually happens for BOTH candidates (a fresh
-    # app_factory instance starts with a genuinely empty schema_cache, same
-    # as a real restart), and that both candidates' real table names reach
-    # the triage prompt - not just the one it ends up selecting.
+def test_group_mode_triage_never_fetches_live_and_only_uses_already_cached_deep_schemas(
+        app_factory, tmp_path, monkeypatch):
+    # build_router_candidate_summaries() (db.py) must NEVER connect to or
+    # query a real database - it reads ONLY whatever deep schema entry is
+    # already sitting in schema_cache for each in-scope connection, in
+    # memory, and degrades to an empty table-names list for a connection
+    # with nothing cached yet (as both start out here - a fresh
+    # app_factory instance has a genuinely empty schema_cache, same as a
+    # real restart) rather than ever falling back to a live fetch. This
+    # replaces an older version of this test that asserted the opposite
+    # (that triage WOULD live-fetch every candidate on a cold cache) - that
+    # was the old, deliberately-changed behavior; see db.py's
+    # build_router_candidate_summaries()/prime_schema_cache_with_reason()
+    # docstrings for the current design and why an independent "shallow"
+    # fetch/cache was removed entirely (it was pure waste: the deep text
+    # was always a superset of it already).
+    #
+    # Phase B's own later per-connection call (for whichever connection
+    # triage ends up picking) still goes through the ordinary, cache-aware
+    # get_database_schema() path exactly as before - this test also
+    # confirms THAT still happens, so the end-to-end request still
+    # succeeds with a real schema for the selected connection.
     env = _two_preset_env(app_factory, tmp_path)
     login_as(env.client, "alice@example.com")
-    _set_all_mode(env.client)
+    _set_group_mode(env.client)
 
     # Imported only AFTER app_factory/fresh_import has run - it drops "db"
     # from sys.modules and re-imports it fresh per test (see helpers.py's
@@ -1811,25 +1920,32 @@ def test_all_mode_fetches_schema_for_every_candidate_regardless_of_cache_state(a
 
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(_gemini_ok('{"action": "route", "indices": [0], "message": "Deals question."}'))
+    harness.queue_response(_gemini_ok('{"action": "sql", "indices": [0], "message": "Routing question."}'))
     harness.register_marker("deals", _gemini_ok("SELECT * FROM deals;"))
 
-    resp = env.client.post('/api/translate', json={'prompt': 'how many deals do we have'})
+    # Deliberately avoids the words "deals"/"campaigns" in the user's own
+    # prompt text, so the later assertion that neither table name reached
+    # the triage prompt can't be trivially "satisfied" by the prompt simply
+    # echoing the user's own words back.
+    resp = env.client.post('/api/translate', json={'prompt': 'general business question'})
     _, data = parse_translate_stream(resp)
     assert data['success'] is True
 
-    # Both connections' schemas were actually fetched live during triage's
-    # candidate-summary build - neither was pre-cached, neither skipped.
-    assert set(fetched_urls) == {"postgresql://u:p@host-a:5432/a", "postgresql://u:p@host-b:5432/b"}
+    # Exactly one live fetch happened for the whole request: Phase B's own
+    # normal deep fetch for the single connection triage selected. Neither
+    # connection was fetched live during triage's own candidate-summary
+    # build - there was nothing cached for either one yet at that point.
+    assert fetched_urls == ["postgresql://u:p@host-a:5432/a"]
 
-    # And both candidates' real table names reached the triage prompt -
-    # not just the one it happened to select.
+    # And triage's own prompt reflects that: with nothing cached at triage
+    # time, neither candidate's real table names could have reached it -
+    # both degraded to an empty table list for that one pass.
     triage_prompt_text = str(harness.generate_calls[0]["contents"])
-    assert "deals" in triage_prompt_text
-    assert "campaigns" in triage_prompt_text
+    assert "deals" not in triage_prompt_text
+    assert "campaigns" not in triage_prompt_text
 
 
-def test_all_mode_route_phase_b_ignores_the_shared_history_and_uses_full_schema_per_connection(
+def test_group_mode_route_phase_b_ignores_the_shared_history_and_uses_full_schema_per_connection(
         app_factory, tmp_path, monkeypatch):
     # The top-level `history` field is triage's own conversation thread
     # (see stream_translation()'s own comment on this) - Phase B's
@@ -1841,7 +1957,7 @@ def test_all_mode_route_phase_b_ignores_the_shared_history_and_uses_full_schema_
     # leak of the shared field.
     env = _two_preset_env(app_factory, tmp_path)
     login_as(env.client, "alice@example.com")
-    _set_all_mode(env.client)
+    _set_group_mode(env.client)
 
     import db as db_module
     monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
@@ -1851,7 +1967,7 @@ def test_all_mode_route_phase_b_ignores_the_shared_history_and_uses_full_schema_
 
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(_gemini_ok('{"action": "route", "indices": [0], "message": "Checking Sales Postgres."}'))
+    harness.queue_response(_gemini_ok('{"action": "sql", "indices": [0], "message": "Checking Sales Postgres."}'))
     harness.register_marker("deals", _gemini_ok("SELECT * FROM deals;"))
 
     resp = env.client.post('/api/translate', json={
@@ -1871,17 +1987,19 @@ def test_all_mode_route_phase_b_ignores_the_shared_history_and_uses_full_schema_
     assert "some earlier unrelated turn" not in phase_b_contents
 
 
-def test_all_mode_route_phase_b_uses_that_connections_own_history_from_connection_histories(
+def test_group_mode_route_phase_b_uses_that_connections_own_history_from_connection_histories(
         app_factory, tmp_path, monkeypatch):
-    # Chunk 5 of "splitting SQL/summary per in-scope database" (see
-    # client.js's captureAllModeHistory()/fanOutAllModeHistoryPerDatabase()/
-    # buildInScopeConnectionHistories() docstrings for the earlier chunks):
-    # a connection's own merged history - keyed by client.js's
-    # connectionBucketKey() scheme, "preset:<id>"/"custom:<key>" - now DOES
-    # reach that same connection's own Phase B SQL-generation call.
+    # See client.js's buildInScopeConnectionHistories() docstring: a
+    # connection's own history from turns asked of it directly - keyed by
+    # client.js's connectionBucketKey() scheme, "preset:<id>"/"custom:<key>"
+    # - reaches that same connection's own Phase B SQL-generation call via
+    # the request's connection_histories field. This test exercises the
+    # server side of that plumbing directly (by sending the payload a real
+    # client would build), independent of how the client itself decides
+    # what belongs in it.
     env = _two_preset_env(app_factory, tmp_path)
     login_as(env.client, "alice@example.com")
-    _set_all_mode(env.client)
+    _set_group_mode(env.client)
 
     import db as db_module
     monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
@@ -1891,7 +2009,7 @@ def test_all_mode_route_phase_b_uses_that_connections_own_history_from_connectio
 
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(_gemini_ok('{"action": "route", "indices": [0], "message": "Checking Sales Postgres."}'))
+    harness.queue_response(_gemini_ok('{"action": "sql", "indices": [0], "message": "Checking Sales Postgres."}'))
     harness.register_marker("deals", _gemini_ok("SELECT * FROM deals;"))
 
     resp = env.client.post('/api/translate', json={
@@ -1910,7 +2028,7 @@ def test_all_mode_route_phase_b_uses_that_connections_own_history_from_connectio
     assert "how many deals last month" in phase_b_contents
 
 
-def test_all_mode_route_phase_b_each_connection_gets_only_its_own_connection_history(
+def test_group_mode_route_phase_b_each_connection_gets_only_its_own_connection_history(
         app_factory, tmp_path, monkeypatch):
     # Two connections selected at once, each with a DIFFERENT
     # connection_histories entry - proves the lookup is keyed per
@@ -1918,7 +2036,7 @@ def test_all_mode_route_phase_b_each_connection_gets_only_its_own_connection_his
     # connection or every history concatenated together.
     env = _two_preset_env(app_factory, tmp_path)
     login_as(env.client, "alice@example.com")
-    _set_all_mode(env.client)
+    _set_group_mode(env.client)
 
     import db as db_module
     monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
@@ -1929,7 +2047,7 @@ def test_all_mode_route_phase_b_each_connection_gets_only_its_own_connection_his
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     harness.queue_response(_gemini_ok(
-        '{"action": "route", "indices": [0, 1], "message": "Checking both."}'
+        '{"action": "sql", "indices": [0, 1], "message": "Checking both."}'
     ))
     # Marked by each connection's own SCHEMA heading, not by the prompt -
     # triage supplies no per-connection "database_prompts" rewrite here
@@ -1977,7 +2095,7 @@ def test_all_mode_route_phase_b_each_connection_gets_only_its_own_connection_his
     assert "sales-only past turn" not in campaigns_text
 
 
-def test_all_mode_route_phase_b_falls_back_to_empty_history_when_connection_histories_omits_this_connection(
+def test_group_mode_route_phase_b_falls_back_to_empty_history_when_connection_histories_omits_this_connection(
         app_factory, tmp_path, monkeypatch):
     # connection_histories is present (not the old-client-never-sent-it
     # case above) but simply has no entry for the one connection actually
@@ -1985,7 +2103,7 @@ def test_all_mode_route_phase_b_falls_back_to_empty_history_when_connection_hist
     # yet. Must fall back to empty history for it, not KeyError.
     env = _two_preset_env(app_factory, tmp_path)
     login_as(env.client, "alice@example.com")
-    _set_all_mode(env.client)
+    _set_group_mode(env.client)
 
     import db as db_module
     monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
@@ -1995,7 +2113,7 @@ def test_all_mode_route_phase_b_falls_back_to_empty_history_when_connection_hist
 
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(_gemini_ok('{"action": "route", "indices": [0], "message": "Checking Sales Postgres."}'))
+    harness.queue_response(_gemini_ok('{"action": "sql", "indices": [0], "message": "Checking Sales Postgres."}'))
     harness.register_marker("deals", _gemini_ok("SELECT * FROM deals;"))
 
     resp = env.client.post('/api/translate', json={
@@ -2011,14 +2129,14 @@ def test_all_mode_route_phase_b_falls_back_to_empty_history_when_connection_hist
     assert "an unrelated database's own past turn" not in phase_b_contents
 
 
-def test_all_mode_route_phase_b_connection_history_is_capped_to_history_max_turns(
+def test_group_mode_route_phase_b_connection_history_is_capped_to_history_max_turns(
         app_factory, tmp_path, monkeypatch):
     # Same HISTORY_MAX_TURNS cap the shared `history` field has always had
     # (see test_translate_routes.py's own turn-count-cap tests) now also
     # applies to each connection's own connection_histories entry.
     env = _two_preset_env(app_factory, tmp_path, extra_env={"HISTORY_MAX_TURNS": "2"})
     login_as(env.client, "alice@example.com")
-    _set_all_mode(env.client)
+    _set_group_mode(env.client)
 
     import db as db_module
     monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
@@ -2028,7 +2146,7 @@ def test_all_mode_route_phase_b_connection_history_is_capped_to_history_max_turn
 
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(_gemini_ok('{"action": "route", "indices": [0], "message": "Checking Sales Postgres."}'))
+    harness.queue_response(_gemini_ok('{"action": "sql", "indices": [0], "message": "Checking Sales Postgres."}'))
     harness.register_marker("deals", _gemini_ok("SELECT * FROM deals;"))
 
     history = []
@@ -2049,7 +2167,7 @@ def test_all_mode_route_phase_b_connection_history_is_capped_to_history_max_turn
     assert "pg-a prompt 2" in phase_b_contents
 
 
-def test_all_mode_route_phase_b_uses_triages_per_connection_rewrite_not_the_original_cross_database_prompt(
+def test_group_mode_route_phase_b_uses_triages_per_connection_rewrite_not_the_original_cross_database_prompt(
         app_factory, tmp_path, monkeypatch):
     # Regression guard for a real user-reported failure: a question phrased
     # across multiple databases at once ("give me data from 2 tables each
@@ -2062,7 +2180,7 @@ def test_all_mode_route_phase_b_uses_triages_per_connection_rewrite_not_the_orig
     # framing.
     env = _two_preset_env(app_factory, tmp_path)
     login_as(env.client, "alice@example.com")
-    _set_all_mode(env.client)
+    _set_group_mode(env.client)
 
     import db as db_module
     monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
@@ -2073,7 +2191,7 @@ def test_all_mode_route_phase_b_uses_triages_per_connection_rewrite_not_the_orig
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     harness.queue_response(_gemini_ok(
-        '{"action": "route", "indices": [0, 1], "message": "Checking Sales Postgres and Marketing Postgres.", '
+        '{"action": "sql", "indices": [0, 1], "message": "Checking Sales Postgres and Marketing Postgres.", '
         '"database_prompts": {'
         '"0": "Give me data from one table in this database.", '
         '"1": "Give me data from a different table in this database."}}'
@@ -2110,7 +2228,7 @@ def test_all_mode_route_phase_b_uses_triages_per_connection_rewrite_not_the_orig
     assert by_id["pg-b"] == "Give me data from a different table in this database."
 
 
-def test_all_mode_route_phase_b_falls_back_to_the_original_prompt_when_triage_omits_database_prompts(
+def test_group_mode_route_phase_b_falls_back_to_the_original_prompt_when_triage_omits_database_prompts(
         app_factory, tmp_path, monkeypatch):
     # Graceful degradation: a "route" response with no "database_prompts"
     # field at all (the model ignored/forgot it, or is an older/simpler
@@ -2119,7 +2237,7 @@ def test_all_mode_route_phase_b_falls_back_to_the_original_prompt_when_triage_om
     # unchanged, not an empty/missing prompt.
     env = _two_preset_env(app_factory, tmp_path)
     login_as(env.client, "alice@example.com")
-    _set_all_mode(env.client)
+    _set_group_mode(env.client)
 
     import db as db_module
     monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
@@ -2130,7 +2248,7 @@ def test_all_mode_route_phase_b_falls_back_to_the_original_prompt_when_triage_om
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     harness.queue_response(_gemini_ok(
-        '{"action": "route", "indices": [0, 1], "message": "Checking both."}'
+        '{"action": "sql", "indices": [0, 1], "message": "Checking both."}'
     ))
     harness.register_marker("deals", _gemini_ok("SELECT * FROM deals;"))
     harness.register_marker("campaigns", _gemini_ok("SELECT * FROM campaigns;"))
@@ -2143,10 +2261,10 @@ def test_all_mode_route_phase_b_falls_back_to_the_original_prompt_when_triage_om
     assert all("the original question, verbatim" in c for c in phase_b_contents)
 
 
-def test_all_mode_route_phase_b_calls_run_concurrently_not_serially(app_factory, tmp_path, monkeypatch):
+def test_group_mode_route_phase_b_calls_run_concurrently_not_serially(app_factory, tmp_path, monkeypatch):
     env = _two_preset_env(app_factory, tmp_path)
     login_as(env.client, "alice@example.com")
-    _set_all_mode(env.client)
+    _set_group_mode(env.client)
 
     import db as db_module
     monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
@@ -2156,7 +2274,7 @@ def test_all_mode_route_phase_b_calls_run_concurrently_not_serially(app_factory,
 
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(_gemini_ok('{"action": "route", "indices": [0, 1], "message": "Checking both."}'))
+    harness.queue_response(_gemini_ok('{"action": "sql", "indices": [0, 1], "message": "Checking both."}'))
 
     delay_seconds = 0.4
 
@@ -2183,7 +2301,7 @@ def test_all_mode_route_phase_b_calls_run_concurrently_not_serially(app_factory,
     assert elapsed < delay_seconds * 1.8
 
 
-# --- Phase A (triage) logged to the translations table as "All Pre-Configured Datasets"/"All Pre-Configured Datasets" ---
+# --- Phase A (triage) logged to the translations table as "Dataset Group"/"Dataset Group" ---
 
 
 def _translation_rows(env):
@@ -2206,40 +2324,31 @@ def _translation_rows(env):
         return [dict(row) for row in cursor.fetchall()]
 
 
-def test_all_mode_answer_outcome_logs_triage_as_a_dedicated_all_all_row(app_factory, tmp_path, monkeypatch):
+def test_group_mode_answer_outcome_is_never_logged_to_translations_table(app_factory, tmp_path, monkeypatch):
     env = _two_preset_env(app_factory, tmp_path)
     login_as(env.client, "alice@example.com")
-    _set_all_mode(env.client)
+    _set_group_mode(env.client)
 
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     harness.queue_response(_gemini_ok(
-        '{"action": "answer", "answer": "You have 2 databases configured."}'
+        '{"action": "general", "answer": "You have 2 databases configured."}'
     ))
 
     resp = env.client.post('/api/translate', json={'prompt': 'how many databases do I have'})
     _, data = parse_translate_stream(resp)
     assert data['success'] is True
 
-    # The "answer" outcome IS Phase A in its entirety - exactly one
-    # translations-table row, tagged "All Pre-Configured Datasets"/"All Pre-Configured Datasets" rather than any real
-    # database (there's no real database involved at all here), carrying
-    # triage's own token usage (see _gemini_ok's fixed usage_metadata).
-    rows = _translation_rows(env)
-    assert len(rows) == 1
-    row = rows[0]
-    assert row['database_type'] == 'All Pre-Configured Datasets'
-    assert row['database_name'] == 'All Pre-Configured Datasets'
-    assert row['nl_prompt'] == 'how many databases do I have'
-    assert row['sql_command'] == data['sql']
-    assert (row['input_tokens'], row['output_tokens'], row['total_tokens'],
-            row['thinking_tokens'], row['cached_content_tokens']) == (10, 5, 15, 0, 0)
+    # The "answer" outcome IS Phase A (triage) in its entirety, and Phase A
+    # is deliberately never recorded in the translations-table history/
+    # stats - only calls that take a prompt and generate real SQL are.
+    assert _translation_rows(env) == []
 
 
-def test_all_mode_failed_outcome_logs_triage_as_a_dedicated_all_all_row(app_factory, tmp_path, monkeypatch):
+def test_group_mode_failed_outcome_is_never_logged_to_translations_table(app_factory, tmp_path, monkeypatch):
     env = _two_preset_env(app_factory, tmp_path)
     login_as(env.client, "alice@example.com")
-    _set_all_mode(env.client)
+    _set_group_mode(env.client)
 
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
@@ -2253,20 +2362,19 @@ def test_all_mode_failed_outcome_logs_triage_as_a_dedicated_all_all_row(app_fact
     _, data = parse_translate_stream(resp)
     assert data['success'] is True
 
-    rows = _translation_rows(env)
-    assert len(rows) == 1
-    row = rows[0]
-    assert row['database_type'] == 'All Pre-Configured Datasets'
-    assert row['database_name'] == 'All Pre-Configured Datasets'
-    assert row['sql_command'] == data['sql']
+    # A "failed" outcome is still Phase A (triage) in its entirety, and
+    # Phase A is deliberately never recorded in the translations-table
+    # history/stats - only calls that take a prompt and generate real SQL
+    # are.
+    assert _translation_rows(env) == []
 
 
-def test_all_mode_route_outcome_logs_a_separate_all_all_triage_row_with_no_double_counting(
+def test_group_mode_route_outcome_logs_one_row_per_phase_b_connection_and_never_logs_triage(
     app_factory, tmp_path, monkeypatch,
 ):
     env = _two_preset_env(app_factory, tmp_path)
     login_as(env.client, "alice@example.com")
-    _set_all_mode(env.client)
+    _set_group_mode(env.client)
 
     import db as db_module
     monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
@@ -2277,7 +2385,7 @@ def test_all_mode_route_outcome_logs_a_separate_all_all_triage_row_with_no_doubl
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     harness.queue_response(_gemini_ok(
-        '{"action": "route", "indices": [0, 1], "message": "Checking Sales Postgres and Marketing Postgres."}'
+        '{"action": "sql", "indices": [0, 1], "message": "Checking Sales Postgres and Marketing Postgres."}'
     ))
     harness.register_marker("deals", _gemini_ok("SELECT * FROM deals;"))
     harness.register_marker("campaigns", _gemini_ok("SELECT * FROM campaigns;"))
@@ -2287,22 +2395,14 @@ def test_all_mode_route_outcome_logs_a_separate_all_all_triage_row_with_no_doubl
     assert data['success'] is True
     assert data['router_route'] is True
 
-    # THREE rows now: Phase A's own "All Pre-Configured Datasets"/"All Pre-Configured Datasets" row,
-    # and one dedicated row PER Phase B connection (pg-a, pg-b) - never
-    # bundled into a single combined row attributed only to the first
-    # selected connection, which is what this used to do.
+    # TWO rows now: one dedicated row PER Phase B connection (pg-a, pg-b) -
+    # never bundled into a single combined row attributed only to the first
+    # selected connection, which is what this used to do. Phase A (triage)
+    # is deliberately never recorded in the translations-table history/
+    # stats - only calls that take a prompt and generate real SQL are.
     rows = _translation_rows(env)
-    assert len(rows) == 3
-    triage_row, phase_b_row_a, phase_b_row_b = rows
-
-    assert triage_row['database_type'] == 'All Pre-Configured Datasets'
-    assert triage_row['database_name'] == 'All Pre-Configured Datasets'
-    assert triage_row['nl_prompt'] == 'how is everything performing across the board'
-    # Not real SQL - Phase A's own routing decision, same '*** NO SQL ***'
-    # convention the "answer"/"failed" outcomes use for their own text.
-    assert triage_row['sql_command'] == '*** NO SQL *** Checking Sales Postgres and Marketing Postgres.'
-    assert (triage_row['input_tokens'], triage_row['output_tokens'], triage_row['total_tokens'],
-            triage_row['thinking_tokens'], triage_row['cached_content_tokens']) == (10, 5, 15, 0, 0)
+    assert len(rows) == 2
+    phase_b_row_a, phase_b_row_b = rows
 
     # pg-a's own row: its own real SQL (not the joined multi-database
     # blob), attributed to Sales Postgres specifically, with only ITS OWN
@@ -2334,7 +2434,7 @@ def test_all_mode_route_outcome_logs_a_separate_all_all_triage_row_with_no_doubl
     # overlap in wall-clock time rather than summing to it). Just sanity-
     # check they're real, non-negative measurements, each within the
     # overall turn duration.
-    for row in (triage_row, phase_b_row_a, phase_b_row_b):
+    for row in (phase_b_row_a, phase_b_row_b):
         assert 0 <= row['duration'] <= data['duration']
 
 
@@ -2747,7 +2847,7 @@ def test_summarize_all_mode_results_retries_an_invalid_or_incomplete_json_respon
     assert len(provider.calls) == 2
 
 
-def test_summarize_results_endpoint_returns_no_sql_prefixed_summary_and_logs_an_all_databases_row(
+def test_summarize_results_endpoint_returns_no_sql_prefixed_summary_and_is_never_logged(
     app_factory, tmp_path, monkeypatch,
 ):
     env = _two_preset_env(app_factory, tmp_path)
@@ -2802,14 +2902,11 @@ def test_summarize_results_endpoint_returns_no_sql_prefixed_summary_and_logs_an_
     ]
     assert data['cross_database_summary'] is None
 
-    rows = _translation_rows(env)
-    assert len(rows) == 1
-    row = rows[0]
-    assert row['database_type'] == 'All Pre-Configured Datasets'
-    assert row['database_name'] == 'All Pre-Configured Datasets'
-    assert row['nl_prompt'] == 'how is everything performing across the board'
-    assert row['sql_command'] == data['summary']
-    assert (row['input_tokens'], row['output_tokens'], row['total_tokens']) == (10, 5, 15)
+    # Phase C (summarization) is deliberately never recorded in the
+    # translations-table history/stats - only calls that take a prompt and
+    # generate real SQL are (Phase B's own per-connection generation,
+    # exercised elsewhere in this file, not this endpoint).
+    assert _translation_rows(env) == []
 
     # Gap 4: Phase C's actual LLM call now carries each in-scope database's
     # schema (via schema_block) and the SQL that ran for it (via
@@ -2819,6 +2916,80 @@ def test_summarize_results_endpoint_returns_no_sql_prefixed_summary_and_logs_an_
     call_text = harness.generate_calls[0]["contents"][0].parts[0].text
     assert "Table: deals" in call_text
     assert "SELECT * FROM deals;" in call_text
+
+
+def test_summarize_results_endpoint_always_uses_tables_only_schema_even_when_the_flag_is_off(
+    app_factory, tmp_path, monkeypatch,
+):
+    # Unlike single-dataset mode's own SQL-GENERATION path (only reduced
+    # when SCHEMA_TABLES_ONLY is explicitly turned on - see
+    # test_translate_routes.py), both summarization call sites
+    # (stream_summarize_result here, and _build_all_mode_schema_block/
+    # Phase C below) go through get_summary_schema_text() instead of
+    # get_llm_schema_text()/get_database_schema() directly, which ALWAYS
+    # reduces to the "tables_only" derivative - unconditionally,
+    # regardless of SCHEMA_TABLES_ONLY. SCHEMA_TABLES_ONLY isn't even set
+    # in this env, so this specifically proves that unconditional
+    # behavior, not just that the flag happens to be respected.
+    env = _two_preset_env(app_factory, tmp_path)
+    login_as(env.client, "alice@example.com")
+    assert env.translate_routes.SCHEMA_TABLES_ONLY is False
+
+    import db as db_module
+    monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
+        "postgresql://u:p@host-a:5432/a": "Table: deals\nid INTEGER\n\nConstraints:\n  none\n",
+        "postgresql://u:p@host-b:5432/b": "Table: campaigns\nid INTEGER\n",
+    }))
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(_gemini_ok(_summary_json(
+        {0: "Sales revenue is $500.", 1: "Marketing had nothing relevant."},
+    )))
+
+    resp = env.client.post('/api/summarize-results', json={
+        'prompt': 'how is everything performing across the board',
+        'database_results': [
+            {"kind": "preset", "id": "pg-a", "name": "Sales Postgres",
+             "sql": "SELECT * FROM deals;",
+             "columns": ["total"], "rows": [{"total": 500}], "rowCount": 1},
+            {"kind": "preset", "id": "pg-b", "name": "Marketing Postgres", "note": "Nothing relevant."},
+        ],
+    })
+    parse_translate_stream(resp)
+
+    call_text = harness.generate_calls[0]["contents"][0].parts[0].text
+    assert "Table: deals" in call_text
+    assert "Constraints:" not in call_text
+
+
+def test_summarize_all_mode_results_always_uses_tables_only_schema_even_when_the_flag_is_off(
+    app_factory, tmp_path, monkeypatch,
+):
+    # Phase C's own half of the same unconditional-reduction guarantee -
+    # see the sibling /api/summarize-results test just above.
+    env = _two_preset_env(app_factory, tmp_path)
+    import db as db_module
+    monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
+        "postgresql://u:p@host-a:5432/a": "Table: deals\nid INTEGER\n\nConstraints:\n  none\n",
+        "postgresql://u:p@host-b:5432/b": "Table: campaigns\nid INTEGER\n",
+    }))
+    assert env.translate_routes.SCHEMA_TABLES_ONLY is False
+
+    provider = _SchemaCapturingFakeProvider([
+        _summary_json({0: "Sales is up 10%.", 1: "Marketing had no data."}),
+    ])
+    _drain(env.translate_routes.summarize_all_mode_results(
+        "how is everything performing",
+        [
+            {"kind": "preset", "id": "pg-a", "name": "Sales Postgres", "columns": [], "rows": []},
+            {"kind": "preset", "id": "pg-b", "name": "Marketing Postgres", "note": "Nothing relevant."},
+        ],
+        provider, client=None, model="m", user_identity="alice@example.com",
+    ))
+    schema_block = provider.calls[0]["llm_input"]["schema_block"]
+    assert "Table: deals" in schema_block
+    assert "Constraints:" not in schema_block
 
 
 def test_summarize_results_endpoint_groups_multiple_resultsets_for_the_same_database(
@@ -2977,7 +3148,7 @@ def test_summarize_results_endpoint_requires_prompt_and_database_results(app_fac
     assert _translation_rows(env) == []
 
 
-def test_summarize_results_endpoint_returns_success_false_when_the_llm_call_fails(
+def test_summarize_results_endpoint_returns_success_false_when_the_llm_call_fails_and_is_never_logged(
     app_factory, tmp_path, monkeypatch,
 ):
     env = _two_preset_env(app_factory, tmp_path)
@@ -3002,31 +3173,17 @@ def test_summarize_results_endpoint_returns_success_false_when_the_llm_call_fail
     assert resp.status_code == 200
     _retry_events, data = parse_translate_stream(resp)
     assert data['success'] is False
-    # A total LLM-call failure IS now logged - same "All Pre-Configured Datasets"/
-    # "All Pre-Configured Datasets" attribution a successful Phase C call gets (this
-    # is never "about" one specific connection), 0 for every token count (no
-    # response was ever successfully returned to have real usage numbers
-    # from), and a TRANSLATION_ERROR(...) sentinel in sql_command in place
-    # of real SQL/summary text, so the failure is still visible in history/
-    # exports instead of silently vanishing.
-    rows = _translation_rows(env)
-    assert len(rows) == 1
-    row = rows[0]
-    assert row['database_type'] == 'All Pre-Configured Datasets'
-    assert row['database_name'] == 'All Pre-Configured Datasets'
-    assert row['sql_command'].startswith('TRANSLATION_ERROR (')
-    assert data['error'] in row['sql_command']
-    assert row['input_tokens'] == 0
-    assert row['output_tokens'] == 0
-    assert row['total_tokens'] == 0
-    assert row['thinking_tokens'] == 0
-    assert row['cached_content_tokens'] == 0
+    # Phase C (summarization) is deliberately never recorded in the
+    # translations-table history/stats, success or failure - see
+    # test_summarize_results_endpoint_returns_no_sql_prefixed_summary_and_
+    # is_never_logged's own comment for why.
+    assert _translation_rows(env) == []
 
 
 # --- Regression: a real provider reporting None (not 0) for a usage field ---
 
 
-def test_all_mode_route_outcome_tolerates_a_real_usage_field_reported_as_none_not_zero(
+def test_group_mode_route_outcome_tolerates_a_real_usage_field_reported_as_none_not_zero(
     app_factory, tmp_path, monkeypatch,
 ):
     # Real-world crash this guards against: a genuine Gemini response's
@@ -3043,7 +3200,7 @@ def test_all_mode_route_outcome_tolerates_a_real_usage_field_reported_as_none_no
     # production.
     env = _two_preset_env(app_factory, tmp_path)
     login_as(env.client, "alice@example.com")
-    _set_all_mode(env.client)
+    _set_group_mode(env.client)
 
     import db as db_module
     monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
@@ -3053,7 +3210,7 @@ def test_all_mode_route_outcome_tolerates_a_real_usage_field_reported_as_none_no
 
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(_gemini_ok('{"action": "route", "indices": [0], "message": "Checking Sales Postgres."}'))
+    harness.queue_response(_gemini_ok('{"action": "sql", "indices": [0], "message": "Checking Sales Postgres."}'))
     harness.register_marker("deals", _gemini_ok("SELECT * FROM deals;", thinking_tokens=None, cached_tokens=None))
 
     resp = env.client.post('/api/translate', json={'prompt': 'show me some data from that database'})

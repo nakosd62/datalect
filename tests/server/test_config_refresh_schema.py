@@ -7,8 +7,9 @@ raw descriptor/credentials - the same convention every other single-
 custom-connection lookup in this app uses), resolved via
 state_store.get_db_connections() scoped to THIS request's own identity,
 then handed to db.py's prime_schema_cache_with_reason() (force-refetches
-and pins both the deep and shallow schema-cache entries - see db.py's own
-docstring for why both - and also reports WHY a failure failed, so this
+and pins the deep schema-cache entry - see db.py's own docstring; this
+used to also refetch a second, independent "shallow" entry, removed since
+nothing reads one anymore - and also reports WHY a failure failed, so this
 route can pick between its two different error messages - see its own
 comment on SCHEMA_FETCH_FAILURE_REASON_EMPTY vs. the generic one).
 

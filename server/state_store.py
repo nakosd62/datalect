@@ -449,8 +449,8 @@ class StateStore(ABC):
     def get_session(self, user_id):
         """Returns {"auto_sql_execute", "is_custom", "connection_id",
         "llm_provider", "llm_model", "llm_byok_key_set", "in_scope_preset_ids",
-        "in_scope_custom_connection_keys", "in_scope_mode", "theme"} for a
-        user/session id - identity only,
+        "in_scope_custom_connection_keys", "in_scope_mode", "in_scope_group_id",
+        "theme"} for a user/session id - identity only,
         never a connection's actual details/credentials (see db.py's
         resolve_active_descriptor, which resolves those FRESH from
         CONFIGURED_DBS or get_db_connections() every time something needs
@@ -519,19 +519,30 @@ class StateStore(ABC):
         the same way resolve_active_descriptor treats a blank
         connection_id - falling back to the app default connection.
 
-        "in_scope_mode" ("single" or "all", defaulting to "single" for a
+        "in_scope_mode" ("single" or "group", defaulting to "single" for a
         session that's never explicitly saved it) is the connection
         picker's binary choice (see webClient/client.js's
         renderDbRadioButtons()): "single" means in_scope_preset_ids/
         in_scope_custom_connection_keys above are the actual in-scope set,
-        exactly as described above; "all" means db.py's
+        exactly as described above; "group" means db.py's
         resolve_in_scope_descriptors ignores those two lists entirely and
-        instead resolves EVERY currently-configured preset plus every one
-        of this user's saved custom connections, fresh, on every request -
-        a dynamic set that automatically includes a connection added after
-        this was saved, not a list frozen at Save time. That's the whole
-        reason this is a separate field rather than just a third possible
-        shape for in_scope_preset_ids/in_scope_custom_connection_keys.
+        instead resolves "in_scope_group_id"'s own fixed "dataset_list"
+        (app_config.py's CONFIGURED_DB_GROUPS - see its own "DATASET
+        GROUPS" comment), fresh, on every request - so a presets-file
+        change to that group's membership is immediately reflected, not a
+        list frozen at Save time. That's the whole reason this is a
+        separate field rather than just a third possible shape for
+        in_scope_preset_ids/in_scope_custom_connection_keys.
+
+        "in_scope_group_id" (defaults to "" - "no group selected", same
+        blank-means-unset convention connection_id uses) is which
+        DATABASE_PRESETS_FILE dataset_group entry's "id" is active when
+        in_scope_mode == "group"; meaningless (ignored) in "single" mode,
+        the same way in_scope_preset_ids/in_scope_custom_connection_keys
+        are ignored in "group" mode. A group_id that no longer resolves to
+        anything (the group was removed/renamed from the presets file
+        since this was saved) is handled the same lenient way a stale
+        connection_id is - see db.py's _resolve_group_configured_descriptors.
 
         "theme" ("dark" or "light", defaulting to "" - "nothing explicitly
         saved yet") is the Preferences modal's color-scheme choice,
@@ -548,21 +559,24 @@ class StateStore(ABC):
     def set_session(self, user_id, connection_id=None, auto_sql_execute=None, is_custom=None,
                      llm_provider=None, llm_model=None, llm_byok_keys=None,
                      in_scope_preset_ids=None, in_scope_custom_connection_keys=None,
-                     in_scope_mode=None, theme=None):
+                     in_scope_mode=None, in_scope_group_id=None, theme=None):
         """Persists the active connection reference (connection_id,
         is_custom), auto_sql_execute flag, llm_provider/llm_model
         selection, Bring-Your-Own-Key values, in-scope connection set,
-        in-scope mode, and/or theme for a user/session id. Only the fields
-        passed (not None) are changed - the others are left as-is. Pass
-        connection_id="" (not None) to explicitly clear it, e.g. when
-        switching to a fresh/default connection - same not-None-means-
-        "change this" convention is_custom/llm_provider/llm_model/
-        in_scope_mode/theme already use. in_scope_preset_ids/
-        in_scope_custom_connection_keys follow the same convention: pass []
-        (not None) to explicitly clear one to empty, None to leave it
-        untouched - callers that mean to update the in-scope set always
-        pass both together (see config_routes.py), since a partial update
-        would leave the two lists describing an inconsistent set.
+        in-scope mode, in-scope group id, and/or theme for a user/session
+        id. Only the fields passed (not None) are changed - the others are
+        left as-is. Pass connection_id="" (not None) to explicitly clear
+        it, e.g. when switching to a fresh/default connection - same
+        not-None-means-"change this" convention is_custom/llm_provider/
+        llm_model/in_scope_mode/in_scope_group_id/theme already use.
+        in_scope_preset_ids/in_scope_custom_connection_keys follow the same
+        convention: pass [] (not None) to explicitly clear one to empty,
+        None to leave it untouched - callers that mean to update the
+        in-scope set always pass both together (see config_routes.py),
+        since a partial update would leave the two lists describing an
+        inconsistent set. Callers that mean to switch a session into
+        "group" mode likewise always pass in_scope_mode="group" and
+        in_scope_group_id="<id>" together, same reasoning.
 
         llm_byok_keys is a dict of ONLY the provider(s) this call means to
         change - {"google": "<new key>"} updates just Google's, leaving
@@ -867,6 +881,7 @@ class SqliteStateStore(StateStore):
                         in_scope_preset_ids TEXT,
                         in_scope_custom_connection_keys TEXT,
                         in_scope_mode TEXT,
+                        in_scope_group_id TEXT NOT NULL DEFAULT '',
                         theme TEXT NOT NULL DEFAULT '',
                         llm_byok_keys TEXT,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -923,6 +938,18 @@ class SqliteStateStore(StateStore):
                 if "in_scope_mode" not in session_columns:
                     cursor.execute(
                         "ALTER TABLE sessions ADD COLUMN in_scope_mode TEXT;"
+                    )
+                # Migration: existing DBs created before dataset groups
+                # existed (see get_session's docstring on in_scope_group_id).
+                # Defaults to '' - "no group selected", meaningless/ignored
+                # unless in_scope_mode == 'group' - same blank-means-unset
+                # convention connection_id already uses, not in_scope_mode's
+                # own NULL-means-"never saved" one, since there's no
+                # separate lazy-derivation step for this field the way
+                # in_scope_preset_ids/in_scope_custom_connection_keys have.
+                if "in_scope_group_id" not in session_columns:
+                    cursor.execute(
+                        "ALTER TABLE sessions ADD COLUMN in_scope_group_id TEXT NOT NULL DEFAULT '';"
                     )
                 # Migration: existing DBs created before is_custom existed.
                 # Defaults to 0/False - every legacy row predates the
@@ -982,6 +1009,7 @@ class SqliteStateStore(StateStore):
                             in_scope_preset_ids TEXT,
                             in_scope_custom_connection_keys TEXT,
                             in_scope_mode TEXT,
+                            in_scope_group_id TEXT NOT NULL DEFAULT '',
                             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                         );
                     """)
@@ -1009,6 +1037,7 @@ class SqliteStateStore(StateStore):
                     old_has_in_scope_presets = "in_scope_preset_ids" in old_columns
                     old_has_in_scope_custom = "in_scope_custom_connection_keys" in old_columns
                     old_has_in_scope_mode = "in_scope_mode" in old_columns
+                    old_has_in_scope_group_id = "in_scope_group_id" in old_columns
                     select_cols = "session_id, auto_sql_execute, is_custom"
                     select_cols += ", custom_connection_key" if old_has_custom_key else ", NULL"
                     select_cols += ", database_url" if old_has_url else ", NULL"
@@ -1017,12 +1046,13 @@ class SqliteStateStore(StateStore):
                     select_cols += ", in_scope_preset_ids" if old_has_in_scope_presets else ", NULL"
                     select_cols += ", in_scope_custom_connection_keys" if old_has_in_scope_custom else ", NULL"
                     select_cols += ", in_scope_mode" if old_has_in_scope_mode else ", NULL"
+                    select_cols += ", in_scope_group_id" if old_has_in_scope_group_id else ", ''"
                     select_cols += ", updated_at" if "updated_at" in old_columns else ", CURRENT_TIMESTAMP"
                     cursor.execute(f"SELECT {select_cols} FROM sessions_old;")
                     for (old_session_id, old_auto_exec, old_is_custom,
                          old_custom_key, old_url, old_llm_provider, old_llm_model,
                          old_in_scope_presets, old_in_scope_custom, old_in_scope_mode,
-                         old_updated_at) in cursor.fetchall():
+                         old_in_scope_group_id, old_updated_at) in cursor.fetchall():
                         if old_is_custom and old_custom_key:
                             new_connection_id = old_custom_key
                         elif not old_is_custom and old_url:
@@ -1035,13 +1065,14 @@ class SqliteStateStore(StateStore):
                             INSERT OR REPLACE INTO sessions
                                 (session_id, auto_sql_execute, is_custom, connection_id,
                                  llm_provider, llm_model, in_scope_preset_ids,
-                                 in_scope_custom_connection_keys, in_scope_mode, updated_at)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                                 in_scope_custom_connection_keys, in_scope_mode,
+                                 in_scope_group_id, updated_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                         """, (
                             old_session_id, old_auto_exec, old_is_custom,
                             new_connection_id, old_llm_provider or '', old_llm_model or '',
                             old_in_scope_presets, old_in_scope_custom, old_in_scope_mode,
-                            old_updated_at,
+                            old_in_scope_group_id or '', old_updated_at,
                         ))
                     cursor.execute("DROP TABLE sessions_old;")
 
@@ -1286,7 +1317,7 @@ class SqliteStateStore(StateStore):
                 cursor.execute(
                     "SELECT auto_sql_execute, is_custom, connection_id, llm_provider, llm_model, "
                     "in_scope_preset_ids, in_scope_custom_connection_keys, in_scope_mode, theme, "
-                    "llm_byok_keys "
+                    "llm_byok_keys, in_scope_group_id "
                     "FROM sessions WHERE session_id = ?",
                     (effective_user,),
                 )
@@ -1315,6 +1346,7 @@ class SqliteStateStore(StateStore):
                         "in_scope_preset_ids": in_scope_preset_ids,
                         "in_scope_custom_connection_keys": in_scope_custom_connection_keys,
                         "in_scope_mode": row[7] or "single",
+                        "in_scope_group_id": row[10] or "",
                         "theme": row[8] or "",
                     }
         except Exception:
@@ -1329,6 +1361,7 @@ class SqliteStateStore(StateStore):
             "in_scope_preset_ids": [],
             "in_scope_custom_connection_keys": [],
             "in_scope_mode": "single",
+            "in_scope_group_id": "",
             "theme": "",
         }
 
@@ -1351,11 +1384,11 @@ class SqliteStateStore(StateStore):
     def set_session(self, user_id, connection_id=None, auto_sql_execute=None, is_custom=None,
                      llm_provider=None, llm_model=None, llm_byok_keys=None,
                      in_scope_preset_ids=None, in_scope_custom_connection_keys=None,
-                     in_scope_mode=None, theme=None):
+                     in_scope_mode=None, in_scope_group_id=None, theme=None):
         if (connection_id is None and auto_sql_execute is None and is_custom is None
                 and llm_provider is None and llm_model is None and llm_byok_keys is None
                 and in_scope_preset_ids is None and in_scope_custom_connection_keys is None
-                and in_scope_mode is None and theme is None):
+                and in_scope_mode is None and in_scope_group_id is None and theme is None):
             return
         effective_user = _effective_user(user_id)
         try:
@@ -1413,6 +1446,9 @@ class SqliteStateStore(StateStore):
                 if in_scope_mode is not None:
                     insert_cols.append("in_scope_mode")
                     insert_vals.append(in_scope_mode)
+                if in_scope_group_id is not None:
+                    insert_cols.append("in_scope_group_id")
+                    insert_vals.append(in_scope_group_id)
                 if theme is not None:
                     insert_cols.append("theme")
                     insert_vals.append(theme)
@@ -1452,6 +1488,9 @@ class SqliteStateStore(StateStore):
                 if in_scope_mode is not None:
                     updates.append("in_scope_mode = ?")
                     params.append(in_scope_mode)
+                if in_scope_group_id is not None:
+                    updates.append("in_scope_group_id = ?")
+                    params.append(in_scope_group_id)
                 if theme is not None:
                     updates.append("theme = ?")
                     params.append(theme)
@@ -1803,6 +1842,7 @@ class FirestoreStateStore(StateStore):
             "in_scope_preset_ids": [],
             "in_scope_custom_connection_keys": [],
             "in_scope_mode": "single",
+            "in_scope_group_id": "",
             "theme": "",
         }
         if not user_id:
@@ -1871,6 +1911,7 @@ class FirestoreStateStore(StateStore):
                         "in_scope_preset_ids": in_scope_preset_ids,
                         "in_scope_custom_connection_keys": in_scope_custom_connection_keys,
                         "in_scope_mode": data.get("in_scope_mode") or "single",
+                        "in_scope_group_id": data.get("in_scope_group_id") or "",
                         "theme": data.get("theme") or "",
                     }
                 if "in_scope_preset_ids" not in data or "in_scope_custom_connection_keys" not in data:
@@ -1896,6 +1937,7 @@ class FirestoreStateStore(StateStore):
                     "in_scope_preset_ids": in_scope_preset_ids,
                     "in_scope_custom_connection_keys": in_scope_custom_connection_keys,
                     "in_scope_mode": data.get("in_scope_mode") or "single",
+                    "in_scope_group_id": data.get("in_scope_group_id") or "",
                     "theme": data.get("theme") or "",
                 }
         except Exception:
@@ -1918,11 +1960,11 @@ class FirestoreStateStore(StateStore):
     def set_session(self, user_id, connection_id=None, auto_sql_execute=None, is_custom=None,
                      llm_provider=None, llm_model=None, llm_byok_keys=None,
                      in_scope_preset_ids=None, in_scope_custom_connection_keys=None,
-                     in_scope_mode=None, theme=None):
+                     in_scope_mode=None, in_scope_group_id=None, theme=None):
         if not user_id or (connection_id is None and auto_sql_execute is None and is_custom is None
                             and llm_provider is None and llm_model is None and llm_byok_keys is None
                             and in_scope_preset_ids is None and in_scope_custom_connection_keys is None
-                            and in_scope_mode is None and theme is None):
+                            and in_scope_mode is None and in_scope_group_id is None and theme is None):
             return
         update_data = {"updated_at": firestore.SERVER_TIMESTAMP}
         if connection_id is not None:
@@ -1957,6 +1999,8 @@ class FirestoreStateStore(StateStore):
             update_data["in_scope_custom_connection_keys"] = list(in_scope_custom_connection_keys)
         if in_scope_mode is not None:
             update_data["in_scope_mode"] = in_scope_mode
+        if in_scope_group_id is not None:
+            update_data["in_scope_group_id"] = in_scope_group_id
         if theme is not None:
             update_data["theme"] = theme
         try:

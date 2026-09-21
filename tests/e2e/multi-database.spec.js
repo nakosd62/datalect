@@ -2,8 +2,8 @@
 //
 // Multi-database question-answering (see server/translate_routes.py's
 // module docstring): the connection picker's binary single-select choice
-// (one specific connection, or "All configured databases" - see
-// renderDbRadioButtons() in client.js), the per-tab database labeling and
+// (one specific connection, or a named dataset group spanning several -
+// see renderDbRadioButtons() in client.js), the per-tab database labeling and
 // '-- database: ...' SQL comments a multi-connection /api/translate
 // response drives (its own disclosure mechanism - there is no separate
 // banner), a follow-up request echoing back the prior turn's pin, and
@@ -33,6 +33,9 @@ function buildConfigState() {
       { id: 'p-a', name: 'Sales Postgres', type: 'postgres' },
       { id: 'p-b', name: 'Marketing Postgres', type: 'postgres' },
     ],
+    configured_database_groups: [
+      { id: 'grp-ab', name: 'Sales & Marketing', dataset_list: ['p-a', 'p-b'] },
+    ],
     active_preset_id: 'p-a',
     default_database_url: '',
     active_database_url: '',
@@ -47,29 +50,32 @@ function buildConfigState() {
     auto_sql_execute: false,
     in_scope_preset_ids: ['p-a', 'p-b'],
     in_scope_custom_connection_keys: [],
-    in_scope_mode: 'all',
+    in_scope_mode: 'group',
+    in_scope_group_id: 'grp-ab',
     max_in_scope_connections: 20,
   };
 }
 
 /** Wires up GET/POST /api/config against an in-memory `state` object that
  * starts as buildConfigState() (or whatever `initial` overrides) - POST
- * merges in_scope_preset_ids/in_scope_custom_connection_keys/in_scope_mode
- * (each independently, when present in the request body) into `state` and
- * returns it, so a test can Save from the modal and then re-open it (or
- * trigger a translate call) against the just-saved scope, same round-trip
- * shape the real server gives, without needing genuinely-configured
- * presets. Returns the live `state` object so a test can inspect what was
- * last saved - including `state._lastPostBody`, the raw request body of
- * the most recent POST. Selecting "All" saves with neither
- * in_scope_preset_ids nor in_scope_custom_connection_keys present in the
- * body at all (mirroring config_routes.py's real "both absent means leave
- * the existing scope alone" behavior) but DOES send in_scope_mode: 'all' -
- * see client.js's triggerConfigSave() - which this mock mirrors into
- * `state.in_scope_mode` exactly like the real backend now persists it (see
- * server/config_routes.py's in_scope_mode handling), since that field, not
- * the in-scope arrays' length, is what isAllConnectionsSelected() actually
- * reads. */
+ * merges in_scope_preset_ids/in_scope_custom_connection_keys/in_scope_mode/
+ * in_scope_group_id (each independently, when present in the request body)
+ * into `state` and returns it, so a test can Save from the modal and then
+ * re-open it (or trigger a translate call) against the just-saved scope,
+ * same round-trip shape the real server gives, without needing genuinely-
+ * configured presets. Returns the live `state` object so a test can inspect
+ * what was last saved - including `state._lastPostBody`, the raw request
+ * body of the most recent POST. Selecting the "Sales & Marketing" dataset
+ * group (grp-ab - see buildConfigState()'s own configured_database_groups)
+ * saves with neither in_scope_preset_ids nor in_scope_custom_connection_keys
+ * present in the body at all (mirroring config_routes.py's real "both
+ * absent means leave the existing scope alone" behavior) but DOES send
+ * in_scope_mode: 'group' plus in_scope_group_id: 'grp-ab' - see client.js's
+ * triggerConfigSave() - which this mock mirrors into `state.in_scope_mode`/
+ * `state.in_scope_group_id` exactly like the real backend now persists it
+ * (see server/config_routes.py's in_scope_mode/in_scope_group_id handling),
+ * since those fields, not the in-scope arrays' length, are what
+ * isGroupModeSelected() actually reads. */
 async function mockConfig(page, initial) {
   const state = initial || buildConfigState();
   await page.route('**/api/config', async (route) => {
@@ -86,6 +92,7 @@ async function mockConfig(page, initial) {
         state.in_scope_custom_connection_keys = body.in_scope_custom_connection_keys;
       }
       if (body.in_scope_mode !== undefined) state.in_scope_mode = body.in_scope_mode;
+      if (body.in_scope_group_id !== undefined) state.in_scope_group_id = body.in_scope_group_id;
       // Mirrors config_routes.py's real POST handler just enough for the
       // badge/primary-connection fields to reflect a preset switch (see
       // client.js's triggerConfigSave(), which always sends preset_id for
@@ -143,32 +150,35 @@ async function normalizedSql(page) {
 }
 
 test.describe('multi-database question answering', () => {
-  test('"All configured databases" and a specific preset are mutually exclusive radios, each saving the right scope', async ({ page }) => {
+  test('a dataset group and a specific preset are mutually exclusive radios, each saving the right scope', async ({ page }) => {
     const state = await mockConfig(page, {
       ...buildConfigState(), in_scope_preset_ids: ['p-a'], in_scope_custom_connection_keys: [], in_scope_mode: 'single',
+      in_scope_group_id: '',
     });
     await gotoApp(page);
     await openConfigModal(page);
 
-    // "All" (rendered last, below the custom connections - see
-    // renderDbRadioButtons() in client.js) + the two presets (p-a, p-b) - a
-    // true single-select radio group again, not the checkbox picker this
-    // replaced.
-    const allRadio = page.locator('input[name="db_connection_option"][value="all"]');
+    // The "Sales & Marketing" dataset group (merged into the same
+    // playgrounds list as the presets themselves, no separate "DATASET
+    // GROUPS" heading/column of its own - see renderDbRadioButtons() in
+    // client.js) + the two presets (p-a, p-b) - a true single-select radio
+    // group, not the checkbox picker this replaced.
+    const groupRadio = page.locator('input[name="db_connection_option"][value="group:grp-ab"]');
     const boxes = page.locator('input[name="db_connection_option"]');
     const presetA = page.locator('input[name="db_connection_option"][value="preset:p-a"]');
     const presetB = page.locator('input[name="db_connection_option"][value="preset:p-b"]');
     await expect(boxes).toHaveCount(3);
-    await expect(allRadio).not.toBeChecked();
+    await expect(groupRadio).not.toBeChecked();
     await expect(presetA).toBeChecked(); // p-a, today's only in-scope preset
 
-    // Picking "All" unchecks whichever specific preset was selected -
+    // Picking the group unchecks whichever specific preset was selected -
     // plain native radio exclusivity, no client bookkeeping involved.
-    await allRadio.check();
+    await groupRadio.check();
     await expect(presetA).not.toBeChecked();
     await page.locator('#configSaveBtn').click();
     await expect(page.locator('#configModal')).toHaveClass(/hidden/);
-    expect(state._lastPostBody.in_scope_mode).toBe('all');
+    expect(state._lastPostBody.in_scope_mode).toBe('group');
+    expect(state._lastPostBody.in_scope_group_id).toBe('grp-ab');
 
     // Picking a specific preset again narrows straight back down to just
     // that one - in_scope_mode flips back to 'single' and the in-scope
@@ -182,16 +192,16 @@ test.describe('multi-database question answering', () => {
     expect(state.in_scope_custom_connection_keys).toEqual([]);
   });
 
-  test('the connection badge reads "All Pre-Configured Datasets" whenever 2+ are in scope, and the single name once only one remains', async ({ page }) => {
+  test('the connection badge reads the dataset group\'s own name whenever a group is in scope, and the single name once narrowed to one preset', async ({ page }) => {
     const state = await mockConfig(page);
     await gotoApp(page);
 
-    // buildConfigState() starts with both p-a and p-b in scope (as if a
-    // prior "All" save, or a session that predates this binary choice) -
-    // the badge should say "All Pre-Configured Datasets", not just the primary's
-    // ("Sales Postgres") name, since showing one name would hide that the
-    // other connection is also in play for this session's questions.
-    await expect(page.locator('#connDbName')).toHaveText('All Pre-Configured Datasets');
+    // buildConfigState() starts on the "Sales & Marketing" dataset group
+    // (grp-ab, spanning p-a and p-b) - the badge should say the group's own
+    // name, not just the primary's ("Sales Postgres") name, since showing
+    // one name would hide that the other connection is also in play for
+    // this session's questions.
+    await expect(page.locator('#connDbName')).toHaveText('Sales & Marketing');
     await expect(page.locator('#configTriggerBadge')).toHaveAttribute(
       'title', 'In scope: Sales Postgres, Marketing Postgres (Click to configure)');
 
@@ -208,30 +218,32 @@ test.describe('multi-database question answering', () => {
       'title', 'Connected to: Marketing Postgres (Click to configure)');
   });
 
-  test('the badge reads "All Pre-Configured Datasets" for a real in_scope_mode "all" session even when the leftover in-scope arrays are short', async ({ page }) => {
-    // Regression guard: a session that saved "All" leaves
+  test('the badge reads the dataset group\'s own name for a real in_scope_mode "group" session even when the leftover in-scope arrays are short', async ({ page }) => {
+    // Regression guard: a session that saved a dataset group leaves
     // in_scope_preset_ids/in_scope_custom_connection_keys untouched (see
-    // triggerConfigSave() - "all" mode ignores them entirely, see db.py's
+    // triggerConfigSave() - group mode ignores them entirely, see db.py's
     // resolve_in_scope_descriptors), so they can be arbitrarily short - even
-    // a single leftover entry from whatever was picked before "All" was
-    // last selected. The badge must still read "All Pre-Configured Datasets" here,
-    // straight off in_scope_mode, not off those arrays' length (which is
-    // exactly what summarizeInScopeConnections() once got wrong).
+    // a single leftover entry from whatever was picked before the group was
+    // last selected. The badge must still read the group's own name here,
+    // straight off in_scope_mode/in_scope_group_id, not off those arrays'
+    // length (which is exactly what summarizeInScopeConnections() once got
+    // wrong).
     await mockConfig(page, {
       ...buildConfigState(),
-      in_scope_mode: 'all',
+      in_scope_mode: 'group',
+      in_scope_group_id: 'grp-ab',
       in_scope_preset_ids: ['p-a'],
       in_scope_custom_connection_keys: [],
     });
     await gotoApp(page);
 
-    await expect(page.locator('#connDbName')).toHaveText('All Pre-Configured Datasets');
+    await expect(page.locator('#connDbName')).toHaveText('Sales & Marketing');
     await expect(page.locator('#configTriggerBadge')).toHaveAttribute(
       'title', 'In scope: Sales Postgres, Marketing Postgres (Click to configure)');
 
     await openConfigModal(page);
-    const allRadio = page.locator('input[name="db_connection_option"][value="all"]');
-    await expect(allRadio).toBeChecked();
+    const groupRadio = page.locator('input[name="db_connection_option"][value="group:grp-ab"]');
+    await expect(groupRadio).toBeChecked();
   });
 
   test('a mocked multi-connection translate response labels result tabs by database and tags the SQL with database comments', async ({ page }) => {
@@ -1394,7 +1406,7 @@ test.describe('multi-database question answering', () => {
   // "Summary tab feedback" describe block covers that variant) - this is
   // here purely to prove the same thumbs-up/down prompt appears for THIS
   // mode's own flavor too (with the leading-label convention active, since
-  // IN_SCOPE_MODE is 'all' here - see buildConfigState()).
+  // IN_SCOPE_MODE is 'group' here - see buildConfigState()).
   test('an "all databases" mode "answer" outcome (a NO-SQL reply, not a routed query) also gets the thumbs up/down feedback prompt', async ({ page }) => {
     await mockConfig(page, { ...buildConfigState(), issue_reporting_enabled: true });
     await gotoApp(page);
@@ -1438,6 +1450,52 @@ test.describe('multi-database question answering', () => {
       category: 'summary_thumbs_up',
       details: 'Correctly declined to make something up.',
     });
+  });
+
+  // New outcome for "all databases" mode (connection_router.py's
+  // run_triage_call merge - see its own docstring): triage can now
+  // resolve to "schema" for a group-mode prompt too, exactly like single-
+  // connection mode already could - the server marks it with the same
+  // '*** NO SQL *** OPEN SCHEMA VIEWER ***' sentinel, and client.js's
+  // /api/translate response handler opens the GROUP's own Schema Viewer
+  // (openGroupSchemaViewer(), the same one the dataset badge's "i" icon
+  // already opens - see schema-viewer.spec.js's "dataset group schema
+  // viewer" tests) rather than rendering the sentinel as text or trying
+  // (and failing) to open a single-connection viewer.
+  test('an "all databases" mode "OPEN SCHEMA VIEWER" reply opens the group\'s own Schema Viewer, not a text reply', async ({ page }) => {
+    await mockConfig(page);
+    await gotoApp(page);
+
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ success: true, sql: '*** NO SQL *** OPEN SCHEMA VIEWER ***' }),
+      });
+    });
+    await page.route('**/api/schema/group*', async (route) => {
+      if (route.request().method() !== 'GET') return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          success: true, kind: 'group', id: 'grp-ab', name: 'Sales & Marketing',
+          datasets: [
+            { id: 'p-a', name: 'Sales Postgres', type: 'PostgreSQL', data_size: '~2.4 GB', schema_size_tokens: 320, available: true },
+            { id: 'p-b', name: 'Marketing Postgres', type: 'PostgreSQL', data_size: null, schema_size_tokens: 150, available: true },
+          ],
+        }),
+      });
+    });
+
+    await page.locator('#aiPrompt').fill('what can I ask about these databases?');
+    await page.locator('#aiPrompt').press('Enter');
+
+    await expect(page.locator('#schemaViewerModal')).not.toHaveClass(/hidden/);
+    await expect(page.locator('#schemaViewerModalTitleText')).toHaveText('Sales & Marketing (Dataset Group)');
+    await expect(page.locator('#schemaViewerGroupTableWrap')).not.toHaveClass(/hidden/);
+    await expect(page.locator('.response-text')).toHaveCount(0);
   });
 
   // Regression guard for a real bug report: an "all databases" mode
@@ -2435,16 +2493,19 @@ test.describe('multi-database question answering', () => {
   // Chunk 4 of "splitting SQL/summary per in-scope database" (see
   // client.js's captureAllModeHistory()/fanOutAllModeHistoryPerDatabase()
   // docstrings for the full multi-window design history): an all-mode
-  // turn's own shared history entry (asserted by the two tests above) is
-  // ALSO fanned out, per in-scope database, into that database's own
+  // turn's own shared history entry (asserted by the two tests above) used
+  // to ALSO be fanned out, per in-scope database, into that database's own
   // single-connection-mode history bucket - identical to the one reached
-  // by switching directly to it (computeBucketKey()'s (kind,id)-based
-  // scheme - see that function's own docstring for why this now matches
-  // regardless of which mode reaches the database). Covers all three
-  // outcome shapes end to end: p-a got real SQL, executed, and its own
-  // Phase C paragraph (the "sql" outcome); p-b only ever got a note (the
-  // "note" outcome, no SQL/results/summary at all).
-  test('switching to a specific database in single-connection mode after an all-mode turn shows that turn merged into its own back/forward history', async ({ page }) => {
+  // by switching directly to it. That fan-out was removed: it surprised
+  // users by making a question asked of the whole group appear, unasked,
+  // in one specific database's own back/forward history. This test now
+  // covers the opposite: switching to p-a (which got real SQL, executed,
+  // and its own Phase C paragraph in the all-mode turn - the "sql"
+  // outcome) or p-b (which only ever got a note - the "note" outcome, no
+  // SQL/results/summary at all) directly afterward lands on a genuinely
+  // blank slate in EITHER case, and a turn asked directly against one of
+  // them stays the only entry in that database's own bucket.
+  test('switching to a specific database in single-connection mode after an all-mode turn does not carry that turn into its own back/forward history', async ({ page }) => {
     await mockConfig(page);
     await gotoApp(page);
 
@@ -2514,32 +2575,23 @@ test.describe('multi-database question answering', () => {
     await page.locator('.result-tab-btn').filter({ hasText: 'Summary' }).click();
     await expect(page.locator('.response-text')).toContainText('Revenue is $500');
 
-    // Switch to Sales Postgres (p-a) specifically - the "sql" (executed)
-    // outcome. reconcileActiveHistoryBucket() (triggered by saving) both
-    // creates/finds that database's own bucket AND immediately restores
-    // its latest turn - no back/forward click needed to SEE it land there
-    // in the first place, only to prove it's really turn history (below).
+    // Switch to Sales Postgres (p-a) directly - the "sql" (executed)
+    // outcome in the all-mode turn just above. p-a's own single-
+    // connection-mode bucket was never touched by that turn (the removed
+    // fan-out used to land it here) - reconcileActiveHistoryBucket()
+    // (triggered by saving) finds a genuinely empty bucket and restores a
+    // blank slate, exactly as if p-a had never been asked anything.
     await openConfigModal(page);
     await page.locator('input[name="db_connection_option"][value="preset:p-a"]').check();
     await page.locator('#configSaveBtn').click();
     await expect(page.locator('#configModal')).toHaveClass(/hidden/);
 
-    // The prompt shown is p-a's OWN triage-rewritten question, not the
-    // original cross-database one and not p-b's rewrite either.
-    await expect(page.locator('#aiPrompt')).toHaveValue('How are sales performing?');
-    // normalizedSql(), not currentSql() - CodeMirror's own SQL formatting
-    // can put "FROM" and "deals" on separate, indented lines (real
-    // pretty-printing, not a bug), so a raw two-word substring check
-    // against unnormalized text is flaky by construction. Same fix this
-    // file already applies at its 'SELECT 1'/'SELECT 2' checks above.
-    await expect.poll(() => normalizedSql(page)).toContain('FROM deals');
-    // Summary tab (p-a's own Phase C paragraph) prepended and made active,
-    // plus the one real result tab.
-    await expect(page.locator('#resultsTabsNav .result-tab-btn')).toHaveCount(2);
-    await expect(page.locator('.response-text')).toContainText('Revenue is $500.');
+    await expect(page.locator('#aiPrompt')).toHaveValue('');
+    expect(await currentSql(page)).toBe('');
+    await expect(page.locator('#resultsTabsNav')).toHaveClass(/hidden/);
 
-    // A second, genuinely single-connection turn asked directly against
-    // p-a - this is what back/forward will actually be exercised against.
+    // A single, genuinely single-connection turn asked directly against
+    // p-a - this will be the ONLY turn in its own bucket.
     await page.route('**/api/translate', async (route) => {
       if (route.request().method() !== 'POST') return route.fallback();
       await route.fulfill({
@@ -2559,7 +2611,7 @@ test.describe('multi-database question answering', () => {
     // Single-connection mode's own post-execution summarization (see
     // requestSingleModeResultsSummary) fires unconditionally on a real
     // question's execution - stubbed out to a no-summary response so this
-    // turn stays a clean, single-tab baseline to navigate back to.
+    // turn stays a clean, single-tab baseline.
     await page.route('**/api/summarize-result', async (route) => {
       if (route.request().method() !== 'POST') return route.fallback();
       await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ success: false }) });
@@ -2576,49 +2628,38 @@ test.describe('multi-database question answering', () => {
     await expect(page.locator('#resultsTabsNav')).toHaveClass(/hidden/);
     await expect(page.locator('#resultsBody')).toContainText('5');
 
-    // Back to the fanned-out all-mode turn - "merged into its own
-    // back/forward history", not just visible on first switch-to.
-    await page.locator('#goBackBtn').click();
-    await expect(page.locator('#aiPrompt')).toHaveValue('How are sales performing?');
-    // normalizedSql() - see the identical fix/comment earlier in this file.
-    await expect.poll(() => normalizedSql(page)).toContain('FROM deals');
-    await expect(page.locator('#resultsTabsNav .result-tab-btn')).toHaveCount(2);
-    await expect(page.locator('.response-text')).toContainText('Revenue is $500.');
+    // There is nothing to go back to - the all-mode turn was never
+    // recorded into p-a's own bucket, so this direct question is the
+    // OLDEST (and only) turn here.
+    await expect(page.locator('#goBackBtn')).toBeDisabled();
 
-    // ...and forward again, back to the direct single-connection turn.
-    await page.locator('#goForwardBtn').click();
-    await expect(page.locator('#aiPrompt')).toHaveValue('how many reps do we have');
-    await expect.poll(() => currentSql(page)).toContain('COUNT');
-    await expect(page.locator('#resultsTabsNav')).toHaveClass(/hidden/);
-    await expect(page.locator('#resultsBody')).toContainText('5');
-
-    // Now switch to Marketing Postgres (p-b) - the "note" outcome (no SQL
-    // ever generated/run for it at all). Its own bucket independently
-    // carries the SAME all-mode turn, fanned out as a plain
-    // '*** NO SQL ***' reply - restoreLatestTurn()'s single-connection
-    // no-SQL branch, not the tabbed-results branch p-a took above.
+    // Marketing Postgres (p-b) - the "note" outcome in the all-mode turn
+    // (no SQL ever generated/run for it at all) - is equally untouched: it
+    // was never visited directly, and its own note is no longer fanned
+    // out into it either, so switching to it also lands on a blank slate.
     await openConfigModal(page);
     await page.locator('input[name="db_connection_option"][value="preset:p-b"]').check();
     await page.locator('#configSaveBtn').click();
     await expect(page.locator('#configModal')).toHaveClass(/hidden/);
 
-    await expect(page.locator('#aiPrompt')).toHaveValue('How is marketing performing?');
-    await expect(page.locator('.response-text')).toContainText('Nothing relevant to marketing here.');
+    await expect(page.locator('#aiPrompt')).toHaveValue('');
     expect(await currentSql(page)).toBe('');
+    await expect(page.locator('#resultsTabsNav')).toHaveClass(/hidden/);
   });
 
-  // Chunk 5 of "splitting SQL/summary per in-scope database" (see
-  // client.js's captureAllModeHistory()/fanOutAllModeHistoryPerDatabase()/
-  // buildInScopeConnectionHistories() docstrings for the earlier chunks):
-  // a connection's history is now COMPLETELY MERGED regardless of which
-  // mode each past turn came from, and that merged history is what an
-  // "all databases" mode request sends (as connection_histories, keyed by
-  // "preset:<id>"/"custom:<key>") for THAT SAME connection's own Phase B
-  // SQL-generation call. Covers both directions: an all-mode turn's own
-  // per-database fan-out (Chunk 4) feeding a LATER all-mode turn, and a
-  // genuinely direct single-connection-mode turn ALSO feeding a later
-  // all-mode turn for that same database.
-  test('a database\'s merged history (from both all-mode fan-out and direct single-connection turns) is sent as connection_histories on the next all-mode request', async ({ page }) => {
+  // See client.js's buildInScopeConnectionHistories() docstring: an "all
+  // databases" mode request sends each in-scope member's own history (as
+  // connection_histories, keyed by "preset:<id>"/"custom:<key>") for that
+  // connection's own Phase B SQL-generation call - but ONLY turns actually
+  // asked against that database directly in single-connection mode. An
+  // all-mode turn's own per-database outcome (a "sql" outcome for p-a, a
+  // "note" outcome for p-b) is deliberately never fanned out into either
+  // database's own bucket (removed - it surprised users by making a group
+  // question appear, unasked, in one specific database's own history), so
+  // neither one contributes anything from that turn here: p-a contributes
+  // only the direct question asked of it afterward, and p-b - never
+  // visited directly at all - contributes nothing whatsoever.
+  test('a database only sends turns actually asked of it directly as connection_histories on a later all-mode request', async ({ page }) => {
     await mockConfig(page);
     await gotoApp(page);
 
@@ -2675,8 +2716,9 @@ test.describe('multi-database question answering', () => {
       });
     });
 
-    // Turn 1 - an "all databases" mode turn that fans out into both p-a's
-    // and p-b's own buckets (Chunk 4).
+    // Turn 1 - an "all databases" mode turn. p-a gets real SQL/results,
+    // p-b gets a "note" outcome - neither is recorded into either
+    // database's own individual bucket.
     await page.locator('#aiPrompt').fill("how's business doing");
     await page.locator('#aiPrompt').press('Enter');
     await expect.poll(() => currentSql(page)).toContain('SELECT');
@@ -2685,7 +2727,8 @@ test.describe('multi-database question answering', () => {
     await expect(page.locator('.response-text')).toContainText('Revenue is $500');
 
     // Switch to Sales Postgres (p-a) directly and ask it a genuinely
-    // single-connection-mode question - turn 2 in that SAME bucket.
+    // single-connection-mode question - the ONLY turn that will ever land
+    // in p-a's own bucket.
     await openConfigModal(page);
     await page.locator('input[name="db_connection_option"][value="preset:p-a"]').check();
     await page.locator('#configSaveBtn').click();
@@ -2718,10 +2761,10 @@ test.describe('multi-database question answering', () => {
     await page.locator('#runBtn').click();
     await expect(page.locator('#resultsBody')).toContainText('5');
 
-    // Switch back to "All configured databases" and ask a third, new
-    // combined question - capture exactly what THIS request sends.
+    // Switch back to the "Sales & Marketing" dataset group and ask a third,
+    // new combined question - capture exactly what THIS request sends.
     await openConfigModal(page);
-    await page.locator('input[name="db_connection_option"][value="all"]').check();
+    await page.locator('input[name="db_connection_option"][value="group:grp-ab"]').check();
     await page.locator('#configSaveBtn').click();
     await expect(page.locator('#configModal')).toHaveClass(/hidden/);
 
@@ -2740,22 +2783,18 @@ test.describe('multi-database question answering', () => {
     const histories = thirdRequestBody.connection_histories;
     expect(histories).toBeTruthy();
 
-    // p-a's own bucket: turn 1 (fanned out from all-mode) THEN turn 2 (the
-    // direct single-connection question) - both, merged, in that order.
+    // p-a's own bucket: ONLY the direct single-connection question asked
+    // of it afterward - turn 1's all-mode outcome was never recorded into
+    // it at all.
     const pa = histories['preset:p-a'];
-    expect(pa).toHaveLength(4);
-    expect(pa[0]).toMatchObject({ role: 'user', text: 'How are sales performing?' });
-    expect(pa[1].text).toContain('FROM deals');
-    expect(pa[1].results[0].rows).toEqual([{ total: 500 }]);
-    expect(pa[2]).toMatchObject({ role: 'user', text: 'how many reps do we have' });
-    expect(pa[3].text).toContain('COUNT');
-    expect(pa[3].results[0].rows).toEqual([{ count: 5 }]);
+    expect(pa).toHaveLength(2);
+    expect(pa[0]).toMatchObject({ role: 'user', text: 'how many reps do we have' });
+    expect(pa[1].text).toContain('COUNT');
+    expect(pa[1].results[0].rows).toEqual([{ count: 5 }]);
 
-    // p-b's own bucket: only turn 1's note outcome - it was never visited
-    // in single-connection mode at all.
-    const pb = histories['preset:p-b'];
-    expect(pb).toHaveLength(2);
-    expect(pb[0]).toMatchObject({ role: 'user', text: 'How is marketing performing?' });
-    expect(pb[1].text).toContain('Nothing relevant to marketing here.');
+    // p-b's own bucket was never even created - it was never visited
+    // directly, and turn 1's "note" outcome for it is no longer fanned out
+    // into it either.
+    expect(histories['preset:p-b']).toBeUndefined();
   });
 });

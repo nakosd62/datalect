@@ -310,4 +310,108 @@ test.describe('chat history persistence', () => {
       });
     }
   });
+
+  // Regression test for renderChatHistoryBucketList()'s own filter: a
+  // bucket whose preset/custom connection/dataset group has since been
+  // deleted (chat_history_routes.py's _resolve_bucket_display() resolves
+  // it to {available: false}) used to still render as its own row, labeled
+  // "Unavailable preset"/"Unavailable connection"/"Unavailable dataset
+  // group" - meaningless to a user browsing this list, since there's
+  // nothing left to resume, rename, or identify by name. It's now
+  // cross-referenced away from the rendered list entirely, while the
+  // server keeps reporting it (so #deleteAllChatHistoryBtn can still reach
+  // and clear it - see that button's own comment in client.js).
+  test('an orphaned bucket (its preset no longer exists) is left out of the History modal, not shown as "Unavailable ..."', async ({ page }) => {
+    await page.unroute('**/api/chat-history');
+    await page.unroute('**/api/chat-history/summary');
+    await gotoApp(page);
+
+    // Seeded directly via the real save endpoint - no UI turn needed. A
+    // "preset:" bucket_key suffix that can't match any of this local dev
+    // server's real CONFIGURED_DBS ids is exactly the shape
+    // _resolve_bucket_display() resolves to {kind: "preset", available:
+    // false} for.
+    const orphanBucketKey = `preset:does-not-exist-e2e-${Date.now()}`;
+    await page.request.post('/api/chat-history/save', {
+      data: {
+        bucket_key: orphanBucketKey,
+        turns: [
+          { role: 'user', text: 'orphaned turn' },
+          { role: 'model', text: 'SELECT 1;' },
+        ],
+      },
+    });
+
+    try {
+      // The server still resolves and reports this bucket (available:
+      // false) - proves the fix is a client-side display filter, not data
+      // loss on the server's own summary endpoint.
+      const summaryResp = await page.request.get('/api/chat-history/summary');
+      const summaryBody = await summaryResp.json();
+      const orphanEntry = summaryBody.buckets.find((b) => b.bucket_key === orphanBucketKey);
+      expect(orphanEntry).toBeTruthy();
+      expect(orphanEntry.kind).toBe('preset');
+      expect(orphanEntry.available).toBe(false);
+
+      await page.locator('#historyBtn').click();
+      await expect(page.locator('#historyModal')).not.toHaveClass(/hidden/);
+
+      // Never rendered as its own row, under any label - not the generic
+      // "Unavailable preset" text, and no delete button wired to its
+      // bucket_key either.
+      await expect(page.locator('.chat-history-bucket-row', { hasText: 'Unavailable preset' })).toHaveCount(0);
+      await expect(page.locator(`.chat-history-bucket-delete-btn[data-bucket-key="${orphanBucketKey}"]`)).toHaveCount(0);
+    } finally {
+      await page.request.post('/api/chat-history/save', {
+        data: { bucket_key: orphanBucketKey, turns: [] },
+      });
+    }
+  });
+
+  // Regression test for a second instance of the exact same bug: the fixed
+  // "all" bucket_key (a fossil from the removed "all mode" feature - see
+  // _resolve_bucket_display's own comment) used to be hardcoded as
+  // {available: true} specifically so it would render with its special
+  // label instead of falling through to "Unknown connection" - but "all
+  // mode" is gone, so there's no more a live feature behind THIS bucket_key
+  // than there is behind a deleted preset. It's now hardcoded
+  // {available: false} too, so it's cross-referenced away by the exact same
+  // client-side filter as any other orphan, not shown as "All
+  // Pre-Configured Datasets (combined)" for a feature that no longer
+  // exists.
+  test('the fixed "all" bucket (a fossil from the removed "all mode" feature) is left out of the History modal too', async ({ page }) => {
+    await page.unroute('**/api/chat-history');
+    await page.unroute('**/api/chat-history/summary');
+    await gotoApp(page);
+
+    await page.request.post('/api/chat-history/save', {
+      data: {
+        bucket_key: 'all',
+        turns: [
+          { role: 'user', text: 'all-mode turn' },
+          { role: 'model', text: 'SELECT 1;' },
+        ],
+      },
+    });
+
+    try {
+      const summaryResp = await page.request.get('/api/chat-history/summary');
+      const summaryBody = await summaryResp.json();
+      const allEntry = summaryBody.buckets.find((b) => b.bucket_key === 'all');
+      expect(allEntry).toBeTruthy();
+      expect(allEntry.kind).toBe('all');
+      expect(allEntry.name).toBe('All Pre-Configured Datasets (combined)');
+      expect(allEntry.available).toBe(false);
+
+      await page.locator('#historyBtn').click();
+      await expect(page.locator('#historyModal')).not.toHaveClass(/hidden/);
+
+      await expect(page.locator('.chat-history-bucket-row', { hasText: 'All Pre-Configured Datasets (combined)' })).toHaveCount(0);
+      await expect(page.locator('.chat-history-bucket-delete-btn[data-bucket-key="all"]')).toHaveCount(0);
+    } finally {
+      await page.request.post('/api/chat-history/save', {
+        data: { bucket_key: 'all', turns: [] },
+      });
+    }
+  });
 });

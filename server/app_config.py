@@ -236,21 +236,39 @@ DEFAULT_CONN = "postgresql://postgres:password@host:23456/defaultdb?sslmode=veri
 # other malformed preset below (missing "name"/"url"/credential) - it never
 # ends up in CONFIGURED_DBS at all, rather than loading anyway and quietly
 # activating the WRONG connection whenever its (collided) radio is clicked.
-# Every object may also carry "include_in_all_mode": false to opt that one
-# preset OUT of "All Pre-Configured Datasets" mode (db.py's
-# _resolve_all_configured_descriptors - the dynamically-resolved candidate
-# pool a session in in_scope_mode "all" asks its question against). Defaults
-# to true/omitted, meaning every preset participates - the only behavior
-# that ever existed before this field did. A preset with this set to false
-# is still fully usable on its own (its individual radio in the DB picker
-# is unaffected), it's just never offered to "All" mode's triage step - use
-# this for a preset that's slow, quarantined/paused, or simply not meant to
-# be silently included in a broad "ask across everything" question (e.g. a
-# scratch/demo dataset an admin wants available individually but never
-# folded into "All"). Custom, user-saved connections were already always
-# excluded from "All" mode regardless of this flag (see
-# _resolve_all_configured_descriptors' own docstring) - this only ever
-# narrows the PRESET pool further, it doesn't change that.
+# DATASET GROUPS - one more entry shape this same file/array can hold,
+# alongside the dialect-specific preset objects described below:
+#   {"id": "sales-suite", "name": "Sales Suite", "type": "dataset_group",
+#    "dataset_list": ["postgres-ec-store", "mysql-employees"]}
+# A dataset_group entry names a fixed, admin-curated SUBSET of the real
+# dataset presets in this same file - selecting it in the DB picker (see
+# webClient/client.js's renderDbRadioButtons()) puts a session into
+# in_scope_mode "group" (db.py's resolve_in_scope_descriptors /
+# _resolve_group_configured_descriptors), which asks a question against
+# every dataset named in "dataset_list" the same way multi-database routing
+# already works - triage picks whichever of them are actually relevant,
+# same as any other multi-connection scope. "id" is required (unlike a
+# real preset, there's no "{type}+{name}" fallback to derive one from - a
+# group is always admin-curated, so naming it explicitly isn't optional)
+# and must be unique across EVERY entry in this file, groups and real
+# datasets alike - a group and a dataset can never share an id, exactly
+# like two datasets can't. "dataset_list" must be a non-empty array of
+# other entries' "id" values; an entry that doesn't resolve to a real,
+# successfully-loaded dataset preset (a typo, a dataset that failed to
+# load for its own reasons, or - deliberately, for now - another
+# dataset_group's id, since nested groups aren't supported) is dropped
+# from the group with a warning, and the whole group is skipped, the same
+# as a malformed preset would be, if NONE of its entries resolve. There is
+# no built-in "every configured dataset" mode any more - a group only ever
+# contains exactly the datasets an admin explicitly listed, so define one
+# yourself (e.g. "id": "everything", listing every dataset's id) if that's
+# what you want. A dataset that isn't listed in any group simply isn't
+# reachable via group mode at all - it's still fully usable individually,
+# on its own radio, exactly as before; group membership has no effect on
+# that. Custom, user-saved connections can never be a group member (only
+# this file's own preset ids are valid "dataset_list" entries) - same
+# "presets only, never a user's own ad hoc connections" reasoning
+# multi-database routing has always used.
 # Every object may also carry "connect_timeout_seconds" and/or
 # "execute_timeout_seconds" (plain numbers, in seconds) to override, for
 # just this one preset, the two app-wide connection-behavior timeouts:
@@ -258,10 +276,9 @@ DEFAULT_CONN = "postgresql://postgres:password@host:23456/defaultdb?sslmode=veri
 # may block dialing/handshaking out to this preset's real host) and
 # execute_routes.py's SQL_EXECUTE_TIMEOUT_SECONDS env var (how long a
 # statement may run against an already-open connection to it). Both are
-# optional and dialect-agnostic, same treatment as "include_in_all_mode"
-# above - omitted (the common case) means this preset just uses whichever
-# value the shared env var currently has, exactly as before either field
-# existed. Use these for a specific dataset known to be reliably slower (or
+# optional and dialect-agnostic - omitted (the common case) means this
+# preset just uses whichever value the shared env var currently has,
+# exactly as before either field existed. Use these for a specific dataset known to be reliably slower (or
 # that should fail faster) than every other configured database, without
 # having to raise or lower either shared env var - and therefore every
 # OTHER preset's own budget too - just to accommodate this one outlier.
@@ -534,6 +551,7 @@ if DATABASE_PRESETS_FILE:
         )
 
 CONFIGURED_DBS = []
+CONFIGURED_DB_GROUPS = []
 if raw_db_presets.strip():
     try:
         parsed_presets = json.loads(raw_db_presets)
@@ -548,7 +566,22 @@ if raw_db_presets.strip():
 
     _seen_preset_ids = set()
 
+    # Split out dataset_group entries BEFORE the main per-entry loop below
+    # runs, so that loop (unchanged dialect-dispatch logic) only ever sees
+    # real, connectable dataset presets - a dataset_group entry has no
+    # dialect/credentials of its own and would otherwise fall through to
+    # the "unsupported type" branch at the bottom of that loop. Groups are
+    # built from _dataset_group_entries_raw in their own pass further down,
+    # once CONFIGURED_DBS (from _preset_entries) is fully populated.
+    _dataset_group_entries_raw = []
+    _preset_entries = []
     for entry in parsed_presets:
+        if isinstance(entry, dict) and (entry.get("type") or "").strip().lower() == "dataset_group":
+            _dataset_group_entries_raw.append(entry)
+        else:
+            _preset_entries.append(entry)
+
+    for entry in _preset_entries:
         if not isinstance(entry, dict):
             logger.warning("Skipping database preset entry that is not a JSON object: %r", entry)
             continue
@@ -588,34 +621,12 @@ if raw_db_presets.strip():
             continue
         _seen_preset_ids.add(preset_id)
 
-        # Optional, dialect-agnostic - unlike everything else parsed in this
-        # loop, applies identically no matter which "type" branch below ends
-        # up handling this entry, so it's read once here rather than
-        # threaded through all ten of them individually. Controls whether
-        # this preset is a candidate for "All Pre-Configured Datasets" mode
-        # (db.py's _resolve_all_configured_descriptors, which today - before
-        # this existed - unconditionally included EVERY entry in
-        # CONFIGURED_DBS with no way to opt one out). Defaults to True (the
-        # only behavior that ever existed before this field did), so a
-        # preset that has never heard of this field behaves exactly as
-        # before. Falsy (false/0/""/null - same leniency this app already
-        # gives a blank optional string field elsewhere in this loop, e.g.
-        # Postgres' "schema" above) opts the preset OUT of "All" mode
-        # entirely - it's still selectable on its own, individually, exactly
-        # as before; it just never joins the dynamically-resolved "all"
-        # candidate pool. Recorded on `preset`/`sql_preset`/etc. below (via
-        # _dbs_len_before_dispatch) ONLY when explicitly False, never as an
-        # explicit "include_in_all_mode": True - mirrors every other
-        # optional field in this loop (blank/omitted = not stored at all),
-        # so a preset dict's shape is completely unchanged for anyone who's
-        # never touched this field, matching every existing test's exact-
-        # equality assertion on CONFIGURED_DBS/configured_databases shapes.
-        exclude_from_all_mode = not entry.get("include_in_all_mode", True)
-
-        # Optional, dialect-agnostic, same "read once here, apply after
-        # dispatch" treatment as include_in_all_mode above - see this
-        # file's DATABASE_PRESETS_FILE comment for what these two do and
-        # backends/base.py's resolve_timeout_seconds() for how a blank/
+        # Optional, dialect-agnostic, applies identically no matter which
+        # "type" branch below ends up handling this entry, so it's read
+        # once here rather than threaded through all ten of them
+        # individually. See this file's DATABASE_PRESETS_FILE comment for
+        # what this does and backends/base.py's resolve_timeout_seconds()
+        # for how a blank/
         # invalid value here just falls back to the shared env var, same
         # as if the field were never set. Left as whatever raw value the
         # JSON happened to hold (int, float, or string) rather than
@@ -1053,15 +1064,85 @@ if raw_db_presets.strip():
         # this one-line addition if it had to be repeated per-branch - this
         # single, branch-independent check can't be missed that way.
         if len(CONFIGURED_DBS) > _dbs_len_before_dispatch:
-            if exclude_from_all_mode:
-                CONFIGURED_DBS[-1]["include_in_all_mode"] = False
-            # Same "blank/omitted = not stored at all" treatment as
-            # include_in_all_mode above - a preset that never set either
-            # field keeps a completely unchanged shape.
+            # "Blank/omitted = not stored at all" - a preset that never set
+            # either timeout field keeps a completely unchanged shape.
             if connect_timeout_seconds not in (None, ""):
                 CONFIGURED_DBS[-1]["connect_timeout_seconds"] = connect_timeout_seconds
             if execute_timeout_seconds not in (None, ""):
                 CONFIGURED_DBS[-1]["execute_timeout_seconds"] = execute_timeout_seconds
+
+    # --- Dataset groups (see DATABASE_PRESETS_FILE's own comment above for
+    # the entry shape and every validation rule applied here) - handled in
+    # this OWN pass, after every real dataset preset above has already been
+    # fully loaded into CONFIGURED_DBS, so a group's "dataset_list" can
+    # reference a dataset defined anywhere else in this same file regardless
+    # of which one happens to appear first. Never added to CONFIGURED_DBS
+    # itself - kept in this separate list instead, so every existing
+    # consumer of CONFIGURED_DBS (resolve_active_descriptor,
+    # prefetch_all_preset_schemas, the individual preset radio list in
+    # webClient/client.js, ...) stays completely unaware groups exist at
+    # all, with no dialect dispatch/connect() logic to worry about skipping
+    # for them. ------------------------------------------------------------
+    # CONFIGURED_DB_GROUPS itself is already initialized to [] above (module
+    # level, alongside CONFIGURED_DBS) so it's always defined even when
+    # DATABASE_PRESETS_FILE is blank/unset - this loop just appends to it.
+    _configured_dataset_ids = {db["id"] for db in CONFIGURED_DBS}
+    for entry in _dataset_group_entries_raw:
+        group_name = (entry.get("name") or "").strip()
+        if not group_name:
+            logger.warning("Skipping dataset group entry with no 'name': %r", entry)
+            continue
+        group_id = (entry.get("id") or "").strip()
+        if not group_id:
+            # Unlike a real dataset preset, there's no "{type}+{name}"
+            # fallback to derive one from here - every group is admin-
+            # curated, so naming it explicitly isn't optional the way it
+            # is (as a migration aid) for a preset.
+            logger.warning(
+                "Skipping dataset group '%s': a dataset_group entry must have an explicit 'id'.", group_name,
+            )
+            continue
+        if group_id in _seen_preset_ids:
+            logger.warning(
+                "Skipping dataset group '%s': its id %r collides with another dataset's or group's id - "
+                "every id in this file (datasets and groups alike) must be unique.",
+                group_name, group_id,
+            )
+            continue
+        raw_dataset_list = entry.get("dataset_list")
+        if not isinstance(raw_dataset_list, list) or not raw_dataset_list:
+            logger.warning(
+                "Skipping dataset group '%s' (id=%s): 'dataset_list' must be a non-empty array of dataset ids.",
+                group_name, group_id,
+            )
+            continue
+        member_ids = []
+        for raw_member_id in raw_dataset_list:
+            member_id = raw_member_id.strip() if isinstance(raw_member_id, str) else ""
+            if not member_id:
+                continue
+            if member_id not in _configured_dataset_ids:
+                # Covers three cases identically: a typo, a dataset that was
+                # itself skipped above for being malformed, and (nested
+                # groups aren't supported - see DATABASE_PRESETS_FILE's own
+                # comment) another dataset_group's id.
+                logger.warning(
+                    "Dataset group '%s' (id=%s) references dataset id %r, which isn't a configured "
+                    "dataset - dropping it from the group.",
+                    group_name, group_id, member_id,
+                )
+                continue
+            if member_id not in member_ids:
+                member_ids.append(member_id)
+        if not member_ids:
+            logger.warning(
+                "Skipping dataset group '%s' (id=%s): none of its 'dataset_list' entries resolved to a "
+                "real configured dataset.",
+                group_name, group_id,
+            )
+            continue
+        _seen_preset_ids.add(group_id)
+        CONFIGURED_DB_GROUPS.append({"id": group_id, "name": group_name, "dataset_list": member_ids})
 
 
 # Ensure at least one default fallback exists

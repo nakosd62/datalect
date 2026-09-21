@@ -224,7 +224,7 @@ from urllib.parse import urlparse
 from flask import Blueprint, request, jsonify
 
 from app_config import (
-    CONFIGURED_DBS, DEFAULT_PRESET_ID, MAX_IN_SCOPE_CONNECTIONS,
+    CONFIGURED_DBS, CONFIGURED_DB_GROUPS, DEFAULT_PRESET_ID, MAX_IN_SCOPE_CONNECTIONS,
     AUTH_ENABLED, IS_CLOUD_RUN, state_store,
     ISSUE_REPORTING_ENABLED, CLIENT_BUILD_ID, logger,
 )
@@ -238,6 +238,7 @@ from db import (
     prime_schema_cache, prime_schema_cache_with_reason, SCHEMA_FETCH_FAILURE_REASON_EMPTY,
     SCHEMA_FETCH_FAILURE_REASON_TIMEOUT, visible_configured_dbs,
     get_database_schema_with_reason, resolve_descriptor_by_reference,
+    build_group_schema_summaries,
 )
 from backends import get_backend
 from backends.base import (
@@ -714,7 +715,8 @@ def _timeout_override_kwargs(source):
     into whichever dialect-specific config/db_config dict literal a caller
     below is building, the same "optional, dialect-agnostic, spread into
     every branch's own dict" role app_config.py's DATABASE_PRESETS_FILE
-    loader's include_in_all_mode plays for CONFIGURED_DBS entries.
+    loader's own connect_timeout_seconds/execute_timeout_seconds handling
+    plays for CONFIGURED_DBS entries.
 
     These are the one custom-connection-side counterpart to that presets-
     file feature (see its own comment for the full explanation): a
@@ -1746,6 +1748,69 @@ def handle_get_schema():
     return apply_session_cookie(resp, session_id), 200
 
 
+@config_bp.route('/api/schema/group', methods=['GET'])
+def handle_get_group_schema():
+    """Read-only dataset-group counterpart to handle_get_schema() above -
+    powers webClient's own dataset-group Schema Viewer variant (client.js's
+    openGroupSchemaViewer()/loadGroupSchemaViewer(), shown when the "i" icon
+    on the dataset badge is clicked while a dataset group, not a single
+    preset/custom connection, is the selected option). Rather than one
+    connection's full entries/tree (handle_get_schema()'s own response
+    shape), this returns one lightweight {"id", "name", "type", "data_size",
+    "schema_size_tokens", "available"} row per dataset in the group's own
+    "dataset_list" - see db.py's build_group_schema_summaries() for exactly
+    what each field means and how it's computed (each member's own already-
+    cached-or-freshly-fetched DEEP schema text, the same one a single-
+    connection GET /api/schema for that same preset would use - never a
+    separate, independently-drifting introspection pass). Sending only
+    these few figures per member (not each one's own full entries/tree,
+    which could be sent by fanning out N of handle_get_schema()'s own
+    responses) is deliberate: a group's whole point is to span several
+    datasets at once, and this dialog's own table (client.js) only ever
+    shows name/type/data size/schema size per row, so there is nothing to
+    gain from paying for - and rendering - N full schemas' worth of table/
+    column detail just to fill in four columns.
+
+    The group to describe is addressed via a required "id" query param
+    (a CONFIGURED_DB_GROUPS id - app_config.py's own "DATASET GROUPS"
+    comment), NOT resolved from the session's own in_scope_group_id the way
+    handle_get_schema() falls back to the session's active connection when
+    kind/id are omitted - this route is always reached from a click that
+    already names a specific group (the badge's "i" icon only offers this
+    variant when a group is the currently-selected option in the first
+    place - see client.js), so there's no equivalent "just show me
+    whatever's active" default to fall back to here.
+
+    404s (rather than the 200-with-empty-list handle_get_schema() might
+    otherwise suggest) when "id" doesn't match any configured group at all -
+    see build_group_schema_summaries()'s own docstring for why that's
+    treated differently from a real, configured group with zero valid
+    members (which returns 200 with an empty "datasets" list instead - a
+    group that exists but is left with nothing to show, not a bad
+    reference)."""
+    session_id = get_or_create_session_id()
+    user_identity = get_current_user_identity(session_id)
+
+    group_id = (request.args.get('id') or '').strip()
+    if not group_id:
+        resp = jsonify({'success': False, 'error': 'Missing dataset group id.'})
+        return apply_session_cookie(resp, session_id), 400
+
+    summary = build_group_schema_summaries(group_id, user_identity)
+    if summary is None:
+        resp = jsonify({'success': False, 'error': 'Dataset group not found.'})
+        return apply_session_cookie(resp, session_id), 404
+
+    resp = jsonify({
+        'success': True,
+        'kind': 'group',
+        'id': summary['id'],
+        'name': summary['name'],
+        'datasets': summary['datasets'],
+    })
+    return apply_session_cookie(resp, session_id), 200
+
+
 @config_bp.route('/api/config/schema-fetch-status', methods=['GET'])
 def handle_schema_fetch_status():
     """Lightweight polling target for webClient's header status dot, used
@@ -1893,11 +1958,24 @@ def handle_config():
         raw_llm_byok_keys = data.get('llm_byok_keys')
         new_llm_byok_keys_to_save = None
         if isinstance(raw_llm_byok_keys, dict):
-            valid_llm_provider_names = {p["name"] for p in list_llm_providers_info()}
+            # Deliberately LLM_BYOK_PROVIDER_NAMES here, NOT "every name
+            # list_llm_providers_info() returns" - those two sets happen to
+            # be identical today (every currently-registered provider
+            # supports BYOK), but aren't guaranteed to stay that way: a
+            # future non-BYOK-eligible provider (e.g. a locally-run model
+            # needing no key at all) would only be safely excludable from
+            # llm_byok_keys storage if this filters against the narrower,
+            # explicitly-BYOK-eligible tuple rather than "every registered
+            # provider" - see LLM_BYOK_PROVIDER_NAMES' own comment. Filtering
+            # against the wrong set here would let such a provider's key
+            # actually get saved into llm_byok_keys storage despite
+            # get_session's llm_byok_key_set (built from this same tuple)
+            # never exposing it back - an orphaned, UI-invisible value
+            # nothing could ever surface or clear again through normal use.
             filtered_llm_byok_keys = {
                 provider_name: key_value.strip()
                 for provider_name, key_value in raw_llm_byok_keys.items()
-                if provider_name in valid_llm_provider_names and isinstance(key_value, str)
+                if provider_name in LLM_BYOK_PROVIDER_NAMES and isinstance(key_value, str)
             }
             if filtered_llm_byok_keys:
                 new_llm_byok_keys_to_save = filtered_llm_byok_keys
@@ -2067,7 +2145,7 @@ def handle_config():
             new_in_scope_preset_ids_to_save = None
             new_in_scope_custom_keys_to_save = None
 
-        # in_scope_mode ("single" | "all" - see StateStore.get_session's
+        # in_scope_mode ("single" | "group" - see StateStore.get_session's
         # docstring): the binary connection-scope choice behind
         # webClient/client.js's radio picker. An invalid/unrecognized value
         # is silently treated as "nothing to save" here (None), same
@@ -2082,7 +2160,28 @@ def handle_config():
         # exactly like every other independently-optional field here.
         new_in_scope_mode = data.get('in_scope_mode')
         new_in_scope_mode_to_save = (
-            new_in_scope_mode if new_in_scope_mode in ("single", "all") else None
+            new_in_scope_mode if new_in_scope_mode in ("single", "group") else None
+        )
+
+        # in_scope_group_id: which DATABASE_PRESETS_FILE dataset_group is
+        # active when in_scope_mode == "group" (see StateStore.get_session's
+        # docstring on in_scope_group_id) - sent together with in_scope_mode
+        # by the client (see renderDbRadioButtons()'s "group:<id>" radio
+        # values), but validated and saved independently, same reasoning as
+        # in_scope_mode's own comment above. An id that doesn't match any
+        # currently-configured group is silently treated as "nothing to
+        # save" here, same leniency every other reference field on this
+        # request already applies to a stale/unknown value - db.py's
+        # _resolve_group_configured_descriptors handles a group_id that
+        # goes stale AFTER being saved (removed from the presets file
+        # later) the same leniently way, so there's no need to reject the
+        # request over one that's already invalid at save time either.
+        new_in_scope_group_id = data.get('in_scope_group_id')
+        new_in_scope_group_id_to_save = (
+            new_in_scope_group_id
+            if isinstance(new_in_scope_group_id, str)
+            and new_in_scope_group_id in {g.get("id") for g in CONFIGURED_DB_GROUPS}
+            else None
         )
 
         preset_id = data.get('preset_id') if not is_custom else None
@@ -2106,6 +2205,7 @@ def handle_config():
                 in_scope_preset_ids=new_in_scope_preset_ids_to_save,
                 in_scope_custom_connection_keys=new_in_scope_custom_keys_to_save,
                 in_scope_mode=new_in_scope_mode_to_save,
+                in_scope_group_id=new_in_scope_group_id_to_save,
                 theme=new_theme,
             )
         elif is_custom:
@@ -2251,8 +2351,12 @@ def handle_config():
                         }
                         invalidate_schema_cache(get_conn_identifier(changed_descriptor))
                         # Backgrounded (was a plain synchronous call here
-                        # before this change) - a full deep+shallow schema
-                        # fetch plus the schema-overview LLM call
+                        # before this change) - a full deep schema fetch
+                        # (all-dbs triage now derives its own summary
+                        # straight from this same deep entry - see
+                        # build_router_candidate_summaries() in db.py - so
+                        # there's no separate shallow fetch here anymore)
+                        # plus the schema-overview LLM call
                         # (prime_schema_cache_with_reason() in db.py) can
                         # take several seconds, and this whole /api/config
                         # POST used to block on it, leaving the config
@@ -2303,6 +2407,7 @@ def handle_config():
                     in_scope_preset_ids=new_in_scope_preset_ids_to_save,
                     in_scope_custom_connection_keys=new_in_scope_custom_keys_to_save,
                     in_scope_mode=new_in_scope_mode_to_save,
+                    in_scope_group_id=new_in_scope_group_id_to_save,
                     theme=new_theme,
                 )
                 if db_name_to_save is not None:
@@ -2321,7 +2426,8 @@ def handle_config():
         elif (new_auto_sql_execute is not None or new_llm_provider is not None or new_llm_model is not None
               or new_llm_byok_keys_to_save is not None
               or new_in_scope_preset_ids_to_save is not None or new_in_scope_custom_keys_to_save is not None
-              or new_in_scope_mode_to_save is not None or new_theme is not None):
+              or new_in_scope_mode_to_save is not None or new_in_scope_group_id_to_save is not None
+              or new_theme is not None):
             # Neither a preset nor a custom connection was actively
             # selected in this request (e.g. only the auto-execute toggle
             # changed, only the in-scope checkboxes changed, or - the
@@ -2340,6 +2446,7 @@ def handle_config():
                 in_scope_preset_ids=new_in_scope_preset_ids_to_save,
                 in_scope_custom_connection_keys=new_in_scope_custom_keys_to_save,
                 in_scope_mode=new_in_scope_mode_to_save,
+                in_scope_group_id=new_in_scope_group_id_to_save,
                 theme=new_theme,
             )
 
@@ -2439,9 +2546,11 @@ def handle_config():
     # state_store.get_db_connections' has_custom_credentials docstring.
     active_uses_custom_credentials = bool(active_custom_db.get("has_custom_credentials")) if active_custom_db else False
 
-    # Admin-configured presets are always redacted to name/type only, for
-    # EVERY visitor - authenticated or anonymous, on Cloud Run or running
-    # locally, no exception. CONFIGURED_DBS entries embed the admin's own
+    # Admin-configured presets are always redacted to name/type (plus the
+    # display-only dialect_name derived from type - see
+    # _preset_dialect_name() below) only, for EVERY visitor - authenticated
+    # or anonymous, on Cloud Run or running locally, no exception.
+    # CONFIGURED_DBS entries embed the admin's own
     # real connection strings and, for dialects with no ambient identity
     # (Snowflake/Databricks/Oracle/Redshift), their plaintext credentials
     # too - those were never any individual visitor's own secret to see
@@ -2457,24 +2566,48 @@ def handle_config():
     # connection is never a secret from them, but another (admin's)
     # preset's credentials always are, regardless of who's asking or where
     # this is running.
+    # dialect_name is a display-only addition (e.g. "PostgreSQL", "BigQuery
+    # Standard SQL") alongside the existing raw "type" key (e.g. "postgres",
+    # "bigquery") - client.js's connection picker (renderDbRadioButtons())
+    # shows it in parentheses next to each preset's name, matching the exact
+    # dialect terminology already used in the single-connection Schema
+    # Viewer's own "<name> in <dialect>" title and the dataset-group Schema
+    # Viewer's "Type" column (both ultimately Backend.dialect_name too - see
+    # db.py's build_group_schema_summaries()). "type" itself is left
+    # unchanged for existing callers that key off the raw dialect string;
+    # get_backend() only needs a {"type": ...} dict to resolve the right
+    # Backend subclass, no real connection details, so this never touches
+    # (or requires) the admin's actual credentials. Falls back to the raw
+    # type string itself on an unrecognized/unsupported type rather than
+    # raising - a redacted preset listing is never worth breaking over a
+    # display label.
+    def _preset_dialect_name(db_type):
+        try:
+            return get_backend({"type": db_type}).dialect_name
+        except Exception:
+            return db_type
+
     def _redact_preset_for_client(db):
-        redacted = {"id": db.get("id"), "name": db.get("name"), "type": db.get("type", "postgres")}
-        # Not a secret (unlike everything else CONFIGURED_DBS carries for
-        # this preset) - client.js's summarizeInScopeConnections() needs it
-        # to keep its "All Pre-Configured Datasets" badge/tooltip text in
-        # sync with what db.py's _resolve_all_configured_descriptors will
-        # actually query, now that a preset can opt out of "all" mode (see
-        # app_config.py's DATABASE_PRESETS_FILE comment on
-        # "include_in_all_mode"). Only added when explicitly False, exactly
-        # like CONFIGURED_DBS' own dict shape - omitted for the common case
-        # so this never changes shape for a deployment that's never touched
-        # the field, matching every existing exact-equality test on this
-        # list's shape.
-        if db.get("include_in_all_mode") is False:
-            redacted["include_in_all_mode"] = False
-        return redacted
+        db_type = db.get("type", "postgres")
+        return {
+            "id": db.get("id"),
+            "name": db.get("name"),
+            "type": db_type,
+            "dialect_name": _preset_dialect_name(db_type),
+        }
 
     configured_dbs = [_redact_preset_for_client(db) for db in visible_configured_dbs()]
+    # Dataset groups (see app_config.py's "DATASET GROUPS" comment) - never
+    # secret, same reasoning as a preset's own id/name/type above: only the
+    # group's own shape ({"id", "name", "dataset_list"}), never anything
+    # CONFIGURED_DBS itself wouldn't already independently redact for each
+    # member preset. client.js's renderDbRadioButtons() renders one radio
+    # per entry here; summarizeInScopeConnections() uses it to label the
+    # active group's badge/tooltip.
+    configured_database_groups = [
+        {"id": g.get("id"), "name": g.get("name"), "dataset_list": list(g.get("dataset_list") or [])}
+        for g in CONFIGURED_DB_GROUPS
+    ]
 
     # Which preset (if any) is active - read straight off session_data's
     # own connection_id/is_custom, computed once, unconditionally,
@@ -2602,6 +2735,7 @@ def handle_config():
         'authenticated': is_authenticated,
         'is_cloud_run': IS_CLOUD_RUN,
         'configured_databases': configured_dbs,
+        'configured_database_groups': configured_database_groups,
         'active_preset_id': active_preset_id,
         'active_connection_missing': connection_missing,
         'active_connection_missing_message': active_connection_missing_message,
@@ -2687,6 +2821,7 @@ def handle_config():
         'in_scope_preset_ids': display_in_scope_preset_ids,
         'in_scope_custom_connection_keys': display_in_scope_custom_keys,
         'in_scope_mode': session_data.get('in_scope_mode') or 'single',
+        'in_scope_group_id': session_data.get('in_scope_group_id') or '',
         'max_in_scope_connections': MAX_IN_SCOPE_CONNECTIONS,
         # Organized by provider (see list_llm_providers_info()'s docstring)
         # so the model-selection modal can render one radio-button section

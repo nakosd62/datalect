@@ -1128,6 +1128,7 @@ def test_init_migrates_pre_connection_id_sessions_table_for_custom_row(tmp_path)
         "session_id", "auto_sql_execute", "is_custom", "connection_id",
         "llm_provider", "llm_model",
         "in_scope_preset_ids", "in_scope_custom_connection_keys", "in_scope_mode",
+        "in_scope_group_id",
         "theme",
         "llm_byok_keys",
         "active_chat_bucket_key",

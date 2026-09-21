@@ -245,16 +245,26 @@ class _BlockingModels:
     """Stand-in for google.genai.Client(...).models - blocks generate_content
     on a pair of threading.Event()s the same way _BlockingBackend above
     blocks execute(), so a test can hold /api/translate's guard acquired
-    for an exact, controlled window."""
+    for an exact, controlled window. Only the FIRST call (Call 1/triage -
+    see translate_routes.py's two-call single-connection redesign) blocks;
+    that's the one that needs to still be in flight for the guard to still
+    be held when the second, concurrent request comes in. Call 2 (SQL
+    generation) then runs normally once released, so the first request's
+    stream still resolves to a real "SELECT 1;" - this test is about the
+    GUARD, not about exercising triage/generation separately."""
 
     def __init__(self):
         self.started = threading.Event()
         self.release_event = threading.Event()
+        self._call_count = 0
 
     def generate_content(self, model, contents, config):
-        self.started.set()
-        self.release_event.wait(timeout=5)
-        return _FakeGenaiResponse("SELECT 1;")
+        self._call_count += 1
+        if self._call_count == 1:
+            self.started.set()
+            self.release_event.wait(timeout=5)
+            return _FakeGenaiResponse('{"action": "sql"}')
+        return _FakeGenaiResponse('{"sql": "SELECT 1;"}')
 
 
 def test_translate_guard_rejects_a_concurrent_request_then_releases_the_slot(app_factory, monkeypatch):

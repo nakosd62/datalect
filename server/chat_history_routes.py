@@ -34,13 +34,13 @@ endpoint that touches it.
 
 from flask import Blueprint, jsonify, request
 
-from app_config import state_store, log_and_generalize_error, CONFIGURED_DBS
+from app_config import state_store, log_and_generalize_error, CONFIGURED_DBS, CONFIGURED_DB_GROUPS
 from auth import get_or_create_session_id, get_current_user_identity, apply_session_cookie
 
 chat_history_bp = Blueprint('chat_history', __name__)
 
 
-def _resolve_bucket_display(bucket_key, preset_by_id, custom_by_key):
+def _resolve_bucket_display(bucket_key, preset_by_id, custom_by_key, group_by_id):
     """Maps one bucket_key (see client.js's computeBucketConnectionSuffix())
     to {"kind", "name", "type", "available"} for the History modal's
     database list - never the bucket_key's own raw suffix when that suffix
@@ -48,12 +48,45 @@ def _resolve_bucket_display(bucket_key, preset_by_id, custom_by_key):
 
     "available" is False whenever the bucket's own connection can no
     longer be resolved against this user's CURRENT presets/custom
-    connections - a preset removed from DATABASE_PRESETS_FILE since this
-    bucket was last written, or a custom connection this user has since
-    deleted. Still returned (not dropped) - the whole point of this modal
-    is letting old, otherwise-invisible turns actually get cleared out."""
+    connections/dataset groups - a preset removed from
+    DATABASE_PRESETS_FILE since this bucket was last written, a custom
+    connection this user has since deleted, a dataset group that no
+    longer exists, or the fixed "all" bucket_key from the now-removed "all
+    mode" feature (see its own branch below - there's no live feature left
+    for THAT one to map to either). Still returned by this endpoint (not
+    dropped) rather than silently vanishing from the API response - it's
+    client.js's own renderChatHistoryBucketList() that leaves an
+    unavailable bucket out of the rendered list (a stale row with nothing
+    left to resume/rename/identify by name is meaningless to a user
+    browsing it), while #deleteAllChatHistoryBtn still reaches it via this
+    same unfiltered response, so old, otherwise-invisible turns can still
+    actually get cleared out."""
     if bucket_key == 'all':
-        return {'kind': 'all', 'name': 'All Pre-Configured Datasets (combined)', 'type': None, 'available': True}
+        # Backward-compat display ONLY - see this module's own comment on
+        # dataset groups below (the "all mode" this bucket_key was ever
+        # written for no longer exists as something a session can newly
+        # select). That makes it exactly as unresolvable against this
+        # user's CURRENT options as a deleted preset/custom connection/
+        # dataset group - there's no live feature left for it to map to
+        # either - so `available` is False here too, same as every other
+        # kind above, and for the same reason (see this function's own
+        # docstring: the History modal's list cross-references against
+        # what's actually selectable today). The hardcoded name is kept
+        # regardless, rather than falling through to `None`/"unknown" -
+        # a bucket saved under this key before "all mode" was removed is
+        # still real history, so anywhere this entry DOES get surfaced
+        # (e.g. a future "show cleared-out history too" view, or just this
+        # module's own tests) it's still identifiable by name, not just an
+        # opaque bucket_key.
+        return {'kind': 'all', 'name': 'All Pre-Configured Datasets (combined)', 'type': None, 'available': False}
+    if bucket_key.startswith('group:'):
+        group = group_by_id.get(bucket_key[len('group:'):])
+        return {
+            'kind': 'group',
+            'name': group.get('name') if group else None,
+            'type': None,
+            'available': group is not None,
+        }
     if bucket_key.startswith('preset:'):
         preset = preset_by_id.get(bucket_key[len('preset:'):])
         return {
@@ -99,6 +132,7 @@ def get_chat_history_summary():
     try:
         buckets = state_store.get_chat_history(user_identity).get('buckets', {}) or {}
         preset_by_id = {str(db.get('id')): db for db in CONFIGURED_DBS}
+        group_by_id = {str(g.get('id')): g for g in CONFIGURED_DB_GROUPS}
         custom_by_key = {
             db.get('connection_key'): db
             for db in state_store.get_db_connections(user_identity)
@@ -110,7 +144,7 @@ def get_chat_history_summary():
             if turn_count <= 0:
                 continue
             entry = {'bucket_key': bucket_key, 'turn_count': turn_count}
-            entry.update(_resolve_bucket_display(bucket_key, preset_by_id, custom_by_key))
+            entry.update(_resolve_bucket_display(bucket_key, preset_by_id, custom_by_key, group_by_id))
             summary.append(entry)
         resp = jsonify({'success': True, 'buckets': summary})
         return apply_session_cookie(resp, session_id)
@@ -143,10 +177,8 @@ def get_chat_history():
 def save_chat_history_bucket():
     """Upserts one bucket's full turn list - called from
     createChatHistoryStore()'s pushTurn() (via its onPersist callback)
-    every time ANY bucket receives a new turn, whether or not it's the one
-    currently shown on screen (see all-mode's pushTurnIntoBucket()). Never
-    changes which bucket is "active" - see /api/chat-history/activate for
-    that."""
+    whenever the currently active bucket receives a new turn. Never changes
+    which bucket is "active" - see /api/chat-history/activate for that."""
     session_id = get_or_create_session_id()
     user_identity = get_current_user_identity(session_id)
     data = request.get_json(silent=True) or {}

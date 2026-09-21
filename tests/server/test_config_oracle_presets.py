@@ -55,7 +55,7 @@ def test_preset_credential_never_appears_in_config_response(app_factory, tmp_pat
     env = app_factory(env={"DATABASE_PRESETS_FILE": path})
     login_as(env.client, "alice@example.com")
     data = env.client.get('/api/config').get_json()
-    assert data['configured_databases'][0] == {"id": "oracle+Orders (Oracle)", "name": "Orders (Oracle)", "type": "oracle"}
+    assert data['configured_databases'][0] == {"id": "oracle+Orders (Oracle)", "name": "Orders (Oracle)", "type": "oracle", "dialect_name": "Oracle Database"}
     assert "password" not in data['configured_databases'][0]
 
 
@@ -135,4 +135,4 @@ def test_anonymous_visitor_never_receives_the_presets_credential(app_factory, tm
     }, mock_firestore=True)
     resp = env.client.get('/api/config')
     assert "preset-password" not in resp.get_data(as_text=True)
-    assert resp.get_json()['configured_databases'] == [{"id": "oracle+Orders (Oracle)", "name": "Orders (Oracle)", "type": "oracle"}]
+    assert resp.get_json()['configured_databases'] == [{"id": "oracle+Orders (Oracle)", "name": "Orders (Oracle)", "type": "oracle", "dialect_name": "Oracle Database"}]

@@ -253,13 +253,15 @@ document.addEventListener('DOMContentLoaded', async () => {
   // exact same pair every all-mode fan-out entry is tagged with (see
   // captureAllModeHistory's databaseSql/notes.connectionPrompts entries,
   // each {kind, id, ...}). Used by computeBucketKey() below for the
-  // currently-active single connection, and by pushTurnIntoBucket() below
-  // for fanning an all-mode turn out into each of ITS in-scope databases'
-  // own buckets - the whole point of Chunk 4 (see that function's own
-  // docstring): a database reached either way now lands in the identical
-  // bucket, so switching to it directly in single-connection mode picks up
-  // history recorded on its behalf while chatting in "all databases" mode,
-  // and vice versa.
+  // currently-active single connection, and by
+  // buildInScopeConnectionHistories() below to look up whichever of a
+  // group's own member databases already has a bucket from having been
+  // visited DIRECTLY in single-connection mode. A dataset-group turn is
+  // deliberately NEVER also recorded into any individual member database's
+  // own bucket (that used to happen here - a fan-out this app's users found
+  // surprising - removed; see this file's own history for the earlier
+  // "Chunk 4" design this replaced), so a database's own back/forward
+  // history only ever reflects turns actually asked against it directly.
   function connectionBucketKey(kind, id) {
     return `${kind}:${id}`;
   }
@@ -273,16 +275,16 @@ document.addEventListener('DOMContentLoaded', async () => {
   // so re-embedding the identity inside this string would just be
   // duplicated information.
   //
-  // "All databases" mode is ONE shared conversation regardless of which
-  // specific presets/custom connections are currently checked into scope -
-  // checking one more database in or out mid-conversation changes who
-  // might answer the NEXT question, not which conversation this is.
+  // A dataset group is ONE shared conversation per group, regardless of
+  // which specific presets its own "dataset_list" happens to name -
+  // switching which group is active is a different conversation, but the
+  // group's own membership isn't consulted for bucketing purposes at all.
   // Everything else (a single active connection) is now identified by its
   // own stable (kind, id) pair - see connectionBucketKey's own docstring
   // for why this replaced the old url|is_custom|customKey|presetId tuple:
   // that tuple went stale whenever ACTIVE_DB_URL wasn't reset on a preset
   // switch (see triggerConfigSave()'s own fix earlier this session) and,
-  // more fundamentally, could never match the {kind, id} pair an all-mode
+  // more fundamentally, could never match the {kind, id} pair a group-mode
   // fan-out entry for the SAME database is tagged with, since a URL alone
   // says nothing about which specific preset/custom connection that URL
   // belongs to. A saved custom connection is identified by its own
@@ -291,14 +293,22 @@ document.addEventListener('DOMContentLoaded', async () => {
   // name/saved - see ACTIVE_CUSTOM_CONNECTION_KEY's own declaration
   // comment) has no connection_key or other server-side identity at all,
   // so this falls back to the raw URL for that one case, same as every
-  // bucket key did before this refactor - all-mode's own fan-out never
+  // bucket key did before this refactor - a group's own fan-out never
   // visits an unsaved connection in the first place
   // (resolve_in_scope_descriptors only ever resolves saved presets/custom
   // connections), so there's no fan-out entry this fallback could ever
   // fail to match anyway.
   function computeBucketConnectionSuffix() {
-    if (IN_SCOPE_MODE === 'all') {
-      return 'all';
+    if (IN_SCOPE_MODE === 'group') {
+      // "all" (bare, no id) is a fossil ONLY a session that saved a bucket
+      // under the removed "all mode" this replaces ever wrote - never
+      // written again, but still real history (see chat_history_routes.py's
+      // _resolve_bucket_display's own backward-compat comment on that same
+      // literal), so it's deliberately left alone here: a session with no
+      // group selected yet falls through to connectionBucketKey below with
+      // whatever IN_SCOPE_GROUP_ID currently is (possibly ''), never back
+      // to that old bare 'all' string.
+      return connectionBucketKey('group', IN_SCOPE_GROUP_ID);
     } else if (ACTIVE_IS_CUSTOM) {
       return ACTIVE_CUSTOM_CONNECTION_KEY
         ? connectionBucketKey('custom', ACTIVE_CUSTOM_CONNECTION_KEY)
@@ -320,11 +330,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // Finds (or creates, starting empty) the chat history store for `key` -
   // shared by reconcileActiveHistoryBucket() below (switching the
-  // CURRENTLY ACTIVE bucket), pushTurnIntoBucket() further down (an
-  // all-mode turn's own per-database fan-out, appending to a bucket that
-  // may or may not be the active one), and hydrateChatHistoryFromServer()
-  // (populating a bucket restored from the server) - so bucket-creation is
-  // written in exactly one place for all three. `bucketKeySuffix` is
+  // CURRENTLY ACTIVE bucket) and hydrateChatHistoryFromServer() (populating
+  // a bucket restored from the server) - so bucket-creation is written in
+  // exactly one place for both. `bucketKeySuffix` is
   // `key`'s own connection-only half (see computeBucketConnectionSuffix())
   // - threaded through separately, rather than re-derived by splitting
   // `key` back apart, so a freshly-created store's onPersist callback
@@ -381,24 +389,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     persistActiveChatBucket(suffix);
   }
 
-  // Appends one (user, model) turn directly into a SPECIFIC database's own
-  // bucket - identity + that database's own connectionBucketKey(kind, id) -
-  // WITHOUT switching `chatStore`/`activeBucketKey` to it and without any
-  // re-render of any kind, even if this happens to be the bucket currently
-  // shown on screen (see fanOutAllModeHistoryPerDatabase's own docstring
-  // for why that's the deliberate, "never disturb the active view" design
-  // for this feature - the turn is simply there, waiting, the next time
-  // the user navigates that bucket's own history). This bucket's own
-  // pushTurn() still persists it server-side exactly the same way the
-  // active bucket's does (see getOrCreateBucketStore()'s onPersist) - only
-  // the ACTIVE-bucket pointer is left untouched here.
-  function pushTurnIntoBucket(kind, id, userText, modelEntry) {
-    const identity = CURRENT_USER_IDENTITY || 'global';
-    const suffix = connectionBucketKey(kind, id);
-    const key = `${identity}::${suffix}`;
-    getOrCreateBucketStore(key, suffix).pushTurn(userText, modelEntry);
-  }
-
   // One-time-per-identity restore of every persisted conversation bucket
   // (see the "Per-bucket history registry" section above) from the
   // server's chat_history table/collection - called from
@@ -431,13 +421,12 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // Fire-and-forget persistence for one bucket's full turn list - passed
   // as onPersist to every createChatHistoryStore() call (see
-  // getOrCreateBucketStore()), so it runs for whichever bucket just
-  // received a turn: the currently active one via chatStore.pushTurn(), or
-  // a DIFFERENT database's own bucket via pushTurnIntoBucket()'s all-mode
-  // fan-out. Best-effort: a failed save here never blocks or surfaces an
-  // error to the user mid-conversation - this page's own in-memory bucket
-  // is unaffected either way; the only risk is this turn not being there
-  // on some FUTURE restart.
+  // getOrCreateBucketStore()), so it runs whenever the currently active
+  // bucket receives a turn via chatStore.pushTurn(). Best-effort: a failed
+  // save here never blocks or surfaces an error to the user mid-
+  // conversation - this page's own in-memory bucket is unaffected either
+  // way; the only risk is this turn not being there on some FUTURE
+  // restart.
   function persistChatBucket(bucketKeySuffix, turns) {
     fetch('/api/chat-history/save', {
       method: 'POST',
@@ -462,56 +451,52 @@ document.addEventListener('DOMContentLoaded', async () => {
     }).catch((err) => console.error('Failed to persist active chat bucket:', err));
   }
 
-  // Chunk 5 of "splitting SQL/summary per in-scope database" (see
-  // captureAllModeHistory()/fanOutAllModeHistoryPerDatabase()'s own
-  // docstrings for the earlier chunks): builds the per-connection history
-  // payload an "all databases" mode /api/translate request sends alongside
-  // its own shared `history` field, so Phase B's per-connection SQL-
-  // generation call for a given database can be fed THAT SAME database's
-  // own FULLY MERGED history - single-connection-mode turns and every
-  // prior all-mode turn already fanned out to it, indistinguishably (see
-  // connectionBucketKey()'s own docstring for why the two are now one and
-  // the same bucket) - instead of no history at all.
+  // Builds the per-connection history payload a dataset-group-mode
+  // /api/translate request sends alongside its own shared `history` field,
+  // so Phase B's per-connection SQL-generation call for a given database
+  // can be fed that database's own history - but ONLY from turns actually
+  // asked against it directly in single-connection mode. A group-mode turn
+  // is deliberately never also recorded into any individual member
+  // database's own bucket (that used to happen, as a "fan-out" - removed
+  // because it surprised users by making a group question appear in a
+  // specific database's own back/forward history), so a database that has
+  // only ever been reached through this group contributes no history here
+  // at all, even after the group has asked about it many times.
   //
-  // One entry per connection "all databases" mode could ever actually
-  // route Phase B to - EVERY currently configured preset (CONFIGURED_DBS)
-  // plus every one of this user's own SAVED custom connections (a row
-  // with a real `connection_key` - see ACTIVE_CUSTOM_CONNECTION_KEY's own
-  // declaration comment for what distinguishes a saved connection from an
-  // unsaved ad hoc one). Deliberately NOT IN_SCOPE_PRESET_IDS/
-  // IN_SCOPE_CUSTOM_KEYS - those are the explicit-list arrays "single"
-  // mode's own scope uses, but "all" mode's real routing candidate pool
-  // ignores them entirely in favor of every configured/saved connection
-  // (see db.py's resolve_in_scope_descriptors/_resolve_all_configured_
-  // descriptors docstrings) - those two arrays can also simply be stale
-  // leftovers from the last time this session was in "single" mode (see
-  // config_routes.py's "'all' mode ignores them, leaves the existing
+  // One entry per connection the active dataset group could ever actually
+  // route Phase B to - exactly its own "dataset_list" members (looked up
+  // from CONFIGURED_DB_GROUPS by IN_SCOPE_GROUP_ID), always presets, never
+  // a custom connection (a group's dataset_list can only ever name another
+  // entry in DATABASE_PRESETS_FILE - see app_config.py's own validation).
+  // Deliberately NOT IN_SCOPE_PRESET_IDS/IN_SCOPE_CUSTOM_KEYS - those are
+  // the explicit-list arrays "single" mode's own scope uses, but "group"
+  // mode's real routing candidate pool ignores them entirely in favor of
+  // the active group's own fixed membership (see db.py's
+  // resolve_in_scope_descriptors/_resolve_group_configured_descriptors
+  // docstrings) - those two arrays can also simply be stale leftovers from
+  // the last time this session was in "single" mode (see
+  // config_routes.py's "'group' mode ignores them, leaves the existing
   // scope alone" behavior), so filtering by them here would silently
-  // starve Phase B of history for a database "all" mode can plainly still
-  // reach. Keyed by the exact same "preset:<id>"/"custom:<key>" string
-  // connectionBucketKey() builds, so translate_routes.py's
-  // stream_translation() can look each one up by `f"{kind}:{id}"` with
-  // zero string-format guessing on the server side.
+  // starve Phase B of history for a database the group can plainly still
+  // reach. Keyed by the exact same "preset:<id>" string connectionBucketKey()
+  // builds, so translate_routes.py's stream_translation() can look each
+  // one up by `f"{kind}:{id}"` with zero string-format guessing on the
+  // server side.
   //
   // Read-only against chatStoresByBucket - deliberately does NOT call
   // getOrCreateBucketStore() - a connection with no bucket yet (never
-  // visited, directly or via fan-out) simply contributes no key at all,
-  // rather than a request-build side effect creating an empty bucket
-  // nothing will ever populate. Built fresh on every all-mode request
-  // (see translatePrompt()'s own call site) rather than kept as standing
-  // state, since which connections are even configured/saved can change
-  // between turns.
+  // visited directly) simply contributes no key at all, rather than a
+  // request-build side effect creating an empty bucket nothing will ever
+  // populate. Built fresh on every group-mode request (see
+  // translatePrompt()'s own call site) rather than kept as standing state,
+  // since a group's own membership can change between turns (see
+  // app_config.py's "read live" reasoning).
   function buildInScopeConnectionHistories() {
     const identity = CURRENT_USER_IDENTITY || 'global';
     const out = {};
-    (CONFIGURED_DBS || []).forEach((db) => {
-      const bucketKeySuffix = connectionBucketKey('preset', db.id);
-      const store = chatStoresByBucket.get(`${identity}::${bucketKeySuffix}`);
-      if (store) out[bucketKeySuffix] = store.toPayload();
-    });
-    (customDatabases || []).forEach((db) => {
-      if (!db.connection_key) return; // unsaved ad hoc row - never part of "all" mode's real candidate pool
-      const bucketKeySuffix = connectionBucketKey('custom', db.connection_key);
+    const group = CONFIGURED_DB_GROUPS.find(g => g.id === IN_SCOPE_GROUP_ID);
+    (group?.dataset_list || []).forEach((presetId) => {
+      const bucketKeySuffix = connectionBucketKey('preset', presetId);
       const store = chatStoresByBucket.get(`${identity}::${bucketKeySuffix}`);
       if (store) out[bucketKeySuffix] = store.toPayload();
     });
@@ -568,37 +553,60 @@ document.addEventListener('DOMContentLoaded', async () => {
   // by this one field uniformly (see renderDbRadioButtons()). null when the
   // active connection isn't a preset at all (a custom connection instead).
   let ACTIVE_PRESET_ID = null;
+  // Each entry is {"id", "name", "type", "dialect_name"} - "type" is the
+  // raw dialect key (e.g. "postgres"), "dialect_name" is config_routes.py's
+  // own display-only addition (e.g. "PostgreSQL") that
+  // renderDbRadioButtons() shows in parentheses next to the preset's name.
+  // Never a secret either way - only ever id/name/type/dialect_name, never
+  // a preset's real connection string (see config_routes.py's
+  // _redact_preset_for_client()).
   let CONFIGURED_DBS = [];
+  // Dataset groups (see server/app_config.py's "DATASET GROUPS" comment) -
+  // one entry per DATABASE_PRESETS_FILE "dataset_group" object, each
+  // {"id", "name", "dataset_list"}. Populated straight from /api/config's
+  // configured_database_groups (see fetchBackendConfig()) - never secret,
+  // same redaction posture as CONFIGURED_DBS above (only id/name/type for
+  // a preset; here, the group's own id/name/member-id-list, never
+  // anything about a member preset's own connection details). Rendered
+  // with a hardcoded "(Dataset Group)" parenthetical rather than a server-
+  // sent field, since a group has no dialect of its own to redact/display.
+  let CONFIGURED_DB_GROUPS = [];
   // Multi-database question-answering (see server/translate_routes.py's
   // module docstring): the set of connections the user has marked "in
   // scope". Populated straight from /api/config's in_scope_preset_ids/
   // in_scope_custom_connection_keys (see fetchBackendConfig()). The
   // connection picker is a single-select radio group again (see
-  // renderDbRadioButtons()) - EITHER one specific connection OR the "All
-  // configured databases" option, and which one is checked is decided by
-  // IN_SCOPE_MODE (below), not by how many entries these two arrays
-  // happen to sum to - see isAllConnectionsSelected(). A single in-scope
-  // connection behaves exactly as before any of this multi-database
-  // feature existed - these two arrays existing/being non-empty is what
-  // the rest of the client uses to decide whether any of the new
-  // multi-database UI (the disclosure banner, per-tab database labels,
-  // pinning) is even relevant for the current session.
+  // renderDbRadioButtons()) - EITHER one specific connection OR one of the
+  // "DATASET GROUPS" options, and which one is checked is decided by
+  // IN_SCOPE_MODE/IN_SCOPE_GROUP_ID (below), not by how many entries these
+  // two arrays happen to sum to - see isGroupModeSelected(). A single
+  // in-scope connection behaves exactly as before any of this
+  // multi-database feature existed - these two arrays existing/being
+  // non-empty is what the rest of the client uses to decide whether any
+  // of the new multi-database UI (the disclosure banner, per-tab database
+  // labels, pinning) is even relevant for the current session.
   let IN_SCOPE_PRESET_IDS = [];
   let IN_SCOPE_CUSTOM_KEYS = [];
-  // The server's persisted "single"|"all" choice (see state_store.py's
+  // The server's persisted "single"|"group" choice (see state_store.py's
   // in_scope_mode docstring) - always one of those two strings once
   // /api/config has ever returned (the server itself defaults a
   // blank/never-set session to "single", never a raw null/undefined), so
-  // isAllConnectionsSelected() can just check this directly instead of
-  // inferring "all" from the in-scope arrays' combined length. That
+  // isGroupModeSelected() can just check this directly instead of
+  // inferring it from the in-scope arrays' combined length. That
   // length-based inference used to be the only signal available (before
   // the server persisted in_scope_mode at all) and gets two edge cases
   // wrong on its own: a legacy session with 2+ specific connections
-  // in scope (in_scope_mode still "single") would misread as "All", and a
-  // session in "all" mode with only ONE connection actually configured
-  // (in_scope_preset_ids/in_scope_custom_connection_keys summing to 1)
-  // would misread as that one specific connection instead of "All".
+  // in scope (in_scope_mode still "single") would misread as a group, and
+  // a session in "group" mode whose active group has only ONE dataset
+  // listed would misread as that one specific connection instead of the
+  // group.
   let IN_SCOPE_MODE = 'single';
+  // Which DATABASE_PRESETS_FILE dataset_group's "id" is active when
+  // IN_SCOPE_MODE === 'group' - see server/state_store.py's
+  // in_scope_group_id docstring. Meaningless/ignored in "single" mode,
+  // same as IN_SCOPE_PRESET_IDS/IN_SCOPE_CUSTOM_KEYS are ignored in
+  // "group" mode.
+  let IN_SCOPE_GROUP_ID = '';
   let MAX_IN_SCOPE_CONNECTIONS = 20;
   // Which connection(s) THIS conversation has actually used, as
   // {kind: "preset"|"custom", id, name} references (never raw descriptors/
@@ -1055,12 +1063,12 @@ document.addEventListener('DOMContentLoaded', async () => {
   // server-side by the time that line is even written - so, same
   // "submission, not completion" semantics the top-level call already
   // uses, just one level down: one event per REAL translate call this
-  // turn is about to make. `mode: 'all'` is hardcoded (never 'single') -
-  // this only ever fires for "all databases" mode's own fan-out.
+  // turn is about to make. `mode: 'group'` is hardcoded (never 'single') -
+  // this only ever fires for dataset group mode's own fan-out.
   function trackAllModeFanoutTranslate(connectionSelection) {
     (connectionSelection || []).forEach((entry) => {
       trackEvent('translate_submitted', {
-        mode: 'all',
+        mode: 'group',
         database_name: entry.name || '',
         database_type: entry.type || '',
         provider: ACTIVE_LLM_PROVIDER || '',
@@ -1360,7 +1368,16 @@ document.addEventListener('DOMContentLoaded', async () => {
   // comment above openSchemaViewer(), near section 6, for the full design)
   const schemaViewerModal = document.getElementById('schemaViewerModal');
   const schemaViewerModalTitleText = document.getElementById('schemaViewerModalTitleText');
+  const schemaViewerFactsLine = document.getElementById('schemaViewerFactsLine');
   const schemaViewerModalCloseBtn = document.getElementById('schemaViewerModalCloseBtn');
+  const schemaViewerPanesWrap = document.getElementById('schemaViewerPanesWrap');
+  // Dataset-group variant's own flat table, shown instead of
+  // schemaViewerPanesWrap above - see openGroupSchemaViewer()/
+  // loadGroupSchemaViewer() near this feature's own section comment.
+  const schemaViewerGroupTableWrap = document.getElementById('schemaViewerGroupTableWrap');
+  const schemaViewerGroupTableBody = document.getElementById('schemaViewerGroupTableBody');
+  const schemaViewerListPane = document.getElementById('schemaViewerListPane');
+  const schemaViewerPanesResizer = document.getElementById('schemaViewerPanesResizer');
   const schemaViewerRefreshBtn = document.getElementById('schemaViewerRefreshBtn');
   const schemaViewerRefreshBtnLabel = document.getElementById('schemaViewerRefreshBtnLabel');
   const schemaViewerRefreshStatus = document.getElementById('schemaViewerRefreshStatus');
@@ -2152,23 +2169,34 @@ document.addEventListener('DOMContentLoaded', async () => {
     resultsRetryStatus.innerHTML = '';
   }
 
-  // Single-connection-mode progress label ("Reading the database schema…",
-  // then "Generating commands for the database…" - see
-  // translate_routes.py's stream_translation() docstring for the
-  // "phase_status" event this renders). Reuses the same banner element/
-  // styling as showRetryStatus()/showAllModeStreamStatus() above rather
-  // than adding a second element - this is never shown at the same time as
-  // either of those (all three are mutually exclusive server-side response
-  // shapes), so there's no risk of them treading on each other. Unlike
-  // showRetryStatus(), there's no "attempt X of Y" counter here - just a
-  // plain label naming which of the two pre-LLM-call waits is currently
-  // happening, since neither wait has a meaningful progress count of its
-  // own. Once /api/translate's stream ends, this same banner element is
-  // reused again for "Fetching results from the database…" - see
-  // showFetchingResultsStatus() below, covering the THIRD real wait
-  // (submitting the generated SQL to the actual database and waiting on
-  // it), which previously had no indicator of any kind once the SQL
-  // arrived.
+  // Single-connection-mode progress label ("Triaging…" for both of the
+  // schema/triage phase_status events - see translate_routes.py's
+  // stream_translation() docstring for the "phase_status" event this
+  // renders - then "Generating SQL…" once Call 1 decides real SQL is
+  // needed). This is the client-side half of the app's canonical 4-message
+  // progress vocabulary - Triaging / Generating SQL / Fetching Results /
+  // Summarizing - shared across single-connection mode (this function plus
+  // showFetchingResultsStatus() below) and dataset-group mode
+  // (showAllModeStreamStatus()/showAllModeSummarizingStatus() further
+  // down), the only difference being that dataset-group mode shows
+  // "Generating SQL…"/"Fetching Results…" as ONE combined message (see
+  // showAllModeStreamStatus()'s own docstring) since multiple connections'
+  // generate/execute steps genuinely overlap in wall-clock time there,
+  // whereas single-connection mode only ever has one connection to wait on
+  // and so shows them as two sequential, mutually-exclusive messages.
+  // Reuses the same banner element/styling as showRetryStatus()/
+  // showAllModeStreamStatus() above rather than adding a second element -
+  // this is never shown at the same time as either of those (all three are
+  // mutually exclusive server-side response shapes), so there's no risk of
+  // them treading on each other. Unlike showRetryStatus(), there's no
+  // "attempt X of Y" counter here - just a plain label naming which of the
+  // two pre-LLM-call waits is currently happening, since neither wait has
+  // a meaningful progress count of its own. Once /api/translate's stream
+  // ends, this same banner element is reused again for "Fetching
+  // Results…" - see showFetchingResultsStatus() below, covering the THIRD
+  // real wait (submitting the generated SQL to the actual database and
+  // waiting on it), which previously had no indicator of any kind once the
+  // SQL arrived.
   function showPhaseStatus(evt) {
     if (!resultsRetryStatus) return;
     resultsRetryStatus.innerHTML =
@@ -2188,7 +2216,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   function showFetchingResultsStatus() {
     if (!resultsRetryStatus) return;
     resultsRetryStatus.innerHTML =
-      `<span class="retry-status-icon animate-spin">⟳</span> Fetching results from the database…`;
+      `<span class="retry-status-icon animate-spin">⟳</span> Fetching Results…`;
     resultsRetryStatus.classList.remove('hidden');
   }
 
@@ -2549,58 +2577,54 @@ document.addEventListener('DOMContentLoaded', async () => {
   // don't exist, which is exactly the confusion a user checking 2+ boxes
   // in the connection picker and then seeing only one name in the badge
   // would run into. Returns {count, label, names} - `label` is what the
-  // badge text should show (the primary's own name when count <= 1,
-  // "All Pre-Configured Datasets" for real "all" mode, "Multiple databases" for
-  // the legacy explicit-subset case below) and `names` is the full
+  // badge text should show (the primary's own name when count <= 1, the
+  // active dataset group's own name for "group" mode, "Multiple databases"
+  // for the legacy explicit-subset case below) and `names` is the full
   // in-scope name list (resolved via configured_databases/custom_databases,
   // both already present on every /api/config response) for the tooltip.
   //
-  // "All" (data.in_scope_mode === 'all') is checked FIRST and directly -
-  // the same source of truth isAllConnectionsSelected() uses - rather
-  // than inferred from in_scope_preset_ids/in_scope_custom_connection_keys'
+  // "group" (data.in_scope_mode === 'group') is checked FIRST and directly -
+  // the same source of truth isGroupModeSelected() uses - rather than
+  // inferred from in_scope_preset_ids/in_scope_custom_connection_keys'
   // combined length the way the fallback branch below still does for a
   // legacy multi-select session. Those two arrays are NOT what decides
-  // "all" mode (see db.py's resolve_in_scope_descriptors: "all" ignores
-  // them entirely in favor of dynamically resolving every currently-
-  // configured connection) and can be arbitrarily short - even a single
-  // leftover entry from whatever was last explicitly picked before "All"
-  // was selected (see triggerConfigSave(): picking "All" leaves them
-  // untouched rather than sending fresh ones) - so counting them would
-  // wrongly show just one connection's name for a session genuinely in
-  // "all" mode, exactly the bug this once had.
+  // "group" mode (see db.py's resolve_in_scope_descriptors: "group" ignores
+  // them entirely in favor of the active group's own fixed "dataset_list")
+  // and can be arbitrarily short - even a single leftover entry from
+  // whatever was last explicitly picked before the group was selected (see
+  // triggerConfigSave(): picking a group leaves them untouched rather than
+  // sending fresh ones) - so counting them would wrongly show just one
+  // connection's name for a session genuinely in "group" mode, exactly the
+  // bug this once had for the removed "all mode" this replaces.
   function summarizeInScopeConnections(data) {
     const configuredDbs = data?.configured_databases || [];
     const customDbs = data?.custom_databases || [];
-    if (data?.in_scope_mode === 'all') {
-      // Presets only - see db.py's _resolve_all_configured_descriptors'
-      // own docstring for why custom connections are deliberately never
-      // part of "All Pre-Configured Datasets" mode. customDbs is intentionally
-      // NOT included in `names` here (unlike the legacy branch below,
-      // which can legitimately include them - it's an explicit, user-
-      // picked subset, not "all"). Also excludes any preset the admin has
-      // opted out of "all" mode (include_in_all_mode: false in
-      // presets.json - see app_config.py's DATABASE_PRESETS_FILE comment
-      // and db.py's _resolve_all_configured_descriptors) - configuredDbs
-      // only ever carries this key when it's explicitly false (see
-      // config_routes.py's _redact_preset_for_client), so `!== false`
-      // treats a missing key exactly like an explicit true, matching the
-      // server's own default. Without this filter, an opted-out preset
-      // would still show up in this badge/tooltip as if it were part of
-      // "All", even though the server never actually queries it.
-      const names = configuredDbs.filter(db => db.include_in_all_mode !== false).map(db => db.name);
-      return { count: names.length, label: names.length > 1 ? 'All Pre-Configured Datasets' : null, names };
+    if (data?.in_scope_mode === 'group') {
+      // Presets only - see db.py's _resolve_group_configured_descriptors'
+      // own docstring for why custom connections can never be a group
+      // member at all. customDbs is intentionally NOT included in `names`
+      // here (unlike the legacy branch below, which can legitimately
+      // include them - it's an explicit, user-picked subset, not a
+      // group). The active group's own "dataset_list" (resolved from
+      // data.configured_database_groups by data.in_scope_group_id) is the
+      // authoritative membership list - configuredDbs is only consulted to
+      // turn each member id into its display name.
+      const group = (data?.configured_database_groups || []).find(g => g.id === data?.in_scope_group_id);
+      const memberIds = group?.dataset_list || [];
+      const names = memberIds.map(id => configuredDbs.find(db => db.id === id)?.name || id);
+      return { count: names.length, label: group ? group.name : null, names };
     }
     const presetIds = data?.in_scope_preset_ids || [];
     const customKeys = data?.in_scope_custom_connection_keys || [];
     const count = presetIds.length + customKeys.length;
     if (count <= 1) return { count, label: null, names: [] };
     // A legacy session that saved an arbitrary multi-connection subset
-    // before the binary single/all choice existed (see
+    // before the binary single/group choice existed (see
     // resolve_in_scope_descriptors' docstring) - still more than one
     // connection in scope, but deliberately given its OWN label rather
-    // than "All Pre-Configured Datasets" too: this subset is explicit and can
-    // include custom connections, and isn't necessarily every preset
-    // either, so calling it "All" anything would misdescribe it.
+    // than a group's own name too: this subset is explicit and can
+    // include custom connections, and isn't tied to any admin-curated
+    // group either, so calling it by a group's name would misdescribe it.
     const names = [
       ...presetIds.map(id => configuredDbs.find(db => db.id === id)?.name || id),
       ...customKeys.map(key => customDbs.find(db => db.connection_key === key)?.name || key),
@@ -2746,6 +2770,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       serverConfirmedAuthEmail = data.authenticated ? (data.user_id || null) : null;
 
       CONFIGURED_DBS = data.configured_databases || [];
+      CONFIGURED_DB_GROUPS = data.configured_database_groups || [];
       DEFAULT_DB_URL = data.default_database_url || "";
       ACTIVE_DB_URL = data.active_database_url || DEFAULT_DB_URL;
       
@@ -2840,7 +2865,8 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       IN_SCOPE_PRESET_IDS = data.in_scope_preset_ids || [];
       IN_SCOPE_CUSTOM_KEYS = data.in_scope_custom_connection_keys || [];
-      IN_SCOPE_MODE = data.in_scope_mode === 'all' ? 'all' : 'single';
+      IN_SCOPE_MODE = data.in_scope_mode === 'group' ? 'group' : 'single';
+      IN_SCOPE_GROUP_ID = data.in_scope_group_id || '';
       if (data.max_in_scope_connections) {
         MAX_IN_SCOPE_CONNECTIONS = data.max_in_scope_connections;
       }
@@ -2987,7 +3013,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const container = document.getElementById('customDbsContainer');
     if (!container) return;
 
-    const allSelected = isAllConnectionsSelected();
+    const groupSelected = isGroupModeSelected();
 
     // Focusing/editing a custom row's own field checks that row's radio -
     // true radio semantics (this is a single-select group again, see
@@ -3037,11 +3063,12 @@ document.addEventListener('DOMContentLoaded', async () => {
       const sfAuthMethod = cfg.auth_method || (cfg.private_key ? 'private_key' : 'password');
       // Checked state comes from the in-scope set (see IN_SCOPE_CUSTOM_KEYS'
       // docstring) matched by connection_key - but, same as a preset
-      // option above, only when "All" isn't the current selection (see
-      // isAllConnectionsSelected()). Falls back to the legacy single-
-      // active-connection URL match only for a row with no connection_key
-      // at all (saved before that field existed on individual rows).
-      const isSelected = !allSelected && (db.connection_key
+      // option above, only when a dataset group isn't the current
+      // selection (see isGroupModeSelected()). Falls back to the legacy
+      // single-active-connection URL match only for a row with no
+      // connection_key at all (saved before that field existed on
+      // individual rows).
+      const isSelected = !groupSelected && (db.connection_key
         ? IN_SCOPE_CUSTOM_KEYS.includes(db.connection_key)
         : (ACTIVE_IS_CUSTOM && !ACTIVE_CUSTOM_CONNECTION_KEY && Boolean(db.url) && activeUrl === db.url));
 
@@ -3815,17 +3842,18 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Multi-database question-answering (see server/translate_routes.py's
   // module docstring) is scoped to a binary choice, not an arbitrary
   // subset: either ONE specific connection is in scope (today's original,
-  // unchanged behavior) or EVERY configured connection is ("All", see
-  // renderDbRadioButtons()' new radio option below). Which one is true is
-  // read straight from the server-persisted IN_SCOPE_MODE (see its
-  // declaration above for why this is more reliable than inferring "all"
+  // unchanged behavior) or one admin-curated DATASET GROUP is (see
+  // renderDbRadioButtons()' group radio options below). Which one is true
+  // is read straight from the server-persisted IN_SCOPE_MODE (see its
+  // declaration above for why this is more reliable than inferring it
   // from the in-scope arrays' combined length) - so this stays correct
-  // even for a session with only one connection actually configured but
-  // in_scope_mode "all", or a legacy session with 2+ specific connections
-  // saved under the old checkbox picker's arbitrary-subset UI but
-  // in_scope_mode still "single" (or never explicitly saved at all).
-  function isAllConnectionsSelected() {
-    return IN_SCOPE_MODE === 'all';
+  // even for a session whose active group has only one dataset actually
+  // listed but in_scope_mode "group", or a legacy session with 2+
+  // specific connections saved under the old checkbox picker's
+  // arbitrary-subset UI but in_scope_mode still "single" (or never
+  // explicitly saved at all).
+  function isGroupModeSelected() {
+    return IN_SCOPE_MODE === 'group';
   }
 
   function renderDbRadioButtons(currentDbUrl) {
@@ -3833,69 +3861,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (!radioGroup) return;
 
     const activeUrl = currentDbUrl || ACTIVE_DB_URL || DEFAULT_DB_URL;
-    const allSelected = isAllConnectionsSelected();
+    const groupSelected = isGroupModeSelected();
 
     let html = `<div class="radio-group-heading">PRE-CONFIGURED DATASETS (PLAYGROUNDS)</div>`;
-
-    // Two visual columns, purely a layout grouping (no change to what's
-    // selectable or how - db_connection_option/preset:<id> works exactly
-    // the same either way) - split straight down the middle by COUNT, not
-    // by dialect type: an earlier version grouped the 4 "simple
-    // credential" dialects (Postgres/MySQL/Oracle/SQL Server/MongoDB) on
-    // the left and the structured/cloud ones (BigQuery/Snowflake/
-    // Databricks/Redshift/Sheets) on the right, but that left a whole
-    // column empty whenever an admin's presets happened to cluster on one
-    // side (e.g. two Postgres presets and nothing else - exactly what
-    // "balanced, half on the left and half on the right" was reported
-    // against). The first (ceil half) of CONFIGURED_DBS's own order goes
-    // left, the rest go right, so an odd count leans left by one rather
-    // than leaving a column short by more than that.
-    const leftCount = Math.ceil(CONFIGURED_DBS.length / 2);
-    const leftPresets = CONFIGURED_DBS.slice(0, leftCount);
-    const rightPresets = CONFIGURED_DBS.slice(leftCount);
-
-    // Whether "All Pre-Configured Datasets" is even worth offering as a
-    // choice - see app_config.py's DATABASE_PRESETS_FILE comment on
-    // "include_in_all_mode" and db.py's _resolve_all_configured_descriptors,
-    // which now excludes any preset an admin has opted out. Deliberately
-    // ">  0", not "> 1": a single eligible preset already renders "All"
-    // today (see config-modal.spec.js's "with only one preset configured"
-    // test - unchanged, since include_in_all_mode defaults to eligible),
-    // so this must stay a no-op for every deployment that's never touched
-    // the new field. It only ever hides the option in the NEW case this
-    // field introduces: an admin has opted every single configured preset
-    // out, leaving nothing for "All" to mean beyond the single fallback
-    // default connection - confusing to still offer as if it were a real
-    // combined-mode choice. NOTE: this is a display-only check computed
-    // fresh every render - a session already saved in_scope_mode "all"
-    // from before an admin dropped eligibility to zero simply shows no
-    // radio checked next time this dialog opens, rather than something
-    // crashing; not solved further here ("for now").
-    const allModeEligibleCount = CONFIGURED_DBS.filter(db => db.include_in_all_mode !== false).length;
-    const showAllOption = allModeEligibleCount > 0;
-
-    // "All Pre-Configured Datasets" (see db.py's _resolve_all_configured_
-    // descriptors - presets only, never custom connections) renders as one
-    // more option in the SAME two-column preset list, directly after the
-    // very last preset - never its own separate section below the custom
-    // connections list the way it used to when it still spanned both
-    // lists. Appended to whichever column that last preset itself landed
-    // in (the right column whenever there's more than one preset total,
-    // so it sits right under the last preset there; the left column in
-    // the edge case where there's only 0-1 presets and the right column
-    // is empty) - this never disturbs the existing left/right preset
-    // split itself (see the count-based comment above), it only adds one
-    // extra item to whichever column already ends last. Only relevant at
-    // all when showAllOption is true.
-    const allOptionGoesInRightColumn = rightPresets.length > 0;
-
-    // Explanation of what this option does - previously a standalone <p>
-    // below the two-column grid, now an on-hover title attribute on the
-    // option itself instead (per explicit request to get it out of the
-    // dialog body), same text unchanged.
-    const ALL_OPTION_HINT = "Ask a question without picking a database first - the app figures out which preset "
-      + "dataset(s) it applies to, and can query more than one at once when a question genuinely needs it. Only "
-      + "presets are eligible here - your own custom connections are never included.";
 
     const renderPresetOption = (db) => {
       // Encodes the preset's stable id (never a secret, unlike the real
@@ -3907,31 +3875,89 @@ document.addEventListener('DOMContentLoaded', async () => {
       const value = `preset:${db.id}`;
       // Checked state comes from the in-scope set (see IN_SCOPE_PRESET_IDS'
       // docstring), not ACTIVE_PRESET_ID directly, but is only ever true
-      // for this SPECIFIC preset when "All" isn't the current selection
-      // (see isAllConnectionsSelected()) - the radio group is single-select
-      // again, so exactly one of "All" or one specific connection is
-      // checked at a time. A session that's never explicitly saved an
-      // in-scope set has this array lazily derived server-side from the
-      // single active connection (state_store.py's get_session), so a
-      // never-touched session's one radio shows checked exactly as before
-      // this feature existed.
-      const isSelected = !allSelected && IN_SCOPE_PRESET_IDS.includes(db.id);
+      // for this SPECIFIC preset when a dataset group isn't the current
+      // selection (see isGroupModeSelected()) - the radio group is
+      // single-select again, so exactly one of a group or one specific
+      // connection is checked at a time. A session that's never explicitly
+      // saved an in-scope set has this array lazily derived server-side
+      // from the single active connection (state_store.py's get_session),
+      // so a never-touched session's one radio shows checked exactly as
+      // before this feature existed.
+      const isSelected = !groupSelected && IN_SCOPE_PRESET_IDS.includes(db.id);
+      // dialect_name (e.g. "PostgreSQL", "BigQuery Standard SQL") is a
+      // display-only field added by config_routes.py's
+      // _redact_preset_for_client() alongside the raw "type" key - shown in
+      // parentheses so every preset in this list reads as "<name> (<type>)",
+      // matching the same "<name> in <dialect>" terminology the Schema
+      // Viewer already uses for a single connection. Falls back to the raw
+      // "type" string itself on the off chance an older cached /api/config
+      // response (or a test double) doesn't carry dialect_name yet.
+      const dialectLabel = db.dialect_name || db.type || 'SQL';
       return `
         <label class="radio-option">
           <input type="radio" name="db_connection_option" value="${value}" data-dbname="${db.name}" ${isSelected ? 'checked' : ''}>
-          <span class="radio-label">${db.name}</span>
+          <span class="radio-label">${db.name} (${dialectLabel})</span>
         </label>
       `;
     };
 
-    const allOption = showAllOption ? `
-      <label class="radio-option all-databases-option" title="${ALL_OPTION_HINT}">
-        <input type="radio" name="db_connection_option" value="all" ${allSelected ? 'checked' : ''}>
-        <span class="radio-label">All Pre-Configured Datasets</span>
-      </label>
-    ` : '';
-    const leftColumnHtml = leftPresets.map(renderPresetOption).join('') + (allOptionGoesInRightColumn ? '' : allOption);
-    const rightColumnHtml = rightPresets.map(renderPresetOption).join('') + (allOptionGoesInRightColumn ? allOption : '');
+    // Dataset groups (see server/app_config.py's "DATASET GROUPS" comment) -
+    // one more admin-curated way to pick a scope, alongside the single
+    // presets/custom connections: a fixed subset of this file's own
+    // presets, never a dynamic "every configured dataset" pool (that
+    // notion doesn't exist any more - a dataset only ever joins a group by
+    // being explicitly listed in some group's own "dataset_list"). Used to
+    // render as its own separate "DATASET GROUPS" heading/column below the
+    // preset list - merged into this SAME playgrounds list instead (one
+    // heading, one balanced-column split) per explicit request: a group is
+    // just one more way to pick a scope, not a fundamentally different
+    // kind of thing that deserves visual separation from the presets that
+    // make it up. Still visually distinguished from an ordinary preset via
+    // the bold `.all-databases-option` styling and its own on-hover
+    // tooltip (GROUP_OPTION_HINT), same as before the merge.
+    const GROUP_OPTION_HINT = "Ask a question without picking a database first - the app figures out which of "
+      + "this group's own datasets it applies to, and can query more than one at once when a question genuinely "
+      + "needs it.";
+    const renderGroupOption = (group) => {
+      const value = `group:${group.id}`;
+      const isSelected = groupSelected && IN_SCOPE_GROUP_ID === group.id;
+      // "(Dataset Group)" mirrors the exact parenthetical the dataset-
+      // group Schema Viewer's own title already uses (see
+      // openGroupSchemaViewer()) - the same "type" a single preset's own
+      // dialect_name occupies in renderPresetOption() above, so every
+      // entry in this whole picker (single presets and groups alike)
+      // reads consistently as "<name> (<type>)".
+      return `
+        <label class="radio-option all-databases-option" title="${GROUP_OPTION_HINT}">
+          <input type="radio" name="db_connection_option" value="${value}" data-dbname="${group.name}" ${isSelected ? 'checked' : ''}>
+          <span class="radio-label">${group.name} (Dataset Group)</span>
+        </label>
+      `;
+    };
+
+    // One combined list - every preset, THEN every dataset group (groups
+    // trail the specific connections they're built from, matching this
+    // section's pre-merge top-to-bottom order) - split into two visual
+    // columns purely as a layout grouping (no change to what's selectable
+    // or how - db_connection_option/preset:<id>/group:<id> all work exactly
+    // the same either way), straight down the middle by COUNT, not by
+    // dialect type or entry kind: an earlier version grouped the 4 "simple
+    // credential" dialects (Postgres/MySQL/Oracle/SQL Server/MongoDB) on
+    // the left and the structured/cloud ones (BigQuery/Snowflake/
+    // Databricks/Redshift/Sheets) on the right, but that left a whole
+    // column empty whenever an admin's presets happened to cluster on one
+    // side (e.g. two Postgres presets and nothing else - exactly what
+    // "balanced, half on the left and half on the right" was reported
+    // against). The first (ceil half) of this combined order goes left, the
+    // rest go right, so an odd count leans left by one rather than leaving
+    // a column short by more than that.
+    const allEntries = [
+      ...CONFIGURED_DBS.map((db) => ({ html: renderPresetOption(db) })),
+      ...CONFIGURED_DB_GROUPS.map((group) => ({ html: renderGroupOption(group) })),
+    ];
+    const leftCount = Math.ceil(allEntries.length / 2);
+    const leftColumnHtml = allEntries.slice(0, leftCount).map((entry) => entry.html).join('');
+    const rightColumnHtml = allEntries.slice(leftCount).map((entry) => entry.html).join('');
 
     html += `
       <div class="preset-columns">
@@ -3982,7 +4008,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   // naively title-casing that string would render OpenAI's heading as
   // "Openai" instead of "OpenAI"; Google/Anthropic would already come out
   // right without it, but spelling all three out here is clearer than a
-  // one-off special case for just the exception.
+  // one-off special case for just the OpenAI exception.
   const LLM_PROVIDER_DISPLAY_NAMES = {
     google: "Google",
     anthropic: "Anthropic",
@@ -4381,24 +4407,27 @@ document.addEventListener('DOMContentLoaded', async () => {
     // boxes the way the old checkbox-based picker required.
     const selectedDbRadio = document.querySelector('input[name="db_connection_option"]:checked');
 
-    // "All configured databases" (see renderDbRadioButtons()'s new radio
-    // option) has no dedicated preset/custom fields of its own - the
+    // A dataset group (see renderDbRadioButtons()'s dataset-group entries,
+    // merged into the same playgrounds list as every single preset) has no
+    // dedicated preset/custom fields of its own - the
     // single PRIMARY connection (today's pre-existing connection_id/
     // is_custom fields) is still just whichever connection would be
-    // first in stable order (presets, then custom - see db.py's
-    // resolve_in_scope_descriptors), same rule already used server-side
-    // for resolving the primary out of an in-scope set. Synthesizing an
-    // equivalent preset:<id>/custom-<index> value here lets the exact same
-    // branch logic below (already handling every dialect) run unchanged
-    // rather than duplicating it for this option.
+    // first in the group's own "dataset_list" order, same rule already
+    // used server-side for resolving the primary out of an in-scope set
+    // (db.py's resolve_in_scope_descriptors/_resolve_group_configured_
+    // descriptors). Synthesizing an equivalent preset:<id> value here lets
+    // the exact same branch logic below (already handling every dialect)
+    // run unchanged rather than duplicating it for this option. A group's
+    // "dataset_list" can only ever name presets (app_config.py's own
+    // validation guarantees this at load time), never a custom
+    // connection, so there's no custom-<index> fallback to synthesize here
+    // the way the old "all configured databases" option needed.
     let effectiveSelectionValue = selectedDbRadio ? selectedDbRadio.value : null;
-    if (effectiveSelectionValue === 'all') {
-      if (CONFIGURED_DBS.length > 0) {
-        effectiveSelectionValue = `preset:${CONFIGURED_DBS[0].id}`;
-      } else {
-        const firstCompleteIndex = customDatabases.findIndex(isCompleteCustomDb);
-        effectiveSelectionValue = firstCompleteIndex >= 0 ? `custom-${firstCompleteIndex}` : null;
-      }
+    if (effectiveSelectionValue && effectiveSelectionValue.startsWith('group:')) {
+      const groupId = effectiveSelectionValue.slice('group:'.length);
+      const group = CONFIGURED_DB_GROUPS.find(g => g.id === groupId);
+      const firstMemberId = group?.dataset_list?.[0];
+      effectiveSelectionValue = firstMemberId ? `preset:${firstMemberId}` : null;
     }
 
     if (effectiveSelectionValue) {
@@ -4809,30 +4838,34 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // Multi-database question-answering (see server/translate_routes.py's
     // module docstring): the picker is a binary single-select choice again
-    // (see renderDbRadioButtons()) - one specific connection, or "All".
-    // in_scope_mode is what the server actually keys its behavior off of
-    // (see db.py's resolve_in_scope_descriptors/
-    // _resolve_all_configured_descriptors): "all" is expanded dynamically,
-    // at request time, to every connection configured THEN - not a list
-    // frozen at Save time, which is the whole point of "All" over the old
-    // arbitrary-checkbox picker. Picking one SPECIFIC connection still
-    // narrows scope back down to exactly that one immediately, below,
-    // which is what keeps a single in-scope connection's behavior
-    // byte-identical to before this feature existed.
-    const allMode = selectedDbRadio && selectedDbRadio.value === 'all';
-    payload.in_scope_mode = allMode ? 'all' : 'single';
+    // (see renderDbRadioButtons()) - one specific connection, or one
+    // admin-curated dataset group. in_scope_mode is what the server
+    // actually keys its behavior off of (see db.py's
+    // resolve_in_scope_descriptors/_resolve_group_configured_descriptors):
+    // "group" resolves the active group's own "dataset_list" fresh, at
+    // request time - not a list frozen at Save time, which is the whole
+    // point of a group over the old arbitrary-checkbox picker. Picking one
+    // SPECIFIC connection still narrows scope back down to exactly that
+    // one immediately, below, which is what keeps a single in-scope
+    // connection's behavior byte-identical to before this feature existed.
+    const groupMode = selectedDbRadio && selectedDbRadio.value.startsWith('group:');
+    payload.in_scope_mode = groupMode ? 'group' : 'single';
+    if (groupMode) {
+      payload.in_scope_group_id = selectedDbRadio.value.slice('group:'.length);
+    }
 
-    if (!allMode) {
+    if (!groupMode) {
       // A custom row with no connection_key yet (freshly added and
       // completed in this SAME save) can't be represented in the in-scope
       // arrays at all until a follow-up save actually persists it and
       // assigns one (see _parse_incoming_custom_databases' docstring) - so
       // in_scope_preset_ids/in_scope_custom_connection_keys are left
-      // unset entirely in that one case (same as "All" above: the server
-      // leaves whatever scope was previously saved alone) rather than sent
-      // as empty arrays, which would otherwise trip the server's own "at
-      // least one connection must be in scope" validation despite a
-      // perfectly valid connection having just been selected.
+      // unset entirely in that one case (same as a dataset group above:
+      // the server leaves whatever scope was previously saved alone)
+      // rather than sent as empty arrays, which would otherwise trip the
+      // server's own "at least one connection must be in scope"
+      // validation despite a perfectly valid connection having just been
+      // selected.
       if (effectiveSelectionValue && effectiveSelectionValue.startsWith('preset:')) {
         payload.in_scope_preset_ids = [effectiveSelectionValue.slice('preset:'.length)];
         payload.in_scope_custom_connection_keys = [];
@@ -4904,12 +4937,15 @@ document.addEventListener('DOMContentLoaded', async () => {
           IN_SCOPE_CUSTOM_KEYS = data.in_scope_custom_connection_keys || [];
         }
         if (data.in_scope_mode !== undefined) {
-          IN_SCOPE_MODE = data.in_scope_mode === 'all' ? 'all' : 'single';
+          IN_SCOPE_MODE = data.in_scope_mode === 'group' ? 'group' : 'single';
+        }
+        if (data.in_scope_group_id !== undefined) {
+          IN_SCOPE_GROUP_ID = data.in_scope_group_id || '';
         }
 
         // Switches to (or creates) whichever bucket the now-current
         // ACTIVE_*/IN_SCOPE_MODE actually names - a real connection change,
-        // or flipping between single/all mode, both land here; re-saving
+        // or flipping between single/group mode, both land here; re-saving
         // the same connection or toggling an unrelated preference (e.g.
         // auto-execute) computes the same key as before and is a no-op
         // (see reconcileActiveHistoryBucket()'s own docstring).
@@ -4918,7 +4954,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (PINNED_CONNECTIONS.some(p => (
           p.kind === 'preset' ? !IN_SCOPE_PRESET_IDS.includes(p.id) : !IN_SCOPE_CUSTOM_KEYS.includes(p.id)
         ))) {
-          // A connection this "all databases" conversation had pinned (see
+          // A connection this dataset-group conversation had pinned (see
           // PINNED_CONNECTIONS' own docstring) was just unchecked from
           // scope - the pin no longer describes a set the user actually
           // wants questions routed to. Unlike a real connection-identity
@@ -5082,6 +5118,20 @@ document.addEventListener('DOMContentLoaded', async () => {
       // handler right after this one runs.
       e.stopPropagation();
       if (datasetSchemaViewerBtn.classList.contains('badge-disabled')) return;
+      // A dataset group (see isGroupModeSelected()) has no single "active"
+      // preset/custom connection of its own to describe - opens the
+      // group-table variant instead (see openGroupSchemaViewer()'s own
+      // comment), addressed by IN_SCOPE_GROUP_ID rather than ACTIVE_
+      // PRESET_ID/ACTIVE_CUSTOM_CONNECTION_KEY (those still point at the
+      // group's own synthesized primary/first member for query execution
+      // purposes - see the config-save handler's effectiveSelectionValue
+      // synthesis - which would silently open just THAT one dataset's own
+      // viewer instead of the whole group's).
+      if (isGroupModeSelected()) {
+        const group = CONFIGURED_DB_GROUPS.find((g) => g.id === IN_SCOPE_GROUP_ID);
+        if (group) openGroupSchemaViewer(group.id, group.name);
+        return;
+      }
       const schemaKind = ACTIVE_IS_CUSTOM ? 'custom' : 'preset';
       const schemaId = ACTIVE_IS_CUSTOM ? ACTIVE_CUSTOM_CONNECTION_KEY : ACTIVE_PRESET_ID;
       if (schemaKind && schemaId) {
@@ -5936,26 +5986,68 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // Mirrors chat_history_routes.py's own _resolve_bucket_display() -
   // "available" false means this bucket's connection could no longer be
-  // resolved against this user's CURRENT presets/custom connections (see
-  // that function's docstring for why such a bucket is still shown, not
-  // hidden). "custom-adhoc" never gets its raw URL rendered here either -
-  // the server already withheld it from `name`/`type` for exactly that
-  // reason; this function has no more of it to work with than that.
+  // resolved against this user's CURRENT presets/custom connections/dataset
+  // groups (a preset removed from DATABASE_PRESETS_FILE, a custom
+  // connection this user has since deleted, a dataset group that no longer
+  // exists, or the fixed "all" bucket_key from the removed "all mode"
+  // feature - see the "all" branch just below and _resolve_bucket_display's
+  // own comment on why THAT one is hardcoded unavailable too, not a special
+  // case). renderChatHistoryBucketList() below never reaches this function
+  // for such a bucket any more (they're filtered out before rendering - see
+  // its own comment), so the "Unavailable ..."/"Unknown connection"
+  // branches here are now unreachable in practice; left in place only as a
+  // defensive fallback for a future call site, not because anything still
+  // calls this with an unavailable bucket today.
+  // "custom-adhoc" never gets its raw URL rendered here either - the
+  // server already withheld it from `name`/`type` for exactly that reason;
+  // this function has no more of it to work with than that.
   function bucketDisplayLabel(bucket) {
+    // "all" (bare, no id) is a fossil from the removed "all mode" this
+    // feature replaces - never written again, but a session that saved
+    // one under it still has real history to show a name for (see
+    // chat_history_routes.py's own backward-compat comment on this same
+    // literal). A "group" bucket falls through to the ordinary
+    // available-and-named branch just below, same as "preset"/"custom" -
+    // chat_history_routes.py's own "group" branch already resolves its
+    // real name the identical way.
     if (bucket.kind === 'all') return bucket.name || 'All Pre-Configured Datasets (combined)';
     if (bucket.available && bucket.name) return bucket.name;
     if (bucket.kind === 'preset') return 'Unavailable preset';
     if (bucket.kind === 'custom') return 'Unavailable connection';
     if (bucket.kind === 'custom-adhoc') return 'Unsaved custom connection';
+    if (bucket.kind === 'group') return 'Unavailable dataset group';
     return 'Unknown connection';
   }
 
   function renderChatHistoryBucketList(buckets) {
     if (!chatHistoryBucketList) return;
     chatHistoryBucketList.innerHTML = '';
+    // #deleteAllChatHistoryBtn is deliberately gated on the FULL, unfiltered
+    // `buckets` list (every bucket the server returned, orphaned ones
+    // included) rather than `visibleBuckets` below - it still needs to be
+    // clickable to actually clear out orphaned turns server-side even
+    // though those rows are no longer individually shown/deletable here
+    // (see its own click handler further down, which likewise iterates the
+    // unfiltered list this function received, not the filtered one built
+    // here).
     if (deleteAllChatHistoryBtn) deleteAllChatHistoryBtn.disabled = buckets.length === 0;
 
-    if (buckets.length === 0) {
+    // Cross-references away every bucket whose connection/preset/dataset
+    // group no longer exists (bucket.available === false - see
+    // bucketDisplayLabel's/_resolve_bucket_display's own comments just
+    // above) instead of rendering it as an "Unavailable connection"/
+    // "Unavailable dataset group" row: once the underlying dataset is gone,
+    // a saved turn for it is meaningless to a user browsing this list -
+    // there's nothing to resume, rename, or even identify by name, just an
+    // opaque orphaned bucket_key. This also excludes the fixed "all"
+    // bucket_key (kind "all") - a fossil from the removed "all mode"
+    // feature (see _resolve_bucket_display's own comment) - since
+    // _resolve_bucket_display hardcodes IT as unavailable too: there's no
+    // live feature left for it to map to either, so it's exactly as
+    // meaningless a row as any other orphan here, not a real exception.
+    const visibleBuckets = buckets.filter((bucket) => bucket.available);
+
+    if (visibleBuckets.length === 0) {
       const li = document.createElement('li');
       li.className = 'chat-history-bucket-row chat-history-bucket-row--empty text-center text-muted py-8';
       li.textContent = 'No saved conversations yet.';
@@ -5963,22 +6055,16 @@ document.addEventListener('DOMContentLoaded', async () => {
       return;
     }
 
-    // "all" first (a global, not-really-a-database bucket), then every
-    // resolvable database alphabetically by name, then unresolvable/
-    // orphaned buckets last, grouped together rather than interleaved -
-    // there's no name to alphabetize THEM by, and they're the least
-    // important entries here.
-    const sorted = [...buckets].sort((a, b) => {
-      const rank = (x) => (x.kind === 'all' ? 0 : x.available ? 1 : 2);
-      const rankDiff = rank(a) - rank(b);
-      if (rankDiff !== 0) return rankDiff;
-      return (a.name || '').localeCompare(b.name || '') || a.bucket_key.localeCompare(b.bucket_key);
-    });
+    // Every entry reaching this sort is a real, currently-available
+    // database (orphans, "all" included, were filtered out above) - just
+    // alphabetical by name, with bucket_key as a stable tiebreaker.
+    const sorted = [...visibleBuckets].sort((a, b) => (
+      (a.name || '').localeCompare(b.name || '') || a.bucket_key.localeCompare(b.bucket_key)
+    ));
 
     sorted.forEach((bucket) => {
       const li = document.createElement('li');
       li.className = 'chat-history-bucket-row';
-      if (!bucket.available) li.classList.add('chat-history-bucket-row--unavailable');
 
       const info = document.createElement('div');
       info.className = 'chat-history-bucket-info';
@@ -6099,7 +6185,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const msgEl = document.getElementById('historyActionMsg');
     if (!msgEl) return;
     msgEl.textContent = text;
-    msgEl.style.color = isError ? 'var(--danger, #f87171)' : 'var(--primary, #10b981)';
+    msgEl.style.color = isError ? 'var(--danger, #f87171)' : 'var(--primary, #487f6d)';
   }
 
   if (chatHistoryBucketList) {
@@ -6198,19 +6284,21 @@ document.addEventListener('DOMContentLoaded', async () => {
   // one, filtering by name and body text) - just a plain, full list of
   // every entry.
   //
-  // The list itself is a 2-level tree: up to four top-level groups
-  // (Tables/Views/Indexes/Routines, each labeled with its own item count
-  // and collapsible - see schemaViewerExpanded below), each holding the
-  // matching items parsed out of this connection's schema text. Tables
-  // come from the same Table:/Table family:/Tab: entries the columns
-  // table (etc.) already uses; Views/Indexes/Routines come from their own
-  // global sections (see parseSchemaViews()/parseSchemaIndexes()/
-  // parseSchemaRoutines() below) the same way Row count estimates/
-  // Constraints/Column value samples do. A group this dialect/connection
-  // has none of (most dialects have no Indexes section at all - see
-  // parseSchemaIndexes()'s own comment) is left out of the tree entirely
-  // (see renderSchemaViewerEntryList()) rather than shown as an empty,
-  // non-expandable "(0)" row.
+  // The list itself is a 2-level tree: up to five top-level groups
+  // (Tables/Views/Indexes/Routines/Grants, each labeled with its own item
+  // count and collapsible - see schemaViewerExpanded below), each holding
+  // the matching items parsed out of this connection's schema text.
+  // Tables come from the same Table:/Table family:/Tab: entries the
+  // columns table (etc.) already uses; Views/Indexes/Routines/Grants come
+  // from their own global sections (see parseSchemaViews()/
+  // parseSchemaIndexes()/parseSchemaRoutines()/parseSchemaGrants() below)
+  // the same way Row count estimates/Constraints/Column value samples do.
+  // A group this dialect/connection has none of (most dialects have no
+  // Indexes section at all - see parseSchemaIndexes()'s own comment; only
+  // Postgres/MySQL/Databricks/Oracle/MSSQL/Redshift emit Grants at all -
+  // see parseSchemaGrants()'s own comment) is left out of the tree
+  // entirely (see renderSchemaViewerEntryList()) rather than shown as an
+  // empty, non-expandable "(0)" row.
   // ===========================================================================
 
   // This request's own connection reference ({kind: 'preset'|'custom', id})
@@ -6220,29 +6308,37 @@ document.addEventListener('DOMContentLoaded', async () => {
   // function's parameters.
   let schemaViewerCurrentRef = { kind: '', id: '' };
   let schemaViewerEntries = [];
-  // { category: 'tables'|'views'|'indexes'|'routines'|null, index: number }
-  // - which single leaf in the tree is selected, if any. Replaces a bare
-  // index now that the list holds four separate item arrays rather than
-  // just schemaViewerEntries.
+  // { category: 'tables'|'views'|'indexes'|'routines'|'grants'|null, index:
+  // number } - which single leaf in the tree is selected, if any. Replaces
+  // a bare index now that the list holds five separate item arrays rather
+  // than just schemaViewerEntries.
   let schemaViewerSelected = { category: null, index: -1 };
   // Which top-level groups are expanded - reset on every fresh load (see
   // loadSchemaViewerConnection()) rather than persisted across
   // connections, since a group that made sense to collapse/expand for one
-  // dataset has no bearing on the next one opened. All four start
+  // dataset has no bearing on the next one opened. All five start
   // collapsed - the dialog opens landed on the pinned "Overview" entry
   // instead (see renderSchemaViewerEntryList()'s default-selection logic),
   // so there's no need for any group's own contents to already be
   // unfurled underneath it.
-  let schemaViewerExpanded = { tables: false, views: false, indexes: false, routines: false };
-  // Views/Indexes/Routines parsed once per load (see parseSchemaViews()/
-  // parseSchemaIndexes()/parseSchemaRoutines() below) - lists in the same
-  // spirit as schemaViewerEntries above, just for these other three tree
-  // groups. schemaViewerViews: [{ name, definition }]. schemaViewerIndexes:
+  let schemaViewerExpanded = { tables: false, views: false, indexes: false, routines: false, grants: false };
+  // Views/Indexes/Routines/Grants parsed once per load (see
+  // parseSchemaViews()/parseSchemaIndexes()/parseSchemaRoutines()/
+  // parseSchemaGrants() below) - lists in the same spirit as
+  // schemaViewerEntries above, just for these other four tree groups.
+  // schemaViewerViews: [{ name, definition }]. schemaViewerIndexes:
   // [{ table, name, kind, detail }]. schemaViewerRoutines: [{ name,
-  // signature, returnType, body }].
+  // signature, returnType, body }]. schemaViewerGrants: [{ table,
+  // privilege, grantee, detail }] - one row per line in the "Grants:"
+  // global section (see parseSchemaGrants()'s own comment for why this
+  // needed its own tree group at all - it used to fall through, un-
+  // recognized, to the bottom of whichever table entry happened to be
+  // LAST, the same "un-headed global section" trap Constraints/Indexes/
+  // Views/Routines were already promoted out of).
   let schemaViewerViews = [];
   let schemaViewerIndexes = [];
   let schemaViewerRoutines = [];
+  let schemaViewerGrants = [];
   // Per-table metadata parsed once per load out of the "Row count
   // estimates:"/"Live row counts:"/"Column value samples:"/"Constraints:"
   // global sections (see parseSchemaRowCounts()/parseSchemaColumnSamples()/
@@ -6267,28 +6363,40 @@ document.addEventListener('DOMContentLoaded', async () => {
   // rest of this load already uses.
   let schemaViewerOverview = null;
   // Facts about the whole connection, parsed/derived once per load and
-  // rendered together at the top of the Overview tab (see
-  // renderSchemaViewerStatsBlockHtml() below) rather than under the modal
-  // title the way schemaViewerSessionInfoText alone used to be shown -
-  // none of these are specific to any one table/view/index/routine.
-  // schemaViewerSessionInfoText: the "Session: ..." one-liner (see
-  // parseSchemaSessionInfo() below), '' when a dialect emits none (e.g.
-  // backends/databricks.py) - rendered under an "Other settings:" label,
-  // not "Session:" (see renderSchemaViewerStatsBlockHtml()).
+  // rendered in the short "Size: ~...; Schema: ... chars" facts line under
+  // the modal title (see renderSchemaViewerFactsLine()/
+  // buildSchemaViewerFactParts() below) - dataset size and schema size
+  // stay visible no matter which tree entry is currently selected, not
+  // just while the Overview entry is (an earlier version of this showed
+  // them only inside the Overview tab's own content instead).
+  // schemaViewerSessionInfoText: the "Session: ..." one-liner's own value,
+  // prefix already stripped (see parseSchemaSessionInfo() below), '' when
+  // a dialect emits none (e.g. backends/databricks.py). Parsed every load
+  // same as the other facts here, but NOT currently rendered anywhere
+  // (buildSchemaViewerFactParts() deliberately leaves it out, per an
+  // explicit request to shorten the facts line to just the two size
+  // figures) - stays available on this variable for any future use.
   // schemaViewerDatasetSizeLine: the "Estimated dataset size: ..."
-  // one-liner the deep fetch appends when its dialect can cheaply
-  // estimate one (see parseSchemaDatasetSizeLine() below and
-  // backends/base.py's format_dataset_size_line()), '' when a dialect has
-  // no cheap way to (e.g. backends/mongodb_sql.py, backends/sheets.py) -
-  // shown side by side with schemaViewerSchemaCharCount on one row.
+  // one-liner's own value, prefix already stripped, the deep fetch
+  // appends when its dialect can cheaply estimate one (see
+  // parseSchemaDatasetSizeLine() below and backends/base.py's
+  // format_dataset_size_line()), '' when a dialect has no cheap way to
+  // (e.g. backends/mongodb_sql.py, backends/sheets.py) - shown with its
+  // own "Data Size:" label, concatenated in the facts line together with
+  // schemaViewerSchemaCharCount's own "Schema Size:"-labeled figure.
   // schemaViewerSchemaCharCount: fullText.length - the raw schema text
-  // size actually sent to the LLM, in characters. schemaViewerDialect:
+  // size actually sent to the LLM, in characters (stored/used internally
+  // as characters throughout; only buildSchemaViewerFactParts()'s display
+  // converts it to an approximate token count for the facts line - see
+  // SCHEMA_VIEWER_CHARS_PER_TOKEN). schemaViewerDialect:
   // GET /api/schema's own "dialect" field, used for the modal title (see
   // loadSchemaViewerConnection()). schemaViewerLimitWarnings: plain-text
   // warning lines for whichever of SCHEMA_MAX_TABLES/SCHEMA_MAX_SCHEMA_
   // CHARS this connection is actually hitting right now (mirrors data.
   // truncated/data.has_omitted_tables - see loadSchemaViewerConnection()'s
-  // own comment; these used to only show in the dismissable notice bar).
+  // own comment; these used to only show in the dismissable notice bar) -
+  // still shown inside the Overview tab, not in the header facts line
+  // (see renderSchemaViewerStatsBlockHtml()).
   let schemaViewerSessionInfoText = '';
   let schemaViewerDatasetSizeLine = '';
   let schemaViewerSchemaCharCount = 0;
@@ -6312,6 +6420,15 @@ document.addEventListener('DOMContentLoaded', async () => {
   // request-token guard pattern used elsewhere in this file for
   // in-flight-request races (e.g. translatePrompt's own).
   let schemaViewerRequestToken = 0;
+
+  // Tracks only "a real POST /api/config/refresh-schema call is in
+  // flight", distinct from schemaViewerRefreshBtn.disabled itself - the
+  // group-schema variant (see openGroupSchemaViewer()) also disables that
+  // same button permanently as its "not available yet for a whole group"
+  // treatment, and closeSchemaViewer() needs to tell the two apart: a
+  // permanently-inert button should never block closing the dialog, only
+  // an actual in-flight request should.
+  let schemaViewerRefreshInFlight = false;
 
   // Matches one column's rendered line, in the "  {name} {type} {NULL|NOT
   // NULL}[ {whatever the dialect appends next}]" shape essentially every
@@ -6833,6 +6950,50 @@ document.addEventListener('DOMContentLoaded', async () => {
     return routines;
   }
 
+  // Parses the "Grants:"/"Grants (current role):"/"Grants (best-effort -
+  // ...):" global section (see backends/*.py's own "N. Grants" comments -
+  // every SQL backend except BigQuery/mongodb_sql/sheets emits one, best-
+  // effort) into [{ table, privilege, grantee, detail }] - one row per
+  // line. Used to be entirely unrecognized by this file, which meant it
+  // fell through the "un-headed global section" trap every OTHER section
+  // here was already promoted out of (see extractNamedSchemaSection()'s
+  // own top-of-feature comment): it just rode along, un-stripped, in
+  // whichever table entry's own "remainder" text happened to be shown
+  // last (see renderSchemaViewerEntryDetail()'s stripNamedSchemaSections()
+  // call) - looking like it belonged to that one table rather than
+  // describing the whole connection. Now a real "Grants" tree group, same
+  // as Views/Indexes/Routines.
+  //
+  // Two line shapes exist across dialects (see e.g. backends/postgres.py's
+  // vs. backends/snowflake.py's own grant_lines list comprehension):
+  //   - Postgres/MySQL/Databricks/Oracle/MSSQL/Redshift: "  Grant {privilege}
+  //     on {table} to {grantee}" - one row per (table, grantee, privilege).
+  //   - Snowflake: "  {table}: {privilege[, privilege...]} (role {role})" -
+  //     one row per table, privileges already comma-joined for that role.
+  // A line matching neither shape (a future backend's own format) is
+  // skipped rather than guessed at - same "never throws, just yields
+  // fewer rows" leniency parseSchemaIndexes()/parseSchemaRoutines() apply
+  // to their own unrecognized lines.
+  function parseSchemaGrants(fullText) {
+    const grants = [];
+    const body = extractNamedSchemaSection(fullText, 'Grants');
+    if (!body) return grants;
+    const grantRe = /^ {2}Grant (\S+) on (\S+) to (\S+)$/;
+    const snowflakeRe = /^ {2}(\S+): (.+) \(role (.+)\)$/;
+    body.split('\n').forEach((line) => {
+      let m = grantRe.exec(line);
+      if (m) {
+        grants.push({ privilege: m[1], table: m[2], grantee: m[3], detail: line.trim() });
+        return;
+      }
+      m = snowflakeRe.exec(line);
+      if (m) {
+        grants.push({ table: m[1], privilege: m[2], grantee: `role ${m[3]}`, detail: line.trim() });
+      }
+    });
+    return grants;
+  }
+
   // The "Session:" line (backends/*.py's own one-liner - session
   // timezone/default collation/territory/sort order, wording and exact
   // fields vary per dialect) is the one global section that's a single
@@ -6847,20 +7008,24 @@ document.addEventListener('DOMContentLoaded', async () => {
     return m ? m[1] : '';
   }
 
-  // Same shape as parseSchemaSessionInfo() above, for the "Estimated
-  // dataset size: ..." bare line a SQL backend's get_schema() (deep
-  // fetch) appends when its dialect has a cheap, catalog/metadata-based
-  // way to estimate the whole connection's total size (see backends/
-  // base.py's format_dataset_size_line() for exactly what it can contain -
-  // rows, bytes, table count, any combination). Returns the full line
-  // (including its "Estimated dataset size:" prefix, unlike
-  // parseSchemaSessionInfo's capture-group-only return) since this one's
-  // wording already reads naturally on its own. '' when a dialect has no
-  // such source (e.g. backends/mongodb_sql.py, backends/sheets.py) - never
-  // shown as a misleading zero/blank statistic.
+  // Same shape as parseSchemaSessionInfo() above (capture-group-only,
+  // prefix stripped), for the "Estimated dataset size: ..." bare line a
+  // SQL backend's get_schema() (deep fetch) appends when its dialect has a
+  // cheap, catalog/metadata-based way to estimate the whole connection's
+  // total size (see backends/base.py's format_dataset_size_line() for
+  // exactly what it can contain - rows, bytes, table count, any
+  // combination). The server-side label stays "Estimated dataset size:"
+  // (this text doubles as part of the real schema_text an LLM prompt also
+  // sees, so it's never rewritten here) - the client applies its own
+  // "Estimate Size:" label at render time instead (see
+  // renderSchemaViewerStatsBlockHtml()), same reasoning as the
+  // "Session:" -> unlabeled treatment for parseSchemaSessionInfo's own
+  // result. '' when a dialect has no such source (e.g. backends/
+  // mongodb_sql.py, backends/sheets.py) - never shown as a misleading
+  // zero/blank statistic.
   function parseSchemaDatasetSizeLine(fullText) {
-    const m = /^Estimated dataset size:.*$/m.exec(fullText || '');
-    return m ? m[0] : '';
+    const m = /^Estimated dataset size: (.+)$/m.exec(fullText || '');
+    return m ? m[1] : '';
   }
 
   // Removes the "Session:"/"Estimated dataset size:" bare lines specifically
@@ -6966,17 +7131,20 @@ document.addEventListener('DOMContentLoaded', async () => {
     return counts.live ? ` (${formatted} rows)` : ` (~${formatted} rows, estimated)`;
   }
 
-  // The four top-level tree groups, in display order. `items()` returns
+  // The five top-level tree groups, in display order. `items()` returns
   // this load's array for that group; `label()` renders one item's own
-  // tree-row text (every group but Indexes just uses its plain name -
-  // Indexes are qualified by table, since an index name alone doesn't say
-  // which table it belongs to; Tables also gets its row-count suffix, see
-  // schemaViewerRowCountSuffix() above).
+  // tree-row text (every group but Indexes/Grants just uses its plain
+  // name - Indexes are qualified by table, since an index name alone
+  // doesn't say which table it belongs to; Grants likewise, plus the
+  // privilege/grantee, since neither alone identifies one grant row;
+  // Tables also gets its row-count suffix, see schemaViewerRowCountSuffix()
+  // above).
   const SCHEMA_VIEWER_GROUPS = [
     { key: 'tables', title: 'Tables', items: () => schemaViewerEntries.filter((e) => e.name !== null), label: (item) => `${item.name}${schemaViewerRowCountSuffix(item.name)}` },
     { key: 'views', title: 'Views', items: () => schemaViewerViews, label: (item) => item.name },
     { key: 'indexes', title: 'Indexes', items: () => schemaViewerIndexes, label: (item) => `${item.table}.${item.name}` },
     { key: 'routines', title: 'Routines', items: () => schemaViewerRoutines, label: (item) => item.name },
+    { key: 'grants', title: 'Grants', items: () => schemaViewerGrants, label: (item) => `${item.table}: ${item.privilege} → ${item.grantee}` },
   ];
 
   function renderSchemaViewerEntryList() {
@@ -7082,49 +7250,95 @@ document.addEventListener('DOMContentLoaded', async () => {
   // db.py's _generate_and_cache_schema_overview()) - pointing at the
   // Refresh Schema button above, which is what actually triggers
   // generation.
-  // Builds the small facts-and-warnings block shown at the top of the
-  // Overview tab, above the AI-written prose (or the "nothing generated
-  // yet" message) - the best-effort total dataset size the deep fetch
+  // Shared by renderSchemaViewerFactsLine() (the persistent header line,
+  // below) - builds the short "Data Size: ~...;   Schema Size: ..."
+  // subtitle from the best-effort total dataset size the deep fetch
   // computed (see parseSchemaDatasetSizeLine()/backends/base.py's
-  // format_dataset_size_line()) and the schema's own text size share ONE
-  // row (side by side, via the -split modifier below, since both are
-  // just size figures about this same connection), followed by the
-  // connection-wide "Session:" line - relabeled "Other settings:" here,
-  // since "Session:" reads like a login/connection-session concept to a
-  // viewer rather than what it actually is (timezone/collation/sort-order
-  // metadata) - on its own row underneath, then a warning row for either
-  // SCHEMA_MAX_TABLES or SCHEMA_MAX_SCHEMA_CHARS this connection is
-  // actually exceeding right now. Each row is independently optional
-  // (most of this is unavailable for at least one real dialect - see
-  // backends/sheets.py, backends/mongodb_sql.py, backends/databricks.py),
-  // so this returns '' rather than an empty box when there's truly
-  // nothing to show (a fresh connection with no schema loaded yet, e.g.).
-  function renderSchemaViewerStatsBlockHtml() {
-    const rows = [];
-    // Dataset size + schema character count: two independent figures
-    // about "how big is this" that read naturally side by side rather
-    // than stacked - shown as one row with as many of the two as are
-    // actually available (a dialect with no cheap size estimate at all,
-    // e.g. MongoDB Atlas SQL/Google Sheets, still gets its schema
-    // character count shown alone here).
-    const sizeParts = [];
-    if (schemaViewerDatasetSizeLine) sizeParts.push(escapeHtml(schemaViewerDatasetSizeLine));
+  // format_dataset_size_line()) and the schema's own text size. Each is
+  // independently optional (most of this is unavailable for at least one
+  // real dialect - see backends/sheets.py, backends/mongodb_sql.py,
+  // backends/databricks.py). Deliberately does NOT include
+  // schemaViewerSessionInfoText (the "Session: ..." one-liner) any more -
+  // kept a short two-fact subtitle rather than three per an explicit
+  // request to shorten it; schemaViewerSessionInfoText is still parsed out
+  // of the real schema text every load (see loadSchemaViewerConnection())
+  // and stays available in that variable for any future use, it's simply
+  // never rendered anywhere right now. Returns an array of already-HTML-
+  // escaped, already-labeled strings ("Data Size: ~2.4 GB", "Schema Size:
+  // 70 tokens") - renderSchemaViewerFactsLine() below joins them.
+  //
+  // Schema Size is displayed in tokens, not raw characters - purely a
+  // display-time conversion (schemaViewerSchemaCharCount itself still
+  // holds the raw character count; nothing about how the schema text is
+  // parsed/stored changes) using the flat approximation of 1 token per 4
+  // characters, per an explicit request. Quantized UP to the nearest 100
+  // (100 * CEIL(tokens / 100), per an explicit request) rather than
+  // rounded to the nearest integer - this is a rough, order-of-magnitude
+  // cost estimate (a flat chars-per-token ratio, not a real tokenizer
+  // count), so a precise-looking exact figure would overstate how exact
+  // it actually is; a small schema still shows as "100 tokens" (the
+  // quantization floor) rather than "0 tokens" for anything above zero.
+  const SCHEMA_VIEWER_CHARS_PER_TOKEN = 4;
+  const SCHEMA_VIEWER_TOKEN_QUANTUM = 100;
+
+  function buildSchemaViewerFactParts() {
+    const factParts = [];
+    if (schemaViewerDatasetSizeLine) factParts.push(`Data Size: ${escapeHtml(schemaViewerDatasetSizeLine)}`);
     if (schemaViewerSchemaCharCount > 0) {
-      sizeParts.push(`Schema size: ${schemaViewerSchemaCharCount.toLocaleString()} characters`);
+      const rawTokenEstimate = schemaViewerSchemaCharCount / SCHEMA_VIEWER_CHARS_PER_TOKEN;
+      const schemaTokenCount = SCHEMA_VIEWER_TOKEN_QUANTUM * Math.ceil(rawTokenEstimate / SCHEMA_VIEWER_TOKEN_QUANTUM);
+      factParts.push(`Schema Size: ${schemaTokenCount.toLocaleString()} tokens`);
     }
-    if (sizeParts.length > 0) {
-      rows.push(`<div class="schema-viewer-overview-stats-row schema-viewer-overview-stats-row-split">${sizeParts.map((p) => `<span>${p}</span>`).join('')}</div>`);
+    return factParts;
+  }
+
+  // Fills in (or hides) the facts line under the modal title - see
+  // index.html's own comment on #schemaViewerFactsLine. Called both from
+  // loadSchemaViewerConnection()'s up-front reset (hides it while a new
+  // connection's schema is loading, same moment the title reverts to its
+  // plain interim name) and once GET /api/schema actually resolves (fills
+  // it in with the real facts, same moment the title is upgraded to
+  // "<name> in <dialect>"). Persistent across which tree entry is
+  // selected - unlike the old Overview-tab-only stats block this replaced,
+  // this stays visible whether a table, a view, or the Overview entry
+  // itself is currently selected. Joined into one short phrase (e.g.
+  // "Data Size: ~2.4 GB;   Schema Size: 281 chars") rather than each fact
+  // as its own separately-wrapped/spaced element - there are only ever the
+  // two facts here now (see buildSchemaViewerFactParts()'s own comment on
+  // why the session-info figure was dropped). The separator is a
+  // semicolon followed by THREE actual non-breaking spaces (U+00A0, not
+  // three plain spaces) - plain spaces collapse to one when rendered as
+  // HTML, so a real visual gap here needs   specifically, per an
+  // explicit request for a wider-than-normal gap between the two facts. */
+  const SCHEMA_VIEWER_FACTS_SEPARATOR = ';   ';
+
+  function renderSchemaViewerFactsLine() {
+    if (!schemaViewerFactsLine) return;
+    const factParts = buildSchemaViewerFactParts();
+    if (factParts.length === 0) {
+      schemaViewerFactsLine.innerHTML = '';
+      schemaViewerFactsLine.classList.add('hidden');
+      return;
     }
-    if (schemaViewerSessionInfoText) {
-      rows.push(`<div class="schema-viewer-overview-stats-row">Other settings: ${escapeHtml(schemaViewerSessionInfoText)}</div>`);
-    }
+    schemaViewerFactsLine.innerHTML = factParts.join(SCHEMA_VIEWER_FACTS_SEPARATOR);
+    schemaViewerFactsLine.classList.remove('hidden');
+  }
+
+  // Builds the small warnings block shown at the top of the Overview tab,
+  // above the AI-written prose (or the "nothing generated yet" message) -
+  // one row for either SCHEMA_MAX_TABLES or SCHEMA_MAX_SCHEMA_CHARS this
+  // connection is actually exceeding right now. The dataset-size/schema-
+  // size/session-info facts this block used to also show live under the
+  // modal title instead now (see renderSchemaViewerFactsLine() above) -
+  // this returns '' rather than an empty box when there's truly nothing to
+  // show (no warnings at all, the common case).
+  function renderSchemaViewerStatsBlockHtml() {
     const warningsHtml = schemaViewerLimitWarnings
       .map((w) => `<div class="schema-viewer-overview-warning">${escapeHtml(w)}</div>`)
       .join('');
-    if (rows.length === 0 && !warningsHtml) return '';
+    if (!warningsHtml) return '';
     return `
       <div class="schema-viewer-overview-stats">
-        ${rows.join('')}
         ${warningsHtml}
       </div>
     `;
@@ -7144,10 +7358,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (!schemaViewerOverviewWrap) return;
     schemaViewerOverviewWrap.classList.remove('hidden');
 
-    // Facts-and-warnings block (session info, schema/dataset size,
-    // limit warnings) - see renderSchemaViewerStatsBlockHtml()'s own
-    // comment. Rendered whether or not an AI overview has been generated
-    // yet, since none of it depends on that.
+    // Limit-warnings block (SCHEMA_MAX_TABLES/SCHEMA_MAX_SCHEMA_CHARS) -
+    // see renderSchemaViewerStatsBlockHtml()'s own comment (the size/
+    // session-info facts that used to also live in this block are now
+    // rendered once, persistently, under the modal title instead - see
+    // renderSchemaViewerFactsLine()). Rendered whether or not an AI
+    // overview has been generated yet, since none of it depends on that.
     const statsHtml = renderSchemaViewerStatsBlockHtml();
 
     if (!schemaViewerOverview) {
@@ -7169,17 +7385,23 @@ document.addEventListener('DOMContentLoaded', async () => {
     const tableNames = schemaViewerEntries.filter((e) => e.name !== null).map((e) => e.name);
     const hasDiagram = !!buildSchemaErDiagram(tableNames, schemaViewerForeignKeys, schemaViewerNamingRelationships);
 
+    // Diagram last: the facts block, the AI prose, and the suggested
+    // questions are all short, text-first ways to get oriented quickly;
+    // the ER diagram is the most visually heavy element here (and the one
+    // most likely to need real vertical scroll room for a schema with
+    // several tables), so it goes at the very bottom of the Overview tab
+    // rather than between the prose and the questions.
     schemaViewerOverviewWrap.innerHTML = `
       ${statsHtml}
       <p class="schema-viewer-overview-prose">${escapeHtml(schemaViewerOverview.prose || '')}</p>
-      ${hasDiagram ? `
-        <div class="schema-viewer-overview-diagram-wrap">
-          <div class="schema-viewer-overview-diagram" id="schemaViewerErDiagram"><p class="text-muted schema-viewer-overview-empty">Rendering diagram...</p></div>
-        </div>` : ''}
       ${questions.length > 0 ? `
         <div class="schema-viewer-overview-questions-block">
           <div class="schema-viewer-overview-questions-title">Questions you could ask</div>
           <ul class="schema-viewer-overview-questions">${questionsHtml}</ul>
+        </div>` : ''}
+      ${hasDiagram ? `
+        <div class="schema-viewer-overview-diagram-wrap">
+          <div class="schema-viewer-overview-diagram" id="schemaViewerErDiagram"><p class="text-muted schema-viewer-overview-empty">Rendering diagram...</p></div>
         </div>` : ''}
     `;
 
@@ -7243,6 +7465,11 @@ document.addEventListener('DOMContentLoaded', async () => {
       const heading = `${r.name}(${r.signature})${r.returnType ? ` -> ${r.returnType}` : ''}`;
       return renderSchemaViewerSimpleDetail(heading, r.body || '(No body available for this routine.)');
     }
+    if (category === 'grants') {
+      const g = schemaViewerGrants[index];
+      if (!g) return renderSchemaViewerSimpleDetail('', '');
+      return renderSchemaViewerSimpleDetail(`${g.table} → ${g.grantee}`, g.detail);
+    }
 
     // category === 'tables' (or an unrecognized/stale ref) - the original,
     // fuller detail: row count, the structured columns table (with its
@@ -7284,16 +7511,18 @@ document.addEventListener('DOMContentLoaded', async () => {
       // below - strip those specific sections out (plus the "Session:"/
       // "Estimated dataset size:" one-liners, now shown at the top of the
       // Overview tab instead - see stripSchemaGlobalBareLines()'s own
-      // comment) and show only whatever is genuinely left (Grants/
-      // Triggers/Comments/... - not yet promoted to their own structured
-      // field, or their own tree group) or nothing at all. A dialect the
-      // column parser doesn't recognize (no columns found) still falls
-      // back to the complete, untouched raw text, same as before this
-      // table existed.
+      // comment) and show only whatever is genuinely left (Triggers/
+      // Comments/... - not yet promoted to their own structured field, or
+      // their own tree group) or nothing at all. A dialect the column
+      // parser doesn't recognize (no columns found) still falls back to
+      // the complete, untouched raw text, same as before this table
+      // existed. "Grants" was the last of these global sections still
+      // falling through here unrecognized (see parseSchemaGrants()'s own
+      // comment) - now stripped too, since it has its own tree group.
       const shownText = columns.length > 0
         ? stripSchemaGlobalBareLines(stripNamedSchemaSections(remainder, [
           'Row count estimates', 'Live row counts', 'Column value samples', 'Constraints',
-          'Indexes', 'Views', 'View definitions', 'Routines', 'Routine definitions',
+          'Indexes', 'Views', 'View definitions', 'Routines', 'Routine definitions', 'Grants',
         ]))
         : (entry.text || '');
       schemaViewerDetailText.textContent = shownText;
@@ -7320,6 +7549,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     schemaViewerViews = [];
     schemaViewerIndexes = [];
     schemaViewerRoutines = [];
+    schemaViewerGrants = [];
     schemaViewerRowCounts = {};
     schemaViewerSamples = {};
     schemaViewerConstraints = {};
@@ -7329,7 +7559,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     schemaViewerSelected = { category: null, index: -1 };
     // See this variable's own top-of-file declaration comment for why
     // every group starts collapsed.
-    schemaViewerExpanded = { tables: false, views: false, indexes: false, routines: false };
+    schemaViewerExpanded = { tables: false, views: false, indexes: false, routines: false, grants: false };
     if (schemaViewerEntryList) {
       schemaViewerEntryList.innerHTML = '<li class="schema-viewer-entry-empty text-center text-muted py-8">Loading...</li>';
     }
@@ -7342,6 +7572,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     schemaViewerSchemaCharCount = 0;
     schemaViewerDialect = '';
     schemaViewerLimitWarnings = [];
+    renderSchemaViewerFactsLine();
     setSchemaViewerRefreshStatus('');
 
     try {
@@ -7407,6 +7638,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       schemaViewerViews = parseSchemaViews(fullText);
       schemaViewerIndexes = parseSchemaIndexes(fullText);
       schemaViewerRoutines = parseSchemaRoutines(fullText);
+      schemaViewerGrants = parseSchemaGrants(fullText);
       // Deterministic ER-diagram inputs (see buildSchemaErDiagram() above) -
       // parsed once per load the same way every other global section is.
       schemaViewerForeignKeys = parseSchemaForeignKeys(fullText);
@@ -7429,6 +7661,9 @@ document.addEventListener('DOMContentLoaded', async () => {
           ? `${dsName} in ${data.dialect}`
           : dsName;
       }
+      // Same moment the title above gets its real value - fills in (or
+      // keeps hidden) the facts line right under it.
+      renderSchemaViewerFactsLine();
       // "cached_at" is informational for ANY connection (a preset's own
       // schema was still cached at some point - at startup, via
       // prefetch_all_preset_schemas() - even though it has no Refresh
@@ -7459,9 +7694,140 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (!schemaViewerModal || !kind || !id) return;
     trackEvent('schema_viewer_viewed', { kind });
     if (schemaViewerModalTitleText) schemaViewerModalTitleText.textContent = name || 'Schema Viewer';
+    // Undoes openGroupSchemaViewer()'s own layout switch (below) in case
+    // the LAST time this shared modal was opened, it was for a dataset
+    // group - this modal instance persists across opens, so without this
+    // a single-connection open right after a group one would still be
+    // showing the group's flat table underneath, with the LHS/RHS panes
+    // still hidden.
+    schemaViewerGroupTableWrap?.classList.add('hidden');
+    schemaViewerPanesWrap?.classList.remove('hidden');
+    if (schemaViewerFactsLine) schemaViewerFactsLine.classList.remove('hidden');
+    if (schemaViewerRefreshBtnLabel) schemaViewerRefreshBtnLabel.textContent = 'Refresh Schema';
+    if (schemaViewerRefreshBtn) {
+      schemaViewerRefreshBtn.title = "Re-fetch this connection's schema (bypasses the cache)";
+    }
     schemaViewerModal.classList.remove('hidden');
     bringModalToFront(schemaViewerModal);
     loadSchemaViewerConnection(kind, id);
+  }
+
+  // groupId/groupName: a CONFIGURED_DB_GROUPS entry's own id/name (see
+  // CONFIGURED_DB_GROUPS' own declaration comment) - the dataset-group
+  // counterpart to openSchemaViewer() above, opened instead of it whenever
+  // the "i" icon on the dataset badge is clicked while a dataset group
+  // (not a single preset/custom connection) is the selected option (see
+  // datasetSchemaViewerBtn's own click handler). Unlike a single
+  // connection, there's no per-group "dialect" to upgrade the title with
+  // once a fetch resolves and no single connection's tables/views/indexes/
+  // routines to browse - the title is fixed up front (never upgraded) and
+  // the body shows a flat table (schemaViewerGroupTableWrap) instead of
+  // the LHS/RHS panes, so this swaps that layout in directly rather than
+  // going through loadSchemaViewerConnection() at all.
+  //
+  // The header's Refresh Schema button/status line stay in the layout
+  // (kept as-is structurally - see index.html's own comment) but are
+  // deliberately inert here for now: POST /api/config/refresh-schema only
+  // ever resolves a single preset/custom connection by {kind, id}, with no
+  // "refresh every member of this group" mode of its own yet, and there is
+  // no single "last refreshed" timestamp that would even mean anything for
+  // several independently-cached datasets at once. Disabling the button
+  // (with an explanatory tooltip) rather than hiding it entirely reads as
+  // "not available for this kind of selection yet", not "gone" - a real
+  // per-group refresh is left for later work to add.
+  function openGroupSchemaViewer(groupId, groupName) {
+    if (!schemaViewerModal || !groupId) return;
+    trackEvent('schema_viewer_viewed', { kind: 'group' });
+    if (schemaViewerModalTitleText) {
+      schemaViewerModalTitleText.textContent = groupName ? `${groupName} (Dataset Group)` : 'Dataset Group';
+    }
+    // No subheader for this variant at all (no data-size/schema-size facts
+    // line - those are now the group table's own per-row columns instead).
+    if (schemaViewerFactsLine) {
+      schemaViewerFactsLine.innerHTML = '';
+      schemaViewerFactsLine.classList.add('hidden');
+    }
+    schemaViewerPanesWrap?.classList.add('hidden');
+    schemaViewerGroupTableWrap?.classList.remove('hidden');
+    schemaViewerCurrentRef = { kind: 'group', id: groupId };
+    if (schemaViewerRefreshBtn) {
+      schemaViewerRefreshBtn.classList.remove('hidden');
+      schemaViewerRefreshBtn.disabled = true;
+      schemaViewerRefreshBtn.title = "Refreshing a whole dataset group at once isn't available yet - open one of its datasets on its own to refresh it.";
+    }
+    if (schemaViewerRefreshBtnLabel) schemaViewerRefreshBtnLabel.textContent = 'Refresh Schema';
+    setSchemaViewerRefreshStatus('');
+    schemaViewerModal.classList.remove('hidden');
+    bringModalToFront(schemaViewerModal);
+    loadGroupSchemaViewer(groupId);
+  }
+
+  // Renders one row of schemaViewerGroupTableBody for a single
+  // /api/schema/group dataset entry (see db.py's
+  // build_group_schema_summaries() for exactly what each field means).
+  // "available": false (a member whose schema fetch failed outright - see
+  // that function's own docstring) shows em-dashes for both size columns
+  // rather than blanks, with the row dimmed and a title tooltip - the same
+  // "something's wrong with just this one, not the whole group" posture
+  // build_group_schema_summaries() itself takes by not failing the whole
+  // request over one bad member.
+  function renderGroupSchemaViewerRow(dataset) {
+    const dataSize = dataset.data_size ? escapeHtml(dataset.data_size) : '&mdash;';
+    const schemaTokens = typeof dataset.schema_size_tokens === 'number'
+      ? dataset.schema_size_tokens.toLocaleString()
+      : '&mdash;';
+    const unavailableTitle = dataset.available === false
+      ? ' title="Could not fetch schema for this dataset."' : '';
+    const rowClass = dataset.available === false ? ' class="schema-viewer-group-row--unavailable"' : '';
+    return `
+      <tr${rowClass}${unavailableTitle}>
+        <td>${escapeHtml(dataset.name || dataset.id || '')}</td>
+        <td>${escapeHtml(dataset.type || 'SQL')}</td>
+        <td>${dataSize}</td>
+        <td>${schemaTokens}</td>
+      </tr>
+    `;
+  }
+
+  async function loadGroupSchemaViewer(groupId) {
+    const myToken = ++schemaViewerRequestToken;
+    setSchemaViewerNotice('');
+    if (schemaViewerGroupTableBody) {
+      schemaViewerGroupTableBody.innerHTML = '<tr><td colspan="4" class="text-center text-muted py-8">Loading...</td></tr>';
+    }
+    try {
+      const response = await fetch(`/api/schema/group?id=${encodeURIComponent(groupId)}`, {
+        headers: getApiHeaders(), credentials: 'same-origin',
+      });
+      const data = await response.json().catch(() => ({}));
+      if (myToken !== schemaViewerRequestToken) return; // superseded by a newer selection
+
+      if (!response.ok || !data.success) {
+        setSchemaViewerNotice(data.error || `Server returned status ${response.status}`, true);
+        if (schemaViewerGroupTableBody) schemaViewerGroupTableBody.innerHTML = '';
+        return;
+      }
+
+      // Same "this same response's own source of truth" reasoning
+      // loadSchemaViewerConnection() documents for data.name - the group
+      // could in principle have been renamed between openGroupSchemaViewer()'s
+      // interim title and this response, however unlikely in the span of
+      // one fetch.
+      if (schemaViewerModalTitleText && data.name) {
+        schemaViewerModalTitleText.textContent = `${data.name} (Dataset Group)`;
+      }
+      const datasets = data.datasets || [];
+      if (schemaViewerGroupTableBody) {
+        schemaViewerGroupTableBody.innerHTML = datasets.length > 0
+          ? datasets.map(renderGroupSchemaViewerRow).join('')
+          : '<tr><td colspan="4" class="text-center text-muted py-8">This dataset group has no datasets in it.</td></tr>';
+      }
+    } catch (err) {
+      if (myToken !== schemaViewerRequestToken) return;
+      console.error('Failed to fetch group schema summary:', err);
+      setSchemaViewerNotice(err.message || 'Failed to reach the backend service.', true);
+      if (schemaViewerGroupTableBody) schemaViewerGroupTableBody.innerHTML = '';
+    }
   }
 
   function closeSchemaViewer() {
@@ -7471,7 +7837,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     // click handler below) should mean the dialog genuinely can't be
     // dismissed by any route until that request returns, not just via
     // this one button.
-    if (schemaViewerRefreshBtn?.disabled) return;
+    if (schemaViewerRefreshInFlight) return;
     schemaViewerModal?.classList.add('hidden');
   }
 
@@ -7484,6 +7850,87 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (e.target === schemaViewerModal) closeSchemaViewer();
     });
   }
+
+  // Lets the user drag #schemaViewerPanesResizer (index.html) to override
+  // the default 20%/80% split between the tree pane and the detail pane
+  // (see .schema-viewer-list-pane's own comment in style.css). Plain
+  // mouse-drag mechanics: mousedown on the resizer captures the list
+  // pane's current pixel width and the pointer's starting X; mousemove
+  // (bound to the whole document, not just the resizer, so a fast drag
+  // that outruns the resizer's own 9px hit area doesn't drop the drag)
+  // computes the delta and sets an inline flex-basis in px directly on
+  // #schemaViewerListPane - an inline style always wins over style.css's
+  // class-level `flex: 0 0 20%` regardless of source order/specificity.
+  // Clamped on both ends (MIN_LIST_PANE_PX/MIN_DETAIL_PANE_PX below) so
+  // neither pane can be dragged down to nothing, or the resizer dragged
+  // past either edge of the dialog. Deliberately NOT persisted anywhere
+  // (no localStorage, no server-side setting) - every fresh open of this
+  // dialog starts back at the default 20% split; this is a same-session
+  // convenience for one particular look at a wide/deep schema, not a
+  // saved preference.
+  function initSchemaViewerPanesResizer() {
+    if (!schemaViewerPanesResizer || !schemaViewerListPane || !schemaViewerPanesWrap) return;
+
+    const MIN_LIST_PANE_PX = 140;
+    const MIN_DETAIL_PANE_PX = 240;
+    const RESIZER_PX = 9;
+    const ARROW_STEP_PX = 24;
+
+    function applyListPaneWidth(px) {
+      const totalPx = schemaViewerPanesWrap.getBoundingClientRect().width;
+      const maxListPanePx = Math.max(MIN_LIST_PANE_PX, totalPx - RESIZER_PX - MIN_DETAIL_PANE_PX);
+      const clampedPx = Math.min(Math.max(px, MIN_LIST_PANE_PX), maxListPanePx);
+      schemaViewerListPane.style.flex = `0 0 ${clampedPx}px`;
+    }
+
+    let dragStartX = 0;
+    let dragStartWidthPx = 0;
+
+    function onDragMove(e) {
+      applyListPaneWidth(dragStartWidthPx + (e.clientX - dragStartX));
+    }
+
+    function stopDragging() {
+      document.removeEventListener('mousemove', onDragMove);
+      document.removeEventListener('mouseup', stopDragging);
+      schemaViewerPanesResizer.classList.remove('schema-viewer-panes-resizer--dragging');
+      document.body.style.userSelect = '';
+      document.body.style.cursor = '';
+    }
+
+    schemaViewerPanesResizer.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      dragStartX = e.clientX;
+      dragStartWidthPx = schemaViewerListPane.getBoundingClientRect().width;
+      schemaViewerPanesResizer.classList.add('schema-viewer-panes-resizer--dragging');
+      // Prevents text selection elsewhere in the dialog while dragging,
+      // and keeps the col-resize cursor showing even when the pointer
+      // briefly strays off the thin resizer itself mid-drag.
+      document.body.style.userSelect = 'none';
+      document.body.style.cursor = 'col-resize';
+      document.addEventListener('mousemove', onDragMove);
+      document.addEventListener('mouseup', stopDragging);
+    });
+
+    // Keyboard equivalent for anyone not using a mouse (role="separator"
+    // + tabindex="0" in index.html makes this focusable) - Left/Right
+    // nudge the split by ARROW_STEP_PX, Home resets to the default 20%
+    // split by clearing the inline override entirely.
+    schemaViewerPanesResizer.addEventListener('keydown', (e) => {
+      if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        applyListPaneWidth(schemaViewerListPane.getBoundingClientRect().width - ARROW_STEP_PX);
+      } else if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        applyListPaneWidth(schemaViewerListPane.getBoundingClientRect().width + ARROW_STEP_PX);
+      } else if (e.key === 'Home') {
+        e.preventDefault();
+        schemaViewerListPane.style.flex = '';
+      }
+    });
+  }
+
+  initSchemaViewerPanesResizer();
 
   // Both presets and custom connections can be refreshed here (see POST
   // /api/config/refresh-schema's own docstring in config_routes.py -
@@ -7503,6 +7950,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     schemaViewerRefreshBtn.addEventListener('click', async () => {
       const { kind, id } = schemaViewerCurrentRef;
       if (!kind || !id) return;
+      schemaViewerRefreshInFlight = true;
       schemaViewerRefreshBtn.disabled = true;
       if (schemaViewerModalCloseBtn) schemaViewerModalCloseBtn.disabled = true;
       if (schemaViewerRefreshBtnLabel) schemaViewerRefreshBtnLabel.textContent = 'Refreshing...';
@@ -7528,6 +7976,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         console.error('Failed to refresh schema:', err);
         setSchemaViewerRefreshStatus(err.message || 'Failed to reach the backend service.', true);
       } finally {
+        schemaViewerRefreshInFlight = false;
         schemaViewerRefreshBtn.disabled = false;
         if (schemaViewerModalCloseBtn) schemaViewerModalCloseBtn.disabled = false;
         if (schemaViewerRefreshBtnLabel) schemaViewerRefreshBtnLabel.textContent = '↻ Refresh Schema';
@@ -8918,7 +9367,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   // /api/translate) rather than returning one plain JSON body - its own
   // retry loop (_summarize_with_retry, see translate_routes.py) can take
   // several real seconds, and this is what makes that visible instead of
-  // leaving the caller's "Summarizing results…" banner
+  // leaving the caller's "Summarizing…" banner
   // (showAllModeSummarizingStatus(), already shown by every call site
   // before awaiting this) frozen with no indication anything is still
   // happening. showRetryStatus() is reused as-is - it already renders
@@ -9059,8 +9508,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     // which comfortably covers CHART_MAX_SERIES without the same color
     // appearing twice in a typical chart.
     return [
-      cssVar('--primary', '#10b981'), cssVar('--secondary', '#6366f1'), cssVar('--accent-cyan', '#38bdf8'),
-      cssVar('--warning', '#f59e0b'), cssVar('--danger', '#f87171'), cssVar('--primary-hover', '#34d399'),
+      cssVar('--primary', '#487f6d'), cssVar('--secondary', '#6366f1'), cssVar('--accent-cyan', '#38bdf8'),
+      cssVar('--warning', '#f59e0b'), cssVar('--danger', '#f87171'), cssVar('--primary-hover', '#6b9f8c'),
       cssVar('--secondary-hover', '#818cf8'),
     ];
   }
@@ -9623,105 +10072,22 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
-  // Looks up a specific database's own triage-rewritten question -
-  // notes.connectionPrompts (new - see maybeFinalize()'s/translatePrompt()'s
-  // pendingAllModeNotes' own construction) mirrors connection_selection's
-  // own per-entry "prompt" field (translate_routes.py's entry_prompts -
-  // that database's own rewrite when triage supplied one, else the
-  // original cross-database question unchanged). Falls back to `notes.prompt`
-  // (the turn's original question) for a `notes` object that predates this
-  // field, or if this database somehow has no matching entry - the same
-  // "never worse than what single-connection mode already had" fallback
-  // entry_prompts itself uses server-side.
-  function findDatabasePrompt(notes, kind, id) {
-    const entries = (notes && notes.connectionPrompts) || [];
-    const match = entries.find((e) => e.kind === kind && e.id === id);
-    return (match && match.prompt) || (notes && notes.prompt) || '';
-  }
-
-  // Chunk 4 of "splitting SQL/summary per in-scope database" (see this
-  // file's own multi-window design history - Chunks 1-3 recorded this same
-  // structured per-database data onto the all-mode turn's OWN shared
-  // history entry via captureAllModeHistory() above; this is what actually
-  // fans it back OUT). For every in-scope database this turn produced a
-  // real outcome for (sql+executed, note, or failed - a database that
-  // still sits in an un-executed "Ready to execute" placeholder has no
-  // outcome yet and is simply not in any of `notes`' three lists below),
-  // reconstructs the exact single-connection-shaped
-  // {prompt, text, results, summary} tuple that database would have
-  // produced had the user asked it directly in single-connection mode
-  // (see restoreLatestTurn()'s own three shapes - '*** NO SQL ***'-prefixed
-  // text with no results/summary for note/failed, {text: sql, results:
-  // [...], summary?} for a real execution, verified against that
-  // function's actual reading behavior), and pushes it into that
-  // database's own bucket via pushTurnIntoBucket() - which never touches
-  // `chatStore`/`activeBucketKey` or re-renders anything, so this has zero
-  // effect on whichever bucket is currently on screen (the all-mode shared
-  // one very much included - that bucket already got its OWN turn from
-  // captureAllModeHistory() above, unaffected by this).
-  //
-  // `notes` is the same shape every captureAllModeHistory() call site
-  // already builds (routingMessage/databaseNotes/generationFailures/
-  // databaseSql/connectionPrompts). `executeResults`/`executeFailures` are
-  // this turn's raw (pre-summarizeResultForHistory) execute rows/failures,
-  // each tagged with its own `.database` (see execute_routes.py/
-  // settleAllModeBatchedResults) - summarizeResultForHistory (below in
-  // this file, already hoisted - see this function's own placement
-  // comment) is reused here unchanged to build each database's own
-  // `results` entries, exactly as maybeFinalize()/executeSql() already use
-  // it for the combined all-mode turn. `summaryResult` is
-  // requestAllModeResultsSummary()'s own {databaseSummaries,
-  // crossDatabaseSummary} (Chunk 2), or null when Phase C never ran (e.g.
-  // a request that failed outright) - every per-database summary lookup
-  // below already tolerates that.
-  function fanOutAllModeHistoryPerDatabase(notes, executeResults, executeFailures, summaryResult) {
-    const databaseNotes = (notes && notes.databaseNotes) || [];
-    const generationFailures = (notes && notes.generationFailures) || [];
-    const databaseSql = (notes && notes.databaseSql) || [];
-    const databaseSummaries = (summaryResult && summaryResult.databaseSummaries) || [];
-    const results = Array.isArray(executeResults) ? executeResults : [];
-    const failures = Array.isArray(executeFailures) ? executeFailures : [];
-
-    function findSummaryText(kind, id) {
-      const match = databaseSummaries.find((s) => s.kind === kind && s.id === id);
-      return (match && match.text) || undefined;
-    }
-
-    // "note" outcome - triage decided this database needed no SQL at all.
-    databaseNotes.forEach((n) => {
-      pushTurnIntoBucket(n.kind, n.id, findDatabasePrompt(notes, n.kind, n.id), {
-        role: 'model',
-        text: `*** NO SQL *** ${n.text || ''}`,
-      });
-    });
-
-    // "failed" outcome - Phase B's own SQL generation call errored for
-    // this database, so (like "note" above) nothing ever executed.
-    generationFailures.forEach((f) => {
-      pushTurnIntoBucket(f.kind, f.id, findDatabasePrompt(notes, f.kind, f.id), {
-        role: 'model',
-        text: `*** NO SQL *** ${f.error || 'Failed to generate SQL for this database.'}`,
-      });
-    });
-
-    // "sql" (executed) outcome - one turn per database that actually got
-    // real SQL, joining that database's own generated text (databaseSql)
-    // with whichever of its own rows/errors came back (matched by the
-    // same `.database` tag every other consumer in this file already
-    // relies on) and its own Phase C paragraph, if Phase C ran.
-    databaseSql.forEach((entry) => {
-      const ownResults = results
-        .filter((r) => r.database && r.database.kind === entry.kind && r.database.id === entry.id)
-        .map(summarizeResultForHistory);
-      const ownFailures = failures
-        .filter((f) => f.database && f.database.kind === entry.kind && f.database.id === entry.id)
-        .map(summarizeResultForHistory);
-      const modelEntry = { role: 'model', text: entry.sql || '', results: [...ownResults, ...ownFailures] };
-      const summaryText = findSummaryText(entry.kind, entry.id);
-      if (summaryText) modelEntry.summary = summaryText;
-      pushTurnIntoBucket(entry.kind, entry.id, findDatabasePrompt(notes, entry.kind, entry.id), modelEntry);
-    });
-  }
+  // NOTE: this file used to also fan a group-mode turn's structured
+  // per-database data (captured onto the group's own shared history entry
+  // just above via captureAllModeHistory()) back OUT into each individual
+  // in-scope database's own bucket, via now-removed
+  // findDatabasePrompt()/fanOutAllModeHistoryPerDatabase()/
+  // pushTurnIntoBucket() helpers - so that switching to a member database
+  // directly in single-connection mode would show that group-mode turn in
+  // its own back/forward history too. That was found to surprise users
+  // (a question asked of the whole group appearing, unasked, in one
+  // specific database's own history) and has been removed: a group-mode
+  // turn now lives ONLY in the group's own combined history (unaffected by
+  // this - see captureAllModeHistory() above), and a database's own
+  // back/forward history only ever reflects turns actually asked against
+  // it directly. See buildInScopeConnectionHistories()'s own docstring for
+  // the one remaining place this distinction matters (Phase B's own
+  // per-connection conversational context).
 
   // "All databases" mode's PROGRESSIVE render path - the streaming
   // counterpart to renderAllModeCombinedResults() above (still used
@@ -9773,8 +10139,8 @@ document.addEventListener('DOMContentLoaded', async () => {
       // side generation is done for this connection" signal, distinct from
       // settledCount just above (which only counts a real-SQL connection
       // once its execution ALSO finishes). Drives showAllModeStreamStatus()'s
-      // "Generating commands (…)" -> "…and fetching results (…)" transition
-      // below.
+      // "Generating SQL (…)…" -> "Generating SQL (…)… Fetching Results (…)…"
+      // transition below.
       generationSettledCount: 0,
       // Per-connection /api/execute calls kicked off below (auto-execute
       // only) - translatePrompt() awaits all of these before it can
@@ -10001,15 +10367,22 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
       resultsRetryStatus.innerHTML =
         `<span class="retry-status-icon animate-spin">⟳</span> ` +
-        `Generating commands (${state.generationSettledCount} of ${total})…`;
+        `Generating SQL (${state.generationSettledCount} of ${total})…`;
       resultsRetryStatus.classList.remove('hidden');
       return;
     }
 
+    // Generating SQL and Fetching Results are deliberately shown as ONE
+    // combined message for dataset-group mode (see this function's own
+    // docstring above for why the two genuinely overlap in wall-clock time
+    // here, unlike single-connection mode's own showPhaseStatus()/
+    // showFetchingResultsStatus(), which show them as two sequential,
+    // mutually-exclusive messages since there's only ever one connection
+    // to wait on at a time).
     resultsRetryStatus.innerHTML =
       `<span class="retry-status-icon animate-spin">⟳</span> ` +
-      `Generating commands (${state.generationSettledCount} of ${total}) and ` +
-      `fetching results (${state.settledCount} of ${total})…`;
+      `Generating SQL (${state.generationSettledCount} of ${total})… ` +
+      `Fetching Results (${state.settledCount} of ${total})…`;
     resultsRetryStatus.classList.remove('hidden');
   }
 
@@ -10029,7 +10402,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   function showAllModeSummarizingStatus() {
     if (!resultsRetryStatus) return;
     resultsRetryStatus.innerHTML =
-      `<span class="retry-status-icon animate-spin">⟳</span> Summarizing results…`;
+      `<span class="retry-status-icon animate-spin">⟳</span> Summarizing…`;
     resultsRetryStatus.classList.remove('hidden');
   }
 
@@ -10043,8 +10416,8 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // Generation is done for this connection regardless of outcome - see
     // generationSettledCount's own declaration comment and
-    // showAllModeStreamStatus()'s "Generating commands…" -> "…and fetching
-    // results…" transition.
+    // showAllModeStreamStatus()'s "Generating SQL…" -> "Generating SQL…
+    // Fetching Results…" transition.
     state.generationSettledCount += 1;
 
     if (evt.outcome === 'note') {
@@ -10240,14 +10613,13 @@ document.addEventListener('DOMContentLoaded', async () => {
       // line, already stashed here by translatePrompt()'s router_route
       // branch before this function could ever run.
       databaseSql: (state.terminalData && state.terminalData.sql_blocks) || [],
-      // Chunk 4's per-database triage-rewritten questions - the SAME
+      // Per-database triage-rewritten questions - the SAME
       // connection_selection array startAllModeStreaming() stashed as
       // state.connectionOrder, now additionally carrying each entry's own
       // "prompt" field (see translate_routes.py's connection_selection/
-      // entry_prompts docstrings) - threaded through so
-      // fanOutAllModeHistoryPerDatabase() below (via findDatabasePrompt())
-      // can record each database's OWN question onto its own fanned-out
-      // turn, not the original cross-database one.
+      // entry_prompts docstrings) - threaded through for
+      // trackAllModeFanoutExecute()'s own per-connection dialect lookup
+      // (see findConnectionType()'s call site further down).
       connectionPrompts: state.connectionOrder || [],
     };
 
@@ -10293,10 +10665,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       // needs its own explicit re-save, rather than trusting it'll reach
       // the server eventually.
       chatStore.persistCurrent();
-      // Chunk 4 - see fanOutAllModeHistoryPerDatabase's own docstring: does
-      // NOT touch chatStore/activeBucketKey, so this runs regardless of
-      // which branch above just fired.
-      fanOutAllModeHistoryPerDatabase(notes, state.executeResults, state.executeFailures, summaryResult);
     }
 
     allModeStreamState = null;
@@ -10343,7 +10711,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     // too.
     // No `prompt` field - the NL prompt text itself isn't sent to GA (privacy).
     trackEvent('translate_submitted', {
-      mode: isAllConnectionsSelected() ? 'all' : 'single',
+      mode: isGroupModeSelected() ? 'group' : 'single',
       database_name: connDbName ? connDbName.textContent : '',
       database_type: getActiveDatabaseType(),
       provider: ACTIVE_LLM_PROVIDER || '',
@@ -10378,16 +10746,16 @@ document.addEventListener('DOMContentLoaded', async () => {
           prompt: promptText,
           history: chatStore.toPayload(),
           // Chunk 5 (see buildInScopeConnectionHistories()'s own
-          // docstring) - "all databases" mode only; JSON.stringify simply
+          // docstring) - dataset group mode only; JSON.stringify simply
           // omits an `undefined`-valued key, so a single-connection-mode
           // request's body carries no connection_histories field at all,
-          // same as before this existed. isAllConnectionsSelected() is
-          // exactly IN_SCOPE_MODE === 'all', matching
-          // stream_translation()'s own router_only_all_mode condition
+          // same as before this existed. isGroupModeSelected() is
+          // exactly IN_SCOPE_MODE === 'group', matching
+          // stream_translation()'s own router_only_group_mode condition
           // (this function never sends a database_url override - see the
           // comment above - so IN_SCOPE_MODE alone decides this the same
           // way server-side).
-          connection_histories: isAllConnectionsSelected() ? buildInScopeConnectionHistories() : undefined,
+          connection_histories: isGroupModeSelected() ? buildInScopeConnectionHistories() : undefined,
           // translate_routes.py's /api/translate handler doesn't read this
           // key at all - the only server-side consumer of a client-echoed
           // pinned_connections entry today is execute_routes.py's
@@ -10514,14 +10882,13 @@ document.addEventListener('DOMContentLoaded', async () => {
             // at all) - server-side, sql_blocks only ever contains entries
             // that actually got real SQL.
             databaseSql: data.sql_blocks || [],
-            // Chunk 4's per-database triage-rewritten questions - this
-            // fallback's own terminal line already carries
-            // connection_selection (same field phase_a_route's live event
-            // would have, for a turn that never emitted one - see this
-            // object's own declaration comment above) with each entry's
-            // own "prompt" field. Threaded through for
-            // fanOutAllModeHistoryPerDatabase()/findDatabasePrompt()'s use
-            // below, same as databaseSql just above.
+            // Per-database triage-rewritten questions - this fallback's own
+            // terminal line already carries connection_selection (same
+            // field phase_a_route's live event would have, for a turn that
+            // never emitted one - see this object's own declaration
+            // comment above) with each entry's own "prompt" field.
+            // Threaded through for the same per-connection dialect lookup
+            // as databaseSql's own sibling comment above.
             connectionPrompts: data.connection_selection || [],
           };
           // GA fan-out tracking (see trackAllModeFanoutTranslate's own
@@ -10568,12 +10935,6 @@ document.addEventListener('DOMContentLoaded', async () => {
             const summaryEntry = getSummaryTabEntry();
             if (summaryEntry) allModeNotes.routingMessage = summaryEntry.text;
             captureAllModeHistory(modelEntry, allModeNotes, [], summaryResult);
-            // Chunk 4 - see fanOutAllModeHistoryPerDatabase's own
-            // docstring. Nothing was executed at all here (this whole
-            // branch is guarded on `!data.sql`), so only the note/failed
-            // outcomes in `allModeNotes` can ever produce a fanned-out
-            // turn.
-            fanOutAllModeHistoryPerDatabase(allModeNotes, [], [], summaryResult);
           }
         }
       } else if (response && response.ok && data && data.sql) {
@@ -10605,25 +10966,45 @@ document.addEventListener('DOMContentLoaded', async () => {
           chatStore.clearPending();
           clearResultsDisplay();
 
-          // Same {kind, id} addressing the Schema Viewer's own "?" buttons
-          // use (see openSchemaViewer()'s own comment) - sourced from the
-          // active connection's own fields (kept in sync by
-          // fetchBackendConfig(); the same ones getActiveDatabaseType()/
-          // trackDbConnectionError() already read), not from anything this
-          // response itself carries, since "OPEN SCHEMA VIEWER" is about
-          // whichever connection this prompt was just asked against.
-          // Falls back to the plain NO-SQL text render when there's no
-          // addressable connection (an ad hoc custom connection typed as a
-          // raw URL, never saved - see ACTIVE_CUSTOM_CONNECTION_KEY's own
-          // declaration comment) - openSchemaViewer() itself no-ops on a
-          // missing kind/id, which would otherwise silently leave the user
-          // with no response at all.
-          const schemaKind = ACTIVE_IS_CUSTOM ? 'custom' : 'preset';
-          const schemaId = ACTIVE_IS_CUSTOM ? ACTIVE_CUSTOM_CONNECTION_KEY : ACTIVE_PRESET_ID;
-          if (schemaKind && schemaId) {
-            openSchemaViewer(schemaKind, schemaId, connDbName ? connDbName.textContent : '');
+          if (IN_SCOPE_MODE === 'group') {
+            // Dataset-group mode's own "OPEN SCHEMA VIEWER" outcome (new -
+            // group-mode triage can now resolve to "schema" the same way
+            // single-connection mode already could, see connection_
+            // router.py's run_triage_call docstring) - opens the group's
+            // own Schema Viewer (the same one the dataset badge's "i" icon
+            // already opens - see openGroupSchemaViewer()'s own comment
+            // and its identical CONFIGURED_DB_GROUPS lookup elsewhere in
+            // this file), addressed by IN_SCOPE_GROUP_ID rather than
+            // ACTIVE_PRESET_ID/ACTIVE_CUSTOM_CONNECTION_KEY (those still
+            // point at the group's own synthesized primary/first member
+            // for query execution purposes, not the group as a whole).
+            const group = CONFIGURED_DB_GROUPS.find((g) => g.id === IN_SCOPE_GROUP_ID);
+            if (group) {
+              openGroupSchemaViewer(group.id, group.name);
+            } else {
+              renderNoSqlResponse(data.sql, { hasLabel: true });
+            }
           } else {
-            renderNoSqlResponse(data.sql, { hasLabel: IN_SCOPE_MODE === 'all' });
+            // Same {kind, id} addressing the Schema Viewer's own "?" buttons
+            // use (see openSchemaViewer()'s own comment) - sourced from the
+            // active connection's own fields (kept in sync by
+            // fetchBackendConfig(); the same ones getActiveDatabaseType()/
+            // trackDbConnectionError() already read), not from anything this
+            // response itself carries, since "OPEN SCHEMA VIEWER" is about
+            // whichever connection this prompt was just asked against.
+            // Falls back to the plain NO-SQL text render when there's no
+            // addressable connection (an ad hoc custom connection typed as a
+            // raw URL, never saved - see ACTIVE_CUSTOM_CONNECTION_KEY's own
+            // declaration comment) - openSchemaViewer() itself no-ops on a
+            // missing kind/id, which would otherwise silently leave the user
+            // with no response at all.
+            const schemaKind = ACTIVE_IS_CUSTOM ? 'custom' : 'preset';
+            const schemaId = ACTIVE_IS_CUSTOM ? ACTIVE_CUSTOM_CONNECTION_KEY : ACTIVE_PRESET_ID;
+            if (schemaKind && schemaId) {
+              openSchemaViewer(schemaKind, schemaId, connDbName ? connDbName.textContent : '');
+            } else {
+              renderNoSqlResponse(data.sql, { hasLabel: false });
+            }
           }
         } else if (isNoSql) {
           setSqlQuery('');
@@ -10637,7 +11018,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           // connection reply never does. IN_SCOPE_MODE reflects the mode
           // this very request was just sent under, which is what decides
           // which of the two this is.
-          renderNoSqlResponse(data.sql, { hasLabel: IN_SCOPE_MODE === 'all' });
+          renderNoSqlResponse(data.sql, { hasLabel: IN_SCOPE_MODE === 'group' });
         } else {
           setSqlQuery(data.sql);
           chatStore.setPending(modelEntry, normalizeSqlForCompare(data.sql));
@@ -11059,13 +11440,6 @@ document.addEventListener('DOMContentLoaded', async () => {
             pushActiveTurn(promptText, modelEntry);
             updateHistoryTurnsSubtitle();
           }
-          // Chunk 4 - see fanOutAllModeHistoryPerDatabase's own docstring.
-          // Runs regardless of which pending/new-turn branch above just
-          // fired, same as maybeFinalize()'s identical call - a no-op
-          // (undefined notes/executeResults, both defaulted inside) for a
-          // plain single-connection execution, where `allModeNotes` is
-          // null.
-          if (allModeNotes) fanOutAllModeHistoryPerDatabase(allModeNotes, data.results, [], allModeSummaryResult);
         }
 
         if (connDbDot) connDbDot.className = 'status-dot connected';
@@ -11163,8 +11537,6 @@ document.addEventListener('DOMContentLoaded', async () => {
             pushActiveTurn(promptText, modelEntry);
             updateHistoryTurnsSubtitle();
           }
-          // Chunk 4 - see fanOutAllModeHistoryPerDatabase's own docstring.
-          fanOutAllModeHistoryPerDatabase(allModeNotes, executeResults, executeFailures, summaryResult);
         // Multi-database question-answering's own partial-failure shape
         // (see execute_routes.py's module docstring) - `failures` is a
         // LIST (one entry per connection that failed; the others keep
@@ -11562,7 +11934,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           // switched away from would guess wrong, a pre-existing class of
           // minor cosmetic edge case this history-restoration code
           // already accepts elsewhere.
-          renderNoSqlResponse(sqlText, { hasLabel: IN_SCOPE_MODE === 'all' });
+          renderNoSqlResponse(sqlText, { hasLabel: IN_SCOPE_MODE === 'group' });
         } else {
           setSqlQuery(sqlText);
 
@@ -11600,10 +11972,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   // executeSql()'s several branches) - clears viewingBlankSlate as a side
   // effect, so submitting a genuinely new question from #newTurnBtn's
   // blank slate correctly exits it rather than leaving the flag stuck true
-  // once a real turn is back on screen. Deliberately NOT used by
-  // pushTurnIntoBucket() (all-mode's fan-out into OTHER databases' own
-  // buckets) - a background bucket receiving a turn says nothing about
-  // whether the bucket currently on screen is still blank.
+  // once a real turn is back on screen.
   function pushActiveTurn(promptText, modelEntry) {
     viewingBlankSlate = false;
     chatStore.pushTurn(promptText, modelEntry);

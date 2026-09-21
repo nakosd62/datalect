@@ -67,7 +67,7 @@ def test_cloud_run_starts_up_successfully_with_mocked_firestore(app_factory, clo
 def test_anonymous_visitor_never_receives_real_preset_connection_strings(app_factory, cloud_run_env):
     env = app_factory(env=cloud_run_env, mock_firestore=True)
     data = env.client.get('/api/config').get_json()
-    assert data['configured_databases'] == [{"id": "postgres+Demo", "name": "Demo", "type": "postgres"}]
+    assert data['configured_databases'] == [{"id": "postgres+Demo", "name": "Demo", "type": "postgres", "dialect_name": "PostgreSQL"}]
     for db in data['configured_databases']:
         assert "url" not in db
 
@@ -210,7 +210,7 @@ def test_authenticated_user_on_cloud_run_gets_same_preset_redaction_as_anonymous
     login_as(env.client, "alice@example.com")
     data = env.client.get('/api/config').get_json()
     assert data['authenticated'] is True
-    assert data['configured_databases'] == [{"id": "postgres+Demo", "name": "Demo", "type": "postgres"}]
+    assert data['configured_databases'] == [{"id": "postgres+Demo", "name": "Demo", "type": "postgres", "dialect_name": "PostgreSQL"}]
     for db in data['configured_databases']:
         assert "url" not in db
     assert data['active_database_url'] == ""

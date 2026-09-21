@@ -201,7 +201,13 @@ def test_success_strips_markdown_fences_and_returns_token_counts(app_factory, mo
     env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(FakeGenaiResponse("```sql\nSELECT * FROM users;\n```"))
+    # Two-call redesign (see translate_routes.py's own section comment
+    # above _SINGLE_DATASET_TRIAGE_SYSTEM_INSTRUCTION): Call 1 (triage)
+    # classifies the prompt as needing real SQL, then Call 2 actually
+    # generates it - every single-connection success test in this file now
+    # queues one canned response per call, consumed in that order.
+    harness.queue_response(FakeGenaiResponse('{"action": "sql"}'))
+    harness.queue_response(FakeGenaiResponse('```sql\n{"sql": "SELECT * FROM users;"}\n```'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'Show all users'})
     assert resp.status_code == 200
@@ -209,49 +215,227 @@ def test_success_strips_markdown_fences_and_returns_token_counts(app_factory, mo
     assert retry_events == []
     assert data['success'] is True
     assert data['sql'] == "SELECT * FROM users;"
-    assert data['total_tokens'] == 15
-    assert data['input_tokens'] == 10
-    assert data['output_tokens'] == 5
+    # Combined across both calls (see stream_translation()'s own
+    # _combined_usage) - 10+10 input, 5+5 output, 15+15 total.
+    assert data['total_tokens'] == 30
+    assert data['input_tokens'] == 20
+    assert data['output_tokens'] == 10
 
 
-def test_success_streams_schema_and_generating_sql_phase_status_before_done(app_factory, monkeypatch):
+def test_success_streams_schema_triage_and_generating_sql_phase_status_before_done(app_factory, monkeypatch):
     """The single-connection path (see stream_translation()'s module
-    docstring) emits two {"status": "phase_status", ...} lines ahead of the
-    terminal "done" line - one before the schema lookup, one before the LLM
-    call - so the client has something better than a bare spinner for the
-    two real waits that happen before any SQL comes back. Neither is a
-    "retrying" line, so parse_translate_stream's retry_events/final_data
-    split (used by every other test in this file) is unaffected by their
-    presence - this test uses parse_translate_stream_events instead, since
-    it needs to see every line, not just the terminal one."""
+    docstring) emits THREE {"status": "phase_status", ...} lines ahead of
+    the terminal "done" line - one before the shallow schema lookup, one
+    before Call 1 (triage), one before Call 2 (SQL generation) - so the
+    client has something better than a bare spinner for the real waits
+    that happen before any SQL comes back. None is a "retrying" line, so
+    parse_translate_stream's retry_events/final_data split (used by every
+    other test in this file) is unaffected by their presence - this test
+    uses parse_translate_stream_events instead, since it needs to see
+    every line, not just the terminal one."""
     env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(FakeGenaiResponse("SELECT 1;"))
+    harness.queue_response(FakeGenaiResponse('{"action": "sql"}'))
+    harness.queue_response(FakeGenaiResponse('{"sql": "SELECT 1;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'give me one'})
     events = parse_translate_stream_events(resp)
 
     phase_statuses = [e for e in events if e.get("status") == "phase_status"]
-    assert [e["phase"] for e in phase_statuses] == ["schema", "generating_sql"]
+    assert [e["phase"] for e in phase_statuses] == ["schema", "triage", "generating_sql"]
     assert all(isinstance(e["message"], str) and e["message"] for e in phase_statuses)
 
-    # Both phase_status lines come before the terminal "done" line, and
-    # neither is mistaken for it.
+    # All three phase_status lines come before the terminal "done" line,
+    # and none is mistaken for it.
     assert events[-1]["status"] == "done"
     assert events[-1]["success"] is True
+
+
+# --- SCHEMA_TABLES_ONLY: the "tables_only" schema kind, single-dataset mode --
+# A cheaper-to-send-to-an-LLM derivative of the already-cached deep schema
+# (see backends/base.py's derive_tables_only_schema_text) - full per-table
+# detail kept, every other schema-object section (Constraints, Indexes,
+# Views, ...) dropped, purely to cut input token cost. Scoped deliberately
+# narrowly: only stream_translation()'s own single-dataset-mode path (via
+# get_llm_schema_text below) is affected. Dataset-group mode's Phase A
+# triage (an unrelated, much smaller "shallow" candidate-summary
+# representation), Phase B fanout, Phase C summarization, and
+# /api/summarize-results all keep seeing the full deep schema regardless -
+# see test_connection_router.py's own SCHEMA_TABLES_ONLY scoping tests for
+# that half of the guarantee.
+
+def test_get_llm_schema_text_returns_the_full_schema_by_default(app_factory, monkeypatch, tmp_path):
+    from helpers import write_database_presets_file
+    presets_path = write_database_presets_file(tmp_path, [
+        {"id": "pg-a", "name": "Postgres A", "type": "postgres", "url": "postgresql://u:p@h/a"},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": presets_path})
+    import db as db_module
+    import schema_cache
+    deep_schema = (
+        "Table: customers\n  id integer NOT NULL\n\n"
+        "Constraints:\n  none\n"
+    )
+    descriptor = {"type": "postgres", "url": "postgresql://u:p@h/a"}
+    schema_cache.set(db_module.get_conn_identifier(descriptor), deep_schema)
+
+    assert env.translate_routes.SCHEMA_TABLES_ONLY is False
+    result = env.translate_routes.get_llm_schema_text(descriptor, None)
+    assert result == deep_schema
+
+
+def test_get_llm_schema_text_reduces_to_tables_only_when_the_flag_is_set(app_factory, monkeypatch, tmp_path):
+    from helpers import write_database_presets_file
+    presets_path = write_database_presets_file(tmp_path, [
+        {"id": "pg-a", "name": "Postgres A", "type": "postgres", "url": "postgresql://u:p@h/a"},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": presets_path, "SCHEMA_TABLES_ONLY": "true"})
+    import db as db_module
+    import schema_cache
+    deep_schema = (
+        "Table: customers\n  id integer NOT NULL\n\n"
+        "Constraints:\n  none\n"
+    )
+    descriptor = {"type": "postgres", "url": "postgresql://u:p@h/a"}
+    schema_cache.set(db_module.get_conn_identifier(descriptor), deep_schema)
+
+    assert env.translate_routes.SCHEMA_TABLES_ONLY is True
+    result = env.translate_routes.get_llm_schema_text(descriptor, None)
+    assert result == "Table: customers\n  id integer NOT NULL"
+    assert "Constraints:" not in result
+
+    # get_database_schema() itself is untouched - still the full deep text
+    # under the same cache key, for any other caller (the schema viewer,
+    # etc.) regardless of this flag.
+    assert db_module.get_database_schema(descriptor) == deep_schema
+
+
+def test_get_summary_schema_text_always_reduces_to_tables_only_even_when_the_flag_is_off(app_factory, tmp_path):
+    # Both summarization call sites (stream_summarize_result and
+    # _build_all_mode_schema_block) go through get_summary_schema_text
+    # instead of get_llm_schema_text - it ALWAYS reduces to the
+    # tables_only derivative, unconditionally, regardless of
+    # SCHEMA_TABLES_ONLY. Deliberately does NOT set that env var here, to
+    # prove this isn't just piggybacking on the flag.
+    from helpers import write_database_presets_file
+    presets_path = write_database_presets_file(tmp_path, [
+        {"id": "pg-a", "name": "Postgres A", "type": "postgres", "url": "postgresql://u:p@h/a"},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": presets_path})
+    import db as db_module
+    import schema_cache
+    deep_schema = (
+        "Table: customers\n  id integer NOT NULL\n\n"
+        "Constraints:\n  none\n"
+    )
+    descriptor = {"type": "postgres", "url": "postgresql://u:p@h/a"}
+    schema_cache.set(db_module.get_conn_identifier(descriptor), deep_schema)
+
+    assert env.translate_routes.SCHEMA_TABLES_ONLY is False
+    result = env.translate_routes.get_summary_schema_text(descriptor, None)
+    assert result == "Table: customers\n  id integer NOT NULL"
+    assert "Constraints:" not in result
+
+    # get_database_schema() itself is untouched either way.
+    assert db_module.get_database_schema(descriptor) == deep_schema
+
+
+def test_schema_tables_only_env_var_is_only_true_for_the_literal_string_true(app_factory):
+    env = app_factory(env={"SCHEMA_TABLES_ONLY": "1"})
+    assert env.translate_routes.SCHEMA_TABLES_ONLY is False
+
+    env = app_factory(env={"SCHEMA_TABLES_ONLY": "TRUE"})
+    assert env.translate_routes.SCHEMA_TABLES_ONLY is True
+
+    env = app_factory(env={})
+    assert env.translate_routes.SCHEMA_TABLES_ONLY is False
+
+
+def test_single_dataset_mode_translate_sends_the_full_schema_by_default(app_factory, monkeypatch, tmp_path):
+    from helpers import write_database_presets_file
+    presets_path = write_database_presets_file(tmp_path, [
+        {"id": "pg-a", "name": "Postgres A", "type": "postgres", "url": "postgresql://u:p@h/a"},
+    ])
+    env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1", "DATABASE_PRESETS_FILE": presets_path})
+    env.app_config.state_store.set_session("global", connection_id="pg-a", is_custom=False)
+    import db as db_module
+    import schema_cache
+    deep_schema = (
+        "Table: customers\n  id integer NOT NULL\n\n"
+        "Constraints:\n  none\n"
+    )
+    descriptor = {"type": "postgres", "url": "postgresql://u:p@h/a"}
+    schema_cache.set(db_module.get_conn_identifier(descriptor), deep_schema)
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(FakeGenaiResponse('{"action": "sql"}'))
+    harness.queue_response(FakeGenaiResponse('{"sql": "SELECT * FROM customers;"}'))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'show customers'})
+    parse_translate_stream(resp)
+
+    # generate_calls[0] is Call 1 (triage), which only ever sees the cheap
+    # SHALLOW schema (get_triage_schema_text) - the full deep schema (and
+    # SCHEMA_TABLES_ONLY's own reduction of it) only ever reaches Call 2
+    # (generate_calls[1], get_llm_schema_text), which is what this test is
+    # actually about.
+    schema_text = harness.generate_calls[1]["contents"][0].parts[0].text
+    assert "Table: customers" in schema_text
+    assert "Constraints:" in schema_text
+
+
+def test_single_dataset_mode_translate_sends_only_tables_when_schema_tables_only_is_set(app_factory, monkeypatch, tmp_path):
+    from helpers import write_database_presets_file
+    presets_path = write_database_presets_file(tmp_path, [
+        {"id": "pg-a", "name": "Postgres A", "type": "postgres", "url": "postgresql://u:p@h/a"},
+    ])
+    env = app_factory(env={
+        "GEMINI_PRESET_KEYS": "fake-key-1",
+        "DATABASE_PRESETS_FILE": presets_path,
+        "SCHEMA_TABLES_ONLY": "true",
+    })
+    env.app_config.state_store.set_session("global", connection_id="pg-a", is_custom=False)
+    import db as db_module
+    import schema_cache
+    deep_schema = (
+        "Table: customers\n  id integer NOT NULL\n\n"
+        "Constraints:\n  none\n"
+    )
+    descriptor = {"type": "postgres", "url": "postgresql://u:p@h/a"}
+    schema_cache.set(db_module.get_conn_identifier(descriptor), deep_schema)
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(FakeGenaiResponse('{"action": "sql"}'))
+    harness.queue_response(FakeGenaiResponse('{"sql": "SELECT * FROM customers;"}'))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'show customers'})
+    parse_translate_stream(resp)
+
+    # See the previous test's own comment - Call 2 (generate_calls[1]) is
+    # the one SCHEMA_TABLES_ONLY actually affects.
+    schema_text = harness.generate_calls[1]["contents"][0].parts[0].text
+    assert "Table: customers" in schema_text
+    assert "Constraints:" not in schema_text
 
 
 def test_success_records_translation_history(app_factory, monkeypatch):
     env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(FakeGenaiResponse("SELECT 1;"))
+    harness.queue_response(FakeGenaiResponse('{"action": "sql"}'))
+    harness.queue_response(FakeGenaiResponse('{"sql": "SELECT 1;"}'))
 
     env.client.set_cookie("crbot_user_id", "alice@example.com")
     resp = env.client.post('/api/translate', json={'prompt': 'give me one'})
     parse_translate_stream(resp)  # drains the stream - see this file's module docstring
 
+    # ONE row per turn - only Call 2 (the actual SQL-generation call) is
+    # recorded in the translations-table history/stats; Call 1 (triage)
+    # is deliberately never logged, even when it decided "sql" - see
+    # translate_routes.py's comment right after that outcome check.
     rows = _translation_rows(env)
     assert len(rows) == 1
     assert rows[0]['sql_command'] == "SELECT 1;"
@@ -261,11 +445,16 @@ def test_postgres_dialect_intro_used_by_default(app_factory, monkeypatch):
     env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(FakeGenaiResponse("SELECT 1;"))
+    harness.queue_response(FakeGenaiResponse('{"action": "sql"}'))
+    harness.queue_response(FakeGenaiResponse('{"sql": "SELECT 1;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
     parse_translate_stream(resp)  # drains the stream - see this file's module docstring
-    system_instruction = harness.generate_calls[0]["config"].system_instruction
+    # The dialect intro only reaches Call 2's own system instruction
+    # (dialect_intro + _SQL_GENERATION_FORMAT_RULES) - Call 1's triage
+    # system instruction is dialect-agnostic (see
+    # _SINGLE_DATASET_TRIAGE_SYSTEM_INSTRUCTION).
+    system_instruction = harness.generate_calls[1]["config"].system_instruction
     assert "PostgreSQL-compatible RDBMSs" in system_instruction
     assert "BigQuery" not in system_instruction
 
@@ -281,7 +470,8 @@ def test_bigquery_dialect_intro_used_when_active_connection_is_bigquery(app_fact
     install_fake_bigquery(monkeypatch)  # so get_database_schema()'s connect() doesn't hit real GCP
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(FakeGenaiResponse("SELECT 1;"))
+    harness.queue_response(FakeGenaiResponse('{"action": "sql"}'))
+    harness.queue_response(FakeGenaiResponse('{"sql": "SELECT 1;"}'))
 
     # A per-request `database_url` override is just a raw string - not
     # enough to identify a rich BigQuery descriptor (type/project/dataset) -
@@ -298,7 +488,9 @@ def test_bigquery_dialect_intro_used_when_active_connection_is_bigquery(app_fact
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
     parse_translate_stream(resp)  # drains the stream - see this file's module docstring
-    system_instruction = harness.generate_calls[0]["config"].system_instruction
+    # generate_calls[1] - Call 2's own system instruction is where the
+    # dialect intro lives (see the Postgres test above for why).
+    system_instruction = harness.generate_calls[1]["config"].system_instruction
     assert "BigQuery Standard SQL" in system_instruction
     assert "_TABLE_SUFFIX" in system_instruction
 
@@ -314,7 +506,8 @@ def test_mssql_dialect_intro_used_when_active_connection_is_mssql(app_factory, t
     install_fake_mssql_connect(monkeypatch)  # so get_database_schema()'s connect() doesn't hit a real server
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(FakeGenaiResponse("SELECT 1;"))
+    harness.queue_response(FakeGenaiResponse('{"action": "sql"}'))
+    harness.queue_response(FakeGenaiResponse('{"sql": "SELECT 1;"}'))
 
     # Same "make the preset the active session connection" approach as the
     # BigQuery test above - "mssql+MS" is the {type}+{name} fallback id
@@ -325,7 +518,7 @@ def test_mssql_dialect_intro_used_when_active_connection_is_mssql(app_factory, t
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
     parse_translate_stream(resp)  # drains the stream - see this file's module docstring
-    system_instruction = harness.generate_calls[0]["config"].system_instruction
+    system_instruction = harness.generate_calls[1]["config"].system_instruction
     assert "Microsoft SQL Server" in system_instruction
     assert "SELECT TOP" in system_instruction
     assert "GO statement" in system_instruction
@@ -351,13 +544,18 @@ def test_schema_precedes_history_and_is_not_glued_to_the_new_prompt(app_factory,
     env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(FakeGenaiResponse("SELECT 2;"))
+    harness.queue_response(FakeGenaiResponse('{"action": "sql"}'))
+    harness.queue_response(FakeGenaiResponse('{"sql": "SELECT 2;"}'))
 
     history = [{"role": "user", "text": "show users"}]
     resp = env.client.post('/api/translate', json={'prompt': 'now show orders', 'history': history})
     parse_translate_stream(resp)  # drains the stream - see this file's module docstring
 
-    contents = harness.generate_calls[0]["contents"]
+    # generate_calls[1] - Call 2's own input (the deep schema block, per
+    # get_llm_schema_text). Call 1/triage (generate_calls[0]) gets the same
+    # ordering guarantee too, just prefixed with its own shallow schema
+    # block instead - not this test's concern.
+    contents = harness.generate_calls[1]["contents"]
     assert contents[0].parts[0].text == "Database Schema:\nNo schema description available.\n\nshow users"
     assert "Database Schema:" not in contents[-1].parts[0].text
     assert "now show orders" in contents[-1].parts[0].text
@@ -379,25 +577,42 @@ def test_schema_precedes_history_and_is_not_glued_to_the_new_prompt(app_factory,
 
 
 def test_no_sql_reply_in_wrong_language_is_retried_and_corrected(app_factory, monkeypatch):
+    """"How many databases do I have?" is a general-knowledge/config
+    question Call 1 (triage) answers directly (its own "general" outcome -
+    see _SINGLE_DATASET_TRIAGE_SYSTEM_INSTRUCTION) - this is now a
+    regression guard for THAT call's own internal language-mismatch retry
+    (triage_single_dataset_question), not Call 2's - Call 2 never runs at
+    all for a "general" outcome."""
     env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
 
-    # Question is in English; the model's first '*** NO SQL ***' reply
-    # comes back in German - flagged as a mismatch by the stand-in below -
-    # and its second, corrected reply is accepted.
-    monkeypatch.setattr(
-        env.translate_routes, "_detect_language",
-        lambda text: "de" if "Datenbanken" in text else ("en" if text else None),
-    )
-    harness.queue_response(FakeGenaiResponse("*** NO SQL *** Sie haben 3 Datenbanken konfiguriert."))
-    harness.queue_response(FakeGenaiResponse("*** NO SQL *** You have 3 databases configured."))
+    # Question is in English; the model's first "general" answer comes
+    # back in German - flagged as a mismatch by the stand-in below - and
+    # its second, corrected reply is accepted. Triage's own language check
+    # now runs inside connection_router.run_triage_call (see that
+    # function's docstring - single-dataset mode's triage is now a thin
+    # wrapper around it), so the stand-in is installed on BOTH modules'
+    # own `detect_language` name - translate_routes._detect_language is a
+    # separate imported alias (see its own import line) that would
+    # otherwise leave connection_router's copy real and undermined.
+    import connection_router
+    _fake_detect = lambda text: "de" if "Datenbanken" in text else ("en" if text else None)
+    monkeypatch.setattr(env.translate_routes, "_detect_language", _fake_detect)
+    monkeypatch.setattr(connection_router, "detect_language", _fake_detect)
+    harness.queue_response(FakeGenaiResponse(
+        json.dumps({"action": "general", "answer": "Sie haben 3 Datenbanken konfiguriert."})
+    ))
+    harness.queue_response(FakeGenaiResponse(
+        json.dumps({"action": "general", "answer": "You have 3 databases configured."})
+    ))
 
     resp = env.client.post('/api/translate', json={'prompt': 'how many databases do I have?'})
     assert resp.status_code == 200
     retry_events, data = parse_translate_stream(resp)
     assert data['success'] is True
     assert data['sql'] == "*** NO SQL *** You have 3 databases configured."
+    # Both attempts are Call 1 (triage) - Call 2 never runs for "general".
     assert len(harness.generate_calls) == 2
     # The retry prompt actually sent to the model must carry the explicit
     # correction naming the mistake - confirms this isn't a coincidental
@@ -407,38 +622,56 @@ def test_no_sql_reply_in_wrong_language_is_retried_and_corrected(app_factory, mo
 
 
 def test_no_sql_reply_still_wrong_language_after_retry_fails_the_turn(app_factory, monkeypatch):
+    """Same "general" outcome as the test above, but both of Call 1's own
+    attempts come back in German. Mirrors triage_all_mode_question's own
+    "still wrong language after retrying" convention (see that function's
+    docstring): this collapses into the SAME generic
+    _TRIAGE_FAILURE_TEXT apology dataset-group mode's own triage failure
+    already shows, rather than a specific "kept coming back in German"
+    message - a deliberate, pre-existing convention this redesign reuses
+    rather than inventing a third way to report a triage-level failure.
+    Still reported as `success: True` (an apology IS a complete, valid
+    single-dataset turn, same as every other triage outcome), unlike Call
+    2's OWN language-mismatch-exhausted failure (still `success: False`
+    with the specific language names - see
+    test_openai_... /Claude equivalents further down, unchanged)."""
     env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
 
-    # Both attempts come back in German - mirrors _summarize_with_retry's
-    # own "never knowingly serve a response in the wrong language"
-    # guarantee: this must fail the turn outright (an honest, specific
-    # error) rather than silently showing text already confirmed wrong.
-    monkeypatch.setattr(
-        env.translate_routes, "_detect_language",
-        lambda text: "de" if "Datenbanken" in text else ("en" if text else None),
-    )
-    harness.queue_response(FakeGenaiResponse("*** NO SQL *** Sie haben 3 Datenbanken konfiguriert."))
-    harness.queue_response(FakeGenaiResponse("*** NO SQL *** Immer noch 3 Datenbanken."))
+    # Same cross-module stand-in reasoning as the test above - triage's own
+    # language check now runs inside connection_router.run_triage_call.
+    import connection_router
+    _fake_detect = lambda text: "de" if "Datenbanken" in text else ("en" if text else None)
+    monkeypatch.setattr(env.translate_routes, "_detect_language", _fake_detect)
+    monkeypatch.setattr(connection_router, "detect_language", _fake_detect)
+    harness.queue_response(FakeGenaiResponse(
+        json.dumps({"action": "general", "answer": "Sie haben 3 Datenbanken konfiguriert."})
+    ))
+    harness.queue_response(FakeGenaiResponse(
+        json.dumps({"action": "general", "answer": "Immer noch 3 Datenbanken."})
+    ))
 
     resp = env.client.post('/api/translate', json={'prompt': 'how many databases do I have?'})
     assert resp.status_code == 200
     retry_events, data = parse_translate_stream(resp)
-    assert data['success'] is False
-    assert "German" in data['error'] and "English" in data['error']
+    assert data['success'] is True
+    assert data['sql'] == env.translate_routes._TRIAGE_FAILURE_TEXT
     assert len(harness.generate_calls) == 2
 
+    # A triage-only outcome (Call 2 never runs) is never recorded at all -
+    # only calls that generate real SQL are logged to the translations
+    # table now, and this one never got that far.
     rows = _translation_rows(env)
-    assert len(rows) == 1
-    assert "TRANSLATION_ERROR" in rows[0]['sql_command']
+    assert len(rows) == 0
 
 
 def test_plain_sql_response_never_triggers_a_language_check(app_factory, monkeypatch):
-    # Regression guard for _no_sql_language_mismatch's own scoping: a plain
-    # generated-SQL response (no '*** NO SQL ***' prefix) must never be run
-    # through language detection at all - detect_language on a SELECT
-    # statement is meaningless, and this must never cost a second LLM call.
+    # Regression guard for _no_sql_language_mismatch's own scoping: a real
+    # generated-SQL response (Call 2's "sql" outcome, not "cannot_answer")
+    # must never be run through language detection at all - detect_language
+    # on a SELECT statement is meaningless, and this must never cost a
+    # THIRD LLM call (a language-mismatch retry).
     env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
@@ -449,17 +682,27 @@ def test_plain_sql_response_never_triggers_a_language_check(app_factory, monkeyp
         detect_calls.append(text)
         return "en"
 
+    # Same cross-module reasoning as the wrong-language tests above -
+    # triage's own detect_language(prompt) call now happens inside
+    # connection_router.run_triage_call, a separate imported name from
+    # translate_routes._detect_language, so the spy needs installing on
+    # both to see both calls.
+    import connection_router
     monkeypatch.setattr(env.translate_routes, "_detect_language", _spy_detect_language)
-    harness.queue_response(FakeGenaiResponse("SELECT * FROM users;"))
+    monkeypatch.setattr(connection_router, "detect_language", _spy_detect_language)
+    harness.queue_response(FakeGenaiResponse('{"action": "sql"}'))
+    harness.queue_response(FakeGenaiResponse('{"sql": "SELECT * FROM users;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'show all users'})
     retry_events, data = parse_translate_stream(resp)
     assert data['success'] is True
     assert data['sql'] == "SELECT * FROM users;"
-    assert len(harness.generate_calls) == 1
-    # _detect_language is still called once, on the user's own PROMPT
-    # (expected_language_code) - just never on the generated SQL itself.
-    assert detect_calls == ['show all users']
+    assert len(harness.generate_calls) == 2
+    # _detect_language is called once per call (Call 1/triage and Call
+    # 2/SQL-gen each compute their own expected_language_code off the same
+    # prompt up front) - never a third time, since real SQL never enters
+    # either call's own language-mismatch branch.
+    assert detect_calls == ['show all users', 'show all users']
 
 
 def test_429_rotates_key_and_retries_immediately_with_no_delay(app_factory, monkeypatch):
@@ -516,12 +759,18 @@ def test_429_rotates_key_and_retries_immediately_with_no_delay(app_factory, monk
 
 
 def test_server_error_retries_with_same_key(app_factory, monkeypatch):
+    """Exercises Call 2's (SQL-generation's) own same-key transient-error
+    retry - Call 1 (triage) is given a single, immediately-successful
+    "sql" response up front (queued first, consumed first) so the turn
+    proceeds straight into Call 2, which is what this test is actually
+    about."""
     env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     monkeypatch.setattr(env.translate_routes.time, "sleep", lambda *a, **k: None)
+    harness.queue_response(FakeGenaiResponse('{"action": "sql"}'))
     harness.queue_error(FakeApiError(500))
-    harness.queue_response(FakeGenaiResponse("SELECT 1;"))
+    harness.queue_response(FakeGenaiResponse('{"sql": "SELECT 1;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
     assert resp.status_code == 200
@@ -540,21 +789,29 @@ def test_server_error_retries_with_same_key(app_factory, monkeypatch):
     # Server-error retries don't rotate keys, and - unlike the 429/rotate
     # path - never reconstruct genai.Client() at all: the same client
     # object is just called again. So exactly one Client() construction,
-    # but two generate_content() calls (the failed attempt + the retry).
+    # but THREE generate_content() calls now (Call 1/triage, Call 2's
+    # failed attempt, Call 2's retry).
     assert len(harness.client_api_keys) == 1
-    assert len(harness.generate_calls) == 2
+    assert len(harness.generate_calls) == 3
 
 
 def test_non_retryable_error_fails_immediately_and_reports_failure_in_body(app_factory, monkeypatch):
-    # Status is 200, not 500 - see this module's docstring on why a
-    # streamed response can't carry a real error status. Nothing here has
-    # actually streamed a retry line (there was none to stream - the
-    # failure is non-retryable), but the HTTP status is decided once, for
-    # every request that reaches the retry loop at all, not per-outcome.
+    """Exercises Call 2's own non-retryable-error handling (still
+    `success: False`, unlike a triage-level failure - see
+    test_no_sql_reply_still_wrong_language_after_retry_fails_the_turn's own
+    docstring for that distinction) - Call 1 is given an immediately-
+    successful "sql" response first so the turn reaches Call 2 at all.
+
+    Status is 200, not 500 - see this module's docstring on why a
+    streamed response can't carry a real error status. Nothing here has
+    actually streamed a retry line (there was none to stream - the
+    failure is non-retryable), but the HTTP status is decided once, for
+    every request that reaches the retry loop at all, not per-outcome."""
     env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     monkeypatch.setattr(env.translate_routes.time, "sleep", lambda *a, **k: None)
+    harness.queue_response(FakeGenaiResponse('{"action": "sql"}'))
     harness.queue_error(FakeApiError(400))  # bad request - _classify_gemini_error returns None
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
@@ -562,7 +819,7 @@ def test_non_retryable_error_fails_immediately_and_reports_failure_in_body(app_f
     retry_events, data = parse_translate_stream(resp)
     assert retry_events == []
     assert data['success'] is False
-    assert len(harness.generate_calls) == 1  # no retry attempted
+    assert len(harness.generate_calls) == 2  # triage, then Call 2's one no-retry attempt
 
 
 def test_exhausts_all_retry_attempts_and_reports_failure_in_body(app_factory, monkeypatch):
@@ -571,7 +828,13 @@ def test_exhausts_all_retry_attempts_and_reports_failure_in_body(app_factory, mo
     A conspicuously large MAX_TRANSLATION_ATTEMPTS is set explicitly to
     prove the two budgets are independent: if key-rotation exhaustion were
     still (wrongly) gated on MAX_TRANSLATION_ATTEMPTS, this test would keep
-    retrying well past 2 attempts instead of giving up right at 2."""
+    retrying well past 2 attempts instead of giving up right at 2.
+
+    Exercises Call 2's own key-rotation exhaustion (still `success: False`)
+    - Call 1 is given an immediately-successful "sql" response first, so it
+    never touches this budget at all (each call tracks its own,
+    independent key-rotation budget - see stream_translation()'s own
+    section comment on this)."""
     env = app_factory(env={
         "GEMINI_PRESET_KEYS": "fake-key-1,fake-key-2",
         "MAX_TRANSLATION_ATTEMPTS": "100",
@@ -579,6 +842,7 @@ def test_exhausts_all_retry_attempts_and_reports_failure_in_body(app_factory, mo
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     monkeypatch.setattr(env.translate_routes.time, "sleep", lambda *a, **k: None)
+    harness.queue_response(FakeGenaiResponse('{"action": "sql"}'))
     harness.queue_error(FakeApiError(429))
     harness.queue_error(FakeApiError(429))
 
@@ -594,7 +858,7 @@ def test_exhausts_all_retry_attempts_and_reports_failure_in_body(app_factory, mo
     # attempt - the second attempt's failure ends the loop, since every
     # configured key has now been tried, without one more retry to announce.
     assert len(retry_events) == 1
-    assert len(harness.generate_calls) == 2
+    assert len(harness.generate_calls) == 3  # triage, then Call 2's two 429 attempts
 
 
 def test_gemini_key_rotation_exhaustion_is_independent_of_max_translation_attempts(app_factory, monkeypatch):
@@ -603,7 +867,9 @@ def test_gemini_key_rotation_exhaustion_is_independent_of_max_translation_attemp
     LLM transient errors': with only 1 configured key and a generously
     large MAX_TRANSLATION_ATTEMPTS, a 429 must give up after exactly 1
     attempt (no second key to rotate to) rather than retrying up to the
-    transient-error budget."""
+    transient-error budget. Exercises Call 2's own budget - see the
+    previous test's docstring for why Call 1 is given an immediately-
+    successful response first."""
     env = app_factory(env={
         "GEMINI_PRESET_KEYS": "fake-key-1",
         "MAX_TRANSLATION_ATTEMPTS": "100",
@@ -611,6 +877,7 @@ def test_gemini_key_rotation_exhaustion_is_independent_of_max_translation_attemp
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     monkeypatch.setattr(env.translate_routes.time, "sleep", lambda *a, **k: None)
+    harness.queue_response(FakeGenaiResponse('{"action": "sql"}'))
     harness.queue_error(FakeApiError(429))
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
@@ -618,7 +885,7 @@ def test_gemini_key_rotation_exhaustion_is_independent_of_max_translation_attemp
     retry_events, data = parse_translate_stream(resp)
     assert data['success'] is False
     assert retry_events == []  # no second key to rotate to - gave up immediately
-    assert len(harness.generate_calls) == 1
+    assert len(harness.generate_calls) == 2  # triage, then Call 2's one attempt
 
 
 def test_max_translation_attempts_defaults_to_5(app_env):
@@ -644,6 +911,9 @@ def test_max_translation_attempts_env_var_overrides_default(app_factory, monkeyp
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     monkeypatch.setattr(env.translate_routes.time, "sleep", lambda *a, **k: None)
+    # Call 1 (triage) succeeds immediately, so this budget is exercised by
+    # Call 2 alone - same reasoning as the 429 tests above.
+    harness.queue_response(FakeGenaiResponse('{"action": "sql"}'))
     harness.queue_error(FakeApiError(500))
     harness.queue_error(FakeApiError(500))
 
@@ -653,7 +923,8 @@ def test_max_translation_attempts_env_var_overrides_default(app_factory, monkeyp
     assert data['success'] is False
     # Stopped after the configured 2 attempts, not the default 5 - proves
     # the env var actually drives the retry loop, not just the constant.
-    assert len(harness.generate_calls) == 2
+    # (+1 for Call 1's own successful triage call.)
+    assert len(harness.generate_calls) == 3
 
 
 def test_translation_retry_delay_seconds_env_var_is_used_as_sleep_duration(app_factory, monkeypatch):
@@ -696,11 +967,15 @@ def test_gemini_client_is_constructed_with_translation_timeout_in_milliseconds(a
     env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1", "TRANSLATION_TIMEOUT_SECONDS": "45"})
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(FakeGenaiResponse("SELECT 1;"))
+    harness.queue_response(FakeGenaiResponse('{"action": "sql"}'))
+    harness.queue_response(FakeGenaiResponse('{"sql": "SELECT 1;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
     assert resp.status_code == 200
     parse_translate_stream(resp)
+    # Both calls share the same client (see make_client()'s own caching -
+    # neither call rotates keys here), so the timeout only needs proving
+    # once.
     assert len(harness.client_http_options) == 1
     assert harness.client_http_options[0].timeout == 45000
 
@@ -715,8 +990,11 @@ def test_classify_gemini_error_retries_httpx_timeout_with_same_key(app_factory, 
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     monkeypatch.setattr(env.translate_routes.time, "sleep", lambda *a, **k: None)
+    # Call 1 (triage) succeeds immediately - this exercises Call 2's own
+    # retry, same reasoning as the other retry tests above.
+    harness.queue_response(FakeGenaiResponse('{"action": "sql"}'))
     harness.queue_error(httpx.TimeoutException("timed out"))
-    harness.queue_response(FakeGenaiResponse("SELECT 1;"))
+    harness.queue_response(FakeGenaiResponse('{"sql": "SELECT 1;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
     assert resp.status_code == 200
@@ -725,14 +1003,15 @@ def test_classify_gemini_error_retries_httpx_timeout_with_same_key(app_factory, 
     assert len(retry_events) == 1
     assert retry_events[0]["rotatedKey"] is False
     assert len(harness.client_api_keys) == 1  # same client/key reused, no rotation
-    assert len(harness.generate_calls) == 2
+    assert len(harness.generate_calls) == 3
 
 
 def test_sets_session_cookie(app_factory, monkeypatch):
     env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(FakeGenaiResponse("SELECT 1;"))
+    harness.queue_response(FakeGenaiResponse('{"action": "sql"}'))
+    harness.queue_response(FakeGenaiResponse('{"sql": "SELECT 1;"}'))
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
     assert "crbot_session_id" in resp.headers.get("Set-Cookie", "")
 
@@ -850,12 +1129,17 @@ def test_history_result_truncation_reaches_the_real_gemini_call(app_factory, mon
     env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1", "HISTORY_RESULT_MAX_ROWS": "2"})
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(FakeGenaiResponse("SELECT 2;"))
+    harness.queue_response(FakeGenaiResponse('{"action": "sql"}'))
+    harness.queue_response(FakeGenaiResponse('{"sql": "SELECT 2;"}'))
 
     history = _make_history_with_results([[0], [1], [2], [3]], row_count=9999)
     resp = env.client.post('/api/translate', json={'prompt': 'now what', 'history': history})
     parse_translate_stream(resp)  # drains the stream - see this file's module docstring
 
+    # Call 1 (triage) is the one that receives history - see "1. Ok to
+    # pass history to call 1" in this redesign's own approval - so it's
+    # generate_calls[0] (not [1]) whose contents carry the truncated-but-
+    # accurately-labeled history text under test here.
     contents = harness.generate_calls[0]["contents"]
     history_text = contents[0].parts[0].text  # schema is prepended here too, but the header text is still present
     assert "[Query Result 1 - 9999 row(s) total, showing 2]" in history_text
@@ -868,12 +1152,15 @@ def test_history_result_truncation_reaches_the_real_claude_call(app_factory, mon
     select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
-    harness.queue_response(FakeClaudeResponse("SELECT 2;"))
+    harness.queue_response(FakeClaudeResponse('{"action": "sql"}'))
+    harness.queue_response(FakeClaudeResponse('{"sql": "SELECT 2;"}'))
 
     history = _make_history_with_results([[0], [1], [2], [3]], row_count=9999)
     resp = env.client.post('/api/translate', json={'prompt': 'now what', 'history': history})
     parse_translate_stream(resp)  # drains the stream - see this file's module docstring
 
+    # Call 1 (triage) is the one that receives history (see the Gemini
+    # version of this test above), so it's create_calls[0], not [1].
     messages = harness.create_calls[0]["messages"]
     # Sole history turn is also the cache_control boundary (see the
     # caching section below), so its content is block form.
@@ -1136,7 +1423,12 @@ def test_history_sent_to_gemini_is_capped_to_history_max_turns(app_factory, monk
     env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1", "HISTORY_MAX_TURNS": "2"})
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(FakeGenaiResponse("SELECT 4;"))
+    # This test is really about Call 1's (triage's) own input, since it
+    # receives history too now (per this redesign) - a second, real Call 2
+    # response is still queued so the turn completes cleanly end to end
+    # rather than exercising an unrelated failure path.
+    harness.queue_response(FakeGenaiResponse('{"action": "sql"}'))
+    harness.queue_response(FakeGenaiResponse('{"sql": "SELECT 4;"}'))
 
     history = []
     for i in range(3):  # 3 turns offered, cap is 2 - the oldest must be dropped entirely
@@ -1160,7 +1452,10 @@ def test_history_sent_to_claude_is_capped_to_history_max_turns(app_factory, monk
     select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
-    harness.queue_response(FakeClaudeResponse("SELECT 4;"))
+    # See the Gemini version of this test above for why two responses are
+    # queued now.
+    harness.queue_response(FakeClaudeResponse('{"action": "sql"}'))
+    harness.queue_response(FakeClaudeResponse('{"sql": "SELECT 4;"}'))
 
     history = []
     for i in range(3):
@@ -1304,7 +1599,12 @@ def test_claude_success_strips_markdown_fences_and_returns_token_counts(app_fact
     select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
-    harness.queue_response(FakeClaudeResponse("```sql\nSELECT * FROM users;\n```", input_tokens=20, output_tokens=8))
+    # Call 1 (triage) then Call 2 (SQL-gen) - see the Gemini version of this
+    # test above for the two-call redesign this mirrors.
+    harness.queue_response(FakeClaudeResponse('{"action": "sql"}', input_tokens=6, output_tokens=2))
+    harness.queue_response(FakeClaudeResponse(
+        '```sql\n{"sql": "SELECT * FROM users;"}\n```', input_tokens=20, output_tokens=8,
+    ))
 
     resp = env.client.post('/api/translate', json={'prompt': 'Show all users'})
     assert resp.status_code == 200
@@ -1312,9 +1612,11 @@ def test_claude_success_strips_markdown_fences_and_returns_token_counts(app_fact
     assert retry_events == []
     assert data['success'] is True
     assert data['sql'] == "SELECT * FROM users;"
-    assert data['input_tokens'] == 20
-    assert data['output_tokens'] == 8
-    assert data['total_tokens'] == 28
+    # Combined across both calls (see stream_translation()'s own
+    # _combined_usage) - 6+20 input, 2+8 output.
+    assert data['input_tokens'] == 26
+    assert data['output_tokens'] == 10
+    assert data['total_tokens'] == 36
     # This app doesn't use extended thinking or prompt caching on the
     # Claude path (see _call_claude's docstring), so these are always 0
     # rather than provider-specific missing fields.
@@ -1331,7 +1633,8 @@ def test_claude_client_is_constructed_with_translation_timeout_in_seconds(app_fa
     select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
-    harness.queue_response(FakeClaudeResponse("SELECT 1;"))
+    harness.queue_response(FakeClaudeResponse('{"action": "sql"}'))
+    harness.queue_response(FakeClaudeResponse('{"sql": "SELECT 1;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
     assert resp.status_code == 200
@@ -1343,7 +1646,8 @@ def test_claude_success_records_translation_history(app_factory, monkeypatch):
     env = app_factory(env={"ANTHROPIC_API_KEY": "fake-key-1"})
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
-    harness.queue_response(FakeClaudeResponse("SELECT 1;"))
+    harness.queue_response(FakeClaudeResponse('{"action": "sql"}'))
+    harness.queue_response(FakeClaudeResponse('{"sql": "SELECT 1;"}'))
 
     # Not select_llm_provider(env, ...) here - that seeds the "global"
     # identity, but this test's request resolves to "alice@example.com" via
@@ -1354,6 +1658,8 @@ def test_claude_success_records_translation_history(app_factory, monkeypatch):
     resp = env.client.post('/api/translate', json={'prompt': 'give me one'})
     parse_translate_stream(resp)  # drains the stream - see this file's module docstring
 
+    # ONE row - see test_success_records_translation_history's own comment
+    # for why (only Call 2 is ever recorded).
     rows = _translation_rows(env)
     assert len(rows) == 1
     assert rows[0]['sql_command'] == "SELECT 1;"
@@ -1369,7 +1675,8 @@ def test_claude_no_temperature_param_is_ever_passed(app_factory, monkeypatch):
     select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
-    harness.queue_response(FakeClaudeResponse("SELECT 1;"))
+    harness.queue_response(FakeClaudeResponse('{"action": "sql"}'))
+    harness.queue_response(FakeClaudeResponse('{"sql": "SELECT 1;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
     assert resp.status_code == 200
@@ -1394,7 +1701,8 @@ def test_claude_dialect_intro_reaches_the_system_param(app_factory, tmp_path, mo
     install_fake_mssql_connect(monkeypatch)
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
-    harness.queue_response(FakeClaudeResponse("SELECT 1;"))
+    harness.queue_response(FakeClaudeResponse('{"action": "sql"}'))
+    harness.queue_response(FakeClaudeResponse('{"sql": "SELECT 1;"}'))
 
     env.app_config.state_store.set_session(
         "global", connection_id="mssql+MS", is_custom=False,
@@ -1402,9 +1710,11 @@ def test_claude_dialect_intro_reaches_the_system_param(app_factory, tmp_path, mo
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
     parse_translate_stream(resp)  # drains the stream - see this file's module docstring
+    # create_calls[1] - Call 2's own system param, where the dialect intro
+    # lives (Call 1's triage system instruction is dialect-agnostic).
     # system is a one-block list now (see test_claude_system_prompt_is_
     # cache_control_marked below for why) rather than a plain string.
-    system_instruction = harness.create_calls[0]["system"][0]["text"]
+    system_instruction = harness.create_calls[1]["system"][0]["text"]
     assert "Microsoft SQL Server" in system_instruction
     assert "schema-qualified" in system_instruction
 
@@ -1420,7 +1730,8 @@ def test_claude_history_uses_assistant_role_and_appends_results(app_factory, mon
     select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
-    harness.queue_response(FakeClaudeResponse("SELECT 2;"))
+    harness.queue_response(FakeClaudeResponse('{"action": "sql"}'))
+    harness.queue_response(FakeClaudeResponse('{"sql": "SELECT 2;"}'))
 
     history = [
         {"role": "user", "text": "show users"},
@@ -1430,6 +1741,8 @@ def test_claude_history_uses_assistant_role_and_appends_results(app_factory, mon
     resp = env.client.post('/api/translate', json={'prompt': 'now show orders', 'history': history})
     parse_translate_stream(resp)  # drains the stream - see this file's module docstring
 
+    # Call 1 (triage) receives history too, so create_calls[0] (not [1])
+    # is the one to check here.
     messages = harness.create_calls[0]["messages"]
     # Two history messages, then the new user turn translate_query() appends.
     assert messages[0]["role"] == "user"
@@ -1455,13 +1768,17 @@ def test_claude_schema_precedes_history_and_is_not_glued_to_the_new_prompt(app_f
     select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
-    harness.queue_response(FakeClaudeResponse("SELECT 2;"))
+    harness.queue_response(FakeClaudeResponse('{"action": "sql"}'))
+    harness.queue_response(FakeClaudeResponse('{"sql": "SELECT 2;"}'))
 
     history = [{"role": "user", "text": "show users"}]
     resp = env.client.post('/api/translate', json={'prompt': 'now show orders', 'history': history})
     parse_translate_stream(resp)  # drains the stream - see this file's module docstring
 
-    messages = harness.create_calls[0]["messages"]
+    # create_calls[1] - Call 2's own input (the deep schema block). Call 1
+    # (create_calls[0]) gets the same ordering guarantee too, just prefixed
+    # with its own shallow schema block instead - not this test's concern.
+    messages = harness.create_calls[1]["messages"]
     # A single-entry history means this message is both the first (schema
     # prepended) AND the last historical turn (cache_control boundary) -
     # content is block form, not a plain string, as a result.
@@ -1483,17 +1800,21 @@ def test_claude_schema_attaches_to_new_prompt_when_there_is_no_history(app_facto
     select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
-    harness.queue_response(FakeClaudeResponse("SELECT 1;"))
+    harness.queue_response(FakeClaudeResponse('{"action": "sql"}'))
+    harness.queue_response(FakeClaudeResponse('{"sql": "SELECT 1;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'show users'})
     parse_translate_stream(resp)  # drains the stream - see this file's module docstring
 
-    messages = harness.create_calls[0]["messages"]
+    messages = harness.create_calls[1]["messages"]
     assert len(messages) == 1
     content = messages[0]["content"]
     assert isinstance(content, list) and len(content) == 2
     assert content[0]["text"] == "Database Schema:\nNo schema description available.\n\n"
-    assert content[1]["text"] == "User Request: show users\n\nSQL Query:"
+    # "JSON response:" (Call 2's own new_prompt_content suffix - see
+    # _SQL_GENERATION_FORMAT_RULES), not "SQL Query:" as before this
+    # redesign.
+    assert content[1]["text"] == "User Request: show users\n\nJSON response:"
 
 
 # --- Claude prompt caching (cache_control) ---
@@ -1515,7 +1836,8 @@ def test_claude_system_prompt_is_cache_control_marked(app_factory, monkeypatch):
     select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
-    harness.queue_response(FakeClaudeResponse("SELECT 1;"))
+    harness.queue_response(FakeClaudeResponse('{"action": "sql"}'))
+    harness.queue_response(FakeClaudeResponse('{"sql": "SELECT 1;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
     parse_translate_stream(resp)  # drains the stream - see this file's module docstring
@@ -1531,7 +1853,8 @@ def test_claude_cache_control_marks_last_history_turn_not_the_new_prompt(app_fac
     select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
-    harness.queue_response(FakeClaudeResponse("SELECT 3;"))
+    harness.queue_response(FakeClaudeResponse('{"action": "sql"}'))
+    harness.queue_response(FakeClaudeResponse('{"sql": "SELECT 3;"}'))
 
     history = [
         {"role": "user", "text": "show users"},
@@ -1542,6 +1865,7 @@ def test_claude_cache_control_marks_last_history_turn_not_the_new_prompt(app_fac
     resp = env.client.post('/api/translate', json={'prompt': 'now just the count', 'history': history})
     parse_translate_stream(resp)  # drains the stream - see this file's module docstring
 
+    # Call 1 (triage) also receives history, so create_calls[0] is checked.
     messages = harness.create_calls[0]["messages"]
     assert len(messages) == 5  # 4 history turns + the new prompt
     # Only the last history turn (index 3) carries a cache_control marker -
@@ -1565,7 +1889,8 @@ def test_claude_schema_block_is_cache_control_marked_even_with_no_history(app_fa
     select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
-    harness.queue_response(FakeClaudeResponse("SELECT 1;"))
+    harness.queue_response(FakeClaudeResponse('{"action": "sql"}'))
+    harness.queue_response(FakeClaudeResponse('{"sql": "SELECT 1;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'show users'})
     parse_translate_stream(resp)  # drains the stream - see this file's module docstring
@@ -1610,7 +1935,8 @@ def test_claude_reports_cache_read_tokens_via_cached_content_tokens(app_factory,
     select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
-    harness.queue_response(FakeClaudeResponse("SELECT 1;", cache_read_tokens=1234))
+    harness.queue_response(FakeClaudeResponse('{"action": "sql"}'))
+    harness.queue_response(FakeClaudeResponse('{"sql": "SELECT 1;"}', cache_read_tokens=1234))
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
     _, data = parse_translate_stream(resp)
@@ -1623,7 +1949,8 @@ def test_claude_default_model_is_claude_sonnet_5(app_factory, monkeypatch):
     select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
-    harness.queue_response(FakeClaudeResponse("SELECT 1;"))
+    harness.queue_response(FakeClaudeResponse('{"action": "sql"}'))
+    harness.queue_response(FakeClaudeResponse('{"sql": "SELECT 1;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
     parse_translate_stream(resp)  # drains the stream - see this file's module docstring
@@ -1638,7 +1965,8 @@ def test_claude_model_env_var_overrides_default(app_factory, monkeypatch):
     select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
-    harness.queue_response(FakeClaudeResponse("SELECT 1;"))
+    harness.queue_response(FakeClaudeResponse('{"action": "sql"}'))
+    harness.queue_response(FakeClaudeResponse('{"sql": "SELECT 1;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
     parse_translate_stream(resp)  # drains the stream - see this file's module docstring
@@ -1650,7 +1978,8 @@ def test_claude_model_override_via_request_body(app_factory, monkeypatch):
     select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
-    harness.queue_response(FakeClaudeResponse("SELECT 1;"))
+    harness.queue_response(FakeClaudeResponse('{"action": "sql"}'))
+    harness.queue_response(FakeClaudeResponse('{"sql": "SELECT 1;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi', 'claude_model': 'claude-x-custom'})
     parse_translate_stream(resp)  # drains the stream - see this file's module docstring
@@ -1673,8 +2002,12 @@ def test_claude_429_never_rotates_key_and_retries_with_delay(app_factory, monkey
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
     sleep_calls = []
     monkeypatch.setattr(env.translate_routes.time, "sleep", lambda secs: sleep_calls.append(secs))
+    # Call 1 (triage) succeeds immediately - this exercises Call 2's own
+    # retry, same reasoning as test_claude_server_error_retries_with_same_
+    # key above.
+    harness.queue_response(FakeClaudeResponse('{"action": "sql"}'))
     harness.queue_error(FakeClaudeRateLimitError())
-    harness.queue_response(FakeClaudeResponse("SELECT 1;"))
+    harness.queue_response(FakeClaudeResponse('{"sql": "SELECT 1;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
     assert resp.status_code == 200
@@ -1701,8 +2034,12 @@ def test_claude_529_overloaded_never_rotates_key_and_retries_with_delay(app_fact
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
     sleep_calls = []
     monkeypatch.setattr(env.translate_routes.time, "sleep", lambda secs: sleep_calls.append(secs))
+    # Call 1 (triage) succeeds immediately - this exercises Call 2's own
+    # retry, same reasoning as test_claude_server_error_retries_with_same_
+    # key above.
+    harness.queue_response(FakeClaudeResponse('{"action": "sql"}'))
     harness.queue_error(FakeClaudeStatusError(529))
-    harness.queue_response(FakeClaudeResponse("SELECT 1;"))
+    harness.queue_response(FakeClaudeResponse('{"sql": "SELECT 1;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
     assert resp.status_code == 200
@@ -1715,13 +2052,17 @@ def test_claude_529_overloaded_never_rotates_key_and_retries_with_delay(app_fact
 
 
 def test_claude_server_error_retries_with_same_key(app_factory, monkeypatch):
+    """Exercises Call 2's own retry - Call 1 (triage) is given an
+    immediately-successful "sql" response first, same reasoning as the
+    Gemini version of this test above."""
     env = app_factory(env={"ANTHROPIC_API_KEY": "fake-key-1"})
     select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
     monkeypatch.setattr(env.translate_routes.time, "sleep", lambda *a, **k: None)
+    harness.queue_response(FakeClaudeResponse('{"action": "sql"}'))
     harness.queue_error(FakeClaudeStatusError(500))
-    harness.queue_response(FakeClaudeResponse("SELECT 1;"))
+    harness.queue_response(FakeClaudeResponse('{"sql": "SELECT 1;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
     assert resp.status_code == 200
@@ -1730,7 +2071,7 @@ def test_claude_server_error_retries_with_same_key(app_factory, monkeypatch):
     assert len(retry_events) == 1
     assert retry_events[0]["rotatedKey"] is False
     assert len(harness.client_api_keys) == 1
-    assert len(harness.create_calls) == 2
+    assert len(harness.create_calls) == 3  # triage, Call 2's failed attempt, Call 2's retry
 
 
 def test_claude_connection_error_retries_with_same_key(app_factory, monkeypatch):
@@ -1747,8 +2088,12 @@ def test_claude_connection_error_retries_with_same_key(app_factory, monkeypatch)
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
     sleep_calls = []
     monkeypatch.setattr(env.translate_routes.time, "sleep", lambda secs: sleep_calls.append(secs))
+    # Call 1 (triage) succeeds immediately - this exercises Call 2's own
+    # retry, same reasoning as test_claude_server_error_retries_with_same_
+    # key above.
+    harness.queue_response(FakeClaudeResponse('{"action": "sql"}'))
     harness.queue_error(FakeClaudeConnectionError())
-    harness.queue_response(FakeClaudeResponse("SELECT 1;"))
+    harness.queue_response(FakeClaudeResponse('{"sql": "SELECT 1;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
     assert resp.status_code == 200
@@ -1761,11 +2106,15 @@ def test_claude_connection_error_retries_with_same_key(app_factory, monkeypatch)
 
 
 def test_claude_non_retryable_error_fails_immediately(app_factory, monkeypatch):
+    """Exercises Call 2's own non-retryable-error handling (still
+    `success: False`) - Call 1 is given an immediately-successful "sql"
+    response first so the turn reaches Call 2 at all."""
     env = app_factory(env={"ANTHROPIC_API_KEY": "fake-key-1"})
     select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
     monkeypatch.setattr(env.translate_routes.time, "sleep", lambda *a, **k: None)
+    harness.queue_response(FakeClaudeResponse('{"action": "sql"}'))
     harness.queue_error(FakeClaudeStatusError(400))  # bad request - _classify_claude_error returns None
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
@@ -1773,7 +2122,7 @@ def test_claude_non_retryable_error_fails_immediately(app_factory, monkeypatch):
     retry_events, data = parse_translate_stream(resp)
     assert retry_events == []
     assert data['success'] is False
-    assert len(harness.create_calls) == 1  # no retry attempted
+    assert len(harness.create_calls) == 2  # triage, then Call 2's one no-retry attempt
 
 
 def test_claude_exhausts_all_retry_attempts_and_reports_failure_in_body(app_factory, monkeypatch):
@@ -1782,12 +2131,15 @@ def test_claude_exhausts_all_retry_attempts_and_reports_failure_in_body(app_fact
     exhausts the shared transient-error budget (MAX_TRANSLATION_ATTEMPTS),
     not a key-rotation budget - configuring 2 CLAUDE_PRESET_KEYS here is
     deliberate: it proves the extra key is never touched (only one
-    Anthropic(...) client is ever constructed) even though it's available."""
+    Anthropic(...) client is ever constructed) even though it's available.
+    Exercises Call 2's own budget - Call 1 is given an immediately-
+    successful "sql" response first, same reasoning as the tests above."""
     env = app_factory(env={"CLAUDE_PRESET_KEYS": "fake-key-1,fake-key-2"})
     select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
     monkeypatch.setattr(env.translate_routes.time, "sleep", lambda *a, **k: None)
+    harness.queue_response(FakeClaudeResponse('{"action": "sql"}'))
     for _ in range(env.translate_routes.MAX_TRANSLATION_ATTEMPTS):
         harness.queue_error(FakeClaudeRateLimitError())
 
@@ -1797,7 +2149,8 @@ def test_claude_exhausts_all_retry_attempts_and_reports_failure_in_body(app_fact
     assert data['success'] is False
     assert "error" in data
     assert len(retry_events) == env.translate_routes.MAX_TRANSLATION_ATTEMPTS - 1
-    assert len(harness.create_calls) == env.translate_routes.MAX_TRANSLATION_ATTEMPTS
+    # +1 for Call 1's own successful triage call.
+    assert len(harness.create_calls) == env.translate_routes.MAX_TRANSLATION_ATTEMPTS + 1
     assert len(harness.client_api_keys) == 1
     assert all(action["rotatedKey"] is False for action in retry_events)
 
@@ -1963,7 +2316,10 @@ def test_openai_success_strips_markdown_fences_and_returns_token_counts(app_fact
     select_llm_provider(env, "openai")
     harness = OpenAiHarness()
     monkeypatch.setattr(env.translate_routes.openai, "OpenAI", harness.make_client_class())
-    harness.queue_response(FakeOpenAiResponse("```sql\nSELECT * FROM users;\n```", input_tokens=20, output_tokens=8, total_tokens=28))
+    harness.queue_response(FakeOpenAiResponse('{"action": "sql"}', input_tokens=6, output_tokens=2, total_tokens=8))
+    harness.queue_response(FakeOpenAiResponse(
+        '```sql\n{"sql": "SELECT * FROM users;"}\n```', input_tokens=20, output_tokens=8, total_tokens=28,
+    ))
 
     resp = env.client.post('/api/translate', json={'prompt': 'Show all users'})
     assert resp.status_code == 200
@@ -1971,9 +2327,11 @@ def test_openai_success_strips_markdown_fences_and_returns_token_counts(app_fact
     assert retry_events == []
     assert data['success'] is True
     assert data['sql'] == "SELECT * FROM users;"
-    assert data['total_tokens'] == 28
-    assert data['input_tokens'] == 20
-    assert data['output_tokens'] == 8
+    # Combined across both calls (see stream_translation()'s own
+    # _combined_usage).
+    assert data['total_tokens'] == 36
+    assert data['input_tokens'] == 26
+    assert data['output_tokens'] == 10
 
 
 def test_openai_client_is_constructed_with_translation_timeout_in_seconds(app_factory, monkeypatch):
@@ -1983,7 +2341,8 @@ def test_openai_client_is_constructed_with_translation_timeout_in_seconds(app_fa
     select_llm_provider(env, "openai")
     harness = OpenAiHarness()
     monkeypatch.setattr(env.translate_routes.openai, "OpenAI", harness.make_client_class())
-    harness.queue_response(FakeOpenAiResponse("SELECT 1;"))
+    harness.queue_response(FakeOpenAiResponse('{"action": "sql"}'))
+    harness.queue_response(FakeOpenAiResponse('{"sql": "SELECT 1;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
     assert resp.status_code == 200
@@ -1995,7 +2354,8 @@ def test_openai_success_records_translation_history(app_factory, monkeypatch):
     env = app_factory(env={"OPENAI_API_KEY": "fake-key-1"})
     harness = OpenAiHarness()
     monkeypatch.setattr(env.translate_routes.openai, "OpenAI", harness.make_client_class())
-    harness.queue_response(FakeOpenAiResponse("SELECT 1;"))
+    harness.queue_response(FakeOpenAiResponse('{"action": "sql"}'))
+    harness.queue_response(FakeOpenAiResponse('{"sql": "SELECT 1;"}'))
 
     # Not select_llm_provider(env, ...) here - see the matching comment in
     # test_claude_success_records_translation_history above.
@@ -2004,6 +2364,8 @@ def test_openai_success_records_translation_history(app_factory, monkeypatch):
     resp = env.client.post('/api/translate', json={'prompt': 'give me one'})
     parse_translate_stream(resp)  # drains the stream - see this file's module docstring
 
+    # ONE row - see test_success_records_translation_history's own comment
+    # for why.
     rows = _translation_rows(env)
     assert len(rows) == 1
     assert rows[0]['sql_command'] == "SELECT 1;"
@@ -2018,12 +2380,14 @@ def test_openai_call_uses_responses_api_shape_not_chat_completions(app_factory, 
     select_llm_provider(env, "openai")
     harness = OpenAiHarness()
     monkeypatch.setattr(env.translate_routes.openai, "OpenAI", harness.make_client_class())
-    harness.queue_response(FakeOpenAiResponse("SELECT 1;"))
+    harness.queue_response(FakeOpenAiResponse('{"action": "sql"}'))
+    harness.queue_response(FakeOpenAiResponse('{"sql": "SELECT 1;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
     parse_translate_stream(resp)  # drains the stream - see this file's module docstring
 
-    call = harness.create_calls[0]
+    # create_calls[1] - Call 2's own request, where the dialect intro lives.
+    call = harness.create_calls[1]
     assert "PostgreSQL-compatible RDBMSs" in call["instructions"]
     assert isinstance(call["input"], list)
     assert all("PostgreSQL-compatible RDBMSs" not in (m.get("content") or "") for m in call["input"])
@@ -2038,7 +2402,8 @@ def test_openai_history_uses_assistant_role_and_appends_results(app_factory, mon
     select_llm_provider(env, "openai")
     harness = OpenAiHarness()
     monkeypatch.setattr(env.translate_routes.openai, "OpenAI", harness.make_client_class())
-    harness.queue_response(FakeOpenAiResponse("SELECT 2;"))
+    harness.queue_response(FakeOpenAiResponse('{"action": "sql"}'))
+    harness.queue_response(FakeOpenAiResponse('{"sql": "SELECT 2;"}'))
 
     history = [
         {"role": "user", "text": "show users"},
@@ -2048,6 +2413,7 @@ def test_openai_history_uses_assistant_role_and_appends_results(app_factory, mon
     resp = env.client.post('/api/translate', json={'prompt': 'now show orders', 'history': history})
     parse_translate_stream(resp)  # drains the stream - see this file's module docstring
 
+    # Call 1 (triage) also receives history, so create_calls[0] is checked.
     messages = harness.create_calls[0]["input"]
     assert messages[0]["role"] == "user"
     assert messages[0]["content"].endswith("show users")
@@ -2065,13 +2431,15 @@ def test_openai_schema_precedes_history_and_is_not_glued_to_the_new_prompt(app_f
     select_llm_provider(env, "openai")
     harness = OpenAiHarness()
     monkeypatch.setattr(env.translate_routes.openai, "OpenAI", harness.make_client_class())
-    harness.queue_response(FakeOpenAiResponse("SELECT 2;"))
+    harness.queue_response(FakeOpenAiResponse('{"action": "sql"}'))
+    harness.queue_response(FakeOpenAiResponse('{"sql": "SELECT 2;"}'))
 
     history = [{"role": "user", "text": "show users"}]
     resp = env.client.post('/api/translate', json={'prompt': 'now show orders', 'history': history})
     parse_translate_stream(resp)  # drains the stream - see this file's module docstring
 
-    messages = harness.create_calls[0]["input"]
+    # create_calls[1] - Call 2's own input (the deep schema block).
+    messages = harness.create_calls[1]["input"]
     assert messages[0]["content"] == "Database Schema:\nNo schema description available.\n\nshow users"
     assert "Database Schema:" not in messages[-1]["content"]
     assert "now show orders" in messages[-1]["content"]
@@ -2087,14 +2455,17 @@ def test_openai_schema_attaches_to_new_prompt_when_there_is_no_history(app_facto
     select_llm_provider(env, "openai")
     harness = OpenAiHarness()
     monkeypatch.setattr(env.translate_routes.openai, "OpenAI", harness.make_client_class())
-    harness.queue_response(FakeOpenAiResponse("SELECT 1;"))
+    harness.queue_response(FakeOpenAiResponse('{"action": "sql"}'))
+    harness.queue_response(FakeOpenAiResponse('{"sql": "SELECT 1;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'show users'})
     parse_translate_stream(resp)  # drains the stream - see this file's module docstring
 
-    messages = harness.create_calls[0]["input"]
+    messages = harness.create_calls[1]["input"]
     assert len(messages) == 1
-    assert messages[0]["content"] == "Database Schema:\nNo schema description available.\n\nUser Request: show users\n\nSQL Query:"
+    # "JSON response:" (Call 2's own new_prompt_content suffix), not
+    # "SQL Query:" as before this redesign.
+    assert messages[0]["content"] == "Database Schema:\nNo schema description available.\n\nUser Request: show users\n\nJSON response:"
 
 
 def test_openai_reports_cached_tokens(app_factory, monkeypatch):
@@ -2104,7 +2475,8 @@ def test_openai_reports_cached_tokens(app_factory, monkeypatch):
     select_llm_provider(env, "openai")
     harness = OpenAiHarness()
     monkeypatch.setattr(env.translate_routes.openai, "OpenAI", harness.make_client_class())
-    harness.queue_response(FakeOpenAiResponse("SELECT 1;", cached_tokens=1234))
+    harness.queue_response(FakeOpenAiResponse('{"action": "sql"}'))
+    harness.queue_response(FakeOpenAiResponse('{"sql": "SELECT 1;"}', cached_tokens=1234))
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
     _, data = parse_translate_stream(resp)
@@ -2122,7 +2494,8 @@ def test_openai_reports_reasoning_tokens_as_thinking_tokens(app_factory, monkeyp
     select_llm_provider(env, "openai")
     harness = OpenAiHarness()
     monkeypatch.setattr(env.translate_routes.openai, "OpenAI", harness.make_client_class())
-    harness.queue_response(FakeOpenAiResponse("SELECT 1;", reasoning_tokens=42))
+    harness.queue_response(FakeOpenAiResponse('{"action": "sql"}'))
+    harness.queue_response(FakeOpenAiResponse('{"sql": "SELECT 1;"}', reasoning_tokens=42))
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
     _, data = parse_translate_stream(resp)
@@ -2135,7 +2508,8 @@ def test_openai_default_model_is_gpt_5_6_luna(app_factory, monkeypatch):
     select_llm_provider(env, "openai")
     harness = OpenAiHarness()
     monkeypatch.setattr(env.translate_routes.openai, "OpenAI", harness.make_client_class())
-    harness.queue_response(FakeOpenAiResponse("SELECT 1;"))
+    harness.queue_response(FakeOpenAiResponse('{"action": "sql"}'))
+    harness.queue_response(FakeOpenAiResponse('{"sql": "SELECT 1;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
     parse_translate_stream(resp)  # drains the stream - see this file's module docstring
@@ -2150,7 +2524,8 @@ def test_openai_model_env_var_overrides_default(app_factory, monkeypatch):
     select_llm_provider(env, "openai")
     harness = OpenAiHarness()
     monkeypatch.setattr(env.translate_routes.openai, "OpenAI", harness.make_client_class())
-    harness.queue_response(FakeOpenAiResponse("SELECT 1;"))
+    harness.queue_response(FakeOpenAiResponse('{"action": "sql"}'))
+    harness.queue_response(FakeOpenAiResponse('{"sql": "SELECT 1;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
     parse_translate_stream(resp)  # drains the stream - see this file's module docstring
@@ -2162,7 +2537,8 @@ def test_openai_model_override_via_request_body(app_factory, monkeypatch):
     select_llm_provider(env, "openai")
     harness = OpenAiHarness()
     monkeypatch.setattr(env.translate_routes.openai, "OpenAI", harness.make_client_class())
-    harness.queue_response(FakeOpenAiResponse("SELECT 1;"))
+    harness.queue_response(FakeOpenAiResponse('{"action": "sql"}'))
+    harness.queue_response(FakeOpenAiResponse('{"sql": "SELECT 1;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi', 'openai_model': 'gpt-5.6-custom'})
     parse_translate_stream(resp)  # drains the stream - see this file's module docstring
@@ -2200,13 +2576,17 @@ def test_openai_rate_limit_never_rotates_key_and_retries_with_delay(app_factory,
 
 
 def test_openai_internal_server_error_retries_with_same_key(app_factory, monkeypatch):
+    """Exercises Call 2's own retry - Call 1 (triage) is given an
+    immediately-successful "sql" response first, same reasoning as the
+    Gemini/Claude versions of this test above."""
     env = app_factory(env={"OPENAI_API_KEY": "fake-key-1"})
     select_llm_provider(env, "openai")
     harness = OpenAiHarness()
     monkeypatch.setattr(env.translate_routes.openai, "OpenAI", harness.make_client_class())
     monkeypatch.setattr(env.translate_routes.time, "sleep", lambda *a, **k: None)
+    harness.queue_response(FakeOpenAiResponse('{"action": "sql"}'))
     harness.queue_error(FakeOpenAiInternalServerError())
-    harness.queue_response(FakeOpenAiResponse("SELECT 1;"))
+    harness.queue_response(FakeOpenAiResponse('{"sql": "SELECT 1;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
     assert resp.status_code == 200
@@ -2215,7 +2595,7 @@ def test_openai_internal_server_error_retries_with_same_key(app_factory, monkeyp
     assert len(retry_events) == 1
     assert retry_events[0]["rotatedKey"] is False
     assert len(harness.client_api_keys) == 1
-    assert len(harness.create_calls) == 2
+    assert len(harness.create_calls) == 3  # triage, Call 2's failed attempt, Call 2's retry
 
 
 def test_openai_connection_error_retries_with_same_key(app_factory, monkeypatch):
@@ -2242,11 +2622,15 @@ def test_openai_connection_error_retries_with_same_key(app_factory, monkeypatch)
 
 
 def test_openai_non_retryable_error_fails_immediately(app_factory, monkeypatch):
+    """Exercises Call 2's own non-retryable-error handling - Call 1 is
+    given an immediately-successful "sql" response first so the turn
+    reaches Call 2 at all."""
     env = app_factory(env={"OPENAI_API_KEY": "fake-key-1"})
     select_llm_provider(env, "openai")
     harness = OpenAiHarness()
     monkeypatch.setattr(env.translate_routes.openai, "OpenAI", harness.make_client_class())
     monkeypatch.setattr(env.translate_routes.time, "sleep", lambda *a, **k: None)
+    harness.queue_response(FakeOpenAiResponse('{"action": "sql"}'))
     harness.queue_error(FakeOpenAiBadRequestError())  # _classify_openai_error returns None
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
@@ -2254,7 +2638,7 @@ def test_openai_non_retryable_error_fails_immediately(app_factory, monkeypatch):
     retry_events, data = parse_translate_stream(resp)
     assert retry_events == []
     assert data['success'] is False
-    assert len(harness.create_calls) == 1  # no retry attempted
+    assert len(harness.create_calls) == 2  # triage, then Call 2's one no-retry attempt
 
 
 def test_openai_exhausts_all_retry_attempts_and_reports_failure_in_body(app_factory, monkeypatch):
@@ -2269,6 +2653,9 @@ def test_openai_exhausts_all_retry_attempts_and_reports_failure_in_body(app_fact
     harness = OpenAiHarness()
     monkeypatch.setattr(env.translate_routes.openai, "OpenAI", harness.make_client_class())
     monkeypatch.setattr(env.translate_routes.time, "sleep", lambda *a, **k: None)
+    # Call 1 (triage) succeeds immediately - this exercises Call 2's own
+    # budget, same reasoning as the Claude version of this test above.
+    harness.queue_response(FakeOpenAiResponse('{"action": "sql"}'))
     for _ in range(env.translate_routes.MAX_TRANSLATION_ATTEMPTS):
         harness.queue_error(FakeOpenAiRateLimitError())
 
@@ -2278,7 +2665,8 @@ def test_openai_exhausts_all_retry_attempts_and_reports_failure_in_body(app_fact
     assert data['success'] is False
     assert "error" in data
     assert len(retry_events) == env.translate_routes.MAX_TRANSLATION_ATTEMPTS - 1
-    assert len(harness.create_calls) == env.translate_routes.MAX_TRANSLATION_ATTEMPTS
+    # +1 for Call 1's own successful triage call.
+    assert len(harness.create_calls) == env.translate_routes.MAX_TRANSLATION_ATTEMPTS + 1
     assert len(harness.client_api_keys) == 1
     assert all(action["rotatedKey"] is False for action in retry_events)
 
@@ -2356,12 +2744,13 @@ def test_unrecognized_persisted_llm_provider_falls_back_to_google_end_to_end(app
     select_llm_provider(env, "gemini")  # the pre-rename label - now unrecognized
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(FakeGenaiResponse("SELECT 1;"))
+    harness.queue_response(FakeGenaiResponse('{"action": "sql"}'))
+    harness.queue_response(FakeGenaiResponse('{"sql": "SELECT 1;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
     _, data = parse_translate_stream(resp)
     assert data['success'] is True
-    assert len(harness.generate_calls) == 1
+    assert len(harness.generate_calls) == 2  # Call 1 (triage) + Call 2 (SQL-gen)
 
 
 # --- LlmProvider.preset_models / default_model / list_llm_providers_info() ---
@@ -2527,7 +2916,8 @@ def test_translate_uses_default_model_env_var_end_to_end_for_a_fresh_session(app
     })
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
-    harness.queue_response(FakeClaudeResponse("SELECT 1;"))
+    harness.queue_response(FakeClaudeResponse('{"action": "sql"}'))
+    harness.queue_response(FakeClaudeResponse('{"sql": "SELECT 1;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
     _, data = parse_translate_stream(resp)
@@ -2552,7 +2942,8 @@ def test_translate_uses_persisted_session_provider_over_env_default(app_factory,
 
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
-    harness.queue_response(FakeClaudeResponse("SELECT 1;"))
+    harness.queue_response(FakeClaudeResponse('{"action": "sql"}'))
+    harness.queue_response(FakeClaudeResponse('{"sql": "SELECT 1;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
     _, data = parse_translate_stream(resp)
@@ -2569,7 +2960,8 @@ def test_translate_falls_back_to_env_provider_when_session_never_saved_a_choice(
     login_as(env.client, "alice@example.com")
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(FakeGenaiResponse("SELECT 1;"))
+    harness.queue_response(FakeGenaiResponse('{"action": "sql"}'))
+    harness.queue_response(FakeGenaiResponse('{"sql": "SELECT 1;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
     _, data = parse_translate_stream(resp)
@@ -2585,7 +2977,8 @@ def test_translate_request_body_model_override_still_wins_over_persisted_session
 
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(FakeGenaiResponse("SELECT 1;"))
+    harness.queue_response(FakeGenaiResponse('{"action": "sql"}'))
+    harness.queue_response(FakeGenaiResponse('{"sql": "SELECT 1;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi', 'model': 'request-override-model'})
     _, data = parse_translate_stream(resp)
@@ -2603,7 +2996,8 @@ def test_translate_falls_back_to_provider_default_model_when_only_provider_persi
 
     harness = ClaudeHarness()
     monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
-    harness.queue_response(FakeClaudeResponse("SELECT 1;"))
+    harness.queue_response(FakeClaudeResponse('{"action": "sql"}'))
+    harness.queue_response(FakeClaudeResponse('{"sql": "SELECT 1;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
     _, data = parse_translate_stream(resp)
@@ -2746,11 +3140,18 @@ def test_single_connection_translate_final_failure_shows_categorized_message(app
     stream_translation()'s inline single-connection retry loop) reaches the
     client's data['error'] with the categorized message intact, with zero
     special-casing needed at that loop's outer catch-all (see
-    format_llm_error_for_user()'s and LlmCallFailed's docstrings)."""
+    format_llm_error_for_user()'s and LlmCallFailed's docstrings). Call 1
+    (triage) is given an immediately-successful "sql" response first, so
+    this exercises Call 2's own retry-exhaustion specifically - Call 1's
+    OWN failure handling is a different, softer convention (always
+    `success: True` with a "*** NO SQL ***"-prefixed apology - see
+    triage_single_dataset_question's docstring) that would never reach
+    `success: False`/data['error'] at all."""
     env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     monkeypatch.setattr(env.translate_routes.time, "sleep", lambda *a, **k: None)
+    harness.queue_response(FakeGenaiResponse('{"action": "sql"}'))
     # A 503 on every attempt (MAX_TRANSLATION_ATTEMPTS) - not a 429, so no
     # key rotation kicks in first; this exhausts the same-key retry budget
     # and reaches the final "give up" raise.
@@ -2780,11 +3181,14 @@ def test_single_connection_translate_final_failure_logs_a_translation_row(app_fa
     every attempt and inter-attempt wait, and a TRANSLATION_ERROR(...)
     sentinel in sql_command in place of real SQL, following the same
     overloaded-column convention "*** NO SQL ***" already uses for non-SQL
-    text in that column."""
+    text in that column. Call 1 (triage) succeeds immediately, so this
+    exercises Call 2's own retry-exhaustion (see the matching comment on
+    the categorized-message test above for why)."""
     env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     monkeypatch.setattr(env.translate_routes.time, "sleep", lambda *a, **k: None)
+    harness.queue_response(FakeGenaiResponse('{"action": "sql"}'))
     for _ in range(10):
         harness.queue_error(FakeApiError(503))
 
@@ -2794,11 +3198,16 @@ def test_single_connection_translate_final_failure_logs_a_translation_row(app_fa
     _, data = parse_translate_stream(resp)
     assert data['success'] is False
 
+    # ONE row - only Call 2 (the actual SQL-generation attempt) is ever
+    # recorded; Call 1 (triage) is never logged, even though it succeeded
+    # and really cost tokens.
     rows = _translation_rows(env)
     assert len(rows) == 1
     row = rows[0]
     assert row['nl_prompt'] == 'give me one'
     assert row['sql_command'] == f"TRANSLATION_ERROR ({data['error']})"
+    # Call 2's own call never succeeded at all - a real, honest 0 here, not
+    # a placeholder standing in for tokens that were actually spent.
     assert row['input_tokens'] == 0
     assert row['output_tokens'] == 0
     assert row['total_tokens'] == 0
@@ -2811,11 +3220,15 @@ def test_single_connection_translate_non_retryable_failure_also_logs_a_translati
     """Same as above, but for the immediate (no-retry) non-retryable
     failure path - LlmCallFailed is raised on the very first attempt here,
     so this is also a regression guard that the new logging doesn't
-    accidentally depend on having gone through at least one retry."""
+    accidentally depend on having gone through at least one retry. Call 1
+    (triage) succeeds immediately, so this exercises Call 2's own
+    immediate failure (see the matching comment on the categorized-message
+    test above for why)."""
     env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     monkeypatch.setattr(env.translate_routes.time, "sleep", lambda *a, **k: None)
+    harness.queue_response(FakeGenaiResponse('{"action": "sql"}'))
     harness.queue_error(FakeApiError(400))  # bad request - _classify_gemini_error returns None
 
     env.client.set_cookie("crbot_user_id", "alice@example.com")
@@ -2824,6 +3237,8 @@ def test_single_connection_translate_non_retryable_failure_also_logs_a_translati
     _, data = parse_translate_stream(resp)
     assert data['success'] is False
 
+    # ONE row - see test_single_connection_translate_final_failure_logs_a_
+    # translation_row's own comment for why (only Call 2 is ever recorded).
     rows = _translation_rows(env)
     assert len(rows) == 1
     assert rows[0]['sql_command'] == f"TRANSLATION_ERROR ({data['error']})"
@@ -2971,7 +3386,8 @@ def test_translate_uses_byok_key_instead_of_env_configured_key(app_factory, monk
 
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(FakeGenaiResponse("SELECT 1;"))
+    harness.queue_response(FakeGenaiResponse('{"action": "sql"}'))
+    harness.queue_response(FakeGenaiResponse('{"sql": "SELECT 1;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
     _, data = parse_translate_stream(resp)
@@ -2988,7 +3404,8 @@ def test_translate_falls_back_to_env_key_when_no_byok_key_is_saved(app_factory, 
 
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(FakeGenaiResponse("SELECT 1;"))
+    harness.queue_response(FakeGenaiResponse('{"action": "sql"}'))
+    harness.queue_response(FakeGenaiResponse('{"sql": "SELECT 1;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
     _, data = parse_translate_stream(resp)
@@ -3003,21 +3420,30 @@ def test_translate_byok_key_failure_never_rotates_to_env_configured_keys_and_sho
     # key-rotation budget weren't forced down to 1 for a BYOK call (see
     # generate_sql_for_connection's/stream_translation's using_byok
     # handling), a 401 here would incorrectly rotate onto one of THOSE,
-    # silently abandoning the user's own key mid-request.
+    # silently abandoning the user's own key mid-request. Call 1 (triage)
+    # succeeds immediately (with the same BYOK key), so this exercises
+    # Call 2's own key-rotation-budget-of-1 exhaustion specifically - Call
+    # 1's OWN failure handling is a different, softer convention (always
+    # `success: True` with a "*** NO SQL ***"-prefixed apology, still
+    # byok-worded via format_llm_error_for_user's own using_byok param -
+    # see triage_single_dataset_question's docstring) that would never
+    # reach `success: False`/data['error'] at all.
     env = app_factory(env={"GEMINI_PRESET_KEYS": "env-key-1,env-key-2"})
     login_as(env.client, "alice@example.com")
     set_llm_byok_key(env, "google", "alices-bad-key", user_identity="alice@example.com")
 
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(FakeGenaiResponse('{"action": "sql"}'))
     harness.queue_error(FakeApiError(401))
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
     assert resp.status_code == 200
     _, data = parse_translate_stream(resp)
     assert data['success'] is False
-    # Exactly one call, with the user's own key - no rotation attempt onto
-    # either of the two env-configured keys.
+    # Exactly one client construction, with the user's own key, reused for
+    # both calls - no rotation attempt onto either of the two
+    # env-configured keys.
     assert harness.client_api_keys == ["alices-bad-key"]
     assert data['error'].startswith(
         "Your custom API key for this model (gemini-3.6-flash) was rejected. Please correct or "
@@ -3037,7 +3463,8 @@ def test_translate_byok_key_removed_falls_back_to_env_key_again(app_factory, mon
 
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(FakeGenaiResponse("SELECT 1;"))
+    harness.queue_response(FakeGenaiResponse('{"action": "sql"}'))
+    harness.queue_response(FakeGenaiResponse('{"sql": "SELECT 1;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
     _, data = parse_translate_stream(resp)
@@ -3212,7 +3639,7 @@ def test_summarize_single_connection_results_gives_up_immediately_for_a_non_retr
     assert len(provider.calls) == 1
 
 
-def test_summarize_result_endpoint_returns_no_sql_prefixed_summary_and_logs_a_real_connection_row(
+def test_summarize_result_endpoint_returns_no_sql_prefixed_summary_and_is_never_logged(
     app_factory, monkeypatch,
 ):
     env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
@@ -3244,10 +3671,12 @@ def test_summarize_result_endpoint_returns_no_sql_prefixed_summary_and_logs_a_re
     # None, not whatever the (here, honest) model wrote.
     assert data['visualization'] is None
 
+    # Call 3 (summarization) is deliberately never recorded in the
+    # translations-table history/stats - only calls that take a prompt and
+    # generate real SQL are (this turn's own earlier /api/translate call,
+    # not exercised here).
     rows = _translation_rows(env)
-    assert len(rows) == 1
-    assert rows[0]['nl_prompt'] == 'how many signups this week'
-    assert rows[0]['sql_command'] == data['summary']
+    assert len(rows) == 0
 
 
 def test_summarize_result_endpoint_streams_a_retrying_line_before_the_terminal_line(
@@ -3334,19 +3763,12 @@ def test_summarize_result_endpoint_returns_success_false_when_the_llm_call_fails
     _retry_events, data = parse_translate_stream(resp)
     assert data['success'] is False
 
-    # A total LLM-call failure IS now logged, against the real connection
-    # this was run for (unlike Phase C's "All Databases" attribution), with
-    # a TRANSLATION_ERROR(...) sentinel standing in for the summary text
-    # and 0 for every token count (no response was ever successfully
-    # returned to have real usage numbers from).
+    # Call 3 (summarization) is deliberately never recorded in the
+    # translations-table history/stats, success or failure - see
+    # test_summarize_result_endpoint_returns_no_sql_prefixed_summary_and_
+    # is_never_logged's own comment for why.
     rows = _translation_rows(env)
-    assert len(rows) == 1
-    assert rows[0]['nl_prompt'] == 'q'
-    assert rows[0]['sql_command'].startswith('TRANSLATION_ERROR (')
-    assert data['error'] in rows[0]['sql_command']
-    assert rows[0]['input_tokens'] == 0
-    assert rows[0]['output_tokens'] == 0
-    assert rows[0]['total_tokens'] == 0
+    assert len(rows) == 0
 
 
 # --- Charting feature: chartability gating, numeric detection, and
@@ -3551,3 +3973,398 @@ def test_summarize_result_endpoint_returns_a_validated_visualization_for_a_genui
     assert data['visualization'] == {
         "chart_type": "line", "x_column": "day", "y_columns": ["signups"], "series_column": None,
     }
+
+
+# --- Two-call single-connection redesign: direct unit tests --------------
+#
+# Everything above exercises the two-call redesign only end to end, through
+# /api/translate - this section adds direct unit tests for the pieces that
+# introduced, mirroring test_connection_router.py's own direct-unit-test
+# style for triage_all_mode_question (_FakeProvider/_drain below are local
+# copies of that file's own helpers of the same name, duplicated rather
+# than imported across test modules for the same load-order-independence
+# reason GenaiHarness is already duplicated here - see this file's own
+# module docstring): _extract_json_object (the chatter-tolerant JSON
+# envelope parser both of the functions below are built on),
+# _parse_single_dataset_triage_response, _parse_sql_generation_response,
+# get_triage_schema_text, and triage_single_dataset_question itself.
+
+def _drain(gen):
+    """See test_connection_router.py's own _drain docstring - same idiom,
+    duplicated here for the same load-order-independence reason as
+    GenaiHarness above."""
+    try:
+        while True:
+            next(gen)
+    except StopIteration as stop:
+        return stop.value
+
+
+class _FakeProvider:
+    """See test_connection_router.py's own _FakeProvider docstring - same
+    shape, duplicated here so triage_single_dataset_question's retry loop
+    (key rotation, transient-error retry, budget exhaustion) can be driven
+    directly without any real client/network/GenaiHarness machinery."""
+
+    def __init__(self, responses, key_pool=None, classify_error=None):
+        self._responses = list(responses)  # list of str (response text) or Exception
+        self.calls = []
+        self._key_pool = list(key_pool) if key_pool else ["fake-key-1"]
+        self._classify_error = classify_error or (lambda exc: None)
+        self.made_clients = []
+
+    def build_llm_input(self, history, schema_block, new_prompt_content):
+        return new_prompt_content
+
+    def call(self, client, model, llm_input, system_instruction):
+        self.calls.append({"client": client, "llm_input": llm_input, "system_instruction": system_instruction})
+        if not self._responses:
+            raise AssertionError("_FakeProvider queue exhausted")
+        item = self._responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item, {}
+
+    def classify_error(self, exc):
+        return self._classify_error(exc)
+
+    def pick_api_key(self, exclude=None):
+        exclude = exclude or set()
+        remaining = [k for k in self._key_pool if k not in exclude]
+        return remaining[0] if remaining else self._key_pool[0]
+
+    def make_client(self, api_key):
+        self.made_clients.append(api_key)
+        return f"client-for-{api_key}"
+
+    def get_key_pool_size(self):
+        return len(self._key_pool)
+
+
+# --- _extract_json_object ---------------------------------------------------
+
+def test_extract_json_object_parses_a_bare_well_behaved_response(app_env):
+    assert app_env.translate_routes._extract_json_object('{"action": "sql"}') == {"action": "sql"}
+
+
+def test_extract_json_object_strips_an_anchored_markdown_fence(app_env):
+    # The fast/common path - the whole response is one fenced block, no
+    # chatter at all, handled by strip_markdown_fence() alone (candidate 1).
+    assert app_env.translate_routes._extract_json_object(
+        '```json\n{"sql": "SELECT 1;"}\n```'
+    ) == {"sql": "SELECT 1;"}
+
+
+def test_extract_json_object_finds_a_fenced_block_buried_in_prose(app_env):
+    # strip_markdown_fence() alone can't touch this (it only strips a fence
+    # anchored at the very start/end) - exercises the second fallback,
+    # _JSON_FENCE_RE searching anywhere in the text.
+    raw = 'Sure, here you go:\n\n```json\n{"sql": "SELECT * FROM users;"}\n```\n\nLet me know if you need more!'
+    assert app_env.translate_routes._extract_json_object(raw) == {"sql": "SELECT * FROM users;"}
+
+
+def test_extract_json_object_falls_back_to_brace_extraction_with_no_fence_at_all(app_env):
+    # No fence anywhere - exercises the last-resort fallback, the substring
+    # from the first '{' to the last '}'.
+    assert app_env.translate_routes._extract_json_object(
+        'Sure! {"action": "help"}'
+    ) == {"action": "help"}
+
+
+def test_extract_json_object_returns_none_for_text_with_no_json_at_all(app_env):
+    assert app_env.translate_routes._extract_json_object("I am not able to respond to your prompt.") is None
+
+
+def test_extract_json_object_returns_none_for_a_json_array_not_an_object(app_env):
+    # Every real caller (_parse_single_dataset_triage_response/_parse_sql_
+    # generation_response) needs a dict specifically - a syntactically
+    # valid JSON array is still rejected.
+    assert app_env.translate_routes._extract_json_object('["sql", "SELECT 1;"]') is None
+
+
+def test_extract_json_object_returns_none_for_empty_or_missing_text(app_env):
+    assert app_env.translate_routes._extract_json_object("") is None
+    assert app_env.translate_routes._extract_json_object(None) is None
+
+
+# --- _parse_single_dataset_triage_response ----------------------------------
+
+def test_parse_single_dataset_triage_response_general_outcome_carries_the_answer(app_env):
+    parsed = app_env.translate_routes._parse_single_dataset_triage_response(
+        '{"action": "general", "answer": "I am a natural-language-to-SQL assistant."}'
+    )
+    assert parsed == {"outcome": "general", "answer": "I am a natural-language-to-SQL assistant."}
+
+
+def test_parse_single_dataset_triage_response_general_outcome_with_no_answer_is_unparseable(app_env):
+    tr = app_env.translate_routes
+    assert tr._parse_single_dataset_triage_response('{"action": "general"}') is None
+    assert tr._parse_single_dataset_triage_response('{"action": "general", "answer": ""}') is None
+    assert tr._parse_single_dataset_triage_response('{"action": "general", "answer": "   "}') is None
+
+
+def test_parse_single_dataset_triage_response_schema_help_sql_outcomes_need_no_other_fields(app_env):
+    tr = app_env.translate_routes
+    assert tr._parse_single_dataset_triage_response('{"action": "schema"}') == {"outcome": "schema"}
+    assert tr._parse_single_dataset_triage_response('{"action": "help"}') == {"outcome": "help"}
+    assert tr._parse_single_dataset_triage_response('{"action": "sql"}') == {"outcome": "sql"}
+    # Case/whitespace-insensitive, same as connection_router's own triage parser.
+    assert tr._parse_single_dataset_triage_response('{"action": " SQL "}') == {"outcome": "sql"}
+
+
+def test_parse_single_dataset_triage_response_rejects_an_unrecognized_or_missing_action(app_env):
+    tr = app_env.translate_routes
+    assert tr._parse_single_dataset_triage_response('{"action": "route"}') is None
+    assert tr._parse_single_dataset_triage_response('{}') is None
+    assert tr._parse_single_dataset_triage_response('{"action": 5}') is None
+
+
+def test_parse_single_dataset_triage_response_tolerates_chatter_around_the_json(app_env):
+    # Proves this goes through _extract_json_object, not a bare
+    # strip_markdown_fence()+json.loads() - see that function's own
+    # docstring for the failure mode this closes.
+    parsed = app_env.translate_routes._parse_single_dataset_triage_response('Sure! {"action": "help"}')
+    assert parsed == {"outcome": "help"}
+
+
+def test_parse_single_dataset_triage_response_returns_none_for_unparseable_or_empty_text(app_env):
+    tr = app_env.translate_routes
+    assert tr._parse_single_dataset_triage_response("not json at all") is None
+    assert tr._parse_single_dataset_triage_response("") is None
+    assert tr._parse_single_dataset_triage_response(None) is None
+    assert tr._parse_single_dataset_triage_response('["action", "sql"]') is None
+
+
+# --- _parse_sql_generation_response ------------------------------------------
+
+def test_parse_sql_generation_response_sql_outcome(app_env):
+    parsed = app_env.translate_routes._parse_sql_generation_response('{"sql": "SELECT * FROM users;"}')
+    assert parsed == {"outcome": "sql", "sql": "SELECT * FROM users;"}
+
+
+def test_parse_sql_generation_response_strips_a_fence_nested_inside_the_sql_field(app_env):
+    # _clean_generated_sql is applied as defense-in-depth to the "sql"
+    # value itself - see that function's own docstring on why a model can
+    # still nest a fenced block INSIDE the JSON string value.
+    parsed = app_env.translate_routes._parse_sql_generation_response(
+        '{"sql": "```sql\\nSELECT * FROM users;\\n```"}'
+    )
+    assert parsed == {"outcome": "sql", "sql": "SELECT * FROM users;"}
+
+
+def test_parse_sql_generation_response_cannot_answer_outcome(app_env):
+    parsed = app_env.translate_routes._parse_sql_generation_response(
+        '{"cannot_answer_reason": "The schema has no table matching \\"invoices\\"."}'
+    )
+    assert parsed == {"outcome": "cannot_answer", "reason": 'The schema has no table matching "invoices".'}
+
+
+def test_parse_sql_generation_response_rejects_both_populated(app_env):
+    parsed = app_env.translate_routes._parse_sql_generation_response(
+        '{"sql": "SELECT 1;", "cannot_answer_reason": "not sure"}'
+    )
+    assert parsed is None
+
+
+def test_parse_sql_generation_response_rejects_neither_populated(app_env):
+    tr = app_env.translate_routes
+    assert tr._parse_sql_generation_response('{}') is None
+    assert tr._parse_sql_generation_response('{"sql": "", "cannot_answer_reason": ""}') is None
+
+
+def test_parse_sql_generation_response_tolerates_chatter_around_the_whole_envelope(app_env):
+    raw = 'Here is the SQL you asked for:\n\n```json\n{"sql": "SELECT * FROM users;"}\n```\n\nEnjoy!'
+    assert app_env.translate_routes._parse_sql_generation_response(raw) == {
+        "outcome": "sql", "sql": "SELECT * FROM users;",
+    }
+
+
+def test_parse_sql_generation_response_returns_none_for_unparseable_or_empty_text(app_env):
+    tr = app_env.translate_routes
+    assert tr._parse_sql_generation_response("I cannot help with that.") is None
+    assert tr._parse_sql_generation_response("") is None
+    assert tr._parse_sql_generation_response(None) is None
+
+
+# --- get_triage_schema_text ---------------------------------------------------
+
+def test_get_triage_schema_text_forwards_to_get_database_schema_with_deep_false(app_env, monkeypatch):
+    calls = []
+
+    def _fake_get_database_schema(descriptor, user_identity, force_refresh=False, deep=True):
+        calls.append({
+            "descriptor": descriptor, "user_identity": user_identity,
+            "force_refresh": force_refresh, "deep": deep,
+        })
+        return "Table: users\nTable: orders"
+
+    monkeypatch.setattr(app_env.translate_routes, "get_database_schema", _fake_get_database_schema)
+    result = app_env.translate_routes.get_triage_schema_text({"url": "sqlite:///x"}, "alice", force_refresh=True)
+
+    assert result == "Table: users\nTable: orders"
+    assert len(calls) == 1
+    assert calls[0]["descriptor"] == {"url": "sqlite:///x"}
+    assert calls[0]["user_identity"] == "alice"
+    assert calls[0]["force_refresh"] is True
+    # The whole point of this wrapper - always the cheap shallow fetch,
+    # never the deep one get_llm_schema_text uses.
+    assert calls[0]["deep"] is False
+
+
+# --- triage_single_dataset_question -------------------------------------------
+#
+# Direct generator tests, mirroring test_connection_router.py's own
+# triage_all_mode_question test style via the local _FakeProvider/_drain
+# above - no real client/network/GenaiHarness involved.
+
+def test_triage_single_dataset_question_general_outcome(app_env):
+    tr = app_env.translate_routes
+    provider = _FakeProvider(['{"action": "general", "answer": "I cannot see who built me."}'])
+    result = _drain(tr.triage_single_dataset_question(
+        "Table: users", "who made you?", provider, client=None, model="m",
+    ))
+    assert result["outcome"] == "general"
+    assert result["answer"] == "I cannot see who built me."
+    assert result["usage"] == {}
+
+
+def test_triage_single_dataset_question_schema_help_sql_outcomes(app_env):
+    tr = app_env.translate_routes
+    for action in ("schema", "help", "sql"):
+        provider = _FakeProvider([f'{{"action": "{action}"}}'])
+        result = _drain(tr.triage_single_dataset_question(
+            "Table: users", "some prompt", provider, client=None, model="m",
+        ))
+        assert result["outcome"] == action
+
+
+def test_triage_single_dataset_question_wrong_language_answer_is_retried_and_corrected(app_env, monkeypatch):
+    tr = app_env.translate_routes
+    # triage_single_dataset_question is now a thin wrapper around
+    # connection_router.run_triage_call (see that function's docstring),
+    # which does its OWN language check via connection_router's own
+    # detect_language/describe_language - a separate imported name from
+    # translate_routes._detect_language/_describe_language, so both
+    # modules' copies need the stand-in installed.
+    _fake_detect = lambda text: "de" if "Datenbanken" in text else ("en" if text == "how many tables?" else None)
+    _fake_describe = lambda code: {"de": "German", "en": "English"}.get(code, code)
+    import connection_router
+    monkeypatch.setattr(tr, "_detect_language", _fake_detect)
+    monkeypatch.setattr(tr, "_describe_language", _fake_describe)
+    monkeypatch.setattr(connection_router, "detect_language", _fake_detect)
+    monkeypatch.setattr(connection_router, "describe_language", _fake_describe)
+    provider = _FakeProvider([
+        '{"action": "general", "answer": "Sie haben 3 Tabellen (Datenbanken-Uebersicht)."}',
+        '{"action": "general", "answer": "You have 3 tables."}',
+    ])
+    result = _drain(tr.triage_single_dataset_question(
+        "Table: users", "how many tables?", provider, client=None, model="m",
+    ))
+    assert result["outcome"] == "general"
+    assert result["answer"] == "You have 3 tables."
+    assert len(provider.calls) == 2
+    assert "CORRECTION" in provider.calls[1]["llm_input"]
+    assert "German" in provider.calls[1]["llm_input"]
+
+
+def test_triage_single_dataset_question_still_wrong_language_after_retry_fails_without_api_error(app_env, monkeypatch):
+    tr = app_env.translate_routes
+    # See the matching comment in test_triage_single_dataset_question_
+    # wrong_language_answer_is_retried_and_corrected above for why both
+    # modules' copies need the stand-in.
+    _fake_detect = lambda text: "de" if "Datenbanken" in text else ("en" if text == "how many tables?" else None)
+    _fake_describe = lambda code: {"de": "German", "en": "English"}.get(code, code)
+    import connection_router
+    monkeypatch.setattr(tr, "_detect_language", _fake_detect)
+    monkeypatch.setattr(tr, "_describe_language", _fake_describe)
+    monkeypatch.setattr(connection_router, "detect_language", _fake_detect)
+    monkeypatch.setattr(connection_router, "describe_language", _fake_describe)
+    provider = _FakeProvider([
+        '{"action": "general", "answer": "Sie haben 3 Datenbanken."}',
+        '{"action": "general", "answer": "Immer noch Datenbanken."}',
+    ])
+    result = _drain(tr.triage_single_dataset_question(
+        "Table: users", "how many tables?", provider, client=None, model="m",
+    ))
+    # Same generic-apology convention as triage_all_mode_question's own
+    # still-wrong-language-after-retry case - api_error False, no specific
+    # error text, so stream_translation()'s own caller shows the fixed
+    # _TRIAGE_FAILURE_TEXT apology rather than naming the languages.
+    assert result == {"outcome": "failed", "api_error": False, "error": None}
+    assert len(provider.calls) == 2
+
+
+def test_triage_single_dataset_question_unparseable_both_times_fails_without_api_error(app_env):
+    tr = app_env.translate_routes
+    provider = _FakeProvider(["not json at all", "still not json"])
+    result = _drain(tr.triage_single_dataset_question(
+        "Table: users", "some prompt", provider, client=None, model="m",
+    ))
+    assert result["outcome"] == "failed"
+    assert result["api_error"] is False
+    assert len(provider.calls) == 2
+
+
+def test_triage_single_dataset_question_unparseable_once_then_valid_succeeds(app_env):
+    # The 2-attempt outer loop gives one unparseable response a second
+    # chance, same policy as triage_all_mode_question.
+    tr = app_env.translate_routes
+    provider = _FakeProvider(["not json at all", '{"action": "schema"}'])
+    result = _drain(tr.triage_single_dataset_question(
+        "Table: users", "some prompt", provider, client=None, model="m",
+    ))
+    assert result == {"outcome": "schema", "usage": {}}
+    assert len(provider.calls) == 2
+
+
+def test_triage_single_dataset_question_non_retryable_error_fails_immediately_with_api_error(app_env):
+    tr = app_env.translate_routes
+    provider = _FakeProvider([RuntimeError("boom")])  # classify_error default: always None (non-retryable)
+    result = _drain(tr.triage_single_dataset_question(
+        "Table: users", "some prompt", provider, client=None, model="m",
+    ))
+    assert result["outcome"] == "failed"
+    assert result["api_error"] is True
+    assert isinstance(result["error"], RuntimeError)
+    # Non-retryable - no second attempt spent on a call that already
+    # proved it can't succeed right now (see this function's own docstring).
+    assert len(provider.calls) == 1
+
+
+def test_triage_single_dataset_question_transient_error_retries_with_same_key_then_succeeds(app_env, monkeypatch):
+    tr = app_env.translate_routes
+    monkeypatch.setattr(tr.time, "sleep", lambda *a, **k: None)
+    provider = _FakeProvider(
+        [RuntimeError("503"), '{"action": "sql"}'],
+        classify_error=lambda exc: {"rotate_key": False, "delay": 1},
+    )
+    events = []
+    gen = tr.triage_single_dataset_question("Table: users", "some prompt", provider, client=None, model="m")
+    try:
+        while True:
+            events.append(json.loads(next(gen)))
+    except StopIteration as stop:
+        result = stop.value
+    assert result == {"outcome": "sql", "usage": {}}
+    assert len(events) == 1
+    assert events[0]["status"] == "retrying"
+    assert events[0]["rotatedKey"] is False
+    assert len(provider.made_clients) == 0  # same key/client throughout - no rotation
+
+
+def test_triage_single_dataset_question_key_rotation_exhaustion_fails_with_api_error(app_env):
+    tr = app_env.translate_routes
+    provider = _FakeProvider(
+        [RuntimeError("429"), RuntimeError("429")],
+        key_pool=["key-a", "key-b"],
+        classify_error=lambda exc: {"rotate_key": True, "delay": 0},
+    )
+    result = _drain(tr.triage_single_dataset_question(
+        "Table: users", "some prompt", provider, client=None, model="m", tried_keys={"key-a"},
+    ))
+    assert result["outcome"] == "failed"
+    assert result["api_error"] is True
+    # Rotated onto the pool's one other key, then gave up once the whole
+    # (size-2) pool was exhausted - never a third attempt.
+    assert len(provider.calls) == 2
+    assert provider.made_clients == ["key-b"]

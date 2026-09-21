@@ -29,11 +29,12 @@ import json
 import re
 import threading
 
-from app_config import DEFAULT_DESCRIPTOR, CONFIGURED_DBS, DATABASE_PRESETS_FILE, state_store, logger
+from app_config import DEFAULT_DESCRIPTOR, CONFIGURED_DBS, CONFIGURED_DB_GROUPS, DATABASE_PRESETS_FILE, state_store, logger
 from backends import get_backend
 from backends.base import (
     extract_entry_names_from_schema_text, schema_text_was_truncated, schema_text_has_omitted_tables,
-    SCHEMA_MAX_CHARS, SCHEMA_MAX_TABLES,
+    parse_dataset_size_line, SCHEMA_MAX_CHARS, SCHEMA_MAX_TABLES, SCHEMA_SIZE_CHARS_PER_TOKEN,
+    quantize_schema_size_tokens,
 )
 import schema_cache
 
@@ -135,7 +136,7 @@ def visible_configured_dbs():
     view every call site that resolves or lists SELECTABLE presets should
     read through instead of iterating CONFIGURED_DBS directly: this
     module's own resolve_active_descriptor/resolve_descriptor_by_reference/
-    _resolve_all_configured_descriptors, and config_routes.py's preset-
+    _resolve_group_configured_descriptors, and config_routes.py's preset-
     listing/preset-selection code in its GET/POST /api/config handler.
 
     Deliberately NOT used by call sites that need to resolve a preset for
@@ -145,7 +146,7 @@ def visible_configured_dbs():
     excluded today shouldn't erase which one a past request actually used.
 
     A plain filter over the live CONFIGURED_DBS list (not a cached/
-    snapshotted copy) for the same reason _resolve_all_configured_descriptors
+    snapshotted copy) for the same reason _resolve_group_configured_descriptors
     already reads CONFIGURED_DBS fresh on every call: an admin-configured
     preset set doesn't change within a process's lifetime today, but this
     keeps the same "read live" property that function already documents
@@ -270,19 +271,20 @@ def resolve_in_scope_descriptors(session, user_id):
     translate_routes.py: len(...) <= 1 is the byte-identical-to-today fast
     path).
 
-    session["in_scope_mode"] == "all" (see StateStore.get_session's
+    session["in_scope_mode"] == "group" (see StateStore.get_session's
     docstring) takes a completely different path here - see
-    _resolve_all_configured_descriptors below - ignoring
+    _resolve_group_configured_descriptors below - ignoring
     in_scope_preset_ids/in_scope_custom_connection_keys entirely in favor
-    of a dynamic, resolved-fresh-every-request "every configured preset"
-    set (presets only - see that function's own docstring for why custom
-    connections are deliberately excluded from it). Every other mode (the
-    default "single", and any legacy session that saved an arbitrary
-    multi-connection subset before the binary single/all choice existed)
-    resolves the explicit in_scope_preset_ids/in_scope_custom_connection_keys
-    lists below, exactly as this function always has - that legacy
-    explicit-subset path CAN still include custom connections, since it's
-    a user-picked list, not "all".
+    of session["in_scope_group_id"]'s own fixed, admin-curated
+    "dataset_list" (app_config.py's CONFIGURED_DB_GROUPS - presets only,
+    see that function's own docstring for why custom connections can never
+    be a group member). Every other mode (the default "single", and any
+    legacy session that saved an arbitrary multi-connection subset before
+    the binary single/group choice existed) resolves the explicit
+    in_scope_preset_ids/in_scope_custom_connection_keys lists below,
+    exactly as this function always has - that legacy explicit-subset path
+    CAN still include custom connections, since it's a user-picked list,
+    not a group.
 
     A reference that no longer resolves (resolve_descriptor_by_reference
     returned None - a removed preset, a deleted custom connection) is
@@ -293,8 +295,8 @@ def resolve_in_scope_descriptors(session, user_id):
     predates this feature and has never explicitly saved a connection at
     all) - this is what guarantees the result is never empty, so callers
     never need their own separate empty-list fallback."""
-    if session.get("in_scope_mode") == "all":
-        return _resolve_all_configured_descriptors(user_id)
+    if session.get("in_scope_mode") == "group":
+        return _resolve_group_configured_descriptors(session.get("in_scope_group_id") or "", user_id)
     entries = []
     for preset_id in session.get("in_scope_preset_ids") or []:
         descriptor, name = resolve_descriptor_by_reference("preset", preset_id, user_id)
@@ -312,55 +314,44 @@ def resolve_in_scope_descriptors(session, user_id):
     return entries
 
 
-def _resolve_all_configured_descriptors(user_id):
-    """"All Pre-Configured Datasets" (see webClient/client.js's
-    renderDbRadioButtons()) - the dynamic candidate pool for a session in
-    in_scope_mode == "all": EVERY currently-configured preset that hasn't
-    explicitly opted out (CONFIGURED_DBS, read fresh on every call, so a
-    preset added or removed since this was last true is immediately
-    reflected - the whole point of "All" over the frozen, save-time-computed
-    subset the old arbitrary checkbox picker produced).
+def _resolve_group_configured_descriptors(group_id, user_id):
+    """A dataset group (see webClient/client.js's renderDbRadioButtons()
+    and app_config.py's own "DATASET GROUPS" comment) - the candidate pool
+    for a session in in_scope_mode == "group": every preset id listed in
+    that group's "dataset_list", looked up fresh in CONFIGURED_DB_GROUPS on
+    every call (so a presets-file change since this session last saved its
+    in_scope_group_id is immediately reflected, same "read live" property
+    _resolve_group_configured_descriptors used to document for the old "all
+    mode" this replaces).
 
-    A preset with "include_in_all_mode": false in DATABASE_PRESETS_FILE
-    (see app_config.py's own comment on that field) is skipped here even
-    though it's still a perfectly valid, individually-selectable preset
-    everywhere else - this is the ONLY place that distinction matters, since
-    every other code path that touches CONFIGURED_DBS (the explicit-list
-    branch in resolve_in_scope_descriptors above, the single-connection
-    radio picker, resolve_descriptor_by_reference) has no notion of "all
-    mode" to exclude a preset from in the first place. Defaults to included
-    (db.get("include_in_all_mode", True)) for any preset that predates this
-    field or never sets it - unchanged behavior for everyone who hasn't
-    opted a preset out.
+    There is no dynamic "every configured preset" pool any more - a group
+    only ever contains exactly the presets an admin explicitly listed in
+    its "dataset_list" (app_config.py already dropped any id that didn't
+    resolve to a real preset when CONFIGURED_DB_GROUPS was built, so every
+    id read here is already known-valid). A group_id that no longer
+    resolves to anything in CONFIGURED_DB_GROUPS (removed/renamed from
+    DATABASE_PRESETS_FILE since this session picked it) falls through to
+    the same single-default-entry fallback as an empty group.
 
     Deliberately PRESETS ONLY, never this user's own custom connections -
-    unlike an earlier version of this feature (when it was still named/
-    framed as "All Databases"), which folded in every one of the user's
-    saved custom connections too. A user's custom connections are their
-    own ad hoc, often one-off or credential-sensitive additions, not part
-    of the curated set an admin actually intends "ask across everything"
-    to mean - and silently including them meant a prompt like "how many
-    customers do we have" could route to a personal scratch connection
-    the user never meant to include in a broad, unscoped question. Each
-    preset is resolved via resolve_descriptor_by_reference exactly like
-    the explicit-list branch in resolve_in_scope_descriptors above, so a
-    preset that (implausibly, mid-request) stops resolving is silently
-    skipped the same way, not a special case. Falls back to the single
-    app-default entry if there's nothing left in the candidate pool -
-    either because nothing is configured at all (CONFIGURED_DBS always has
-    at least DEFAULT_CONN in practice, see app_config.py, so this half is a
-    defensive floor, not an expected path) or, now, because an admin has
-    set "include_in_all_mode": false on every single configured preset
-    (an unusual but legitimate config - "All" mode degrading to one default
-    connection is a saner outcome than returning zero candidates)."""
+    a group's "dataset_list" can only ever name other entries in this same
+    presets file (app_config.py's own validation enforces this at load
+    time), so there's no separate "exclude custom connections" step needed
+    here the way the old all-mode resolver had to document. Each member
+    preset is resolved via resolve_descriptor_by_reference exactly like the
+    explicit-list branch in resolve_in_scope_descriptors above, so a preset
+    that (implausibly, mid-request) stops resolving is silently skipped the
+    same way, not a special case. Falls back to the single app-default
+    entry if there's nothing left in the candidate pool - group_id didn't
+    match any configured group, or every one of its members failed to
+    resolve."""
+    group = next((g for g in CONFIGURED_DB_GROUPS if g.get("id") == group_id), None)
     entries = []
-    for db in visible_configured_dbs():
-        if not db.get("include_in_all_mode", True):
-            continue
-        preset_id = db.get("id")
-        descriptor, name = resolve_descriptor_by_reference("preset", preset_id, user_id)
-        if descriptor is not None:
-            entries.append({"kind": "preset", "id": preset_id, "name": name, "descriptor": descriptor})
+    if group:
+        for preset_id in group.get("dataset_list") or []:
+            descriptor, name = resolve_descriptor_by_reference("preset", preset_id, user_id)
+            if descriptor is not None:
+                entries.append({"kind": "preset", "id": preset_id, "name": name, "descriptor": descriptor})
     if not entries:
         return [{
             "kind": "preset", "id": "", "name": "Default connection",
@@ -377,35 +368,49 @@ def build_router_candidate_summaries(in_scope_entries, user_id):
     with this list.
 
     Deliberately never includes column-level schema - only enough for the
-    router to guess relevance from table/tab names and dialect. Calls
-    get_database_schema(..., deep=False) - the Phase 1-only ("shallow")
-    fetch - rather than the deep fetch every real generation path uses,
-    so an all-dbs question against N in-scope connections doesn't pay
-    Phase 2's live-query cost (sampling, min/max, live row counts, ...)
-    for the N-1 connections the router doesn't end up selecting; a
-    connection that IS selected gets its schema re-fetched deep, through
-    the normal get_database_schema() call Phase B already makes, at which
-    point it's a fresh cache lookup under a different key (see
-    get_database_schema()'s cache_key suffixing) - not reused from here.
-    Reduced via backends/base.py's extract_entry_names_from_schema_text,
-    same as before this split existed.
+    router to guess relevance from table/tab names and dialect.
 
-    Fetched in parallel (one worker per in-scope connection) via
-    ThreadPoolExecutor, mirroring execute_routes.py's
-    _execute_with_timeout precedent - a cold cache on several connections
-    at once (e.g. right after the user adds a new connection to scope)
-    shouldn't serialize one slow schema fetch behind another. A single
-    connection's fetch failing degrades to an empty table_names list for
-    just that entry (get_database_schema() already degrades to its own
-    "schema fetch failed" placeholder text on failure, which
-    extract_entry_names_from_schema_text then reduces to []) rather than
-    failing the whole summary."""
+    Deliberately NEVER connects to or queries a real database, and never
+    writes anything new to schema_cache.py. This reads ONLY the
+    already-cached DEEP schema entry for each in-scope connection (a
+    plain schema_cache.get(cache_key) - the very same durable entry a real
+    /api/translate call would use) and reduces it in-memory via
+    backends/base.py's extract_entry_names_from_schema_text. A connection
+    whose deep schema hasn't been cached yet (never selected/used, or a
+    preset whose startup prefetch hasn't finished) simply degrades to an
+    empty table_names list for this one triage pass - it starts
+    participating in triage the moment something else populates its deep
+    cache entry (its own first real use, a preset prefetch, or an explicit
+    "Refresh Schema"), same as a genuine fetch failure already degraded to
+    [] before this change.
+
+    This intentionally does NOT try to reconstruct a true Phase-1-only
+    ("shallow") subset of the cached text - the deep entry's Phase 2
+    sections (view/routine bodies, live row counts, sampling, ...) are
+    simply left in and ignored by extract_entry_names_from_schema_text's
+    heading-only regex, and whatever SCHEMA_MAX_CHARS truncation already
+    applied to the deep entry applies here too, as-is. There used to be a
+    genuinely separate, independently-fetched-and-cached "shallow" cache
+    entry (cache_key + "::shallow") specifically for this function, so an
+    all-dbs question wouldn't pay Phase 2's live-query cost per candidate
+    connection - but since the deep text was always a superset of that
+    Phase 1-only text anyway (same backends/base.py-shared two-phase
+    design every dialect follows), fetching and caching it separately was
+    pure waste: this reads the deep entry that's already sitting in the
+    cache instead, for free, with zero live queries of its own. See
+    get_schema_shallow() on each Backend subclass (still implemented,
+    still exercised by real tests) and the old ::shallow cache-key suffix
+    handling in get_database_schema()/get_database_schema_with_reason()
+    below - both left in place, unused by this function now, in case a
+    genuine independent shallow fetch is ever needed again for some other
+    purpose."""
     if not in_scope_entries:
         return []
 
     def _summarize(entry):
-        schema_text = get_database_schema(entry["descriptor"], user_id, deep=False)
-        table_names = extract_entry_names_from_schema_text(schema_text)
+        cache_key = get_conn_identifier(entry["descriptor"])
+        schema_text = schema_cache.get(cache_key)
+        table_names = extract_entry_names_from_schema_text(schema_text) if schema_text else []
         try:
             dialect = get_backend(entry["descriptor"]).dialect_name
         except Exception:
@@ -424,6 +429,115 @@ def build_router_candidate_summaries(in_scope_entries, user_id):
                 entry = in_scope_entries[index]
                 results[index] = {"name": entry["name"], "dialect": "SQL", "table_names": []}
     return results
+
+
+def build_group_schema_summaries(group_id, user_id):
+    """Builds the dataset-group Schema Viewer's own table (see webClient/
+    client.js's openGroupSchemaViewer()/loadGroupSchemaViewer()) - one
+    {"id", "name", "type", "data_size", "schema_size_tokens", "available"}
+    dict per preset in the group's own "dataset_list", in that same order
+    (app_config.py's CONFIGURED_DB_GROUPS is looked up fresh on every call,
+    same "read live" property _resolve_group_configured_descriptors above
+    documents).
+
+    Returns None (not an empty list) when group_id doesn't match any
+    configured group at all - the caller (config_routes.py's
+    handle_get_group_schema()) treats that as a 404, distinct from a real,
+    configured group that simply has no valid members left (an empty list),
+    since those mean genuinely different things to the person who just
+    clicked a specific group's own "i" icon. Deliberately does NOT fall
+    back to the single app-default entry the way
+    _resolve_group_configured_descriptors does for query routing - that
+    fallback exists so a query always has SOME real connection to run
+    against, but showing a fabricated "Default connection" row in a
+    dataset-group's own schema table would misrepresent what's actually in
+    it.
+
+    Unlike build_router_candidate_summaries() above, this DOES call
+    get_database_schema() (not a bare schema_cache.get() read) for each
+    member - deliberately: that function fetches-and-caches on a cache
+    miss exactly like GET /api/schema (config_routes.py's
+    handle_get_schema()) already does for a single connection, so opening
+    this dialog for a group whose members haven't all been prefetched yet
+    (or one added to DATABASE_PRESETS_FILE after this server's own startup
+    prefetch already ran) still fills in real numbers rather than leaving
+    permanent blanks - a deliberate, occasional dialog open is a
+    reasonable moment to pay a real fetch's cost, unlike Phase A triage
+    (every single question), which is exactly why that function documents
+    NOT doing this. Every member is still fetched concurrently (same
+    ThreadPoolExecutor pattern as build_router_candidate_summaries above)
+    so a slow/unreachable member doesn't serialize behind the others.
+
+    "data_size" mirrors the Schema Viewer's own "Data Size: ..." fact for a
+    single connection (backends/base.py's format_dataset_size_line()/
+    parse_dataset_size_line() - the best-effort, schema-wide catalog
+    estimate each dialect's deep get_schema() embeds, never a live scan) -
+    None for a dialect with no cheap source for it (see backends/sheets.py,
+    backends/mongodb_sql.py) or a member whose fetch failed outright.
+    "schema_size_tokens" mirrors that same viewer's "Schema Size: ...
+    tokens" fact - len(schema_text) / SCHEMA_SIZE_CHARS_PER_TOKEN, then
+    quantized UP to the nearest SCHEMA_SIZE_TOKEN_QUANTUM (see
+    quantize_schema_size_tokens()), the exact same flat approximation
+    client.js's own facts line uses (see those constants' own comments in
+    backends/base.py for why this is shared rather than independently-
+    tuned figures) - None for a member whose fetch failed outright (there
+    is no schema text to measure).
+    "available" is False only for that failed-fetch case - a genuinely
+    reachable connection with nothing to describe (SCHEMA_FETCH_FAILURE_
+    REASON_EMPTY, in get_database_schema_with_reason()'s terms - an empty
+    schema) still counts as "available" here with a real (zero-ish)
+    schema_size_tokens and no data_size line, since it was still fetched
+    successfully; this function uses the reason-less get_database_schema()
+    and so can't distinguish EMPTY from FATAL/TIMEOUT the way GET
+    /api/schema's own error messaging does - "available": False here just
+    means "nothing to show for this one row", the table's own equivalent
+    of that route's error message, without needing the finer-grained
+    reason a single-connection dialog's dedicated error text does."""
+    group = next((g for g in CONFIGURED_DB_GROUPS if g.get("id") == group_id), None)
+    if group is None:
+        return None
+
+    member_ids = group.get("dataset_list") or []
+    resolved = []
+    for preset_id in member_ids:
+        descriptor, name = resolve_descriptor_by_reference("preset", preset_id, user_id)
+        if descriptor is not None:
+            resolved.append({"id": preset_id, "name": name, "descriptor": descriptor})
+
+    def _summarize(entry):
+        try:
+            dialect = get_backend(entry["descriptor"]).dialect_name
+        except Exception:
+            dialect = "SQL"
+        schema_text = get_database_schema(entry["descriptor"], user_id, deep=True)
+        if not schema_text or schema_text == _SCHEMA_FETCH_FAILED:
+            return {
+                "id": entry["id"], "name": entry["name"], "type": dialect,
+                "data_size": None, "schema_size_tokens": None, "available": False,
+            }
+        return {
+            "id": entry["id"], "name": entry["name"], "type": dialect,
+            "data_size": parse_dataset_size_line(schema_text),
+            "schema_size_tokens": quantize_schema_size_tokens(len(schema_text) / SCHEMA_SIZE_CHARS_PER_TOKEN),
+            "available": True,
+        }
+
+    results = [None] * len(resolved)
+    if resolved:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(resolved)) as pool:
+            future_to_index = {pool.submit(_summarize, entry): i for i, entry in enumerate(resolved)}
+            for future in concurrent.futures.as_completed(future_to_index):
+                index = future_to_index[future]
+                try:
+                    results[index] = future.result()
+                except Exception:
+                    logger.exception("Error building group schema summary")
+                    entry = resolved[index]
+                    results[index] = {
+                        "id": entry["id"], "name": entry["name"], "type": "SQL",
+                        "data_size": None, "schema_size_tokens": None, "available": False,
+                    }
+    return {"id": group.get("id"), "name": group.get("name"), "datasets": results}
 
 
 def resolve_conn_str(conn_str=None, user_id=None):
@@ -510,31 +624,39 @@ def record_translation(user_id, conn_str, nl_prompt, sql_command, gemini_model, 
 
 
 def record_all_databases_triage(user_id, nl_prompt, sql_command, gemini_model, duration, input_tokens, output_tokens, total_tokens, thinking_tokens, cached_content_tokens):
-    """Logs "All Pre-Configured Datasets" mode's Phase A (triage) step to the same
+    """Logs dataset group mode's Phase A (triage) step to the same
     translations table record_translation() writes to, but tagged with the
-    literal database_type/database_name "All Pre-Configured Datasets"/"All Preset
-    Datasets" rather than any real connection descriptor - unlike every
-    other row in this table, a triage call isn't "about" one specific
-    database at all (it's the step that decides whether real data is even
-    needed, and if so, which connection(s) to route to), so there's no
-    real descriptor to resolve a db_type/db_name from the way
-    record_translation() does above.
+    literal database_type/database_name "Dataset Group" rather than any
+    real connection descriptor - unlike every other row in this table, a
+    triage call isn't "about" one specific database at all (it's the step
+    that decides whether real data is even needed, and if so, which
+    connection(s) to route to), so there's no real descriptor to resolve a
+    db_type/db_name from the way record_translation() does above. Kept as
+    this one fixed, generic label rather than the active group's own real
+    name - unlike a preset/custom connection's name (always resolved fresh
+    from its own live record), the group a past triage call ran against may
+    since have been renamed or removed entirely from DATABASE_PRESETS_FILE,
+    so baking in its name at log time would go stale the same way an old
+    "database_url" copy in this table used to (see record_translation's own
+    module-level reasoning for why every OTHER row here resolves its name
+    fresh, never at write time) - simplest to just not carry a name for
+    this one, same as it never did for the "all mode" this replaces.
 
     Deliberately bypasses record_translation()'s _to_descriptor/
     _resolve_database_name resolution entirely rather than trying to feed
-    it a synthetic descriptor - "All Pre-Configured Datasets" is a fixed, literal
-    label, not a lookup result.
+    it a synthetic descriptor - "Dataset Group" is a fixed, literal label,
+    not a lookup result.
 
-    Called once per "All Pre-Configured Datasets" request regardless of triage's
+    Called once per dataset-group-mode request regardless of triage's
     outcome (answer/failed/route - see translate_routes.py's
-    router_only_all_mode branch), always with ONLY triage's own duration
+    router_only_group_mode branch), always with ONLY triage's own duration
     and LLM token usage - never folded in with any Phase B (per-database
     generation) numbers, so a "route" outcome's real, per-database
     translations-table row (logged separately, attributed to that specific
     connection) never double-counts the tokens/time this row already
     accounts for."""
     state_store.record_translation(
-        user_id, "All Pre-Configured Datasets", "All Pre-Configured Datasets", nl_prompt, sql_command, gemini_model,
+        user_id, "Dataset Group", "Dataset Group", nl_prompt, sql_command, gemini_model,
         duration, input_tokens, output_tokens, total_tokens, thinking_tokens, cached_content_tokens
     )
 
@@ -653,21 +775,20 @@ def get_database_schema_with_reason(conn_str=None, user_id=None, force_refresh=F
 
 
 def prime_schema_cache(descriptor, user_id=None):
-    """Force-fetches BOTH the deep and shallow schema cache entries for
-    one connection - thin wrapper around prime_schema_cache_with_reason()
-    (below) for the two pre-existing callers that only ever needed a bare
-    success/failure signal (prefetch_all_preset_schemas, and
-    config_routes.py's own-connection-config-changed branch), discarding
-    the failure reason. See that function's docstring for the full
-    deep+shallow/success semantics, unchanged here."""
+    """Force-fetches the deep schema cache entry for one connection - thin
+    wrapper around prime_schema_cache_with_reason() (below) for the two
+    pre-existing callers that only ever needed a bare success/failure
+    signal (prefetch_all_preset_schemas, and config_routes.py's
+    own-connection-config-changed branch), discarding the failure reason.
+    See that function's docstring for the full semantics, unchanged here."""
     success, _reason = prime_schema_cache_with_reason(descriptor, user_id)
     return success
 
 
 def prime_schema_cache_with_reason(descriptor, user_id=None):
-    """Same deep+shallow force-fetch prime_schema_cache() above documents,
-    shared by the startup preset prefetch (prefetch_all_preset_schemas,
-    below), the connection-config-changed branch, and the "Refresh Schema"
+    """Same deep force-fetch prime_schema_cache() above documents, shared
+    by the startup preset prefetch (prefetch_all_preset_schemas, below),
+    the connection-config-changed branch, and the "Refresh Schema"
     endpoint (config_routes.py's /api/config/refresh-schema) - but also
     returns a failure reason, as a (success, reason) pair: reason is None
     on success, else whatever get_database_schema_with_reason()'s deep
@@ -680,18 +801,22 @@ def prime_schema_cache_with_reason(descriptor, user_id=None):
     dialog's list (EMPTY/TIMEOUT) or be dropped from it until the next
     restart (FATAL) - see that function's own docstring.
 
-    Both are fetched (not just deep) because build_router_candidate_summaries()
-    (all-dbs triage) uses the shallow entry - leaving it stale after an
-    explicit refresh would mean triage still sees the OLD schema even
-    though a real generation call would now see the new one.
+    Only the deep entry is force-fetched here. This used to also force-
+    fetch a second, independent "shallow" cache entry (deep entries and
+    that old shallow entry were fetched and cached completely separately,
+    under different cache_key suffixes) purely so
+    build_router_candidate_summaries() (all-dbs triage) would see fresh
+    data after a refresh - but that function no longer reads (or causes)
+    any independent shallow fetch at all: it derives its compact,
+    table-name-only summary directly from whichever deep entry is already
+    sitting in the cache, in-memory, with no fetch or cache write of its
+    own (see that function's own docstring). So refreshing the deep entry
+    here is now sufficient to keep triage fresh too - there is no separate
+    shallow entry left to go stale.
 
     success is True if the (user-visible) deep fetch succeeded, False if
     it hit the _SCHEMA_FETCH_FAILED fallback - callers use this to decide
-    success/failure. The shallow fetch is best-effort and only attempted
-    if the deep fetch succeeded; a shallow-only failure never downgrades
-    an otherwise-successful deep fetch back to an overall failure (and
-    never produces its own reason - only the deep fetch's outcome is ever
-    reported).
+    success/failure.
 
     Also (best-effort, never affecting this function's own return value)
     regenerates this connection's cached schema OVERVIEW - a short LLM-
@@ -726,7 +851,6 @@ def prime_schema_cache_with_reason(descriptor, user_id=None):
         deep_text, reason = get_database_schema_with_reason(descriptor, user_id, force_refresh=True, deep=True)
         success = deep_text != _SCHEMA_FETCH_FAILED
         if success:
-            get_database_schema(descriptor, user_id, force_refresh=True, deep=False)
             _generate_and_cache_schema_overview(descriptor, user_id, deep_text)
         fetch_error = None if success else reason
         return success, (reason if not success else None)
@@ -921,7 +1045,7 @@ def prefetch_all_preset_schemas():
       failure forever. Instead it's marked via _mark_preset_fatally_failed()
       and disappears from visible_configured_dbs() - the filtered view
       resolve_active_descriptor/resolve_descriptor_by_reference/
-      _resolve_all_configured_descriptors above and config_routes.py's
+      _resolve_group_configured_descriptors above and config_routes.py's
       preset-listing/selection code all read instead of CONFIGURED_DBS
       directly - until the next server restart re-runs this whole
       function from scratch and gives it another chance. A session
@@ -1039,14 +1163,13 @@ def prefetch_all_preset_schemas():
             # force-refetching live is
             # the whole point of this function no longer unconditionally
             # calling prime_schema_cache_with_reason() below - see this
-            # function's own docstring for the full reasoning. Also warms
-            # the shallow entry the same way, if one was durably saved for
-            # it too (it always is, in the common case - both are written
-            # together by a single successful prime_schema_cache_with_
-            # reason() call, see that function's own docstring) - fetched
-            # separately here since it's a genuinely separate cache_key.
+            # function's own docstring for the full reasoning. (There used
+            # to also be a second, independent "shallow" cache entry warmed
+            # here for build_router_candidate_summaries() - removed now
+            # that that function derives its summary directly from this
+            # same deep entry instead, with no shallow entry of its own
+            # left to warm.)
             if schema_cache.get(cache_key) is not None:
-                schema_cache.get(cache_key + _SHALLOW_CACHE_KEY_SUFFIX)
                 return
             ok, reason = prime_schema_cache_with_reason(descriptor, user_id=None)
             if ok:

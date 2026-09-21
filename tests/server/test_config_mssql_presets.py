@@ -60,7 +60,7 @@ def test_preset_credential_never_appears_in_config_response(app_factory, tmp_pat
     env = app_factory(env={"DATABASE_PRESETS_FILE": path})
     login_as(env.client, "alice@example.com")
     data = env.client.get('/api/config').get_json()
-    assert data['configured_databases'][0] == {"id": "mssql+Orders (SQL Server)", "name": "Orders (SQL Server)", "type": "mssql"}
+    assert data['configured_databases'][0] == {"id": "mssql+Orders (SQL Server)", "name": "Orders (SQL Server)", "type": "mssql", "dialect_name": "Microsoft SQL Server"}
     assert "password" not in data['configured_databases'][0]
 
 
@@ -95,7 +95,7 @@ def test_anonymous_visitor_never_receives_the_presets_credential(app_factory, tm
     }, mock_firestore=True)
     resp = env.client.get('/api/config')
     assert "preset-password" not in resp.get_data(as_text=True)
-    assert resp.get_json()['configured_databases'] == [{"id": "mssql+Orders (SQL Server)", "name": "Orders (SQL Server)", "type": "mssql"}]
+    assert resp.get_json()['configured_databases'] == [{"id": "mssql+Orders (SQL Server)", "name": "Orders (SQL Server)", "type": "mssql", "dialect_name": "Microsoft SQL Server"}]
 
 
 def test_preset_encrypt_false_omits_cafile(app_factory, tmp_path, monkeypatch):

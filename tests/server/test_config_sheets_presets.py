@@ -101,7 +101,10 @@ def test_valid_preset_appears_in_configured_databases_with_no_credential_fields(
     env = app_factory(env={"DATABASE_PRESETS_FILE": path})
     data = env.client.get('/api/config').get_json()
     assert data['configured_databases'] == [
-        {"id": "sheets+Team Roster (Sheet)", "name": "Team Roster (Sheet)", "type": "sheets"}
+        {
+            "id": "sheets+Team Roster (Sheet)", "name": "Team Roster (Sheet)", "type": "sheets",
+            "dialect_name": "Google Visualization API Query Language",
+        }
     ]
 
 
@@ -145,7 +148,10 @@ def test_preset_with_credentials_json_still_redacted_to_id_name_type(app_factory
     assert key_json not in resp.get_data(as_text=True)
     data = resp.get_json()
     assert data['configured_databases'] == [
-        {"id": "sheets+Private Roster", "name": "Private Roster", "type": "sheets"}
+        {
+            "id": "sheets+Private Roster", "name": "Private Roster", "type": "sheets",
+            "dialect_name": "Google Visualization API Query Language",
+        }
     ]
 
 

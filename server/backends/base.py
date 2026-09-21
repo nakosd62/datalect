@@ -62,6 +62,18 @@ SCHEMA_MAX_TABLE_NAMES_SCANNED = int(os.environ.get("SCHEMA_MAX_TABLE_NAMES_SCAN
 # view definitions, more table entries than fit even after the caps above).
 SCHEMA_MAX_CHARS = int(os.environ.get("SCHEMA_MAX_SCHEMA_CHARS", 100_000))
 
+# When true, translate_routes.py feeds the LLM the "tables_only" schema
+# derivative (see derive_tables_only_schema_text below) instead of the full
+# deep schema text for every /api/translate (and related) call - identical
+# per-table detail (columns, types, everything else under a table's own
+# heading), but every OTHER top-level schema-object section (Constraints,
+# Indexes, Views, Grants, and so on) stripped out, purely to cut down input
+# token cost. Off by default, so an unset/blank/anything-other-than-"true"
+# value leaves every existing deployment's prompts byte-for-byte unchanged.
+# Read once at import time like every other SCHEMA_* flag here, so flipping
+# it requires a process restart, same as the numeric caps above.
+SCHEMA_TABLES_ONLY = os.environ.get("SCHEMA_TABLES_ONLY", "").strip().lower() == "true"
+
 # --- Frequent-value sampling threshold ---------------------------------------
 # Every backend's own Phase 2 "Column value samples" section picks each
 # categorical column's top FREQUENT_VALUES_LIMIT values by plain COUNT(*) -
@@ -536,6 +548,62 @@ def format_dataset_size_line(total_rows=None, total_bytes=None, note=None):
     return ""
 
 
+# The reciprocal of format_dataset_size_line() above: pulls that same
+# "Estimated dataset size: ..." line's own value back out of a full schema
+# text, for a caller that wants just this one figure rather than the whole
+# text (e.g. db.py's build_group_schema_summaries(), which reports each
+# dataset-group member's own data size in the Schema Viewer's group table -
+# see webClient/client.js's openGroupSchemaViewer()). Mirrors client.js's
+# own parseSchemaDatasetSizeLine() exactly (same "^Estimated dataset size: "
+# anchor, multiline mode, first match only) so the server and client always
+# agree on what this line looks like - if one side's regex ever drifted from
+# the other's, only one of them would still recognize a dialect's line.
+# Returns None (not '') when the schema text has no such line at all (a
+# dialect with no cheap schema-wide size source - see backends/sheets.py,
+# backends/mongodb_sql.py - or a schema fetch that failed outright), so a
+# caller can tell "no line to show" apart from "" being a real, empty figure.
+_DATASET_SIZE_LINE_RE = re.compile(r"^Estimated dataset size: (.+)$", re.MULTILINE)
+
+
+def parse_dataset_size_line(schema_text):
+    m = _DATASET_SIZE_LINE_RE.search(schema_text or "")
+    return m.group(1) if m else None
+
+
+# Same flat, non-tokenizer approximation client.js's Schema Viewer uses for
+# its "Schema Size: ... tokens" facts-line figure (SCHEMA_VIEWER_CHARS_PER_
+# TOKEN there) - kept as one shared constant here so db.py's
+# build_group_schema_summaries() (the dataset-group Schema Viewer's own
+# per-dataset "Schema Size" column) reports the exact same number a user
+# would see if they instead opened that one dataset on its own. Not a real
+# tokenizer on either side - just len(schema_text) / 4.
+SCHEMA_SIZE_CHARS_PER_TOKEN = 4
+
+# Same quantization client.js's Schema Viewer applies to that same figure
+# (SCHEMA_VIEWER_TOKEN_QUANTUM there) - the raw chars-per-4 estimate above
+# is quantized UP to the nearest multiple of this, per an explicit request,
+# since it's only ever a rough, order-of-magnitude cost estimate and a
+# precise-looking exact figure would overstate how exact it actually is.
+# Shared here for the same "the group table and the single-connection
+# viewer must always show the identical number" reason as
+# SCHEMA_SIZE_CHARS_PER_TOKEN itself - see quantize_schema_size_tokens()
+# below, db.py's build_group_schema_summaries()'s only caller.
+SCHEMA_SIZE_TOKEN_QUANTUM = 100
+
+
+def quantize_schema_size_tokens(raw_token_count):
+    """Rounds a raw chars-per-token schema-size estimate UP to the nearest
+    SCHEMA_SIZE_TOKEN_QUANTUM (100 * CEIL(raw_token_count / 100)) - see
+    that constant's own comment for why. `raw_token_count` is typically
+    itself already a float (len(schema_text) / SCHEMA_SIZE_CHARS_PER_TOKEN)
+    - this only ever returns a plain int, never negative (a 0-or-negative
+    input, which shouldn't happen for any real schema_text but costs
+    nothing to guard, returns 0 rather than a confusing negative multiple)."""
+    if raw_token_count <= 0:
+        return 0
+    return SCHEMA_SIZE_TOKEN_QUANTUM * math.ceil(raw_token_count / SCHEMA_SIZE_TOKEN_QUANTUM)
+
+
 # Column-name suffixes that conventionally mark a foreign-key-shaped column
 # (customer_id, order_key, region_fk) - matched case-insensitively against
 # the tail of a column name, longest suffix first so "_id" doesn't shadow a
@@ -930,6 +998,76 @@ def split_schema_text_into_entries(schema_text):
         name = _strip_trailing_asides(match.group(1)).strip()
         entries.append({"name": name or None, "heading": match.group(0), "text": block})
     return entries
+
+
+# Recognizes the start of the first NON-table top-level section in a full
+# schema_text - "top-level" meaning flush against the left margin, as
+# opposed to a continuation line belonging to the entry above it. Every
+# backend indents every continuation line it ever emits - a column
+# definition, a constraint/index/view/grant/trigger/comment/routine
+# listing, a sampled value, a naming-convention relationship (see e.g.
+# postgres.py's `f"  {col_name} {data_type} ..."`, mongodb_sql.py's
+# `f"  {col.column_name} {col.type_name} ..."`, bigquery.py's nested
+# column/struct lines) - by at least one leading space. The only other
+# kind of unindented line get_schema()/get_schema_shallow() ever emits is
+# a table/table-family/tab heading (_ENTRY_HEADING_RE above) or the
+# "[... N more table(s)/table-family(ies) not shown ...]" overflow notice
+# that can immediately follow the table loop - both excluded here via
+# negative lookahead, since derive_tables_only_schema_text (below) wants
+# to know where the first section that ISN'T one of those two things
+# begins, without hardcoding the long, backend-specific list of actual
+# non-table section names (Constraints/Indexes/Views/Grants/Triggers/
+# Comments/Row count estimates/Routines/Session/View definitions/Routine
+# definitions/Live row counts/Column value samples/Estimated dataset
+# size/Likely relationships/... - mongodb_sql.py and sheets.py don't even
+# have most of these, and a future backend could add new ones).
+_NON_TABLE_TOP_LEVEL_LINE_RE = re.compile(
+    r'^(?!\s)(?!\[\.\.\.)(?!(?:Table family|Table|Tab):).+$',
+    re.MULTILINE,
+)
+
+
+def derive_tables_only_schema_text(schema_text):
+    """Reduces a full deep schema_text down to just its leading run of
+    table/table-family/tab entries - full per-table detail (columns,
+    types, everything else indented under that table's own heading) kept
+    exactly as-is, but every OTHER top-level schema-object section that
+    follows (Constraints, Indexes, Views, Grants, Triggers, Comments, Row
+    count estimates, Routines, Session, View definitions, Routine
+    definitions, Live row counts, Column value samples, Likely
+    relationships, and any backend-specific ones like Clustering keys or
+    Partition columns) dropped entirely. This is the "tables_only" schema
+    kind: a cheaper-to-send-to-an-LLM derivative of the already-cached
+    deep schema, computed purely in memory - no new database round trip,
+    no new schema_cache entry (see translate_routes.py's
+    get_llm_schema_text, the only caller, gated by SCHEMA_TABLES_ONLY
+    above).
+
+    Relies on a structural fact confirmed across every backend's
+    get_schema()/get_schema_shallow(): the Tables-and-Columns loop always
+    runs FIRST and appends every table/table-family entry as one
+    contiguous block, before any other section is even queried, let
+    alone appended (mssql.py even reorders explicitly - `schema_parts =
+    table_section_parts + schema_parts` - to guarantee this same
+    invariant holds there too) - so the boundary between "all the
+    tables" and "everything else" is always a single point in
+    schema_text, never interleaved. That's what lets this just find the
+    first top-level line that ISN'T a table heading and ISN'T the
+    "[... N more ... not shown ...]" overflow notice (itself about which
+    tables were omitted, so kept), and truncate there, rather than
+    needing to recognize every individual non-table section by name.
+
+    Never raises. Returns schema_text (rstripped) unchanged if it's
+    empty/falsy, or if no such non-table line is found at all - which
+    happens for backends/schemas with no non-table sections to begin
+    with (mongodb_sql.py, sheets.py), correctly a no-op rather than an
+    error."""
+    if not schema_text:
+        return schema_text
+    match = _NON_TABLE_TOP_LEVEL_LINE_RE.search(schema_text)
+    if not match:
+        return schema_text.rstrip()
+    return schema_text[:match.start()].rstrip()
 
 
 def materialize_ca_cert_tempfile(ca_cert_pem):

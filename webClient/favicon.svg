@@ -4,12 +4,12 @@
          with bold, minimal shapes for legibility at 16-32px (a previous
          version reused a lightly-scaled-down copy of the full artwork,
          which read as a soft, indistinct blob at those sizes). Two flat
-         colors only (this blue + white, no gradients/outlines/fine detail
+         colors only (this green + white, no gradients/outlines/fine detail
          like pupils-within-eyes or multiple stacked cylinders) so the
          silhouette survives heavy downscaling - the fuller, more detailed
          mark stays in use everywhere there's room for it (the app header,
          apple-touch-icon.png). -->
-    <rect width="64" height="64" rx="14" fill="#0ea5e9"/>
+    <rect width="64" height="64" rx="14" fill="#10b981"/>
 
     <!-- Antenna -->
     <line x1="21" y1="12" x2="21" y2="5" stroke="#ffffff" stroke-width="4" stroke-linecap="round"/>
@@ -19,14 +19,14 @@
          head, no separate pupil layer - the extra detail vanished at
          favicon sizes anyway). -->
     <rect x="7" y="12" width="28" height="18" rx="8" fill="#ffffff"/>
-    <circle cx="15.5" cy="21" r="2.6" fill="#0ea5e9"/>
-    <circle cx="26.5" cy="21" r="2.6" fill="#0ea5e9"/>
+    <circle cx="15.5" cy="21" r="2.6" fill="#10b981"/>
+    <circle cx="26.5" cy="21" r="2.6" fill="#10b981"/>
 
     <!-- Body ('A' shape) - one bold white silhouette with a small
          triangular counter punched through in the background color,
          same construction trick logo.svg's body/database-stack use. -->
     <path d="M 21 30 L 33 58 L 25 58 L 23 49 L 19 49 L 17 58 L 9 58 Z" fill="#ffffff"/>
-    <path d="M 18 45 L 24 45 L 21 36 Z" fill="#0ea5e9"/>
+    <path d="M 18 45 L 24 45 L 21 36 Z" fill="#10b981"/>
 
     <!-- Database - a single cylinder (logo.svg's 3-stack read as one
          smudge at small sizes) with one seam arc to still say "database"
@@ -34,5 +34,5 @@
     <rect x="41" y="18" width="17" height="28" fill="#ffffff"/>
     <ellipse cx="49.5" cy="18" rx="8.5" ry="4.5" fill="#ffffff"/>
     <ellipse cx="49.5" cy="46" rx="8.5" ry="4.5" fill="#ffffff"/>
-    <path d="M 41 31 A 8.5 4.5 0 0 0 58 31" fill="none" stroke="#0ea5e9" stroke-width="2"/>
+    <path d="M 41 31 A 8.5 4.5 0 0 0 58 31" fill="none" stroke="#10b981" stroke-width="2"/>
 </svg>

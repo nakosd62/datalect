@@ -8,6 +8,12 @@ validation config_routes.py applies (empty-set rejection,
 MAX_IN_SCOPE_CONNECTIONS cap, silent-drop of unknown/stale references) -
 modeled directly on test_config_model_selection.py and its
 helpers.select_llm_provider pattern.
+
+Dataset group mode (in_scope_mode == "group" - see app_config.py's own
+"DATASET GROUPS" comment) is exercised here too, alongside the
+single-connection-mode tests above: both are the same binary
+in_scope_mode choice, so its own save/round-trip/validation tests belong
+in this same file rather than a separate one.
 """
 
 from helpers import login_as, write_database_presets_file
@@ -23,35 +29,70 @@ def _two_preset_env(app_factory, tmp_path, extra_env=None):
     return app_factory(env=env)
 
 
+def _two_preset_one_group_env(app_factory, tmp_path, extra_env=None):
+    presets_path = write_database_presets_file(tmp_path, [
+        {"id": "pg-a", "name": "Postgres A", "type": "postgres", "url": "postgresql://u:p@h/a"},
+        {"id": "pg-b", "name": "Postgres B", "type": "postgres", "url": "postgresql://u:p@h/b"},
+        {"id": "grp-ab", "name": "AB Group", "type": "dataset_group", "dataset_list": ["pg-a", "pg-b"]},
+    ])
+    env = {"DATABASE_PRESETS_FILE": presets_path}
+    env.update(extra_env or {})
+    return app_factory(env=env)
+
+
 def test_get_config_exposes_in_scope_mode_default(app_env):
     data = app_env.client.get('/api/config').get_json()
     assert data["in_scope_mode"] == "single"
 
 
-def test_post_config_persists_in_scope_mode_all_and_round_trips(app_factory, tmp_path):
-    env = _two_preset_env(app_factory, tmp_path)
+def test_post_config_persists_in_scope_mode_group_and_round_trips(app_factory, tmp_path):
+    env = _two_preset_one_group_env(app_factory, tmp_path)
     login_as(env.client, "alice@example.com")
 
-    resp = env.client.post('/api/config', json={"in_scope_mode": "all"})
+    resp = env.client.post('/api/config', json={"in_scope_mode": "group", "in_scope_group_id": "grp-ab"})
     assert resp.status_code == 200
 
     data = env.client.get('/api/config').get_json()
-    assert data["in_scope_mode"] == "all"
+    assert data["in_scope_mode"] == "group"
+    assert data["in_scope_group_id"] == "grp-ab"
 
 
 def test_post_config_invalid_in_scope_mode_is_silently_ignored(app_factory, tmp_path):
-    env = _two_preset_env(app_factory, tmp_path)
+    env = _two_preset_one_group_env(app_factory, tmp_path)
     login_as(env.client, "alice@example.com")
-    env.client.post('/api/config', json={"in_scope_mode": "all"})
+    env.client.post('/api/config', json={"in_scope_mode": "group", "in_scope_group_id": "grp-ab"})
 
     resp = env.client.post('/api/config', json={"in_scope_mode": "some-bogus-value"})
     assert resp.status_code == 200
 
     # An unrecognized in_scope_mode is treated as "nothing to save" (same
     # leniency an unrecognized llm_provider name gets) - it must not clear
-    # the previously-saved "all" back down to the default.
+    # the previously-saved "group" back down to the default.
     data = env.client.get('/api/config').get_json()
-    assert data["in_scope_mode"] == "all"
+    assert data["in_scope_mode"] == "group"
+
+
+def test_post_config_unknown_group_id_is_silently_ignored(app_factory, tmp_path):
+    env = _two_preset_one_group_env(app_factory, tmp_path)
+    login_as(env.client, "alice@example.com")
+    env.client.post('/api/config', json={"in_scope_mode": "group", "in_scope_group_id": "grp-ab"})
+
+    resp = env.client.post('/api/config', json={"in_scope_group_id": "not-a-real-group"})
+    assert resp.status_code == 200
+
+    # Same leniency as an unrecognized in_scope_mode above - must not clear
+    # the previously-saved group id.
+    data = env.client.get('/api/config').get_json()
+    assert data["in_scope_group_id"] == "grp-ab"
+
+
+def test_get_config_exposes_configured_database_groups(app_factory, tmp_path):
+    env = _two_preset_one_group_env(app_factory, tmp_path)
+    login_as(env.client, "alice@example.com")
+    data = env.client.get('/api/config').get_json()
+    assert data["configured_database_groups"] == [
+        {"id": "grp-ab", "name": "AB Group", "dataset_list": ["pg-a", "pg-b"]}
+    ]
 
 
 def test_in_scope_mode_save_is_independent_of_in_scope_arrays(app_factory, tmp_path):
@@ -134,7 +175,9 @@ def test_never_touched_session_honors_database_default_pointing_at_non_postgres_
     data = env.client.get('/api/config').get_json()
     assert data["active_preset_id"] == "bq-a"
     assert data["in_scope_preset_ids"] == ["bq-a"]
-    assert {"id": "bq-a", "name": "BigQuery A", "type": "bigquery"} in data["configured_databases"]
+    assert {
+        "id": "bq-a", "name": "BigQuery A", "type": "bigquery", "dialect_name": "BigQuery Standard SQL",
+    } in data["configured_databases"]
 
 
 def test_session_with_explicit_preset_selection_derives_single_entry_in_scope(app_factory, tmp_path):

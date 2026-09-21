@@ -180,65 +180,142 @@ def test_preset_missing_name_is_skipped(app_factory, tmp_path):
     assert env.app_config.CONFIGURED_DBS[0]["name"] == "Default DB"
 
 
-# --- include_in_all_mode (dialect-agnostic - see the DATABASE_PRESETS_FILE
-# comment above this field's parsing in app_config.py) --------------------
+# --- dataset groups ("type": "dataset_group" entries in this same flat
+# presets array - see the DATABASE_PRESETS_FILE comment above their parsing
+# in app_config.py) -------------------------------------------------------
 
-def test_preset_include_in_all_mode_omitted_is_not_stored(app_factory, tmp_path):
-    # The common case (a preset that's never heard of this field) must
-    # leave CONFIGURED_DBS' shape completely unchanged - same reasoning as
-    # every other optional field in this loop (e.g. Postgres' "schema"),
-    # and what every other exact-equality test in this file already
-    # depends on implicitly by never mentioning this key.
+def test_dataset_group_is_not_added_to_configured_dbs(app_factory, tmp_path):
+    # A dataset_group entry has no dialect/credentials of its own - it must
+    # never reach CONFIGURED_DBS (every existing consumer of that list -
+    # dialect dispatch, connect(), the individual preset radio - stays
+    # completely unaware groups exist), only CONFIGURED_DB_GROUPS.
     path = write_database_presets_file(tmp_path, [
-        {"type": "postgres", "name": "Shop", "url": "postgresql://u:p@h/db"},
+        {"type": "postgres", "id": "pg-a", "name": "Shop", "url": "postgresql://u:p@h/db"},
+        {"id": "grp-1", "name": "Group One", "type": "dataset_group", "dataset_list": ["pg-a"]},
     ])
     env = app_factory(env={"DATABASE_PRESETS_FILE": path})
-    assert "include_in_all_mode" not in env.app_config.CONFIGURED_DBS[0]
+    assert [db["id"] for db in env.app_config.CONFIGURED_DBS] == ["pg-a"]
+    assert env.app_config.CONFIGURED_DB_GROUPS == [
+        {"id": "grp-1", "name": "Group One", "dataset_list": ["pg-a"]}
+    ]
 
 
-def test_preset_include_in_all_mode_true_explicit_is_not_stored(app_factory, tmp_path):
-    # Explicit true is the default anyway - stored the same way as omitted
-    # (not stored at all), not as a literal "include_in_all_mode": True.
+def test_dataset_group_can_forward_reference_a_dataset_defined_later_in_the_file(app_factory, tmp_path):
+    # Groups are built in their own pass AFTER every real dataset preset
+    # has already been loaded (see app_config.py's two-pass split) - so a
+    # group listed before the datasets it references still resolves them.
     path = write_database_presets_file(tmp_path, [
-        {"type": "postgres", "name": "Shop", "url": "postgresql://u:p@h/db", "include_in_all_mode": True},
+        {"id": "grp-1", "name": "Group One", "type": "dataset_group", "dataset_list": ["pg-a", "pg-b"]},
+        {"type": "postgres", "id": "pg-a", "name": "A", "url": "postgresql://u:p@h/a"},
+        {"type": "postgres", "id": "pg-b", "name": "B", "url": "postgresql://u:p@h/b"},
     ])
     env = app_factory(env={"DATABASE_PRESETS_FILE": path})
-    assert "include_in_all_mode" not in env.app_config.CONFIGURED_DBS[0]
+    assert env.app_config.CONFIGURED_DB_GROUPS == [
+        {"id": "grp-1", "name": "Group One", "dataset_list": ["pg-a", "pg-b"]}
+    ]
 
 
-def test_preset_include_in_all_mode_false_is_recorded(app_factory, tmp_path):
+def test_dataset_group_missing_id_is_skipped(app_factory, tmp_path):
+    # Unlike a real dataset preset, there's no "{type}+{name}" fallback id
+    # for a group - every group is admin-curated, so naming it explicitly
+    # isn't optional.
     path = write_database_presets_file(tmp_path, [
-        {"type": "postgres", "name": "Shop", "url": "postgresql://u:p@h/db", "include_in_all_mode": False},
+        {"type": "postgres", "id": "pg-a", "name": "Shop", "url": "postgresql://u:p@h/db"},
+        {"name": "No Id Group", "type": "dataset_group", "dataset_list": ["pg-a"]},
     ])
     env = app_factory(env={"DATABASE_PRESETS_FILE": path})
-    assert env.app_config.CONFIGURED_DBS[0]["include_in_all_mode"] is False
+    assert env.app_config.CONFIGURED_DB_GROUPS == []
 
 
-@pytest.mark.parametrize("falsy_value", [False, 0, "", None])
-def test_preset_include_in_all_mode_falsy_values_all_exclude(app_factory, tmp_path, falsy_value):
-    # Lenient on purpose, same forgiveness this app already gives a blank
-    # optional string field elsewhere in this same parsing loop - an admin
-    # writing "include_in_all_mode": 0 or "" by mistake still gets excluded
-    # rather than silently (and surprisingly) staying included.
+def test_dataset_group_id_colliding_with_a_dataset_id_is_skipped(app_factory, tmp_path):
+    # "id" is required to be unique across EVERY entry in this file, groups
+    # and real datasets sharing one namespace.
     path = write_database_presets_file(tmp_path, [
-        {"type": "postgres", "name": "Shop", "url": "postgresql://u:p@h/db", "include_in_all_mode": falsy_value},
+        {"type": "postgres", "id": "shared-id", "name": "Shop", "url": "postgresql://u:p@h/db"},
+        {"id": "shared-id", "name": "Colliding Group", "type": "dataset_group", "dataset_list": ["shared-id"]},
     ])
     env = app_factory(env={"DATABASE_PRESETS_FILE": path})
-    assert env.app_config.CONFIGURED_DBS[0]["include_in_all_mode"] is False
+    assert env.app_config.CONFIGURED_DB_GROUPS == []
 
 
-def test_preset_include_in_all_mode_does_not_affect_other_dialect_branches(app_factory, tmp_path):
-    # Parsed once, generically, before the type dispatch (see app_config.py)
-    # - proven here against a non-Postgres dialect too, not just the one
-    # every other test above happens to use.
-    path = write_database_presets_file(tmp_path, [{
-        "type": "bigquery", "name": "Trends", "project_id": "bigquery-public-data",
-        "dataset": "google_trends", "include_in_all_mode": False,
-    }])
+def test_dataset_group_id_colliding_with_another_group_id_is_skipped(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [
+        {"type": "postgres", "id": "pg-a", "name": "Shop", "url": "postgresql://u:p@h/db"},
+        {"id": "grp-1", "name": "First Group", "type": "dataset_group", "dataset_list": ["pg-a"]},
+        {"id": "grp-1", "name": "Second Group", "type": "dataset_group", "dataset_list": ["pg-a"]},
+    ])
     env = app_factory(env={"DATABASE_PRESETS_FILE": path})
-    db = env.app_config.CONFIGURED_DBS[0]
-    assert db["type"] == "bigquery"
-    assert db["include_in_all_mode"] is False
+    assert env.app_config.CONFIGURED_DB_GROUPS == [
+        {"id": "grp-1", "name": "First Group", "dataset_list": ["pg-a"]}
+    ]
+
+
+def test_dataset_group_missing_dataset_list_is_skipped(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [
+        {"type": "postgres", "id": "pg-a", "name": "Shop", "url": "postgresql://u:p@h/db"},
+        {"id": "grp-1", "name": "Group One", "type": "dataset_group"},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    assert env.app_config.CONFIGURED_DB_GROUPS == []
+
+
+def test_dataset_group_drops_unknown_member_ids_but_keeps_the_valid_ones(app_factory, tmp_path):
+    # A typo, a dataset that failed to load for its own reasons, or another
+    # dataset_group's id (nested groups aren't supported) - all three are
+    # dropped from the member list with a warning, same leniency as a
+    # stale preset reference elsewhere in this app.
+    path = write_database_presets_file(tmp_path, [
+        {"type": "postgres", "id": "pg-a", "name": "Shop", "url": "postgresql://u:p@h/db"},
+        {"id": "grp-1", "name": "Group One", "type": "dataset_group",
+         "dataset_list": ["pg-a", "not-a-real-id"]},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    assert env.app_config.CONFIGURED_DB_GROUPS == [
+        {"id": "grp-1", "name": "Group One", "dataset_list": ["pg-a"]}
+    ]
+
+
+def test_dataset_group_with_zero_valid_members_is_skipped_entirely(app_factory, tmp_path):
+    path = write_database_presets_file(tmp_path, [
+        {"type": "postgres", "id": "pg-a", "name": "Shop", "url": "postgresql://u:p@h/db"},
+        {"id": "grp-1", "name": "Group One", "type": "dataset_group", "dataset_list": ["not-a-real-id"]},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    assert env.app_config.CONFIGURED_DB_GROUPS == []
+
+
+def test_dataset_group_cannot_reference_a_custom_connection(app_factory, tmp_path):
+    # "dataset_list" can only ever name other entries in this SAME presets
+    # file - a user's own saved custom connection was never a candidate to
+    # begin with, since it isn't part of CONFIGURED_DBS at all.
+    path = write_database_presets_file(tmp_path, [
+        {"type": "postgres", "id": "pg-a", "name": "Shop", "url": "postgresql://u:p@h/db"},
+        {"id": "grp-1", "name": "Group One", "type": "dataset_group",
+         "dataset_list": ["pg-a", "some-custom-connection-key"]},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    assert env.app_config.CONFIGURED_DB_GROUPS == [
+        {"id": "grp-1", "name": "Group One", "dataset_list": ["pg-a"]}
+    ]
+
+
+def test_no_dataset_groups_defined_yields_empty_list(app_factory, tmp_path):
+    # There is no built-in "every configured dataset" mode any more - a
+    # presets file with no dataset_group entries at all has an empty
+    # CONFIGURED_DB_GROUPS, not some default "everything" group.
+    path = write_database_presets_file(tmp_path, [
+        {"type": "postgres", "id": "pg-a", "name": "Shop", "url": "postgresql://u:p@h/db"},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": path})
+    assert env.app_config.CONFIGURED_DB_GROUPS == []
+
+
+def test_configured_db_groups_is_empty_when_no_presets_file_at_all(app_factory):
+    # CONFIGURED_DB_GROUPS must always be defined (module import must not
+    # blow up) even when DATABASE_PRESETS_FILE is unset entirely - the
+    # single-synthetic-default-preset fallback path.
+    env = app_factory()
+    assert env.app_config.CONFIGURED_DB_GROUPS == []
 
 
 # --- connect_timeout_seconds / execute_timeout_seconds (dialect-agnostic -
@@ -248,7 +325,7 @@ def test_preset_include_in_all_mode_does_not_affect_other_dialect_branches(app_f
 def test_preset_timeout_overrides_omitted_are_not_stored(app_factory, tmp_path):
     # The common case (a preset that's never heard of either field) must
     # leave CONFIGURED_DBS' shape completely unchanged, same reasoning as
-    # include_in_all_mode above.
+    # every other optional field in this parsing loop.
     path = write_database_presets_file(tmp_path, [
         {"type": "postgres", "name": "Shop", "url": "postgresql://u:p@h/db"},
     ])

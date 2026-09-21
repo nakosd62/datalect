@@ -7,24 +7,25 @@ provider-native input conversion, the system prompt, and the
 Google (the original/default, still "Gemini" under the hood - see
 GeminiProvider), Anthropic ("Claude" under the hood - see ClaudeProvider),
 and OpenAI - registered under the labels "google"/"anthropic"/"openai" in
-_LLM_PROVIDERS below. There is deliberately no fleet-wide provider-select
-env var (there used to be one, LLM_PROVIDER - removed since a session with
-nothing saved just needs ONE hardcoded default provider+model pair, not an
-independently configurable provider-name knob to keep in sync with it -
-see get_llm_provider()'s docstring). A session picks its own provider/model via
+_LLM_PROVIDERS below. There is deliberately no fleet-wide provider-select env var (there
+used to be one, LLM_PROVIDER - removed since a session with nothing saved
+just needs ONE hardcoded default provider+model pair, not an independently
+configurable provider-name knob to keep in sync with it - see
+get_llm_provider()'s docstring). A session picks its own provider/model via
 the model-selection UI (state_store.py's llm_provider/llm_model), resolved
 per-request in translate_query() below.
 
 Provider dispatch goes through the LlmProvider interface (see that class's
 docstring further down): translate_query()/stream_translation() call
 methods on a single `provider` object rather than branching on the active
-provider's name themselves at each step. This is what makes adding a
-FOURTH provider later a matter of writing one new LlmProvider subclass and
-adding one line to _LLM_PROVIDERS, rather than finding and extending every
-`if provider == ...` branch in this file - there used to be about half
-a dozen of those (client construction, model/key selection, history
-building, the call itself, error classification, key-rotation logic)
-before this was introduced.
+provider's name themselves at each step. This is what makes adding a new
+provider a matter of writing one new LlmProvider subclass and adding one
+line to _LLM_PROVIDERS, rather than finding and extending every
+`if provider == ...` branch in this file -
+there used to be about half a dozen of those (client construction,
+model/key selection, history building, the call itself, error
+classification, key-rotation logic) before this dispatch layer was
+introduced.
 
 Each provider's SDK-specific mechanics (key pool, error classification,
 history shape, the actual API call) still live in their own free
@@ -76,12 +77,16 @@ from app_config import logger, state_store, MAX_TRANSLATION_ATTEMPTS, TRANSLATIO
 from auth import get_or_create_session_id, get_current_user_identity, apply_session_cookie
 from db import (
     resolve_conn_str, get_database_schema, record_translation,
-    record_all_databases_triage,
     resolve_in_scope_descriptors, build_router_candidate_summaries,
     resolve_descriptor_by_reference,
 )
 from backends import get_backend
-from connection_router import triage_all_mode_question, is_label_only_response, strip_markdown_fence
+from backends.base import SCHEMA_TABLES_ONLY, derive_tables_only_schema_text
+from connection_router import (
+    run_triage_call, is_label_only_response, strip_markdown_fence,
+    _build_candidate_schema_block, _extract_json_object,
+    _parse_single_dataset_triage_response,
+)
 import cancel_registry
 from concurrency_guard import TRANSLATE_GUARD, busy_response
 from rate_limiter import translate_rate_limit, summarize_rate_limit
@@ -90,8 +95,8 @@ translate_bp = Blueprint('translate', __name__)
 
 # Which LLM provider a request actually uses is resolved per-session (see
 # translate_query()'s session_data.get('llm_provider') lookup below), never
-# a provider-NAME env var - "google"/"anthropic"/"openai" are the only
-# valid values, matching _LLM_PROVIDERS' keys below. A session that never
+# a provider-NAME env var - "google"/"anthropic"/"openai" are the
+# only valid values, matching _LLM_PROVIDERS' keys below. A session that never
 # explicitly picked one (via the model-selection UI) falls back to this
 # app's one fleet-wide default: whichever provider get_llm_provider()
 # returns for an unrecognized/blank name - see that function's (and
@@ -834,7 +839,7 @@ class LlmCallFailed(Exception):
     fetch, via _build_all_mode_schema_block, happens BEFORE this retry
     loop even starts, and get_database_schema() never raises regardless -
     see its own docstring), so their callers (translate_routes.py's
-    router_only_all_mode branch, and the /api/summarize-results route)
+    router_only_group_mode branch, and the /api/summarize-results route)
     call format_llm_error_for_user() directly on the raw exception instead -
     one fewer layer of indirection where it isn't needed."""
     pass
@@ -1115,10 +1120,10 @@ def _call_openai(client, model, llm_input, system_instruction):
     broadly than Chat Completions'. Returns (text, usage_dict) in the same
     shape _call_gemini/_call_claude return above.
 
-    No `temperature` here, for the same reason _call_claude doesn't pass
+    No `temperature` passed, for the same reason _call_claude doesn't pass
     one: current-generation reasoning-capable models (the gpt-5.6 family
-    this app defaults to) reject sampling parameters outright rather than
-    silently ignoring them.
+    this app defaults to, and real OpenAI in general) reject sampling
+    parameters outright rather than silently ignoring them.
 
     No explicit cache markers here either, unlike _call_claude's
     cache_control blocks: like Gemini 2.5+ (see _call_gemini's docstring),
@@ -1559,8 +1564,8 @@ def list_llm_providers_info():
     "default_model"} - the shape config_routes.py's GET /api/config needs
     to build the model-selection modal's radio list, organized by
     provider. Order follows _LLM_PROVIDERS' own definition order (google,
-    anthropic, openai) so the modal's provider sections render in a stable,
-    predictable order across requests."""
+    anthropic, openai) so the modal's provider sections render in a
+    stable, predictable order across requests."""
     return [
         {"name": p.name, "preset_models": p.preset_models, "default_model": p.default_model}
         for p in _LLM_PROVIDERS.values()
@@ -1576,6 +1581,122 @@ def _strip_no_sql_prefix(text):
     client.js's own copy of this regex already tolerates. Returns the
     stripped, trimmed remainder (possibly empty)."""
     return _NO_SQL_PREFIX_RE.sub("", text or "").strip()
+
+
+# A model that ignores "Return ONLY the raw SQL code block" or "*** NO SQL
+# ***" (see _COMMON_FORMAT_RULES) and instead wraps its actual answer in a
+# sentence or two of chatter defeats every check below on its own, since
+# they're anchored at position 0 (does this string START with ```, does it
+# START with *** NO SQL ***) - exactly the failure mode a weaker local
+# model (Ollama) hits far more often than a frontier one: real-world
+# reports were "the SQL box shows a prose explanation with the query
+# somewhere inside it" and "asking about the app itself never opens the
+# Help popup" - both are this same anchored-parsing brittleness, not (only)
+# a prompt-wording problem. _MAX_MARKER_PREAMBLE_CHARS bounds how much
+# leading text is treated as "chatter to discard before a marker/fence"
+# rather than scanning the entire response indefinitely, which risks
+# matching a marker-like or fence-like sequence that coincidentally shows
+# up deep inside a long, otherwise-legitimate multi-statement SQL script -
+# a couple of sentences' worth is plenty for the kind of preamble an
+# instruction-following slip actually produces ("Sure, here's the query
+# you asked for: ...").
+_MAX_MARKER_PREAMBLE_CHARS = 400
+_NO_SQL_SEARCH_RE = re.compile(r'\*\*\*\s*NO\s*SQL\s*\*\*\*', re.IGNORECASE)
+
+# The set of markdown fence "language" tags a model is actually likely to
+# write on a ```-fenced SQL block (bare ``` with no tag at all is handled
+# separately below, since this alternation is always optional). Kept as an
+# explicit safelist - rather than the previous "any run of word characters"
+# - specifically so a response with NO real tag, where the fence is glued
+# directly onto the SQL with no separating whitespace/newline (e.g.
+# Ollama's qwen2.5-coder:3b occasionally emitting "```SELECT * FROM
+# foo;\n```" instead of "```sql\nSELECT ...\n```"), can never have its
+# first SQL keyword ("SELECT", "WITH", ...) mistaken for a language tag
+# and silently eaten along with the fence delimiter - see the regression
+# tests for _clean_generated_sql for the exact case this fixes.
+_SQL_FENCE_LANG_ALTERNATION = (
+    r'sql|mysql|postgres(?:ql)?|tsql|mssql|plsql|t-sql|oracle|sqlite|'
+    r'snowflake|redshift|bigquery|databricks|hive|spark(?:sql)?'
+)
+# A complete, paired fence: opening ``` (+ optional safelisted tag), a REAL
+# newline (never just "some following whitespace"), the content, then a
+# closing ```. Requiring an actual newline right after the opening
+# delimiter is what makes the tag safelist above airtight: a bare
+# "```SELECT ...\n```" has no recognized tag and no newline immediately
+# after the delimiter either, so this simply doesn't match it at all (it
+# falls through to the leading/trailing stripping below instead) rather
+# than guessing where a tag might end.
+_SQL_FENCE_RE = re.compile(
+    r'```[ \t]*(?:' + _SQL_FENCE_LANG_ALTERNATION + r')?[ \t]*\r?\n(.*?)```',
+    re.DOTALL | re.IGNORECASE,
+)
+# Used only when _SQL_FENCE_RE found no complete pair - independently strip
+# a leading and/or a trailing fence delimiter, so an UNPAIRED fence (an
+# opening ``` with no closing one, a stray closing ``` with no opening one,
+# or an opening ``` glued directly onto the SQL with no tag/newline at all)
+# still gets its backticks removed instead of being shipped to the client
+# verbatim. The two are independent (a response can have either, both, or
+# - after this whole function runs - neither) precisely so a lone stray
+# ``` at either end doesn't require its non-existent counterpart to also
+# be present before anything gets cleaned.
+_LEADING_FENCE_RE = re.compile(
+    r'^```[ \t]*(?:' + _SQL_FENCE_LANG_ALTERNATION + r')?[ \t]*\r?\n?',
+    re.IGNORECASE,
+)
+_TRAILING_FENCE_RE = re.compile(r'\r?\n?[ \t]*```[ \t]*$')
+
+
+def _clean_generated_sql(raw_text):
+    """Turns whatever text a provider's call() returned into what the rest
+    of this file already expects: either exactly the raw SQL (no fences),
+    or a string starting exactly with the '*** NO SQL ***' marker (see
+    _NO_SQL_PREFIX_RE above) - so a well-behaved response (any of Google/
+    Anthropic/OpenAI, or Ollama on a good day) round-trips through this
+    completely unchanged, while a response that buries either one behind a
+    sentence or two of chatter, or wraps it in markdown fences the prompt
+    explicitly asked it not to use (Ollama's small local models, in
+    practice - qwen2.5:3b and, less often but still seen, qwen2.5-
+    coder:3b), still gets classified correctly instead of having that
+    chatter or fence syntax shipped to the client as if it were part of
+    the SQL/marker text itself.
+
+    Checked in this order:
+      1. The '*** NO SQL ***' marker, searched for (not just matched at
+         position 0) within the first _MAX_MARKER_PREAMBLE_CHARS - if
+         found, everything before it is discarded and the marker onward is
+         returned as-is. This only fixes the marker's POSITION; every
+         caller still runs _NO_SQL_PREFIX_RE.match()/_strip_no_sql_prefix()
+         on the result to actually recognize it and extract the free text,
+         exactly as before.
+      2. A complete, PAIRED ```-fenced block anywhere in the text (see
+         _SQL_FENCE_RE) - if found, its contents alone are returned,
+         discarding everything outside the fence (chatter before AND
+         after it, e.g. "Here's the SQL:\\n```sql\\nSELECT ...\\n```\\nLet
+         me know if you need anything else!").
+      3. No complete pair found - the response may still have an UNPAIRED
+         fence delimiter at one end (an opening ``` with no closing ```,
+         a stray closing ``` with no opening one at all, or an opening ```
+         glued directly onto the SQL with no recognized tag and no
+         newline to anchor on - see _SQL_FENCE_RE's own comment for why
+         that shape doesn't count as a "complete pair"). _LEADING_FENCE_RE
+         and _TRAILING_FENCE_RE each strip their end independently, so
+         either shape - or neither, for the common case of a response
+         that's already clean - is handled without requiring both."""
+    text = (raw_text or "").strip()
+    if not text:
+        return text
+
+    marker_match = _NO_SQL_SEARCH_RE.search(text[:_MAX_MARKER_PREAMBLE_CHARS])
+    if marker_match:
+        return text[marker_match.start():].strip()
+
+    fence_match = _SQL_FENCE_RE.search(text)
+    if fence_match:
+        return fence_match.group(1).strip()
+
+    text = _LEADING_FENCE_RE.sub('', text, count=1)
+    text = _TRAILING_FENCE_RE.sub('', text, count=1)
+    return text.strip()
 
 
 # Fixed apology text for when "all databases" mode's triage call fails
@@ -1601,6 +1722,92 @@ _TRIAGE_FAILURE_TEXT = (
     "*** NO SQL *** I wasn't able to produce a usable response to your "
     "prompt, even after retrying. Try rephrasing your question."
 )
+
+
+def get_llm_schema_text(descriptor, user_identity, force_refresh=False):
+    """Single-dataset mode's own schema fetch - stream_translation()'s
+    inline "byte-for-byte the same single-connection path this endpoint
+    has always run" branch (reached whenever router_only_group_mode is
+    False: in_scope_mode isn't "group", or an explicit database_url
+    override is in play), the one call site that hands a schema straight
+    to the LLM being asked to translate a prompt into SQL for a single,
+    explicitly-identified dataset.
+
+    Wraps get_database_schema() with the SCHEMA_TABLES_ONLY reduction
+    (see backends/base.py's derive_tables_only_schema_text) so that, when
+    that flag is enabled, this one call site hands the LLM the cheaper
+    tables-only derivative instead of the full deep schema text -
+    exactly, and only, for this "translating NL to SQL in single-dataset
+    mode" case. get_database_schema() itself is completely untouched by
+    this (same cache key, same cached full deep text either way) - this
+    only trims what gets handed onward to the LLM from here.
+
+    Deliberately NOT used anywhere else schema_text reaches an LLM:
+    dataset-group mode's own Phase A triage (connection_router.py's
+    build_router_candidate_summaries) already uses its own much smaller
+    "shallow" candidate-summary representation, unrelated to this;
+    dataset-group mode's Phase B fanout (_run_phase_b_fanout via
+    generate_sql_for_connection below) always sees the full deep schema;
+    Phase C's cross-database summarization (_build_all_mode_schema_block)
+    and /api/summarize-results's own schema fetch (stream_summarize_
+    result) both always see the full deep schema too. SCHEMA_TABLES_ONLY
+    only ever affects this one path."""
+    schema = get_database_schema(descriptor, user_identity, force_refresh=force_refresh)
+    if SCHEMA_TABLES_ONLY:
+        schema = derive_tables_only_schema_text(schema)
+    return schema
+
+
+def get_triage_schema_text(descriptor, user_identity, force_refresh=False):
+    """Single-dataset mode's own Call 1 (triage_single_dataset_question,
+    see its own docstring below) - the ONLY call site that hands this
+    dataset's SHALLOW schema (deep=False - Phase 1/catalog-only, no live
+    per-table queries - see db.get_database_schema's own docstring) to an
+    LLM, mirroring dataset-group mode's own Phase A triage (connection_
+    router.build_router_candidate_summaries), which already fetches every
+    in-scope connection's schema this same cheap way for the identical
+    reason: classifying a prompt into general knowledge/schema/help/SQL
+    needs to know this dataset's shape (its dialect and table/tab names),
+    never real data or column-level/constraint/index detail, so there is
+    no reason to pay Phase 2's live-query cost before even knowing whether
+    real SQL generation (get_llm_schema_text below - the ONLY call site
+    that still fetches the full deep schema for this mode) will run at
+    all. Cached completely independently from get_llm_schema_text's own
+    deep fetch (see get_database_schema's cache_key/deep=False split) -
+    a cold triage-schema cache never forces a deep fetch, and vice versa.
+
+    Deliberately NOT reduced further by SCHEMA_TABLES_ONLY (unlike
+    get_llm_schema_text above) - that flag's own derive_tables_only_
+    schema_text() reduction is meant to trim what an already-DEEP schema
+    hands an LLM; the shallow fetch here is already far smaller than even
+    that reduced form, so there is nothing left for it to usefully do."""
+    return get_database_schema(descriptor, user_identity, force_refresh=force_refresh, deep=False)
+
+
+def get_summary_schema_text(descriptor, user_identity):
+    """Both summarization call sites' own schema fetch -
+    stream_summarize_result() (single-dataset mode's /api/summarize-
+    results, via summarize_single_connection_results) and
+    _build_all_mode_schema_block() (Phase C's cross-database
+    summarization, via summarize_all_mode_results) below.
+
+    Always reduces to the "tables_only" schema derivative (see
+    backends/base.py's derive_tables_only_schema_text) - unconditionally,
+    regardless of SCHEMA_TABLES_ONLY. Unlike get_llm_schema_text above
+    (single-dataset mode's own SQL-GENERATION path, which only reduces
+    when that flag is explicitly turned on), summarizing an already-
+    executed query's results never needs anything beyond what each
+    table/column means - never constraints, indexes, views, grants, or
+    any of the other schema-object sections a translate prompt can still
+    carry when SCHEMA_TABLES_ONLY is off - so this reduces every time,
+    independent of that flag's setting.
+
+    get_database_schema() itself is completely untouched by this (same
+    cache key, same cached full deep text either way, for any other
+    caller) - this only trims what gets handed onward to the
+    summarization LLM from here."""
+    schema = get_database_schema(descriptor, user_identity)
+    return derive_tables_only_schema_text(schema)
 
 
 def generate_sql_for_connection(descriptor, prompt, history, provider, client, model,
@@ -1732,13 +1939,7 @@ def generate_sql_for_connection(descriptor, prompt, history, provider, client, m
             continue
     end_time = time.perf_counter()
 
-    if generated_sql.startswith("```"):
-        lines = generated_sql.splitlines()
-        if lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].startswith("```"):
-            lines = lines[:-1]
-        generated_sql = "\n".join(lines).strip()
+    generated_sql = _clean_generated_sql(generated_sql)
 
     return generated_sql, usage_info, round(1000 * (end_time - start_time)), api_key, client
 
@@ -1807,7 +2008,7 @@ def _run_phase_b_fanout(selected_entries, prompts, histories, provider, model, u
 
     This is a GENERATOR: as each connection's call completes (in
     COMPLETION order, not original order - this is what lets
-    stream_translation()'s router_only_all_mode branch report each
+    stream_translation()'s router_only_group_mode branch report each
     database's own result to the client as soon as it's ready, rather
     than waiting for the slowest one), it yields `(entry, classified)`,
     where `classified` is _classify_generation_outcome's return shape for
@@ -2470,7 +2671,7 @@ def _summarize_with_retry(prompt_content, schema_block, system_instruction, prov
     paragraph) - the policy was added first, purely server-side, with
     nothing surfaced to the client; a slow/rate-limited summarization call
     could silently sit in a multi-second TRANSLATION_RETRY_DELAY_SECONDS
-    wait with the "Summarizing results…" banner frozen, indistinguishable
+    wait with the "Summarizing…" banner frozen, indistinguishable
     from a hang. Both direct callers (summarize_all_mode_results,
     summarize_single_connection_results) forward these via `return (yield
     from _summarize_with_retry(...))`, and both routes that call THEM
@@ -2680,15 +2881,20 @@ def _build_all_mode_schema_block(database_results, user_identity):
     Each unique (kind, id) pair is resolved via resolve_descriptor_by_
     reference - the same {kind, id}-only trust boundary translate_routes.py/
     execute_routes.py already use everywhere else (never raw descriptors/
-    credentials sent by the client) - then its schema is fetched via the
-    same cached get_database_schema() Phase B/single-connection mode
-    already use, so this costs nothing beyond a cache lookup for a
-    connection Phase B just fetched moments earlier in this same turn. A
-    reference that no longer resolves (a preset removed, or a custom
-    connection deleted, in the moments since triage/Phase B ran) is
-    silently skipped, same leniency resolve_in_scope_descriptors already
-    applies elsewhere - one missing schema shouldn't block summarizing the
-    other databases that did resolve.
+    credentials sent by the client) - then its schema is fetched via
+    get_summary_schema_text() above, the SAME cached get_database_schema()
+    Phase B/single-connection mode already use, but always reduced to the
+    "tables_only" derivative regardless of SCHEMA_TABLES_ONLY - Phase C
+    only ever needs to know what each table/column means, never
+    constraints/indexes/views/etc, and every database referenced here
+    already got its full schema fetched (and cached) moments earlier in
+    this same turn by Phase B, so this costs nothing beyond a cache
+    lookup either way. A reference that no longer resolves (a preset
+    removed, or a custom connection deleted, in the moments since
+    triage/Phase B ran) is silently skipped, same leniency
+    resolve_in_scope_descriptors already applies elsewhere - one missing
+    schema shouldn't block summarizing the other databases that did
+    resolve.
 
     `user_identity` falsy (a caller with no real session to resolve
     against - e.g. a unit test exercising summarize_all_mode_results()
@@ -2714,7 +2920,7 @@ def _build_all_mode_schema_block(database_results, user_identity):
         descriptor, _resolved_name = resolve_descriptor_by_reference(kind, ref_id, user_identity)
         if descriptor is None:
             continue
-        schema = get_database_schema(descriptor, user_identity)
+        schema = get_summary_schema_text(descriptor, user_identity)
         blocks.append(f"{names_by_key[key]}:\n{schema}")
     if not blocks:
         return ""
@@ -2886,7 +3092,7 @@ def summarize_results():
     (_summarize_with_retry, see its docstring) can now genuinely take
     several real seconds - a transient-error wait, possibly a key
     rotation first - and previously nothing reached the client during
-    that wait at all; the "Summarizing results…" banner just sat there
+    that wait at all; the "Summarizing…" banner just sat there
     frozen, indistinguishable from a hang. Zero or more
     {"status": "retrying", "attempt": <next attempt #>, "maxAttempts": N,
      "delaySeconds": <float>, "rotatedKey": <bool>} lines are emitted live
@@ -2985,18 +3191,15 @@ def summarize_results():
                 if isinstance(error, BaseException) else
                 'Unable to summarize results right now.'
             )
-            # Logged the same way a successful Phase C call is (see below) -
-            # "All Pre-Configured Datasets"/"All Pre-Configured Datasets", 0 duration-attributed tokens
-            # (a total failure never has a usable response to report token
-            # counts from - see summarize_all_mode_results'/_summarize_with_
-            # retry's own docstrings), and the sql_command column holding a
-            # TRANSLATION_ERROR(...) sentinel rather than real SQL, since
-            # there is none - same overloaded-column convention this app
-            # already uses for "*** NO SQL ***" text.
-            record_all_databases_triage(
-                user_identity, prompt, f"TRANSLATION_ERROR ({error_message})", llm_model, duration,
-                0, 0, 0, 0, 0,
-            )
+            # Phase C (summarization) is deliberately NEVER recorded in the
+            # translations-table history/stats - only calls that take a
+            # prompt and generate real SQL are (single-connection Call 2,
+            # dataset-group mode's own Phase B per-connection generation) -
+            # triage and summarization calls aren't useful there and would
+            # just pollute the stats. See the matching comment on Phase A's
+            # own (removed) logging call further down for the fuller
+            # reasoning; this used to log a "Dataset Group"/"Dataset Group"
+            # row here on a total Phase C failure.
             yield json.dumps({'status': 'done', 'success': False, 'error': error_message}) + "\n"
             return
 
@@ -3057,17 +3260,12 @@ def summarize_results():
             summary_paragraphs.append(cross_database_summary)
 
         summary_text = "*** NO SQL *** " + parsed["label"] + "\n\n" + "\n\n".join(summary_paragraphs)
-        usage_dict = usage or {}
-        # Logged the same way Phase A's own triage call is (see
-        # record_all_databases_triage's docstring) - "All Pre-Configured Datasets"/
-        # "All Pre-Configured Datasets" rather than any one real connection, since this call
-        # is likewise never "about" just one specific database.
-        record_all_databases_triage(
-            user_identity, prompt, summary_text, llm_model, duration,
-            usage_dict.get("input_tokens", 0), usage_dict.get("output_tokens", 0),
-            usage_dict.get("total_tokens", 0), usage_dict.get("thinking_tokens", 0),
-            usage_dict.get("cached_content_tokens", 0),
-        )
+        # Phase C (summarization) is deliberately never recorded in the
+        # translations-table history/stats - see the comment on this
+        # function's own failure branch above for why. `usage`/`duration`
+        # (computed above) are no longer used for anything now that this
+        # call logs nothing and the client response below never carried
+        # usage/duration fields either.
 
         yield json.dumps({
             'status': 'done', 'success': True, 'summary': summary_text,
@@ -3630,7 +3828,7 @@ def summarize_result():
         # guard is held - see the comment above this generator's
         # definition.
         conn_str = resolve_conn_str(data.get('database_url'), user_identity)
-        schema = get_database_schema(conn_str, user_identity)
+        schema = get_summary_schema_text(conn_str, user_identity)
 
         start_time = time.perf_counter()
         client = provider.make_client(api_key)
@@ -3656,16 +3854,12 @@ def summarize_result():
                 if isinstance(error, BaseException) else
                 'Unable to summarize results right now.'
             )
-            # Logged against the real connection this was run for (unlike
-            # Phase C's "All Pre-Configured Datasets"/"All Pre-Configured Datasets" logging above), 0
-            # tokens (no usable response on a total failure - see
-            # _summarize_with_retry's own docstring), sql_command holding a
-            # TRANSLATION_ERROR(...) sentinel in place of real SQL, same
-            # overloaded-column convention "*** NO SQL ***" already uses.
-            record_translation(
-                user_identity, conn_str, prompt, f"TRANSLATION_ERROR ({error_message})", llm_model, duration,
-                0, 0, 0, 0, 0,
-            )
+            # Call 3 (summarization) is deliberately NEVER recorded in the
+            # translations-table history/stats - only calls that take a
+            # prompt and generate real SQL are (Call 2 here, dataset-group
+            # mode's own Phase B per-connection generation) - triage and
+            # summarization calls aren't useful there and would just
+            # pollute the stats.
             yield json.dumps({'status': 'done', 'success': False, 'error': error_message}) + "\n"
             return
 
@@ -3679,17 +3873,9 @@ def summarize_result():
         # it's not None.
         summary_text = "*** NO SQL *** " + parsed["summary"]
         visualization = parsed["visualization"]
-        usage_dict = usage or {}
-        # Logged as a real translations-table row against the actual connection
-        # this was run for (unlike Phase C's "All Pre-Configured Datasets"/"All Pre-Configured Datasets"
-        # special-case logging - there IS one real connection here), same call
-        # translate_query()'s own single-connection path already uses.
-        record_translation(
-            user_identity, conn_str, prompt, summary_text, llm_model, duration,
-            usage_dict.get("input_tokens", 0), usage_dict.get("output_tokens", 0),
-            usage_dict.get("total_tokens", 0), usage_dict.get("thinking_tokens", 0),
-            usage_dict.get("cached_content_tokens", 0),
-        )
+        # Call 3 (summarization) is deliberately never recorded in the
+        # translations-table history/stats - see the comment on this
+        # function's own failure branch above for why.
 
         yield json.dumps({
             'status': 'done', 'success': True, 'summary': summary_text, 'visualization': visualization,
@@ -3708,6 +3894,151 @@ def summarize_result():
 
     resp = Response(stream_with_context(_stream_summarize_result_with_guard_release()), mimetype='application/x-ndjson')
     return apply_session_cookie(resp, session_id)
+
+
+# =============================================================================
+# Single-dataset mode's own two-call redesign for stream_translation()'s
+# single-connection path below: Call 1 (triage_single_dataset_question)
+# classifies a prompt into general knowledge/schema/help/SQL BEFORE any
+# dialect-specific SQL-generation system instruction is ever built or sent,
+# and Call 2 (the '*** NO SQL ***'-free JSON-enveloped SQL-generation call
+# stream_translation() itself runs inline, only when Call 1 resolves to
+# "sql") never has to decide whether to classify at all - it only ever
+# generates SQL, with a single structured escape hatch for "I can't
+# confidently answer this."
+#
+# This exists because a real qwen2.5-coder:7b smoke test surfaced a
+# genuine architectural problem, not a prompt-wording one: the old single-
+# call design (_COMMON_FORMAT_RULES, still used unchanged by dataset-group
+# mode's own Phase B fan-out below - see generate_sql_for_connection - and
+# deliberately left that way, per this session's repeated agreement to
+# scope this redesign to the single-connection path only) asked ONE call
+# to both classify (via a '*** NO SQL ***' free-text marker convention)
+# AND generate SQL in the same response - the model generated genuinely
+# correct SQL while ALSO spuriously prepending '*** NO SQL ***' to it,
+# treating the marker as a reflexive prefix rather than a true either/or
+# branch. Splitting classification and generation into two calls removes
+# the marker (and the ambiguity it created) from the generation call
+# entirely: Call 2's JSON envelope's OWN SHAPE (exactly one of "sql"/
+# "cannot_answer_reason" populated) is what tells the two cases apart now,
+# not a literal string a model has to remember to emit (or not) inside
+# free text it's also trying to get right in every other way.
+#
+# Mirrors dataset-group mode's own two-phase precedent one level down
+# (connection_router.py's triage_all_mode_question decides "answer vs.
+# route" before ever picking a connection) - the identical classify-then-
+# act shape, just with four outcomes instead of two, scoped to exactly one
+# already-selected dataset rather than choosing among several, and (unlike
+# that function) never itself generating SQL - triage_single_dataset_
+# question's own "sql" outcome is purely a signal for stream_translation()
+# to run Call 2 next, not something it has any further step to take here.
+# =============================================================================
+
+# _SINGLE_DATASET_TRIAGE_SYSTEM_INSTRUCTION, _extract_json_object, and
+# _parse_single_dataset_triage_response now live in connection_router.py
+# (imported above) - they're shared with that module's own multi-candidate
+# (dataset-group) triage prompt/parser via one unified retry-loop function,
+# run_triage_call, also imported above. See that function's own docstring
+# for the full reasoning behind the merge.
+
+
+def triage_single_dataset_question(schema_block, prompt, provider, client, model,
+                                    history=None, api_key=None, tried_keys=None, using_byok=False):
+    """Single-dataset mode's own Call 1: decides which of general
+    knowledge/schema questions/help questions/real SQL generation `prompt`
+    needs, given `schema_block` (this dataset's own SHALLOW/overview
+    schema text - see get_triage_schema_text - which is deliberately NOT
+    the full deep schema stream_translation()'s eventual Call 2 still
+    fetches separately, and only once this call actually resolves to
+    "sql") and `history` (this session's already-trimmed conversation
+    turns for this exact dataset, letting a follow-up resolve a reference
+    from the prior turn, e.g. "who is the current US president?" ->
+    answer -> "and the vice president?").
+
+    A THIN WRAPPER around connection_router.run_triage_call with
+    num_candidates fixed at 1 - see that function's own docstring for the
+    full retry-loop/key-rotation/language-verification/GENERATOR
+    reasoning (unchanged by the merge that introduced this wrapper; this
+    function's own signature, generator-ness, and return shape are all
+    still exactly what they were before that merge, so every existing
+    caller/test of this function needed zero changes).
+
+    Returns exactly one of:
+      {"outcome": "general", "answer": <str>, "usage": <dict|None>}
+      {"outcome": "schema", "usage": <dict|None>}
+      {"outcome": "help", "usage": <dict|None>}
+      {"outcome": "sql", "usage": <dict|None>}
+      {"outcome": "failed", "api_error": <bool>, "error": <exception|None>}"""
+    return (yield from run_triage_call(
+        1, schema_block, prompt, provider, client, model,
+        history=history, max_connections=1,
+        api_key=api_key, tried_keys=tried_keys, using_byok=using_byok,
+    ))
+
+
+# The output-format/behavior rules that follow the dialect intro in
+# stream_translation()'s single-connection Call 2 (SQL generation, see the
+# module-level section comment above _SINGLE_DATASET_TRIAGE_SYSTEM_
+# INSTRUCTION) - identical for every dialect, so pulled out once here
+# rather than duplicated per dialect entry, same reasoning as
+# _COMMON_FORMAT_RULES. Deliberately a SEPARATE constant, not a
+# replacement for _COMMON_FORMAT_RULES - that one is still used, unchanged,
+# by generate_sql_for_connection (dataset-group mode's Phase B fan-out,
+# explicitly out of scope for this redesign - see this module's own
+# docstring). Call 2 is only ever reached once Call 1 has already decided
+# "sql" - it is never asked to classify anything itself, which is exactly
+# what removes the failure mode this redesign exists to fix: there is no
+# more '*** NO SQL ***' marker for a model to reflexively (and, in
+# practice, sometimes spuriously) emit, since the JSON envelope's OWN
+# SHAPE (exactly one of "sql"/"cannot_answer_reason" populated) is what
+# the app now uses to tell "real SQL" and "can't confidently answer" apart,
+# not a literal string sharing space with the free text.
+_SQL_GENERATION_FORMAT_RULES = (
+    "Format the result data to be easily readable. For example, format timestamps as date:hour:min:sec.\n"
+    "If you want to respond partly with a SQL command and partly with free text, enclose the free text as follows 'SELECT <your free-text response in quotes> as RESPONSE;'.\n"
+    "If a user asks you who you are or what model you are using, hide this behind a generic response.\n"
+    "If you cannot confidently generate valid SQL for this request - it's too ambiguous to act on, it references data/tables that aren't in the schema below, it asks for something this database/dialect can't express, or you run into any other error reasoning about it - do NOT guess: explain WHY in \"cannot_answer_reason\" instead (see the response format below). A bare, unexplained refusal (e.g. just 'I am not able to respond to your prompt.' with nothing else) is NOT acceptable - always give the actual, specific reason.\n"
+    "Always write any free-text content you produce (a \"cannot_answer_reason\" explanation, or SQL comments if asked to document the query) in the SAME LANGUAGE as the user's most recent prompt below - regardless of the language used in the database schema, table/column names, or earlier chat history.\n"
+    "Respond with ONLY a JSON object, no markdown fences, no other text: exactly one of \"sql\" or \"cannot_answer_reason\" must be populated (a non-empty string), the other omitted or empty - never both, never neither.\n"
+    "- Real SQL: {\"sql\": \"<the raw SQL - one or more statements - with NO markdown code fences or backticks around it>\"}\n"
+    "- Cannot confidently answer: {\"cannot_answer_reason\": \"<your brief, specific explanation, in the user's own language as described above>\"}\n"
+)
+
+
+def _parse_sql_generation_response(text):
+    """Parses Call 2's raw response text (_SQL_GENERATION_FORMAT_RULES)
+    into exactly one of:
+      {"outcome": "sql", "sql": <non-empty str>}
+      {"outcome": "cannot_answer", "reason": <non-empty str>}
+      None  # unparseable, both populated, or neither populated - caller retries
+    Never raises. "sql" is additionally passed through _clean_generated_
+    sql's own fence-stripping as defense-in-depth only (that function's
+    '*** NO SQL ***'-marker search is a harmless no-op here - real SQL has
+    no legitimate reason to contain that exact substring) - the prompt
+    above already asks for a bare, fence-free string, but a model that
+    nests a fenced block INSIDE the JSON string value is otherwise
+    indistinguishable from one that didn't. The outer JSON envelope itself
+    goes through _extract_json_object (see its own docstring) rather than
+    a bare strip_markdown_fence()+json.loads(), so a weak/local model that
+    wraps the WHOLE envelope in a sentence or two of chatter (not just an
+    inner SQL string) still parses instead of forcing a retry."""
+    parsed = _extract_json_object(text)
+    if not isinstance(parsed, dict):
+        return None
+
+    sql = parsed.get("sql")
+    sql = sql.strip() if isinstance(sql, str) else ""
+    reason = parsed.get("cannot_answer_reason")
+    reason = reason.strip() if isinstance(reason, str) else ""
+
+    if bool(sql) == bool(reason):
+        # Neither populated, or both populated - the contract requires
+        # exactly one; either way this attempt gets no more benefit of the
+        # doubt than a plain unparseable response would.
+        return None
+    if sql:
+        return {"outcome": "sql", "sql": _clean_generated_sql(sql)}
+    return {"outcome": "cannot_answer", "reason": reason}
 
 
 @translate_bp.route('/api/translate', methods=['POST'])
@@ -3769,24 +4100,27 @@ def translate_query():
     # reflects) - it wins over "all" mode below, same as it always has.
     explicit_db_override = bool(data.get('database_url'))
 
-    # "All configured databases" mode (see db.py's
-    # resolve_in_scope_descriptors) runs a real two-phase flow - see
-    # stream_translation()'s router_only_all_mode branch below,
-    # connection_router.triage_all_mode_question, and _run_phase_b_fanout:
-    # a triage call decides "answer" (table names alone are enough),
-    # "route" (generate and execute real SQL against one or more specific
+    # Dataset group mode (session in_scope_mode == "group" - see db.py's
+    # resolve_in_scope_descriptors/_resolve_group_configured_descriptors,
+    # and app_config.py's own "DATASET GROUPS" comment) runs a real
+    # two-phase flow - see stream_translation()'s router_only_group_mode
+    # branch below, connection_router.triage_all_mode_question (its name
+    # predates and is independent of this user-facing "group" concept -
+    # see that module's own docstring), and _run_phase_b_fanout: a triage
+    # call decides "answer" (table names alone are enough), "route"
+    # (generate and execute real SQL against one or more specific
     # connections, in parallel), or "failed" (fixed apology text, no
-    # fallback guess). Unconditional whenever in_scope_mode is "all",
-    # regardless of how many connections are actually configured (even
-    # just one) - triage still needs to decide "answer directly" vs.
+    # fallback guess). Unconditional whenever in_scope_mode is "group",
+    # regardless of how many datasets the active group actually lists
+    # (even just one) - triage still needs to decide "answer directly" vs.
     # "actually go query this database" either way, so there's no
     # connection-count threshold below which it's skipped. A session whose
-    # in_scope_mode isn't "all" (the default "single", or an explicit
+    # in_scope_mode isn't "group" (the default "single", or an explicit
     # database_url override) takes none of the branches below - see
     # stream_translation()'s single-connection path, which is byte-for-byte
     # the same code path this endpoint has always run.
     in_scope_entries = resolve_in_scope_descriptors(session_data, user_identity)
-    router_only_all_mode = session_data.get('in_scope_mode') == 'all' and not explicit_db_override
+    router_only_group_mode = session_data.get('in_scope_mode') == 'group' and not explicit_db_override
     #
     # The triage call itself gets this turn's ordinary conversation history
     # (see triage_all_mode_question's docstring) - it's a single, non-per-
@@ -3794,31 +4128,32 @@ def translate_query():
     # (e.g. resolving "how large is THIS database" against a prior turn's
     # answer). Phase B's per-connection calls below are different: each one
     # gets THAT SPECIFIC connection's own history instead (see
-    # connection_histories just below) - completely merged across however
-    # the user has ever reached it, single-connection mode and "all
-    # databases" mode alike (see client.js's connectionBucketKey()/
-    # buildInScopeConnectionHistories() docstrings for the client-side half
-    # of this).
+    # connection_histories just below) - but only from turns actually
+    # asked against it directly in single-connection mode, never from a
+    # dataset-group turn that merely routed to it (see client.js's
+    # connectionBucketKey()/buildInScopeConnectionHistories() docstrings
+    # for the client-side half of this).
 
     history = data.get('history', [])[-(HISTORY_MAX_TURNS * 2):]
-    # Chunk 5 of "splitting SQL/summary per in-scope database" (see
-    # client.js's captureAllModeHistory()/fanOutAllModeHistoryPerDatabase()/
-    # buildInScopeConnectionHistories() docstrings for the full, multi-
-    # window design history of this feature): one entry per in-scope
-    # connection the client currently has a bucket for, keyed exactly like
-    # client.js's connectionBucketKey() builds its bucket keys -
-    # "preset:<id>" / "custom:<key>" - each value that connection's own
-    # FULLY MERGED history array (every single-connection-mode turn AND
-    # every all-mode turn ever fanned out to it, indistinguishably - see
-    # fanOutAllModeHistoryPerDatabase()'s own docstring for why that merge
-    # is already real by the time this ever reaches the server). Consulted
-    # below, per selected connection, ONLY for Phase B's real SQL-generation
-    # calls - triage above keeps using the ordinary shared `history`, since
-    # routing is not itself an NL-to-SQL translation. Defaults to `{}` for
-    # an older client that never sends this field at all, or a connection
-    # this dict simply has no entry for (never visited, directly or via
-    # fan-out) - both cases fall back to the same empty-history behavior
-    # generate_sql_for_connection has always had, not an error.
+    # See client.js's buildInScopeConnectionHistories() docstring: one
+    # entry per in-scope connection the client currently has a bucket for,
+    # keyed exactly like client.js's connectionBucketKey() builds its
+    # bucket keys - "preset:<id>" / "custom:<key>" - each value that
+    # connection's own history array from turns actually asked against it
+    # DIRECTLY in single-connection mode. A dataset-group turn's own
+    # per-connection outcome is deliberately never folded into any member
+    # connection's own bucket (an earlier "fan-out" design did this and was
+    # removed - it surprised users by making a group question appear,
+    # unasked, in one specific connection's own history), so a connection
+    # only ever reached through group mode contributes no history here at
+    # all. Consulted below, per selected connection, ONLY for Phase B's
+    # real SQL-generation calls - triage above keeps using the ordinary
+    # shared `history`, since routing is not itself an NL-to-SQL
+    # translation. Defaults to `{}` for an older client that never sends
+    # this field at all, or a connection this dict simply has no entry for
+    # (never visited directly) - both cases fall back to the same
+    # empty-history behavior generate_sql_for_connection has always had,
+    # not an error.
     connection_histories = data.get('connection_histories') or {}
     force_schema_refresh = bool(data.get('refresh_schema'))
 
@@ -3830,7 +4165,7 @@ def translate_query():
     # Zero or more progress lines are emitted first:
     #   {"status": "retrying", "attempt": <next attempt #>, "maxAttempts": N,
     #    "delaySeconds": <float>, "rotatedKey": <bool>}
-    # For the single-connection path specifically (router_only_all_mode
+    # For the single-connection path specifically (router_only_group_mode
     # False - see stream_translation() below), exactly two more progress
     # lines are emitted ahead of the retry loop, so the client has
     # something better than a bare spinner for the two real waits that
@@ -3889,7 +4224,7 @@ def translate_query():
             if callable(close_fn):
                 cancel_token, cancel_handle = cancel_registry.register(session_id, close_fn)
 
-            if router_only_all_mode:
+            if router_only_group_mode:
                 # "All databases" mode's real two-phase flow (see
                 # connection_router.triage_all_mode_question and
                 # _run_phase_b_fanout above): a triage call decides
@@ -3922,26 +4257,34 @@ def translate_query():
                 # summary is itself schema_cache-backed, so this is fast
                 # on a warm cache but not on a cold one or a forced
                 # refresh), and previously had no progress indicator at
-                # all.
+                # all. Both this and "routing" just below share the single
+                # user-facing "Triaging…" label (see the app's own
+                # canonical 4-message progress vocabulary - Triaging/
+                # Generating SQL/Fetching Results/Summarizing - client.js's
+                # showPhaseStatus()'s docstring has the full list) - the
+                # distinct `phase` KEY still separates them for anything
+                # that inspects the stream programmatically (see
+                # test_translate_routes.py's phase-sequence assertions),
+                # only the human-readable `message` is now shared.
                 yield json.dumps({
                     "status": "phase_status",
                     "phase": "collecting_schema_summaries",
-                    "message": "Collecting database summaries…",
+                    "message": "Triaging…",
                 }) + "\n"
                 candidate_summaries = build_router_candidate_summaries(in_scope_entries, user_identity)
 
                 # Second of router mode's two phase_status lines - the
                 # triage LLM call itself, which now carries its own real
-                # retry/key-rotation budget (see triage_all_mode_question's
+                # retry/key-rotation budget (see run_triage_call's
                 # docstring), so this wait can be the longest one and
                 # previously had no progress indicator at all either.
                 yield json.dumps({
                     "status": "phase_status",
                     "phase": "routing",
-                    "message": "Deciding which databases to contact…",
+                    "message": "Triaging…",
                 }) + "\n"
-                # yield from (not a plain call) - triage_all_mode_question is
-                # now a generator that yields live "retrying" NDJSON lines
+                # yield from (not a plain call) - run_triage_call is a
+                # generator that yields live "retrying" NDJSON lines
                 # whenever its own internal retry loop actually fires (key
                 # rotation or a transient-error wait - see its docstring for
                 # why this used to be invisible to the client). Forwarding
@@ -3950,13 +4293,21 @@ def translate_query():
                 # retry loop already gives - client.js needs no changes for
                 # this, since 'retrying' is already handled generically
                 # regardless of which server-side call produced it.
-                triage_result = yield from triage_all_mode_question(
-                    candidate_summaries, prompt, provider, client, llm_model, history=history,
+                #
+                # This is the SAME unified triage call single-dataset mode's
+                # own triage_single_dataset_question delegates to (see that
+                # function's docstring) - here called directly with
+                # num_candidates == len(candidate_summaries) and the
+                # multi-candidate schema block, instead of through that
+                # thin single-dataset-only wrapper.
+                triage_result = yield from run_triage_call(
+                    len(candidate_summaries), _build_candidate_schema_block(candidate_summaries),
+                    prompt, provider, client, llm_model, history=history,
                     api_key=api_key, using_byok=bool(byok_key),
                 )
                 # Phase A's own elapsed time and LLM usage, isolated from
                 # whatever Phase B work (if any) happens next below -
-                # logged as its own dedicated "All Pre-Configured Datasets"/"All Pre-Configured Datasets" translations-
+                # logged as its own dedicated "Dataset Group"/"Dataset Group" translations-
                 # table row further down (see
                 # db.record_all_databases_triage's docstring), regardless
                 # of outcome, since triage always runs exactly once per
@@ -3966,12 +4317,32 @@ def translate_query():
                 usage_info = dict(triage_usage)
                 extra_fields = {}
 
-                if triage_result["outcome"] == "answer":
+                if triage_result["outcome"] == "general":
                     # Can be answered from table names/dialects/general
                     # knowledge alone, no real database access needed -
                     # same '*** NO SQL ***' convention/rendering path
                     # client.js already handles with zero changes.
                     generated_sql = "*** NO SQL *** " + triage_result["answer"]
+                    triage_log_text = generated_sql
+                elif triage_result["outcome"] == "schema":
+                    # NEW outcome for group mode (run_triage_call's merge -
+                    # see its docstring): opens the group's own Schema
+                    # Viewer, mirroring single-dataset mode's identical
+                    # handling of this same outcome below. client.js's
+                    # translate-response handler needs one small additive
+                    # branch for this (IN_SCOPE_MODE === 'group' calls
+                    # openGroupSchemaViewer() instead of the single-
+                    # connection openSchemaViewer()) - see that file's own
+                    # comment at the isOpenSchema branch.
+                    generated_sql = "*** NO SQL *** OPEN SCHEMA VIEWER ***"
+                    triage_log_text = generated_sql
+                elif triage_result["outcome"] == "help":
+                    # NEW outcome for group mode, same reasoning as
+                    # "schema" just above - opens the (mode-agnostic) Help
+                    # modal, which client.js's isOpenHelp branch already
+                    # handles identically regardless of IN_SCOPE_MODE, so
+                    # this needed no client.js changes at all.
+                    generated_sql = "*** NO SQL *** OPEN HELP POPUP ***"
                     triage_log_text = generated_sql
                 elif triage_result["outcome"] == "failed":
                     # Triage itself couldn't produce anything usable after
@@ -4003,8 +4374,26 @@ def translate_query():
                     else:
                         generated_sql = _TRIAGE_FAILURE_TEXT
                     triage_log_text = generated_sql
-                else:  # "route" - needs real data from specific connection(s)
-                    selected_entries = [in_scope_entries[i] for i in triage_result["indices"]]
+                else:  # "sql" - needs real data from specific connection(s)
+                    # A group with exactly one in-scope connection calls
+                    # run_triage_call with num_candidates == 1, which uses
+                    # its single-dataset branch (byte-identical to single-
+                    # dataset mode's own triage_single_dataset_question -
+                    # see run_triage_call's docstring) - that branch's own
+                    # "sql" outcome carries no "indices"/"message"/
+                    # "database_prompts" at all, since single-dataset mode
+                    # never has anything to pick between. There is still
+                    # only one possible candidate here though (the group's
+                    # sole member), so that's implicitly "selected" rather
+                    # than requiring the model to say so - defaulting to it
+                    # keeps a single-connection dataset group able to reach
+                    # real SQL at all, the same guarantee this branch's own
+                    # module comment above promises for "even just one"
+                    # configured connection.
+                    indices = triage_result.get("indices")
+                    if indices is None:
+                        indices = list(range(len(in_scope_entries)))
+                    selected_entries = [in_scope_entries[i] for i in indices]
                     # Each connection gets ITS OWN instruction - triage's
                     # own rewrite of `prompt` for that connection alone
                     # when it supplied one (see triage_all_mode_question's
@@ -4018,7 +4407,7 @@ def translate_query():
                     # entirely.
                     database_prompts_by_index = triage_result.get("database_prompts") or {}
                     entry_prompts = [
-                        database_prompts_by_index.get(i) or prompt for i in triage_result["indices"]
+                        database_prompts_by_index.get(i) or prompt for i in indices
                     ]
                     # Each connection's OWN merged history (Chunk 5 - see
                     # connection_histories' own declaration comment above)
@@ -4207,20 +4596,14 @@ def translate_query():
                 thinking_tokens = usage_info.get("thinking_tokens", 0)
                 cached_content_tokens = usage_info.get("cached_content_tokens", 0)
 
-                # Phase A (triage) always gets its own dedicated
-                # "All Pre-Configured Datasets"/"All Pre-Configured Datasets" translations-table row - see
-                # record_all_databases_triage's docstring - using ONLY its
-                # own duration/usage computed above, never Phase B's (kept
-                # entirely separate below) so nothing is ever double-
-                # counted across the two rows.
-                record_all_databases_triage(
-                    user_identity, prompt, triage_log_text, llm_model, triage_duration,
-                    triage_usage.get("input_tokens", 0), triage_usage.get("output_tokens", 0),
-                    triage_usage.get("total_tokens", 0), triage_usage.get("thinking_tokens", 0),
-                    triage_usage.get("cached_content_tokens", 0),
-                )
+                # Phase A (triage) is deliberately NEVER recorded in the
+                # translations-table history/stats - only calls that take a
+                # prompt and generate real SQL are (Phase B's own per-
+                # connection generation below, single-connection mode's own
+                # Call 2) - triage and summarization calls aren't useful
+                # there and would just pollute the stats.
 
-                if triage_result["outcome"] == "route":
+                if triage_result["outcome"] == "sql":
                     # One dedicated translations-table row PER SELECTED
                     # CONNECTION - not one combined row for the whole batch
                     # attributed only to the first connection, which is
@@ -4265,23 +4648,36 @@ def translate_query():
 
             # Byte-for-byte the same single-connection path this endpoint
             # has always run - see this module's docstring. Only reached
-            # when router_only_all_mode is False (its own branch above
+            # when router_only_group_mode is False (its own branch above
             # always returns before falling through to here), i.e. for the
             # overwhelming majority of sessions today: in_scope_mode isn't
             # "all", or an explicit database_url override is in play.
             #
-            # First of the two phase_status lines this path emits (see the
-            # module docstring above) - schema lookup is usually a cache
-            # hit and near-instant, but can be a real, visible wait on a
-            # cold cache or an explicit refresh_schema request, and the
+            # Two-call redesign (see the module-level section comment above
+            # _SINGLE_DATASET_TRIAGE_SYSTEM_INSTRUCTION for the full
+            # reasoning): Call 1 (triage_single_dataset_question) classifies
+            # `prompt` into general knowledge/schema/help/SQL using only
+            # this dataset's cheap SHALLOW schema; Call 2 (the JSON-
+            # enveloped SQL-generation call below, inlined here exactly the
+            # way this whole path already was before this redesign) only
+            # ever runs once Call 1 resolves to "sql", and only then pays
+            # the full DEEP schema fetch's cost. This mirrors dataset-group
+            # mode's own Phase A/Phase B split one level down - see that
+            # section comment for how closely.
+            #
+            # First of this path's phase_status lines (see the module
+            # docstring above) - the shallow schema lookup is usually a
+            # cache hit and near-instant, but can be a real, visible wait on
+            # a cold cache or an explicit refresh_schema request, and the
             # client has no other way to distinguish "still building the
             # prompt" from "waiting on the model" without this.
             yield json.dumps({
                 "status": "phase_status",
                 "phase": "schema",
-                "message": "Reading the database schema…",
+                "message": "Triaging…",
             }) + "\n"
-            schema = get_database_schema(conn_str, user_identity, force_refresh=force_schema_refresh)
+            triage_schema = get_triage_schema_text(conn_str, user_identity, force_refresh=force_schema_refresh)
+            triage_schema_block = f"Database Schema (overview):\n{triage_schema}\n\n"
 
             try:
                 dialect_name = get_backend(conn_str).dialect_name
@@ -4289,7 +4685,166 @@ def translate_query():
                 dialect_name = "PostgreSQL"
             dialect_intro = _DIALECT_PROMPT_INTROS.get(dialect_name, _DEFAULT_DIALECT_PROMPT_INTRO)
 
-            system_instruction = dialect_intro + _COMMON_FORMAT_RULES
+            # The key-ROTATION retry budget (see LlmProvider.
+            # supports_key_rotation's docstring) - sized to how many keys
+            # are actually configured for a provider that supports it
+            # (Gemini today - see _classify_gemini_error's 429 case), or 1
+            # (meaning "already exhausted, since tried_llm_keys already has
+            # one key in it") for a provider that doesn't, making the
+            # rotate_key branch of Call 2's own retry loop below
+            # effectively unreachable for Claude/OpenAI, exactly as before
+            # this dispatch existed. tried_llm_keys already starts as
+            # {api_key} (set above, before this generator runs), so it's
+            # the natural running total of distinct keys tried BY CALL 2 -
+            # Call 1 tracks its own, independent key-rotation budget
+            # internally (triage_single_dataset_question is given no
+            # explicit tried_keys, so it starts fresh from {api_key}
+            # itself), the same independent-per-call-budget precedent
+            # dataset-group mode's own Phase A/Phase B split already
+            # established (triage_all_mode_question's own internal
+            # rotation is never threaded into _run_phase_b_fanout either).
+            # A "Bring Your Own Key" forces this down to 1 (already met by
+            # tried_llm_keys' own starting size), same reasoning as
+            # generate_sql_for_connection's own using_byok parameter -
+            # there's no second key of the user's own to rotate to, so this
+            # loop's rotate_key branch below is made unreachable exactly
+            # the same way it already is for a provider that doesn't
+            # support rotation at all.
+            key_pool_size = 1 if byok_key else provider.get_key_pool_size()
+
+            # Second of this path's phase_status lines - Call 1 itself,
+            # which carries its own real retry/key-rotation budget (see
+            # triage_single_dataset_question's docstring), so this wait can
+            # be more than instantaneous and previously had no progress
+            # indicator of its own distinct from the old single call's.
+            yield json.dumps({
+                "status": "phase_status",
+                "phase": "triage",
+                "message": "Triaging…",
+            }) + "\n"
+
+            triage_start_time = time.perf_counter()
+            # yield from (not a plain call) - triage_single_dataset_question
+            # is a generator that yields live "retrying" NDJSON lines
+            # whenever its own internal retry loop actually fires (key
+            # rotation or a transient-error wait) - forwarded here exactly
+            # like dataset-group mode's own `yield from
+            # triage_all_mode_question(...)` above, so a slow/rate-limited
+            # Call 1 gets the same live feedback Call 2's own retry loop
+            # below already gives. client.js needs no changes for this -
+            # 'retrying' is already handled generically regardless of which
+            # server-side call produced it.
+            triage_result = yield from triage_single_dataset_question(
+                triage_schema_block, prompt, provider, client, llm_model, history=history,
+                api_key=api_key, using_byok=bool(byok_key),
+            )
+            triage_duration = round(1000 * (time.perf_counter() - triage_start_time))
+            triage_usage = dict(triage_result.get("usage") or {})
+
+            # Adds Call 1's own token usage on top of whatever Call 2 (if
+            # it runs at all) separately reports, for the ONE combined
+            # {input,output,total,thinking,cached_content}_tokens total
+            # this turn's own single record_translation row/'done' response
+            # report - unlike dataset-group mode's own Phase A/Phase B
+            # split (which logs two SEPARATE translations-table rows, one
+            # per phase, via its own dedicated record_all_databases_triage
+            # - see that call site above), single-dataset mode has always
+            # logged exactly one row per turn, and this redesign doesn't
+            # change that invariant - it only makes that one row's token
+            # counts honest about BOTH LLM calls that made up the turn,
+            # instead of silently dropping Call 1's own contribution the
+            # moment Call 2 runs and its own usage dict would otherwise
+            # just overwrite this variable outright.
+            def _combined_usage(other_usage):
+                other_usage = other_usage or {}
+                return {
+                    k: (triage_usage.get(k) or 0) + (other_usage.get(k) or 0)
+                    for k in ("input_tokens", "output_tokens", "total_tokens",
+                              "thinking_tokens", "cached_content_tokens")
+                }
+
+            # Outcomes 1-3 (general/schema/help) are each a COMPLETE,
+            # self-contained turn on their own - Call 2 never runs for any
+            # of them, satisfying the "skip the follow-up summarization
+            # step unless Call 2 actually ran" requirement this redesign
+            # was also asked to meet: client.js's executeSql() (the one
+            # thing that ever triggers /api/summarize-result) is only
+            # reached from its own final `else` branch, i.e. only when
+            # `sql` is neither an OPEN HELP POPUP/OPEN SCHEMA VIEWER/
+            # '*** NO SQL ***' reply nor empty - exactly the shape only
+            # Call 2's own real-SQL outcome below ever produces. Each of
+            # these three branches reuses the EXACT marker strings client.js
+            # already string-matches on (see this module's own docstring on
+            # why that makes this a zero-client-changes redesign), built
+            # here server-side now instead of by the model itself - there
+            # is no more risk of a model spuriously emitting (or forgetting)
+            # one of these, since Call 1 only ever chooses among four fixed
+            # JSON "action" values, never free-form marker text.
+            if triage_result["outcome"] in ("general", "schema", "help", "failed"):
+                if triage_result["outcome"] == "general":
+                    generated_sql = "*** NO SQL *** " + triage_result["answer"]
+                elif triage_result["outcome"] == "schema":
+                    generated_sql = "*** NO SQL *** OPEN SCHEMA VIEWER ***"
+                elif triage_result["outcome"] == "help":
+                    generated_sql = "*** NO SQL *** OPEN HELP POPUP ***"
+                else:
+                    # Call 1 itself couldn't produce anything usable after
+                    # its own bounded retry - deliberately NOT a fallback
+                    # guess at "general"/"schema"/"help"/"sql": a wrong
+                    # guess here could mean silently running real SQL the
+                    # user never actually asked for. WHICH apology depends
+                    # on WHY it failed - same "api_error" distinction (and
+                    # the same format_llm_error_for_user()/_TRIAGE_FAILURE_
+                    # TEXT choice between them) as dataset-group mode's own
+                    # triage failure handling above; see triage_single_
+                    # dataset_question's docstring for what "api_error"
+                    # means here.
+                    if triage_result.get("api_error"):
+                        generated_sql = "*** NO SQL *** " + format_llm_error_for_user(
+                            provider, llm_model, triage_result["error"], using_byok=bool(byok_key)
+                        )
+                    else:
+                        generated_sql = _TRIAGE_FAILURE_TEXT
+
+                input_tokens = triage_usage.get("input_tokens", 0)
+                output_tokens = triage_usage.get("output_tokens", 0)
+                total_tokens = triage_usage.get("total_tokens", 0)
+                thinking_tokens = triage_usage.get("thinking_tokens", 0)
+                cached_content_tokens = triage_usage.get("cached_content_tokens", 0)
+                # Call 1 (triage) is deliberately NEVER recorded in the
+                # translations-table history/stats - only calls that take a
+                # prompt and generate real SQL are (Call 2 below) - triage
+                # and summarization calls aren't useful there and would
+                # just pollute the stats.
+                yield json.dumps({
+                    'status': 'done',
+                    'success': True,
+                    'sql': generated_sql,
+                    'input_tokens': input_tokens,
+                    'output_tokens': output_tokens,
+                    'total_tokens': total_tokens,
+                    'thinking_tokens': thinking_tokens,
+                    'cached_content_tokens': cached_content_tokens,
+                    'duration': triage_duration,
+                }) + "\n"
+                return
+
+            # triage_result["outcome"] == "sql" from here on - Call 1
+            # decided this prompt genuinely needs real SQL generated
+            # against real data, so (and only so) this now pays for the
+            # full DEEP schema fetch (unlike Call 1's own cheap shallow
+            # fetch above) and runs Call 2.
+            #
+            # Call 1 (triage) is deliberately NEVER recorded in the
+            # translations-table history/stats, even here where it decided
+            # real SQL is needed - only Call 2 (the actual SQL-generation
+            # call just below) gets its own row. Triage's own duration/
+            # usage is still folded into the CLIENT-facing 'done' response
+            # below (via _combined_usage) so the reported cost for the turn
+            # stays honest about both calls - only the DB row is
+            # triage-free now.
+            schema = get_llm_schema_text(conn_str, user_identity, force_refresh=force_schema_refresh)
+            system_instruction = dialect_intro + _SQL_GENERATION_FORMAT_RULES
             schema_block = f"Database Schema:\n{schema}\n\n"
 
             # Sequencing matters here for prompt-caching purposes: the schema
@@ -4308,7 +4863,7 @@ def translate_query():
             # schema -> history -> new prompt. build_llm_input() below is
             # where each provider decides exactly how (see LlmProvider.
             # build_llm_input's docstring and each subclass's own).
-            new_prompt_content = f"User Request: {prompt}\n\nSQL Query:"
+            new_prompt_content = f"User Request: {prompt}\n\nJSON response:"
 
             # Computed once, up front, off the user's own prompt - see
             # _no_sql_language_mismatch's docstring for the full picture.
@@ -4317,53 +4872,35 @@ def translate_query():
             # that threads this through.
             expected_language_code = _detect_language(prompt)
 
-            # The key-ROTATION retry budget (see LlmProvider.
-            # supports_key_rotation's docstring) - sized to how many keys
-            # are actually configured for a provider that supports it
-            # (Gemini today - see _classify_gemini_error's 429 case), or 1
-            # (meaning "already exhausted, since tried_llm_keys already has
-            # one key in it") for a provider that doesn't, making this
-            # branch of the retry loop below effectively unreachable for
-            # Claude/OpenAI, exactly as before this dispatch existed.
-            # tried_llm_keys already starts as {api_key} (set above, before
-            # this generator runs), so it's the natural running total of
-            # distinct keys tried. A "Bring Your Own Key" forces this down
-            # to 1 (already met by tried_llm_keys' own starting size), same
-            # reasoning as generate_sql_for_connection's own using_byok
-            # parameter - there's no second key of the user's own to
-            # rotate to, so this loop's rotate_key branch below is made
-            # unreachable exactly the same way it already is for a
-            # provider that doesn't support rotation at all.
-            key_pool_size = 1 if byok_key else provider.get_key_pool_size()
-
-            # Second of the two phase_status lines (see the module
-            # docstring above) - emitted once, right before the retry loop
-            # below makes its first attempt. This is the wait that's
-            # normally the longest one and the one the "just a spinner"
-            # complaint was really about; a "retrying" line (if any) will
-            # naturally overwrite this same banner once/if the loop below
-            # actually needs one.
+            # Third of this path's phase_status lines - emitted once, right
+            # before Call 2's own retry loop below makes its first attempt.
+            # This is the wait that's normally the longest one and the one
+            # the "just a spinner" complaint was really about; a "retrying"
+            # line (if any) will naturally overwrite this same banner
+            # once/if the loop below actually needs one.
             yield json.dumps({
                 "status": "phase_status",
                 "phase": "generating_sql",
-                "message": "Generating commands for the database…",
+                "message": "Generating SQL…",
             }) + "\n"
 
             start_time = time.perf_counter()
             generated_sql = ""
             usage_info = {}
             # Bounded 2-attempt outer loop, same "1 real attempt + 1
-            # corrective retry" budget _summarize_with_retry uses for the
-            # exact same reason (see its own docstring, and
-            # _no_sql_language_mismatch's) - closes the language-
-            # verification gap for THIS call's own free-text replies
-            # ('*** NO SQL ***' answers/help-popup/error text), which
-            # previously had only _COMMON_FORMAT_RULES' bare instruction
-            # and nothing checking whether the model actually followed it.
-            # Ordinary generated SQL (no '*** NO SQL ***' prefix) never
-            # enters the language-mismatch branch below at all - see
-            # _no_sql_language_mismatch's docstring for why that check is
-            # deliberately scoped to free text only.
+            # corrective retry" budget _summarize_with_retry/triage_single_
+            # dataset_question use for the exact same reason - covers BOTH
+            # an unparseable JSON response (new - Call 2's own response is
+            # now JSON-enveloped, see _parse_sql_generation_response) and a
+            # language mismatch on a "cannot_answer_reason" reply (the
+            # closest surviving equivalent of the old design's '*** NO SQL
+            # ***' free-text replies), sharing the same 2-attempt budget
+            # exactly like triage_all_mode_question's own outer loop treats
+            # its own "unparseable" and "wrong language" cases as one
+            # shared budget rather than two independent ones. Ordinary
+            # generated SQL never enters either retry branch below at all -
+            # see _no_sql_language_mismatch's docstring for why that check
+            # is deliberately scoped to free text only.
             for language_attempt in range(2):
                 llm_input = provider.build_llm_input(history, schema_block, new_prompt_content)
                 # transient_attempt tracks the SHARED, both-providers budget
@@ -4377,10 +4914,11 @@ def translate_query():
                 # tried_llm_keys/gemini_key_pool_size, so a run of 429s
                 # doesn't eat into this counter at all, and vice versa.
                 transient_attempt = 1
+                raw_response = ""
                 try:
                     while True:
                         try:
-                            generated_sql, usage_info = provider.call(client, llm_model, llm_input, system_instruction)
+                            raw_response, usage_info = provider.call(client, llm_model, llm_input, system_instruction)
                             break
                         except Exception as e:
                             retry_action = provider.classify_error(e)
@@ -4459,18 +4997,27 @@ def translate_query():
                     # so, same as a successful later-attempt call, it already
                     # includes every attempt's own call time plus every
                     # inter-attempt wait/rotation (transient AND, now,
-                    # language-driven), and nothing from before the loop
-                    # (schema fetch, prompt building) or after it - i.e. only
-                    # time actually spent waiting on the LLM.
-                    duration = round(1000 * (time.perf_counter() - start_time))
+                    # language-driven) - plus triage_duration, Call 1's own
+                    # already-measured elapsed time, so this turn's one
+                    # reported duration honestly covers BOTH LLM calls, not
+                    # just Call 2's own share of it.
+                    call2_duration = round(1000 * (time.perf_counter() - start_time))
                     error_message = str(e)
-                    # No usage_info was ever populated (it's only ever assigned
-                    # on a successful provider.call() return above), so every
-                    # token count here is a real, honest 0 - not a placeholder
-                    # standing in for tokens that were actually spent.
+                    # Call 2's own usage_info was never populated (it's only
+                    # ever assigned on a successful provider.call() return
+                    # above), so its own contribution here is a real, honest
+                    # 0 - not a placeholder standing in for tokens that were
+                    # actually spent. Logged as ITS OWN dedicated row here
+                    # (Call 1's own row, with Call 1's own real, non-zero
+                    # usage, was already logged separately right after
+                    # triage resolved to "sql" - see that record_translation
+                    # call above) - matching dataset-group mode's own "each
+                    # LLM call gets its own row" convention rather than
+                    # folding both calls' usage into one combined row the
+                    # way this turn used to.
                     record_translation(
-                        user_identity, conn_str, prompt, f"TRANSLATION_ERROR ({error_message})", llm_model, duration,
-                        0, 0, 0, 0, 0,
+                        user_identity, conn_str, prompt, f"TRANSLATION_ERROR ({error_message})", llm_model,
+                        call2_duration, 0, 0, 0, 0, 0,
                     )
                     yield json.dumps({
                         'status': 'done',
@@ -4479,90 +5026,147 @@ def translate_query():
                     }) + "\n"
                     return
 
-                if generated_sql.startswith("```"):
-                    lines = generated_sql.splitlines()
-                    if lines[0].startswith("```"):
-                        lines = lines[1:]
-                    if lines and lines[-1].startswith("```"):
-                        lines = lines[:-1]
-                    generated_sql = "\n".join(lines).strip()
-
-                # Language verification - see _no_sql_language_mismatch's
-                # docstring for exactly what this does and doesn't cover.
-                # Only a '*** NO SQL ***' free-text reply is ever checked;
-                # plain generated SQL always falls straight through to
-                # `break` below, unchanged from before this loop existed.
-                stripped_sql = generated_sql.strip()
-                if _NO_SQL_PREFIX_RE.match(stripped_sql):
-                    free_text = _strip_no_sql_prefix(stripped_sql)
-                    actual_language_code = _no_sql_language_mismatch(free_text, expected_language_code)
-                    if actual_language_code is not None:
-                        expected_name = _describe_language(expected_language_code)
-                        actual_name = _describe_language(actual_language_code)
-                        if language_attempt + 1 < 2:
-                            logger.warning(
-                                "Translation free-text reply came back in %s instead of the prompt's own %s "
-                                "(attempt %d/2) - discarding, retrying with an explicit correction",
-                                actual_name, expected_name, language_attempt + 1,
-                            )
-                            # Same "name the mistake and the fix directly"
-                            # shape as _summarize_with_retry's own correction
-                            # addendum - simply re-asking with the identical
-                            # prompt would likely just reproduce the same
-                            # wrong-language answer, since whatever pulled
-                            # the model toward actual_name (usually
-                            # foreign-language schema/data in view) is still
-                            # there.
-                            new_prompt_content = (
-                                f"{new_prompt_content}\n\nCORRECTION: your previous free-text reply to this "
-                                f"exact request was written in {actual_name}, which is WRONG - the request was "
-                                f"in {expected_name}, so any free-text reply (not real generated SQL itself, "
-                                f"which is unaffected) must be written entirely in {expected_name}. Write your "
-                                f"full response again, from scratch, entirely in {expected_name} this time."
-                            )
-                            continue
-                        # The one corrective retry is exhausted and the
-                        # reply STILL came back in the wrong language -
-                        # mirrors _summarize_with_retry's own "never
-                        # knowingly serve a response in the wrong language"
-                        # guarantee: this turn fails outright (an honest,
-                        # specific error) rather than silently showing text
-                        # already confirmed to be in the wrong language.
+                parsed_generation = _parse_sql_generation_response(raw_response)
+                if parsed_generation is None:
+                    # Unparseable JSON - shares Call 2's own 2-attempt
+                    # budget (this loop's `language_attempt` counter) with
+                    # the language-mismatch case just below, rather than a
+                    # separate budget of its own - see this loop's own
+                    # section comment above.
+                    if language_attempt + 1 < 2:
                         logger.warning(
-                            "Translation free-text reply still came back in %s instead of %s after "
-                            "retrying - failing this turn rather than serving a known-wrong-language response",
-                            actual_name, expected_name,
+                            "SQL-generation response could not be parsed as the required JSON object "
+                            "(attempt %d/2) - discarding, retrying with an explicit correction",
+                            language_attempt + 1,
                         )
-                        duration = round(1000 * (time.perf_counter() - start_time))
-                        error_message = (
-                            f"The response kept coming back in {actual_name} instead of {expected_name}, "
-                            f"even after retrying. Try rephrasing your question."
+                        new_prompt_content = (
+                            f"{new_prompt_content}\n\nCORRECTION: your previous response could not be parsed - "
+                            f"it must be ONLY a JSON object with exactly one of \"sql\"/\"cannot_answer_reason\" "
+                            f"populated, no markdown fences, no other text. Respond again, from scratch, in "
+                            f"that exact shape."
                         )
-                        # Unlike the LlmCallFailed path above, real usage WAS
-                        # spent (the call itself succeeded, twice) - logged
-                        # honestly rather than as 0s.
-                        record_translation(
-                            user_identity, conn_str, prompt, f"TRANSLATION_ERROR ({error_message})", llm_model,
-                            duration, usage_info.get("input_tokens", 0), usage_info.get("output_tokens", 0),
-                            usage_info.get("total_tokens", 0), usage_info.get("thinking_tokens", 0),
-                            usage_info.get("cached_content_tokens", 0),
+                        continue
+                    logger.warning(
+                        "SQL-generation response still unparseable after retrying - failing this turn"
+                    )
+                    # Call 2's OWN elapsed time - logged as its own
+                    # dedicated row below (Call 1's own row was already
+                    # logged separately above).
+                    call2_duration = round(1000 * (time.perf_counter() - start_time))
+                    error_message = (
+                        "I wasn't able to produce a usable response to your prompt, even after retrying. "
+                        "Try rephrasing your question."
+                    )
+                    # Real usage WAS spent by Call 2 itself (it succeeded,
+                    # twice) - logged honestly as ITS OWN row here, rather
+                    # than combined with Call 1's own already-logged usage
+                    # (see the new record_translation call right after
+                    # triage resolved to "sql", above) - matching dataset-
+                    # group mode's own "each LLM call gets its own row"
+                    # convention.
+                    record_translation(
+                        user_identity, conn_str, prompt, f"TRANSLATION_ERROR ({error_message})", llm_model,
+                        call2_duration, usage_info.get("input_tokens", 0), usage_info.get("output_tokens", 0),
+                        usage_info.get("total_tokens", 0), usage_info.get("thinking_tokens", 0),
+                        usage_info.get("cached_content_tokens", 0),
+                    )
+                    yield json.dumps({
+                        'status': 'done',
+                        'success': False,
+                        'error': error_message,
+                    }) + "\n"
+                    return
+
+                if parsed_generation["outcome"] == "sql":
+                    # Real SQL - never enters the language-mismatch check
+                    # below at all, unchanged from before this redesign.
+                    generated_sql = parsed_generation["sql"]
+                    break
+
+                # "cannot_answer" - the closest surviving equivalent of the
+                # old design's '*** NO SQL ***' free-text replies (Call 2's
+                # own structured escape hatch for "I can't confidently
+                # generate SQL for this, and here's why" - see
+                # _SQL_GENERATION_FORMAT_RULES). Language verification
+                # mirrors this path's own pre-redesign check exactly - see
+                # _no_sql_language_mismatch's docstring for what this does
+                # and doesn't cover - just reading the free text straight
+                # out of "reason" instead of stripping a marker off it.
+                free_text = parsed_generation["reason"]
+                actual_language_code = _no_sql_language_mismatch(free_text, expected_language_code)
+                if actual_language_code is not None:
+                    expected_name = _describe_language(expected_language_code)
+                    actual_name = _describe_language(actual_language_code)
+                    if language_attempt + 1 < 2:
+                        logger.warning(
+                            "Translation free-text reply came back in %s instead of the prompt's own %s "
+                            "(attempt %d/2) - discarding, retrying with an explicit correction",
+                            actual_name, expected_name, language_attempt + 1,
                         )
-                        yield json.dumps({
-                            'status': 'done',
-                            'success': False,
-                            'error': error_message,
-                        }) + "\n"
-                        return
+                        # Same "name the mistake and the fix directly"
+                        # shape as _summarize_with_retry's own correction
+                        # addendum - simply re-asking with the identical
+                        # prompt would likely just reproduce the same
+                        # wrong-language answer, since whatever pulled
+                        # the model toward actual_name (usually
+                        # foreign-language schema/data in view) is still
+                        # there.
+                        new_prompt_content = (
+                            f"{new_prompt_content}\n\nCORRECTION: your previous free-text reply to this "
+                            f"exact request was written in {actual_name}, which is WRONG - the request was "
+                            f"in {expected_name}, so \"cannot_answer_reason\" must be written entirely in "
+                            f"{expected_name} this time. Write your full response again, from scratch, "
+                            f"entirely in {expected_name} this time."
+                        )
+                        continue
+                    # The one corrective retry is exhausted and the
+                    # reply STILL came back in the wrong language -
+                    # mirrors _summarize_with_retry's own "never
+                    # knowingly serve a response in the wrong language"
+                    # guarantee: this turn fails outright (an honest,
+                    # specific error) rather than silently showing text
+                    # already confirmed to be in the wrong language.
+                    logger.warning(
+                        "Translation free-text reply still came back in %s instead of %s after "
+                        "retrying - failing this turn rather than serving a known-wrong-language response",
+                        actual_name, expected_name,
+                    )
+                    # Call 2's OWN elapsed time - same "its own dedicated
+                    # row" reasoning as the unparseable-response branch
+                    # above.
+                    call2_duration = round(1000 * (time.perf_counter() - start_time))
+                    error_message = (
+                        f"The response kept coming back in {actual_name} instead of {expected_name}, "
+                        f"even after retrying. Try rephrasing your question."
+                    )
+                    # Unlike the LlmCallFailed path above, real usage WAS
+                    # spent by Call 2 itself (it succeeded, twice) - logged
+                    # honestly as ITS OWN row here, same reasoning as the
+                    # unparseable-response branch just above.
+                    record_translation(
+                        user_identity, conn_str, prompt, f"TRANSLATION_ERROR ({error_message})", llm_model,
+                        call2_duration, usage_info.get("input_tokens", 0), usage_info.get("output_tokens", 0),
+                        usage_info.get("total_tokens", 0), usage_info.get("thinking_tokens", 0),
+                        usage_info.get("cached_content_tokens", 0),
+                    )
+                    yield json.dumps({
+                        'status': 'done',
+                        'success': False,
+                        'error': error_message,
+                    }) + "\n"
+                    return
+                generated_sql = "*** NO SQL *** " + free_text
                 break
             end_time = time.perf_counter()
 
-            duration = round(1000 * (end_time - start_time))
-            input_tokens = usage_info.get("input_tokens", 0)
-            output_tokens = usage_info.get("output_tokens", 0)
-            total_tokens = usage_info.get("total_tokens", 0)
-            thinking_tokens = usage_info.get("thinking_tokens", 0)
-            cached_content_tokens = usage_info.get("cached_content_tokens", 0)
-
+            # Call 2's OWN elapsed time/usage - logged as ITS OWN dedicated
+            # translations-table row (Call 1's own row, with Call 1's own
+            # duration/usage, was already logged separately above, right
+            # after triage resolved to "sql") - matching dataset-group
+            # mode's own "each LLM call gets its own row" convention
+            # instead of collapsing both calls into one combined-usage row
+            # the way this turn used to.
+            #
             # Anonymous visitors share a single per-session identity
             # (anonymous:<session_id>) rather than a real signed-in one, but
             # the translation is recorded the same way regardless - a
@@ -4572,7 +5176,28 @@ def translate_query():
             # as dead code once the History modal stopped showing it - see
             # chat_history_routes.py's module docstring for where that
             # modal's data actually comes from today).
-            record_translation(user_identity, conn_str, prompt, generated_sql, llm_model, duration, input_tokens, output_tokens, total_tokens, thinking_tokens, cached_content_tokens)
+            call2_duration = round(1000 * (end_time - start_time))
+            record_translation(
+                user_identity, conn_str, prompt, generated_sql, llm_model, call2_duration,
+                usage_info.get("input_tokens", 0), usage_info.get("output_tokens", 0),
+                usage_info.get("total_tokens", 0), usage_info.get("thinking_tokens", 0),
+                usage_info.get("cached_content_tokens", 0),
+            )
+
+            # The CLIENT still sees ONE combined total for the whole turn
+            # (both calls) in the 'done' response below - matching dataset-
+            # group mode's own precedent (its 'done' response's usage_info
+            # is Phase A + Phase B combined even though they're logged as
+            # separate translations-table rows) - this is purely about how
+            # this turn's usage is split across DB rows, not a change to
+            # what the client is told it cost.
+            duration = triage_duration + call2_duration
+            combined_usage = _combined_usage(usage_info)
+            input_tokens = combined_usage["input_tokens"]
+            output_tokens = combined_usage["output_tokens"]
+            total_tokens = combined_usage["total_tokens"]
+            thinking_tokens = combined_usage["thinking_tokens"]
+            cached_content_tokens = combined_usage["cached_content_tokens"]
 
             yield json.dumps({
                 'status': 'done',

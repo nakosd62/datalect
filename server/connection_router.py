@@ -1,21 +1,27 @@
 """
 connection_router.py
 
-Phase A of "all databases" mode (see translate_routes.py's module
-docstring for Phase B, the real SQL generation, and Phase C,
-summarize_all_mode_results): triage_all_mode_question is a cheap, single
-LLM call that decides whether a natural-language question can be
-answered directly from the session's in-scope connections' names/dialects/
-table names alone (see db.py's resolve_in_scope_descriptors), or genuinely
-needs real data from one or more specific connections - and if so, which
-ones - before any full, column-level schema is ever fetched or sent to
-the model.
+Home of the app's unified triage call (run_triage_call): Call 1 for BOTH
+single-dataset mode (translate_routes.py's triage_single_dataset_question,
+now a thin num_candidates=1 wrapper around this module's run_triage_call)
+and Phase A of "all databases"/group mode (called directly from
+translate_routes.py's router_only_group_mode branch, with num_candidates
+== the number of in-scope connections). See run_triage_call's own
+docstring for the full picture and for why this used to be two separate,
+substantially duplicated implementations (this module's own
+triage_all_mode_question plus translate_routes.py's
+triage_single_dataset_question) before this merge.
 
-Only runs at all when a session's in_scope_mode is "all" -
-translate_routes.py's single-connection path never imports or calls this
-module, so an existing single-connection session's behavior/cost/latency
-is completely unaffected by this feature's existence (see this module's
-tests in tests/server/test_connection_router.py for the regression guard).
+Group mode's own half of this - deciding whether a natural-language
+question can be answered directly from the session's in-scope
+connections' names/dialects/table names alone (see db.py's
+resolve_in_scope_descriptors), or genuinely needs real data from one or
+more specific connections, and if so which ones - before any full,
+column-level schema is ever fetched or sent to the model - only runs at
+all when a session's in_scope_mode is "all". Single-dataset mode's own
+half runs for every other session, using this exact same retry-loop/
+parsing/key-rotation machinery with num_candidates fixed at 1 and no
+indices/database_prompts/message to resolve.
 
 Deliberately reuses the SAME LlmProvider/client/model translate_routes.py
 already built for the main SQL-generation call, rather than a separate
@@ -24,17 +30,11 @@ for why (picking connections and generating dialect-correct SQL are
 different-difficulty tasks best kept as two calls, but there's no
 standalone cheap model configured for the first one, so it just borrows
 whichever provider/model the session is already using). This means
-triage_all_mode_question is a second call against the same client/API
-key translate_routes.py already picked for the main generation call -
-though it DOES run its own retry loop against that key pool (key
-rotation on a 429, wait-and-retry on a transient 5xx/timeout, see
-triage_all_mode_question's docstring) rather than deferring retry
-entirely to the caller: a bare "catch everything, retry the same key
-twice, give up" loop used to live here instead, which meant a capacity/
-rate-limit failure was retried uselessly (same key, doomed to fail the
-same way again) and then reported back indistinguishably from "the model
-gave an unparseable response" - see translate_routes.py's
-format_llm_error_for_user for the user-facing half of that fix.
+run_triage_call is a second call against the same client/API key
+translate_routes.py already picked for the main generation call - though
+it DOES run its own retry loop against that key pool (key rotation on a
+429, wait-and-retry on a transient 5xx/timeout, see run_triage_call's
+docstring) rather than deferring retry entirely to the caller.
 """
 
 import json
@@ -53,21 +53,19 @@ from language_detect import detect_language, describe_language
 # How many of a session's in-scope connections a single question's Phase A
 # routing may ever select at once - the same MAX_IN_SCOPE_CONNECTIONS cap
 # config_routes.py applies to how many a user may mark in scope AT ALL
-# (see its docstring in app_config.py). These used to be two independent
-# constants (this module previously had its own, smaller
-# MAX_DATABASES_PER_QUERY, defaulting to 5) - now there is exactly one
-# "how many databases" knob, used everywhere the concept comes up.
+# (see its docstring in app_config.py). There is exactly one "how many
+# databases" knob, used everywhere the concept comes up.
+
 
 def _build_candidate_schema_block(candidate_summaries):
     """Renders `candidate_summaries` (name/dialect/table-list per in-scope
-    connection - see triage_all_mode_question's own docstring for exactly
-    what this is: names/dialects/table names only, no column-level detail)
-    into its own stable block - analogous to single-connection mode's
-    schema_block (translate_routes.py's generate_sql_for_connection builds
-    the identically-shaped f"Database Schema:\n{schema}\n\n") - meant to be
+    connection - see run_triage_call's own docstring for exactly what this
+    is: names/dialects/table names only, no column-level detail) into its
+    own stable block - analogous to single-connection mode's schema_block
+    (translate_routes.py's generate_sql_for_connection builds the
+    identically-shaped f"Database Schema:\n{schema}\n\n") - meant to be
     passed to provider.build_llm_input() as ITS schema_block parameter
-    rather than folded into the ever-changing new-prompt text (see
-    _build_candidate_question_prompt below for that).
+    rather than folded into the ever-changing new-prompt text.
 
     This is what lets build_llm_input() place this block ahead of the
     history vector (see that function's own docstring on exactly where
@@ -75,15 +73,14 @@ def _build_candidate_schema_block(candidate_summaries):
     there is history, folded into the new prompt only when there isn't),
     matching the design's own LLM-1 input ordering: "<triage system
     instructions> : <summary database schema of all databases> : <history
-    vector> : <new user prompt>". Previously this text was concatenated
-    directly onto the new user prompt instead (see _build_candidate_
-    question_prompt's own docstring) - functionally the model saw the
-    exact same information either way, but a block that's genuinely
-    stable across a whole session (the same candidates' names/dialects/
-    tables, unchanged turn after turn) ended up re-sent every time as part
-    of the ONE string that changes on every single turn, instead of being
-    its own reusable, cache-friendly prefix - purely a caching-efficiency
-    fix, not a behavior change."""
+    vector> : <new user prompt>". Only ever built for the multi-candidate
+    (group-mode) call site - single-dataset mode builds its own schema
+    block from a plain shallow-schema TEXT dump instead (see
+    translate_routes.py's get_triage_schema_text) - run_triage_call itself
+    is agnostic to which convention produced the schema_block it's given;
+    see that function's own docstring for why unifying the two schema-
+    block-rendering conventions themselves was deliberately left out of
+    this merge."""
     lines = ["Candidate database connections:"]
     for i, c in enumerate(candidate_summaries):
         table_names = c.get("table_names") or []
@@ -95,23 +92,15 @@ def _build_candidate_schema_block(candidate_summaries):
     return "\n".join(lines) + "\n\n"
 
 
-def _build_candidate_question_prompt(user_question):
-    """The ever-changing half of triage's prompt - just the new question
-    itself, now that the stable candidate-summaries block above is built
-    (and placed) separately by _build_candidate_schema_block. See that
-    function's own docstring for why this split exists."""
-    return f"User question: {user_question}\n\nJSON array of relevant candidate indices:"
-
-
 def strip_markdown_fence(text):
     """Strips a leading/trailing markdown code fence (```/```json/etc.)
     from `text` if present, tolerating models that wrap their JSON despite
     being told not to. Returns the (possibly unchanged) stripped string.
-    Used by _parse_triage_response here, and by translate_routes.py's own
-    _clean_summary_response (Phase C's structured per-database summary
-    response) - public (no leading underscore) specifically so this
-    tolerance stays written in exactly one place across both callers
-    rather than being copied."""
+    Used by _extract_json_object here (as its first, cheapest candidate),
+    and by translate_routes.py's own _clean_summary_response (Phase C's
+    structured per-database summary response) - public (no leading
+    underscore) specifically so this tolerance stays written in exactly
+    one place across both callers rather than being copied."""
     cleaned = (text or "").strip()
     if cleaned.startswith("```"):
         lines = cleaned.splitlines()
@@ -123,6 +112,63 @@ def strip_markdown_fence(text):
     return cleaned
 
 
+# A ```-fenced block found ANYWHERE in a response (not just anchored to
+# the very start/end the way strip_markdown_fence's own check is) - used
+# by _extract_json_object's own "chatter around a fence" fallback below.
+_JSON_FENCE_RE = re.compile(r'```[ \t]*(?:json)?[ \t]*\r?\n(.*?)```', re.DOTALL | re.IGNORECASE)
+
+
+def _extract_json_object(text):
+    """Best-effort JSON-object extraction from a triage/SQL-generation
+    call's raw text response (every one of this app's JSON-enveloped
+    prompts asks for ONLY a bare JSON object, no fences, no other text) -
+    tolerating leading/trailing chatter and markdown-fence wrapping that a
+    naive strip_markdown_fence()-then-json.loads() sequence would fail on
+    (that only strips a fence anchored at the very start/end of the
+    string). Without this, a weak/local model that wraps its JSON in even
+    a single sentence of chatter (e.g. "Sure, here's the SQL you asked "
+    "for:\\n\\n```json\\n{...}\\n```\\n\\nLet me know if you need anything "
+    "else!") would fail to parse at all.
+
+    Returns the parsed dict, or None if nothing usable could be found.
+    Tried in order, each only attempted after the previous one fails to
+    yield a dict, so a well-behaved response never pays for the more
+    expensive fallback searches:
+      1. The whole (fence-stripped) text, as-is - the well-behaved case
+         every provider is expected to produce in practice.
+      2. The contents of a ```-fenced block found ANYWHERE in the text
+         (see _JSON_FENCE_RE) - a model that wraps its JSON in a sentence
+         or two of chatter before and/or after a fenced block.
+      3. The substring from the first '{' to the last '}' in the text - a
+         last-resort attempt at a model that emits chatter with no fence
+         at all, wrapped around (or before) a real JSON object.
+    Never raises. Used by _parse_single_dataset_triage_response and
+    _parse_multi_candidate_triage_response here, and by
+    translate_routes.py's own _parse_sql_generation_response (Call 2's own
+    parser, imported from here for the same reason strip_markdown_fence
+    already is)."""
+    if not text:
+        return None
+    candidates = [strip_markdown_fence(text)]
+    fence_match = _JSON_FENCE_RE.search(text)
+    if fence_match:
+        candidates.append(fence_match.group(1).strip())
+    first_brace = text.find('{')
+    last_brace = text.rfind('}')
+    if first_brace != -1 and last_brace > first_brace:
+        candidates.append(text[first_brace:last_brace + 1])
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
 def _clean_indices(raw_list, num_candidates, max_connections):
     """Dedupe/range-check/cap a raw (untrusted, model-supplied) list of
     candidate indices, preserving the model's own ranking (first
@@ -131,8 +177,8 @@ def _clean_indices(raw_list, num_candidates, max_connections):
     silently dropped, and the result is capped at `max_connections` (stops
     appending once reached, rather than truncating a longer valid list
     from the end). Returns [] if nothing survives - used by
-    _parse_triage_response so this validation only needs to be right in
-    one place."""
+    _parse_multi_candidate_triage_response so this validation only needs
+    to be right in one place."""
     seen = set()
     indices = []
     for item in raw_list or []:
@@ -149,116 +195,8 @@ def _clean_indices(raw_list, num_candidates, max_connections):
     return indices
 
 
-# =============================================================================
-# "All databases" mode triage: decides "answer" (table names/dialects alone
-# are enough - no real data access needed), "route" (generate and execute
-# real SQL against one or more specific connections), or "failed" (the LLM
-# call never produced anything usable, even after a bounded retry). On
-# total failure this returns "failed" rather than guessing a connection: a
-# wrong guess here would mean silently running real SQL against a database
-# the user never actually asked about, which is a materially worse failure
-# mode than a routing mistake would be for a read-only pick.
-# =============================================================================
-
-_TRIAGE_SYSTEM_INSTRUCTION = (
-    "You are a triage assistant for a natural-language-to-SQL app with more "
-    "than one database connection configured. You are given a list of "
-    "candidate database connections (each with a name, its SQL dialect, and "
-    "a sample of its table/tab names - NOT full column-level schema, and NOT "
-    "any actual data/rows) and a user's natural-language question. Decide "
-    "exactly one of two things:\n"
-    "1. \"answer\" - you can respond directly, using ONLY the connection "
-    "list above (names, dialects, table names) and your own general "
-    "knowledge, with NO need to look at any actual data/rows in any "
-    "database. Use this for questions like \"how many databases do I "
-    "have\", \"which database looks like it has sports data\", \"what "
-    "tables does the Sales database have\", or a general-knowledge "
-    "question unrelated to any database at all.\n"
-    "2. \"route\" - fulfilling the request requires actually operating on "
-    "real data in one or more of these connections - reading it (e.g. \"how "
-    "many customers do we have\", \"what were last month's top products\") "
-    "or adding/changing/removing it via INSERT/UPDATE/DELETE/DDL (e.g. "
-    "\"add a new customer\", \"delete last month's test orders\", \"create "
-    "a table for...\") - whichever the connection's database and the "
-    "connected user's own permissions allow; you are not restricted to "
-    "read-only questions. Pick which connection(s) are relevant, "
-    "most-relevant first (most questions need exactly ONE; only "
-    "include more than one when the question genuinely needs data from more "
-    "than one - there is no cross-database join, each is queried "
-    "independently). Never pick more than "
-    f"{MAX_IN_SCOPE_CONNECTIONS} connections.\n"
-    "For \"route\", ALSO rewrite the user's own question into a separate, "
-    "self-contained instruction for EACH connection you picked, in "
-    "\"database_prompts\" (a JSON object keyed by that connection's index as "
-    "a string). Each connection is queried completely independently, by a "
-    "SEPARATE call that only ever sees that ONE connection's own schema - it "
-    "never sees the original question, the other connection(s), or this "
-    "triage step at all - so the original wording is frequently wrong once "
-    "narrowed to just one connection: a question phrased across multiple "
-    "databases (\"give me data from 2 tables each from a different "
-    "database\", \"compare X in database A against Y in database B\") must "
-    "become a plain, single-database request for EACH one (e.g. \"give me "
-    "data from one table in this database\" for each; \"how many X\" / \"how "
-    "many Y\" split apart, one per relevant connection) - never an "
-    "instruction that itself still mentions needing more than one database, "
-    "since the connection being asked has no way to fulfill that. A question "
-    "that was already naturally single-database in scope (even when routed "
-    "to just one connection) can be rewritten as the same question, only "
-    "reworded if needed to drop any reference to picking/identifying WHICH "
-    "database (already decided here, not that connection's job to re-decide) "
-    "- e.g. \"how large is this database\" -> \"how large is this "
-    "database?\" is fine verbatim once only one connection is being asked. "
-    "Every index you put in \"indices\" needs its own entry here - do not "
-    "omit any.\n"
-    "Both \"answer\" and \"message\" below (never \"database_prompts\" - those "
-    "are internal, per-connection instructions the end user never sees) have "
-    "two parts. FIRST, a label line: a short (one to two word) section-"
-    "heading label meaning \"Triage\" - in English this label is literally "
-    "the single word \"Triage\", but you must instead write it TRANSLATED "
-    "into the SAME LANGUAGE as the user's own question below, with nothing "
-    "else on that line, followed by a blank line. SECOND, immediately after "
-    "that blank line, your actual response text, ALSO written in that same "
-    "language - e.g., if the question was in English: \"Triage\\n\\nChecking "
-    "Sales Postgres, since it has an orders table and the question asks "
-    "about recent purchases.\" Never stop after the label - the label by "
-    "itself, with nothing following it, is not a valid \"answer\"/\"message\" "
-    "value; the label is a UI section heading prepended to your response, "
-    "not a substitute for writing one. The label itself is plain text with "
-    "no markdown emphasis of your own around it.\n"
-    "Respond with ONLY a JSON object, no markdown fences, no other text:\n"
-    "- For outcome 1: {\"action\": \"answer\", \"answer\": \"<your direct "
-    "response, written for the end user in the same language as their "
-    "question, plain text, starting with the translated label line "
-    "described above>\"}\n"
-    "- For outcome 2: {\"action\": \"route\", \"indices\": [...0-based "
-    "candidate indices, most-relevant first...], \"message\": \"<starting "
-    "with the translated label line described above, then one to two "
-    "short sentences, for the end user, in the same language as their "
-    "question: name the real database name(s) "
-    "you're about to check, AND briefly explain WHY - what in the question "
-    "and/or in those databases' table names made them the relevant pick, "
-    "e.g. (for an English question) 'Triage\\n\\nChecking Sales Postgres, "
-    "since it has an orders table "
-    "and the question asks about recent purchases.' A message whose second "
-    "part only names the database(s) with no reason is NOT acceptable - "
-    "always include the brief why.>\", \"database_prompts\": {\"<index as a "
-    "string>\": \"<that connection's own self-contained rewritten "
-    "question - plain text, no \"Triage\" line, this one is never shown to "
-    "the end user>\", ...one entry per index in \"indices\"...}}\n"
-    "Refer to a connection ONLY by its real 'name' field, never by its "
-    "candidate index/bracket number (the '[0]', '[1]', etc. above is an "
-    "internal ordinal for this prompt only, meaningless to the user and "
-    "never to be repeated back to them) or any other internal id/label - "
-    "this applies inside \"database_prompts\" too: a rewritten question may "
-    "reference the target database by its real name if useful context, but "
-    "never by index/bracket number. If you genuinely cannot classify the "
-    "question at all, prefer \"route\" with your single best guess over "
-    "inventing a third response shape."
-)
-
-
 def _clean_database_prompts(raw, valid_indices):
-    """Validates a "route" response's untrusted "database_prompts" value
+    """Validates a "sql" response's untrusted "database_prompts" value
     against the (already-cleaned) `valid_indices` list, returning a plain
     {int_index: non_empty_prompt_str} dict covering only entries that
     actually check out - never raises, and never lets one bad entry throw
@@ -292,13 +230,14 @@ def _clean_database_prompts(raw, valid_indices):
 
 def is_label_only_response(text):
     """True when `text` is a known failure mode of the "<label line>
-    \\n\\n<body>" shape both _TRIAGE_SYSTEM_INSTRUCTION here and
-    translate_routes.py's _SUMMARY_SYSTEM_INSTRUCTION ask the model for (a
-    short section-heading label, written in the SAME LANGUAGE as the
-    user's own question - see those two prompts - followed by a blank
-    line, then the real response): the model wrote a leading line,
-    a blank line, and then stopped, leaving nothing (or only whitespace)
-    as the body. Also true for a genuinely empty/whitespace-only `text`.
+    \\n\\n<body>" shape both _MULTI_CANDIDATE_TRIAGE_SYSTEM_INSTRUCTION
+    here and translate_routes.py's _SUMMARY_SYSTEM_INSTRUCTION ask the
+    model for (a short section-heading label, written in the SAME
+    LANGUAGE as the user's own question - see those two prompts -
+    followed by a blank line, then the real response): the model wrote a
+    leading line, a blank line, and then stopped, leaving nothing (or only
+    whitespace) as the body. Also true for a genuinely empty/whitespace-
+    only `text`.
 
     Deliberately does NOT flag a response with no blank line at all as
     invalid - that's a plain, un-labeled answer (the model skipped the
@@ -312,7 +251,7 @@ def is_label_only_response(text):
     user's own question's language - see those two prompts), only
     whether whatever is there was followed by real content or not.
 
-    Used by triage_all_mode_question here and by translate_routes.py's
+    Used by run_triage_call here and by translate_routes.py's
     summarize_all_mode_results for the same reason. Both MUST call this
     on the response text before applying their own `.strip()` to it (see
     each call site) - a response that's just "<label>\\n\\n" with nothing
@@ -336,55 +275,292 @@ def is_label_only_response(text):
     return not parts[1].strip()
 
 
-def _parse_triage_response(text, num_candidates, max_connections):
-    """Parses the triage call's raw response text into exactly one of:
-      {"outcome": "answer", "answer": <non-empty str>}
-      {"outcome": "route", "indices": <non-empty list>, "message": <str|None>,
-       "database_prompts": {int_index: non_empty_str, ...}}
-      None  # unparseable, or doesn't fit either shape - caller retries
-    Never raises. Does NOT tolerate a bare JSON array or an object without
-    an "action" key - "action"/"route"/"answer" is this prompt's own
-    contract, not something to guess around. An "action": "route"
-    response whose indices are all invalid/out-of-range/empty after
-    _clean_indices is treated as a parse failure for this attempt (None),
-    not silently degraded to "answer" or a phantom empty routing - the
-    caller's bounded retry gets another chance instead.
+# =============================================================================
+# Single-dataset triage (num_candidates == 1): decides "general" (answerable
+# from general knowledge/conversation alone), "schema" (opens the Schema
+# Viewer), "help" (opens the Help modal), or "sql" (generate and execute
+# real SQL against this one dataset). Byte-identical prompt wording and
+# parsing to this module's pre-merge translate_routes.py counterpart - see
+# run_triage_call's own docstring for why keeping this branch unchanged
+# mattered.
+# =============================================================================
 
-    "database_prompts" is validated leniently, never as a reason to retry
-    the whole attempt (see _clean_database_prompts) - a missing/malformed
-    rewrite for one or every connection just means Phase B falls back to
-    the user's own original question for that connection (today's
-    original behavior, before this field existed), not a failed triage
-    attempt. The routing decision itself (which connections, and the
-    user-facing "message") is still useful even when the model forgot or
-    botched the per-connection rewrites."""
-    if not text:
-        return None
-    cleaned = strip_markdown_fence(text)
-    try:
-        parsed = json.loads(cleaned)
-    except Exception:
-        return None
+_SINGLE_DATASET_TRIAGE_SYSTEM_INSTRUCTION = (
+    "You are a triage assistant for a natural-language-to-SQL app. You are "
+    "given an overview of ONE already-selected database/dataset (its "
+    "dialect and table/tab names - NOT full column-level detail, and NOT "
+    "any actual data/rows), the past chat interactions for this "
+    "conversation, and the user's newest natural-language prompt. Decide "
+    "exactly one of four things:\n"
+    "1. \"general\" - the prompt can be answered directly from your own "
+    "general-purpose training and/or the ordinary conversation so far, "
+    "with NO need to look at any actual data/rows in this dataset and NO "
+    "need to generate SQL at all - e.g. a general-knowledge question "
+    "unrelated to this dataset (\"who is the president of the US\"), small "
+    "talk, or a follow-up about something already said earlier in this "
+    "conversation. If a user asks who you are or what model you are "
+    "using, hide this behind a generic response rather than naming a "
+    "specific vendor/model - this still counts as \"general\". Provide "
+    "your actual answer in \"answer\" (see below).\n"
+    "2. \"schema\" - the prompt is asking about the dataset/schema itself "
+    "rather than requesting actual data - e.g. \"what is in here?\", \"what "
+    "does this dataset hold?\", \"what data do you have?\", \"what tables/"
+    "columns are available?\" - OR is asking what kinds of questions could "
+    "even be asked about this dataset - e.g. \"what can I ask about this "
+    "dataset?\", \"what are some interesting questions to ask?\". This app "
+    "has a dedicated Schema Viewer the user can open instead of reading a "
+    "text/ASCII description of it - it already shows an overview, an ER "
+    "diagram, and a list of suggested example questions for this exact "
+    "dataset, so never attempt to describe the schema or suggest questions "
+    "yourself under this outcome.\n"
+    "3. \"help\" - the prompt is about this app itself (how to use it, "
+    "what it can do), not about the dataset or its data at all.\n"
+    "4. \"sql\" - fulfilling the request requires actually operating on "
+    "real data in this dataset - reading it (e.g. \"how many customers do "
+    "we have\", \"what were last month's top products\") or adding/"
+    "changing/removing it via INSERT/UPDATE/DELETE/DDL (e.g. \"add a new "
+    "customer\", \"delete last month's test orders\", \"create a table "
+    "for...\"), whichever this dataset's dialect and the connected user's "
+    "own permissions allow - you are not restricted to read-only "
+    "questions. This is also the correct choice whenever you're genuinely "
+    "unsure which of the four outcomes applies: a later, dedicated SQL-"
+    "generation step still has its own way of saying \"I can't confidently "
+    "answer this\" (with a real, specific reason) when it turns out real "
+    "data access wasn't actually possible - prefer this outcome over "
+    "guessing \"general\" and risking an answer that looks like it came "
+    "from real data but didn't.\n"
+    "\"answer\" (outcome 1 only) must be written for the end user, in the "
+    "SAME LANGUAGE as the user's own newest prompt below, regardless of "
+    "the language used in the dataset's table/column names or earlier "
+    "chat history - plain text, no markdown fences.\n"
+    "Respond with ONLY a JSON object, no markdown fences, no other text:\n"
+    "- For outcome 1: {\"action\": \"general\", \"answer\": \"<your direct "
+    "response, written for the end user as described above>\"}\n"
+    "- For outcome 2: {\"action\": \"schema\"}\n"
+    "- For outcome 3: {\"action\": \"help\"}\n"
+    "- For outcome 4: {\"action\": \"sql\"}\n"
+    "Outcomes 2, 3, and 4 need no other fields - the app itself handles "
+    "what happens next for those."
+)
+
+
+def _parse_single_dataset_triage_response(text):
+    """Parses a single-dataset triage call's raw response text
+    (_SINGLE_DATASET_TRIAGE_SYSTEM_INSTRUCTION) into exactly one of:
+      {"outcome": "general", "answer": <non-empty str>}
+      {"outcome": "schema"}
+      {"outcome": "help"}
+      {"outcome": "sql"}
+      None  # unparseable, or doesn't fit any of the four shapes - caller retries
+    Never raises. Mirrors _parse_multi_candidate_triage_response's own
+    "general"/"schema"/"help" handling exactly - same "action"-keyed JSON
+    contract and the same refusal to guess around a missing/unrecognized
+    "action" - just without any indices/message/database_prompts to
+    validate, since a single-dataset triage call has nothing to pick
+    between."""
+    parsed = _extract_json_object(text)
     if not isinstance(parsed, dict):
         return None
 
     action = parsed.get("action")
     action = action.strip().lower() if isinstance(action, str) else None
 
-    if action == "answer":
+    if action == "general":
         answer = parsed.get("answer")
-        if isinstance(answer, str) and answer.strip() and not is_label_only_response(answer):
-            return {"outcome": "answer", "answer": answer.strip()}
-        # Either missing/empty, JUST the translated label with no real
-        # answer after it, or missing the label/blank-line shape entirely -
-        # the "answer" outcome has no further step to fall back on (unlike
-        # "message" below, which the caller already has a fallback sentence
-        # for), so this is a parse failure like any other, giving the
-        # bounded retry loop another attempt instead of showing the user a
-        # bare label heading (or an un-labeled reply) with nothing under it.
+        if isinstance(answer, str) and answer.strip():
+            return {"outcome": "general", "answer": answer.strip()}
+        # Missing/empty "answer" - unlike "schema"/"help"/"sql" (which need
+        # no free text from the model at all), "general" has nothing to
+        # fall back on here, so this is a parse failure like any other,
+        # giving the bounded retry loop below another attempt rather than
+        # returning an empty answer to the user.
         return None
 
-    if action == "route":
+    if action in ("schema", "help", "sql"):
+        return {"outcome": action}
+
+    return None
+
+
+# =============================================================================
+# Multi-candidate triage (num_candidates > 1, i.e. dataset-group/"all
+# databases" mode): decides "general"/"schema"/"help" exactly like the
+# single-dataset case above, or "sql" - generate and execute real SQL
+# against one or more of the candidate connections. On total failure this
+# returns "failed" rather than guessing a connection: a wrong guess here
+# would mean silently running real SQL against a database the user never
+# actually asked about, which is a materially worse failure mode than a
+# routing mistake would be for a read-only pick.
+# =============================================================================
+
+_MULTI_CANDIDATE_TRIAGE_SYSTEM_INSTRUCTION = (
+    "You are a triage assistant for a natural-language-to-SQL app with more "
+    "than one database connection configured. You are given a list of "
+    "candidate database connections (each with a name, its SQL dialect, and "
+    "a sample of its table/tab names - NOT full column-level schema, and NOT "
+    "any actual data/rows), the past chat interactions for this "
+    "conversation, and the user's newest natural-language prompt. Decide "
+    "exactly one of four things:\n"
+    "1. \"general\" - the prompt can be answered directly from your own "
+    "general-purpose training, the connection list above (names, dialects, "
+    "table names), and/or the ordinary conversation so far, with NO need to "
+    "look at any actual data/rows in any database and NO need to generate "
+    "SQL at all - e.g. \"how many databases do I have\", \"which database "
+    "looks like it has sports data\", \"what tables does the Sales database "
+    "have\", a general-knowledge question unrelated to any database, or "
+    "small talk/a follow-up about something already said earlier in this "
+    "conversation. If a user asks who you are or what model you are using, "
+    "hide this behind a generic response rather than naming a specific "
+    "vendor/model - this still counts as \"general\". Provide your actual "
+    "answer in \"answer\" (see below).\n"
+    "2. \"schema\" - the prompt is asking to browse or see the schema/"
+    "structure of these datasets in detail, or is asking what kinds of "
+    "questions could even be asked about them - e.g. \"show me the schema\", "
+    "\"what can I ask about these databases?\", \"what are some interesting "
+    "questions to ask?\". This app has a dedicated Schema Viewer covering "
+    "every in-scope database at once; never attempt to describe the schema "
+    "or suggest questions yourself under this outcome - a plain question "
+    "about WHICH database has WHAT tables (answerable from the connection "
+    "list above alone, e.g. \"which database has an orders table\") is "
+    "\"general\", not this.\n"
+    "3. \"help\" - the prompt is about this app itself (how to use it, what "
+    "it can do), not about any dataset or its data at all.\n"
+    "4. \"sql\" - fulfilling the request requires actually operating on "
+    "real data in one or more of these connections - reading it (e.g. \"how "
+    "many customers do we have\", \"what were last month's top products\") "
+    "or adding/changing/removing it via INSERT/UPDATE/DELETE/DDL (e.g. "
+    "\"add a new customer\", \"delete last month's test orders\", \"create "
+    "a table for...\") - whichever the connection's database and the "
+    "connected user's own permissions allow; you are not restricted to "
+    "read-only questions. This is also the correct choice whenever you're "
+    "genuinely unsure which of the four outcomes applies. Pick which "
+    "connection(s) are relevant, most-relevant first (most questions need "
+    "exactly ONE; only include more than one when the question genuinely "
+    "needs data from more than one - there is no cross-database join, each "
+    "is queried independently). Never pick more than "
+    f"{MAX_IN_SCOPE_CONNECTIONS} connections.\n"
+    "For outcome 4, ALSO rewrite the user's own prompt into a separate, "
+    "self-contained instruction for EACH connection you picked, in "
+    "\"database_prompts\" (a JSON object keyed by that connection's index as "
+    "a string). Each connection is queried completely independently, by a "
+    "SEPARATE call that only ever sees that ONE connection's own schema - it "
+    "never sees the original prompt, the other connection(s), or this "
+    "triage step at all - so the original wording is frequently wrong once "
+    "narrowed to just one connection: a prompt phrased across multiple "
+    "databases (\"give me data from 2 tables each from a different "
+    "database\", \"compare X in database A against Y in database B\") must "
+    "become a plain, single-database request for EACH one (e.g. \"give me "
+    "data from one table in this database\" for each; \"how many X\" / \"how "
+    "many Y\" split apart, one per relevant connection) - never an "
+    "instruction that itself still mentions needing more than one database, "
+    "since the connection being asked has no way to fulfill that. A prompt "
+    "that was already naturally single-database in scope (even when routed "
+    "to just one connection) can be rewritten as the same prompt, only "
+    "reworded if needed to drop any reference to picking/identifying WHICH "
+    "database (already decided here, not that connection's job to re-decide) "
+    "- e.g. \"how large is this database\" -> \"how large is this "
+    "database?\" is fine verbatim once only one connection is being asked. "
+    "Every index you put in \"indices\" needs its own entry here - do not "
+    "omit any.\n"
+    "\"answer\" (outcome 1) and \"message\" (outcome 4, below - never "
+    "\"database_prompts\", those are internal, per-connection instructions "
+    "the end user never sees) both have two parts. FIRST, a label line: a "
+    "short (one to two word) section-heading label meaning \"Triage\" - in "
+    "English this label is literally the single word \"Triage\", but you "
+    "must instead write it TRANSLATED into the SAME LANGUAGE as the user's "
+    "own prompt below, with nothing else on that line, followed by a blank "
+    "line. SECOND, immediately after that blank line, your actual response "
+    "text, ALSO written in that same language - e.g., if the prompt was in "
+    "English: \"Triage\\n\\nChecking Sales Postgres, since it has an orders "
+    "table and the prompt asks about recent purchases.\" Never stop after "
+    "the label - the label by itself, with nothing following it, is not a "
+    "valid \"answer\"/\"message\" value; the label is a UI section heading "
+    "prepended to your response, not a substitute for writing one. The "
+    "label itself is plain text with no markdown emphasis of your own "
+    "around it.\n"
+    "Respond with ONLY a JSON object, no markdown fences, no other text:\n"
+    "- For outcome 1: {\"action\": \"general\", \"answer\": \"<your direct "
+    "response, starting with the translated label line described above>\"}\n"
+    "- For outcome 2: {\"action\": \"schema\"}\n"
+    "- For outcome 3: {\"action\": \"help\"}\n"
+    "- For outcome 4: {\"action\": \"sql\", \"indices\": [...0-based "
+    "candidate indices, most-relevant first...], \"message\": \"<starting "
+    "with the translated label line described above, then one to two "
+    "short sentences, for the end user: name the real database name(s) "
+    "you're about to check, AND briefly explain WHY - what in the prompt "
+    "and/or in those databases' table names made them the relevant pick, "
+    "e.g. (for an English prompt) 'Triage\\n\\nChecking Sales Postgres, "
+    "since it has an orders table and the prompt asks about recent "
+    "purchases.' A message whose second part only names the database(s) "
+    "with no reason is NOT acceptable - always include the brief why.>\", "
+    "\"database_prompts\": {\"<index as a string>\": \"<that connection's "
+    "own self-contained rewritten prompt - plain text, no \"Triage\" line, "
+    "this one is never shown to the end user>\", ...one entry per index in "
+    "\"indices\"...}}\n"
+    "Outcomes 2 and 3 need no other fields - the app itself handles what "
+    "happens next for those.\n"
+    "Refer to a connection ONLY by its real 'name' field, never by its "
+    "candidate index/bracket number (the '[0]', '[1]', etc. above is an "
+    "internal ordinal for this prompt only, meaningless to the user and "
+    "never to be repeated back to them) or any other internal id/label - "
+    "this applies inside \"database_prompts\" too: a rewritten prompt may "
+    "reference the target database by its real name if useful context, but "
+    "never by index/bracket number."
+)
+
+
+def _parse_multi_candidate_triage_response(text, num_candidates, max_connections):
+    """Parses a multi-candidate triage call's raw response text
+    (_MULTI_CANDIDATE_TRIAGE_SYSTEM_INSTRUCTION) into exactly one of:
+      {"outcome": "general", "answer": <non-empty str>}
+      {"outcome": "schema"}
+      {"outcome": "help"}
+      {"outcome": "sql", "indices": <non-empty list>, "message": <str|None>,
+       "database_prompts": {int_index: non_empty_str, ...}}
+      None  # unparseable, or doesn't fit any of the four shapes - caller retries
+    Never raises. Mirrors _parse_single_dataset_triage_response's own
+    "general"/"schema"/"help" handling exactly - this is genuinely the
+    same parser with one more outcome ("sql") needing the indices/message/
+    database_prompts validation this module's pre-merge triage_all_mode_
+    question/_parse_triage_response used to do for its own "route"
+    outcome. An "action": "sql" response whose indices are all invalid/
+    out-of-range/empty after _clean_indices is treated as a parse failure
+    for this attempt (None), not silently degraded to "general" or a
+    phantom empty routing - the caller's bounded retry gets another chance
+    instead.
+
+    "database_prompts" is validated leniently, never as a reason to retry
+    the whole attempt (see _clean_database_prompts) - a missing/malformed
+    rewrite for one or every connection just means Phase B falls back to
+    the user's own original question for that connection, not a failed
+    triage attempt. The routing decision itself (which connections, and
+    the user-facing "message") is still useful even when the model forgot
+    or botched the per-connection rewrites."""
+    parsed = _extract_json_object(text)
+    if not isinstance(parsed, dict):
+        return None
+
+    action = parsed.get("action")
+    action = action.strip().lower() if isinstance(action, str) else None
+
+    if action == "general":
+        answer = parsed.get("answer")
+        if isinstance(answer, str) and answer.strip() and not is_label_only_response(answer):
+            return {"outcome": "general", "answer": answer.strip()}
+        # Either missing/empty, JUST the translated label with no real
+        # answer after it, or missing the label/blank-line shape entirely -
+        # the "general" outcome has no further step to fall back on
+        # (unlike "message" below, which the caller already has a fallback
+        # sentence for), so this is a parse failure like any other, giving
+        # the bounded retry loop another attempt instead of showing the
+        # user a bare label heading (or an un-labeled reply) with nothing
+        # under it.
+        return None
+
+    if action in ("schema", "help"):
+        return {"outcome": action}
+
+    if action == "sql":
         indices = _clean_indices(parsed.get("indices"), num_candidates, max_connections)
         if not indices:
             return None
@@ -404,177 +580,164 @@ def _parse_triage_response(text, num_candidates, max_connections):
         # (translate_routes.py's stream_translation()) already builds a
         # translated-label fallback sentence for that case, so there's no
         # need to fail this whole attempt (and lose a valid routing
-        # decision) over a message-only omission the way the "answer"
+        # decision) over a message-only omission the way the "general"
         # outcome above must.
         if message is not None and message_is_label_only:
             message = None
         database_prompts = _clean_database_prompts(parsed.get("database_prompts"), indices)
         return {
-            "outcome": "route", "indices": indices, "message": message,
+            "outcome": "sql", "indices": indices, "message": message,
             "database_prompts": database_prompts,
         }
 
     return None
 
 
-def triage_all_mode_question(candidate_summaries, user_question, provider, client, model,
-                              history=None, max_connections=MAX_IN_SCOPE_CONNECTIONS,
-                              api_key=None, tried_keys=None, using_byok=False):
-    """"All databases" mode's first call: decides whether `user_question`
-    can be answered directly from `candidate_summaries` alone (names,
-    dialects, table names - no real data access), or genuinely needs real
-    data from one or more specific connections. Returns exactly one of:
-      {"outcome": "answer", "answer": <str>, "usage": <dict|None>}
-      {"outcome": "route", "indices": [...], "message": <str|None>,
-       "database_prompts": {int_index: str, ...}, "usage": <dict|None>}
-      {"outcome": "failed", "api_error": <bool>}
+def _build_triage_question_prompt(prompt):
+    """The ever-changing half of triage's prompt for BOTH single-dataset
+    and multi-candidate triage - just the new prompt itself, now that the
+    stable schema block (single-dataset mode's own overview text, or
+    multi-candidate mode's _build_candidate_schema_block) is built (and
+    placed) separately by the caller. One shared wording now, used
+    regardless of candidate count."""
+    return f"User Request: {prompt}\n\nJSON classification:"
 
-    "route"'s "database_prompts" is the model's own rewrite of
-    `user_question` into a separate, self-contained instruction per
-    selected connection (see _TRIAGE_SYSTEM_INSTRUCTION) - necessary
-    because Phase B's per-connection calls (translate_routes.py's
-    _run_phase_b_fanout) are each fully independent and only ever see ONE
-    connection's own schema, never the original question's full framing
-    or any other connection. Passing the verbatim original question
-    through unchanged breaks down the moment it was phrased across
-    multiple databases at once (e.g. "give me data from 2 tables each
-    from a different database") - each individual connection has no way
-    to fulfill an instruction that still talks about needing more than
-    one database, and fails outright. Keyed by index (not positionally
-    parallel to "indices") specifically so it can never desynchronize
-    from whichever indices survive _clean_indices' own deduping/capping -
-    see _clean_database_prompts. Missing an entry for some (or every)
-    selected index is tolerated, not a parse failure - the caller
-    (_run_phase_b_fanout) falls back to the original `user_question` for
-    any connection with no rewrite, exactly today's pre-existing
-    behavior.
 
-    `history` (the session's ordinary, already-trimmed conversation turns -
-    same shape/list stream_translation() already builds for the single-
-    connection path, see translate_routes.py's `history` variable) lets a
-    follow-up question resolve a reference from the PRIOR triage turn, e.g.
-    "which databases have sports data?" -> "Baseball (BigQuery)" -> "how
-    large is THIS database?" - without it, every triage call is answered in
-    total isolation and "this database" is unresolvable. This is
-    deliberately just the ordinary shared history, NOT the "different
-    history per database" case that's still out of scope: this call is a
-    single, non-per-database step (it only ever sees table names, never any
-    one connection's real data), so there's exactly one conversation thread
-    for it to consult, unlike Phase B's per-connection calls (see
-    translate_routes.py's _run_phase_b_fanout, which deliberately still
-    passes empty history to each - threading distinct per-database history
-    through THOSE remains the deferred, genuinely complex follow-up work).
-    None (the default) is treated as no history at all - today's original
-    behavior, unchanged for any caller that doesn't pass it.
+def run_triage_call(num_candidates, schema_block, prompt, provider, client, model,
+                     history=None, max_connections=MAX_IN_SCOPE_CONNECTIONS,
+                     api_key=None, tried_keys=None, using_byok=False):
+    """Unified triage call - Call 1 for BOTH single-dataset mode
+    (translate_routes.py's triage_single_dataset_question, a thin wrapper
+    around this function with num_candidates fixed at 1) and Phase A of
+    "all databases"/group mode (called directly from translate_routes.py's
+    router_only_group_mode branch, with num_candidates == the number of
+    in-scope connections). Previously these were two separate
+    implementations - _SINGLE_DATASET_TRIAGE_SYSTEM_INSTRUCTION/_parse_
+    single_dataset_triage_response/triage_single_dataset_question used to
+    live in translate_routes.py, and _TRIAGE_SYSTEM_INSTRUCTION/_parse_
+    triage_response/triage_all_mode_question here - genuinely duplicated
+    retry-loop, key-rotation, and language-verification machinery,
+    differing only in the prompt wording and in whether a "route"/"sql"
+    outcome also needed to pick which connection(s) to query. This
+    function merges them into ONE retry loop with exactly one behavioral
+    branch, decided purely by `num_candidates`:
+      num_candidates == 1: uses _SINGLE_DATASET_TRIAGE_SYSTEM_INSTRUCTION
+        and _parse_single_dataset_triage_response - byte-identical prompt
+        wording and parsing to single-dataset mode's own pre-merge
+        behavior, so this is a pure internal refactor for that caller, not
+        a behavior change (see triage_single_dataset_question's own
+        docstring: this keeps that function's entire existing test suite
+        passing unmodified).
+      num_candidates > 1: uses _MULTI_CANDIDATE_TRIAGE_SYSTEM_INSTRUCTION
+        and _parse_multi_candidate_triage_response - the "sql" outcome
+        additionally carries "indices"/"message"/"database_prompts", and
+        "general"/"sql" carry the translated two-part label-line
+        convention (see is_label_only_response's docstring) that only
+        ever made sense once there was genuinely more than one candidate
+        to explain a pick between. "schema"/"help" are NEW outcomes for
+        this caller - group mode previously had no way to resolve to
+        either; see translate_routes.py's router_only_group_mode branch
+        for what it now does with them (opens the group's own Schema
+        Viewer / Help modal, mirroring single-dataset mode's own handling
+        of the same two outcomes).
 
-    Bounded 2-attempt retry at getting a PARSEABLE response - unchanged
-    from before this docstring paragraph was updated. What DID change: an
-    exception raised by the LLM call itself, within either of those 2
-    attempts, is no longer treated identically to "the model replied with
-    unparseable text." It's now retried using the exact same policy as
-    every other LLM call in this app - provider.classify_error() (see
-    translate_routes.py's generate_sql_for_connection, which the retry
-    loop below mirrors byte-for-byte): a 429/capacity error rotates to a
-    different configured key and retries immediately (budget: one attempt
-    per configured key, provider.get_key_pool_size()); a transient
-    5xx/timeout waits TRANSLATION_RETRY_DELAY_SECONDS and retries the same
-    key (budget: MAX_TRANSLATION_ATTEMPTS); a non-retryable error ends
-    this call's attempt immediately, with no further retry at all.
-    Previously this loop caught EVERY exception the same way, never
-    rotated keys, and reported the exact same generic {"outcome":
-    "failed"} whether the LLM call itself failed (e.g. every configured
-    Gemini key was out of capacity) or the model just replied with
-    something unparseable - masking a resource-exhaustion/API condition
-    as if the model had simply been unable to understand the question.
+    Returns exactly one of:
+      {"outcome": "general", "answer": <str>, "usage": <dict|None>}
+      {"outcome": "schema", "usage": <dict|None>}
+      {"outcome": "help", "usage": <dict|None>}
+      {"outcome": "sql", "usage": <dict|None>}  # num_candidates == 1 only
+      {"outcome": "sql", "indices": [...], "message": <str|None>,
+       "database_prompts": {int_index: str, ...},
+       "usage": <dict|None>}  # num_candidates > 1 only
+      {"outcome": "failed", "api_error": <bool>, "error": <exception|None>}
 
-    GENERATOR, exactly like generate_sql_for_connection: every time either
-    retry branch below actually fires, this yields a fully wire-encoded
-    NDJSON progress line (`json.dumps({"status": "retrying", ...}) +
-    "\\n"`), in the identical shape stream_translation()'s own inline
-    single-connection retry loop and generate_sql_for_connection already
-    emit. The caller (stream_translation()'s router_only_all_mode branch)
-    forwards these live via `triage_result = yield from
-    triage_all_mode_question(...)` - the exact same idiom
-    _run_phase_b_fanout's `yield from generate_sql_for_connection(...)`
-    uses - so a transient error or key rotation DURING triage is no
-    longer invisible to the user the way it used to be: previously this
-    was the one LLM call in the whole "all databases" pipeline whose own
-    retry loop (below) could genuinely take several real seconds (a
-    TRANSLATION_RETRY_DELAY_SECONDS wait, possibly more than once) with
-    nothing on screen beyond the static "Deciding which databases to
-    contact…" phase_status line emitted once, before this call even
-    started - indistinguishable from a hang. client.js needs no changes
-    to already show this: 'retrying' is handled generically by its
-    existing dispatcher (the same showRetryStatus() the single-connection
-    generate-SQL path's own retry lines already trigger), regardless of
-    which server-side call actually produced the line. A caller with no
-    NDJSON stream to forward into (e.g. a unit test calling this function
-    directly) drains it via _drain_generation below, same as
-    _run_phase_b_fanout does for generate_sql_for_connection's own
-    progress lines when it has nowhere live to forward them either.
-    Returns (via `return`, capturable by `yield from`/_drain_generation)
-    the exact same result shape described above - converting this to a
-    generator changes nothing about what it ultimately produces, only
-    adds the ability to observe progress before that final value arrives.
+    `schema_block` is built by the CALLER using whichever convention its
+    own mode already uses (single-dataset mode's own plain overview-text
+    block via translate_routes.py's get_triage_schema_text, or multi-
+    candidate mode's _build_candidate_schema_block) - this function only
+    needs `num_candidates` itself (to bound/validate a "sql" outcome's
+    "indices", and to pick which of the two prompts/parsers above
+    applies), not the candidates' own contents, so unifying the two
+    different schema-block-rendering conventions themselves was
+    deliberately left out of this merge: a real difference in what each
+    mode already fetches/caches for its own schema summary (single-
+    dataset mode fetches a session-scoped shallow schema fresh, cheaply,
+    even on a cold cache; multi-candidate mode reads only whatever's
+    already cached from each connection's own deep-schema entry via
+    db.build_router_candidate_summaries, deliberately never triggering a
+    fetch of its own) - collapsing these into one shared representation
+    would have meant picking one of those two caching behaviors for both
+    modes, a real behavior change neither mode asked for.
 
-    The two are now distinguished via the "api_error" flag on a "failed"
-    outcome:
+    `history` (the session's ordinary, already-trimmed conversation turns)
+    lets a follow-up question resolve a reference from the PRIOR triage
+    turn, e.g. "which databases have sports data?" -> "Baseball (BigQuery)"
+    -> "how large is THIS database?" - without it, every triage call is
+    answered in total isolation and "this database"/"this dataset" is
+    unresolvable. None (the default) is treated as no history at all.
+
+    Bounded 2-attempt retry at getting a PARSEABLE, correctly-languaged
+    response. An exception raised by the LLM call itself, within either of
+    those 2 attempts, is retried using the same policy as every other LLM
+    call in this app - provider.classify_error() (mirrors translate_
+    routes.py's generate_sql_for_connection byte-for-byte): a 429/capacity
+    error rotates to a different configured key and retries immediately
+    (budget: one attempt per configured key, provider.get_key_pool_size());
+    a transient 5xx/timeout waits TRANSLATION_RETRY_DELAY_SECONDS and
+    retries the same key (budget: MAX_TRANSLATION_ATTEMPTS); a non-
+    retryable error ends this call's attempt immediately, with no further
+    retry at all.
+
+    GENERATOR: every time either retry branch below actually fires, this
+    yields a fully wire-encoded NDJSON progress line (`json.dumps({"status":
+    "retrying", ...}) + "\\n"`), in the identical shape stream_
+    translation()'s own inline single-connection retry loop and generate_
+    sql_for_connection already emit. The caller forwards these live via
+    `triage_result = yield from run_triage_call(...)` - client.js needs no
+    changes to already show this: 'retrying' is handled generically by its
+    existing dispatcher, regardless of which server-side call actually
+    produced the line. A caller with no NDJSON stream to forward into
+    (e.g. a unit test calling this function directly) drains it via
+    _drain_generation below.
+
+    The two failure reasons are distinguished via the "api_error" flag on
+    a "failed" outcome:
       api_error=True: the LLM call's own retry budget (key rotation
         and/or transient-error retries) was used up, or it hit a non-
         retryable API error outright - a real technical/capacity
-        problem, not a question-comprehension one. No fallback guess at
-        some candidate connection is made here either way: a wrong guess
-        would mean actually running real SQL against a database the user
-        never asked about.
+        problem, not a question-comprehension one. No fallback guess is
+        made here either way: a wrong guess would mean actually running
+        real SQL against a database the user never asked about (multi-
+        candidate mode) or treating an ambiguous prompt as answerable
+        when it might not be (single-dataset mode).
       api_error=False: every attempt got a real response back, but it
         was unparseable garbage both times - genuinely nothing more
         useful to try.
     A "failed" outcome also carries an "error" key: the raw exception the
-    LLM call finally failed with when api_error=True (guaranteed to be an
-    actual exception instance in that case - see the loop below, which
-    only ever sets api_error=True in the same breath as capturing the
-    exception that triggered it), or None when api_error=False (there is
-    no exception to report - the model responded twice, just not usably).
-    The caller (translate_routes.py's router_only_all_mode branch) shows
-    a different, honest message for the api_error=True case - built by
-    format_llm_error_for_user() there from this result's "error" key (the
-    raw exception the LLM call finally failed with - see that key's own
-    docstring just below) - instead of its fixed "wasn't able to produce
-    a usable response" apology (_TRIAGE_FAILURE_TEXT), which is reserved
-    for the genuinely-unparseable case.
+    LLM call finally failed with when api_error=True, or None when
+    api_error=False.
 
     `api_key`/`tried_keys` mirror generate_sql_for_connection's own
     parameters of the same name: both optional, defaulting to a freshly
-    picked key / a fresh single-key set when omitted (same "explicit, not
-    closed-over" reasoning applies as that function's docstring, even
-    though this call never runs in parallel across threads the way Phase
-    B's fan-out does - keeping the same shape avoids a third, subtly
-    different convention for the same idea). The caller
-    (translate_routes.py) passes its own already-picked `api_key` as the
-    starting point, so this doesn't burn a different key than the rest of
-    the request for no reason unless a rotation is actually needed.
+    picked key / a fresh single-key set when omitted. `using_byok`, like
+    generate_sql_for_connection's own parameter of the same name, forces
+    the key-rotation budget down to exactly 1 (there's no second key of
+    the user's own to rotate to)."""
+    single = num_candidates == 1
+    system_instruction = (
+        _SINGLE_DATASET_TRIAGE_SYSTEM_INSTRUCTION if single
+        else _MULTI_CANDIDATE_TRIAGE_SYSTEM_INSTRUCTION
+    )
 
-    `using_byok`, like generate_sql_for_connection's own parameter of the
-    same name, forces the key-rotation budget down to exactly 1 (there's
-    no second key of the user's own to rotate to). This function never
-    calls format_llm_error_for_user() itself (it returns the raw
-    exception via "error" instead - see above), so unlike that function
-    it has nothing else to do with the flag."""
     # Mutable - a language-mismatch retry (see below) appends a correction
-    # onto this exact string for the next attempt, same "rebuild the
-    # prompt content, not just re-ask unchanged" approach translate_routes.py's
-    # _summarize_with_retry/stream_translation() use for the identical gap.
-    question_prompt_content = _build_candidate_question_prompt(user_question)
-    schema_block = _build_candidate_schema_block(candidate_summaries)
+    # onto this exact string for the next attempt.
+    question_prompt_content = _build_triage_question_prompt(prompt)
 
-    # Computed once, up front, off the user's own question - see
-    # language_detect.detect_language's own docstring, and
-    # translate_routes.py's _no_sql_language_mismatch (this function's
-    # sibling fix for the exact same previously-unverified-instruction gap)
-    # for the fuller picture. None (detection unavailable or too
-    # low-confidence) disables the check below entirely, same as every
-    # other call site that threads this through.
-    expected_language_code = detect_language(user_question)
+    # Computed once, up front, off the user's own prompt - see
+    # language_detect.detect_language's own docstring. None (detection
+    # unavailable or too low-confidence) disables the check below
+    # entirely, same as every other call site that threads this through.
+    expected_language_code = detect_language(prompt)
 
     if api_key is None:
         api_key = provider.pick_api_key()
@@ -585,18 +748,12 @@ def triage_all_mode_question(candidate_summaries, user_question, provider, clien
     last_error = None
     api_error = False
     for attempt in range(2):
-        # Rebuilt every attempt (cheap - just string formatting) rather
-        # than once up front, so a language-mismatch retry's corrected
-        # question_prompt_content actually reaches the model - an
-        # unparseable-response retry rebuilds an unchanged llm_input here
-        # too, which is harmless (functionally identical to the old
-        # build-once behavior for that case).
         llm_input = provider.build_llm_input(history or [], schema_block, question_prompt_content)
         text = None
         transient_attempt = 1
         while True:
             try:
-                text, usage = provider.call(client, model, llm_input, _TRIAGE_SYSTEM_INSTRUCTION)
+                text, usage = provider.call(client, model, llm_input, system_instruction)
                 api_error = False
                 break
             except Exception as e:
@@ -616,13 +773,11 @@ def triage_all_mode_question(candidate_summaries, user_question, provider, clien
                         client = provider.make_client(api_key)
                     tried_keys.add(api_key)
                     logger.warning(
-                        "Connection triage call failed (%d/%d configured keys tried), rotating API key and retrying immediately: %s",
+                        "Triage call failed (%d/%d configured keys tried), rotating API key and retrying immediately: %s",
                         len(tried_keys), key_pool_size, e,
                     )
                     # Told to the client before continuing, same as
-                    # generate_sql_for_connection's identical line - see
-                    # this function's docstring for why this loop yields
-                    # at all now.
+                    # generate_sql_for_connection's identical line.
                     yield json.dumps({
                         "status": "retrying",
                         "attempt": len(tried_keys),
@@ -636,7 +791,7 @@ def triage_all_mode_question(candidate_summaries, user_question, provider, clien
                     api_error = True
                     break
                 logger.warning(
-                    "Connection triage call failed (attempt %d/%d), retrying in %ds: %s",
+                    "Triage call failed (attempt %d/%d), retrying in %ds: %s",
                     transient_attempt, MAX_TRANSLATION_ATTEMPTS, retry_action["delay"], e,
                 )
                 # Told to the client before sleeping, not after - same
@@ -661,19 +816,28 @@ def triage_all_mode_question(candidate_summaries, user_question, provider, clien
             # can't succeed right now.
             break
 
-        parsed = _parse_triage_response(text, len(candidate_summaries), max_connections)
+        parsed = (
+            _parse_single_dataset_triage_response(text) if single
+            else _parse_multi_candidate_triage_response(text, num_candidates, max_connections)
+        )
         if parsed is not None:
             # Language verification - mirrors translate_routes.py's
             # _no_sql_language_mismatch for triage's own free text:
-            # "answer" for outcome 1, "message" for outcome 2
-            # ("database_prompts" is internal, per-connection instructions
-            # the end user never sees - never checked here, see
-            # _TRIAGE_SYSTEM_INSTRUCTION). A "route" outcome's "message"
-            # being None (the model omitted it - _parse_triage_response
-            # already tolerates that) has no free text to check at all, so
-            # it's never flagged - the caller already has its own
-            # server-built fallback sentence for exactly that case.
-            free_text = parsed["answer"] if parsed["outcome"] == "answer" else parsed.get("message")
+            # "answer" for "general", "message" for a multi-candidate
+            # "sql" outcome ("database_prompts" is internal, per-
+            # connection instructions the end user never sees - never
+            # checked here). A "sql" outcome's "message" being None (the
+            # model omitted it - the parser already tolerates that) has no
+            # free text to check at all, so it's never flagged - the
+            # caller already has its own server-built fallback sentence
+            # for exactly that case. Single-dataset mode's own "sql"
+            # outcome never carries a "message" at all.
+            if parsed["outcome"] == "general":
+                free_text = parsed["answer"]
+            elif not single and parsed["outcome"] == "sql":
+                free_text = parsed.get("message")
+            else:
+                free_text = None
             actual_language_code = None
             if free_text and expected_language_code is not None:
                 detected = detect_language(free_text)
@@ -688,7 +852,7 @@ def triage_all_mode_question(candidate_summaries, user_question, provider, clien
             actual_name = describe_language(actual_language_code)
             if attempt + 1 < 2:
                 logger.warning(
-                    "Connection triage response came back in %s instead of the question's own %s "
+                    "Triage response came back in %s instead of the prompt's own %s "
                     "(attempt %d/2) - discarding, retrying with an explicit correction",
                     actual_name, expected_name, attempt + 1,
                 )
@@ -698,12 +862,10 @@ def triage_all_mode_question(candidate_summaries, user_question, provider, clien
                 # _summarize_with_retry's/stream_translation()'s own
                 # correction addendum - simply re-asking with the identical
                 # prompt would likely just reproduce the same wrong-
-                # language answer, since whatever pulled the model toward
-                # actual_name (usually foreign-language table/dialect names
-                # in the candidate list) is still there.
+                # language answer.
                 question_prompt_content = (
                     f"{question_prompt_content}\n\nCORRECTION: your previous response to this exact "
-                    f"question was written in {actual_name}, which is WRONG - the question was in "
+                    f"prompt was written in {actual_name}, which is WRONG - the prompt was in "
                     f"{expected_name}, so your \"answer\"/\"message\" free text must be written entirely "
                     f"in {expected_name} this time (this applies only to that free text - \"indices\"/"
                     f"\"database_prompts\" are unaffected). Write your full response again, from "
@@ -711,16 +873,12 @@ def triage_all_mode_question(candidate_summaries, user_question, provider, clien
                 )
                 continue
             # The one corrective retry is exhausted and the response STILL
-            # came back in the wrong language - mirrors
-            # _summarize_with_retry's/stream_translation()'s own "never
-            # knowingly serve a response in the wrong language" guarantee:
-            # counts as an overall triage failure (the caller's existing
-            # fixed apology text, api_error=False - same "genuinely nothing
-            # more useful to try" bucket the unparseable-both-times case
-            # already uses) rather than silently returning text already
+            # came back in the wrong language - counts as an overall
+            # triage failure (the caller's existing fixed apology text,
+            # api_error=False) rather than silently returning text already
             # confirmed to be in the wrong language.
             logger.warning(
-                "Connection triage response still came back in %s instead of %s after retrying - "
+                "Triage response still came back in %s instead of %s after retrying - "
                 "failing triage rather than serving a known-wrong-language response",
                 actual_name, expected_name,
             )
@@ -730,7 +888,7 @@ def triage_all_mode_question(candidate_summaries, user_question, provider, clien
         last_error = f"unparseable triage response: {text!r}"
         api_error = False
 
-    logger.warning("Connection triage (Phase A2, all-mode) failed after retry, no fallback: %s", last_error)
+    logger.warning("Triage failed after retry, no fallback: %s", last_error)
     return {
         "outcome": "failed",
         "api_error": api_error,
@@ -739,17 +897,17 @@ def triage_all_mode_question(candidate_summaries, user_question, provider, clien
 
 
 def _drain_generation(gen):
-    """Runs a triage_all_mode_question() generator to completion from a
-    plain (non-streaming) context, discarding every yielded 'retrying'
-    progress line and returning the final `return`ed result dict -
-    identical in shape and purpose to translate_routes.py's own
-    _drain_generation (which does the same thing for generate_sql_for_
-    connection/summarize_all_mode_results/summarize_single_connection_
-    results) - kept as a separate copy here rather than a shared import
-    since translate_routes.py already imports FROM this module and the
-    reverse import would be circular. Used by tests that call
-    triage_all_mode_question directly and want its plain result dict, not
-    a generator object to iterate themselves."""
+    """Runs a run_triage_call() generator to completion from a plain
+    (non-streaming) context, discarding every yielded 'retrying' progress
+    line and returning the final `return`ed result dict - identical in
+    shape and purpose to translate_routes.py's own _drain_generation
+    (which does the same thing for generate_sql_for_connection/
+    summarize_all_mode_results/summarize_single_connection_results) - kept
+    as a separate copy here rather than a shared import since translate_
+    routes.py already imports FROM this module and the reverse import
+    would be circular. Used by tests that call run_triage_call directly
+    and want its plain result dict, not a generator object to iterate
+    themselves."""
     try:
         while True:
             next(gen)

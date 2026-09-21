@@ -297,6 +297,67 @@ test.describe('translate + execute', () => {
     await expect.poll(() => currentSql(page)).toBe('');
   });
 
+  // The "OPEN HELP POPUP"/"OPEN SCHEMA VIEWER" marker conventions
+  // (client.js's isOpenHelp/isOpenSchema branches, just above the plain
+  // isNoSql branch the test above covers) had no e2e coverage at all
+  // before this pair of tests - discovered while reviewing this exact
+  // area for translate_routes.py's own two-call single-connection
+  // redesign (see that file's module-level section comment above
+  // _SINGLE_DATASET_TRIAGE_SYSTEM_INSTRUCTION): Call 1 now DECIDES the
+  // "schema"/"help" outcome via a JSON "action" field rather than a model
+  // free-typing one of these marker strings itself, but the server still
+  // constructs the exact same marker text for client.js to consume - so
+  // client.js's own handling of it is completely unchanged and, like the
+  // rest of this file, exercised here purely through mockTranslate()'s
+  // network-layer mock, independent of anything server-side.
+  test('an "OPEN HELP POPUP" reply opens the real Help modal instead of rendering as text', async ({ page }) => {
+    await mockTranslate(page, { sql: '*** NO SQL *** OPEN HELP POPUP ***' });
+    await gotoApp(page);
+
+    await page.locator('#aiPrompt').fill('how do I use this app?');
+    await page.locator('#aiPrompt').press('Enter');
+
+    await expect(page.locator('#helpModal')).not.toHaveClass(/hidden/);
+    // Never falls through to the plain NO-SQL text render alongside it.
+    await expect(page.locator('.response-text')).toHaveCount(0);
+    await expect.poll(() => currentSql(page)).toBe('');
+  });
+
+  test('an "OPEN SCHEMA VIEWER" reply opens the real Schema Viewer modal instead of rendering as text', async ({ page }) => {
+    await mockTranslate(page, { sql: '*** NO SQL *** OPEN SCHEMA VIEWER ***' });
+    // openSchemaViewer() (client.js) fetches the real Schema Viewer's own
+    // data source - mocked here the same minimal way schema-viewer.spec.js
+    // does for its own tests, since this spec only cares that client.js
+    // actually reaches the modal, not what the modal then renders from it.
+    await page.route('**/api/schema*', async (route) => {
+      if (route.request().method() !== 'GET') return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          kind: 'preset',
+          id: 'default',
+          name: 'Orders DB',
+          dialect: 'PostgreSQL',
+          truncated: false,
+          has_omitted_tables: false,
+          entries: [{ name: 'orders', heading: 'Table: orders', text: 'Table: orders\n  id integer NOT NULL' }],
+          cached_at: null,
+          overview: null,
+        }),
+      });
+    });
+    await gotoApp(page);
+
+    await page.locator('#aiPrompt').fill('what is in this dataset?');
+    await page.locator('#aiPrompt').press('Enter');
+
+    await expect(page.locator('#schemaViewerModal')).not.toHaveClass(/hidden/);
+    await expect(page.locator('.response-text')).toHaveCount(0);
+    await expect.poll(() => currentSql(page)).toBe('');
+  });
+
   // /api/translate normally streams newline-delimited JSON - zero or more
   // {"status": "retrying", ...} progress lines (rendered live at the top
   // of the results area - see client.js's showRetryStatus()/

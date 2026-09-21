@@ -372,10 +372,11 @@ class SheetsBackend(Backend):
         tab has no comparable catalog to source any of them from. So this
         IS the full get_schema_shallow()/get_schema() story for this
         backend; get_schema() below is a thin alias, not a separate deep
-        layer, and db.py's shallow/deep cache-key split just ends up
-        caching the identical text twice for a Sheets connection rather
-        than saving anything - a harmless no-op, not a bug, given there's
-        nothing cheaper to compute."""
+        layer. (db.py's all-dbs triage step - build_router_candidate_
+        summaries() - no longer calls get_schema_shallow() on any backend
+        at all, deep or otherwise; it derives its summary straight from
+        whatever deep entry is already cached, so this method's only real
+        caller today is get_schema() just below.)"""
         try:
             table = self._fetch(connection, f"select * limit {SHEETS_SCHEMA_SAMPLE_ROWS}")
         except Exception:

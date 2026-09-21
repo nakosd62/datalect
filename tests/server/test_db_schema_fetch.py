@@ -355,26 +355,45 @@ def test_invalidate_schema_cache_clears_both_deep_and_shallow_entries(app_factor
     assert fake.get_schema_shallow_calls == 2
 
 
-def test_build_router_candidate_summaries_fetches_shallow_not_deep(app_factory, monkeypatch):
-    # The whole reason get_database_schema() grew a `deep` parameter: an
-    # all-dbs question's triage step must not pay Phase 2's live-query
-    # cost for every in-scope connection - only the shallow (Phase 1)
-    # fetch should run here, regardless of how many connections were
-    # never actually selected for generation afterward.
+def test_build_router_candidate_summaries_reads_only_the_cached_deep_entry_no_live_fetch(
+        app_factory, monkeypatch):
+    # build_router_candidate_summaries() must NEVER connect to or query a
+    # real database - not even the cheaper Phase-1-only introspection.
+    # There used to be a genuinely separate, independently-fetched
+    # "shallow" cache entry just for this - removed because the deep text
+    # was always a superset of it anyway (see db.py's own docstring). Now
+    # this reads ONLY whatever deep entry is already sitting in
+    # schema_cache, in memory, and reduces it via
+    # extract_entry_names_from_schema_text - zero backend calls either way.
     app_factory()
     db_module, fake = _install_fake_backend(
-        monkeypatch, schema_text="Table: full_deep_table\n  id integer NOT NULL",
-        shallow_schema_text="Table: customers\n  id integer NOT NULL",
+        monkeypatch, schema_text="Table: customers\n  id integer NOT NULL",
     )
+    descriptor = {"type": "postgres", "url": "postgresql://u:p@host/db"}
+
+    # Nothing cached yet - degrades to an empty table list, still with no
+    # backend call of any kind.
+    summaries = db_module.build_router_candidate_summaries(
+        [{"name": "My DB", "descriptor": descriptor}], user_id=None,
+    )
+    assert summaries == [{"name": "My DB", "dialect": "SQL", "table_names": []}]
+    assert fake.get_schema_calls == 0
+    assert fake.get_schema_shallow_calls == 0
+
+    # Warm the deep cache the ordinary way (a ordinary generation call, or
+    # a prefetch/refresh would do this in real life) - now the SAME cached
+    # deep text is what triage's summary is derived from.
+    db_module.get_database_schema(descriptor)
+    assert fake.get_schema_calls == 1
 
     summaries = db_module.build_router_candidate_summaries(
-        [{"name": "My DB", "descriptor": {"type": "postgres", "url": "postgresql://u:p@host/db"}}],
-        user_id=None,
+        [{"name": "My DB", "descriptor": descriptor}], user_id=None,
     )
-
-    assert fake.get_schema_shallow_calls == 1
-    assert fake.get_schema_calls == 0
     assert summaries == [{"name": "My DB", "dialect": "SQL", "table_names": ["customers"]}]
+    # Still no shallow call, and no SECOND deep call either - this was a
+    # pure cache read, not a fetch of any kind.
+    assert fake.get_schema_shallow_calls == 0
+    assert fake.get_schema_calls == 1
 
 
 def test_invalidate_schema_cache_is_safe_when_nothing_was_cached(app_factory):
@@ -428,30 +447,31 @@ def test_force_refresh_replaces_the_cached_entry_which_then_stays_cached(app_fac
     assert fake.get_schema_calls == 2
 
 
-def test_prime_schema_cache_fetches_and_caches_both_deep_and_shallow_on_success(app_factory, monkeypatch):
+def test_prime_schema_cache_fetches_and_caches_the_deep_entry_on_success(app_factory, monkeypatch):
+    # prime_schema_cache() used to also force-fetch a second, independent
+    # "shallow" cache entry here - removed (see db.py's own docstring):
+    # build_router_candidate_summaries() no longer reads (or needs) any
+    # shallow entry at all, it derives its summary straight from this same
+    # deep entry, so there's nothing left for prime_schema_cache to warm
+    # besides the deep one.
     app_factory()
-    db_module, fake = _install_fake_backend(
-        monkeypatch, schema_text="DEEP TEXT", shallow_schema_text="SHALLOW TEXT",
-    )
+    db_module, fake = _install_fake_backend(monkeypatch, schema_text="DEEP TEXT")
     descriptor = {"type": "postgres", "url": "postgresql://u:p@host/db"}
 
     result = db_module.prime_schema_cache(descriptor)
 
     assert result is True
     assert fake.get_schema_calls == 1
-    assert fake.get_schema_shallow_calls == 1
-    # Both entries are now cached - a plain get_database_schema call for
-    # either afterward is served from cache, not re-fetched.
+    assert fake.get_schema_shallow_calls == 0
+    # The deep entry is now cached - a plain get_database_schema call
+    # afterward is served from cache, not re-fetched.
     assert db_module.get_database_schema(descriptor, deep=True) == "DEEP TEXT"
-    assert db_module.get_database_schema(descriptor, deep=False) == "SHALLOW TEXT"
     assert fake.get_schema_calls == 1
-    assert fake.get_schema_shallow_calls == 1
 
 
-def test_prime_schema_cache_returns_false_and_skips_shallow_when_deep_fails(app_factory, monkeypatch):
-    # If the user-visible (deep) fetch fails, there's no point also paying
-    # for a shallow fetch - and the caller (the refresh endpoint, or
-    # startup prefetch) must be able to tell it failed.
+def test_prime_schema_cache_returns_false_when_deep_fetch_fails(app_factory, monkeypatch):
+    # The caller (the refresh endpoint, or startup prefetch) must be able
+    # to tell a failed fetch failed.
     app_factory()
     db_module, fake = _install_fake_backend(monkeypatch, schema_text=None)
     descriptor = {"type": "postgres", "url": "postgresql://u:p@host/db"}
@@ -568,14 +588,15 @@ def test_prime_schema_cache_always_force_refreshes(app_factory, monkeypatch):
     descriptor = {"type": "postgres", "url": "postgresql://u:p@host/db"}
 
     db_module.get_database_schema(descriptor, deep=True)
-    db_module.get_database_schema(descriptor, deep=False)
     assert fake.get_schema_calls == 1
-    assert fake.get_schema_shallow_calls == 1
 
     db_module.prime_schema_cache(descriptor)
 
     assert fake.get_schema_calls == 2
-    assert fake.get_schema_shallow_calls == 2
+    # prime_schema_cache only ever force-fetches the deep entry now - see
+    # this function's own docstring on the removed independent shallow
+    # fetch.
+    assert fake.get_schema_shallow_calls == 0
 
 
 def test_prefetch_all_preset_schemas_calls_prime_schema_cache_once_per_preset(app_factory, monkeypatch, tmp_path):
@@ -637,8 +658,11 @@ def test_prefetch_all_preset_schemas_skips_live_fetch_when_a_durable_copy_alread
     # (plus the schema-overview LLM call) all over again - see this
     # function's own docstring. Simulates that exact scenario: nothing in
     # THIS process's own memory yet (a fresh process, like right after a
-    # restart), but a durable store that already has both the deep AND
-    # shallow entries from an earlier process lifetime.
+    # restart), but a durable store that already has the deep entry from
+    # an earlier process lifetime. (There used to also be a separate
+    # "shallow" entry this function warmed here too - removed along with
+    # the independent shallow fetch/cache it existed to serve; see this
+    # function's own docstring.)
     from helpers import write_database_presets_file
     presets_path = write_database_presets_file(tmp_path, [
         {"id": "pg-a", "name": "Postgres A", "type": "postgres", "url": "postgresql://u:p@h/a"},
@@ -648,7 +672,6 @@ def test_prefetch_all_preset_schemas_skips_live_fetch_when_a_durable_copy_alread
 
     descriptor = {"type": "postgres", "url": "postgresql://u:p@h/a"}
     cache_key = db_module.get_conn_identifier(descriptor)
-    shallow_key = cache_key + db_module._SHALLOW_CACHE_KEY_SUFFIX
 
     class _FakeDurableStore:
         def __init__(self, rows):
@@ -668,7 +691,6 @@ def test_prefetch_all_preset_schemas_skips_live_fetch_when_a_durable_copy_alread
 
     durable = _FakeDurableStore({
         cache_key: {"schema_text": "DURABLE DEEP TEXT", "cached_at": "2026-01-01T00:00:00+00:00", "overview": None},
-        shallow_key: {"schema_text": "DURABLE SHALLOW TEXT", "cached_at": "2026-01-01T00:00:00+00:00", "overview": None},
     })
     monkeypatch.setattr(db_module.schema_cache, "_state_store", lambda: durable)
 
@@ -681,11 +703,7 @@ def test_prefetch_all_preset_schemas_skips_live_fetch_when_a_durable_copy_alread
     db_module.prefetch_all_preset_schemas()
 
     assert calls == []  # no live fetch, no LLM overview call, at all
-    # Both entries are now warm in THIS process's own memory, read through
-    # from the durable store - proving the "also warms the shallow entry"
-    # half of this function's own docstring, not just the deep one.
     assert db_module.schema_cache.get(cache_key) == "DURABLE DEEP TEXT"
-    assert db_module.schema_cache.get(shallow_key) == "DURABLE SHALLOW TEXT"
 
 
 def test_prefetch_all_preset_schemas_fetches_live_when_nothing_durable_exists_yet(app_factory, monkeypatch, tmp_path):
