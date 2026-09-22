@@ -2516,6 +2516,94 @@ def test_build_summary_prompt_caps_rows_at_summary_results_max_rows(app_factory,
     assert prompt_text.count("{'n':") == 3
 
 
+# --- "All databases" mode, Phase C: charting - multiple independently
+# chartable databases in the same turn ---
+#
+# Mirrors test_translate_routes.py's own single-connection charting
+# section: "all databases" mode never supported charting AT ALL before
+# this feature (see chart_helpers.py's own module docstring) - these
+# cover the "all databases" half of the same _pick_chartable_results/
+# _describe_chartable_results/_clean_visualizations machinery, keyed by
+# the same 0-based `database_results` index "per_database" already uses.
+
+def test_build_summary_prompt_includes_a_chartable_result_sets_section(app_factory, tmp_path):
+    env = _two_preset_env(app_factory, tmp_path)
+    database_results = [
+        {"name": "Sales Postgres", "columns": ["day", "revenue"],
+         "rows": [{"day": "Mon", "revenue": 100}, {"day": "Tue", "revenue": 150}], "rowCount": 2},
+        {"name": "Marketing Postgres", "note": "Nothing relevant."},
+    ]
+    chartable_by_index = env.translate_routes._pick_chartable_results(database_results)
+    prompt_text = env.translate_routes._build_summary_prompt(
+        "how is everything performing", database_results, chartable_by_index,
+    )
+    assert "Chartable result sets" in prompt_text
+    assert '"0" ([0] Sales Postgres)' in prompt_text
+    assert "revenue (numeric)" in prompt_text
+    # The note-only entry never qualified, so its index must not appear.
+    assert '"1"' not in prompt_text
+
+
+def test_build_summary_prompt_reports_none_chartable_when_nothing_qualifies(app_factory, tmp_path):
+    env = _two_preset_env(app_factory, tmp_path)
+    database_results = [{"name": "Marketing Postgres", "note": "Nothing relevant."}]
+    prompt_text = env.translate_routes._build_summary_prompt(
+        "q", database_results, env.translate_routes._pick_chartable_results(database_results),
+    )
+    assert "none available this turn" in prompt_text
+
+
+def test_summarize_results_endpoint_returns_a_chart_for_each_qualifying_database(
+    app_factory, tmp_path, monkeypatch,
+):
+    """Positive end-to-end coverage for the core "all databases" mode gap
+    this feature closed: previously Phase C never computed or validated
+    any "visualizations" field at all, no matter how chartable a
+    database's own results were. Two databases, each with genuinely
+    chartable results, must each get their own validated chart, keyed by
+    their own 0-based database_results index - independent of each other,
+    same as summarize_all_mode_results' "per_database" paragraphs already
+    are."""
+    env = _two_preset_env(app_factory, tmp_path)
+    login_as(env.client, "alice@example.com")
+    import db as db_module
+    monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
+        "postgresql://u:p@host-a:5432/a": "Table: deals\nid INTEGER\n",
+        "postgresql://u:p@host-b:5432/b": "Table: campaigns\nid INTEGER\n",
+    }))
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(_gemini_ok(json.dumps({
+        "label": "Results Summary",
+        "per_database": {"0": "Sales trended upward.", "1": "Campaigns split evenly."},
+        "cross_database": None,
+        "visualizations": {
+            "0": {"chart_type": "line", "x_column": "day", "y_columns": ["revenue"], "series_column": None},
+            "1": {"chart_type": "bar", "x_column": "campaign", "y_columns": ["clicks"], "series_column": None},
+        },
+    })))
+
+    resp = env.client.post('/api/summarize-results', json={
+        'prompt': 'how did sales and campaigns perform',
+        'database_results': [
+            {"kind": "preset", "id": "pg-a", "name": "Sales Postgres", "sql": "SELECT day, revenue FROM deals;",
+             "columns": ["day", "revenue"],
+             "rows": [{"day": "Mon", "revenue": 100}, {"day": "Tue", "revenue": 150}], "rowCount": 2},
+            {"kind": "preset", "id": "pg-b", "name": "Marketing Postgres", "sql": "SELECT campaign, clicks FROM campaigns;",
+             "columns": ["campaign", "clicks"],
+             "rows": [{"campaign": "spring", "clicks": 40}, {"campaign": "fall", "clicks": 42}], "rowCount": 2},
+        ],
+    })
+    assert resp.status_code == 200
+    _retry_events, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    assert data['visualizations'] == {
+        "0": {"chart_type": "line", "x_column": "day", "y_columns": ["revenue"], "series_column": None},
+        "1": {"chart_type": "bar", "x_column": "campaign", "y_columns": ["clicks"], "series_column": None},
+    }
+
+
 class _SchemaCapturingFakeProvider(_FakeProvider):
     """_FakeProvider variant that preserves schema_block instead of
     discarding it (the shared _FakeProvider.build_llm_input returns just
@@ -2555,6 +2643,7 @@ def test_summarize_all_mode_results_includes_schema_for_each_in_scope_database(a
         "label": "Results Summary",
         "per_database": {0: "Sales is up 10%.", 1: "Marketing had no data."},
         "cross_database": None,
+        "visualizations": {},
     }
     schema_block = provider.calls[0]["llm_input"]["schema_block"]
     assert "Sales Postgres:\nTable: deals" in schema_block
@@ -2627,6 +2716,7 @@ def test_summarize_all_mode_results_returns_stripped_text_and_usage_on_success(a
         "label": "Results Summary",
         "per_database": {0: "Sales is up 10%, Marketing had no data."},
         "cross_database": None,
+        "visualizations": {},
     }
     assert usage == {}
     assert error is None
@@ -2680,7 +2770,10 @@ def test_summarize_all_mode_results_retries_a_retryable_error_and_succeeds_on_a_
         "how is everything performing", [{"name": "Sales Postgres", "columns": [], "rows": []}],
         provider, client="initial-client", model="m",
     ))
-    assert parsed == {"label": "Results Summary", "per_database": {0: "Sales is up 10%."}, "cross_database": None}
+    assert parsed == {
+        "label": "Results Summary", "per_database": {0: "Sales is up 10%."}, "cross_database": None,
+        "visualizations": {},
+    }
     assert error is None
     assert len(provider.calls) == 2
     # The retry rotated to a genuinely different key/client for the
@@ -2714,7 +2807,10 @@ def test_summarize_all_mode_results_yields_a_retrying_line_for_key_rotation(app_
         "delaySeconds": 0, "rotatedKey": True,
     }
     parsed, usage, error = _drain(gen)
-    assert parsed == {"label": "Results Summary", "per_database": {0: "Sales is up 10%."}, "cross_database": None}
+    assert parsed == {
+        "label": "Results Summary", "per_database": {0: "Sales is up 10%."}, "cross_database": None,
+        "visualizations": {},
+    }
     assert error is None
 
 
@@ -2743,7 +2839,10 @@ def test_summarize_all_mode_results_yields_a_retrying_line_for_a_transient_error
     assert sleep_calls == []  # not yet - only after the yield resumes
 
     parsed, usage, error = _drain(gen)
-    assert parsed == {"label": "Results Summary", "per_database": {0: "Sales is up 10%."}, "cross_database": None}
+    assert parsed == {
+        "label": "Results Summary", "per_database": {0: "Sales is up 10%."}, "cross_database": None,
+        "visualizations": {},
+    }
     assert sleep_calls == [2.5]
 
 
@@ -2817,7 +2916,10 @@ def test_summarize_all_mode_results_retries_an_invalid_or_incomplete_json_respon
             "how is everything performing", [{"name": "Sales Postgres", "columns": [], "rows": []}],
             provider, client=None, model="m",
         ))
-        assert parsed == {"label": "Results Summary", "per_database": {0: "Sales is up 10%."}, "cross_database": None}
+        assert parsed == {
+        "label": "Results Summary", "per_database": {0: "Sales is up 10%."}, "cross_database": None,
+        "visualizations": {},
+    }
         assert error is None
         assert len(provider.calls) == 2
 
@@ -2831,6 +2933,7 @@ def test_summarize_all_mode_results_retries_an_invalid_or_incomplete_json_respon
     ))
     assert parsed == {
         "label": "Results Summary", "per_database": {0: "fenced, but otherwise valid"}, "cross_database": None,
+        "visualizations": {},
     }
     assert len(provider.calls) == 1
 
@@ -2874,7 +2977,10 @@ def test_summarize_all_mode_results_wrong_language_is_retried_and_corrected(app_
         "how is everything performing", [{"name": "Sales Postgres", "columns": [], "rows": []}],
         provider, client=None, model="m",
     ))
-    assert parsed == {"label": "Results Summary", "per_database": {0: "Sales are up 10%."}, "cross_database": None}
+    assert parsed == {
+        "label": "Results Summary", "per_database": {0: "Sales are up 10%."}, "cross_database": None,
+        "visualizations": {},
+    }
     assert error is None
     assert len(provider.calls) == 2
     # The retry prompt actually carried the explicit correction, not just a

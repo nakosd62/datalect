@@ -26,13 +26,24 @@ const { test, expect, gotoApp, mockTranslate, mockExecute } = require('./fixture
  * spec.js's own local helper of the same name, extended with an optional
  * `visualization` field (translate_routes.py's own already-validated
  * {chart_type, x_column, y_columns, series_column} object, or omitted/null
- * for "not chartable"/"model chose a table"). */
+ * for "not chartable"/"model chose a table").
+ *
+ * The server's own response field is "visualizations" - a {"<index>": {...},
+ * ...} object keyed by 0-based statement_results index (see chart_helpers.py's
+ * _clean_visualizations and summarize_routes.py's stream_summarize_result) -
+ * not a single "visualization" value, since more than one Query Result can
+ * now each get their own chart in the same turn. Every test in this file
+ * only ever executes a single statement (see the `results` arrays passed to
+ * mockExecute below - always exactly one entry), so this helper's own
+ * `visualization` param still only ever needs to describe THAT one result,
+ * at index "0" - it's wrapped into the real {"0": ...} shape here so every
+ * call site below can keep passing the simpler singular shape. */
 async function mockSummarizeResult(page, { summary, visualization, error } = {}) {
   await page.route('**/api/summarize-result', async (route) => {
     if (route.request().method() !== 'POST') return route.fallback();
     const body = error !== undefined
       ? { success: false, error }
-      : { success: true, summary, visualization: visualization !== undefined ? visualization : null };
+      : { success: true, summary, visualizations: visualization ? { '0': visualization } : {} };
     await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
   });
 }
@@ -556,5 +567,67 @@ test.describe('single-connection mode: chart discoverability (tab badge + Summar
     const dataTab = page.locator('#resultsTabsNav .result-tab-btn').nth(1);
     await expect(dataTab).not.toHaveClass(/result-tab-btn--chartable/);
     await expect(dataTab).not.toContainText('📊');
+  });
+
+  test('a multi-statement script with two independently chartable results gets its own captioned preview for each, each jumping to its own tab', async ({ page }) => {
+    // Regression coverage for the core multi-chart fix (see chart_helpers.
+    // py's _pick_chartable_results): a two-statement script where BOTH
+    // statements' results independently qualify for a chart must show TWO
+    // previews on the Summary tab, not just one - and each preview must
+    // jump to ITS OWN tab, not always the first (see
+    // jumpToChartableResultTab()'s own `index` param).
+    await mockTranslate(page, { sql: 'SELECT day, signups FROM daily_signups; SELECT region, revenue FROM regional_revenue;' });
+    await mockExecute(page, {
+      results: [
+        { columns: ['day', 'signups'], rows: [{ day: 'Mon', signups: 10 }, { day: 'Tue', signups: 14 }, { day: 'Wed', signups: 9 }], rowCount: 3 },
+        { columns: ['region', 'revenue'], rows: [{ region: 'east', revenue: 500 }, { region: 'west', revenue: 480 }], rowCount: 2 },
+      ],
+    });
+    await page.route('**/api/summarize-result', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          summary: '*** NO SQL *** Signups trended upward, and revenue split evenly across regions.',
+          visualizations: {
+            '0': { chart_type: 'line', x_column: 'day', y_columns: ['signups'], series_column: null },
+            '1': { chart_type: 'bar', x_column: 'region', y_columns: ['revenue'], series_column: null },
+          },
+        }),
+      });
+    });
+    await gotoApp(page);
+
+    await page.locator('#aiPrompt').fill('how did signups and revenue look this week');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect(page.locator('.response-text')).toContainText('Signups trended upward', { timeout: 10000 });
+
+    // Both statements' own tabs carry the badge.
+    await expect(page.locator('#resultsTabsNav .result-tab-btn').nth(1)).toHaveClass(/result-tab-btn--chartable/);
+    await expect(page.locator('#resultsTabsNav .result-tab-btn').nth(2)).toHaveClass(/result-tab-btn--chartable/);
+
+    // Two previews on the Summary tab, each with its own distinguishing
+    // caption (only shown at all once there's more than one preview).
+    const previews = page.locator('.summary-chart-inline-preview');
+    await expect(previews).toHaveCount(2);
+    await expect(page.locator('.summary-chart-inline-preview-caption')).toHaveCount(2);
+    await expect(previews.nth(0).locator('.summary-chart-inline-preview-caption')).toHaveText('Query 1');
+    await expect(previews.nth(1).locator('.summary-chart-inline-preview-caption')).toHaveText('Query 2');
+
+    // Clicking the SECOND preview jumps to the SECOND data tab (index 2:
+    // Summary, Query 1, Query 2), not the first.
+    await previews.nth(1).click();
+    await expect(page.locator('#resultsTabsNav .result-tab-btn').nth(2)).toHaveClass(/active/);
+    expect(await page.evaluate(() => window.__lastChartConfig.type)).toBe('bar');
+    await expect(page.locator('#resultsChartWrapper')).not.toHaveClass(/hidden/);
+
+    // Back to the Summary tab, then the FIRST preview jumps to the FIRST
+    // data tab instead.
+    await page.locator('#resultsTabsNav .result-tab-btn').nth(0).click();
+    await previews.nth(0).click();
+    await expect(page.locator('#resultsTabsNav .result-tab-btn').nth(1)).toHaveClass(/active/);
+    expect(await page.evaluate(() => window.__lastChartConfig.type)).toBe('line');
   });
 });

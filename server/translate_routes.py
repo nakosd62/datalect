@@ -346,18 +346,23 @@ from summarize_routes import (
 )
 
 # The chart/visualization eligibility + validation helpers
-# (_CHART_MIN_ROWS/_column_looks_numeric/_pick_chartable_result/
-# _describe_chartable_columns/_clean_visualization) live in chart_helpers.py
-# (see that module's own docstring) - re-imported here purely so they stay
-# reachable as translate_routes.<name> for every existing test's
-# app_env.translate_routes.<name> attribute access. Nothing in this
-# module's own remaining code calls them directly any more (their one real
-# caller, the single-connection summarization pipeline, moved to
-# summarize_routes.py too), same "keep purely for back-compat" posture as
-# the SDK imports llm_providers.py's own docstring explains.
+# (_CHART_MIN_ROWS/_column_looks_numeric/_pick_chartable_results/
+# _describe_chartable_results/_clean_visualization/_clean_visualizations)
+# live in chart_helpers.py (see that module's own docstring) - re-imported
+# here purely so they stay reachable as translate_routes.<name> for every
+# existing test's app_env.translate_routes.<name> attribute access.
+# Nothing in this module's own remaining code calls them directly any more
+# (their one real caller, the single-connection summarization pipeline,
+# moved to summarize_routes.py too), same "keep purely for back-compat"
+# posture as the SDK imports llm_providers.py's own docstring explains.
+# _pick_chartable_results/_describe_chartable_results (plural) replaced
+# the old _pick_chartable_result/_describe_chartable_columns (singular) -
+# multiple simultaneous chartable result sets are now supported instead
+# of at most one per turn - and _clean_visualizations (plural) is new
+# alongside the still-unchanged, single-entry _clean_visualization.
 from chart_helpers import (
-    _CHART_MIN_ROWS, _column_looks_numeric, _pick_chartable_result,
-    _describe_chartable_columns, _clean_visualization,
+    _CHART_MIN_ROWS, _column_looks_numeric, _pick_chartable_results,
+    _describe_chartable_results, _clean_visualization, _clean_visualizations,
 )
 
 

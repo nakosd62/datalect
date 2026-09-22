@@ -3494,7 +3494,7 @@ def test_build_single_summary_prompt_includes_the_question_sql_and_results(app_e
     results = [{"columns": ["n"], "rows": [{"n": 42}], "rowCount": 1}]
     prompt_text = app_env.translate_routes._build_single_summary_prompt(
         "how many users signed up", "SELECT COUNT(*) AS n FROM users;", results,
-        app_env.translate_routes._pick_chartable_result(results),
+        app_env.translate_routes._pick_chartable_results(results),
     )
     assert "Original question: how many users signed up" in prompt_text
     assert "SELECT COUNT(*) AS n FROM users;" in prompt_text
@@ -3515,7 +3515,7 @@ def test_build_single_summary_prompt_does_not_cap_rows_the_same_way_past_turn_hi
     many_rows = [{"n": i} for i in range(row_count)]
     results = [{"columns": ["n"], "rows": many_rows, "rowCount": row_count}]
     prompt_text = app_env.translate_routes._build_single_summary_prompt(
-        "q", "SELECT n FROM t;", results, app_env.translate_routes._pick_chartable_result(results),
+        "q", "SELECT n FROM t;", results, app_env.translate_routes._pick_chartable_results(results),
     )
     assert f"Query Result 1 - {row_count} row(s):" in prompt_text
     assert f"Total Rows: {row_count}" in prompt_text
@@ -3533,7 +3533,7 @@ def test_build_single_summary_prompt_caps_rows_at_summary_results_max_rows(app_f
     many_rows = [{"n": i} for i in range(row_count)]
     results = [{"columns": ["n"], "rows": many_rows, "rowCount": row_count}]
     prompt_text = env.translate_routes._build_single_summary_prompt(
-        "q", "SELECT n FROM t;", results, env.translate_routes._pick_chartable_result(results),
+        "q", "SELECT n FROM t;", results, env.translate_routes._pick_chartable_results(results),
     )
     # The real total row count is still reported honestly...
     assert f"Query Result 1 - {row_count} row(s) total, showing the first 3:" in prompt_text
@@ -3545,7 +3545,7 @@ def test_build_single_summary_prompt_caps_rows_at_summary_results_max_rows(app_f
 def test_build_single_summary_prompt_formats_notes_and_errors_too(app_env):
     results = [{"columns": [], "rows": [], "rowCount": 0}, {"error": "syntax error near SELECT"}]
     prompt_text = app_env.translate_routes._build_single_summary_prompt(
-        "q", "SELECT 1; SELECT 2;", results, app_env.translate_routes._pick_chartable_result(results),
+        "q", "SELECT 1; SELECT 2;", results, app_env.translate_routes._pick_chartable_results(results),
     )
     assert "Query Result 2: query failed - syntax error near SELECT" in prompt_text
 
@@ -3600,13 +3600,13 @@ def test_summarize_single_connection_results_returns_stripped_text_and_usage_on_
 
     provider = _FakeProvider([json.dumps({
         "summary": "Results Summary\n\nSignups are up 20% this week - worth a closer look at channel X.",
-        "visualization": None,
+        "visualizations": {},
     })])
     # summarize_single_connection_results is now a generator (yields live
     # 'retrying' progress lines - see its docstring); drain it to get the
     # final (parsed, usage, error) result, same idiom used for
     # generate_sql_for_connection elsewhere. `parsed` is now the
-    # {"summary", "visualization"} dict _clean_single_summary_response
+    # {"summary", "visualizations"} dict _clean_single_summary_response
     # produces, not a bare string - see that function's own docstring.
     parsed, usage, error = app_env.translate_routes._drain_generation(
         app_env.translate_routes.summarize_single_connection_results(
@@ -3618,8 +3618,8 @@ def test_summarize_single_connection_results_returns_stripped_text_and_usage_on_
     assert parsed["summary"] == "Results Summary\n\nSignups are up 20% this week - worth a closer look at channel X."
     # Only 1 row - below _CHART_MIN_ROWS - so charting was never even
     # offered to the model regardless of what it says (see
-    # _pick_chartable_result); "visualization" is forced None either way.
-    assert parsed["visualization"] is None
+    # _pick_chartable_results); "visualizations" is forced empty either way.
+    assert parsed["visualizations"] == {}
     assert usage == {}
     assert error is None
     assert len(provider.calls) == 1
@@ -3659,8 +3659,8 @@ def test_summarize_single_connection_results_wrong_language_is_retried_and_corre
     )
     monkeypatch.setattr(app_env.translate_routes, "_detect_language", _fake_detect)
     provider = _FakeProvider([
-        json.dumps({"summary": "Die Anmeldungen sind diese Woche um 20% gestiegen.", "visualization": None}),
-        json.dumps({"summary": "Signups are up 20% this week.", "visualization": None}),
+        json.dumps({"summary": "Die Anmeldungen sind diese Woche um 20% gestiegen.", "visualizations": {}}),
+        json.dumps({"summary": "Signups are up 20% this week.", "visualizations": {}}),
     ])
     parsed, usage, error = app_env.translate_routes._drain_generation(
         app_env.translate_routes.summarize_single_connection_results(
@@ -3686,8 +3686,8 @@ def test_summarize_single_connection_results_still_wrong_language_after_retry_fa
     )
     monkeypatch.setattr(app_env.translate_routes, "_detect_language", _fake_detect)
     provider = _FakeProvider([
-        json.dumps({"summary": "Die Anmeldungen sind diese Woche um 20% gestiegen.", "visualization": None}),
-        json.dumps({"summary": "Die Anmeldungen sind immer noch um 20% gestiegen.", "visualization": None}),
+        json.dumps({"summary": "Die Anmeldungen sind diese Woche um 20% gestiegen.", "visualizations": {}}),
+        json.dumps({"summary": "Die Anmeldungen sind immer noch um 20% gestiegen.", "visualizations": {}}),
     ])
     parsed, usage, error = app_env.translate_routes._drain_generation(
         app_env.translate_routes.summarize_single_connection_results(
@@ -3714,7 +3714,7 @@ def test_summarize_result_endpoint_returns_no_sql_prefixed_summary_and_is_never_
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     harness.queue_response(FakeGenaiResponse(json.dumps({
         "summary": "Signups are up 20% this week - worth digging into channel X.",
-        "visualization": None,
+        "visualizations": {},
     })))
 
     resp = env.client.post('/api/summarize-result', json={
@@ -3732,9 +3732,9 @@ def test_summarize_result_endpoint_returns_no_sql_prefixed_summary_and_is_never_
     assert data['summary'] == '*** NO SQL *** Signups are up 20% this week - worth digging into channel X.'
     # Only 1 row in the result - below _CHART_MIN_ROWS - so charting was
     # never on offer this turn regardless of what the model said (see
-    # _pick_chartable_result); the route must still report a validated
-    # None, not whatever the (here, honest) model wrote.
-    assert data['visualization'] is None
+    # _pick_chartable_results); the route must still report a validated
+    # empty object, not whatever the (here, honest) model wrote.
+    assert data['visualizations'] == {}
 
     # Call 3 (summarization) is deliberately never recorded in the
     # translations-table history/stats - only calls that take a prompt and
@@ -3763,7 +3763,7 @@ def test_summarize_result_endpoint_streams_a_retrying_line_before_the_terminal_l
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     harness.queue_error(FakeApiError(429))
     harness.queue_response(FakeGenaiResponse(json.dumps({
-        "summary": "Signups are up 20% this week.", "visualization": None,
+        "summary": "Signups are up 20% this week.", "visualizations": {},
     })))
 
     resp = env.client.post('/api/summarize-result', json={
@@ -3792,7 +3792,7 @@ def test_summarize_result_endpoint_uses_byok_key_instead_of_env_configured_key(a
 
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(FakeGenaiResponse(json.dumps({"summary": "All good here.", "visualization": None})))
+    harness.queue_response(FakeGenaiResponse(json.dumps({"summary": "All good here.", "visualizations": {}})))
 
     resp = env.client.post('/api/summarize-result', json={
         'prompt': 'q', 'sql': 'SELECT 1;', 'results': [{"columns": [], "rows": [], "rowCount": 0}],
@@ -3840,55 +3840,69 @@ def test_summarize_result_endpoint_returns_success_false_when_the_llm_call_fails
 # visualization validation ---
 #
 # The single-connection results summarizer now also decides, in the same
-# LLM call, whether the result set should be charted instead of tabled -
+# LLM call, whether each result set should be charted instead of tabled -
 # see the module comment above _SINGLE_SUMMARY_SYSTEM_INSTRUCTION for the
 # full design rationale. These tests cover the pieces that make that
 # decision trustworthy even though the model's own say-so is never taken
-# on faith: _pick_chartable_result decides server-side, independent of the
-# model, whether charting is even possible for this turn; _column_looks_
-# numeric backs that decision and _clean_visualization's own column
-# choices; and _clean_visualization/_clean_single_summary_response
-# re-validate whatever the model claims against the real result set,
-# silently falling back to a null/no-chart decision on any mismatch
-# rather than erroring or rendering garbage.
+# on faith: _pick_chartable_results decides server-side, independent of
+# the model, which entries (zero, one, or several) are even eligible to
+# be charted this turn; _column_looks_numeric backs that decision and
+# _clean_visualization's own column choices; and _clean_visualization/
+# _clean_visualizations/_clean_single_summary_response re-validate
+# whatever the model claims against the real result set, silently
+# dropping any entry that doesn't survive validation rather than erroring
+# or rendering garbage.
 
-def test_pick_chartable_result_is_none_when_more_than_one_real_tabular_result(app_env):
-    # Two real (non-note, non-error) results in the same turn is treated
-    # as ambiguous - there's no single result set to chart against - so
-    # charting is never offered regardless of shape.
+def test_pick_chartable_results_returns_every_independently_qualifying_entry(app_env):
+    # Two real (non-note, non-error), independently chartable results in
+    # the same turn now BOTH get offered a chart - no longer treated as
+    # ambiguous, since each is keyed by its own 0-based index rather than
+    # sharing one unindexed "visualization" field.
     results = [
         {"columns": ["n"], "rows": [{"n": 1}, {"n": 2}], "rowCount": 2},
         {"columns": ["m"], "rows": [{"m": 1}, {"m": 2}], "rowCount": 2},
     ]
-    assert app_env.translate_routes._pick_chartable_result(results) is None
+    assert app_env.translate_routes._pick_chartable_results(results) == {0: results[0], 1: results[1]}
 
 
-def test_pick_chartable_result_is_none_below_the_minimum_row_count(app_env):
+def test_pick_chartable_results_omits_a_result_below_the_minimum_row_count(app_env):
     assert app_env.translate_routes._CHART_MIN_ROWS == 2
     results = [{"columns": ["n"], "rows": [{"n": 1}], "rowCount": 1}]
-    assert app_env.translate_routes._pick_chartable_result(results) is None
+    assert app_env.translate_routes._pick_chartable_results(results) == {}
 
 
-def test_pick_chartable_result_is_none_with_no_numeric_column(app_env):
+def test_pick_chartable_results_omits_a_result_with_no_numeric_column(app_env):
     results = [{"columns": ["name"], "rows": [{"name": "a"}, {"name": "b"}], "rowCount": 2}]
-    assert app_env.translate_routes._pick_chartable_result(results) is None
+    assert app_env.translate_routes._pick_chartable_results(results) == {}
 
 
-def test_pick_chartable_result_is_none_for_a_note_or_error_only_result(app_env):
+def test_pick_chartable_results_omits_a_note_or_error_only_result(app_env):
     # An empty statement result (no columns at all - e.g. an INSERT/UPDATE
     # note) and a pure error result both fail the "has columns" test in
-    # _pick_chartable_result, same as today's note/error prompt formatting
+    # _entry_is_chartable, same as today's note/error prompt formatting
     # already distinguishes them from real tabular results.
     results = [{"columns": [], "rows": [], "rowCount": 0}]
-    assert app_env.translate_routes._pick_chartable_result(results) is None
+    assert app_env.translate_routes._pick_chartable_results(results) == {}
 
     results = [{"error": "syntax error"}]
-    assert app_env.translate_routes._pick_chartable_result(results) is None
+    assert app_env.translate_routes._pick_chartable_results(results) == {}
 
 
-def test_pick_chartable_result_returns_the_entry_when_genuinely_chartable(app_env):
+def test_pick_chartable_results_returns_the_entry_when_genuinely_chartable(app_env):
     entry = {"columns": ["day", "n"], "rows": [{"day": "Mon", "n": 1}, {"day": "Tue", "n": 2}], "rowCount": 2}
-    assert app_env.translate_routes._pick_chartable_result([entry]) is entry
+    assert app_env.translate_routes._pick_chartable_results([entry]) == {0: entry}
+    assert app_env.translate_routes._pick_chartable_results([entry])[0] is entry
+
+
+def test_pick_chartable_results_only_offers_the_entries_that_qualify(app_env):
+    # A mix of one genuinely chartable entry, one too-short entry, and one
+    # error - only the qualifying one's own index appears in the result,
+    # keyed by its real 0-based position, not renumbered.
+    chartable = {"columns": ["day", "n"], "rows": [{"day": "Mon", "n": 1}, {"day": "Tue", "n": 2}], "rowCount": 2}
+    too_short = {"columns": ["n"], "rows": [{"n": 1}], "rowCount": 1}
+    errored = {"error": "syntax error"}
+    results = [too_short, chartable, errored]
+    assert app_env.translate_routes._pick_chartable_results(results) == {1: chartable}
 
 
 def test_column_looks_numeric_requires_ninety_percent_of_non_null_values(app_env):
@@ -3978,23 +3992,27 @@ def test_clean_single_summary_response_returns_none_for_label_only_summary(app_e
     # (see its own docstring) - is still rejected the same way it always
     # was, now from inside the JSON envelope rather than as the raw
     # response text.
-    raw_text = json.dumps({"summary": "Results Summary\n\n", "visualization": None})
+    raw_text = json.dumps({"summary": "Results Summary\n\n", "visualizations": {}})
     assert app_env.translate_routes._clean_single_summary_response(raw_text, None) is None
 
 
-def test_clean_single_summary_response_falls_back_to_null_visualization_without_failing_the_summary(app_env):
-    # An otherwise-valid "summary" paired with an invalid "visualization"
+def test_clean_single_summary_response_drops_an_invalid_visualization_without_failing_the_summary(app_env):
+    # An otherwise-valid "summary" paired with an invalid visualization
     # (here, a hallucinated column) must not invalidate the whole response
     # and trigger a retry - only "summary" being broken should do that.
-    # The bad visualization is simply cleaned down to None.
+    # The bad entry is simply dropped from "visualizations" rather than
+    # failing the whole response.
     chartable = {"columns": ["day", "n"], "rows": [{"day": "Mon", "n": 1}, {"day": "Tue", "n": 2}]}
+    chartable_by_index = {0: chartable}
     raw_text = json.dumps({
         "summary": "Results Summary\n\nSignups trended upward this week.",
-        "visualization": {"chart_type": "bar", "x_column": "made_up", "y_columns": ["n"], "series_column": None},
+        "visualizations": {
+            "0": {"chart_type": "bar", "x_column": "made_up", "y_columns": ["n"], "series_column": None},
+        },
     })
-    parsed = app_env.translate_routes._clean_single_summary_response(raw_text, chartable)
+    parsed = app_env.translate_routes._clean_single_summary_response(raw_text, chartable_by_index)
     assert parsed["summary"] == "Results Summary\n\nSignups trended upward this week."
-    assert parsed["visualization"] is None
+    assert parsed["visualizations"] == {}
 
 
 def test_summarize_result_endpoint_returns_a_validated_visualization_for_a_genuinely_chartable_result(
@@ -4013,8 +4031,8 @@ def test_summarize_result_endpoint_returns_a_validated_visualization_for_a_genui
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     harness.queue_response(FakeGenaiResponse(json.dumps({
         "summary": "Signups trended upward across the week.",
-        "visualization": {
-            "chart_type": "line", "x_column": "day", "y_columns": ["signups"], "series_column": None,
+        "visualizations": {
+            "0": {"chart_type": "line", "x_column": "day", "y_columns": ["signups"], "series_column": None},
         },
     })))
 
@@ -4035,8 +4053,68 @@ def test_summarize_result_endpoint_returns_a_validated_visualization_for_a_genui
     _retry_events, data = parse_translate_stream(resp)
     assert data['success'] is True
     assert data['summary'] == '*** NO SQL *** Signups trended upward across the week.'
-    assert data['visualization'] == {
-        "chart_type": "line", "x_column": "day", "y_columns": ["signups"], "series_column": None,
+    # Over the wire, json.dumps stringifies the dict's int keys - see
+    # _clean_visualizations' own docstring for why the key is "0" here
+    # but an int (0) when calling that function directly in-process.
+    assert data['visualizations'] == {
+        "0": {"chart_type": "line", "x_column": "day", "y_columns": ["signups"], "series_column": None},
+    }
+
+
+def test_summarize_result_endpoint_returns_a_chart_for_each_qualifying_result_of_a_multi_statement_script(
+    app_factory, monkeypatch,
+):
+    """Regression coverage for the core fix this feature made: a
+    multi-statement script whose script produced TWO independently
+    chartable result sets used to get ZERO charts (the old _pick_
+    chartable_result treated more than one real tabular result as
+    ambiguous and gave up entirely - see test_pick_chartable_results_
+    returns_every_independently_qualifying_entry above for that function's
+    own direct-unit-test coverage). Now each qualifying Query Result gets
+    its own chart, keyed by its own 0-based index, independent of the
+    other."""
+    env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
+    login_as(env.client, "alice@example.com")
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(FakeGenaiResponse(json.dumps({
+        "summary": "Signups trended upward, and revenue split evenly across regions.",
+        "visualizations": {
+            "0": {"chart_type": "line", "x_column": "day", "y_columns": ["signups"], "series_column": None},
+            "1": {"chart_type": "bar", "x_column": "region", "y_columns": ["revenue"], "series_column": None},
+        },
+    })))
+
+    resp = env.client.post('/api/summarize-result', json={
+        'prompt': 'how did signups and revenue look this week',
+        'sql': 'SELECT day, signups FROM daily_signups; SELECT region, revenue FROM regional_revenue;',
+        'results': [
+            {
+                "columns": ["day", "signups"],
+                "rows": [
+                    {"day": "Mon", "signups": 10},
+                    {"day": "Tue", "signups": 14},
+                    {"day": "Wed", "signups": 9},
+                ],
+                "rowCount": 3,
+            },
+            {
+                "columns": ["region", "revenue"],
+                "rows": [
+                    {"region": "east", "revenue": 500},
+                    {"region": "west", "revenue": 480},
+                ],
+                "rowCount": 2,
+            },
+        ],
+    })
+    assert resp.status_code == 200
+    _retry_events, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    assert data['visualizations'] == {
+        "0": {"chart_type": "line", "x_column": "day", "y_columns": ["signups"], "series_column": None},
+        "1": {"chart_type": "bar", "x_column": "region", "y_columns": ["revenue"], "series_column": None},
     }
 
 

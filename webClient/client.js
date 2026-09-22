@@ -2598,12 +2598,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (resultsChartWrapper) resultsChartWrapper.classList.add('hidden');
     if (resultsTableWrapper) resultsTableWrapper.classList.remove('hidden');
     destroyResultsChart();
-    // Same reasoning: the Summary tab's own inline mini-chart (see
-    // renderSummaryInlineChart()) sits on a <canvas> inside resultsBody,
-    // which this function just wiped via innerHTML above - the Chart.js
-    // instance itself would otherwise leak (and its old canvas reference
-    // would be stale) rather than being cleanly destroyed.
-    destroySummaryInlineChart();
+    // Same reasoning: the Summary tab's own inline mini-chart preview(s)
+    // (see renderSummaryInlineChart()) sit on <canvas> elements inside
+    // resultsBody, which this function just wiped via innerHTML above -
+    // those Chart.js instances would otherwise leak (and their old canvas
+    // references would be stale) rather than being cleanly destroyed.
+    destroySummaryInlineCharts();
     // Same reasoning as the chart reset just above - a truncation notice
     // left over from the PREVIOUS turn's result must not linger through a
     // "cleared" results area either.
@@ -6561,11 +6561,15 @@ document.addEventListener('DOMContentLoaded', async () => {
         const direction = summaryFeedbackTrigger.dataset.summaryFeedbackTrigger;
         openReportIssueModal({ category: direction === 'up' ? 'summary_thumbs_up' : 'summary_thumbs_down' });
       }
-      // The Summary tab's "View as chart" inline link (see
-      // summaryChartInlineLinkHtml()/jumpToChartableResultTab()) - same
-      // delegated-listener reasoning as the two triggers above.
+      // The Summary tab's "View as chart" inline link/preview (see
+      // summaryChartInlineLinkHtml()/renderSummaryInlineChart()/
+      // jumpToChartableResultTab()) - same delegated-listener reasoning as
+      // the two triggers above. The trigger's own value is which
+      // currentResultsList index it targets (there can be more than one
+      // now, one per chartable result this turn), read straight off the
+      // dataset attribute and handed to jumpToChartableResultTab().
       const viewChartTrigger = e.target.closest('[data-view-chart-trigger]');
-      if (viewChartTrigger) jumpToChartableResultTab();
+      if (viewChartTrigger) jumpToChartableResultTab(viewChartTrigger.dataset.viewChartTrigger);
     });
   }
   // The header's "Send Feedback" button - a persistent element (unlike the
@@ -9261,11 +9265,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (resultsChartWrapper) resultsChartWrapper.classList.add('hidden');
     if (resultsTableWrapper) resultsTableWrapper.classList.remove('hidden');
     destroyResultsChart();
-    // The Summary tab's own inline mini-chart (see renderSummaryInlineChart())
-    // is rebuilt fresh on every render too, same as the full-tab chart above -
-    // a stale instance left over from a previous render must not leak into
-    // this one's canvas.
-    destroySummaryInlineChart();
+    // The Summary tab's own inline mini-chart preview(s) (see
+    // renderSummaryInlineChart()) are rebuilt fresh on every render too,
+    // same as the full-tab chart above - every stale instance left over
+    // from a previous render must not leak into this one's canvases. This
+    // one call up front (rather than the isText branch below trying to
+    // destroy-then-rebuild each preview one at a time) is what makes going
+    // from N previews to a different N - or to zero - always start from a
+    // clean slate.
+    destroySummaryInlineCharts();
     // Same reset-first posture as the toggle/chart-wrapper lines just
     // above - only the successful, non-empty tabular branch below ever
     // turns this back on, and only when THIS tab's own result was
@@ -9337,37 +9345,59 @@ document.addEventListener('DOMContentLoaded', async () => {
         ? renderMarkdownLiteSummaryTab(result.text || '')
         : renderMarkdownLite(result.text || '');
       // Chart discoverability (see renderSummaryInlineChart()'s own
-      // docstring) - whenever THIS turn has a chartable tab somewhere,
-      // show an actual small rendering of its chart right in the Summary
-      // tab, rather than making the user click through to find it. Gated
-      // on `!result.summaryPending` since "all databases" mode's Summary
-      // tab can render before Phase C - and therefore before any tab's
-      // own visualization - has actually arrived. `.find()` rather than
-      // `.some()` since rendering the chart needs the actual entry, not
-      // just the fact that one exists.
-      const chartableEntry = (result.tabLabel === 'Summary' && !result.summaryPending && currentResultsList)
-        ? currentResultsList.find((r) => r && r.visualization)
-        : null;
+      // docstring) - whenever THIS turn has one or more chartable tabs,
+      // show an actual small rendering of EACH of their charts right in
+      // the Summary tab, rather than making the user click through to
+      // find them. Gated on `!result.summaryPending` since "all
+      // databases" mode's Summary tab can render before Phase C - and
+      // therefore before any tab's own visualization - has actually
+      // arrived. Every qualifying entry gets its own preview (not just
+      // the first) - a turn can now genuinely have more than one
+      // independently chartable result (see chart_helpers.py's
+      // _pick_chartable_results) - each carrying its own real
+      // currentResultsList index so its own preview can jump straight
+      // back to its own tab, not always the first one.
+      const chartableEntries = (result.tabLabel === 'Summary' && !result.summaryPending && currentResultsList)
+        ? (() => {
+          // Same "Query N" numbers the tab strip itself shows for these
+          // exact same tabs (see computeQueryNumbers' own docstring) -
+          // computed once here and threaded through so a preview/fallback
+          // link's own caption can never drift out of sync with what the
+          // tab strip says for that same tab.
+          const queryNumbers = computeQueryNumbers(currentResultsList);
+          return currentResultsList.reduce((acc, r, idx) => {
+            if (r && r.visualization) acc.push({ entry: r, index: idx, queryNumber: queryNumbers.get(idx) });
+            return acc;
+          }, []);
+        })()
+        : [];
       // Chart.js failed to load (see the `typeof Chart` guards throughout
-      // this file) - fall back to the old plain-text nudge rather than
-      // silently showing nothing for a chartable turn.
-      if (chartableEntry && typeof Chart === 'undefined') {
-        summaryHtml += summaryChartInlineLinkHtml();
+      // this file) - fall back to the old plain-text nudge, one per
+      // qualifying entry, rather than silently showing nothing for a
+      // chartable turn.
+      if (chartableEntries.length && typeof Chart === 'undefined') {
+        chartableEntries.forEach(({ entry, index, queryNumber }) => {
+          summaryHtml += summaryChartInlineLinkHtml(entry, index, queryNumber, chartableEntries.length);
+        });
       }
       p.innerHTML = summaryHtml;
-      // A live preview sits BESIDE the summary text (see
-      // .summary-text-chart-row in style.css), not below it as a
-      // full-width block - so the two only share a row wrapper when
-      // there's an actual preview to place next to the text; otherwise
-      // the paragraph goes straight into td exactly as before. The chart
-      // itself isn't actually built here - just this empty row it'll live
-      // in - see the `chartRow` comment further down for why that has to
-      // wait.
+      // A live preview grid sits BELOW the summary text (see
+      // .summary-text-chart-row/.summary-chart-preview-grid in style.css),
+      // not beside it - so the two only share a wrapper when there's at
+      // least one actual preview to place underneath; otherwise the
+      // paragraph goes straight into td exactly as before. The charts
+      // themselves aren't actually built here - just the empty grid
+      // they'll live in - see the `chartRow`/`previewGrid` comment
+      // further down for why that has to wait.
       let chartRow = null;
-      if (chartableEntry && typeof Chart !== 'undefined') {
+      let previewGrid = null;
+      if (chartableEntries.length && typeof Chart !== 'undefined') {
         chartRow = document.createElement('div');
         chartRow.className = 'summary-text-chart-row';
         chartRow.appendChild(p);
+        previewGrid = document.createElement('div');
+        previewGrid.className = 'summary-chart-preview-grid';
+        chartRow.appendChild(previewGrid);
         td.appendChild(chartRow);
       } else {
         td.appendChild(p);
@@ -9400,15 +9430,23 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       tr.appendChild(td);
       resultsBody.appendChild(tr);
-      // NOW that chartRow is actually attached to the live document (via
-      // td -> tr -> resultsBody just above) - only past this point does
-      // its <canvas> have a real, laid-out width for
+      // NOW that previewGrid is actually attached to the live document
+      // (via chartRow -> td -> tr -> resultsBody just above) - only past
+      // this point does each <canvas> have a real, laid-out width for
       // buildResultsChartConfig()'s own legend-scaling (see its `canvas`
-      // param comment) to read. Building the chart any earlier - e.g.
-      // back where chartRow itself was created, while it was still a
+      // param comment) to read. Building any chart earlier - e.g. back
+      // where previewGrid itself was created, while it was still a
       // detached element - would have measured a width of 0.
-      if (chartRow) {
-        renderSummaryInlineChart(chartRow, chartableEntry);
+      if (previewGrid) {
+        // Every previous render's own preview instances were already torn
+        // down once, up front, by this same function's own
+        // destroySummaryInlineCharts() call near the top - see that
+        // call's own comment for why a single clean-slate reset there,
+        // rather than a destroy-then-rebuild per entry here, is what
+        // correctly handles going from N previews to a different N.
+        chartableEntries.forEach(({ entry, index, queryNumber }) => {
+          renderSummaryInlineChart(previewGrid, entry, index, queryNumber, chartableEntries.length);
+        });
       }
       setReportContext({
         category: 'wrong_result',
@@ -9630,6 +9668,33 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
+  // Returns a Map from currentResultsList index -> that entry's 1-based
+  // "Query N" number - the same number the tab strip itself shows for
+  // that tab (see buildResultsTabsNav's own isError/default branches
+  // below) - counting only entries that actually get a "Query N" label (a
+  // real result or a failed statement), and skipping any leading or
+  // interspersed isText ("Summary"/"Note") or isPending (all-mode's own
+  // live-streaming placeholder) tabs entirely, since those never consume
+  // a query number. Computed once and shared by buildResultsTabsNav (the
+  // tab strip's own labels) and chartPreviewCaption (the Summary tab's own
+  // preview/fallback-link captions) so the two can never show a different
+  // number for the same tab - see chartableEntries' own comment in
+  // renderTableResult()'s isText branch for the regression this fixes: a
+  // single-connection turn with one query result AND a Summary tab used
+  // to label that one real tab "Query 2", never "Query 1", since the
+  // Summary tab itself occupied position 0 and the old code numbered
+  // straight off the raw array index.
+  function computeQueryNumbers(list) {
+    const numbers = new Map();
+    let queryNumber = 0;
+    (list || []).forEach((res, idx) => {
+      if (res && (res.isText || res.isPending)) return;
+      queryNumber += 1;
+      numbers.set(idx, queryNumber);
+    });
+    return numbers;
+  }
+
   function buildResultsTabsNav() {
     if (!resultsTabsNav) return;
     resultsTabsNav.innerHTML = '';
@@ -9640,6 +9705,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     resultsTabsNav.classList.remove('hidden');
+    // See computeQueryNumbers' own docstring for why this is a SEPARATE
+    // number from `idx` (this forEach's own currentResultsList position) -
+    // `idx + 1` directly used to leak any leading Summary/Note/pending
+    // tabs' own count into the "Query N" numbers shown to the user.
+    const queryNumbers = computeQueryNumbers(currentResultsList);
     currentResultsList.forEach((res, idx) => {
       const btn = document.createElement('button');
       const isError = !!res.isError;
@@ -9685,8 +9755,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         // failed statement in an otherwise-successful multi-statement
         // script draws the eye immediately, instead of looking like just
         // another results tab.
-        btn.textContent = `${dbLabel}Query ${idx + 1} (Error)`;
+        btn.textContent = `${dbLabel}Query ${queryNumbers.get(idx)} (Error)`;
       } else {
+        const queryNumber = queryNumbers.get(idx);
         const count = res.rowCount !== undefined ? res.rowCount : (res.rows ? res.rows.length : 0);
         // A "+" after the count is the tab strip's own half of the
         // truncation signal (see EXECUTE_RESULTS_MAX_ROWS/fetch_capped_rows
@@ -9700,7 +9771,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         // the `.result-tab-btn--chartable` color class) so it survives
         // being read as plain text (title attribute, screen readers,
         // narrow layouts that might otherwise strip a background tint).
-        btn.textContent = `${dbLabel}Query ${idx + 1} (${rowLabel})${isChartable ? ' 📊' : ''}`;
+        btn.textContent = `${dbLabel}Query ${queryNumber} (${rowLabel})${isChartable ? ' 📊' : ''}`;
       }
 
       btn.addEventListener('click', () => {
@@ -10219,9 +10290,25 @@ document.addEventListener('DOMContentLoaded', async () => {
         // /api/summarize-results docstring) - an internal convention,
         // never meant to reach the user verbatim.
         appendPhaseCSummaryToSummaryTab(stripNoSqlPrefix(data.summary));
+        // Tags whichever of `executeResults`' own entries each
+        // visualization belongs to (zero, one, or several - see
+        // chart_helpers.py's _clean_visualizations) - see
+        // attachVisualizationsToResultsList's own docstring for why a
+        // plain positional-index lookup is exact here: `executeResults`
+        // is the SAME array (by reference) buildAllModeSummaryPayload
+        // just built `database_results` from, in the same order, and
+        // every call site of this function either already spread
+        // `executeResults` directly into currentResultsList (via
+        // renderAllModeCombinedResults, BEFORE this call resolves) or
+        // maps over it into a persisted `summarizedResults` copy AFTER
+        // this call resolves (see summarizeResultForHistory's own
+        // `.visualization` copy-through) - so mutating it in place here,
+        // once, is enough to reach both the live tab(s) and history.
+        attachVisualizationsToResultsList(executeResults, data.visualizations);
         return {
           databaseSummaries: Array.isArray(data.database_summaries) ? data.database_summaries : [],
           crossDatabaseSummary: data.cross_database_summary || null,
+          visualizations: data.visualizations || {},
         };
       } else if (data && data.error) {
         appendPhaseCErrorToSummaryTab(data.error);
@@ -10272,11 +10359,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
-  // --- Charting: rendering a single-connection result as a Chart.js chart ---
+  // --- Charting: rendering a result as a Chart.js chart ---
   //
-  // Single-connection mode's own post-execution summarization call (below)
-  // now rides along a "visualization" decision from the same LLM call -
-  // see translate_routes.py's _SINGLE_SUMMARY_SYSTEM_INSTRUCTION and
+  // Both single-connection mode's and "all databases" mode's own
+  // post-execution summarization calls (below) ride along zero or more
+  // "visualizations" decisions from the same LLM call - see
+  // summarize_routes.py's _SINGLE_SUMMARY_SYSTEM_INSTRUCTION/
+  // _SUMMARY_SYSTEM_INSTRUCTION and chart_helpers.py's _clean_visualizations/
   // _clean_visualization for the server-side design/validation. By the
   // time a `{chart_type, x_column, y_columns, series_column}` object
   // reaches this file, it has ALREADY been validated against the real
@@ -10285,12 +10374,12 @@ document.addEventListener('DOMContentLoaded', async () => {
   // trusts any other server response shape, rather than re-validating it a
   // second time.
   //
-  // Scope (matches the feature's own agreed v1 scope): single-connection
-  // mode only. "All databases" mode's own Summary/Note/per-database tabs
-  // (renderAllModeCombinedResults et al.) never carry a `.visualization`
-  // field at all - summarize_all_mode_results (Phase C) doesn't compute
-  // one - so nothing here needs an explicit guard against showing a chart
-  // there; it simply never has anything to show.
+  // Both pipelines can now offer MORE THAN ONE chart per turn - each
+  // qualifying result tab independently gets its own `.visualization`
+  // (see attachVisualizationsToResultsList below) - so everything from
+  // here down is written per-entry (one result object's own
+  // `.visualization`/`.chartView`) rather than assuming at most one
+  // chartable result exists for the whole turn.
 
   // In-flight Chart.js instance for whichever tab is currently showing a
   // chart - at most one at a time, since only the active tab is ever
@@ -10298,13 +10387,17 @@ document.addEventListener('DOMContentLoaded', async () => {
   // building a new one on the same <canvas>, or the two silently overlap.
   let resultsChartInstance = null;
 
-  // Separate in-flight Chart.js instance for the Summary tab's own small
-  // inline preview (see renderSummaryInlineChart()) - deliberately distinct
+  // In-flight Chart.js instances for the Summary tab's own small inline
+  // previews (see renderSummaryInlineChart()) - deliberately distinct
   // from resultsChartInstance above, since the two can be on screen at the
-  // same time (the Summary tab's preview canvas, and a full chart left
+  // same time (the Summary tab's preview canvas(es), and a full chart left
   // rendered on a different, inactive tab's own <canvas>); destroying one
-  // must never tear down the other.
-  let summaryInlineChartInstance = null;
+  // must never tear down the other. An ARRAY, not a single instance - the
+  // Summary tab can now show more than one preview at once (one per
+  // chartable entry - see chartableEntries in renderTableResult()'s isText
+  // branch), each with its own live Chart.js instance to track and tear
+  // down.
+  let summaryInlineChartInstances = [];
 
   const CHART_MAX_SERIES = 12; // sane cap on `series_column` grouping - see buildResultsChartConfig()'s own comment.
 
@@ -10602,11 +10695,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
-  function destroySummaryInlineChart() {
-    if (summaryInlineChartInstance) {
-      summaryInlineChartInstance.destroy();
-      summaryInlineChartInstance = null;
-    }
+  // Tears down EVERY currently-live Summary-tab preview instance at once
+  // (see summaryInlineChartInstances' own declaration comment) - called
+  // once per Summary-tab render pass, before rebuilding the fresh set of
+  // previews for whatever chartable entries this render actually has, not
+  // once per individual preview (which would risk destroying an instance
+  // built earlier in the very same render pass).
+  function destroySummaryInlineCharts() {
+    summaryInlineChartInstances.forEach((instance) => instance.destroy());
+    summaryInlineChartInstances = [];
   }
 
   // Draws `result.visualization` onto #resultsChartCanvas. Safe to call
@@ -10638,45 +10735,61 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (result && result.visualization && result.chartView !== false) {
       renderResultChart(result);
     }
-    // The Summary tab's own inline mini-chart (see renderSummaryInlineChart())
-    // reads the same live theme colors as the full-tab chart above, and
-    // needs the same refresh-on-theme-switch treatment. Re-rendering the
-    // whole tab (rather than reaching in and rebuilding just the <canvas>)
-    // is the simplest correct way to do that: renderTableResult() already
-    // knows how to find the chartable entry and rebuild the inline chart
-    // from scratch, so there's no separate rebuild path to keep in sync.
+    // The Summary tab's own inline mini-chart preview(s) (see
+    // renderSummaryInlineChart()) read the same live theme colors as the
+    // full-tab chart above, and need the same refresh-on-theme-switch
+    // treatment - EVERY preview currently showing, not just one.
+    // Re-rendering the whole tab (rather than reaching in and rebuilding
+    // each <canvas> individually) is the simplest correct way to do that:
+    // renderTableResult() already knows how to find every chartable entry
+    // and rebuild all of their inline previews from scratch, so there's no
+    // separate rebuild path to keep in sync.
     if (result && result.isText && result.tabLabel === 'Summary' && !result.summaryPending
       && currentResultsList.some((r) => r && r.visualization)) {
       renderTableResult(result);
     }
   }
 
-  // Finds, among `list`, the one result entry that visualization's own
-  // x_column/y_columns actually belong to, and tags it with `.visualization` -
-  // mirrors _pick_chartable_result/_clean_visualization's own server-side
-  // matching (there is, by construction, at most one such entry: the
-  // single chartable result _pick_chartable_result identified for this
-  // turn - see translate_routes.py's own docstring on that function).
-  // No-op when `visualization` is null (nothing to attach) or `list` isn't
-  // an array (e.g. a bare {error} entry list, which never has `.columns`
-  // to match against anyway - this would already no-op via `.find`
-  // finding nothing, this guard just skips the work).
+  // Attaches each entry of `visualizationsByIndex` (the server's own
+  // {"<index>": {chart_type, x_column, y_columns, series_column}, ...}
+  // object - see chart_helpers.py's _clean_visualizations/
+  // _describe_chartable_results and both summarize_routes.py pipelines'
+  // own docstrings) onto the matching position in `list`, as that
+  // entry's own `.visualization`. The server validates each key against
+  // the EXACT SAME 0-based index it computed _pick_chartable_results
+  // over (statement_results for single-connection mode, database_results
+  // for "all databases" mode) - the same array `list` is itself built
+  // from/kept in the same order as (see this function's own two call-site
+  // families below) - so a plain numeric-index lookup is exact, not a
+  // guess: no column-name matching is needed the way a single unindexed
+  // `visualization` field once required.
+  //
+  // No-op when `visualizationsByIndex` is null/empty (nothing to attach)
+  // or `list` isn't an array (e.g. a bare {error} entry list). An index
+  // with no corresponding `list` entry (out of range, or that position
+  // isn't a plain object) is silently skipped rather than throwing -
+  // defensive only, since a well-formed server response never produces
+  // one.
   //
   // Called on BOTH the live, on-screen currentResultsList entries AND the
   // separate `summarizedResults` copy executeSql() persists onto the turn
   // (see summarizeResultForHistory()) - two different sets of objects
-  // built from the same underlying rows, so the same visualization object
-  // is attached to each independently, by each call's own caller.
-  function attachVisualizationToResultsList(list, visualization) {
-    if (!visualization || !Array.isArray(list)) return;
-    const needed = [visualization.x_column, ...visualization.y_columns];
-    const match = list.find((r) => r && Array.isArray(r.columns) && needed.every((c) => r.columns.includes(c)));
-    if (match) match.visualization = visualization;
+  // built from the same underlying rows in the same order, so the same
+  // per-index visualization objects are attached to each independently,
+  // by each call's own caller.
+  function attachVisualizationsToResultsList(list, visualizationsByIndex) {
+    if (!visualizationsByIndex || !Array.isArray(list)) return;
+    Object.keys(visualizationsByIndex).forEach((key) => {
+      const index = Number(key);
+      if (!Number.isInteger(index) || index < 0 || index >= list.length) return;
+      const entry = list[index];
+      if (entry && typeof entry === 'object') entry.visualization = visualizationsByIndex[key];
+    });
   }
 
   // Keeps the CURRENT turn's own persisted copy (chatStore.lastTurn()'s
   // modelEntry.results - a separate set of objects from currentResultsList,
-  // see attachVisualizationToResultsList's own comment) in sync with a
+  // see attachVisualizationsToResultsList's own comment) in sync with a
   // live tab's chartView, so a choice survives stepping back and forward
   // through history (chatStore's undo()/redo()) without needing a fresh
   // execution to re-derive it. Matched by object identity: both copies
@@ -10751,33 +10864,47 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
-  // --- Chart discoverability: Summary tab inline preview + tab-strip badge ---
+  // --- Chart discoverability: Summary tab inline previews + tab-strip badges ---
   //
   // The Summary tab becomes the active tab the instant it's created (see
   // prependSingleModeSummaryTab()) - the model's own answer is the first
   // thing shown. That's exactly the problem for charting: a chart sitting
   // on some OTHER, now-inactive tab is otherwise invisible unless the user
-  // happens to click around the tab strip on their own. Two things fix
-  // that, together: buildResultsTabsNav() below tags that tab's own label
-  // with a small chart badge (persistently visible whenever the user DOES
-  // look at the tab strip), and renderSummaryInlineChart()/
-  // jumpToChartableResultTab() here render an actual small chart preview
-  // right under the Summary text, clickable straight through to the
-  // full-size version (summaryChartInlineLinkHtml() below is kept only as
-  // the plain-text fallback for the rare case Chart.js itself failed to
-  // load - see renderTableResult()'s isText branch, which is the only
-  // place that decides between the two).
+  // happens to click around the tab strip on their own - and now there can
+  // be MORE than one such tab in the same turn (see chart_helpers.py's
+  // _pick_chartable_results). Two things fix that, together:
+  // buildResultsTabsNav() below tags each qualifying tab's own label with
+  // a small chart badge (persistently visible whenever the user DOES look
+  // at the tab strip), and renderSummaryInlineChart()/
+  // jumpToChartableResultTab() here render one small chart preview per
+  // qualifying entry, stacked in a grid right under the Summary text (see
+  // .summary-chart-preview-grid in style.css), each independently
+  // clickable straight through to its own full-size tab
+  // (summaryChartInlineLinkHtml() below is kept only as the plain-text
+  // fallback - one link per entry, same as the previews - for the rare
+  // case Chart.js itself failed to load - see renderTableResult()'s isText
+  // branch, which is the only place that decides between the two).
 
-  // Jumps straight to whichever result tab in the CURRENT turn carries a
-  // validated visualization, and makes sure it lands showing the chart
-  // itself (not whatever Table/Chart state was left over from an earlier
-  // visit) - that's the whole point of the click. No-op if nothing in
-  // currentResultsList is chartable (shouldn't happen - the callout that
-  // triggers this is only ever rendered when one exists - but a no-op is
-  // cheaper than assuming that invariant always holds).
-  function jumpToChartableResultTab() {
+  // Jumps straight to ONE SPECIFIC result tab in the CURRENT turn - the
+  // one at `index`, always a currentResultsList index that genuinely
+  // carries a validated visualization (every caller below reads it off a
+  // chartableEntries entry it just built, never guesses) - and makes sure
+  // it lands showing the chart itself (not whatever Table/Chart state was
+  // left over from an earlier visit) - that's the whole point of the
+  // click. With more than one chartable result in the same turn, each
+  // preview/fallback-link's own trigger carries its OWN index (see
+  // data-view-chart-trigger's value below), so clicking the second
+  // preview jumps to the second chart's own tab, not always the first.
+  // `index` undefined/invalid (defensive only - shouldn't happen, since
+  // every trigger that calls this always carries a real index) falls back
+  // to the first chartable tab, the old single-chart behavior, rather
+  // than silently doing nothing.
+  function jumpToChartableResultTab(index) {
     if (!currentResultsList) return;
-    const idx = currentResultsList.findIndex((r) => r && r.visualization);
+    let idx = Number(index);
+    if (!Number.isInteger(idx) || !currentResultsList[idx] || !currentResultsList[idx].visualization) {
+      idx = currentResultsList.findIndex((r) => r && r.visualization);
+    }
     if (idx < 0) return;
     activeResultIndex = idx;
     const entry = currentResultsList[idx];
@@ -10789,54 +10916,93 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // Fallback only (see the comment block above): appended directly onto
   // the end of the Summary tab's own rendered text whenever Chart.js
-  // itself never loaded, so there's still SOME way to reach the chart tab
-  // even without a live preview to click on. A plain inline <button>
-  // styled as a text link (see .summary-chart-inline-link in style.css),
-  // so it reads as a natural trailing continuation of the summary itself
-  // rather than a UI control bolted on afterward. data-view-chart-trigger
-  // is handled by the same delegated #resultsBody click listener as the
-  // Report/feedback buttons below, for the same "rebuilt fresh on every
-  // render, so a persistent per-element listener would never survive a
-  // re-render" reason. Leading space keeps it from running into the
-  // summary's own last word.
-  function summaryChartInlineLinkHtml() {
-    return ' <button type="button" class="summary-chart-inline-link" data-view-chart-trigger>📊 View as chart</button>';
+  // itself never loaded, so there's still SOME way to reach each chart's
+  // own tab even without a live preview to click on - one link per
+  // chartable entry (`index` is that entry's own currentResultsList
+  // index, carried on data-view-chart-trigger so jumpToChartableResultTab()
+  // knows exactly which tab this particular link means), captioned "View
+  // as chart" alone when it's the only one, or numbered ("View chart 1 as
+  // chart", "View chart 2 as chart", ...) when there's more than one, so
+  // multiple fallback links are still distinguishable from each other. A
+  // plain inline <button> styled as a text link (see .summary-chart-
+  // inline-link in style.css), so it reads as a natural trailing
+  // continuation of the summary itself rather than a UI control bolted on
+  // afterward. data-view-chart-trigger is handled by the same delegated
+  // #resultsBody click listener as the Report/feedback buttons below, for
+  // the same "rebuilt fresh on every render, so a persistent per-element
+  // listener would never survive a re-render" reason. Leading space keeps
+  // it from running into the summary's own last word (or the previous
+  // link's own, when more than one is appended in a row).
+  function summaryChartInlineLinkHtml(entry, index, queryNumber, total) {
+    const label = total > 1 ? `View ${chartPreviewCaption(entry, queryNumber)}` : 'View as chart';
+    return ` <button type="button" class="summary-chart-inline-link" data-view-chart-trigger="${index}">📊 ${label}</button>`;
   }
 
-  // The Summary tab's own small, clickable chart preview - renders
-  // beside the summary text, inside the shared `.summary-text-chart-row`
-  // flex wrapper (see renderTableResult()'s isText branch, the only call
-  // site, and that CSS rule's own comment on the side-by-side layout)
-  // whenever this turn has a chartable tab and Chart.js is actually
-  // available. Reuses buildResultsChartConfig() exactly as the full-tab
-  // chart view does (same data, same colors), just with `compact: true`
-  // to drop axis titles this small a preview has no room for, and
-  // `options.events = []` to turn off Chart.js's own hover/tooltip/click
-  // handling - the whole point is a small, inert picture that reads as
-  // "click me", not a second fully-interactive chart competing with the
-  // real one a tab over. The <canvas> is wrapped in a plain <button
-  // data-view-chart-trigger> (same delegated click handling, same
-  // jumpToChartableResultTab() destination as the old text-link fallback
-  // above) so clicking anywhere on the preview - not just a caption below
-  // it - jumps straight to the full, interactive chart on its own tab.
-  function renderSummaryInlineChart(container, entry) {
+  // A short caption naming which result a Summary-tab preview belongs to
+  // - only actually shown once there's more than one preview on screen at
+  // once (see renderSummaryInlineChart()'s own use of `total`), since a
+  // single preview is already unambiguous without one. "all databases"
+  // mode's own entries carry `.database.name` (see execute_routes.py/
+  // buildAllModeSummaryPayload); single-connection mode's don't, so those
+  // fall back to the same "Query N" (1-based) convention buildResultsTabsNav()
+  // already uses for its own tab labels.
+  function chartPreviewCaption(entry, queryNumber) {
+    const dbName = entry && entry.database && entry.database.name;
+    return dbName ? `${dbName} - Query ${queryNumber}` : `Query ${queryNumber}`;
+  }
+
+  // ONE of the Summary tab's own small, clickable chart previews - renders
+  // into `container` (the shared `.summary-chart-preview-grid` wrapper -
+  // see renderTableResult()'s isText branch, the only call site, and that
+  // CSS rule's own comment on the grid-of-cards layout below the summary
+  // text) for a single chartable `entry` at its own currentResultsList
+  // `index`, whenever this turn has at least one chartable tab and
+  // Chart.js is actually available - called once per qualifying entry, so
+  // a turn with several independently chartable results gets one card per
+  // result, not just the first. Reuses buildResultsChartConfig() exactly
+  // as the full-tab chart view does (same data, same colors), just with
+  // `compact: true` to drop axis titles this small a preview has no room
+  // for, and `options.events = []` to turn off Chart.js's own hover/
+  // tooltip/click handling - the whole point is a small, inert picture
+  // that reads as "click me", not a second fully-interactive chart
+  // competing with the real one a tab over. The <canvas> is wrapped in a
+  // plain <button data-view-chart-trigger="{index}"> (same delegated
+  // click handling as the text-link fallback above, but now carrying
+  // THIS card's own index, since more than one can be on screen at once)
+  // so clicking anywhere on the card - not just its caption - jumps
+  // straight to that chart's own full, interactive tab. `total` (the
+  // number of chartable entries this render pass has, across every card)
+  // decides whether a caption is shown at all - see chartPreviewCaption's
+  // own comment on why one preview alone stays uncaptioned. The caller
+  // (renderTableResult()'s isText branch) is responsible for calling
+  // destroySummaryInlineCharts() ONCE before its own loop over every
+  // qualifying entry, not once per call here - see that function's own
+  // docstring for why.
+  function renderSummaryInlineChart(container, entry, index, queryNumber, total) {
     const wrapper = document.createElement('button');
     wrapper.type = 'button';
     wrapper.className = 'summary-chart-inline-preview';
-    wrapper.setAttribute('data-view-chart-trigger', '');
-    wrapper.setAttribute('aria-label', 'View as chart');
+    wrapper.setAttribute('data-view-chart-trigger', String(index));
+    wrapper.setAttribute('aria-label', `View ${chartPreviewCaption(entry, queryNumber)} as chart`);
 
     const canvas = document.createElement('canvas');
     canvas.className = 'summary-chart-inline-preview-canvas';
     wrapper.appendChild(canvas);
+    if (total > 1) {
+      const caption = document.createElement('span');
+      caption.className = 'summary-chart-inline-preview-caption';
+      caption.textContent = chartPreviewCaption(entry, queryNumber);
+      wrapper.appendChild(caption);
+    }
     container.appendChild(wrapper);
 
-    // `container` must already be attached to the document by the time
-    // this runs (see renderTableResult()'s isText branch, the only call
-    // site, which appends the row to `td` - and `td`'s own `tr` to the
-    // live resultsBody - before calling this) for `wrapper.clientWidth`
-    // just below to read a real, laid-out size rather than 0. `wrapper`
-    // itself (not the canvas - see buildResultsChartConfig()'s own
+    // `container`'s own PARENT (`chartRow`, the `.summary-text-chart-row`
+    // wrapper) must already be attached to the document by the time this
+    // runs (see renderTableResult()'s isText branch, the only call site,
+    // which appends `chartRow` to `td` - and `td`'s own `tr` to the live
+    // resultsBody - before calling this) for `wrapper.clientWidth` just
+    // below to read a real, laid-out size rather than 0. `wrapper` itself
+    // (not the canvas - see buildResultsChartConfig()'s own
     // `containerWidth` comment) is what's actually CSS-sized (flex: 0 0
     // 50% - see .summary-chart-inline-preview in style.css), so it's what
     // gets measured for the legend-scaling passed in here.
@@ -10844,8 +11010,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const config = buildResultsChartConfig(entry, entry.visualization, { compact: true, containerWidth });
     config.options = config.options || {};
     config.options.events = [];
-    destroySummaryInlineChart();
-    summaryInlineChartInstance = new Chart(canvas.getContext('2d'), config);
+    summaryInlineChartInstances.push(new Chart(canvas.getContext('2d'), config));
   }
 
   // --- Single-connection mode's own post-execution results summarization ---
@@ -10864,17 +11029,19 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Fire-and-await (see executeSql()'s call site - already inside an
   // async flow with buttons disabled). Best-effort, same posture as
   // requestAllModeResultsSummary: a failure here never fails the turn
-  // itself. Returns `{summaryText, visualization}` on success - `summaryText`
-  // is the SUMMARY_TAB_BLOCK_MARKER-prefixed summary text (server's own
-  // "*** NO SQL ***" convention stripped first - see stripNoSqlPrefix), or
-  // the server's own honest error text (also marked, so it reads the same
-  // way a real summary would) on failure; `visualization` is the server's
-  // already-validated {chart_type, x_column, y_columns, series_column}
-  // decision (see translate_routes.py's _clean_visualization), or null
-  // when this result set wasn't chartable/the model chose a table. Returns
-  // bare `null` (not an object) when there's nothing to show at all
-  // (abort, or no usable response) - every call site already guards on
-  // truthiness before touching either field, so this asymmetry is safe.
+  // itself. Returns `{summaryText, visualizations}` on success -
+  // `summaryText` is the SUMMARY_TAB_BLOCK_MARKER-prefixed summary text
+  // (server's own "*** NO SQL ***" convention stripped first - see
+  // stripNoSqlPrefix), or the server's own honest error text (also
+  // marked, so it reads the same way a real summary would) on failure;
+  // `visualizations` is the server's own {"<index>": {chart_type,
+  // x_column, y_columns, series_column}, ...} object (see
+  // chart_helpers.py's _clean_visualizations), already validated,
+  // possibly empty when nothing this turn was chartable/the model chose
+  // tables throughout. Returns bare `null` (not an object) when there's
+  // nothing to show at all (abort, or no usable response) - every call
+  // site already guards on truthiness before touching either field, so
+  // this asymmetry is safe.
   //
   // /api/summarize-result streams NDJSON the same way /api/summarize-
   // results does now (see that function's identical comment just above)
@@ -10896,10 +11063,10 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (response.ok && data && data.success && data.summary) {
         return {
           summaryText: stripNoSqlPrefix(data.summary),
-          visualization: data.visualization || null,
+          visualizations: data.visualizations || {},
         };
       } else if (data && data.error) {
-        return { summaryText: SUMMARY_TAB_BLOCK_MARKER + data.error, visualization: null };
+        return { summaryText: SUMMARY_TAB_BLOCK_MARKER + data.error, visualizations: {} };
       }
       return null;
     } catch (err) {
@@ -12113,6 +12280,20 @@ document.addEventListener('DOMContentLoaded', async () => {
     // untruncated result instead of the same capped preview the user was
     // actually shown at execution time.
     if (result.truncated) summarized.truncated = true;
+    // The actual SQL text that produced this result - buildResultsTabsNav()
+    // reads it (via `res.query || res.sql || res.statement`) to set each
+    // tab's hover title. The error branch above already preserved this via
+    // `.statement`; this success branch never did, which silently dropped
+    // every successful tab's hover-SQL the moment its turn was persisted to
+    // history - a fresh execute's own live `data.results` (never round-
+    // tripped through this function) always had it, so the bug only ever
+    // showed up after stepping back to a turn, or reloading the page and
+    // restoring the last one. `result.statement` covers every real backend
+    // (see backends/base.py's execute() docstring); `.query`/`.sql` are
+    // included too since that's the exact same fallback chain
+    // buildResultsTabsNav() itself already checks.
+    const statementText = result.query || result.sql || result.statement;
+    if (statementText) summarized.statement = statementText;
     // "All databases" mode results are tagged with which connection they
     // came from (see execute_routes.py and buildResultsTabsNav()'s dbLabel)
     // - preserve that tag so a later history restore can still label each
@@ -12121,7 +12302,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     // columns/rows/rowCount/error and ignores unknown keys, so this is
     // harmless for what actually reaches the LLM.
     if (result.database) summarized.database = result.database;
-    // Same idea, for charting (see attachVisualizationToResultsList's own
+    // Same idea, for charting (see attachVisualizationsToResultsList's own
     // docstring) - a defensive belt-and-suspenders copy for whichever call
     // site happens to attach `.visualization` onto `result` BEFORE this
     // function runs over it; every current call site also re-attaches it
@@ -12339,17 +12520,17 @@ document.addEventListener('DOMContentLoaded', async () => {
             hideAllModeStreamStatus();
             if (summaryResult) {
               singleModeSummary = summaryResult.summaryText;
-              // Tags whichever one of THIS turn's own result tabs the
-              // visualization actually belongs to - see
-              // attachVisualizationToResultsList's own docstring. Applied to
-              // both the live, on-screen entries (data.results - the same
-              // objects currentResultsList already points at, via
+              // Tags whichever of THIS turn's own result tabs each
+              // visualization actually belongs to (zero, one, or several) -
+              // see attachVisualizationsToResultsList's own docstring.
+              // Applied to both the live, on-screen entries (data.results -
+              // the same objects currentResultsList already points at, via
               // renderMultiTurnResults(data.results) just above) and the
               // separate summarizedResults copy below that actually gets
               // persisted onto the turn, since the two are different
               // objects built from the same underlying rows.
-              attachVisualizationToResultsList(data.results, summaryResult.visualization);
-              attachVisualizationToResultsList(summarizedResults, summaryResult.visualization);
+              attachVisualizationsToResultsList(data.results, summaryResult.visualizations);
+              attachVisualizationsToResultsList(summarizedResults, summaryResult.visualizations);
             }
             if (singleModeSummary) prependSingleModeSummaryTab(singleModeSummary);
           }
@@ -12524,24 +12705,25 @@ document.addEventListener('DOMContentLoaded', async () => {
           // Same "no real question to summarize against" guard the
           // success branch uses.
           let singleModeSummary = null;
-          let singleModeVisualization = null;
+          let singleModeVisualizations = null;
           if (promptText !== "[Direct SQL Execution]") {
             showAllModeSummarizingStatus();
             const summaryResult = await requestSingleModeResultsSummary(promptText, sql, statementResults);
             hideAllModeStreamStatus();
             if (summaryResult) {
               singleModeSummary = summaryResult.summaryText;
-              singleModeVisualization = summaryResult.visualization;
-              // Tags whichever succeeded-before-the-failure statement this
-              // belongs to (the failed statement itself is never chartable -
-              // it's an {error} entry, with no `.columns` to match against)
-              // - see attachVisualizationToResultsList's own docstring.
+              singleModeVisualizations = summaryResult.visualizations;
+              // Tags whichever succeeded-before-the-failure statement(s)
+              // each visualization belongs to (the failed statement itself
+              // is never chartable - it's an {error} entry, so it can never
+              // be a key _pick_chartable_results assigned) - see
+              // attachVisualizationsToResultsList's own docstring.
               // statementResults shares its succeeded entries' object
               // references with currentResultsList (both were built from
               // data.results by renderResultsWithFailedStatement just
-              // above), so this alone is enough to make the live tab
+              // above), so this alone is enough to make the live tab(s)
               // chartable too, not just the persisted copy below.
-              attachVisualizationToResultsList(statementResults, singleModeVisualization);
+              attachVisualizationsToResultsList(statementResults, singleModeVisualizations);
             }
             // Preserves the active tab (the just-rendered failure, which
             // is what needs the user's attention) rather than stealing
@@ -12563,7 +12745,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           // Separate objects from statementResults' own (see
           // summarizeResultForHistory) - re-tag this copy too, same as the
           // success branch does for its own summarizedResults.
-          attachVisualizationToResultsList(summarizedResults, singleModeVisualization);
+          attachVisualizationsToResultsList(summarizedResults, singleModeVisualizations);
           if (chatStore.getPending() && !chatStore.isPendingCurrent()) {
             chatStore.clearPending();
           }

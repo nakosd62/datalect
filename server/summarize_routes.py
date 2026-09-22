@@ -97,7 +97,7 @@ from concurrency_guard import TRANSLATE_GUARD, busy_response
 from rate_limiter import summarize_rate_limit
 from prompt_loader import load_prompt
 from llm_providers import format_results_table_text, format_llm_error_for_user, get_llm_provider
-from chart_helpers import _pick_chartable_result, _describe_chartable_columns, _clean_visualization
+from chart_helpers import _pick_chartable_results, _describe_chartable_results, _clean_visualizations
 
 summarize_bp = Blueprint('summarize', __name__)
 
@@ -135,7 +135,7 @@ def get_summary_schema_text(descriptor, user_identity):
 _SUMMARY_SYSTEM_INSTRUCTION = load_prompt("summary_all_databases.txt")
 
 
-def _build_summary_prompt(user_question, database_results, expected_language_code=None):
+def _build_summary_prompt(user_question, database_results, chartable_by_index=None, expected_language_code=None):
     """Renders `database_results` - client-submitted
     [{"name", "sql", "columns", "rows", "rowCount"} | {"name", "note"} |
     {"name", "error"} | {"name", "sql", "error"}, ...], one entry per
@@ -146,10 +146,20 @@ def _build_summary_prompt(user_question, database_results, expected_language_cod
     Phase C had no SQL in its prompt at all, only the raw results/errors,
     despite the design's own LLM-3 input spec calling for "generated SQL
     for all in-scope databases"), followed by one labeled results block
-    per entry, same as before. A note/generation-failure entry has no
-    `sql` (nothing was ever generated to run for it) and is simply
-    skipped in the SQL section, same as it's already skipped from having
-    a results block below.
+    per entry, same as before, then the "Chartable result sets" section
+    (see _describe_chartable_results) describing `chartable_by_index`. A
+    note/generation-failure entry has no `sql` (nothing was ever generated
+    to run for it) and is simply skipped in the SQL section, same as it's
+    already skipped from having a results block below.
+
+    `chartable_by_index` - the caller's own _pick_chartable_results(
+    database_results) return value (see that function's docstring),
+    computed once and threaded through here (rather than recomputed) so
+    the "Chartable result sets" section below always describes the exact
+    same entries _clean_summary_response will later validate the model's
+    "visualizations" choices against. None (the default - every existing
+    caller/test that never mentions charting at all) is treated as "nothing
+    chartable", same as an explicit {}.
 
     Real result rows are capped at SUMMARY_RESULTS_MAX_ROWS (Gap 5's fix
     made this call reason over "the complete results/errors from all tabs
@@ -199,8 +209,10 @@ def _build_summary_prompt(user_question, database_results, expected_language_cod
     sql_section = f"SQL executed for each database:\n\n{sql_joiner.join(sql_blocks)}\n\n" if sql_blocks else ""
 
     blocks = []
+    names_by_index = {}
     for i, entry in enumerate(database_results or []):
         name = entry.get("name") or "Unknown database"
+        names_by_index[i] = name
         error = entry.get("error")
         note = entry.get("note")
         if error:
@@ -219,6 +231,13 @@ def _build_summary_prompt(user_question, database_results, expected_language_cod
             )
             blocks.append(header + "\n" + format_results_table_text(cols, rows, max_rows=SUMMARY_RESULTS_MAX_ROWS))
     results_text = "\n\n".join(blocks) if blocks else "(no databases returned anything)"
+    # Same "[i] name" labeling the results blocks above already use, so a
+    # chartable entry's own line in the "Chartable result sets" section
+    # reads as an obvious cross-reference to the results block the model
+    # just saw immediately above, not an unrelated second numbering scheme.
+    chartable_section = _describe_chartable_results(
+        chartable_by_index or {}, lambda i: f"[{i}] {names_by_index.get(i, 'Unknown database')}",
+    )
     # The trailing reminder repeats _SUMMARY_SYSTEM_INSTRUCTION's own
     # language-matching rule right here, at the very end of the actual
     # user-turn content rather than only up in the system instruction -
@@ -244,6 +263,7 @@ def _build_summary_prompt(user_question, database_results, expected_language_cod
         f"Original question: {user_question}\n\n"
         f"{sql_section}"
         f"Results gathered from each database queried to help answer it:\n\n{results_text}\n\n"
+        f"{chartable_section}\n"
         "Reminder: write your response - the label line AND every paragraph - in the SAME "
         "LANGUAGE as the \"Original question\" above, no matter what language the database/table "
         "names or the results data shown above happen to be in." + named_language_sentence
@@ -625,11 +645,12 @@ def _build_all_mode_schema_block(database_results, user_identity):
     return "Database schema for each database queried:\n\n" + "\n\n".join(blocks) + "\n\n"
 
 
-def _clean_summary_response(raw_text, num_databases):
+def _clean_summary_response(raw_text, num_databases, chartable_by_index=None):
     """Parses Phase C's structured JSON response (see
     _SUMMARY_SYSTEM_INSTRUCTION) into
       {"label": <non-empty str>, "per_database": {int_index: <non-empty str>, ...},
-       "cross_database": <non-empty str> | None}
+       "cross_database": <non-empty str> | None,
+       "visualizations": {int_index: <_clean_visualization's shape>, ...}}
     or None (unparseable, or missing/incomplete required content) - the
     caller's bounded retry (_summarize_with_retry, via the content_parser
     it's given) treats None exactly like an empty/invalid response used to
@@ -646,10 +667,20 @@ def _clean_summary_response(raw_text, num_databases):
     triage, a gap for ANY index in range(num_databases) invalidates the
     WHOLE response, giving the bounded retry loop another attempt instead
     of silently showing a summary with one database's paragraph missing.
+    "visualizations", by contrast, is validated leniently exactly like
+    single-connection mode's own equivalent field: _clean_visualizations
+    returning {} (no charts at all) is always a fine, valid outcome, never
+    a reason to retry - only "label"/"per_database" failing validation is.
 
     `num_databases` is the caller's own len(database_results) - see
     _build_summary_prompt's docstring for why its "[i]" indices already
-    match this same 0-based numbering.
+    match this same 0-based numbering. `chartable_by_index` is that same
+    caller's own _pick_chartable_results(database_results) return value
+    (see that function's docstring) - the same dict _build_summary_prompt's
+    own "Chartable result sets" section described to the model, so
+    "visualizations" is validated against exactly what was actually on
+    offer. None (the default) is treated as "nothing chartable", same as
+    an explicit {}.
 
     "cross_database" is optional (see _SUMMARY_SYSTEM_INSTRUCTION - only
     meant to be written when the question genuinely asks for something
@@ -689,16 +720,21 @@ def _clean_summary_response(raw_text, num_databases):
     cross_database = parsed.get("cross_database")
     cross_database = cross_database.strip() if isinstance(cross_database, str) and cross_database.strip() else None
 
-    return {"label": label, "per_database": per_database, "cross_database": cross_database}
+    visualizations = _clean_visualizations(parsed.get("visualizations"), chartable_by_index or {})
+
+    return {
+        "label": label, "per_database": per_database, "cross_database": cross_database,
+        "visualizations": visualizations,
+    }
 
 
-def _make_summary_content_parser(num_databases):
-    """Binds `num_databases` into a content_parser closure for
-    _summarize_with_retry - see _clean_summary_response above for the
-    actual validation. A small wrapper rather than a lambda so it's
-    consistent with, and greppable alongside, _default_content_parser."""
+def _make_summary_content_parser(num_databases, chartable_by_index=None):
+    """Binds `num_databases`/`chartable_by_index` into a content_parser
+    closure for _summarize_with_retry - see _clean_summary_response above
+    for the actual validation. A small wrapper rather than a lambda so
+    it's consistent with, and greppable alongside, _default_content_parser."""
     def _parser(text):
-        return _clean_summary_response(text, num_databases)
+        return _clean_summary_response(text, num_databases, chartable_by_index)
     return _parser
 
 
@@ -749,20 +785,37 @@ def summarize_all_mode_results(user_question, database_results, provider, client
     just builds the Phase-C-specific prompt/schema_block ahead of
     delegating.
 
+    Also decides, ride-along with the summary (one LLM call, not a second
+    round trip) - same as single-connection mode's own equivalent call -
+    whether any of `database_results`' own entries are chartable.
+    _pick_chartable_results computed once here and threaded into both the
+    prompt (_describe_chartable_results, via _build_summary_prompt) and
+    the response validation (_clean_visualizations, via
+    _make_summary_content_parser), so the two can never disagree about
+    which entries/columns were actually on offer. Unlike single-connection
+    mode (which only ever charts the ONE connection's own results), this
+    can chart MORE THAN ONE entry per turn - two different databases (or
+    two statements from the same one) can each independently qualify, and
+    each gets its own key in "visualizations".
+
     Returns (parsed, usage, error) on success/failure - `parsed`, when not
     None, is exactly _clean_summary_response's own returned shape
-    ({"label", "per_database", "cross_database"} - see its docstring),
-    never the model's raw JSON text. See _summarize_with_retry's docstring
-    for the exact meaning of `error` on failure."""
+    ({"label", "per_database", "cross_database", "visualizations"} - see
+    its docstring), never the model's raw JSON text. See
+    _summarize_with_retry's docstring for the exact meaning of `error` on
+    failure."""
     expected_language_code = translate_routes._detect_language(user_question)
-    prompt_content = _build_summary_prompt(user_question, database_results, expected_language_code)
+    chartable_by_index = _pick_chartable_results(database_results)
+    prompt_content = _build_summary_prompt(
+        user_question, database_results, chartable_by_index, expected_language_code,
+    )
     schema_block = _build_all_mode_schema_block(database_results, user_identity)
     num_databases = len(database_results or [])
     return (yield from _summarize_with_retry(
         prompt_content, schema_block, _SUMMARY_SYSTEM_INSTRUCTION, provider, client, model,
         api_key=api_key, tried_keys=tried_keys, using_byok=using_byok,
         log_label="Phase C summarization", expected_language_code=expected_language_code,
-        content_parser=_make_summary_content_parser(num_databases),
+        content_parser=_make_summary_content_parser(num_databases, chartable_by_index),
         language_text_extractor=_summary_language_text,
         invalid_content_error="response was not valid, complete per-database summary JSON",
     ))
@@ -800,7 +853,8 @@ def summarize_results():
     followed by exactly one terminal line:
       {"status": "done", "success": true, "summary": "...",
        "database_summaries": [{"kind", "id", "name", "text"}, ...],
-       "cross_database_summary": "..." | null}
+       "cross_database_summary": "..." | null,
+       "visualizations": {"<index>": {"chart_type", "x_column", "y_columns", "series_column"}, ...}}
       or, on failure (retry/rotation budget exhausted, or 2 consecutive
       content-invalid responses):
       {"status": "done", "success": false, "error": "..."}
@@ -824,12 +878,15 @@ def summarize_results():
     "text" combining every one of that database's own resultset
     paragraphs (newline-joined, so they render as sub-paragraphs nested
     under one heading rather than that heading repeating once per
-    resultset), not one entry per resultset. "database_summaries" and
-    "cross_database_summary" are purely ADDITIVE new fields alongside that
-    unchanged "summary" string (Chunk 1's own sql_blocks precedent) - the
-    per-database split callers need to record separate per-database turns
-    later, and the cross-database paragraph split out on its own, distinct
-    from any one database's paragraph.
+    resultset), not one entry per resultset. "database_summaries",
+    "cross_database_summary", and "visualizations" are purely ADDITIVE new
+    fields alongside that unchanged "summary" string (Chunk 1's own
+    sql_blocks precedent) - the per-database split callers need to record
+    separate per-database turns later, the cross-database paragraph split
+    out on its own distinct from any one database's paragraph, and
+    "visualizations" (see _clean_visualizations) giving client.js zero or
+    more validated per-entry chart decisions to render instead of/alongside
+    the affected result tab's own table.
     The two early-validation returns below (missing API key, missing
     prompt/database_results) happen before any of this and keep their
     real plain-JSON 400 responses, exactly as /api/translate's own two
@@ -969,6 +1026,19 @@ def summarize_results():
             'status': 'done', 'success': True, 'summary': summary_text,
             'database_summaries': database_summaries,
             'cross_database_summary': cross_database_summary,
+            # Flat, keyed by the SAME 0-based index `database_results` (the
+            # request body the client itself built) was indexed by - NOT
+            # grouped by database the way database_summaries above is: a
+            # chart addresses one specific statement's own columns/rows, so
+            # it can't be joined across a database's several resultsets the
+            # way summary paragraphs are. The client already knows which of
+            # its own result tabs each index refers to, since it built
+            # database_results in that same order (see client.js's
+            # buildAllModeSummaryPayload/requestAllModeResultsSummary).
+            # Already fully validated against the real executed columns/
+            # rows (see _clean_visualizations) - client.js trusts this at
+            # face value, same as every other server response shape.
+            'visualizations': parsed.get("visualizations") or {},
         }) + "\n"
 
     # See concurrency_guard.py's own module docstring - TRANSLATE_GUARD,
@@ -1024,17 +1094,19 @@ def summarize_results():
 # treating a nice-to-have's failure as a turn failure.
 #
 # This call also decides, "ride-along" with the summary (one LLM call,
-# not a second round trip), whether the results are worth showing as a
-# chart instead of only a table - see _SINGLE_SUMMARY_SYSTEM_INSTRUCTION's
-# own "visualization" paragraph below and _clean_single_summary_response.
-# The model's own judgment about WHETHER charting is even possible is
-# never trusted on its own: _pick_chartable_result decides that server-
-# side, from the real executed statement_results, before the model is
-# ever asked anything - a multi-statement result, a single-row result, or
-# a result with no numeric column at all is never offered a chart no
-# matter what the model might otherwise claim, and its own x_column/
-# y_columns/series_column choices are re-validated against the real
-# columns (and, for y_columns, the real row VALUES - see
+# not a second round trip), whether the results are worth showing as one
+# or more charts instead of only tables - see
+# _SINGLE_SUMMARY_SYSTEM_INSTRUCTION's own "visualizations" paragraph
+# below and _clean_single_summary_response. The model's own judgment
+# about WHICH result sets charting is even possible for is never trusted
+# on its own: _pick_chartable_results decides that server-side, from the
+# real executed statement_results, before the model is ever asked
+# anything - EVERY qualifying entry (2+ rows, at least one numeric
+# column, real tabular columns/rows) is independently offered a chart, so
+# a multi-statement script with several genuinely chartable result sets
+# can get a chart for each one, not just a single favorite - and its own
+# x_column/y_columns/series_column choices, per entry, are re-validated
+# against the real columns (and, for y_columns, the real row VALUES - see
 # _column_looks_numeric) rather than trusted on faith, the same "never
 # blindly trust LLM output" posture this app already applies to generated
 # SQL (see translate_query()'s own docstring).
@@ -1043,7 +1115,7 @@ def summarize_results():
 _SINGLE_SUMMARY_SYSTEM_INSTRUCTION = load_prompt("summary_single_connection.txt")
 
 
-def _build_single_summary_prompt(user_question, sql, statement_results, chartable_entry, expected_language_code=None):
+def _build_single_summary_prompt(user_question, sql, statement_results, chartable_by_index, expected_language_code=None):
     """Renders `statement_results` - client-submitted [{"columns", "rows",
     "rowCount"} | {"note"} | {"error"}, ...], one entry per SQL statement
     /api/execute actually ran for this turn - into one labeled text block
@@ -1058,12 +1130,16 @@ def _build_single_summary_prompt(user_question, sql, statement_results, chartabl
     many are shown, so the model isn't misled into thinking it saw
     everything.
 
-    `chartable_entry` - _pick_chartable_result(statement_results)'s own
-    return value, computed once by the caller and threaded through here
-    (rather than recomputed) so the "Chartable columns" section below
-    always describes the exact same entry _clean_single_summary_response
-    will later validate the model's "visualization" choice against - see
-    _describe_chartable_columns for the rendering itself.
+    `chartable_by_index` - _pick_chartable_results(statement_results)'s
+    own return value ({index: entry} for every independently qualifying
+    result), computed once by the caller and threaded through here
+    (rather than recomputed) so the "Chartable result sets" section below
+    always describes the exact same entries _clean_single_summary_response
+    will later validate the model's "visualizations" choices against - see
+    _describe_chartable_results for the rendering itself. Each entry is
+    labeled "Query Result {index + 1}", matching the same 1-based
+    numbering the "Query Result N" blocks above already use, so the model
+    sees one consistent numbering throughout this whole prompt.
 
     `expected_language_code` - see _build_summary_prompt's own docstring
     for what this is and why it's threaded through from the caller rather
@@ -1103,33 +1179,35 @@ def _build_single_summary_prompt(user_question, sql, statement_results, chartabl
         f"Original question: {user_question}\n\n"
         f"SQL executed:\n{sql}\n\n"
         f"Results:\n\n{results_text}\n\n"
-        f"{_describe_chartable_columns(chartable_entry)}\n"
+        f"{_describe_chartable_results(chartable_by_index, lambda i: f'Query Result {i + 1}')}\n"
         "Reminder: write your response - the label line AND every paragraph of \"summary\" - in "
         "the SAME LANGUAGE as the \"Original question\" above, no matter what language the schema, "
         "SQL, or results data shown above happen to be in." + named_language_sentence
     )
-def _clean_single_summary_response(raw_text, chartable_entry):
+def _clean_single_summary_response(raw_text, chartable_by_index):
     """Parses the single-connection summarization call's structured JSON
     response (see _SINGLE_SUMMARY_SYSTEM_INSTRUCTION) into
-      {"summary": <non-empty str>, "visualization": <_clean_visualization's
-       shape> | None}
+      {"summary": <non-empty str>, "visualizations": <_clean_visualizations'
+       shape - {index: _clean_visualization's shape}>}
     or None (unparseable, or "summary" itself is missing/invalid - the
     caller's bounded retry, via _summarize_with_retry's content_parser,
     treats None exactly like an empty/invalid response always was before
     this call moved off free-text prose). Mirrors _clean_summary_response's
     JSON-via-strip_markdown_fence-then-json.loads shape closely - see that
     function's own docstring - adapted to this call's own "summary" +
-    "visualization" envelope instead of Phase C's per-database one.
+    "visualizations" envelope instead of Phase C's per-database one.
 
     "summary" is validated exactly like the old free-text contract
     (_default_content_parser) always was: a non-empty, non-label-only
     stripped string. A malformed/missing "summary" invalidates the WHOLE
     response (returns None, giving the bounded retry another attempt) -
     same as a missing per-database paragraph does for Phase C - since
-    there's nothing sensible to show in its place. "visualization", by
-    contrast, is validated leniently: _clean_visualization returning None
-    (a table) is always a fine, valid outcome, never a reason to retry -
-    only "summary" itself failing validation is."""
+    there's nothing sensible to show in its place. "visualizations", by
+    contrast, is validated leniently: _clean_visualizations silently drops
+    any entry that's invalid/unknown/absent rather than ever invalidating
+    the whole response - an empty {} result is always a fine, valid
+    outcome, never a reason to retry - only "summary" itself failing
+    validation is."""
     if not raw_text:
         return None
     cleaned = strip_markdown_fence(raw_text)
@@ -1145,26 +1223,26 @@ def _clean_single_summary_response(raw_text, chartable_entry):
         return None
     summary = summary.strip()
 
-    visualization = _clean_visualization(parsed.get("visualization"), chartable_entry)
-    return {"summary": summary, "visualization": visualization}
+    visualizations = _clean_visualizations(parsed.get("visualizations"), chartable_by_index)
+    return {"summary": summary, "visualizations": visualizations}
 
 
-def _make_single_summary_content_parser(chartable_entry):
-    """Binds `chartable_entry` into a content_parser closure for
+def _make_single_summary_content_parser(chartable_by_index):
+    """Binds `chartable_by_index` into a content_parser closure for
     _summarize_with_retry - see _clean_single_summary_response above for
     the actual validation. A small wrapper rather than a lambda so it's
     consistent with, and greppable alongside, _make_summary_content_parser
     (Phase C's own equivalent binder)."""
     def _parser(text):
-        return _clean_single_summary_response(text, chartable_entry)
+        return _clean_single_summary_response(text, chartable_by_index)
     return _parser
 
 
 def _single_summary_language_text(parsed):
     """language_text_extractor for this call's JSON-mode content_parser -
     mirrors Phase C's own _summary_language_text, adapted to this call's
-    "summary" + "visualization" shape: only "summary" is ever prose worth
-    running _detect_language over ("visualization" is column names/enum
+    "summary" + "visualizations" shape: only "summary" is ever prose worth
+    running _detect_language over ("visualizations" is column names/enum
     values, not natural language)."""
     return parsed.get("summary") or ""
 
@@ -1190,19 +1268,19 @@ def summarize_single_connection_results(user_question, schema, sql, statement_re
 
     Also decides, ride-along with the summary (see this file's "Single-
     connection mode's own post-execution results summarization" section
-    comment), whether the results are chartable - _pick_chartable_result
-    computed once here and threaded into both the prompt
-    (_describe_chartable_columns, via _build_single_summary_prompt) and
-    the response validation (_clean_visualization, via
+    comment), which results (zero, one, or several) are chartable -
+    _pick_chartable_results computed once here and threaded into both the
+    prompt (_describe_chartable_results, via _build_single_summary_prompt)
+    and the response validation (_clean_visualizations, via
     _make_single_summary_content_parser), so the two can never disagree
-    about which columns were actually on offer.
+    about which entries/columns were actually on offer.
 
     GENERATOR (see _summarize_with_retry's own docstring): `yield from`s
     that function directly, so its live 'retrying' progress lines pass
     straight through unchanged - this function adds none of its own.
 
     Returns (parsed, usage, error) - `parsed` is exactly
-    _clean_single_summary_response's own {"summary", "visualization"}
+    _clean_single_summary_response's own {"summary", "visualizations"}
     dict, or None on failure (see _summarize_with_retry's docstring for
     the exact meaning of `usage`/`error` in that case) - NOT yet unwrapped
     into a plain summary string; that stays the caller's job (see
@@ -1210,16 +1288,16 @@ def summarize_single_connection_results(user_question, schema, sql, statement_re
     presentation-wrapped" contract summarize_all_mode_results' own
     {"label", "per_database", "cross_database"} return already has."""
     expected_language_code = translate_routes._detect_language(user_question)
-    chartable_entry = _pick_chartable_result(statement_results)
+    chartable_by_index = _pick_chartable_results(statement_results)
     prompt_content = _build_single_summary_prompt(
-        user_question, sql, statement_results, chartable_entry, expected_language_code,
+        user_question, sql, statement_results, chartable_by_index, expected_language_code,
     )
     return (yield from _summarize_with_retry(
         prompt_content, f"Database Schema:\n{schema}\n\n", _SINGLE_SUMMARY_SYSTEM_INSTRUCTION, provider, client, model,
-        content_parser=_make_single_summary_content_parser(chartable_entry),
+        content_parser=_make_single_summary_content_parser(chartable_by_index),
         language_text_extractor=_single_summary_language_text,
-        invalid_content_error="response was not the expected {\"summary\": ..., \"visualization\": ...} JSON shape, "
-                               "or \"summary\" itself was empty/label-only",
+        invalid_content_error="response was not the expected {\"summary\": ..., \"visualizations\": {...}} JSON "
+                               "shape, or \"summary\" itself was empty/label-only",
         api_key=api_key, tried_keys=tried_keys, using_byok=using_byok,
         log_label="Single-connection results summarization", expected_language_code=expected_language_code,
     ))
@@ -1338,21 +1416,22 @@ def summarize_result():
             return
 
         # `parsed` is summarize_single_connection_results' own
-        # {"summary", "visualization"} dict (see its own docstring) - only
+        # {"summary", "visualizations"} dict (see its own docstring) - only
         # "summary" gets the "*** NO SQL ***" prefix/translations-table
-        # logging treatment; "visualization" (already fully validated
-        # against the real executed columns/rows - see _clean_
-        # visualization) rides along in the response as-is, for client.js
-        # to render as a chart instead of/alongside the results table when
-        # it's not None.
+        # logging treatment; "visualizations" (each entry already fully
+        # validated against the real executed columns/rows - see _clean_
+        # visualizations/_clean_visualization) rides along in the response
+        # as-is, keyed by the same 0-based statement_results index it was
+        # validated against, for client.js to render as a chart instead
+        # of/alongside the results table for each qualifying Query Result.
         summary_text = "*** NO SQL *** " + parsed["summary"]
-        visualization = parsed["visualization"]
+        visualizations = parsed["visualizations"]
         # Call 3 (summarization) is deliberately never recorded in the
         # translations-table history/stats - see the comment on this
         # function's own failure branch above for why.
 
         yield json.dumps({
-            'status': 'done', 'success': True, 'summary': summary_text, 'visualization': visualization,
+            'status': 'done', 'success': True, 'summary': summary_text, 'visualizations': visualizations,
         }) + "\n"
 
     def _stream_summarize_result_with_guard_release():

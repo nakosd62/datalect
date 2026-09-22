@@ -84,20 +84,19 @@
   --font-mono: 'Fira Code', 'Courier New', Courier, monospace;
 
   /* Color Palette */
-  /* Warmed very slightly off pure navy-black, and given a bit more
-     separation from --surface-1 below - the two used to sit close enough
-     in value that .results-container (background-color: var(--surface-1))
-     read as flush against the page rather than as its own lifted panel.
-     .results-container itself no longer paints that background at all any
-     more (see its own comment - removed per a later, explicit "no visible
-     box around the results area" request), so this separation's only
-     surviving job is every OTHER --surface-1 use (modals, dropdowns, the
-     guided tour tooltip, and so on) still reading as lifted panels of
-     their own. */
-  --bg-dark: #0b0f14;
-  --bg-card: rgba(19, 26, 36, 0.65);
+  /* NEUTRAL GRAPHITE PASS (per explicit request - the previous --bg-dark/
+     --bg-card/--bg-input all carried a cool navy cast, e.g. --bg-dark's old
+     #0b0f14 has R11/G15/B20 - blue consistently the highest channel by a
+     wide margin - which read as "bluish" rather than a true dark gray).
+     Each value below keeps its original lightness (so nothing that was
+     tuned against it for contrast needs retuning) but flattens the hue to
+     R=G=B - true graphite instead of navy. Scoped to dark mode only, same
+     as the light theme's own near-white surfaces below, which were never
+     part of this complaint. */
+  --bg-dark: #0f0f0f;
+  --bg-card: rgba(27, 27, 27, 0.65);
   --bg-card-border: rgba(255, 255, 255, 0.08);
-  --bg-input: rgba(11, 15, 20, 0.85);
+  --bg-input: rgba(15, 15, 15, 0.85);
 
   /* Toned down from the original #10b981 ("Glowing CockroachDB green") in
      two passes per explicit request, each keeping the same hue and
@@ -158,16 +157,17 @@
      secondary text. */
   --text-footer: #3a4756;
 
-  /* Modal/dropdown/table "surface" scale - previously hardcoded slate
-     hexes (#0f172a/#1e293b/#334155/#131d31) repeated throughout the
-     results table, tab bar, modal cards, and dropdown menus. --surface-1
-     (also .results-container's own background) moved a step further from
-     --bg-dark above - see that token's own comment - the rest of the
-     scale keeps its original spacing, just carried along the same shift. */
-  --surface-1: #131a24;
-  --surface-2: #1c2531;
-  --surface-3: #2b3644;
-  --surface-stripe: #161d29;
+  /* Modal/dropdown/table "surface" scale - this is the scale
+     .result-tab-btn/table header/table row backgrounds actually ride on
+     (see NEUTRAL GRAPHITE PASS above - same flatten-the-hue-keep-the-
+     lightness treatment, since these three are exactly "the results
+     headers and table rows" the bluish-tint complaint called out). Each
+     one keeps its original spacing/lightness relative to --bg-dark above,
+     just with the navy cast removed. */
+  --surface-1: #1b1b1b;
+  --surface-2: #262626;
+  --surface-3: #373737;
+  --surface-stripe: #1f1f1f;
 
   /* Generic translucent-white "wash" tiers - borders/hovers/chip
      backgrounds that used to be one-off rgba(255,255,255,0.0N) literals.
@@ -231,10 +231,11 @@
   --modal-scrim: rgba(var(--scrim-rgb), 0.7);
 
   /* .table-responsive/.stats-card-vertical's own "recessed input-like
-     panel" background - same rgb as --bg-input's dark-theme value, but
-     needs its own alpha so it stays valid once --bg-input goes solid
-     (opaque, no alpha channel at all) in the light theme below. */
-  --recessed-panel-bg: rgba(11, 15, 20, 0.45);
+     panel" background - same rgb as --bg-input's dark-theme value (see
+     NEUTRAL GRAPHITE PASS above), but needs its own alpha so it stays
+     valid once --bg-input goes solid (opaque, no alpha channel at all) in
+     the light theme below. */
+  --recessed-panel-bg: rgba(15, 15, 15, 0.45);
 
   --transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
 }
@@ -1292,7 +1293,19 @@ textarea:focus {
   align-items: center;
   gap: 0.5rem;
   justify-content: center;
-  filter: drop-shadow(0px 0px 10px rgba(56, 189, 248, 0.35));
+  /* MONOCHROME PASS (see index.html's own comment on the mascot svg) -
+     `color` resolves every currentColor shape in that svg. First tried
+     --text-primary (full white/near-black) per that request, then backed
+     off to --text-secondary (the same muted slate --dataset-center-label
+     already uses right next to this icon) per an explicit follow-up - the
+     full-contrast pair read as too stark/"sharp" next to that label's own
+     softer tone. The glow was a sky-blue rgba(56, 189, 248, ...) literal,
+     independent of any token - now var(--overlay-18) (white wash in dark
+     mode, dark wash in light mode) so it stays a neutral halo around
+     whichever color the icon itself resolves to, instead of a fixed blue
+     tint that clashed once the icon stopped being green. */
+  color: var(--text-secondary);
+  filter: drop-shadow(0px 0px 10px var(--overlay-18));
   flex-shrink: 0;
 }
 
@@ -1312,17 +1325,23 @@ textarea:focus {
    now that it's two lines. (0.9375rem = the original 0.75rem bumped up
    25% per explicit follow-up request - still comfortably under the icon's
    height at this line-height, just less cramped than the initial pass.)
-   Color switched from var(--accent-cyan) (which, per this file's
-   PALETTE/DARK-MODE-WHITE-ACCENT-PASS comments above, is now white in
-   dark mode, decoupled from the brand green) to #10b981 - the literal
-   emerald-500 hex already hardcoded on the header svg's own robot
-   head/arms (see index.html) - so this label reads as the icon's own
-   color specifically, in both themes, rather than following whatever
-   --accent-cyan happens to alias to. */
+   Color was #10b981 (the literal emerald-500 hex then hardcoded on the
+   header svg's own robot head/arms - see index.html) so this label read
+   as the icon's own color specifically. MONOCHROME PASS (per explicit
+   request, same one covering the svg itself): tried var(--text-primary)
+   first - white in dark mode, near-black in light mode - rather than
+   var(--accent-cyan), which still aliases to the brand green in light
+   mode and would have brought the green back the moment someone switched
+   themes; then backed off to var(--text-secondary) per an explicit
+   follow-up (that full-contrast pair read as too stark/"sharp"), matching
+   .dataset-center-label's own muted tone right next to this icon. Still
+   reads as "the icon's own color", since the svg resolves its own
+   currentColor shapes from this exact same token via .crbot-icon-wrapper's
+   `color` in this file. */
 .header-icon-label .full-text {
   display: flex;
   flex-direction: column;
-  color: #10b981;
+  color: var(--text-secondary);
   font-size: 0.9375rem;
   line-height: 1.15;
   font-weight: 600;
@@ -1330,7 +1349,9 @@ textarea:focus {
 
 .header-icon-label .short-text {
   display: none;
-  color: var(--accent-cyan);
+  /* Same MONOCHROME PASS as .full-text above - kept in sync with it so the
+     mobile/narrow-viewport label doesn't go back to green on its own. */
+  color: var(--text-secondary);
   font-size: 0.85rem;
   font-weight: 700;
 }
@@ -1660,7 +1681,13 @@ textarea:focus {
   border: 1px solid rgba(var(--accent-cyan-rgb), 0.35);
   border-radius: 0;
   transform: none;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4), inset 0 0 12px rgba(var(--accent-cyan-rgb), 0.08);
+  /* FLAT PASS (per explicit request - the old fixed rgba(0, 0, 0, 0.4) drop
+     shadow plus inset glow read as "very pronounced" in light mode, where a
+     black shadow shows up clearly against a light page instead of blending
+     into a dark one) - removed entirely, matching .results-container's own
+     "no visible box" flatness (see its comment) rather than just re-tuning
+     the shadow's opacity per theme. The 1px border above still frames the
+     box; there's just no shadow/glow riding along with it any more. */
   padding: 4px;
   box-sizing: border-box;
 }
@@ -1687,7 +1714,8 @@ textarea:focus {
   background: var(--surface-1);
   border: 1px solid rgba(var(--accent-cyan-rgb), 0.35);
   border-radius: 0;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4), inset 0 0 12px rgba(var(--accent-cyan-rgb), 0.08);
+  /* FLAT PASS - see .speech-bubble-wrapper's own comment above; same
+     removal, kept in sync since this is that same box's SQL variant. */
   height: 100px;
   min-height: 56px;
   max-height: 80vh;
@@ -3131,19 +3159,20 @@ textarea.report-issue-preview:focus {
   color: var(--secondary-hover);
 }
 
-/* The Summary tab's own small chart preview (see client.js's
-   renderSummaryInlineChart()/jumpToChartableResultTab()) - sits beside
-   the summary text (see .summary-text-chart-row just below) at half the
-   row's width (this feature's first cut ran it full-width underneath the
-   text; a later nit shrank it to a small fixed-width thumbnail; this is
-   the third size, proportional rather than a fixed pixel value so it
-   scales with whatever width the results area itself has). Reset to a
-   plain, borderless block first since the underlying element is a
-   <button> (needed for the same click-to-navigate/keyboard-focus
-   behavior as every other data-view-chart-trigger control in this
-   file), then given a subtle hover affordance so it still reads as
-   clickable even though it looks like a small chart rather than a link
-   or pill. */
+/* One card in the Summary tab's own chart-preview grid (see client.js's
+   renderSummaryInlineChart()/jumpToChartableResultTab()) - sits inside
+   .summary-chart-preview-grid just below (see that rule's own comment)
+   at roughly half the grid's width, so two cards sit side by side on a
+   normal-width pane and wrap to one per row on a narrower one (this
+   feature's first cut ran a single preview full-width underneath the
+   text; a later nit shrank it to a small fixed-width thumbnail; this
+   proportional width is what lets several cards share one row instead of
+   assuming there's ever only one). Reset to a plain, borderless block
+   first since the underlying element is a <button> (needed for the same
+   click-to-navigate/keyboard-focus behavior as every other
+   data-view-chart-trigger control in this file), then given a subtle
+   hover affordance so it still reads as clickable even though it looks
+   like a small chart rather than a link or pill. */
 .summary-chart-inline-preview {
   display: block;
   flex: 0 0 50%;
@@ -3179,26 +3208,48 @@ textarea.report-issue-preview:focus {
   aspect-ratio: 2 / 1;
 }
 
-/* Wraps the Summary tab's own text and (when this turn has one) its
-   chart preview together (see renderTableResult()'s isText branch) - a
-   simple side-by-side row, text on the left flexing to fill the space,
-   the small fixed-width chart preview pinned to the right of it. Wraps
-   onto its own line below the text on a narrow enough tab/pane (see the
-   resizable editor/results layout further up) rather than squeezing the
-   preview illegibly thin. Only ever built when there's an actual preview
-   to place - the plain-text summary (no chartable tab this turn) skips
-   this wrapper entirely and the paragraph goes straight into the cell,
-   same as always. */
-.summary-text-chart-row {
-  display: flex;
-  align-items: flex-start;
-  flex-wrap: wrap;
-  gap: 0.9rem;
+/* Names which result a given preview card belongs to (see client.js's
+   chartPreviewCaption()) - only ever rendered at all when there's more
+   than one card in the grid at once, since a single card is already
+   unambiguous without one. Sits below the canvas, small and muted so it
+   reads as a caption rather than competing with the chart itself for
+   attention. */
+.summary-chart-inline-preview-caption {
+  display: block;
+  margin-top: 0.3rem;
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  text-align: center;
 }
 
-.summary-text-chart-row .response-text {
-  flex: 1 1 260px;
-  min-width: 0;
+/* The grid of chart-preview cards themselves (see client.js's
+   renderSummaryInlineChart(), called once per chartable entry) - wraps as
+   many .summary-chart-inline-preview cards as this turn actually has,
+   two per row at each card's own ~50% width above and wrapping onto
+   further rows as needed, rather than assuming there's ever only one.
+   Sits INSIDE .summary-text-chart-row, below the summary text (see that
+   rule's own comment) - only ever built when there's at least one actual
+   preview to place. */
+.summary-chart-preview-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.9rem;
+  width: 100%;
+}
+
+/* Wraps the Summary tab's own text and (when this turn has any) its
+   chart preview grid together (see renderTableResult()'s isText branch) -
+   text on top, the grid of one-or-more preview cards stacked directly
+   underneath it (see .summary-chart-preview-grid just above), each full
+   width so cards can wrap and lay out independently of the text's own
+   width. Only ever built when there's at least one actual preview to
+   place - the plain-text summary (no chartable tab this turn) skips this
+   wrapper entirely and the paragraph goes straight into the cell, same as
+   always. */
+.summary-text-chart-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
 }
 
 /* Wraps .report-issue-inline-btn when it has to be inserted as its own

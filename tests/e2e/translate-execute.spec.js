@@ -1011,6 +1011,58 @@ test.describe('single-connection mode: post-execution results summarization', ()
     expect(summarizeCalls).toBe(2);
   });
 
+  // Regression guard: summarizeResultForHistory()'s success branch used to
+  // build its summarized copy from just {columns, rowCount, rows}, silently
+  // dropping the result's own `.statement` - the exact SQL that produced it
+  // - even though the error branch right above it already preserved that
+  // field. A FRESH turn's own live results (never round-tripped through
+  // that function) always had it, so buildResultsTabsNav()'s hover title
+  // (see its own `res.query || res.sql || res.statement` fallback) only
+  // ever went missing once a turn was persisted to history and restored -
+  // i.e. exactly what stepping back to an earlier turn does here.
+  test('stepping back to an earlier turn still shows its query text on tab hover', async ({ page }) => {
+    await mockTranslate(page, { sql: 'SELECT COUNT(*) AS n FROM signups;' });
+    await mockExecute(page, { results: [{ columns: ['n'], rows: [{ n: 42 }], rowCount: 1, statement: 'SELECT COUNT(*) AS n FROM signups' }] });
+    await page.route('**/api/summarize-result', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200, contentType: 'application/json',
+        body: JSON.stringify({ success: true, summary: '*** NO SQL *** Results Summary\n\nSignups are trending up.' }),
+      });
+    });
+    await gotoApp(page);
+
+    await page.locator('#aiPrompt').fill('how many signups this week');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect(page.locator('.response-text')).toContainText('Signups are trending up', { timeout: 10000 });
+
+    // Confirmed still correct on a LIVE (never-persisted) turn's own tab.
+    const liveTab = page.locator('#resultsTabsNav .result-tab-btn', { hasText: 'Query 1' });
+    await expect(liveTab).toHaveAttribute('title', 'SELECT COUNT(*) AS n FROM signups');
+
+    // A second, unrelated turn - somewhere to navigate back FROM.
+    await mockTranslate(page, { sql: 'SELECT 2 AS n;' });
+    await mockExecute(page, { results: [{ columns: ['n'], rows: [{ n: 2 }], rowCount: 1, statement: 'SELECT 2 AS n' }] });
+    await page.route('**/api/summarize-result', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200, contentType: 'application/json',
+        body: JSON.stringify({ success: true, summary: '*** NO SQL *** Results Summary\n\nHere is two.' }),
+      });
+    });
+    await page.locator('#aiPrompt').fill('give me two');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect(page.locator('.response-text')).toContainText('Here is two', { timeout: 10000 });
+
+    // Stepping back re-renders the FIRST turn's tab strip from its history
+    // entry, not from a fresh /api/execute response - this is the path that
+    // used to lose the tooltip.
+    await page.locator('#goBackBtn').click();
+    await expect(page.locator('.response-text')).toContainText('Signups are trending up');
+    const restoredTab = page.locator('#resultsTabsNav .result-tab-btn', { hasText: 'Query 1' });
+    await expect(restoredTab).toHaveAttribute('title', 'SELECT COUNT(*) AS n FROM signups');
+  });
+
   // Regression guard for "Turn History Handling in Datalect" Gap 1: a turn
   // that concludes with an error still gets added to chatStore's history,
   // same as a successful turn - previously executeSql()'s entire failure
