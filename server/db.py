@@ -623,44 +623,6 @@ def record_translation(user_id, conn_str, nl_prompt, sql_command, gemini_model, 
     )
 
 
-def record_all_databases_triage(user_id, nl_prompt, sql_command, gemini_model, duration, input_tokens, output_tokens, total_tokens, thinking_tokens, cached_content_tokens):
-    """Logs dataset group mode's Phase A (triage) step to the same
-    translations table record_translation() writes to, but tagged with the
-    literal database_type/database_name "Dataset Group" rather than any
-    real connection descriptor - unlike every other row in this table, a
-    triage call isn't "about" one specific database at all (it's the step
-    that decides whether real data is even needed, and if so, which
-    connection(s) to route to), so there's no real descriptor to resolve a
-    db_type/db_name from the way record_translation() does above. Kept as
-    this one fixed, generic label rather than the active group's own real
-    name - unlike a preset/custom connection's name (always resolved fresh
-    from its own live record), the group a past triage call ran against may
-    since have been renamed or removed entirely from DATABASE_PRESETS_FILE,
-    so baking in its name at log time would go stale the same way an old
-    "database_url" copy in this table used to (see record_translation's own
-    module-level reasoning for why every OTHER row here resolves its name
-    fresh, never at write time) - simplest to just not carry a name for
-    this one, same as it never did for the "all mode" this replaces.
-
-    Deliberately bypasses record_translation()'s _to_descriptor/
-    _resolve_database_name resolution entirely rather than trying to feed
-    it a synthetic descriptor - "Dataset Group" is a fixed, literal label,
-    not a lookup result.
-
-    Called once per dataset-group-mode request regardless of triage's
-    outcome (answer/failed/route - see translate_routes.py's
-    router_only_group_mode branch), always with ONLY triage's own duration
-    and LLM token usage - never folded in with any Phase B (per-database
-    generation) numbers, so a "route" outcome's real, per-database
-    translations-table row (logged separately, attributed to that specific
-    connection) never double-counts the tokens/time this row already
-    accounts for."""
-    state_store.record_translation(
-        user_id, "Dataset Group", "Dataset Group", nl_prompt, sql_command, gemini_model,
-        duration, input_tokens, output_tokens, total_tokens, thinking_tokens, cached_content_tokens
-    )
-
-
 def get_db_connection(conn_str=None, user_id=None):
     descriptor = resolve_conn_str(conn_str, user_id)
     return get_backend(descriptor).connect(descriptor)
@@ -895,6 +857,18 @@ _SCHEMA_OVERVIEW_SYSTEM_INSTRUCTION = (
     "naturally - each one concrete enough that it could be translated "
     "into a real query, not generic questions that could apply to any "
     "database.\n"
+    "Most of these should read like a precise, analytical request, but "
+    "include AT LEAST ONE - and ideally two - that a real person would "
+    "actually say out loud instead: casual, first-person, or "
+    "exploratory in phrasing rather than a technical restatement of a "
+    "table or column, while still being something this exact dataset "
+    "could plausibly help answer. For example, for a movie-rental "
+    "dataset, prefer \"which movie should I watch tonight?\" alongside "
+    "something like \"list the top 5 highest-rated movies\"; for an "
+    "e-commerce dataset, prefer \"how can I improve sales?\" alongside "
+    "something like \"what are total sales by product category?\". Do "
+    "not label, flag, or otherwise call out which questions are which - "
+    "just mix them in naturally within the list.\n"
     "Write both fields in English regardless of the language any table/"
     "column names happen to use.\n"
 )

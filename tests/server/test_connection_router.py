@@ -2847,6 +2847,64 @@ def test_summarize_all_mode_results_retries_an_invalid_or_incomplete_json_respon
     assert len(provider.calls) == 2
 
 
+# --- summarize_all_mode_results' own language verification -----------------
+# Regression guard for the SAME _detect_language/_summarize_with_retry
+# machinery every "success" test above already runs through without ever
+# actually flexing this branch (fresh_import's FakeLanguageIdentifier - see
+# helpers.py - always returns None, so those never see a mismatch at all).
+# This is the summarization-side counterpart to generate_sql_for_
+# connection's own equivalent language-verification tests in
+# test_translate_routes.py (added alongside that function's own fix for a
+# real user-reported gap in Phase B) - Phase C's own use of this same
+# _summarize_with_retry machinery predates both of those and was never
+# actually exercised by a dedicated test of its own until now. Mirrors
+# triage_all_mode_question's own dedicated language tests above almost
+# exactly, just against summarize_all_mode_results instead.
+def test_summarize_all_mode_results_wrong_language_is_retried_and_corrected(app_factory, tmp_path, monkeypatch):
+    env = _two_preset_env(app_factory, tmp_path)
+    _fake_detect = lambda text: (
+        "de" if "Umsatz" in text else ("en" if text == "how is everything performing" else None)
+    )
+    monkeypatch.setattr(env.translate_routes, "_detect_language", _fake_detect)
+    provider = _FakeProvider([
+        _summary_json({0: "Der Umsatz ist um 10% gestiegen."}),
+        _summary_json({0: "Sales are up 10%."}),
+    ])
+    parsed, usage, error = _drain(env.translate_routes.summarize_all_mode_results(
+        "how is everything performing", [{"name": "Sales Postgres", "columns": [], "rows": []}],
+        provider, client=None, model="m",
+    ))
+    assert parsed == {"label": "Results Summary", "per_database": {0: "Sales are up 10%."}, "cross_database": None}
+    assert error is None
+    assert len(provider.calls) == 2
+    # The retry prompt actually carried the explicit correction, not just a
+    # coincidental second identical attempt.
+    assert "CORRECTION" in provider.calls[1]["llm_input"]
+    assert "German" in provider.calls[1]["llm_input"]
+
+
+def test_summarize_all_mode_results_still_wrong_language_after_retry_fails(app_factory, tmp_path, monkeypatch):
+    env = _two_preset_env(app_factory, tmp_path)
+    _fake_detect = lambda text: (
+        "de" if "Umsatz" in text else ("en" if text == "how is everything performing" else None)
+    )
+    monkeypatch.setattr(env.translate_routes, "_detect_language", _fake_detect)
+    provider = _FakeProvider([
+        _summary_json({0: "Der Umsatz ist um 10% gestiegen."}),
+        _summary_json({0: "Der Umsatz ist immer noch um 10% gestiegen."}),
+    ])
+    parsed, usage, error = _drain(env.translate_routes.summarize_all_mode_results(
+        "how is everything performing", [{"name": "Sales Postgres", "columns": [], "rows": []}],
+        provider, client=None, model="m",
+    ))
+    # Mirrors _summarize_with_retry's own "never knowingly serve a response
+    # in the wrong language" guarantee: the exhausted retry fails the whole
+    # call rather than returning text already confirmed to be in German.
+    assert (parsed, usage) == (None, None)
+    assert error == "response was written in German instead of English"
+    assert len(provider.calls) == 2
+
+
 def test_summarize_results_endpoint_returns_no_sql_prefixed_summary_and_is_never_logged(
     app_factory, tmp_path, monkeypatch,
 ):

@@ -419,6 +419,89 @@ test.describe('schema viewer', () => {
     await expect(page.locator('.schema-viewer-group-header', { hasText: 'Grants' })).toHaveCount(0);
   });
 
+  test('the "Comments:" global section is folded into the table/column display, instead of being left at the bottom of the last table', async ({ page }) => {
+    // Regression test for a real bug (Oracle/etc. schemas): table and
+    // column catalog comments used to be an entirely unrecognized global
+    // section - they just rode along in whichever table entry's own
+    // raw-text "remainder" happened to be shown last, reading as if they
+    // belonged to that one table rather than describing the whole
+    // connection.
+    await gotoApp(page);
+    await mockSchema(page, {
+      entries: [
+        { name: 'customers', heading: 'Table: customers', text: 'Table: customers\n  id integer NOT NULL' },
+        { name: 'orders', heading: 'Table: orders', text: (
+          'Table: orders\n  id integer NOT NULL\n  status text NOT NULL\n\n' +
+          'Comments:\n' +
+          '  [table] orders: Sales orders placed by customers.\n' +
+          '  [column] orders.status: One of pending/shipped/cancelled.'
+        ) },
+      ],
+    });
+    await openSchemaViewer(page);
+
+    await page.locator('.schema-viewer-group-header', { hasText: 'Tables' }).click();
+    await page.locator('.schema-viewer-entry-item', { hasText: 'orders' }).click();
+
+    // Not left behind in the "orders" table's own raw-text pane any more.
+    await expect(page.locator('#schemaViewerDetailText')).not.toContainText('Comments:');
+    await expect(page.locator('#schemaViewerDetailText')).not.toContainText('One of pending/shipped/cancelled');
+
+    // The table-level comment shows as its own note under the heading...
+    await expect(page.locator('#schemaViewerTableCommentText')).toHaveText('Sales orders placed by customers.');
+
+    // ...and the column-level comment shows in that column's own row of
+    // the structured columns table, rather than as raw text.
+    const statusRow = page.locator('.schema-viewer-columns-table tbody tr', { hasText: 'status' });
+    await expect(statusRow).toContainText('One of pending/shipped/cancelled.');
+
+    // A table with no comment of its own shows no note at all.
+    await page.locator('.schema-viewer-entry-item', { hasText: 'customers' }).click();
+    await expect(page.locator('#schemaViewerTableCommentText')).toHaveClass(/hidden/);
+  });
+
+  test('the "Likely relationships (naming convention, unconfirmed):" global section gets its own tree group, instead of being left at the bottom of the last table', async ({ page }) => {
+    // Regression test for the same class of bug as Grants/Comments above -
+    // this section had no parser of its own at all before this, so it
+    // fell through unrecognized to the bottom of the last table entry's
+    // raw text, describing the whole connection but looking like it only
+    // applied to that one table.
+    await gotoApp(page);
+    await mockSchema(page, {
+      entries: [
+        { name: 'customers', heading: 'Table: customers', text: 'Table: customers\n  id integer NOT NULL' },
+        { name: 'orders', heading: 'Table: orders', text: (
+          'Table: orders\n  id integer NOT NULL\n  customer_id integer NOT NULL\n  region_id integer NOT NULL\n\n' +
+          'Likely relationships (naming convention, unconfirmed):\n' +
+          '  orders.customer_id -> likely relationship (unconfirmed): references customers, based on column naming convention only - no enforced foreign key found.\n' +
+          '  orders.region_id -> likely relationship (unconfirmed): same column name also appears in shipments, based on column naming convention only - no enforced foreign key found.'
+        ) },
+      ],
+    });
+    await openSchemaViewer(page);
+
+    // Not left behind in the "orders" table's own raw-text pane any more.
+    await page.locator('.schema-viewer-group-header', { hasText: 'Tables' }).click();
+    await page.locator('.schema-viewer-entry-item', { hasText: 'orders' }).click();
+    await expect(page.locator('#schemaViewerDetailText')).not.toContainText('Likely relationships');
+    await expect(page.locator('#schemaViewerDetailText')).not.toContainText('likely relationship (unconfirmed)');
+
+    // Its own separate, collapsible "Likely Relationships (2)" group
+    // instead - both heuristics, not just the ER diagram's own narrower
+    // "references <table>" one.
+    const relHeader = page.locator('.schema-viewer-group-header', { hasText: 'Likely Relationships' });
+    await expect(relHeader).toContainText('Likely Relationships (2)');
+    await relHeader.click();
+    const relItems = page.locator('.schema-viewer-entry-item[data-category="relationships"]');
+    await expect(relItems).toHaveCount(2);
+    await expect(relItems.nth(0)).toContainText('orders.customer_id');
+    await expect(relItems.nth(1)).toContainText('orders.region_id');
+
+    await relItems.nth(0).click();
+    await expect(page.locator('#schemaViewerDetailHeading')).toHaveText('orders.customer_id');
+    await expect(page.locator('#schemaViewerDetailText')).toContainText('references customers');
+  });
+
   test('large per-table row counts are shortened to K/M/B with 3-digit accuracy, in both the tree and the detail heading', async ({ page }) => {
     await gotoApp(page);
     await mockSchema(page, {

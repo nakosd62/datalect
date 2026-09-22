@@ -3639,6 +3639,71 @@ def test_summarize_single_connection_results_gives_up_immediately_for_a_non_retr
     assert len(provider.calls) == 1
 
 
+# --- summarize_single_connection_results' own language verification -------
+# Regression guard for the SAME _detect_language/_summarize_with_retry
+# machinery the success test just above already runs through without ever
+# actually flexing this branch (fresh_import's FakeLanguageIdentifier - see
+# helpers.py - always returns None, so it never sees a mismatch at all).
+# This is single-connection mode's counterpart to test_connection_router.
+# py's identically-named summarize_all_mode_results tests, and to
+# generate_sql_for_connection's own equivalent language-verification tests
+# above (added alongside that function's own fix for a real user-reported
+# gap in Phase B) - this call's own use of _summarize_with_retry predates
+# both of those and was never actually exercised by a dedicated test of its
+# own until now.
+def test_summarize_single_connection_results_wrong_language_is_retried_and_corrected(app_env, monkeypatch):
+    from test_connection_router import _FakeProvider
+
+    _fake_detect = lambda text: (
+        "de" if "Anmeldungen" in text else ("en" if text == "how many signups this week" else None)
+    )
+    monkeypatch.setattr(app_env.translate_routes, "_detect_language", _fake_detect)
+    provider = _FakeProvider([
+        json.dumps({"summary": "Die Anmeldungen sind diese Woche um 20% gestiegen.", "visualization": None}),
+        json.dumps({"summary": "Signups are up 20% this week.", "visualization": None}),
+    ])
+    parsed, usage, error = app_env.translate_routes._drain_generation(
+        app_env.translate_routes.summarize_single_connection_results(
+            "how many signups this week", "Sales Schema", "SELECT COUNT(*) FROM signups;",
+            [{"columns": ["n"], "rows": [{"n": 42}], "rowCount": 1}],
+            provider, client=None, model="m",
+        )
+    )
+    assert parsed["summary"] == "Signups are up 20% this week."
+    assert error is None
+    assert len(provider.calls) == 2
+    # The retry prompt actually carried the explicit correction, not just a
+    # coincidental second identical attempt.
+    assert "CORRECTION" in provider.calls[1]["llm_input"]
+    assert "German" in provider.calls[1]["llm_input"]
+
+
+def test_summarize_single_connection_results_still_wrong_language_after_retry_fails(app_env, monkeypatch):
+    from test_connection_router import _FakeProvider
+
+    _fake_detect = lambda text: (
+        "de" if "Anmeldungen" in text else ("en" if text == "how many signups this week" else None)
+    )
+    monkeypatch.setattr(app_env.translate_routes, "_detect_language", _fake_detect)
+    provider = _FakeProvider([
+        json.dumps({"summary": "Die Anmeldungen sind diese Woche um 20% gestiegen.", "visualization": None}),
+        json.dumps({"summary": "Die Anmeldungen sind immer noch um 20% gestiegen.", "visualization": None}),
+    ])
+    parsed, usage, error = app_env.translate_routes._drain_generation(
+        app_env.translate_routes.summarize_single_connection_results(
+            "how many signups this week", "Sales Schema", "SELECT COUNT(*) FROM signups;",
+            [{"columns": ["n"], "rows": [{"n": 42}], "rowCount": 1}],
+            provider, client=None, model="m",
+        )
+    )
+    # Mirrors _summarize_with_retry's own "never knowingly serve a response
+    # in the wrong language" guarantee: the exhausted retry fails the whole
+    # call rather than returning text already confirmed to be in German.
+    assert (parsed, usage) == (None, None)
+    assert error == "response was written in German instead of English"
+    assert len(provider.calls) == 2
+
+
 def test_summarize_result_endpoint_returns_no_sql_prefixed_summary_and_is_never_logged(
     app_factory, monkeypatch,
 ):

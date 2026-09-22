@@ -13,6 +13,7 @@ accounts/
 
 # Leftovers
 _to_delete/
+presets_archive.json
 
 # Ignore utility scripts
 *.sh

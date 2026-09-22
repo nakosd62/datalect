@@ -104,7 +104,7 @@ test.describe('first-run onboarding', () => {
     }).toPass({ timeout: 2000 });
   });
 
-  test('the tour includes a step spotlighting the "i" schema-info icon nested in the DB badge', async ({ page }) => {
+  test('the tour includes a step spotlighting the "i" schema-info icon beside the DB badge', async ({ page }) => {
     await page.goto('/');
     await expect(page.locator('#tourOverlay')).not.toHaveClass(/hidden/);
 
@@ -119,12 +119,12 @@ test.describe('first-run onboarding', () => {
       await page.locator('#tourNextBtn').click();
     }
     await expect(title).toHaveText('Peek at its schema anytime');
-    await expect(page.locator('#tourTooltipBody')).toContainText('"i" inside the badge');
+    await expect(page.locator('#tourTooltipBody')).toContainText('"i" icon next to the badge');
 
-    // The spotlight is actually positioned over the small nested info
-    // button, not the whole badge behind it - same regression guard as
-    // the model-badge/gear-button tests below, and specifically the point
-    // of this step: it should call out the icon as its own target.
+    // The spotlight is actually positioned over the small standalone info
+    // button, not the badge next to it - same regression guard as the
+    // model-badge/gear-button tests below, and specifically the point of
+    // this step: it should call out the icon as its own target.
     const iconBox = await page.locator('#datasetSchemaViewerBtn').boundingBox();
     await expect(async () => {
       const spotlightBox = await page.locator('#tourSpotlight').boundingBox();
@@ -160,7 +160,7 @@ test.describe('first-run onboarding', () => {
     }).toPass({ timeout: 2000 });
   });
 
-  test('on a narrow (mobile) header, the combined more-menu tour step also mentions Preferences', async ({ page }) => {
+  test('on a narrow (mobile) header, the combined more-menu tour step also mentions Preferences and switching the AI model', async ({ page }) => {
     await page.setViewportSize({ width: 420, height: 800 });
     await page.goto('/');
     await expect(page.locator('#tourOverlay')).not.toHaveClass(/hidden/);
@@ -172,6 +172,27 @@ test.describe('first-run onboarding', () => {
     }
     await expect(title).toContainText('preferences');
     await expect(page.locator('#tourTooltipBody')).toContainText('preferences (color theme and auto-execute)');
+    // The model badge is ALSO folded into this same combined step at this
+    // width (see .header-actions > .model-picker-wrapper in style.css) -
+    // its own always-separate wide-header step (checked below) never
+    // appears here, so its mention has to live in this body text instead.
+    await expect(page.locator('#tourTooltipBody')).toContainText('switch the AI model');
+  });
+
+  test('on a narrow (mobile) header, the model badge\'s own step never appears - it is folded into the combined more-menu step above', async ({ page }) => {
+    await page.setViewportSize({ width: 420, height: 800 });
+    await page.goto('/');
+    await expect(page.locator('#tourOverlay')).not.toHaveClass(/hidden/);
+
+    const title = page.locator('#tourTooltipTitle');
+    const seenTitles = [];
+    for (let i = 0; i < 10; i++) {
+      seenTitles.push(await title.textContent());
+      const nextBtn = page.locator('#tourNextBtn');
+      if ((await nextBtn.textContent()) === 'Done') break;
+      await nextBtn.click();
+    }
+    expect(seenTitles.some((t) => t === 'This is the AI model translating your questions')).toBe(false);
   });
 
   test('the tour includes a step spotlighting the Send Feedback button, only when the feature is configured', async ({ page }) => {

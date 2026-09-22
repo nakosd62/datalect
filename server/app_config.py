@@ -203,6 +203,20 @@ def _compute_client_build_id():
 
 CLIENT_BUILD_ID = _compute_client_build_id()
 
+# How often (in minutes) client.js polls GET /api/client-version to notice a
+# new frontend build and, piggybacking on that same request, to detect the
+# server going unreachable at all (see config_routes.py's GET /api/
+# client-version docstring and client.js's own checkForNewClientVersion()/
+# markServerUnreachable() for the full picture). 0 disables the poll
+# entirely - client.js still contains every bit of the polling/banner code,
+# it just never schedules the interval (and skips the one startup check too),
+# for a deployment that would rather not have any background polling at all,
+# or that finds the new-version nudge more distracting than useful. Defaults
+# to the 5 minutes this was hardcoded to before this became configurable.
+CLIENT_VERSION_CHECK_INTERVAL_MINUTES = int(
+    os.environ.get("CLIENT_VERSION_CHECK_INTERVAL_MINUTES", 5)
+)
+
 DEFAULT_CONN = "postgresql://postgres:password@host:23456/defaultdb?sslmode=verify-full"
 
 # --- Admin-preset database connections ---------------------------------------

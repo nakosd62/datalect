@@ -136,63 +136,101 @@
 
             <div class="header-icon-label">
               <div class="label-line">
-                <span class="full-text">Talk to your Data</span>
+                <!-- Two stacked lines instead of one - see .full-text's own
+                     comment in style.css for the font-size/color reasoning. -->
+                <span class="full-text">
+                  <span class="full-text-row">talk to</span>
+                  <span class="full-text-row">your data</span>
+                </span>
                 <span class="short-text"></span>
               </div>
             </div>
           </div>
         </div>
 
-        <div class="header-actions">
-          <div id="configTriggerBadge" class="status-badge connected clickable-badge" title="Connection Info (Click to configure)">
+        <!--
+          The active dataset, called out as the header's own centerpiece
+          (per explicit request) rather than bundled among the secondary
+          controls in .header-actions below, where it used to sit as just
+          another same-sized pill among many. Sits in the middle column of
+          .crbot-header's 3-column grid (see that rule's own comment in
+          style.css) so it's centered regardless of how wide the logo
+          (left) or .header-actions (right) end up being.
+        -->
+        <div class="crbot-dataset-center">
+          <span class="dataset-center-label">Dataset:</span>
+          <div id="configTriggerBadge" class="status-badge connected clickable-badge dataset-badge-prominent" title="Connection Info (Click to configure)" aria-haspopup="dialog" aria-expanded="false">
             <span id="connDbDot" class="status-dot"></span>
             <span id="connDbName" class="conn-badge-text"></span>
-            <!--
-              Opens the Schema Viewer for whichever connection is CURRENTLY
-              ACTIVE (see the click handler next to configTriggerBadge's own
-              in client.js). Nested inside the dataset badge itself (rather
-              than sitting beside it as its own separate control) so it
-              reads as "this badge has a schema/info affordance" instead of
-              an unrelated icon floating next to it - its own click handler
-              calls stopPropagation() so clicking it doesn't also fire
-              configTriggerBadge's own click-to-configure handler. Because
-              this button only ever addresses the active connection, it
-              replaces the old per-row "?" buttons that used to live inside
-              the DB connection config dialog (one per preset/custom row,
-              addressing THAT row's connection regardless of what was
-              active) - those let the Schema Viewer be opened for a dataset
-              other than the one a chat prompt would actually run against,
-              and opened it on top of the config dialog besides. A single
-              button tied to "whatever is active right now" can't have
-              either problem: there is no other connection it could mean,
-              and it's not launched from inside another modal.
-
-              A vertical divider (schema-info-divider) sits right before it,
-              with margin on both sides so it reads as "name, then a
-              separated action" rather than one continuous run of text and
-              icon - see that span's own CSS for why this exists (it used
-              to be one unbroken run with no visual break between the name
-              and this button at all). The glyph itself is Feather's
-              "info" icon (a circle, a vertical stroke, a dot above it -
-              reading as a lowercase "i") rather than "help-circle" (a
-              circle with a curved "?" stroke) - "?" reads as "get help/
-              what is this", which is too close to configTriggerBadge's
-              own "click to configure" affordance; "i" reads more
-              specifically as "view info about this", which is what this
-              button actually does.
-            -->
-            <span class="schema-info-divider" aria-hidden="true"></span>
-            <button type="button" id="datasetSchemaViewerBtn" class="schema-info-btn dataset-schema-viewer-btn" title="View schema for this dataset">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <circle cx="12" cy="12" r="10"></circle>
-                <line x1="12" y1="16" x2="12" y2="12"></line>
-                <line x1="12" y1="8" x2="12.01" y2="8"></line>
-              </svg>
-            </button>
+            <!-- Chevron affordance, same glyph/rotate-on-open language as
+                 #modelTriggerBadge's own .model-badge-caret - marks this as
+                 a "click to choose" control rather than plain status text.
+                 client.js flips aria-expanded on open/close of #configModal
+                 the same way it already does for the model pick list. -->
+            <svg class="dataset-badge-caret" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <polyline points="6 9 12 15 18 9"></polyline>
+            </svg>
           </div>
+          <!--
+            Opens the Schema Viewer for whichever connection is CURRENTLY
+            ACTIVE (see the click handler next to configTriggerBadge's own
+            in client.js). Sits BESIDE the dataset badge now, as its own
+            separately-sized control (per explicit request), rather than
+            nested inside the pill at a smaller, badge-matched size - its
+            own click handler still calls stopPropagation() so clicking it
+            doesn't also fire configTriggerBadge's own click-to-configure
+            handler. Because this button only ever addresses the active
+            connection, it replaces the old per-row "?" buttons that used
+            to live inside the DB connection config dialog (one per preset/
+            custom row, addressing THAT row's connection regardless of what
+            was active) - those let the Schema Viewer be opened for a
+            dataset other than the one a chat prompt would actually run
+            against, and opened it on top of the config dialog besides. A
+            single button tied to "whatever is active right now" can't have
+            either problem: there is no other connection it could mean, and
+            it's not launched from inside another modal. The glyph itself
+            is Feather's "info" icon (a circle, a vertical stroke, a dot
+            above it - reading as a lowercase "i") rather than "help-circle"
+            (a circle with a curved "?" stroke) - "?" reads as "get help/
+            what is this", which is too close to configTriggerBadge's own
+            "click to configure" affordance; "i" reads more specifically as
+            "view info about this", which is what this button actually does.
+          -->
+          <button type="button" id="datasetSchemaViewerBtn" class="dataset-info-btn dataset-schema-viewer-btn" title="View schema for this dataset">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="10"></circle>
+              <line x1="12" y1="16" x2="12" y2="12"></line>
+              <line x1="12" y1="8" x2="12.01" y2="8"></line>
+            </svg>
+          </button>
+        </div>
 
-          <div id="modelTriggerBadge" class="status-badge connected clickable-badge" title="Model Info (Click to configure)">
-            <span id="modelBadgeName" class="conn-badge-text"></span>
+        <div class="header-actions">
+          <!-- In-place pick list (see .model-pick-list in style.css and the
+               MODEL PICK LIST section in client.js) rather than the old
+               #modelModal popup dialog - clicking the badge drops a
+               provider-grouped list right below it; clicking an option
+               selects and saves immediately, no separate Save step. -->
+          <div id="modelPickerWrapper" class="model-picker-wrapper">
+            <div id="modelTriggerBadge" class="status-badge connected clickable-badge" title="Model Info (Click to choose)" aria-haspopup="listbox" aria-expanded="false">
+              <span id="modelBadgeName" class="conn-badge-text"></span>
+              <!-- Chevron-down affordance so the badge itself reads as "a
+                   dropdown selector, click to open" rather than plain,
+                   non-interactive status text - same glyph as
+                   #resultsDownloadCaretBtn's own chevron elsewhere in this
+                   file, for a consistent "this opens a list" cue across the
+                   app. Flips to point up while the list is open (see
+                   .model-badge-caret's [aria-expanded="true"] rule in
+                   style.css), tracking the very same aria-expanded
+                   attribute client.js already toggles on this element. -->
+              <svg class="model-badge-caret" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <polyline points="6 9 12 15 18 9"></polyline>
+              </svg>
+            </div>
+            <div id="modelPickList" class="model-pick-list hidden" role="listbox" aria-label="Translation model">
+              <div id="modelPickOptions"></div>
+              <div id="modelPickError" class="model-pick-error"></div>
+            </div>
           </div>
 
           <button id="helpBtn" class="help-btn" title="Help">
@@ -234,6 +272,32 @@
               </svg>
             </button>
             <div id="moreMenuDropdown" class="auth-dropdown-menu more-menu-dropdown hidden">
+              <!-- The model picker (#modelPickerWrapper, folded in here at
+                   the same <=900px breakpoint as the other icons below - see
+                   .header-actions > .model-picker-wrapper in style.css) is
+                   the one item here that isn't a simple forward-to-the-real-
+                   button action: it needs its OWN current-selection display
+                   and its own second-level list of options, since there's no
+                   longer a visible header badge to open for that. This
+                   button just toggles #moreMenuModelSubmenu below it open/
+                   closed (same expand-in-place pattern as an accordion, not
+                   a flyout - #moreMenuDropdown already has overflow:visible,
+                   see its own comment, so a taller expanded submenu is never
+                   clipped) rather than forwarding a .click() to a hidden
+                   real button. See the MODEL PICK LIST section in client.js
+                   for renderModelPickList()/selectModel(), shared with
+                   #modelPickList/#modelPickOptions above. -->
+              <button id="moreMenuModelBtn" class="auth-dropdown-item more-menu-model-btn" type="button" aria-haspopup="listbox" aria-expanded="false">
+                <span class="more-menu-model-label">Model: <span id="moreMenuModelCurrent" class="more-menu-model-current"></span></span>
+                <svg class="more-menu-model-caret" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <polyline points="6 9 12 15 18 9"></polyline>
+                </svg>
+              </button>
+              <div id="moreMenuModelSubmenu" class="more-menu-model-submenu hidden" role="listbox" aria-label="Translation model">
+                <div id="moreMenuModelOptions"></div>
+                <div id="moreMenuModelError" class="model-pick-error"></div>
+              </div>
+              <div class="auth-dropdown-divider"></div>
               <button id="moreMenuHelpBtn" class="auth-dropdown-item" type="button">Doc</button>
               <button id="moreMenuFeedbackBtn" class="auth-dropdown-item hidden" type="button">Feedback</button>
               <button id="moreMenuHistoryBtn" class="auth-dropdown-item" type="button">History</button>
@@ -256,55 +320,69 @@
       </div>
 
       <section class="card editor-card">
-        <div class="controls-layout-grid">
-          <div class="inputs-column" style="width: 100%;">
-            <div class="input-row">
-              <div class="speech-bubble-wrapper">
-                <textarea id="aiPrompt" rows="1" placeholder="Ask your question here by typing or using the mic..."></textarea>
-                <div class="history-nav-group inline-history-nav">
-                  <button id="goBackBtn" class="btn-action-sm" type="button" title="Go back to previous turn">&lt;</button>
-                  <span id="historyLabel"></span>
-                  <button id="goForwardBtn" class="btn-action-sm" type="button" title="Go forward to next turn">&gt;</button>
-                  <button id="newTurnBtn" class="btn-action-sm" type="button" title="Start a new question">+</button>
-                </div>
-                <button type="button" id="micBtn" class="mic-btn" title="Voice-to-text input">
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
-                    <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
-                    <line x1="12" y1="19" x2="12" y2="23"></line>
-                    <line x1="8" y1="23" x2="16" y2="23"></line>
-                  </svg>
-                </button>
+        <!--
+          Side-by-side (wide screens) / stacked (narrow screens) layout for
+          the NL prompt and SQL boxes - see initEditorPanesResizer() and
+          initResultsPanesResizer() in client.js for the drag mechanics, and
+          .editor-panes-row's own comment in style.css for the breakpoint.
+          #editorPanesResizer (a vertical divider, wide screens only) lets
+          the user resize the NL pane vs the SQL pane; #resultsPanesResizer
+          (below, a horizontal divider) replaces the old native
+          resize:vertical handle that used to live on the SQL box alone -
+          dragging it now resizes BOTH boxes together (in the side-by-side
+          layout, where they're always kept the same height) instead of
+          just the SQL box.
+        -->
+        <div class="editor-panes-row" id="editorPanesRow">
+          <div class="editor-pane editor-pane-nl" id="editorPaneNl">
+            <div class="speech-bubble-wrapper">
+              <textarea id="aiPrompt" rows="1" placeholder="Ask your question here by typing or using the mic..."></textarea>
+              <div class="history-nav-group inline-history-nav">
+                <button id="goBackBtn" class="btn-action-sm" type="button" title="Go back to previous turn">&lt;</button>
+                <span id="historyLabel"></span>
+                <button id="goForwardBtn" class="btn-action-sm" type="button" title="Go forward to next turn">&gt;</button>
+                <button id="newTurnBtn" class="btn-action-sm" type="button" title="Start a new question">+</button>
               </div>
+              <button type="button" id="micBtn" class="mic-btn" title="Voice-to-text input">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+                  <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                  <line x1="12" y1="19" x2="12" y2="23"></line>
+                  <line x1="8" y1="23" x2="16" y2="23"></line>
+                </svg>
+              </button>
             </div>
-            <div class="input-row">
-              <div class="speech-bubble-wrapper sql-bubble">
-                <div class="sql-overlay-actions">
-                  <button id="runBtn" class="btn btn-execute sql-overlay-btn" title="Execute SQL Query">
-                    <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
-                      <polygon points="5 3 19 12 5 21 5 3"></polygon>
+          </div>
+          <div id="editorPanesResizer" class="editor-panes-resizer" role="separator" aria-orientation="vertical" aria-label="Resize the prompt and SQL panes" tabindex="0"></div>
+          <div class="editor-pane editor-pane-sql" id="editorPaneSql">
+            <div class="speech-bubble-wrapper sql-bubble">
+              <div class="sql-overlay-actions">
+                <button id="runBtn" class="btn btn-execute sql-overlay-btn" title="Execute SQL Query">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
+                    <polygon points="5 3 19 12 5 21 5 3"></polygon>
+                  </svg>
+                  <span>Execute</span>
+                </button>
+                <div class="sql-overlay-report-btns">
+                  <button type="button" id="reportSqlGoodBtn" class="report-sql-btn report-sql-btn--positive hidden" title="Report accurate SQL">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.72a2 2 0 0 0 2-1.7l1.38-9a2 2 0 0 0-2-2.3zM7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3"></path>
                     </svg>
-                    <span>Execute</span>
                   </button>
-                  <div class="sql-overlay-report-btns">
-                    <button type="button" id="reportSqlGoodBtn" class="report-sql-btn report-sql-btn--positive hidden" title="Report accurate SQL">
-                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                        <path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.72a2 2 0 0 0 2-1.7l1.38-9a2 2 0 0 0-2-2.3zM7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3"></path>
-                      </svg>
-                    </button>
-                    <button type="button" id="reportSqlBtn" class="report-sql-btn hidden" title="Report wrong SQL">
-                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                        <path d="M10 15v4a3 3 0 0 0 3 3l4-9V2H5.72a2 2 0 0 0-2 1.7l-1.38 9a2 2 0 0 0 2 2.3zm7-13h2.67A2.31 2.31 0 0 1 22 4v7a2.31 2.31 0 0 1-2.33 2H17"></path>
-                      </svg>
-                    </button>
-                  </div>
+                  <button type="button" id="reportSqlBtn" class="report-sql-btn hidden" title="Report wrong SQL">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M10 15v4a3 3 0 0 0 3 3l4-9V2H5.72a2 2 0 0 0-2 1.7l-1.38 9a2 2 0 0 0 2 2.3zm7-13h2.67A2.31 2.31 0 0 1 22 4v7a2.31 2.31 0 0 1-2.33 2H17"></path>
+                    </svg>
+                  </button>
                 </div>
-                <textarea id="sqlQuery" name="query" rows="2" placeholder="You may enter SQL here and execute it..."></textarea>
               </div>
+              <textarea id="sqlQuery" name="query" rows="2" placeholder="You may enter SQL here and execute it..."></textarea>
             </div>
           </div>
         </div>
       </section>
+
+      <div id="resultsPanesResizer" class="results-panes-resizer" role="separator" aria-orientation="horizontal" aria-label="Resize the editor and results areas" tabindex="0"></div>
 
       <section class="card table-card">
         <div class="results-container">
@@ -522,6 +600,14 @@
                  estimate. Never both: once an authoritative count exists,
                  the estimate next to it would be pure noise. -->
             <div id="schemaViewerDetailHeading" class="schema-viewer-detail-heading"></div>
+            <!-- This table's own "[table] NAME: description" line from the
+                 "Comments:" global section (see parseSchemaComments() in
+                 client.js), when the connection's catalog has one for the
+                 currently-selected table - a per-column comment goes in the
+                 columns table's own "Comments" column instead (below), not
+                 here. Hidden whenever the selected table has no table-level
+                 comment, or a non-table entry is selected. -->
+            <div id="schemaViewerTableCommentText" class="schema-viewer-table-comment hidden"></div>
             <!-- Pinned "Overview" entry's content (see
                  renderSchemaViewerOverviewDetail() in client.js): the
                  cached LLM-written prose + suggested questions, and a
@@ -536,9 +622,10 @@
                  line convention (e.g. a Google Sheets dataset, or the "No
                  schema description available." fallback), in which case
                  the raw text below is all there is to show. Its
-                 "Constraints" and "Sample values" columns are filled in
-                 from the "Constraints:"/"Column value samples:" sections
-                 (see parseSchemaConstraints()/parseSchemaColumnSamples())
+                 "Constraints", "Sample values" and "Comments" columns are
+                 filled in from the "Constraints:"/"Column value samples:"/
+                 "Comments:" sections (see parseSchemaConstraints()/
+                 parseSchemaColumnSamples()/parseSchemaComments())
                  whenever that dialect's fetch found one for a given
                  column. -->
             <div id="schemaViewerColumnsWrap" class="schema-viewer-columns-wrap hidden">
@@ -551,6 +638,7 @@
                     <th>Attributes</th>
                     <th>Constraints</th>
                     <th>Sample values</th>
+                    <th>Comments</th>
                   </tr>
                 </thead>
                 <tbody id="schemaViewerColumnsBody"></tbody>
@@ -612,6 +700,20 @@
             <input type="checkbox" id="autoSqlExecuteCheckbox">
             <span class="checkbox-label">Run generated SQL automatically after each translation</span>
           </label>
+          <!-- Show SQL - controls whether the SQL box (#editorPaneSql, with
+               its Execute/report-issue controls) is shown at all, growing
+               the NL prompt box to full width when it's hidden - see
+               applySqlPaneVisibility()/enforceShowSqlLinkage() in client.js.
+               Linked to the checkbox above: auto-execute off means the
+               generated SQL is the only feedback the user gets before
+               anything runs, so it MUST stay visible - unchecking
+               auto-execute force-checks and locks this one (see
+               #showSqlLockedNote below, shown only while that's in effect). -->
+          <label class="checkbox-option">
+            <input type="checkbox" id="showSqlCheckbox">
+            <span class="checkbox-label">Show SQL</span>
+          </label>
+          <p id="showSqlLockedNote" class="text-muted hidden" style="font-size: 0.78rem; margin: 0;">SQL must stay visible while automatic execution is off.</p>
         </div>
         <div class="config-section">
           <span class="config-label">Bring Your Own Key</span>
@@ -643,29 +745,6 @@
           <button type="button" id="preferencesSaveBtn" class="btn btn-primary">Save Changes</button>
         </div>
       </div>
-    </div>
-  </div>
-
-  <div id="modelModal" class="modal-overlay hidden">
-    <div class="modal-card">
-      <div class="modal-header">
-        <h2 class="modal-title">Model Selection</h2>
-        <button id="modelModalCloseBtn" class="modal-close-btn" type="button">&times;</button>
-      </div>
-      <form id="modelForm" class="modal-body" onsubmit="event.preventDefault();">
-        <div class="modal-scroll-content">
-          <div class="config-section">
-            <span class="config-label">Translation Model</span>
-            <div class="radio-group" id="modalModelRadioGroup"></div>
-          </div>
-        </div>
-        <div class="modal-footer-fixed">
-          <div id="modelSaveError" class="config-error-message" style="display: none; color: var(--danger); font-size: 0.85rem;"></div>
-          <div class="modal-actions" style="display: flex; gap: 0.5rem; justify-content: flex-end; align-items: center;">
-            <button type="button" id="modelSaveBtn" class="btn btn-primary">Save Changes</button>
-          </div>
-        </div>
-      </form>
     </div>
   </div>
 

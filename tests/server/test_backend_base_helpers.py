@@ -773,6 +773,27 @@ def test_parse_dataset_size_line_only_matches_the_first_occurrence():
     assert parse_dataset_size_line(schema) == "~1.0 GB"
 
 
+def test_parse_dataset_size_line_strips_a_trailing_note_parenthetical():
+    # format_dataset_size_line()'s own optional `note` (e.g. backends/
+    # databricks.py's real one) is aimed at the LLM reading the full schema
+    # prompt, not at the Schema Viewer's own compact "Data Size: ..." UI
+    # fact - per an explicit request, this must never reach that fact line.
+    schema = (
+        "Estimated dataset size: ~21.9K rows (live count of the tables shown "
+        "here only, not a schema-wide total - Databricks has no cheap "
+        "catalog-only row-count statistic)"
+    )
+    assert parse_dataset_size_line(schema) == "~21.9K rows"
+    # Same stripping for the bytes-preferred case, and regardless of what
+    # the note itself says.
+    assert parse_dataset_size_line(
+        "Estimated dataset size: ~2.4 GB (stats may be stale since last ANALYZE)"
+    ) == "~2.4 GB"
+    # No note at all is unaffected - the common case for every dialect that
+    # never passes one.
+    assert parse_dataset_size_line("Estimated dataset size: ~1.23M rows") == "~1.23M rows"
+
+
 # --- quantize_schema_size_tokens() -------------------------------------------
 # Shared by db.py's build_group_schema_summaries() (the dataset-group Schema
 # Viewer's own "Schema Size" column) and client.js's own facts-line figure

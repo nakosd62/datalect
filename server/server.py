@@ -7,6 +7,7 @@ Thin entrypoint. All the actual logic lives in focused modules:
     auth.py               - session/identity resolution, auth guard, /api/auth/me
     db.py                  - connection resolution, schema introspection
     translate_routes.py    - /api/translate (Gemini NL -> SQL)
+    summarize_routes.py     - /api/summarize-results, /api/summarize-result
     execute_routes.py      - /api/execute (run SQL, return results)
     config_routes.py       - /api/config (session DB/model selection)
     report_routes.py       - /api/report-issue (email an error/wrong-result report)
@@ -24,6 +25,7 @@ from app_config import app, state_store
 from auth import auth_bp, enforce_authentication, refresh_auth_session_cookie
 from config_routes import config_bp
 from translate_routes import translate_bp
+from summarize_routes import summarize_bp
 from execute_routes import execute_bp
 from chat_history_routes import chat_history_bp
 from report_routes import report_bp
@@ -39,7 +41,7 @@ app.before_request(enforce_authentication)
 # alive. See auth.py's refresh_auth_session_cookie()/auth_session.py.
 app.after_request(refresh_auth_session_cookie)
 
-for bp in (auth_bp, config_bp, translate_bp, execute_bp, chat_history_bp, report_bp):
+for bp in (auth_bp, config_bp, translate_bp, summarize_bp, execute_bp, chat_history_bp, report_bp):
     app.register_blueprint(bp)
 
 

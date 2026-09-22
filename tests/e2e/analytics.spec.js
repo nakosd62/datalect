@@ -744,10 +744,14 @@ test.describe('analytics: connection/model/nav', () => {
     await gotoApp(page);
 
     await page.locator('#modelTriggerBadge').click();
-    await expect(page.locator('#modelModal')).not.toHaveClass(/hidden/);
-    await page.locator('input[name="llm_model_option"][value="anthropic::claude-sonnet-5"]').check();
-    await page.locator('#modelSaveBtn').click();
-    await expect(page.locator('#modelModal')).toHaveClass(/hidden/);
+    await expect(page.locator('#modelPickList')).not.toHaveClass(/hidden/);
+    // Scoped to #modelPickList - renderModelPickList() (client.js) fills
+    // an identical #moreMenuModelOptions list for the narrow-header more-
+    // menu too (see model-selection.spec.js's own describe block for that
+    // one), so an unscoped .model-pick-option[data-value=...] now matches
+    // both and trips Playwright's strict mode.
+    await page.locator('#modelPickList .model-pick-option[data-value="anthropic::claude-sonnet-5"]').click();
+    await expect(page.locator('#modelPickList')).toHaveClass(/hidden/);
 
     const events = await trackedEvents(page, 'model_selected');
     expect(events.length).toBe(1);

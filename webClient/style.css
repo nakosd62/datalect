@@ -31,24 +31,53 @@
    buttons, progress banners, and #stopBtn.btn-stop all painted with it -
    while --primary's green only ever showed up as the status dot, and
    --secondary's indigo didn't appear in the header/input chrome at all.
-   Fixed by making --accent-cyan/--accent-cyan-rgb/--on-accent-cyan alias
-   directly to --primary/--primary-rgb/--on-primary in both themes below,
-   rather than rewriting the 30+ call sites that reference the cyan tokens
-   by name - every one of them now renders in the app's actual green
-   without any other change. The brand mark itself (the inline header SVG,
-   logo.svg, favicon.svg and its derived rasters) was recolored the same
-   way, from its old sky-blue family to the matching emerald family, so
-   the logo now matches the accent it sits next to instead of predating
-   it. An earlier version of this pass also gave the model badge its own
-   indigo tint from --secondary to give that token a visible header job -
-   reverted after review clashed visually with the rest of the now all-
-   green header, so the model badge stays plain/neutral like the DB badge
-   beside it (both just .status-badge's default styling) and --secondary
-   keeps only its pre-existing jobs (the inline "add a chart" link, a
-   couple of secondary badges - see its call sites below). --bg-dark/
-   --surface-1 also moved apart slightly (see their own comments) since
-   they used to sit close enough in value that the results panel read as
-   flush with the page background.
+   Fixed (at the time) by making --accent-cyan/--accent-cyan-rgb/
+   --on-accent-cyan alias directly to --primary/--primary-rgb/--on-primary
+   in both themes, rather than rewriting the 30+ call sites that reference
+   the cyan tokens by name - every one of them rendered in the app's actual
+   green without any other change. The brand mark itself (the inline header
+   SVG, logo.svg, favicon.svg and its derived rasters) was recolored the
+   same way, from its old sky-blue family to the matching emerald family,
+   so the logo matched the accent it sat next to instead of predating it.
+   An earlier version of this pass also gave the model badge its own indigo
+   tint from --secondary to give that token a visible header job - reverted
+   after review clashed visually with the rest of the then all-green
+   header, so the model badge stays plain/neutral like the DB badge beside
+   it (both just .status-badge's default styling) and --secondary keeps
+   only its pre-existing jobs (the inline "add a chart" link, a couple of
+   secondary badges - see its call sites below). --bg-dark/--surface-1 also
+   moved apart slightly (see their own comments) since they used to sit
+   close enough in value that the results panel read as flush with the
+   page background.
+
+   DARK-MODE "WHITE ACCENT" PASS (per explicit request - the green accent
+   above read as too dominant once it was everywhere): --accent-cyan/
+   --accent-cyan-rgb/--on-accent-cyan/--accent-cyan-glow now carry their
+   OWN white-based values in the dark theme below, decoupled from --primary
+   - every call site named in the paragraph above (wordmark, footer link,
+   mic icon, header icon buttons, progress banners, tabs, focus rings,
+   borders/glows, the auth avatar/menu, the guided tour, the Schema
+   Viewer's own accents, and so on) renders in white now, again with no
+   per-call-site change needed. --primary itself is UNCHANGED and keeps its
+   real, narrower job: the Execute-SQL button, every .btn-primary (Save/OK/
+   Send Report/Next-style "primary action" buttons), the thumbs-up icons
+   (.report-sql-btn--positive/.summary-feedback-btn--up), and the DB
+   "connected" status dot (.status-dot.connected) - success/affirmative
+   actions and states, not the general UI accent any more. --danger keeps
+   its own pre-existing job (cancel/delete buttons, thumbs-down icons, the
+   disconnected status dot) and ALSO gained one more: #stopBtn.btn-stop
+   (the in-flight "Cancel" button) moved from --accent-cyan to --danger, so
+   cancelling a running query now reads as the same red as every other
+   cancel/delete action instead of the old "mild, in-progress" blue-green
+   tone (see that rule's own comment for why it was accent-cyan before).
+   The light theme's --accent-cyan/--accent-cyan-rgb/--on-accent-cyan keep
+   aliasing --primary exactly as before - this pass was scoped to dark mode
+   only, per the request. The illustrated header/favicon mascot artwork
+   itself (hardcoded hex fills, not driven by these tokens at all) was
+   deliberately left untouched - it's a multi-color character illustration
+   (already using white for its own eyes/highlights), not a single-hue
+   accent, and repainting it solid white would erase its shape rather than
+   just "de-green" it.
    ========================================================================= */
 :root {
   --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
@@ -58,7 +87,13 @@
   /* Warmed very slightly off pure navy-black, and given a bit more
      separation from --surface-1 below - the two used to sit close enough
      in value that .results-container (background-color: var(--surface-1))
-     read as flush against the page rather than as its own lifted panel. */
+     read as flush against the page rather than as its own lifted panel.
+     .results-container itself no longer paints that background at all any
+     more (see its own comment - removed per a later, explicit "no visible
+     box around the results area" request), so this separation's only
+     surviving job is every OTHER --surface-1 use (modals, dropdowns, the
+     guided tour tooltip, and so on) still reading as lifted panels of
+     their own. */
   --bg-dark: #0b0f14;
   --bg-card: rgba(19, 26, 36, 0.65);
   --bg-card-border: rgba(255, 255, 255, 0.08);
@@ -106,8 +141,9 @@
      same reasoning as --on-primary/--on-accent-cyan above, computed
      per-theme since --warning (unlike --primary) isn't reliably
      bright/dark enough in both themes to share one constant value.
-     Currently unused (#stopBtn.btn-stop moved to --accent-cyan/
-     --on-accent-cyan below - see there for why) but kept defined
+     Currently unused (#stopBtn.btn-stop went straight from --accent-cyan/
+     --on-accent-cyan to --danger/--on-danger, never through --warning -
+     see the DARK-MODE "WHITE ACCENT" PASS note up top) but kept defined
      alongside --warning itself for whenever a real warning-colored
      badge is needed. */
   --on-warning: #080b11;
@@ -152,19 +188,28 @@
   --text-table-strong: #f1f5f9;
   --chip-text: #cbd5e1;
 
-  /* Was its own distinct blue (the active tab, the progress-status banner,
-     #stopBtn.btn-stop, the header icon buttons, the mic icon, the
-     wordmark/footer link - see the PALETTE "SIGNAL" PASS note up top).
-     That made it the app's real on-screen accent while --primary's green
-     barely showed up anywhere. Aliased straight to --primary/--primary-rgb/
-     --on-primary now instead of carrying its own values, so every one of
-     those call sites renders in green without having to touch them
-     individually - kept as its own token name (rather than deleted) purely
-     so this file doesn't need a mass find-and-replace across every
-     var(--accent-cyan) use. */
-  --accent-cyan: var(--primary);
-  --accent-cyan-rgb: var(--primary-rgb);
-  --on-accent-cyan: var(--on-primary);
+  /* This app's general UI accent (the active tab, the progress-status
+     banner, the header icon buttons, the mic icon, the wordmark/footer
+     link, focus rings, borders/glows, and so on - see the DARK-MODE "WHITE
+     ACCENT" PASS note up top) - carries its OWN white-based value here,
+     independent of --primary, per an explicit request to move the general
+     accent off green everywhere except the specific success/save/execute
+     buttons and status dot --primary is still reserved for (see that same
+     note). #stopBtn.btn-stop moved OFF this token onto --danger as part of
+     the same request - see its own comment. Kept as its own token name
+     (rather than renamed) purely so this file doesn't need a mass
+     find-and-replace across every var(--accent-cyan) use; the light theme
+     below still aliases this straight to --primary/--primary-rgb/
+     --on-primary, unchanged - this pass was scoped to dark mode only. */
+  --accent-cyan: #ffffff;
+  --accent-cyan-rgb: 255, 255, 255;
+  --on-accent-cyan: #080b11;
+  /* White-accent counterpart to --primary-glow, for the handful of pulse/
+     focus glows that used to ride on --primary-glow purely because it was
+     "the app's accent color's glow" rather than anything semantically
+     green (the help-button attention ring, the quick-prompts restore
+     button's hover, the input focus glow) - see their own call sites. */
+  --accent-cyan-glow: rgba(255, 255, 255, 0.15);
 
   /* Text color that sits ON TOP of a solid --primary-colored button/badge -
      constant across themes: --primary is always bright enough that a dark
@@ -252,11 +297,13 @@
   --text-table-strong: #0f172a;
   --chip-text: #334155;
 
-  /* Aliased to --primary here too - see the dark theme's --accent-cyan
-     comment above. */
+  /* Unchanged by the dark-mode "white accent" pass (see the dark theme's
+     --accent-cyan comment above) - the light theme keeps aliasing straight
+     to --primary/--primary-rgb/--on-primary, exactly as before. */
   --accent-cyan: var(--primary);
   --accent-cyan-rgb: var(--primary-rgb);
   --on-accent-cyan: var(--on-primary);
+  --accent-cyan-glow: var(--primary-glow);
 
   --on-primary: #ffffff;
 
@@ -300,7 +347,7 @@ body {
   right: -5%;
   width: 500px;
   height: 500px;
-  background: radial-gradient(circle, rgba(var(--primary-rgb), 0.06) 0%, rgba(0,0,0,0) 70%);
+  background: radial-gradient(circle, rgba(var(--accent-cyan-rgb), 0.06) 0%, rgba(0,0,0,0) 70%);
   z-index: -1;
   pointer-events: none;
 }
@@ -361,6 +408,26 @@ body {
   text-overflow: ellipsis;
 }
 
+/* Chevron-down affordance on #modelTriggerBadge (see index.html) - marks
+   the badge as a dropdown selector rather than plain status text, matching
+   the visual language of #resultsDownloadCaretBtn's own chevron elsewhere.
+   Muted like the badge text itself rather than a full-strength icon color,
+   since it's a secondary affordance cue, not the badge's primary content. */
+.model-badge-caret {
+  color: var(--text-muted);
+  flex-shrink: 0;
+  margin-left: -0.05rem;
+  transition: transform 0.15s ease;
+}
+
+/* Points up instead of down while the list is open - tracks the same
+   aria-expanded attribute client.js's modelTriggerBadge click handler
+   already sets/clears (see MODEL PICK LIST section), so this needs no
+   JS of its own beyond that existing toggle. */
+#modelTriggerBadge[aria-expanded="true"] .model-badge-caret {
+  transform: rotate(180deg);
+}
+
 /* Layout Vertical */
 .vertical-layout {
   display: flex;
@@ -400,19 +467,24 @@ select {
 }
 
 select:focus {
-  border-color: var(--primary);
-  box-shadow: 0 0 0 3px var(--primary-glow);
+  border-color: var(--accent-cyan);
+  box-shadow: 0 0 0 3px var(--accent-cyan-glow);
 }
 
-/* Cards (Glassmorphism) */
+/* .card - USED to be a "glassmorphism" panel (translucent blurred
+   background, 1px border, drop shadow, its own inset padding) wrapping
+   the NL/SQL editor row (.editor-card) and the whole results area
+   (.table-card) each in their own visibly framed box. Removed entirely
+   per explicit request - the visible border/background/shadow read as an
+   unwanted extra "box" nested inside .app-container's own page margin,
+   and .editor-card/.table-card's own horizontal padding was eating into
+   space their actual contents (the NL/SQL text boxes, the results table)
+   could otherwise use. Now just a layout helper (still a flex column,
+   still zero own margin) with no visual chrome of its own and no
+   horizontal inset, so those contents grow to the same width
+   .app-container itself allows rather than a narrower one this padding
+   used to carve out. */
 .card {
-  background-color: var(--bg-card);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
-  border: 1px solid var(--bg-card-border);
-  border-radius: 12px;
-  padding: 0.5rem 1.25rem;
-  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
   display: flex;
   flex-direction: column;
   margin-bottom: 0;
@@ -424,8 +496,17 @@ select:focus {
 }
 
 /* Dynamic Height Results Section */
+/* margin-top used to add 0.575rem here to compensate for .vertical-layout's
+   own tight 0.175rem gap (see that rule's own comment), back when
+   .editor-card sat directly next to .table-card with nothing in between.
+   That's stale now that #resultsPanesResizer (a real, visible divider) sits
+   between them - the resizer's own presence is the deliberate visual
+   separation, and this margin was left in by mistake on top of it, making
+   the gap BELOW the resizer (~12px) much wider than the gap ABOVE it
+   (~2.8px, just .vertical-layout's shared gap). Removed so both sides of
+   the resizer sit at that same tight gap, matching how snugly the NL/SQL
+   panes sit against #editorPanesResizer above. */
 .table-card {
-  padding: 0.75rem;
   flex: 1;
   min-height: 0;
   max-height: none;
@@ -451,8 +532,8 @@ textarea {
 
 textarea:focus {
   outline: none;
-  border-color: var(--primary);
-  box-shadow: 0 0 0 3px var(--primary-glow);
+  border-color: var(--accent-cyan);
+  box-shadow: 0 0 0 3px var(--accent-cyan-glow);
 }
 
 /* Buttons */
@@ -514,8 +595,14 @@ textarea:focus {
 .mic-btn {
   position: absolute;
   right: 2px;
-  top: 50%;
-  transform: translateY(-50%);
+  /* Anchored to the top-right corner (matching #reportSqlGoodBtn/
+     #runBtn's own .sql-overlay-actions in the SQL box) rather than
+     vertically centered - vertical centering only looked right back when
+     this box's height was fixed at a couple of lines; now that its height
+     can be dragged much taller (see .editor-panes-row's own comment), a
+     centered icon would float in the middle of a mostly-empty box instead
+     of sitting with the controls a user expects to find up top. */
+  top: 6px;
   background: transparent;
   border: none;
   color: var(--accent-cyan);
@@ -530,7 +617,7 @@ textarea:focus {
 }
 
 .mic-btn:hover {
-  color: var(--primary);
+  color: var(--accent-cyan);
   background: var(--overlay-2);
 }
 
@@ -695,14 +782,22 @@ textarea:focus {
   animation: pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite;
 }
 
-/* Header Section */
+/* Header Section
+   ------------------------------------------------------------------------
+   Plain flex row, left to right: logo/label (.crbot-title-group), the
+   active dataset badge (.crbot-dataset-center, sitting right beside the
+   logo with its own left margin for breathing room - per explicit request
+   to move it next to the icon/label instead of centered in the header),
+   then everything else (.header-actions, pushed all the way to the right
+   via its own margin-left: auto below, since it's no longer a dedicated
+   grid column of its own). Used to be a three-column grid (logo | 1fr
+   centered dataset badge | actions) - see git history if that layout is
+   ever needed again. */
 .crbot-header {
   margin-bottom: 0;
   padding-bottom: 0.075rem;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  flex-wrap: nowrap;
   gap: 0.5rem;
   width: 100%;
 }
@@ -715,6 +810,78 @@ textarea:focus {
   gap: 0.15rem;
   min-width: max-content;
   flex-shrink: 0;
+}
+
+/* Sits immediately after the logo/label (see .crbot-header's own comment
+   above) rather than centered in the header - margin-left is the actual
+   "next to the icon/label, leaving some space" gap; min-width: 0 lets it
+   still shrink instead of overflowing on a narrow header, since a flex
+   item's default min-width is auto (sized to its content, ignoring the
+   parent's available space). */
+.crbot-dataset-center {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 0.5rem;
+  min-width: 0;
+  margin-left: 1.5rem;
+}
+
+.dataset-center-label {
+  font-size: 0.9375rem; /* .dataset-badge-prominent's own 0.8125rem * ~1.15, same math */
+  font-weight: 600;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+/* The active dataset badge itself, made deliberately more prominent than
+   every other header control (per explicit request) instead of blending
+   in as just another same-sized pill among many - larger text than the
+   shared .status-badge default (0.8125rem), plus its own caret (below)
+   and separated info button (.dataset-info-btn above) so it reads as the
+   header's centerpiece rather than one option among several. First tried
+   at a full 30% bump (1.05625rem); dialed back to a more modest ~15%
+   (0.9375rem) per follow-up feedback that the larger size read as too
+   big. Everything else about the pill (background, border, padding
+   shape, connected/badge-disabled behavior) still comes from the shared
+   .status-badge/.connected/.badge-disabled rules elsewhere in this file -
+   this only overrides size. */
+.dataset-badge-prominent,
+.dataset-badge-prominent .conn-badge-text {
+  font-size: 0.9375rem;
+}
+
+.dataset-badge-prominent {
+  gap: 0.5rem;
+  padding: 0.3rem 1rem;
+}
+
+/* Slightly larger than the shared .status-badge default (8px) so the
+   connected/disconnected dot stays visually proportionate to the
+   larger-than-usual name next to it instead of looking undersized -
+   not scaled by the exact same factor as the text, just nudged up. */
+.dataset-badge-prominent .status-dot {
+  width: 10px;
+  height: 10px;
+}
+
+/* Chevron affordance - same glyph/rotate-on-open language as
+   #modelTriggerBadge's own .model-badge-caret (see that rule's own
+   comment for the full reasoning): marks the badge as a dropdown-style
+   selector rather than plain status text. Flips to point up while
+   #configModal is open, tracking the same aria-expanded attribute
+   client.js's configTriggerBadge click handler/closeConfigModal() now
+   toggle, the same pattern already used for the model pick list. */
+.dataset-badge-caret {
+  color: var(--text-muted);
+  flex-shrink: 0;
+  margin-left: -0.05rem;
+  transition: transform 0.15s ease;
+}
+
+#configTriggerBadge[aria-expanded="true"] .dataset-badge-caret {
+  transform: rotate(180deg);
 }
 
 .crbot-title,
@@ -742,6 +909,12 @@ textarea:focus {
   gap: 0.5rem;
   flex-shrink: 1;
   min-width: 0;
+  /* Used to be its own dedicated grid column (auto-width, on the right) in
+     .crbot-header's old three-column grid - now that the header is a plain
+     flex row (see that rule's own comment), this is what still pushes it
+     all the way to the right edge, past the dataset badge and whatever
+     space is left after it. */
+  margin-left: auto;
 }
 
 .gear-btn, .help-btn, .history-btn, .feedback-btn, .more-menu-btn {
@@ -790,7 +963,7 @@ textarea:focus {
 
 .gear-btn:hover {
   background: var(--overlay-4);
-  color: var(--primary);
+  color: var(--accent-cyan);
   transform: rotate(30deg);
 }
 
@@ -799,15 +972,22 @@ textarea:focus {
 .feedback-btn:hover,
 .more-menu-btn:hover {
   background: var(--overlay-4);
-  color: var(--primary);
+  color: var(--accent-cyan);
 }
 
-/* Triple-dot "more" menu - collapses Help/History/Sign-in into one menu on
-   very narrow screens (see the @media (max-width: 480px) block below) so
-   the connection/model status badges stop getting squashed. Hidden by
-   default; only shown under that breakpoint. Reuses the .auth-dropdown-*
-   panel styling (see the Google Auth section further down) for visual
-   consistency with the existing avatar dropdown. */
+/* Triple-dot "more" menu - collapses Model/Help/History/Preferences/
+   Feedback/Sign-in into one menu once the header gets narrow (see the
+   @media (max-width: 900px) block further down, right before the
+   "Natural Language & SQL Row Layouts" section - same breakpoint as the
+   NL/SQL panes switching to stacked, per explicit request) so the
+   connection status badge stops getting squashed. Hidden by default;
+   only shown under that breakpoint. Reuses the .auth-dropdown-* panel
+   styling (see the Google Auth section further down) for visual
+   consistency with the existing avatar dropdown - except the Model item,
+   which gets its own current-selection display and expandable second-
+   level list (.more-menu-model-* below) rather than just forwarding a
+   click to a hidden real button, since there's no header badge left to
+   open once this fires. */
 .more-menu-wrapper {
   position: relative;
   display: none;
@@ -864,14 +1044,14 @@ textarea:focus {
    disruptive as a tooltip or overlay. Removed permanently (see
    ONBOARDING_SEEN_KEY in client.js) the first time Help is opened. */
 .help-btn-attention {
-  color: var(--primary);
-  border-color: var(--primary);
+  color: var(--accent-cyan);
+  border-color: var(--accent-cyan);
   animation: help-btn-pulse 2s ease-in-out infinite;
 }
 
 @keyframes help-btn-pulse {
-  0%, 100% { box-shadow: 0 0 0 0 var(--primary-glow); }
-  50% { box-shadow: 0 0 0 6px var(--primary-glow); }
+  0%, 100% { box-shadow: 0 0 0 0 var(--accent-cyan-glow); }
+  50% { box-shadow: 0 0 0 6px var(--accent-cyan-glow); }
 }
 
 /* Generic "grayed out, not clickable right now" look, shared by two
@@ -921,6 +1101,192 @@ textarea:focus {
   background: var(--overlay-1);
 }
 
+/* ===========================================================================
+   MODEL PICK LIST - an in-place dropdown anchored under #modelTriggerBadge
+   (see client.js's MODEL PICK LIST section), replacing the old #modelModal
+   popup dialog per explicit request: picking a model should feel like
+   choosing from a list right there, not opening a separate dialog.
+   Visually modeled on .auth-dropdown-menu below (same position/surface/
+   border/shadow recipe, so it reads as the same family of header dropdown)
+   but with its own row styling, since each row here is a directly-clickable
+   option (click = select AND save immediately) rather than a menu action.
+   =========================================================================== */
+.model-picker-wrapper {
+  position: relative;
+  display: inline-flex;
+  flex-shrink: 0;
+}
+
+.model-pick-list {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 8px);
+  background-color: var(--surface-1);
+  border: 1px solid var(--bg-card-border);
+  border-radius: 8px;
+  box-shadow: 0 10px 25px rgba(0, 0, 0, 0.4);
+  min-width: 220px;
+  max-width: min(320px, 90vw);
+  max-height: min(360px, 70vh);
+  overflow-y: auto;
+  z-index: 100;
+  padding: 0.5rem 0;
+}
+
+.model-pick-list.hidden {
+  display: none !important;
+}
+
+.model-pick-group-heading {
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  padding: 0.5rem 1rem 0.25rem;
+}
+
+.model-pick-group-heading:first-child {
+  padding-top: 0.25rem;
+}
+
+.model-pick-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  width: 100%;
+  background: transparent;
+  border: none;
+  color: var(--text-primary);
+  padding: 0.5rem 1rem;
+  font-size: 0.85rem;
+  font-family: var(--font-sans);
+  text-align: left;
+  cursor: pointer;
+  transition: var(--transition);
+}
+
+.model-pick-option:hover {
+  background-color: var(--overlay-2);
+}
+
+.model-pick-option.selected {
+  color: var(--accent-cyan);
+  font-weight: 600;
+}
+
+/* Reserves the checkmark's width on every row (not just the selected one)
+   so labels all stay left-aligned at the same column instead of the
+   selected row's label shifting left to make room for a mark that only it
+   has. */
+.model-pick-option .model-pick-check {
+  visibility: hidden;
+  flex-shrink: 0;
+}
+
+.model-pick-option.selected .model-pick-check {
+  visibility: visible;
+}
+
+.model-pick-error {
+  display: none;
+  color: var(--danger);
+  font-size: 0.8rem;
+  line-height: 1.4;
+  padding: 0.4rem 1rem 0.25rem;
+}
+
+/* Model item inside the triple-dot menu (see index.html's own comment on
+   #moreMenuModelBtn/#moreMenuModelSubmenu, and this file's own comment
+   above .more-menu-wrapper) - the one row here that isn't a plain forward-
+   to-the-real-button action. .auth-dropdown-item already gives it the
+   same row padding/font/hover as every other item; this just adds the
+   space-between layout (label left, caret right) that plain item doesn't
+   need. */
+.more-menu-model-btn {
+  justify-content: space-between;
+}
+
+/* Real <button disabled> here (unlike .status-badge.badge-disabled's own
+   plain <div> + class-based fake-disabled a few rules up - this element
+   has a native disabled state to reach for instead) - toggled by the same
+   setButtonsDisabled() while a query is in flight, so a narrow-header user
+   can't swap the active model out from under it via this second surface
+   any more than a wide-header user could via modelTriggerBadge itself.
+   Same grayed-out visual language as .status-badge.badge-disabled for
+   consistency, even though the underlying mechanism differs. */
+.more-menu-model-btn:disabled {
+  opacity: 0.45;
+  filter: grayscale(1);
+  cursor: not-allowed;
+}
+
+.more-menu-model-btn:disabled:hover {
+  background: transparent;
+}
+
+/* Long model names (rare, but not impossible depending on what a
+   deployment's admin configures) get truncated with an ellipsis rather
+   than wrapping the row onto a second line or pushing the caret out past
+   the menu's own edge - same spirit as .status-badge's own max-width
+   ellipsis truncation elsewhere in this file. */
+.more-menu-model-current {
+  display: inline-block;
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+  color: var(--accent-cyan);
+  font-weight: 600;
+}
+
+/* Same rotate-on-open language as .model-badge-caret/.dataset-badge-caret
+   elsewhere in this file - marks this row as an expandable list rather
+   than a plain menu action, tracking the same aria-expanded attribute
+   client.js's moreMenuModelBtn click handler toggles. */
+.more-menu-model-caret {
+  color: var(--text-muted);
+  flex-shrink: 0;
+  transition: transform 0.15s ease;
+}
+
+#moreMenuModelBtn[aria-expanded="true"] .more-menu-model-caret {
+  transform: rotate(180deg);
+}
+
+/* The second-level list itself - expands IN PLACE below #moreMenuModelBtn
+   (an accordion, not a flyout to the side) rather than reusing
+   .model-pick-list's own position:absolute presentation, since a flyout
+   anchored to a row this close to the dropdown's own right edge would run
+   off-screen on the narrow viewports this menu exists for in the first
+   place. #moreMenuDropdown already has overflow:visible (see that rule's
+   own comment, added for the same reason - nested dropdown content that
+   needs to actually be seen), so this is free to grow the whole menu
+   taller with no clipping. Shares .model-pick-group-heading/
+   .model-pick-option/.model-pick-check/.model-pick-error with the header's
+   own #modelPickList (see renderModelPickList() in client.js, which fills
+   both) for one visual language across the two presentations of the same
+   list - none of those carry positioning of their own, only the
+   standalone .model-pick-list container does, so they drop in here
+   unchanged. */
+.more-menu-model-submenu {
+  display: flex;
+  flex-direction: column;
+  background: var(--overlay-1);
+}
+
+.more-menu-model-submenu.hidden {
+  display: none !important;
+}
+
+/* Slightly indented from the toggle button above, so the list reads as
+   nested under it rather than as more items at the same level. */
+.more-menu-model-submenu .model-pick-option {
+  padding-left: 1.75rem;
+}
+
 .crbot-icon-wrapper {
   display: flex;
   align-items: center;
@@ -938,10 +1304,27 @@ textarea:focus {
   white-space: nowrap;
 }
 
+/* Two stacked lines ("talk to" / "your data", see index.html's
+   full-text-row spans) rather than the old single "Talk to your Data"
+   line - font-size shrunk from the old 1.2rem so the pair together still
+   fits the vertical space the 60x60 header icon (.crbot-icon-wrapper's svg)
+   takes up beside them, instead of the label growing taller than its icon
+   now that it's two lines. (0.9375rem = the original 0.75rem bumped up
+   25% per explicit follow-up request - still comfortably under the icon's
+   height at this line-height, just less cramped than the initial pass.)
+   Color switched from var(--accent-cyan) (which, per this file's
+   PALETTE/DARK-MODE-WHITE-ACCENT-PASS comments above, is now white in
+   dark mode, decoupled from the brand green) to #10b981 - the literal
+   emerald-500 hex already hardcoded on the header svg's own robot
+   head/arms (see index.html) - so this label reads as the icon's own
+   color specifically, in both themes, rather than following whatever
+   --accent-cyan happens to alias to. */
 .header-icon-label .full-text {
-  display: inline;
-  color: var(--accent-cyan);
-  font-size: 1.2rem;
+  display: flex;
+  flex-direction: column;
+  color: #10b981;
+  font-size: 0.9375rem;
+  line-height: 1.15;
   font-weight: 600;
 }
 
@@ -959,23 +1342,89 @@ textarea:focus {
   .header-icon-label .short-text {
     display: inline;
   }
+  /* Same "secondary text goes first" reclaiming of space as the logo's
+     own full-text/short-text swap right above - the "Dataset:" label is
+     the badge's own explanatory prefix, not the badge itself, so it's the
+     first thing dropped once the header gets tight. The badge (name, dot,
+     caret) and the separate info button both stay, still at their
+     enlarged size, all the way down to the next breakpoint. */
+  .dataset-center-label {
+    display: none;
+  }
 }
 
 @media (max-width: 480px) {
   .crbot-header {
     gap: 0.35rem;
   }
+  /* Tightened from the wider-screen 1.5rem (.crbot-dataset-center's own
+     default) - there's a lot less spare width to spend on breathing room
+     once the header's this narrow. */
+  .crbot-dataset-center {
+    margin-left: 0.5rem;
+  }
   .status-badge {
     max-width: 168px;
   }
-  /* Collapse Help/History/Sign-in into the triple-dot menu. The ">"
-     combinator matters here: it only hides #g_id_signin while it's still a
-     direct child of .header-actions (its original header position).
-     client.js's relocateMoreMenuAuthSlot() moves that same live node into
-     #moreMenuAuthSlot (inside the dropdown below) whenever this breakpoint
-     is active, at which point it's no longer a direct child here and stays
-     visible in its new spot - so sign-in/sign-out keeps working on mobile
-     instead of being hidden along with the header copy. */
+  /* At this width .header-actions has already collapsed most of its own
+     controls into the triple-dot menu (see below), but the dataset center
+     column still has to share the row with the model badge and that menu
+     button - reverting the badge/info-button's enlargement here (rather
+     than at 768px, where there's still enough room to keep it prominent)
+     is what keeps that three-way split from overflowing on a phone-width
+     screen. .status-badge's own 168px max-width above still applies on
+     top of this, truncating a long dataset name with an ellipsis rather
+     than ever actually overflowing. */
+  .dataset-badge-prominent,
+  .dataset-badge-prominent .conn-badge-text {
+    font-size: 0.8125rem;
+  }
+  .dataset-badge-prominent {
+    padding: 0.2rem 0.75rem;
+    gap: 0.35rem;
+  }
+  .dataset-badge-prominent .status-dot {
+    width: 8px;
+    height: 8px;
+  }
+  .dataset-info-btn {
+    width: 22px;
+    height: 22px;
+  }
+  .dataset-info-btn svg {
+    width: 14px;
+    height: 14px;
+  }
+}
+
+/* Collapse Model/Help/History/Preferences/Feedback/Sign-in into the
+   triple-dot menu. Deliberately the SAME breakpoint as the "Natural
+   Language & SQL Row Layouts" section below switches the NL/SQL panes
+   from side-by-side to stacked (max-width: 900px / min-width: 901px) -
+   per explicit request, so the header only gives up these six controls
+   at the exact width where the app is already reflowing into its narrow,
+   single-column layout, rather than at some unrelated breakpoint of its
+   own. This used to fire at max-width: 480px (see git history if that's
+   ever needed) - moved out to its own query here, at 900px, when that
+   changed; the model picker was folded in at the same time, per a
+   follow-up request to keep every header re-arrangement on one shared
+   breakpoint rather than giving it its own.
+   The ">" combinator matters here: it only hides #g_id_signin while it's
+   still a direct child of .header-actions (its original header position).
+   client.js's relocateAuthContainer() moves that same live node into
+   #moreMenuAuthSlot (inside the dropdown below) whenever this breakpoint
+   is active, at which point it's no longer a direct child here and stays
+   visible in its new spot - so sign-in/sign-out keeps working at this
+   width instead of being hidden along with the rest. client.js's own
+   NARROW_HEADER_MEDIA_QUERY constant must stay in sync with this number.
+   The model picker doesn't need an equivalent reparenting trick - unlike
+   the cross-origin sign-in iframe, #modelPickerWrapper has no real
+   interactive twin to move around: the more-menu's own #moreMenuModelBtn/
+   #moreMenuModelSubmenu (see index.html and the MODEL PICK LIST section
+   in client.js) are a second, independent presentation of the exact same
+   underlying selection, not a reparented copy of this one. */
+@media (max-width: 900px) {
+  .header-actions > .model-picker-wrapper,
   .header-actions > .help-btn,
   .header-actions > .history-btn,
   .header-actions > .gear-btn,
@@ -988,13 +1437,216 @@ textarea:focus {
   }
 }
 
-/* Natural Language & SQL Row Layouts */
-.nl-prompt-row,
-.sql-prompt-row {
+/* Natural Language & SQL Row Layouts
+   ------------------------------------------------------------------------
+   .editor-panes-row wraps the NL prompt pane (#editorPaneNl) and the SQL
+   pane (#editorPaneSql), with #editorPanesResizer (a draggable divider,
+   see initEditorPanesResizer() in client.js) between them. This divider's
+   ORIENTATION follows the row's own layout direction, matching whichever
+   arrangement is active - it isn't just hidden below the breakpoint:
+
+   > 900px (see the media query below, matching this app's existing
+   narrow-layout breakpoint elsewhere): the two panes sit SIDE BY SIDE,
+   equal width by default (50/50, both flex: 1 1 0). The divider is
+   VERTICAL (col-resize, dragged left/right) and resizes the WIDTH split
+   between them. Both panes' actual boxes (.speech-bubble-wrapper /
+   .speech-bubble-wrapper.sql-bubble) are also kept the SAME height as each
+   other by JS (setEditorAreaHeightPx() in client.js) per explicit request -
+   dragging #resultsPanesResizer below changes that shared height.
+
+   <= 900px: the two panes STACK (flex-direction: column), full width each.
+   The SAME divider becomes HORIZONTAL (row-resize, dragged up/down) and
+   resizes the HEIGHT split between the stacked NL and SQL boxes instead -
+   see setNlPaneHeightPx()/applyNlPaneHeightPx() in client.js. Neither box
+   has its own native resize handle any more (see
+   .speech-bubble-wrapper.sql-bubble below) - #editorPanesResizer here and
+   #resultsPanesResizer further down (which still separately controls the
+   SQL box's own height, growing/shrinking the whole stacked block) are the
+   only two ways to resize anything in the editor area, in both layouts. */
+.editor-panes-row {
   display: flex;
-  align-items: center;
-  gap: 0.85rem;
+  align-items: stretch;
   width: 100%;
+  /* The resizer's own thickness plus each pane's padding supplies the
+     visual gap in both layouts (see below) - same pattern as
+     .schema-viewer-panes/.schema-viewer-panes-resizer. */
+  gap: 0;
+}
+
+/* Deliberately NOT display:flex - .speech-bubble-wrapper (the pane's one
+   child) already carries its own `flex: 1` from back when it sat directly
+   inside the old .input-row's flex ROW (see that rule's own comment) - if
+   this pane were ALSO a flex container (column direction, so the main axis
+   is now height), that same `flex: 1` would hijack the wrapper's HEIGHT
+   (flex-basis: 0% grows to fill the pane) and silently override whatever
+   explicit height client.js sets on it, which is exactly the bug this
+   comment is here to head off. Plain block layout sidesteps that entirely:
+   the wrapper just fills the pane's width (normal block sizing) and its
+   height comes purely from its own height/min-height/max-height (CSS
+   default, or client.js's inline override) with no flex interference. */
+.editor-pane {
+  min-width: 0;
+  min-height: 0;
+}
+
+/* The draggable divider itself, between .editor-pane-nl and
+   .editor-pane-sql (see initEditorPanesResizer() in client.js) - same
+   9px/10px hit-area, 1px-hairline, thicken-on-hover treatment as
+   .schema-viewer-panes-resizer/.results-panes-resizer, for a consistent
+   drag-handle language across the app. Base rule below is the <= 900px
+   (stacked/horizontal) presentation; the media query further down
+   overrides it for the > 900px (side-by-side/vertical) presentation. */
+.editor-panes-resizer {
+  display: block;
+  flex: 0 0 auto;
+  width: 100%;
+  height: 10px;
+  min-width: 0;
+  position: relative;
+  cursor: row-resize;
+}
+
+.editor-panes-resizer::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 1px;
+  background: var(--bg-card-border);
+  transform: translateY(-50%);
+  transition: background-color 0.15s ease, height 0.15s ease;
+}
+
+.editor-panes-resizer:hover::after,
+.editor-panes-resizer:focus-visible::after,
+.editor-panes-resizer.editor-panes-resizer--dragging::after {
+  height: 3px;
+  background: var(--accent-cyan);
+}
+
+.editor-panes-resizer:focus-visible {
+  outline: none;
+}
+
+@media (max-width: 900px) {
+  .editor-panes-row {
+    flex-direction: column;
+  }
+
+  .editor-pane-nl {
+    padding-bottom: 0.5rem;
+  }
+
+  .editor-pane-sql {
+    padding-top: 0.5rem;
+  }
+}
+
+@media (min-width: 901px) {
+  .editor-pane-nl,
+  .editor-pane-sql {
+    flex: 1 1 0;
+    min-width: 0;
+  }
+
+  .editor-pane-nl {
+    padding-right: 0.5rem;
+  }
+
+  .editor-pane-sql {
+    padding-left: 0.5rem;
+  }
+
+  /* Rotated to a vertical divider for the side-by-side layout - same
+     hairline/hover treatment, just on the perpendicular axis (width
+     instead of height, col-resize instead of row-resize). */
+  .editor-panes-resizer {
+    width: 9px;
+    height: auto;
+    min-height: 0;
+    cursor: col-resize;
+  }
+
+  .editor-panes-resizer::after {
+    left: 50%;
+    right: auto;
+    top: 0;
+    bottom: 0;
+    width: 1px;
+    height: auto;
+    transform: translateX(-50%);
+  }
+
+  .editor-panes-resizer:hover::after,
+  .editor-panes-resizer:focus-visible::after,
+  .editor-panes-resizer.editor-panes-resizer--dragging::after {
+    width: 3px;
+    height: auto;
+    background: var(--accent-cyan);
+  }
+
+  /* "Show SQL" unchecked (Preferences > SQL Execution - see
+     applySqlPaneVisibility() in client.js): #editorPaneSql/
+     #editorPanesResizer are hidden outright (.hidden, display:none) and
+     this grows the NL pane to fill the freed width. !important
+     deliberately outweighs any inline flex-basis initEditorPanesResizer()'s
+     drag handlers may have left on .editor-pane-nl (e.g. a dragged-to-40%
+     split) - "SQL is gone" should always read as full width regardless of
+     whatever split was last dragged, and removing this class (Show SQL
+     re-checked) simply lets that inline style resume untouched, no JS
+     bookkeeping needed. Scoped to this >900px block on purpose - in the
+     stacked (<=900px) layout .editor-panes-row's main axis is height, not
+     width, so forcing flex-basis: 100% there would fight the NL box's own
+     independently-managed height instead of doing anything useful; hiding
+     the SQL pane in that layout already leaves the NL pane as the sole
+     block filling its column, with no extra CSS needed. */
+  .editor-panes-row.sql-hidden .editor-pane-nl {
+    flex: 1 1 100% !important;
+  }
+}
+
+/* The draggable divider between the editor area (both NL/SQL panes above)
+   and the results area below (see initResultsPanesResizer() in client.js).
+   Present at every screen width - unlike #editorPanesResizer, this one
+   isn't about the split BETWEEN the two boxes, it's what REPLACED the SQL
+   box's own native resize:vertical handle (see .speech-bubble-wrapper.
+   sql-bubble below): dragging it grows/shrinks the SQL box (and, in the
+   side-by-side layout, the NL box right along with it, to keep them equal)
+   at the expense of the results area, or vice versa. Horizontal
+   counterpart of .schema-viewer-panes-resizer - same visual language,
+   rotated 90deg (row-resize cursor, a horizontal hairline that thickens on
+   hover/focus/drag). */
+.results-panes-resizer {
+  flex: 0 0 auto;
+  width: 100%;
+  height: 10px;
+  min-width: 0;
+  position: relative;
+  cursor: row-resize;
+}
+
+.results-panes-resizer::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 1px;
+  background: var(--bg-card-border);
+  transform: translateY(-50%);
+  transition: background-color 0.15s ease, height 0.15s ease;
+}
+
+.results-panes-resizer:hover::after,
+.results-panes-resizer:focus-visible::after,
+.results-panes-resizer.results-panes-resizer--dragging::after {
+  height: 3px;
+  background: var(--accent-cyan);
+}
+
+.results-panes-resizer:focus-visible {
+  outline: none;
 }
 
 /* Speech/Prompt Containers */
@@ -1008,20 +1660,38 @@ textarea:focus {
   border: 1px solid rgba(var(--accent-cyan-rgb), 0.35);
   border-radius: 0;
   transform: none;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4), inset 0 0 12px rgba(var(--primary-rgb), 0.08);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4), inset 0 0 12px rgba(var(--accent-cyan-rgb), 0.08);
   padding: 4px;
   box-sizing: border-box;
 }
 
+/* height/min-height/max-height here are just the CSS-level DEFAULT/
+   fallback (100px, matching this box's long-standing default size) -
+   client.js's setEditorAreaHeightPx() sets an inline `height` directly on
+   this element (and on .editor-pane-nl's wrapper too, when side by side -
+   see .editor-panes-row's own comment above) whenever the user drags
+   #resultsPanesResizer, and an inline style always wins over these class
+   rules regardless of source order/specificity.
+   resize: none (was resize: vertical) - this box is no longer
+   individually resizable by dragging its own corner; that native browser
+   resize handle is replaced app-wide by the explicit #resultsPanesResizer
+   divider below the editor area, so the SAME drag affects the NL pane too
+   in the side-by-side layout instead of only ever affecting this one box.
+   min-height dropped from the old 100px to 56px (MIN_EDITOR_AREA_PX in
+   client.js - kept in sync with that constant) since the resizer now
+   allows shrinking below what the native handle used to permit; max-height
+   loosened from a flat 600px to 80vh as a generous CSS-only safety net -
+   client.js's own drag clamp (based on how much room .table-card needs to
+   keep, not a fixed number) is what actually bounds it day to day. */
 .speech-bubble-wrapper.sql-bubble {
   background: var(--surface-1);
   border: 1px solid rgba(var(--accent-cyan-rgb), 0.35);
   border-radius: 0;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4), inset 0 0 12px rgba(var(--primary-rgb), 0.08);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4), inset 0 0 12px rgba(var(--accent-cyan-rgb), 0.08);
   height: 100px;
-  min-height: 100px;
-  max-height: 600px;
-  resize: vertical;
+  min-height: 56px;
+  max-height: 80vh;
+  resize: none;
   overflow: hidden;
   position: relative;
   display: flex;
@@ -1030,32 +1700,15 @@ textarea:focus {
   padding: 6px;
 }
 
-.nl-prompt-row .speech-bubble-wrapper,
-.nl-prompt-row .nl-prompt-controls,
-.sql-prompt-row .sql-prompt-controls {
-  height: 42px;
-  min-height: 42px;
-}
-
-.inputs-column .input-row:first-child {
-  min-height: auto;
-  height: auto;
-}
-
-.sql-prompt-row .speech-bubble-wrapper.sql-bubble {
-  height: 100px;
-  min-height: 100px;
-  max-height: 600px;
-  resize: vertical;
-  overflow: hidden;
-  display: flex;
-  flex-direction: column;
-}
-
 /* Textarea Box Styles */
 .speech-bubble-wrapper textarea#aiPrompt {
   width: 100%;
-  height: 34px;
+  /* Fills the wrapper's full height (was a fixed 34px, ~1 line) rather
+     than capping the usable typing area partway down an otherwise-empty
+     box - this wrapper's own height is set directly by client.js (see
+     .editor-panes-row's own comment in this file), so a definite height
+     is always present for this percentage to resolve against. */
+  height: 100%;
   background: transparent !important;
   border: none !important;
   box-shadow: none !important;
@@ -1063,9 +1716,13 @@ textarea:focus {
   font-family: var(--font-mono) !important;
   font-size: 0.85rem;
   line-height: 1.25;
-  padding: 0.25rem 0.6rem;
+  /* Top padding bumped from 0.25rem to 0.5rem to match #sqlQuery's own
+     top padding just below - was tuned for a single-line box, and read as
+     text jammed against the top edge once this box could actually be
+     taller than one line. */
+  padding: 0.5rem 0.6rem;
   padding-right: 2.2rem !important;
-  resize: none; 
+  resize: none;
   outline: none;
   transform: none;
   border-radius: 0;
@@ -1090,7 +1747,7 @@ textarea:focus {
   background: transparent !important;
   border: none !important;
   box-shadow: none !important;
-  color: var(--primary-hover) !important;
+  color: var(--accent-cyan) !important;
   font-family: var(--font-mono) !important;
   font-size: 0.9rem;
   line-height: 1.45;
@@ -1144,9 +1801,14 @@ textarea:focus {
   gap: 0.25rem;          /* reduced spacing between icon and text */
   border-radius: 4px;    /* scaled down radius */
   /* z-index: 10; Ensures it renders on top of CodeMirror scroll/gutters */
-  background: rgba(var(--accent-cyan-rgb), 0.85); /* Brand blue accent - matches logo/icons */
+  /* Deliberately --primary (this app's real green), not --accent-cyan -
+     the Execute button stays green even after the dark-mode "white
+     accent" pass moved --accent-cyan off green everywhere else (see that
+     note up top), per explicit request that Execute keep reading as the
+     same "go/success" color as Save and the thumbs-up icons. */
+  background: rgba(var(--primary-rgb), 0.85);
   color: #ffffff;
-  border: 1px solid rgba(var(--accent-cyan-rgb), 0.4);
+  border: 1px solid rgba(var(--primary-rgb), 0.4);
   border-radius: 6px;
   backdrop-filter: blur(4px);
   cursor: pointer;
@@ -1154,8 +1816,8 @@ textarea:focus {
 }
 
 #runBtn.sql-overlay-btn:hover:not(:disabled) {
-  background: rgba(var(--accent-cyan-rgb), 1);
-  box-shadow: 0 0 10px rgba(var(--accent-cyan-rgb), 0.4);
+  background: rgba(var(--primary-rgb), 1);
+  box-shadow: 0 0 10px rgba(var(--primary-rgb), 0.4);
 }
 
 #runBtn.sql-overlay-btn:disabled {
@@ -1368,7 +2030,7 @@ textarea:focus {
   position: fixed;
   border-radius: 10px;
   box-shadow: 0 0 0 9999px rgba(var(--scrim-rgb), 0.78);
-  border: 2px solid var(--primary);
+  border: 2px solid var(--accent-cyan);
   pointer-events: none;
   transition: top 0.3s ease, left 0.3s ease, width 0.3s ease, height 0.3s ease;
 }
@@ -1381,7 +2043,7 @@ textarea:focus {
   border: 1px solid var(--bg-card-border);
   border-radius: 12px;
   padding: 1.1rem 1.15rem 1rem;
-  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(var(--primary-rgb), 0.15);
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(var(--accent-cyan-rgb), 0.15);
   transition: top 0.3s ease, left 0.3s ease;
 }
 
@@ -1390,7 +2052,7 @@ textarea:focus {
   font-weight: 700;
   letter-spacing: 0.06em;
   text-transform: uppercase;
-  color: var(--primary-hover);
+  color: var(--accent-cyan);
   margin-bottom: 0.4rem;
 }
 
@@ -1452,7 +2114,7 @@ textarea:focus {
 .restore-quick-prompts-btn {
   background: transparent;
   border: 1px solid var(--bg-card-border);
-  color: var(--primary-hover);
+  color: var(--accent-cyan);
   font-size: 0.8rem;
   padding: 0.3rem 0.75rem;
   border-radius: 999px;
@@ -1461,8 +2123,8 @@ textarea:focus {
 }
 
 .restore-quick-prompts-btn:hover {
-  background: var(--primary-glow);
-  border-color: var(--primary);
+  background: var(--accent-cyan-glow);
+  border-color: var(--accent-cyan);
 }
 
 .modal-body {
@@ -1528,7 +2190,7 @@ textarea:focus {
 .help-dialog-body h3 {
   font-size: 0.95rem;
   font-weight: 600;
-  color: var(--primary);
+  color: var(--accent-cyan);
   margin-top: 0.5rem;
 }
 
@@ -1668,7 +2330,7 @@ textarea.report-issue-preview:focus {
 }
 
 .config-input:focus, .config-select:focus {
-  border-color: var(--primary);
+  border-color: var(--accent-cyan);
 }
 
 .modal-actions {
@@ -1832,12 +2494,21 @@ textarea.report-issue-preview:focus {
    select/name input/toggle/remove button alongside it, not just a label),
    so without this it rendered as a bare, unstyled native browser radio -
    a different size/color than every preset's right above it, even though
-   both are options in the same db_connection_option radio group. */
+   both are options in the same db_connection_option radio group.
+   flex-shrink: 0 (new) fixes a real bug: .radio-option is a flex row whose
+   default flex-shrink: 1 let this radio be squeezed smaller than every
+   other one in the list, but only for whichever preset happened to have
+   the longest label (e.g. "US Sensus (Google Visualization API Qu...)") -
+   the browser was shrinking the radio itself, alongside the label's own
+   ellipsis truncation, to make that one row fit its column. A fixed
+   width/height alone doesn't protect against that in a flex container;
+   only flex-shrink: 0 does. */
 .radio-option input[type="radio"],
 .custom-db-header-row input[type="radio"] {
-  accent-color: var(--primary);
+  accent-color: var(--accent-cyan);
   width: 1rem;
   height: 1rem;
+  flex-shrink: 0;
   cursor: pointer;
 }
 
@@ -1847,27 +2518,33 @@ textarea.report-issue-preview:focus {
   text-overflow: ellipsis;
 }
 
-/* Schema Viewer "?" (help-circle) button. Used to exist once per preset
-   and once per saved custom connection inside the DB connection config
-   dialog (letting the Schema Viewer be opened for a connection other than
+/* Schema Viewer "i" info button. Used to exist once per preset and once
+   per saved custom connection inside the DB connection config dialog
+   (letting the Schema Viewer be opened for a connection other than
    whichever one was actually active, and always stacked on top of that
    dialog besides) - both of those are gone now. The one surviving copy
-   (#datasetSchemaViewerBtn, see index.html) lives NESTED inside
-   configTriggerBadge itself (the dataset badge), right after its name
-   text, rather than floating beside it as a separate, unlabeled icon -
-   that placement was ambiguous about which dataset it referred to. Its
-   own click handler in client.js calls stopPropagation() so clicking it
-   doesn't also fire the badge's own click-to-configure handler, and it
-   only ever opens the Schema Viewer for the currently ACTIVE connection,
-   so there's no other connection it could mean and no config dialog
-   underneath it to get stuck behind. */
-.schema-info-btn {
+   (#datasetSchemaViewerBtn, see index.html) now sits BESIDE the dataset
+   badge, inside .crbot-dataset-center, as its own separately-sized
+   control (per explicit request to pull it out of the pill and enlarge it
+   to match the badge's own bigger font) rather than nested inside the
+   badge at a small, badge-matched size. Being a sibling of the badge now
+   (rather than nested inside it) means its clicks no longer bubble
+   through the badge's own click-to-configure handler at all - its click
+   handler in client.js still calls stopPropagation() as a harmless
+   belt-and-suspenders leftover from the nested days, but it isn't
+   load-bearing any more. It only ever opens the Schema Viewer for the
+   currently ACTIVE connection, so there's no other connection it could
+   mean and no config dialog underneath it to get stuck behind. Sized up
+   from the old nested version's 18px (badge-
+   matched) - see .dataset-badge-prominent's own comment for how its
+   enlargement (and this icon's matching one) were sized. */
+.dataset-info-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
-  width: 22px;
-  height: 22px;
+  width: 29px;
+  height: 29px;
   padding: 0;
   background: transparent;
   border: 1px solid var(--surface-3);
@@ -1877,42 +2554,10 @@ textarea.report-issue-preview:focus {
   transition: var(--transition);
 }
 
-.schema-info-btn:hover {
+.dataset-info-btn:hover {
   background: var(--overlay-2);
   color: var(--accent-cyan);
   border-color: var(--accent-cyan);
-}
-
-/* Sized down and border-less by default when nested inside the dataset
-   badge (see this button's own comment above) so it reads as part of the
-   pill rather than a second button glued onto it - the hover state above
-   (background + border appearing) is what signals it's independently
-   clickable, without needing a visible border at rest to look "attached".
-   No margin-left of its own any more - the divider right before it (see
-   .schema-info-divider below) is what supplies its spacing from the name
-   now, on both sides, instead of this button nudging itself away alone. */
-.status-badge .schema-info-btn {
-  width: 18px;
-  height: 18px;
-  border-color: transparent;
-}
-
-/* Sits between the dataset name and the info button (see index.html's
-   own comment on it): a couple of spaces, a thin vertical bar, then a
-   couple more spaces, so the two feel like separate, deliberately spaced
-   controls rather than one continuous run of text-then-icon. The margin
-   here is on top of .status-badge's own 0.35rem inter-child flex gap, so
-   the actual visual gap on each side of the bar is larger than the gap
-   between any other two items in the pill (dot-to-name, for instance) -
-   that asymmetry is deliberate: it's what visually calls out "there are
-   two separate targets here" without needing the info button itself to
-   look like a whole second pill. */
-.schema-info-divider {
-  width: 1px;
-  height: 12px;
-  background: var(--surface-3);
-  margin: 0 0.35rem;
-  flex-shrink: 0;
 }
 
 /* Same "grayed out, not clickable right now" treatment as
@@ -1920,13 +2565,13 @@ textarea.report-issue-preview:focus {
    here via the same class (toggled by the same setButtonsDisabled() call)
    since #datasetSchemaViewerBtn isn't a .status-badge itself and so isn't
    covered by that selector. */
-.schema-info-btn.badge-disabled {
+.dataset-info-btn.badge-disabled {
   cursor: not-allowed;
   opacity: 0.45;
   filter: grayscale(1);
 }
 
-.schema-info-btn.badge-disabled:hover {
+.dataset-info-btn.badge-disabled:hover {
   background: transparent;
   color: var(--text-secondary);
   border-color: var(--surface-3);
@@ -1935,15 +2580,15 @@ textarea.report-issue-preview:focus {
 /* Dataset groups (see renderDbRadioButtons() in client.js) - each admin-
    curated group renders as its own radio, merged into the very same
    two-column playgrounds list as every single preset (no separate
-   section/heading of its own any more). Bolded like a heading would be, so
-   it still reads as a distinct, deliberate top-level choice rather than
-   just another preset name, even sitting in the same column as one. The
+   section/heading of its own any more). No longer bolded (per explicit
+   request - it read as visually heavier than every ordinary preset beside
+   it, not just "distinct"); it's still set apart from an ordinary preset
+   by its own on-hover tooltip and "(Dataset Group)" suffix instead. The
    explanation of what this option does lives in its own `title` attribute
    (a plain on-hover tooltip, no custom CSS needed) rather than as visible
    text in the dialog body - see renderDbRadioButtons()'s
    GROUP_OPTION_HINT. */
 .all-databases-option {
-  font-weight: 600;
   white-space: normal;
   margin-bottom: 0.15rem;
 }
@@ -1959,10 +2604,23 @@ textarea.report-issue-preview:focus {
 }
 
 .checkbox-option input[type="checkbox"] {
-  accent-color: var(--primary);
+  accent-color: var(--accent-cyan);
   width: 1rem;
   height: 1rem;
   cursor: pointer;
+}
+
+/* Locked state - Preferences' "Show SQL" checkbox while automatic
+   execution is off (see enforceShowSqlLinkage() in client.js): forced
+   checked and disabled, so it needs to visibly read as "on, but not
+   yours to change right now" rather than just an ordinary checked box. */
+.checkbox-option:has(input:disabled) {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.checkbox-option input[type="checkbox"]:disabled {
+  cursor: not-allowed;
 }
 
 /* ===========================================================================
@@ -2135,14 +2793,23 @@ textarea.report-issue-preview:focus {
   margin-top: 0.5rem;
 }
 
+/* USED to paint its own background-color: var(--surface-1); border-radius:
+   8px - a distinctly-tinted, rounded "lifted panel" look (see --bg-dark's
+   own comment on why --surface-1 was kept visually separate from it) that
+   read as a second, nested "box" around the whole results area, right
+   inside .table-card's own now-removed border/background (see .card's
+   comment above) - visible even before any query has run, since it never
+   depended on there being a table to show. Removed per the same explicit
+   "no box" request: the results area now sits flush against the page,
+   with only .table-responsive's own recessed-panel look (once a real
+   result renders) providing any framing at all, the same way each NL/SQL
+   text box still keeps its own individual border. */
 .results-container {
   display: flex;
   flex-direction: column;
   height: 100%;
   flex: 1;
   min-height: 0;
-  background-color: var(--surface-1);
-  border-radius: 8px;
   overflow: hidden;
 }
 
@@ -2222,18 +2889,21 @@ textarea.report-issue-preview:focus {
   font-weight: 500;
   line-height: 1;
   border-radius: 6px;
-  /* Matches #runBtn.sql-overlay-btn's own 1px border exactly (same width,
-     same hue) purely so the two buttons come out the same overall height -
-     without a border here, this button rendered 2px shorter than Execute
-     despite every other sizing property already matching. */
-  border: 1px solid rgba(var(--accent-cyan-rgb), 0.4);
-  /* The header/logo's own blue (--accent-cyan), matching .results-retry-
-     status's own progress-banner color above - not --danger's bright red
-     (too alarming for "cancel an in-progress query"), and not --warning's
-     amber either (the light theme's particular shade of it read as
-     aggressively red-orange rather than as a mild notice). */
-  background-color: var(--accent-cyan);
-  color: var(--on-accent-cyan);
+  /* Matches #runBtn.sql-overlay-btn's own 1px border WIDTH exactly, so the
+     two buttons come out the same overall height - without a border here,
+     this button rendered 2px shorter than Execute despite every other
+     sizing property already matching. Not the same HUE any more, though
+     (see the color comment below) - only the width matters here. */
+  border: 1px solid rgba(var(--danger-rgb), 0.4);
+  /* --danger's red, per explicit request - this used to be --accent-cyan
+     (matching .results-retry-status's own progress-banner color above),
+     deliberately not --danger, on the reasoning that a bright red felt too
+     alarming for "cancel an in-progress query". Overridden by a later,
+     more specific request: cancelling a query should read as the same red
+     as every other cancel/delete action in the app, not as a mild,
+     in-progress notice. */
+  background-color: var(--danger);
+  color: var(--on-danger);
 }
 
 #stopBtn.btn-stop:hover {
@@ -2245,9 +2915,11 @@ textarea.report-issue-preview:focus {
    between the header and the editor card, shown only when the server's
    CLIENT_BUILD_ID (server/app_config.py) has actually changed since page
    load, i.e. a real frontend change landed, not just any server restart.
-   --accent-cyan again, matching .results-retry-status/#stopBtn.btn-stop
-   above - the same "mild notice, not alarming" precedent, since this too
-   is only ever a suggestion, never a forced reload. */
+   --accent-cyan again, matching .results-retry-status above (#stopBtn.
+   btn-stop USED to match this same "mild notice, not alarming" tone too,
+   before it moved to --danger red - see its own comment) - this banner is
+   still only ever a suggestion, never a forced reload, so it keeps the
+   milder accent color rather than following that same move to red. */
 
 /* Server-down banner (see client.js's markServerUnreachable()/
    markServerReachable()) - unlike .new-version-banner above, this reports
@@ -2434,15 +3106,14 @@ textarea.report-issue-preview:focus {
   background-color: rgba(var(--danger-rgb), 0.12);
 }
 
-/* The Summary tab's "View as chart" nudge (see client.js's
-   summaryChartInlineLinkHtml()/jumpToChartableResultTab()) - appended
-   straight onto the tail end of the summary text itself (inside the same
-   <p>, not a separate element below it), so it reads as a plain inline
-   text link continuing the prose rather than a standalone UI control. An
-   earlier version used a separate outlined pill button sitting under the
-   text; that read as out-of-context clutter, so this is deliberately
-   unstyled as a "button" (no border/background/pill) and instead just
-   looks like clickable text, matching how a link would sit inline. */
+/* Fallback-only nudge (see client.js's summaryChartInlineLinkHtml()'s own
+   comment) for the rare case Chart.js itself failed to load, so there's
+   still some way to reach the chart tab. Appended straight onto the tail
+   end of the summary text itself (inside the same <p>, not a separate
+   element below it), so it reads as a plain inline text link continuing
+   the prose rather than a standalone UI control. Deliberately unstyled as
+   a "button" (no border/background/pill) and instead just looks like
+   clickable text, matching how a link would sit inline. */
 .summary-chart-inline-link {
   display: inline;
   padding: 0;
@@ -2458,6 +3129,76 @@ textarea.report-issue-preview:focus {
 
 .summary-chart-inline-link:hover {
   color: var(--secondary-hover);
+}
+
+/* The Summary tab's own small chart preview (see client.js's
+   renderSummaryInlineChart()/jumpToChartableResultTab()) - sits beside
+   the summary text (see .summary-text-chart-row just below) at half the
+   row's width (this feature's first cut ran it full-width underneath the
+   text; a later nit shrank it to a small fixed-width thumbnail; this is
+   the third size, proportional rather than a fixed pixel value so it
+   scales with whatever width the results area itself has). Reset to a
+   plain, borderless block first since the underlying element is a
+   <button> (needed for the same click-to-navigate/keyboard-focus
+   behavior as every other data-view-chart-trigger control in this
+   file), then given a subtle hover affordance so it still reads as
+   clickable even though it looks like a small chart rather than a link
+   or pill. */
+.summary-chart-inline-preview {
+  display: block;
+  flex: 0 0 50%;
+  min-width: 220px;
+  padding: 0.4rem;
+  border: 1px solid var(--bg-card-border);
+  border-radius: 8px;
+  background: none;
+  cursor: pointer;
+  box-sizing: border-box;
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+}
+
+.summary-chart-inline-preview:hover {
+  border-color: var(--secondary);
+  background-color: rgba(var(--secondary-rgb), 0.06);
+}
+
+/* Chart.js needs an explicit-height positioned ancestor to size its
+   canvas against (see .results-chart-wrapper's own comment above) - an
+   aspect-ratio here (rather than a fixed pixel height, as this rule used
+   before) is what makes the preview's height scale right along with its
+   now-proportional width above, instead of staying fixed while only the
+   width grows. Chart.js's own legend/tick text size scales right along
+   with it too - see buildResultsChartConfig()'s own comment on reading
+   the real canvas width at render time - so the whole preview grows or
+   shrinks as one proportional unit rather than the chart "content"
+   staying a fixed size inside a resized box. */
+.summary-chart-inline-preview-canvas {
+  display: block;
+  width: 100%;
+  height: auto;
+  aspect-ratio: 2 / 1;
+}
+
+/* Wraps the Summary tab's own text and (when this turn has one) its
+   chart preview together (see renderTableResult()'s isText branch) - a
+   simple side-by-side row, text on the left flexing to fill the space,
+   the small fixed-width chart preview pinned to the right of it. Wraps
+   onto its own line below the text on a narrow enough tab/pane (see the
+   resizable editor/results layout further up) rather than squeezing the
+   preview illegibly thin. Only ever built when there's an actual preview
+   to place - the plain-text summary (no chartable tab this turn) skips
+   this wrapper entirely and the paragraph goes straight into the cell,
+   same as always. */
+.summary-text-chart-row {
+  display: flex;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 0.9rem;
+}
+
+.summary-text-chart-row .response-text {
+  flex: 1 1 260px;
+  min-width: 0;
 }
 
 /* Wraps .report-issue-inline-btn when it has to be inserted as its own
@@ -2853,7 +3594,7 @@ tr.report-issue-row td {
 
 .results-download-menu-item:hover {
   background-color: var(--overlay-2);
-  color: var(--primary);
+  color: var(--accent-cyan);
 }
 
 /* Shown whenever the currently-displayed tab's result was cut off by
@@ -2894,20 +3635,11 @@ tr.report-issue-row td {
   box-sizing: border-box;
 }
 
-.inputs-column {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  gap: 0.75rem;
-  min-width: 0;
-}
-
-.input-row {
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-  min-height: 52px;
-}
+/* .inputs-column/.input-row used to wrap the NL/SQL rows inside
+   .controls-layout-grid - both replaced by .editor-panes-row/.editor-pane
+   (see that rule's own comment further up) when the side-by-side editor
+   layout was added, and removed here since grep confirms index.html no
+   longer references either class anywhere. */
 
 /* Action Buttons Column */
 .action-buttons-column {
@@ -2947,7 +3679,7 @@ tr.report-issue-row td {
 .stat-card-title {
   font-size: 0.65rem;
   font-weight: 700;
-  color: var(--primary);
+  color: var(--accent-cyan);
   text-transform: uppercase;
   letter-spacing: 0.05em;
   margin-bottom: 0.15rem;
@@ -3035,8 +3767,8 @@ tr.report-issue-row td {
 
 .auth-avatar-circle:hover {
   background: var(--overlay-4);
-  border-color: var(--primary);
-  color: var(--primary);
+  border-color: var(--accent-cyan);
+  color: var(--accent-cyan);
 }
 
 .auth-avatar-img {
@@ -3050,7 +3782,7 @@ tr.report-issue-row td {
   font-size: 0.55rem;
   /*font-size: clamp(0.9rem, 1.5vw, 1.1rem);*/
   font-weight: 600;
-  color: var(--primary);
+  color: var(--accent-cyan);
 }
 
 .auth-dropdown-menu {
@@ -3128,8 +3860,8 @@ tr.report-issue-row td {
 
 .auth-avatar-circle:hover {
   background: var(--overlay-4);
-  color: var(--primary);
-  border-color: var(--primary);
+  color: var(--accent-cyan);
+  border-color: var(--accent-cyan);
 }
 
 .auth-avatar-img {
@@ -3196,7 +3928,7 @@ tr.report-issue-row td {
 
 .auth-dropdown-item:hover {
   background-color: var(--overlay-2);
-  color: var(--primary);
+  color: var(--accent-cyan);
 }
 
 .history-modal-header {
@@ -3402,14 +4134,9 @@ tr.report-issue-row td {
   cursor: not-allowed;
 }
 
-/* Dynamic Controls Layout Grid Base */
-.controls-layout-grid {
-  display: flex;
-  gap: 1rem;
-  align-items: stretch;
-  width: 100%;
-  flex-wrap: nowrap;
-}
+/* .controls-layout-grid (the old wrapper around .inputs-column) was
+   removed along with .inputs-column/.input-row above - see
+   .editor-panes-row's own comment for its replacement. */
 
 /* Wide Screen Layout (> 900px) */
 @media (min-width: 901px) {
@@ -3443,17 +4170,6 @@ tr.report-issue-row td {
 
 /* Narrow Screens Layout (<= 900px) */
 @media (max-width: 900px) {
-  .controls-layout-grid {
-    display: flex;
-    flex-direction: column;
-    gap: 0.75rem;
-    width: 100%;
-  }
-
-  .inputs-column {
-    width: 100%;
-  }
-
   /* 4 Action Buttons placed side-by-side under SQL box */
   .action-buttons-column {
     width: 100%;
@@ -3578,8 +4294,9 @@ tr.report-issue-row td {
 .speech-bubble-wrapper .inline-history-nav {
   position: absolute;
   right: 28px;
-  top: 50%;
-  transform: translateY(-50%);
+  /* Top-anchored, same reasoning as .mic-btn just above - sits right next
+     to it in a row along the top edge instead of centered down the box. */
+  top: 6px;
   display: inline-flex;
   align-items: center;
   background: var(--overlay-6);
@@ -3999,7 +4716,7 @@ tr.report-issue-row td {
 .schema-viewer-panes-resizer:focus-visible::after,
 .schema-viewer-panes-resizer.schema-viewer-panes-resizer--dragging::after {
   width: 3px;
-  background: var(--primary);
+  background: var(--accent-cyan);
 }
 
 .schema-viewer-panes-resizer:focus-visible {
@@ -4130,6 +4847,20 @@ tr.report-issue-row td {
   overflow-wrap: anywhere;
 }
 
+/* This table's own "[table] NAME: description" catalog comment (see
+   parseSchemaComments()/schemaViewerTableCommentText in client.js) -
+   deliberately styled as a quiet aside (muted color, italic, smaller than
+   the heading it sits under) rather than another bold heading-like line,
+   since it's descriptive metadata about the table, not a fact on the same
+   level as its name/row count. */
+.schema-viewer-table-comment {
+  flex-shrink: 0;
+  font-size: 0.82rem;
+  font-style: italic;
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+
 .schema-viewer-detail-text {
   flex: 1 1 auto;
   min-height: 0;
@@ -4173,19 +4904,19 @@ tr.report-issue-row td {
 }
 
 /* table-layout: fixed + an explicit equal width per column (below) is
-   what makes all 6 columns genuinely equal-width instead of the browser's
+   what makes all 7 columns genuinely equal-width instead of the browser's
    default content-based auto-sizing, which is what used to let a long
-   Sample values/Constraints value visually "steal" width from its
-   neighbors and squeeze Column/Type/Nullable's headers into wrapping.
+   Sample values/Constraints/Comments value visually "steal" width from
+   its neighbors and squeeze Column/Type/Nullable's headers into wrapping.
    min-width keeps that equal split from ever being squeezed so tight
    that a header would have to wrap: it's sized so "Sample values" - the
-   longest of the 6 headers - comfortably fits, unwrapped, in a single
-   16.6667% share (~130px) including this table's own cell padding. Below
+   longest of the 7 headers - comfortably fits, unwrapped, in a single
+   14.2857% share (~130px) including this table's own cell padding. Below
    that width, .schema-viewer-columns-wrap's own overflow: auto is what
    gives the table a horizontal scrollbar instead of shrinking further. */
 .schema-viewer-columns-table {
   width: 100%;
-  min-width: 780px;
+  min-width: 910px;
   table-layout: fixed;
   border-collapse: collapse;
   font-family: var(--font-mono);
@@ -4194,7 +4925,7 @@ tr.report-issue-row td {
 
 .schema-viewer-columns-table th,
 .schema-viewer-columns-table td {
-  width: 16.6667%;
+  width: 14.2857%;
   padding: 0.4rem 0.65rem;
   text-align: left;
   border-bottom: 1px solid var(--bg-card-border);
@@ -4392,6 +5123,15 @@ tr.report-issue-row td {
    sampled peek at real data, so it's toned down relative to the rest of
    the row rather than competing with it visually. */
 .schema-viewer-col-samples {
+  color: var(--text-secondary);
+  font-style: italic;
+}
+
+/* Same treatment as .schema-viewer-col-samples above, for the same reason
+   - a column's own catalog comment (see parseSchemaComments() in
+   client.js) is descriptive metadata, not a structural fact like
+   Attributes/Constraints, so it's toned down the same way. */
+.schema-viewer-col-comments {
   color: var(--text-secondary);
   font-style: italic;
 }

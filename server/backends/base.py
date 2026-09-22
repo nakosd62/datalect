@@ -555,19 +555,34 @@ def format_dataset_size_line(total_rows=None, total_bytes=None, note=None):
 # dataset-group member's own data size in the Schema Viewer's group table -
 # see webClient/client.js's openGroupSchemaViewer()). Mirrors client.js's
 # own parseSchemaDatasetSizeLine() exactly (same "^Estimated dataset size: "
-# anchor, multiline mode, first match only) so the server and client always
-# agree on what this line looks like - if one side's regex ever drifted from
-# the other's, only one of them would still recognize a dialect's line.
+# anchor, multiline mode, first match only, same trailing-note stripping
+# below) so the server and client always agree on what this line looks
+# like - if one side's regex ever drifted from the other's, only one of
+# them would still recognize a dialect's line.
 # Returns None (not '') when the schema text has no such line at all (a
 # dialect with no cheap schema-wide size source - see backends/sheets.py,
 # backends/mongodb_sql.py - or a schema fetch that failed outright), so a
 # caller can tell "no line to show" apart from "" being a real, empty figure.
 _DATASET_SIZE_LINE_RE = re.compile(r"^Estimated dataset size: (.+)$", re.MULTILINE)
 
+# format_dataset_size_line()'s own optional trailing "(note)" parenthetical
+# (see its own docstring on `note`) - a caveat aimed at the LLM reading the
+# full schema prompt (e.g. backends/databricks.py's "live count of the
+# tables shown here only, not a schema-wide total - Databricks has no cheap
+# catalog-only row-count statistic"), not something an end user needs
+# alongside a one-line UI fact ("Data Size: ~21.9K rows") - per an explicit
+# request, parse_dataset_size_line() strips it before returning. Assumes
+# the note text itself never contains parentheses of its own - true for
+# every note any backend passes today (databricks.py is the only caller
+# that passes one) - so a plain, non-nested trailing match is enough.
+_DATASET_SIZE_NOTE_RE = re.compile(r"\s*\([^()]*\)$")
+
 
 def parse_dataset_size_line(schema_text):
     m = _DATASET_SIZE_LINE_RE.search(schema_text or "")
-    return m.group(1) if m else None
+    if not m:
+        return None
+    return _DATASET_SIZE_NOTE_RE.sub("", m.group(1))
 
 
 # Same flat, non-tokenizer approximation client.js's Schema Viewer uses for

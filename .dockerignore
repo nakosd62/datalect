@@ -23,6 +23,7 @@ accounts/
 
 # Leftovers
 _to_delete/
+presets_archive.json
 
 # Ignore local state
 state/

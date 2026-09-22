@@ -16,6 +16,7 @@ grand-cosmos-716-*.json
 
 # Leftovers
 _to_delete/
+presets_archive.json
 
 # Logs
 *.log

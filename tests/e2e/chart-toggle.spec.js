@@ -137,7 +137,14 @@ test.describe('single-connection mode: Table/Chart toggle', () => {
     await expect(page.locator('.response-text')).toContainText('42 signups', { timeout: 10000 });
     await page.locator('#resultsTabsNav .result-tab-btn').nth(1).click();
 
-    await expect(page.locator('#resultsViewToggle')).toHaveClass(/hidden/);
+    // #resultsViewToggle (the toolbar row) stays visible here - it also
+    // hosts the download button/menu, shown for every non-empty result
+    // regardless of whether this one is chartable (see renderTableResult()'s
+    // own comment on this in client.js). It's #resultsViewToggleButtons -
+    // the actual Table/Chart pills - that stays hidden for a non-chartable
+    // result, which is what "no toggle" here actually means.
+    await expect(page.locator('#resultsViewToggle')).not.toHaveClass(/hidden/);
+    await expect(page.locator('#resultsViewToggleButtons')).toHaveClass(/hidden/);
     await expect(page.locator('#resultsTableWrapper')).not.toHaveClass(/hidden/);
     await expect(page.locator('#resultsChartWrapper')).toHaveClass(/hidden/);
     expect(await page.evaluate(() => window.__lastChartConfig)).toBeNull();
@@ -435,12 +442,12 @@ test.describe('chart dual y-axes for wildly different scales', () => {
 // turn's results arrive (see prependSingleModeSummaryTab()), so a chart
 // sitting on the other, now-inactive data tab is otherwise invisible unless
 // the user happens to click around the tab strip. See client.js's
-// buildResultsTabsNav() (the tab-strip badge) and summaryChartInlineLinkHtml()/
-// jumpToChartableResultTab() (the Summary tab's own trailing inline link -
-// appended straight onto the end of the summary text itself, not a separate
-// boxed callout under it).
-test.describe('single-connection mode: chart discoverability (tab badge + Summary inline link)', () => {
-  test('a chartable result gets a badge on its own tab, and a "View as chart" link at the end of the Summary text', async ({ page }) => {
+// buildResultsTabsNav() (the tab-strip badge) and renderSummaryInlineChart()/
+// jumpToChartableResultTab() (the Summary tab's own small, clickable chart
+// preview - rendered directly under the summary text, not a separate boxed
+// callout elsewhere on the page).
+test.describe('single-connection mode: chart discoverability (tab badge + Summary inline chart preview)', () => {
+  test('a chartable result gets a badge on its own tab, and a small chart preview at the end of the Summary text', async ({ page }) => {
     await mockTranslate(page, { sql: 'SELECT day, signups FROM daily_signups;' });
     await mockExecute(page, { results: CHARTABLE_RESULTS });
     await mockSummarizeResult(page, {
@@ -453,11 +460,17 @@ test.describe('single-connection mode: chart discoverability (tab badge + Summar
     await page.locator('#aiPrompt').press('Enter');
     await expect(page.locator('.response-text')).toContainText('Signups trended upward', { timeout: 10000 });
 
-    // Summary tab is active by default - the link must already be visible
-    // right here, with no click needed to discover the chart.
-    const callout = page.locator('.summary-chart-inline-link');
-    await expect(callout).toBeVisible();
-    await expect(callout).toContainText('View as chart');
+    // Summary tab is active by default - the mini chart preview must
+    // already be rendered right here, with no click needed to discover the
+    // chart. It's a live Chart.js instance (the fake `Chart` from
+    // fixtures.js's CHART.JS NETWORK ISOLATION setup), built from the exact
+    // same visualization data the full-tab chart would use.
+    const preview = page.locator('.summary-chart-inline-preview');
+    await expect(preview).toBeVisible();
+    await expect(page.locator('.summary-chart-inline-preview-canvas')).toHaveCount(1);
+    expect(await page.evaluate(() => window.__lastChartConfig.type)).toBe('line');
+    expect(await page.evaluate(() => window.__lastChartConfig.data.labels)).toEqual(['Mon', 'Tue', 'Wed']);
+    expect(await page.evaluate(() => window.__chartInstanceCount)).toBe(1);
 
     // The data tab (index 1) carries the badge - both the CSS hook and the
     // literal emoji in its own label text (see buildResultsTabsNav()'s
@@ -467,7 +480,33 @@ test.describe('single-connection mode: chart discoverability (tab badge + Summar
     await expect(dataTab).toContainText('📊');
   });
 
-  test('clicking "View as chart" jumps to the chartable tab, already showing the chart', async ({ page }) => {
+  test('the compact preview drops axis titles that the full-tab chart shows', async ({ page }) => {
+    await mockTranslate(page, { sql: 'SELECT day, signups FROM daily_signups;' });
+    await mockExecute(page, { results: CHARTABLE_RESULTS });
+    await mockSummarizeResult(page, {
+      summary: '*** NO SQL *** Results Summary\n\nSignups trended upward this week.',
+      visualization: CHARTABLE_VISUALIZATION,
+    });
+    await gotoApp(page);
+
+    await page.locator('#aiPrompt').fill('how did signups trend this week');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect(page.locator('.response-text')).toContainText('Signups trended upward', { timeout: 10000 });
+
+    // Summary tab's own compact preview, still on screen right now.
+    const previewConfig = await page.evaluate(() => window.__lastChartConfig);
+    expect(previewConfig.options.scales.x.title.display).toBe(false);
+    expect(previewConfig.options.scales.y.title.display).toBe(false);
+    expect(previewConfig.options.events).toEqual([]);
+
+    // The full-tab chart for the very same data keeps its axis titles.
+    await page.locator('#resultsTabsNav .result-tab-btn').nth(1).click();
+    const fullConfig = await page.evaluate(() => window.__lastChartConfig);
+    expect(fullConfig.options.scales.x.title.display).toBe(true);
+    expect(fullConfig.options.scales.y.title.display).toBe(true);
+  });
+
+  test('clicking the chart preview jumps to the chartable tab, already showing the chart', async ({ page }) => {
     await mockTranslate(page, { sql: 'SELECT day, signups FROM daily_signups;' });
     await mockExecute(page, { results: CHARTABLE_RESULTS });
     await mockSummarizeResult(page, {
@@ -481,16 +520,16 @@ test.describe('single-connection mode: chart discoverability (tab badge + Summar
     await expect(page.locator('.response-text')).toContainText('Signups trended upward', { timeout: 10000 });
 
     // Manually flip the (as-yet-unvisited) data tab to Table first, so the
-    // link's own "force chart view" behavior (see
+    // preview's own "force chart view" behavior (see
     // jumpToChartableResultTab()'s comment) is actually exercised rather
     // than coincidentally matching the model's own Chart-by-default choice.
     await page.locator('#resultsTabsNav .result-tab-btn').nth(1).click();
     await page.locator('.results-view-toggle-btn[data-view="table"]').click();
     await expect(page.locator('#resultsTableWrapper')).not.toHaveClass(/hidden/);
 
-    // Back to the Summary tab, then click the inline link.
+    // Back to the Summary tab, then click its chart preview.
     await page.locator('#resultsTabsNav .result-tab-btn').nth(0).click();
-    await page.locator('.summary-chart-inline-link').click();
+    await page.locator('.summary-chart-inline-preview').click();
 
     await expect(page.locator('#resultsTabsNav .result-tab-btn').nth(1)).toHaveClass(/active/);
     await expect(page.locator('#resultsChartWrapper')).not.toHaveClass(/hidden/);
@@ -499,7 +538,7 @@ test.describe('single-connection mode: chart discoverability (tab badge + Summar
     expect(await page.evaluate(() => window.__chartInstanceCount)).toBe(1);
   });
 
-  test('no badge and no inline link at all when the result is not chartable', async ({ page }) => {
+  test('no badge and no inline chart preview at all when the result is not chartable', async ({ page }) => {
     await mockTranslate(page, { sql: 'SELECT COUNT(*) AS n FROM signups;' });
     await mockExecute(page, { results: [{ columns: ['n'], rows: [{ n: 42 }], rowCount: 1 }] });
     await mockSummarizeResult(page, {
@@ -512,6 +551,7 @@ test.describe('single-connection mode: chart discoverability (tab badge + Summar
     await page.locator('#aiPrompt').press('Enter');
     await expect(page.locator('.response-text')).toContainText('42 signups', { timeout: 10000 });
 
+    await expect(page.locator('.summary-chart-inline-preview')).toHaveCount(0);
     await expect(page.locator('.summary-chart-inline-link')).toHaveCount(0);
     const dataTab = page.locator('#resultsTabsNav .result-tab-btn').nth(1);
     await expect(dataTab).not.toHaveClass(/result-tab-btn--chartable/);

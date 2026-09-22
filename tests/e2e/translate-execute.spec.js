@@ -70,6 +70,43 @@ test.describe('translate + execute', () => {
     expect(await normalizedSql(page)).toContain('LIMIT');
   });
 
+  test('resubmitting the same, un-edited prompt clears the stale SQL right away instead of leaving it up through the whole in-flight request', async ({ page }) => {
+    await mockTranslate(page, { sql: 'SELECT * FROM users LIMIT 10;' });
+    await gotoApp(page);
+
+    await page.locator('#aiPrompt').fill('show me the first 10 users');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect.poll(() => normalizedSql(page)).toContain('users');
+
+    // Re-mock with a response that only resolves once this test lets it,
+    // so the SQL box's state can be inspected WHILE the second request is
+    // still in flight - the whole point of this test.
+    let resolveTranslate;
+    const translateGate = new Promise((resolve) => { resolveTranslate = resolve; });
+    await page.unroute('**/api/translate');
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await translateGate;
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ sql: 'SELECT * FROM orders LIMIT 5;' }),
+      });
+    });
+
+    // Resubmit via Enter with NO edit to #aiPrompt in between (no .fill()
+    // call, no keystroke) - the exact scenario that used to leave the
+    // first response's SQL sitting in the box, since client.js only ever
+    // cleared it from aiPrompt's own 'input' listener, which never fires
+    // without an actual edit.
+    await page.locator('#aiPrompt').press('Enter');
+
+    await expect.poll(() => normalizedSql(page)).toBe('');
+
+    resolveTranslate();
+    await expect.poll(() => normalizedSql(page)).toContain('orders');
+  });
+
   test('running the generated SQL renders a results table', async ({ page }) => {
     await mockTranslate(page, { sql: 'SELECT id, name FROM users;' });
     await mockExecute(page, {
@@ -486,11 +523,11 @@ test.describe('translate + execute', () => {
     await expect(dbBadge).toHaveClass(/badge-disabled/);
     await expect(modelBadge).toHaveClass(/badge-disabled/);
     // Not just visually grayed out - actually inert. Clicking either while
-    // disabled must not open its modal.
+    // disabled must not open its modal/pick list.
     await dbBadge.click();
     await expect(page.locator('#configModal')).toHaveClass(/hidden/);
     await modelBadge.click();
-    await expect(page.locator('#modelModal')).toHaveClass(/hidden/);
+    await expect(page.locator('#modelPickList')).toHaveClass(/hidden/);
     // An unrelated icon (history) stays fully enabled the whole time - its
     // popup doesn't touch the active connection/model.
     await expect(historyBtn).not.toBeDisabled();

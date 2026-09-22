@@ -54,6 +54,35 @@ _APP_MODULE_NAMES = [
     # effect for code that hasn't already imported the real py3langid model,
     # and this module is where that import now actually lives.
     "language_detect",
+    # The LLM provider abstraction (API key pools, error classification,
+    # TRANSLATION_TIMEOUT_SECONDS, etc.), extracted out of translate_routes.py
+    # into its own module - dropped here for the same reason translate_routes
+    # itself is: it reads several of the env vars below at import time
+    # (TRANSLATION_TIMEOUT_SECONDS, TRANSLATION_RETRY_DELAY_SECONDS via
+    # app_config), so a stale cached copy from a previous test's env would
+    # otherwise silently leak into this one.
+    "llm_providers",
+    # Chart/visualization eligibility + validation helpers, extracted out of
+    # translate_routes.py - no env-derived module-level state of its own,
+    # but dropped here anyway for consistency with the other extracted
+    # pieces and so it never silently drifts out of sync with a fresh
+    # translate_routes/summarize_routes import.
+    "chart_helpers",
+    # The two post-execution summarization pipelines (+ their routes),
+    # extracted out of translate_routes.py into their own module - dropped
+    # here for the same reason llm_providers is: it computes its own
+    # SUMMARY_RESULTS_MAX_ROWS from the env var below at import time, so a
+    # stale cached copy from a previous test's env would otherwise silently
+    # leak into this one.
+    "summarize_routes",
+    # SQL generation (dialect prompts, response cleanup, dataset-group
+    # mode's Phase B fan-out, single-dataset mode's Call 1/Call 2 helpers),
+    # extracted out of translate_routes.py - no env-derived module-level
+    # state of its own (its dialect prompts are plain file reads, same
+    # content every time), but dropped here anyway for consistency with the
+    # other extracted pieces and so it never silently drifts out of sync
+    # with a fresh translate_routes import.
+    "sql_generation",
 ]
 
 # Every env var any of the above modules reads at import or request time.
@@ -197,9 +226,9 @@ def fresh_import(monkeypatch, tmp_path, env=None, register_blueprints=True, mock
 
     Returns a SimpleNamespace with at least `.app_config`; when
     register_blueprints=True (the default) also `.auth`, `.config_routes`,
-    `.execute_routes`, `.translate_routes`, `.cancel_registry`,
-    `.concurrency_guard`, `.rate_limiter`, and `.client` (a Flask test
-    client with state_store.init() already called).
+    `.execute_routes`, `.translate_routes`, `.summarize_routes`,
+    `.cancel_registry`, `.concurrency_guard`, `.rate_limiter`, and `.client`
+    (a Flask test client with state_store.init() already called).
     """
     os.makedirs(tmp_path, exist_ok=True)
     monkeypatch.chdir(tmp_path)
@@ -258,6 +287,7 @@ def fresh_import(monkeypatch, tmp_path, env=None, register_blueprints=True, mock
         import config_routes
         import execute_routes
         import translate_routes
+        import summarize_routes
         import chat_history_routes
         import report_routes
         import cancel_registry
@@ -273,7 +303,7 @@ def fresh_import(monkeypatch, tmp_path, env=None, register_blueprints=True, mock
         app_config.app.after_request(auth.refresh_auth_session_cookie)
         for bp in (
             auth.auth_bp, config_routes.config_bp, execute_routes.execute_bp,
-            translate_routes.translate_bp,
+            translate_routes.translate_bp, summarize_routes.summarize_bp,
             chat_history_routes.chat_history_bp, report_routes.report_bp,
         ):
             app_config.app.register_blueprint(bp)
@@ -283,6 +313,7 @@ def fresh_import(monkeypatch, tmp_path, env=None, register_blueprints=True, mock
         ns.config_routes = config_routes
         ns.execute_routes = execute_routes
         ns.translate_routes = translate_routes
+        ns.summarize_routes = summarize_routes
         ns.report_routes = report_routes
         ns.cancel_registry = cancel_registry
         ns.concurrency_guard = concurrency_guard

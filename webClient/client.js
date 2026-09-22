@@ -631,9 +631,9 @@ document.addEventListener('DOMContentLoaded', async () => {
   // registry too (a bigger change than asked for).
   let PINNED_CONNECTIONS = [];
   // Model-selection state (see fetchBackendConfig()/updateModelBadge()/
-  // renderModelRadioButtons()) - mirrors CONFIGURED_DBS/ACTIVE_DB_URL's own
+  // renderModelPickList()) - mirrors CONFIGURED_DBS/ACTIVE_DB_URL's own
   // "fetched once per /api/config round-trip, read by the badge and the
-  // modal's render function" pattern. LLM_PROVIDERS is the GET response's
+  // pick list's render function" pattern. LLM_PROVIDERS is the GET response's
   // 'llm_providers' list verbatim: [{name, preset_models, default_model}, ...].
   let LLM_PROVIDERS = [];
   let ACTIVE_LLM_PROVIDER = "";
@@ -719,6 +719,14 @@ document.addEventListener('DOMContentLoaded', async () => {
   let customDbName = "";
   let customDatabases = [];
   let autoSqlExecuteEnabled = true;
+  // "Show SQL" (Preferences > SQL Execution section, alongside
+  // auto-execute) - whether #editorPaneSql (the SQL box + its Execute/
+  // report-issue controls) is shown at all. Client-side only (localStorage,
+  // like THEME_STORAGE_KEY - see SHOW_SQL_STORAGE_KEY below), unlike
+  // auto_sql_execute: nothing server-side reads or reacts to this, it's
+  // purely a local layout choice, so there's nothing for the backend to
+  // know. Defaults to visible.
+  let showSqlEnabled = true;
   // True when running on Cloud Run and the current request has no verified
   // login (i.e. the backend resolved it to a per-session "anonymous:..."
   // identity - see auth.py's ANONYMOUS_USER_ID_PREFIX). Anonymous users get
@@ -1197,6 +1205,24 @@ document.addEventListener('DOMContentLoaded', async () => {
   let sqlEditor = null;
   updateHistoryNavButtons();
   const micBtn = document.getElementById('micBtn');
+  // DOM refs for the resizable NL/SQL editor layout - see
+  // initEditorPanesResizer()/initResultsPanesResizer() further down (right
+  // after the CodeMirror resize-observer block) for the drag mechanics, and
+  // .editor-panes-row's own comment in style.css for the two layouts these
+  // support (side-by-side above 900px, stacked at/below it).
+  const editorPanesRow = document.getElementById('editorPanesRow');
+  const editorPaneNl = document.getElementById('editorPaneNl');
+  const editorPaneSql = document.getElementById('editorPaneSql');
+  const editorPanesResizer = document.getElementById('editorPanesResizer');
+  const resultsPanesResizer = document.getElementById('resultsPanesResizer');
+  const editorCard = document.querySelector('.editor-card');
+  const tableCard = document.querySelector('.table-card');
+  const verticalLayout = document.querySelector('.vertical-layout');
+  // The NL box's own wrapper - deliberately queried as "the
+  // .speech-bubble-wrapper that ISN'T .sql-bubble" rather than by a class
+  // of its own, matching how the rest of this file already distinguishes
+  // the two (e.g. getTourSteps()'s promptWrapper further down).
+  const nlWrapper = aiPrompt ? aiPrompt.closest('.speech-bubble-wrapper') : null;
   // Opens #reportIssueModal in 'wrong_sql' mode (see REPORT_CATEGORY_CONFIG
   // below) - sits beside #runBtn inside the SQL box itself, so it's wired
   // separately from both the resultsBody-delegated error/wrong_result
@@ -1220,13 +1246,22 @@ document.addEventListener('DOMContentLoaded', async () => {
   const connDbDot = document.getElementById('connDbDot');
   const datasetSchemaViewerBtn = document.getElementById('datasetSchemaViewerBtn');
 
-  // DOM Elements - Model Selection Modal & Badge (mirrors the DB connection
-  // badge/modal pair above - see updateModelBadge()/renderModelRadioButtons()).
-  const modelModal = document.getElementById('modelModal');
+  // DOM Elements - Model Pick List & Badge (an in-place dropdown, not a
+  // modal - see the MODEL PICK LIST section below for
+  // updateModelBadge()/renderModelPickList()/selectModel()). Below
+  // NARROW_HEADER_MEDIA_QUERY's breakpoint, #modelPickerWrapper itself is
+  // CSS-hidden (see .header-actions > .model-picker-wrapper in style.css)
+  // and #moreMenuModelBtn/#moreMenuModelSubmenu - the more-menu's own
+  // second presentation of this exact same selection - take over; both are
+  // wired up in the MODEL PICK LIST section below, sharing renderModelPickList()/
+  // selectModel() rather than duplicating either.
+  const modelPickerWrapper = document.getElementById('modelPickerWrapper');
   const modelTriggerBadge = document.getElementById('modelTriggerBadge');
-  const modelModalCloseBtn = document.getElementById('modelModalCloseBtn');
-  const modelSaveBtn = document.getElementById('modelSaveBtn');
+  const modelPickList = document.getElementById('modelPickList');
   const modelBadgeName = document.getElementById('modelBadgeName');
+  const moreMenuModelBtn = document.getElementById('moreMenuModelBtn');
+  const moreMenuModelSubmenu = document.getElementById('moreMenuModelSubmenu');
+  const moreMenuModelCurrent = document.getElementById('moreMenuModelCurrent');
 
   // DOM Elements - Preferences Modal (theme + auto-execute-SQL - opened from
   // the header's #prefsBtn on desktop, or #moreMenuPrefsBtn on mobile; see
@@ -1240,6 +1275,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   const themeOptionDark = document.getElementById('themeOptionDark');
   const themeOptionLight = document.getElementById('themeOptionLight');
   const autoSqlExecuteCheckbox = document.getElementById('autoSqlExecuteCheckbox');
+  const showSqlCheckbox = document.getElementById('showSqlCheckbox');
+  const showSqlLockedNote = document.getElementById('showSqlLockedNote');
   // Bring Your Own Key (Preferences dialog's third section) - one
   // {input, clearBtn} pair per provider, keyed by the same "google"/
   // "anthropic"/"openai" names used everywhere else (LLM_PROVIDERS,
@@ -1384,6 +1421,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const schemaViewerNotice = document.getElementById('schemaViewerNotice');
   const schemaViewerEntryList = document.getElementById('schemaViewerEntryList');
   const schemaViewerDetailHeading = document.getElementById('schemaViewerDetailHeading');
+  const schemaViewerTableCommentText = document.getElementById('schemaViewerTableCommentText');
   const schemaViewerOverviewWrap = document.getElementById('schemaViewerOverviewWrap');
   const schemaViewerColumnsWrap = document.getElementById('schemaViewerColumnsWrap');
   const schemaViewerColumnsBody = document.getElementById('schemaViewerColumnsBody');
@@ -1568,6 +1606,411 @@ document.addEventListener('DOMContentLoaded', async () => {
       sqlEditor.refresh();
     }
   });
+
+  // ===========================================================================
+  // RESIZABLE NL/SQL EDITOR LAYOUT
+  // ===========================================================================
+  // Two independent draggable dividers (see .editor-panes-row's own comment
+  // in style.css for the full picture):
+  //
+  //  - #editorPanesResizer sits BETWEEN the NL and SQL boxes. Above 900px
+  //    (side by side) it's a vertical, col-resize divider that splits their
+  //    shared WIDTH; at/below 900px (stacked) it's a horizontal, row-resize
+  //    divider that splits their shared HEIGHT instead - same element, same
+  //    drag mechanics (mousedown captures a starting pointer position and
+  //    size, mousemove computes a delta and re-applies), just reading
+  //    clientX/width in one layout and clientY/height in the other.
+  //
+  //  - #resultsPanesResizer sits BETWEEN the whole editor area and the
+  //    results area below it, in both layouts. It replaces the SQL box's
+  //    own native resize:vertical handle (see .speech-bubble-wrapper.
+  //    sql-bubble's own comment in style.css) - dragging it sets the SQL
+  //    box's height directly (editorAreaHeightPx below), and, ONLY in the
+  //    side-by-side layout, forces the NL box to match it (equal height is
+  //    an explicit requirement there; in the stacked layout the NL box's
+  //    own height is independently controlled by #editorPanesResizer
+  //    above, so it's left alone here).
+  //
+  // Both dimensions ARE persisted, in localStorage, under
+  // EDITOR_LAYOUT_STORAGE_KEY below - unlike initSchemaViewerPanesResizer()
+  // further down (a same-session convenience that deliberately always
+  // resets on reopen), these two dividers are a standing layout preference:
+  // once someone drags either one, every later page load restores that same
+  // split instead of snapping back to the defaults below. Saved as one JSON
+  // object covering all three state variables together (editorAreaHeightPx/
+  // nlPaneWidthPx/nlPaneHeightPx) so a single read/write covers both
+  // dividers regardless of which one actually moved.
+  const MIN_EDITOR_AREA_PX = 56;      // matches .speech-bubble-wrapper.sql-bubble's own CSS min-height fallback
+  const MIN_RESULTS_AREA_PX = 150;    // leaves room for the results toolbar + a couple of rows
+  const MIN_NL_PANE_WIDTH_PX = 260;   // side-by-side layout, width split
+  const MIN_SQL_PANE_WIDTH_PX = 300;  // a bit more than the NL pane's - room for the Execute/report-button overlay
+  const MIN_NL_PANE_HEIGHT_PX = 40;   // stacked layout, height split - about one line + padding
+  const DEFAULT_NL_PANE_HEIGHT_PX = 44; // this box's own natural/compact height (34px textarea + 4px+4px padding + 1px+1px border)
+  const EDITOR_PANES_RESIZER_HIT_PX = 9;
+  const ARROW_STEP_PX = 24;
+  const EDITOR_LAYOUT_STORAGE_KEY = 'datalectEditorLayout';
+
+  // Reads back whatever saveEditorLayoutPreference() last wrote, tolerating
+  // a missing/corrupt/foreign value the same way the rest of this file's
+  // localStorage reads do (THEME_STORAGE_KEY, SHOW_SQL_STORAGE_KEY, etc.) -
+  // null here just means "nothing usable was saved", so every caller below
+  // falls back to its own normal hardcoded default in that case.
+  function loadEditorLayoutPreference() {
+    try {
+      const raw = window.localStorage.getItem(EDITOR_LAYOUT_STORAGE_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      return (parsed && typeof parsed === 'object') ? parsed : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // Picks one field out of loadEditorLayoutPreference()'s result, only
+  // trusting it when it's actually a finite number (nlPaneWidthPx's own
+  // "unset" state is null, which correctly falls through to fallback here
+  // too) - guards against a hand-edited or half-written localStorage value
+  // putting NaN/Infinity/a string into the layout math below.
+  function readSavedPx(value, fallback) {
+    return (typeof value === 'number' && isFinite(value)) ? value : fallback;
+  }
+
+  // Persists all three state variables together in one write. Called after
+  // every drag ends and after every keyboard-driven change below - NOT on
+  // every mousemove during an active drag, so dragging doesn't hit
+  // localStorage dozens of times a second.
+  function saveEditorLayoutPreference() {
+    try {
+      window.localStorage.setItem(EDITOR_LAYOUT_STORAGE_KEY, JSON.stringify({
+        editorAreaHeightPx,
+        nlPaneWidthPx,
+        nlPaneHeightPx,
+      }));
+    } catch (e) {
+      // localStorage unavailable - still applies for this page view, just
+      // won't persist across reloads, same tradeoff as setTheme() above.
+    }
+  }
+
+  const savedEditorLayout = loadEditorLayoutPreference();
+
+  let editorAreaHeightPx = readSavedPx(savedEditorLayout && savedEditorLayout.editorAreaHeightPx, 100); // the SQL box's own height - default matches its long-standing 100px CSS default
+  let nlPaneWidthPx = readSavedPx(savedEditorLayout && savedEditorLayout.nlPaneWidthPx, null);     // side-by-side layout only - null means "default 50/50, no custom flex-basis yet"
+  let nlPaneHeightPx = readSavedPx(savedEditorLayout && savedEditorLayout.nlPaneHeightPx, DEFAULT_NL_PANE_HEIGHT_PX); // stacked layout only
+
+  function isWideEditorLayout() {
+    return window.matchMedia('(min-width: 901px)').matches;
+  }
+
+  // Re-applies both boxes' height from the current state variables above,
+  // honoring whichever layout is active right now - the single place both
+  // dividers (and the layout-mode sync below) funnel through, so the two
+  // boxes never end up out of sync with each other or with editorAreaHeightPx/
+  // nlPaneHeightPx.
+  function applyEditorPaneHeights() {
+    if (sqlContainer) sqlContainer.style.height = `${editorAreaHeightPx}px`;
+    if (nlWrapper) {
+      nlWrapper.style.height = isWideEditorLayout()
+        ? `${editorAreaHeightPx}px`
+        : `${nlPaneHeightPx}px`;
+    }
+    if (sqlEditor) {
+      sqlEditor.setSize('100%', '100%');
+      sqlEditor.refresh();
+    }
+  }
+
+  function setEditorAreaHeightPx(px) {
+    editorAreaHeightPx = px;
+    applyEditorPaneHeights();
+  }
+
+  function setNlPaneHeightPx(px) {
+    nlPaneHeightPx = px;
+    applyEditorPaneHeights();
+  }
+
+  // The largest editorAreaHeightPx can grow to right now without pushing
+  // .table-card below MIN_RESULTS_AREA_PX - measured live (header/banner
+  // height above the editor, and - in the stacked layout - the NL box's
+  // own current height, both captured via the SAME subtraction so this
+  // works unchanged in either layout without needing to know which one is
+  // active).
+  function computeMaxEditorAreaHeightPx() {
+    if (!verticalLayout || !editorCard || !tableCard) return Infinity;
+    const verticalLayoutHeight = verticalLayout.getBoundingClientRect().height;
+    const editorCardHeight = editorCard.getBoundingClientRect().height;
+    const tableCardHeight = tableCard.getBoundingClientRect().height;
+    const otherHeightPx = verticalLayoutHeight - editorCardHeight - tableCardHeight;
+    const fixedInEditorPx = editorCardHeight - editorAreaHeightPx;
+    return Math.max(
+      MIN_EDITOR_AREA_PX,
+      verticalLayoutHeight - otherHeightPx - fixedInEditorPx - MIN_RESULTS_AREA_PX
+    );
+  }
+
+  // Same idea as computeMaxEditorAreaHeightPx() above, but for the NL box's
+  // own height in the stacked layout (dragging #editorPanesResizer there) -
+  // the "fixed" part of editor-card this time is the SQL box's height plus
+  // whatever gap sits between the two, which falls straight out of the
+  // same subtraction.
+  function computeMaxNlPaneHeightPx() {
+    if (!verticalLayout || !editorCard || !tableCard || !nlWrapper) return Infinity;
+    const verticalLayoutHeight = verticalLayout.getBoundingClientRect().height;
+    const editorCardHeight = editorCard.getBoundingClientRect().height;
+    const tableCardHeight = tableCard.getBoundingClientRect().height;
+    const nlHeightPx = nlWrapper.getBoundingClientRect().height;
+    const otherHeightPx = verticalLayoutHeight - editorCardHeight - tableCardHeight;
+    const fixedInEditorPx = editorCardHeight - nlHeightPx;
+    return Math.max(
+      MIN_NL_PANE_HEIGHT_PX,
+      verticalLayoutHeight - otherHeightPx - fixedInEditorPx - MIN_RESULTS_AREA_PX
+    );
+  }
+
+  function applyNlPaneWidthPx(px) {
+    if (!editorPanesRow || !editorPaneNl) return;
+    const totalPx = editorPanesRow.getBoundingClientRect().width;
+    const maxNlPanePx = Math.max(
+      MIN_NL_PANE_WIDTH_PX,
+      totalPx - EDITOR_PANES_RESIZER_HIT_PX - MIN_SQL_PANE_WIDTH_PX
+    );
+    const clampedPx = Math.min(Math.max(px, MIN_NL_PANE_WIDTH_PX), maxNlPanePx);
+    nlPaneWidthPx = clampedPx;
+    editorPaneNl.style.flex = `0 0 ${clampedPx}px`;
+  }
+
+  function applyNlPaneHeightPx(px) {
+    const clampedPx = Math.min(Math.max(px, MIN_NL_PANE_HEIGHT_PX), computeMaxNlPaneHeightPx());
+    setNlPaneHeightPx(clampedPx);
+  }
+
+  // Keeps both boxes correct whenever the side-by-side/stacked layout
+  // itself changes (a window resize crossing the 900px breakpoint, not a
+  // drag) - toggles the NL box's forced-equal-height behavior and clears/
+  // reapplies the width-split inline style, which only ever makes sense in
+  // one of the two layouts.
+  let lastEditorLayoutWasWide = null;
+  function syncEditorLayoutMode() {
+    const wide = isWideEditorLayout();
+    if (wide === lastEditorLayoutWasWide) return;
+    lastEditorLayoutWasWide = wide;
+    if (editorPaneNl) {
+      if (wide && nlPaneWidthPx != null) {
+        applyNlPaneWidthPx(nlPaneWidthPx);
+      } else {
+        editorPaneNl.style.flex = '';
+      }
+    }
+    applyEditorPaneHeights();
+  }
+
+  function initEditorPanesResizer() {
+    if (!editorPanesResizer || !editorPaneNl || !editorPanesRow || !nlWrapper) return;
+
+    let dragStartPos = 0;
+    let dragStartNlWidthPx = 0;
+    let dragStartNlHeightPx = 0;
+    let activeMoveHandler = null;
+
+    function onDragMoveWide(e) {
+      applyNlPaneWidthPx(dragStartNlWidthPx + (e.clientX - dragStartPos));
+    }
+
+    function onDragMoveNarrow(e) {
+      applyNlPaneHeightPx(dragStartNlHeightPx + (e.clientY - dragStartPos));
+    }
+
+    function stopDragging() {
+      if (activeMoveHandler) document.removeEventListener('mousemove', activeMoveHandler);
+      document.removeEventListener('mouseup', stopDragging);
+      editorPanesResizer.classList.remove('editor-panes-resizer--dragging');
+      document.body.style.userSelect = '';
+      document.body.style.cursor = '';
+      activeMoveHandler = null;
+      saveEditorLayoutPreference();
+    }
+
+    editorPanesResizer.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      editorPanesResizer.classList.add('editor-panes-resizer--dragging');
+      document.body.style.userSelect = 'none';
+
+      if (isWideEditorLayout()) {
+        dragStartPos = e.clientX;
+        dragStartNlWidthPx = editorPaneNl.getBoundingClientRect().width;
+        document.body.style.cursor = 'col-resize';
+        activeMoveHandler = onDragMoveWide;
+      } else {
+        dragStartPos = e.clientY;
+        dragStartNlHeightPx = nlWrapper.getBoundingClientRect().height;
+        document.body.style.cursor = 'row-resize';
+        activeMoveHandler = onDragMoveNarrow;
+      }
+
+      document.addEventListener('mousemove', activeMoveHandler);
+      document.addEventListener('mouseup', stopDragging);
+    });
+
+    // Keyboard equivalent (role="separator" + tabindex="0" in index.html
+    // makes this focusable), axis-aware same as the drag handlers above.
+    editorPanesResizer.addEventListener('keydown', (e) => {
+      if (isWideEditorLayout()) {
+        if (e.key === 'ArrowLeft') {
+          e.preventDefault();
+          applyNlPaneWidthPx(editorPaneNl.getBoundingClientRect().width - ARROW_STEP_PX);
+          saveEditorLayoutPreference();
+        } else if (e.key === 'ArrowRight') {
+          e.preventDefault();
+          applyNlPaneWidthPx(editorPaneNl.getBoundingClientRect().width + ARROW_STEP_PX);
+          saveEditorLayoutPreference();
+        } else if (e.key === 'Home') {
+          e.preventDefault();
+          nlPaneWidthPx = null;
+          editorPaneNl.style.flex = '';
+          saveEditorLayoutPreference();
+        }
+      } else {
+        if (e.key === 'ArrowUp') {
+          e.preventDefault();
+          applyNlPaneHeightPx(nlPaneHeightPx - ARROW_STEP_PX);
+          saveEditorLayoutPreference();
+        } else if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          applyNlPaneHeightPx(nlPaneHeightPx + ARROW_STEP_PX);
+          saveEditorLayoutPreference();
+        } else if (e.key === 'Home') {
+          e.preventDefault();
+          setNlPaneHeightPx(DEFAULT_NL_PANE_HEIGHT_PX);
+          saveEditorLayoutPreference();
+        }
+      }
+    });
+  }
+
+  function initResultsPanesResizer() {
+    if (!resultsPanesResizer || !editorCard || !tableCard || !verticalLayout) return;
+
+    let dragStartY = 0;
+    let dragStartHeightPx = 0;
+
+    function onDragMove(e) {
+      const desiredPx = dragStartHeightPx + (e.clientY - dragStartY);
+      const clampedPx = Math.min(Math.max(desiredPx, MIN_EDITOR_AREA_PX), computeMaxEditorAreaHeightPx());
+      setEditorAreaHeightPx(clampedPx);
+    }
+
+    function stopDragging() {
+      document.removeEventListener('mousemove', onDragMove);
+      document.removeEventListener('mouseup', stopDragging);
+      resultsPanesResizer.classList.remove('results-panes-resizer--dragging');
+      document.body.style.userSelect = '';
+      document.body.style.cursor = '';
+      saveEditorLayoutPreference();
+    }
+
+    resultsPanesResizer.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      dragStartY = e.clientY;
+      dragStartHeightPx = editorAreaHeightPx;
+      resultsPanesResizer.classList.add('results-panes-resizer--dragging');
+      document.body.style.userSelect = 'none';
+      document.body.style.cursor = 'row-resize';
+      document.addEventListener('mousemove', onDragMove);
+      document.addEventListener('mouseup', stopDragging);
+    });
+
+    resultsPanesResizer.addEventListener('keydown', (e) => {
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        setEditorAreaHeightPx(Math.max(MIN_EDITOR_AREA_PX, editorAreaHeightPx - ARROW_STEP_PX));
+        saveEditorLayoutPreference();
+      } else if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        setEditorAreaHeightPx(Math.min(editorAreaHeightPx + ARROW_STEP_PX, computeMaxEditorAreaHeightPx()));
+        saveEditorLayoutPreference();
+      } else if (e.key === 'Home') {
+        e.preventDefault();
+        setEditorAreaHeightPx(100);
+        saveEditorLayoutPreference();
+      }
+    });
+  }
+
+  initEditorPanesResizer();
+  initResultsPanesResizer();
+  // Establishes the correct starting state for whichever layout the page
+  // happens to load into (forced-equal NL/SQL height if wide, compact NL
+  // height if stacked) - lastEditorLayoutWasWide starts out null, so this
+  // first call always applies regardless of which layout that turns out to be.
+  syncEditorLayoutMode();
+  // A restored size may no longer fit - e.g. the browser window is smaller
+  // now than it was when it got saved. Reclamp through the same MIN/
+  // computeMax bounds the drag handlers themselves use (nlPaneWidthPx is
+  // already clamped this way inside syncEditorLayoutMode() above via
+  // applyNlPaneWidthPx(), so only the two height dimensions need it here)
+  // so a restored layout starts out sane rather than overflowing.
+  if (savedEditorLayout) {
+    setEditorAreaHeightPx(Math.min(Math.max(editorAreaHeightPx, MIN_EDITOR_AREA_PX), computeMaxEditorAreaHeightPx()));
+    if (!isWideEditorLayout()) {
+      setNlPaneHeightPx(Math.min(Math.max(nlPaneHeightPx, MIN_NL_PANE_HEIGHT_PX), computeMaxNlPaneHeightPx()));
+    }
+  }
+  window.addEventListener('resize', syncEditorLayoutMode);
+
+  // ===========================================================================
+  // SHOW SQL (Preferences > SQL Execution section, alongside auto-execute -
+  // see the PREFERENCES MODAL section further down for
+  // loadPreferencesIntoUI()/savePreferences()/enforceShowSqlLinkage()).
+  // Whether #editorPaneSql (the SQL box, plus its Execute/report-issue
+  // controls) is shown at all. When hidden, #editorPaneNl (the NL prompt
+  // box) grows to fill the freed width - see .editor-panes-row.sql-hidden's
+  // own comment in style.css for the wide (side-by-side) layout; the
+  // stacked layout needs no extra handling, since hiding the SQL pane there
+  // just leaves the NL pane as the sole block already filling that column.
+  // ===========================================================================
+  const SHOW_SQL_STORAGE_KEY = 'datalectShowSql';
+
+  function loadShowSqlPreference() {
+    try {
+      const stored = window.localStorage.getItem(SHOW_SQL_STORAGE_KEY);
+      return stored === null ? true : stored === '1'; // unset -> default visible
+    } catch (e) {
+      return true; // localStorage unavailable - default to visible either way
+    }
+  }
+
+  function applySqlPaneVisibility(visible) {
+    if (editorPaneSql) editorPaneSql.classList.toggle('hidden', !visible);
+    if (editorPanesResizer) editorPanesResizer.classList.toggle('hidden', !visible);
+    if (editorPanesRow) editorPanesRow.classList.toggle('sql-hidden', !visible);
+    if (visible && sqlEditor) {
+      // CodeMirror mis-measures itself while its container sits under
+      // display:none (a well-known CodeMirror gotcha, same reasoning as
+      // the ResizeObserver/setSize() calls elsewhere in this file) -
+      // refresh once the box is visible again so it repaints at its real
+      // size instead of whatever it last measured before being hidden.
+      requestAnimationFrame(() => sqlEditor.refresh());
+    }
+  }
+
+  function setShowSqlEnabled(enabled) {
+    showSqlEnabled = enabled;
+    applySqlPaneVisibility(enabled);
+    try {
+      window.localStorage.setItem(SHOW_SQL_STORAGE_KEY, enabled ? '1' : '0');
+    } catch (e) {
+      // localStorage unavailable - still applies for this page view, just
+      // won't persist across reloads, same tradeoff as setTheme() above.
+    }
+  }
+
+  // Applies whatever was saved (or the default, visible) as soon as the
+  // editor panes themselves exist - before the very first paint the user
+  // actually interacts with, same spirit as syncEditorLayoutMode() just
+  // above.
+  showSqlEnabled = loadShowSqlPreference();
+  applySqlPaneVisibility(showSqlEnabled);
 
   function parseJwt(token) {
     try {
@@ -1833,10 +2276,14 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // ===========================================================================
   // MORE MENU (triple-dot mobile header menu)
-  //    Collapses Help/History/Sign-in into one dropdown under the same
-  //    narrow-header breakpoint style.css uses to hide them (see
-  //    NARROW_HEADER_MEDIA_QUERY below, and the @media (max-width: 480px)
-  //    block in style.css). The Help/History items just forward a .click()
+  //    Collapses Help/History/Preferences/Feedback/Sign-in into one dropdown
+  //    under the same narrow-header breakpoint style.css uses to hide them
+  //    (see NARROW_HEADER_MEDIA_QUERY below, and the @media (max-width: 900px)
+  //    block in style.css, right before its "Natural Language & SQL Row
+  //    Layouts" section). That's deliberately the SAME width where the NL/SQL
+  //    panes switch from side-by-side to stacked, per explicit request -
+  //    keep this constant and that CSS breakpoint in sync if either changes.
+  //    The Help/History/Preferences/Feedback items just forward a .click()
   //    to the real (CSS-hidden-at-this-width) header buttons, which fires
   //    their existing real listeners unchanged - no logic duplicated. The
   //    sign-in control is different: #g_id_signin holds a real, cross-origin
@@ -1847,7 +2294,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   //    looks the container up by ID and only ever sets its innerHTML, so it
   //    doesn't care which parent currently holds it.
   // ===========================================================================
-  const NARROW_HEADER_MEDIA_QUERY = '(max-width: 480px)';
+  const NARROW_HEADER_MEDIA_QUERY = '(max-width: 900px)';
   const moreMenuWrapper = document.getElementById('moreMenuWrapper');
   const moreMenuBtn = document.getElementById('moreMenuBtn');
   const moreMenuDropdown = document.getElementById('moreMenuDropdown');
@@ -1859,6 +2306,15 @@ document.addEventListener('DOMContentLoaded', async () => {
   const headerActionsEl = document.querySelector('.header-actions');
 
   function closeMoreMenu() {
+    // Collapses the Model submenu back closed too (see
+    // closeMoreMenuModelSubmenu() in the MODEL PICK LIST section further
+    // down - forward-referenced here since both are plain function
+    // declarations in this same scope) - reopening the menu later should
+    // never surprise the user with it already expanded from last time.
+    // Unconditional (not gated behind the early return below) so this
+    // still resets it even if the dropdown itself happened to already be
+    // hidden some other way.
+    closeMoreMenuModelSubmenu();
     if (!moreMenuDropdown || moreMenuDropdown.classList.contains('hidden')) return;
     moreMenuDropdown.classList.add('hidden');
     moreMenuBtn?.setAttribute('aria-expanded', 'false');
@@ -2010,6 +2466,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (configTriggerBadge) configTriggerBadge.classList.toggle('badge-disabled', disabled);
     if (modelTriggerBadge) modelTriggerBadge.classList.toggle('badge-disabled', disabled);
     if (datasetSchemaViewerBtn) datasetSchemaViewerBtn.classList.toggle('badge-disabled', disabled);
+    // #moreMenuModelBtn is the narrow-header twin of modelTriggerBadge (see
+    // index.html's comment on it) - a real <button>, so a native `disabled`
+    // toggle here does the job instead of the class-based fake-disabled the
+    // plain-<div> badges above need; also closes its own submenu if it
+    // happened to be open, same "don't leave a now-blocked control's popup
+    // sitting open" spirit as the rest of this function.
+    if (moreMenuModelBtn) {
+      moreMenuModelBtn.disabled = disabled;
+      if (disabled) closeMoreMenuModelSubmenu();
+    }
 
     // Sign-in/sign-out control: signing in or out mid-turn tears down the
     // whole active turn out from under it (see auth-disabled's own comment
@@ -2132,6 +2598,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (resultsChartWrapper) resultsChartWrapper.classList.add('hidden');
     if (resultsTableWrapper) resultsTableWrapper.classList.remove('hidden');
     destroyResultsChart();
+    // Same reasoning: the Summary tab's own inline mini-chart (see
+    // renderSummaryInlineChart()) sits on a <canvas> inside resultsBody,
+    // which this function just wiped via innerHTML above - the Chart.js
+    // instance itself would otherwise leak (and its old canvas reference
+    // would be stale) rather than being cleanly destroyed.
+    destroySummaryInlineChart();
     // Same reasoning as the chart reset just above - a truncation notice
     // left over from the PREVIOUS turn's result must not linger through a
     // "cleared" results area either.
@@ -2733,15 +3205,22 @@ document.addEventListener('DOMContentLoaded', async () => {
   function updateModelBadge() {
     if (!modelBadgeName) return;
     // ACTIVE_LLM_MODEL alone (not "provider/model") - the provider is
-    // implied by which model is showing, and the modal (grouped by
+    // implied by which model is showing, and the pick list (grouped by
     // provider heading) is where that grouping actually matters; the badge
     // itself just needs to answer "what model am I using right now" at a
     // glance, same one-value-only spirit as the DB badge's connDbName.
     modelBadgeName.textContent = ACTIVE_LLM_MODEL || "Model";
     if (modelTriggerBadge) {
       modelTriggerBadge.title = ACTIVE_LLM_MODEL
-        ? `Using model: ${ACTIVE_LLM_MODEL} (Click to configure)`
-        : 'Model Info (Click to configure)';
+        ? `Using model: ${ACTIVE_LLM_MODEL} (Click to choose)`
+        : 'Model Info (Click to choose)';
+    }
+    // The more-menu's own current-selection display (see
+    // #moreMenuModelBtn's comment in index.html) - kept in sync with the
+    // real badge above on every config fetch, same "always current, no
+    // separate refresh step" spirit as the badge itself.
+    if (moreMenuModelCurrent) {
+      moreMenuModelCurrent.textContent = ACTIVE_LLM_MODEL || "Model";
     }
   }
 
@@ -2823,6 +3302,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         currentHistoryMaxTurns = data.history_max_turns;
       }
       chatStore.setMaxTurns(data.history_max_turns);
+
+      // 0 is a legitimate, meaningful value here (poll disabled) - unlike
+      // history_max_turns just above, this can't use a truthy check, or
+      // "disabled" would silently be ignored and fall back to the default.
+      if (typeof data.client_version_check_interval_minutes === 'number' && data.client_version_check_interval_minutes >= 0) {
+        clientVersionCheckIntervalMinutes = data.client_version_check_interval_minutes;
+      }
 
       if (data.auth_enabled && data.google_client_id) {
         googleAuthEnabled = true;
@@ -3995,14 +4481,16 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   // ===========================================================================
-  // MODEL SELECTION MODAL (fetch already covered by fetchBackendConfig() -
-  // see LLM_PROVIDERS/ACTIVE_LLM_PROVIDER/ACTIVE_LLM_MODEL - this section
-  // just renders/saves the radio list, mirroring renderDbRadioButtons()/
-  // triggerConfigSave() above but scoped to model selection only, since a
-  // model choice is otherwise fully independent of the DB connection form.)
+  // MODEL PICK LIST (fetch already covered by fetchBackendConfig() - see
+  // LLM_PROVIDERS/ACTIVE_LLM_PROVIDER/ACTIVE_LLM_MODEL). An in-place
+  // dropdown anchored under #modelTriggerBadge, replacing the old
+  // #modelModal popup dialog per explicit request - clicking an option
+  // selects AND saves immediately (a real "pick list", like a native
+  // <select>), with no separate "Save Changes" step the way the old radio
+  // list + modelSaveBtn combo needed.
   // ===========================================================================
 
-  // Display-only company names for the modal's radio-group headings.
+  // Display-only company names for the pick list's group headings.
   // provider.name IS "google"/"anthropic"/"openai" server-side now (see
   // translate_routes.py's _LLM_PROVIDERS) - this map exists only because
   // naively title-casing that string would render OpenAI's heading as
@@ -4015,58 +4503,80 @@ document.addEventListener('DOMContentLoaded', async () => {
     openai: "OpenAI",
   };
 
-  function renderModelRadioButtons() {
-    const radioGroup = document.getElementById('modalModelRadioGroup');
-    if (!radioGroup) return;
+  // Renders into BOTH #modelPickOptions (the header badge's own dropdown)
+  // AND #moreMenuModelOptions (the triple-dot menu's second-level list -
+  // see index.html's comment on #moreMenuModelBtn) every time it's
+  // called, from whichever globals (LLM_PROVIDERS/ACTIVE_LLM_PROVIDER/
+  // ACTIVE_LLM_MODEL) are current right now - one render function, two
+  // presentations of the identical list, so they can never drift out of
+  // sync with each other the way hand-maintaining two copies could.
+  // Harmless to call for a target that isn't in the DOM at all (element
+  // missing entirely) or isn't currently visible (CSS-hidden by the
+  // narrow-header breakpoint) - it's just an innerHTML rebuild either way,
+  // and only one of the two is ever actually shown to the user at once.
+  function renderModelPickList() {
+    const optionsEl = document.getElementById('modelPickOptions');
+    const moreMenuOptionsEl = document.getElementById('moreMenuModelOptions');
+    if (!optionsEl && !moreMenuOptionsEl) return;
 
-    // One radio-group-heading + column of radio-options per provider (see
-    // renderDbRadioButtons() for the same heading/radio-option markup this
-    // reuses verbatim via the shared .radio-group/.radio-option/
-    // .radio-group-heading CSS classes) - "organized by llm_provider", as
-    // requested, without needing any new CSS.
+    // One group-heading + column of clickable options per provider -
+    // "organized by llm_provider", same grouping the old radio list gave,
+    // just rendered as directly-clickable rows instead of radio inputs.
     // Provider/model names are server-configured (env vars an admin sets),
     // never raw end-user input - same trust level renderDbRadioButtons()
-    // already extends to db.name above, so this interpolates them
+    // extends to db.name elsewhere in this file, so this interpolates them
     // unescaped too, consistent with that existing convention.
     let html = '';
     LLM_PROVIDERS.forEach((provider) => {
       const providerLabel = LLM_PROVIDER_DISPLAY_NAMES[provider.name] ||
         (provider.name.charAt(0).toUpperCase() + provider.name.slice(1));
-      html += `<div class="radio-group-heading">${providerLabel}</div>`;
+      html += `<div class="model-pick-group-heading">${providerLabel}</div>`;
       html += (provider.preset_models || []).map((model) => {
         const value = `${provider.name}::${model}`;
         const isSelected = provider.name === ACTIVE_LLM_PROVIDER && model === ACTIVE_LLM_MODEL;
         return `
-          <label class="radio-option">
-            <input type="radio" name="llm_model_option" value="${value}" ${isSelected ? 'checked' : ''}>
-            <span class="radio-label">${model}</span>
-          </label>
+          <button type="button" class="model-pick-option${isSelected ? ' selected' : ''}" data-value="${value}" role="option" aria-selected="${isSelected}">
+            <span class="model-pick-option-label">${model}</span>
+            <span class="model-pick-check" aria-hidden="true">&check;</span>
+          </button>
         `;
       }).join('');
     });
 
-    radioGroup.innerHTML = html;
+    if (optionsEl) optionsEl.innerHTML = html;
+    if (moreMenuOptionsEl) moreMenuOptionsEl.innerHTML = html;
   }
 
-  function closeModelModal() {
-    if (modelModal) modelModal.classList.add('hidden');
+  function closeModelPickList() {
+    if (!modelPickList || modelPickList.classList.contains('hidden')) return;
+    modelPickList.classList.add('hidden');
+    modelTriggerBadge?.setAttribute('aria-expanded', 'false');
   }
 
-  async function saveModelSelection() {
-    const modelSaveErrorEl = document.getElementById('modelSaveError');
-    if (modelSaveErrorEl) {
-      modelSaveErrorEl.style.display = 'none';
-      modelSaveErrorEl.textContent = '';
-    }
+  // The more-menu's own twin of closeModelPickList() above - separate
+  // function (rather than a shared one branching on which surface is
+  // active) since the two toggle entirely different elements and there's
+  // never a reason to call one from outside its own surface except the
+  // "reset on close"/"reset on successful save" cases below, which
+  // already call both explicitly.
+  function closeMoreMenuModelSubmenu() {
+    if (!moreMenuModelSubmenu || moreMenuModelSubmenu.classList.contains('hidden')) return;
+    moreMenuModelSubmenu.classList.add('hidden');
+    moreMenuModelBtn?.setAttribute('aria-expanded', 'false');
+  }
 
-    const checked = document.querySelector('input[name="llm_model_option"]:checked');
-    if (!checked) {
-      closeModelModal();
-      return;
-    }
-    const separatorIndex = checked.value.indexOf('::');
-    const llmProvider = checked.value.slice(0, separatorIndex);
-    const llmModel = checked.value.slice(separatorIndex + 2);
+  async function selectModel(llmProvider, llmModel) {
+    // Shared by both surfaces (see the two error containers below), so a
+    // failed save leaves ITS OWN caller's list open with the error message
+    // right next to it - whichever one the user actually clicked from -
+    // without disturbing the other, inactive one.
+    const modelPickErrorEl = document.getElementById('modelPickError');
+    const moreMenuModelErrorEl = document.getElementById('moreMenuModelError');
+    [modelPickErrorEl, moreMenuModelErrorEl].forEach((el) => {
+      if (!el) return;
+      el.style.display = 'none';
+      el.textContent = '';
+    });
 
     try {
       const response = await fetch('/api/config', {
@@ -4081,52 +4591,146 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
       await fetchBackendConfig();
       trackEvent('model_selected', { provider: llmProvider, model: llmModel });
-      closeModelModal();
+      // Close both surfaces (whichever one was actually open - the other
+      // is already a no-op) and, since a selection is a completed action
+      // the same way clicking Doc/History/Preferences is, the whole
+      // triple-dot menu along with it rather than leaving it open on just
+      // the now-collapsed submenu.
+      closeModelPickList();
+      closeMoreMenuModelSubmenu();
+      closeMoreMenu();
     } catch (err) {
-      if (modelSaveErrorEl) {
-        modelSaveErrorEl.textContent = err.message || 'Failed to save model selection.';
-        modelSaveErrorEl.style.display = 'block';
+      // Left open (unlike the success path) so the error is visible right
+      // next to the list that caused it, and the user can immediately
+      // retry a different option without reopening anything.
+      const targetErrorEl = modelPickList && !modelPickList.classList.contains('hidden')
+        ? modelPickErrorEl
+        : moreMenuModelErrorEl;
+      if (targetErrorEl) {
+        targetErrorEl.textContent = err.message || 'Failed to save model selection.';
+        targetErrorEl.style.display = 'block';
       }
     }
   }
 
-  if (modelTriggerBadge && modelModal) {
-    modelTriggerBadge.addEventListener('click', async () => {
+  if (modelTriggerBadge && modelPickList && modelPickerWrapper) {
+    modelTriggerBadge.addEventListener('click', async (e) => {
       // See setButtonsDisabled()'s own comment on badge-disabled - a query
-      // is in flight, so opening this modal is blocked entirely rather
-      // than just visually grayed out (the div has no native `disabled`
-      // to rely on for that).
+      // is in flight, so opening this list is blocked entirely rather than
+      // just visually grayed out (the div has no native `disabled` to rely
+      // on for that).
       if (modelTriggerBadge.classList.contains('badge-disabled')) return;
-      await fetchBackendConfig();
-      renderModelRadioButtons();
-      const modelSaveErrorEl = document.getElementById('modelSaveError');
-      if (modelSaveErrorEl) {
-        modelSaveErrorEl.style.display = 'none';
-        modelSaveErrorEl.textContent = '';
+      e.stopPropagation();
+      // Toggle: a second click on the badge while the list is already open
+      // closes it again, same as the more-menu/auth-avatar dropdowns.
+      if (!modelPickList.classList.contains('hidden')) {
+        closeModelPickList();
+        return;
       }
-      modelModal.classList.remove('hidden');
-      bringModalToFront(modelModal);
+      await fetchBackendConfig();
+      renderModelPickList();
+      const modelPickErrorEl = document.getElementById('modelPickError');
+      if (modelPickErrorEl) {
+        modelPickErrorEl.style.display = 'none';
+        modelPickErrorEl.textContent = '';
+      }
+      modelPickList.classList.remove('hidden');
+      modelTriggerBadge.setAttribute('aria-expanded', 'true');
+    });
+
+    // Same "click outside closes it" idiom as moreMenuDropdown/authDropdown
+    // elsewhere in this file.
+    document.addEventListener('click', (e) => {
+      if (!modelPickList.classList.contains('hidden') && !modelPickerWrapper.contains(e.target)) {
+        closeModelPickList();
+      }
+    });
+
+    // One delegated listener for every option row, rather than re-binding
+    // per-button on each renderModelPickList() call (which fully replaces
+    // #modelPickOptions' innerHTML on every open).
+    modelPickList.addEventListener('click', (e) => {
+      const optionBtn = e.target.closest('.model-pick-option');
+      if (!optionBtn) return;
+      const separatorIndex = optionBtn.dataset.value.indexOf('::');
+      const llmProvider = optionBtn.dataset.value.slice(0, separatorIndex);
+      const llmModel = optionBtn.dataset.value.slice(separatorIndex + 2);
+      selectModel(llmProvider, llmModel);
     });
   }
 
-  if (modelModalCloseBtn) {
-    modelModalCloseBtn.addEventListener('click', closeModelModal);
-  }
+  // The more-menu's own presentation of the exact same list (see
+  // index.html's comment on #moreMenuModelBtn/#moreMenuModelSubmenu, and
+  // the CSS comment on .more-menu-model-submenu) - an expand-in-place
+  // second-level list under its own toggle button, rather than the header
+  // badge's absolutely-positioned flyout, since this only ever shows up on
+  // narrow viewports where a flyout anchored this close to the menu's own
+  // edge would risk running off-screen.
+  if (moreMenuModelBtn && moreMenuModelSubmenu) {
+    moreMenuModelBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      // Toggle: a second click while the submenu is already open collapses
+      // it again, without closing the rest of the more-menu around it.
+      if (!moreMenuModelSubmenu.classList.contains('hidden')) {
+        closeMoreMenuModelSubmenu();
+        return;
+      }
+      await fetchBackendConfig();
+      renderModelPickList();
+      const moreMenuModelErrorEl = document.getElementById('moreMenuModelError');
+      if (moreMenuModelErrorEl) {
+        moreMenuModelErrorEl.style.display = 'none';
+        moreMenuModelErrorEl.textContent = '';
+      }
+      moreMenuModelSubmenu.classList.remove('hidden');
+      moreMenuModelBtn.setAttribute('aria-expanded', 'true');
+    });
 
-  if (modelSaveBtn) {
-    modelSaveBtn.addEventListener('click', saveModelSelection);
+    // Same delegated-listener idiom as #modelPickList above, over the
+    // exact same .model-pick-option rows (renderModelPickList() fills
+    // both containers identically).
+    moreMenuModelSubmenu.addEventListener('click', (e) => {
+      const optionBtn = e.target.closest('.model-pick-option');
+      if (!optionBtn) return;
+      const separatorIndex = optionBtn.dataset.value.indexOf('::');
+      const llmProvider = optionBtn.dataset.value.slice(0, separatorIndex);
+      const llmModel = optionBtn.dataset.value.slice(separatorIndex + 2);
+      selectModel(llmProvider, llmModel);
+    });
   }
 
   // ===========================================================================
-  // PREFERENCES MODAL (theme + auto-execute-SQL). Mirrors the Model Selection
-  // Modal above: a small, independent settings surface with its own minimal
-  // POST to /api/config, distinct from the DB connection form's
-  // triggerConfigSave(). Theme itself never goes to the server (see the
-  // THEME SWITCHING section) - only auto_sql_execute is persisted there.
+  // PREFERENCES MODAL (theme + auto-execute-SQL + show-SQL). Mirrors the
+  // Model Selection Modal above: a small, independent settings surface with
+  // its own minimal POST to /api/config, distinct from the DB connection
+  // form's triggerConfigSave(). Theme and Show SQL never go to the server
+  // (see THEME SWITCHING/SHOW SQL above) - only auto_sql_execute is
+  // persisted there.
   // ===========================================================================
 
   function closePreferencesModal() {
     if (preferencesModal) preferencesModal.classList.add('hidden');
+  }
+
+  // The two checkboxes' linked rule (per explicit request): auto-execute
+  // off means the generated SQL is the only feedback the user gets before
+  // anything actually runs against their database, so it MUST stay
+  // visible - Show SQL is force-checked AND locked (disabled, so the user
+  // can't immediately undo the nudge) for as long as auto-execute is off,
+  // and freed again the moment auto-execute is back on. Called both when
+  // the dialog first loads (reflecting whatever was already saved) and
+  // live on every change to the auto-execute checkbox while the dialog is
+  // open, so the constraint holds no matter how the user gets there.
+  function enforceShowSqlLinkage() {
+    if (!autoSqlExecuteCheckbox || !showSqlCheckbox) return;
+    const autoExecuteOff = !autoSqlExecuteCheckbox.checked;
+    if (autoExecuteOff) {
+      showSqlCheckbox.checked = true;
+    }
+    showSqlCheckbox.disabled = autoExecuteOff;
+    if (showSqlLockedNote) {
+      showSqlLockedNote.classList.toggle('hidden', !autoExecuteOff);
+    }
   }
 
   function loadPreferencesIntoUI() {
@@ -4136,6 +4740,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (autoSqlExecuteCheckbox) {
       autoSqlExecuteCheckbox.checked = autoSqlExecuteEnabled;
     }
+    if (showSqlCheckbox) {
+      showSqlCheckbox.checked = showSqlEnabled;
+    }
+    enforceShowSqlLinkage();
 
     // Bring Your Own Key - every box always starts blank (the saved key,
     // if any, is never sent to the browser - see LLM_BYOK_KEY_SET's own
@@ -4162,6 +4770,17 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     const selectedTheme = themeOptionLight && themeOptionLight.checked ? 'light' : 'dark';
     setTheme(selectedTheme);
+
+    // enforceShowSqlLinkage() has already forced this checked (and
+    // disabled it) whenever auto-execute is off, so reading its .checked
+    // here - rather than re-deriving "off means true" separately - is
+    // enough to honor the linked rule regardless of how the user got to
+    // this state (unchecked auto-execute just now, or opened the dialog
+    // with it already off). Client-side only, like theme - see SHOW SQL
+    // above - so this applies immediately rather than waiting on the
+    // /api/config round trip below.
+    const showSqlValue = showSqlCheckbox ? showSqlCheckbox.checked : showSqlEnabled;
+    setShowSqlEnabled(showSqlValue);
 
     const autoSqlExecuteValue = autoSqlExecuteCheckbox
       ? autoSqlExecuteCheckbox.checked
@@ -4234,6 +4853,14 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   if (preferencesSaveBtn) {
     preferencesSaveBtn.addEventListener('click', savePreferences);
+  }
+
+  // Live linkage while the dialog is open (see enforceShowSqlLinkage()'s
+  // own comment) - unchecking auto-execute immediately force-checks and
+  // locks Show SQL, without waiting for Save, so the constraint is visible
+  // the moment the user creates the situation it protects against.
+  if (autoSqlExecuteCheckbox) {
+    autoSqlExecuteCheckbox.addEventListener('change', enforceShowSqlLinkage);
   }
 
   // Bring Your Own Key - "x" click marks that provider for an explicit
@@ -5067,6 +5694,11 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   function closeConfigModal() {
     if (configModal) configModal.classList.add('hidden');
+    // Chevron affordance (see .dataset-badge-caret in style.css) - every
+    // path that hides this modal runs through this one function, so
+    // setting it back to false here (rather than in each individual close
+    // trigger) covers all of them in one place.
+    configTriggerBadge?.setAttribute('aria-expanded', 'false');
   }
 
   if (configTriggerBadge && configModal) {
@@ -5087,6 +5719,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         configSaveErrorEl.textContent = '';
       }
       configModal.classList.remove('hidden');
+      configTriggerBadge.setAttribute('aria-expanded', 'true');
       bringModalToFront(configModal);
     });
   }
@@ -5098,24 +5731,27 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Opens the Schema Viewer for whichever connection is currently ACTIVE -
   // same {kind, id} addressing, and the same active-connection fields, as
   // the "OPEN SCHEMA VIEWER" chat sentinel's own dispatch (see its comment
-  // a bit further down in this file). This button lives NESTED INSIDE
-  // configTriggerBadge (see index.html's own comment on it) rather than
+  // a bit further down in this file). This button sits BESIDE
+  // configTriggerBadge, inside .crbot-dataset-center (see index.html's own
+  // comment on it), as its own separately-sized control rather than
   // inside the config modal on purpose: it replaced that modal's old
   // per-row "?" buttons, which could open the Schema Viewer for a
   // connection other than the active one (so a suggested-question prompt
   // fired from it could run against the wrong dataset) and always opened
   // on top of the config modal (so the user had to dismiss two dialogs to
   // see their results). A button that only ever means "the active
-  // connection" can't have either problem - and living inside the dataset
-  // badge itself (rather than floating beside it as an unrelated icon)
-  // makes it obvious at a glance which dataset it's asking about.
+  // connection" can't have either problem - and sitting right next to the
+  // dataset badge (rather than floating somewhere unrelated) still makes
+  // it obvious at a glance which dataset it's asking about.
   if (datasetSchemaViewerBtn) {
     datasetSchemaViewerBtn.addEventListener('click', (e) => {
       e.preventDefault();
-      // Required now that this button is NESTED inside configTriggerBadge
-      // rather than a sibling of it - without this, the click would also
-      // bubble up and fire configTriggerBadge's own click-to-configure
-      // handler right after this one runs.
+      // Belt-and-suspenders now that this button is a SIBLING of
+      // configTriggerBadge (inside .crbot-dataset-center) rather than
+      // nested inside it - a sibling's click wouldn't bubble through
+      // configTriggerBadge at all, so this technically isn't load-bearing
+      // any more, but it's harmless to keep in case that nesting ever
+      // changes again.
       e.stopPropagation();
       if (datasetSchemaViewerBtn.classList.contains('badge-disabled')) return;
       // A dataset group (see isGroupModeSelected()) has no single "active"
@@ -5162,12 +5798,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     const resultsCard = document.querySelector('.table-card');
     const historyNav = document.querySelector('.inline-history-nav');
     const authContainer = googleAuthEnabled ? document.getElementById('g_id_signin') : null;
-    // Under the narrow-header breakpoint, historyBtn/authContainer/helpBtn/
-    // sendFeedbackBtn are CSS-hidden (collapsed into the triple-dot
-    // #moreMenuBtn - see the MORE MENU section above) - they'd still exist
-    // in the DOM, so pointing the tour at them directly would spotlight a
-    // zero-size rect. Point at the visible moreMenuBtn instead, with one
-    // combined step.
+    // Under the narrow-header breakpoint, modelTriggerBadge/historyBtn/
+    // authContainer/helpBtn/sendFeedbackBtn/prefsBtn are all CSS-hidden
+    // (collapsed into the triple-dot #moreMenuBtn - see the MORE MENU
+    // section above) - they'd still exist in the DOM, so pointing the tour
+    // at them directly would spotlight a zero-size rect. Point at the
+    // visible moreMenuBtn instead, with one combined step.
     const isNarrowHeader = !!(moreMenuWrapper && window.getComputedStyle(moreMenuWrapper).display !== 'none');
     // Mirrors sendFeedbackBtn/moreMenuFeedbackBtn's own visibility gate
     // (fetchBackendConfig() toggles both on ISSUE_REPORTING_ENABLED) -
@@ -5204,20 +5840,20 @@ document.addEventListener('DOMContentLoaded', async () => {
       {
         target: datasetSchemaViewerBtn,
         title: 'Peek at its schema anytime',
-        body: 'Click the "i" inside the badge to see this dataset\'s tables, columns, and an ER diagram - without switching which dataset you\'re connected to.'
+        body: 'Click the "i" icon next to the badge to see this dataset\'s tables, columns, and an ER diagram - without switching which dataset you\'re connected to.'
       },
+      ...(isNarrowHeader ? [{
+        target: moreMenuBtn,
+        title: 'Model, help, history, preferences & sign-in live here',
+        body: isAnonymousUser
+          ? `Tap this menu to switch the AI model (grouped by provider), see the full docs, your past translations, your preferences (color theme and auto-execute)${feedbackMenuClause} and to sign in with Google so your connections and history follow you across devices.`
+          : `Tap this menu to switch the AI model (grouped by provider), see the full docs, your past translations, your preferences (color theme and auto-execute)${feedbackMenuClause} and to sign out.`
+      }] : [
       {
         target: modelTriggerBadge,
         title: "This is the AI model translating your questions",
         body: "Click this badge to switch between the available models, grouped by provider (Google, Anthropic, OpenAI)."
       },
-      ...(isNarrowHeader ? [{
-        target: moreMenuBtn,
-        title: 'Help, history, preferences & sign-in live here',
-        body: isAnonymousUser
-          ? `Tap this menu for the full docs, your past translations, your preferences (color theme and auto-execute)${feedbackMenuClause} and to sign in with Google so your connections and history follow you across devices.`
-          : `Tap this menu for the full docs, your past translations, your preferences (color theme and auto-execute)${feedbackMenuClause} and to sign out.`
-      }] : [
       {
         target: prefsBtn,
         title: 'Make it yours',
@@ -6284,21 +6920,23 @@ document.addEventListener('DOMContentLoaded', async () => {
   // one, filtering by name and body text) - just a plain, full list of
   // every entry.
   //
-  // The list itself is a 2-level tree: up to five top-level groups
-  // (Tables/Views/Indexes/Routines/Grants, each labeled with its own item
-  // count and collapsible - see schemaViewerExpanded below), each holding
-  // the matching items parsed out of this connection's schema text.
-  // Tables come from the same Table:/Table family:/Tab: entries the
-  // columns table (etc.) already uses; Views/Indexes/Routines/Grants come
-  // from their own global sections (see parseSchemaViews()/
-  // parseSchemaIndexes()/parseSchemaRoutines()/parseSchemaGrants() below)
-  // the same way Row count estimates/Constraints/Column value samples do.
-  // A group this dialect/connection has none of (most dialects have no
-  // Indexes section at all - see parseSchemaIndexes()'s own comment; only
-  // Postgres/MySQL/Databricks/Oracle/MSSQL/Redshift emit Grants at all -
-  // see parseSchemaGrants()'s own comment) is left out of the tree
-  // entirely (see renderSchemaViewerEntryList()) rather than shown as an
-  // empty, non-expandable "(0)" row.
+  // The list itself is a 2-level tree: up to six top-level groups
+  // (Tables/Views/Indexes/Routines/Grants/Likely Relationships, each
+  // labeled with its own item count and collapsible - see
+  // schemaViewerExpanded below), each holding the matching items parsed
+  // out of this connection's schema text. Tables come from the same
+  // Table:/Table family:/Tab: entries the columns table (etc.) already
+  // uses; Views/Indexes/Routines/Grants/Likely Relationships come from
+  // their own global sections (see parseSchemaViews()/
+  // parseSchemaIndexes()/parseSchemaRoutines()/parseSchemaGrants()/
+  // parseSchemaRelationships() below) the same way Row count
+  // estimates/Constraints/Column value samples do. A group this
+  // dialect/connection has none of (most dialects have no Indexes section
+  // at all - see parseSchemaIndexes()'s own comment; only Postgres/MySQL/
+  // Databricks/Oracle/MSSQL/Redshift emit Grants at all - see
+  // parseSchemaGrants()'s own comment) is left out of the tree entirely
+  // (see renderSchemaViewerEntryList()) rather than shown as an empty,
+  // non-expandable "(0)" row.
   // ===========================================================================
 
   // This request's own connection reference ({kind: 'preset'|'custom', id})
@@ -6308,20 +6946,20 @@ document.addEventListener('DOMContentLoaded', async () => {
   // function's parameters.
   let schemaViewerCurrentRef = { kind: '', id: '' };
   let schemaViewerEntries = [];
-  // { category: 'tables'|'views'|'indexes'|'routines'|'grants'|null, index:
-  // number } - which single leaf in the tree is selected, if any. Replaces
-  // a bare index now that the list holds five separate item arrays rather
-  // than just schemaViewerEntries.
+  // { category: 'tables'|'views'|'indexes'|'routines'|'grants'|
+  // 'relationships'|null, index: number } - which single leaf in the tree
+  // is selected, if any. Replaces a bare index now that the list holds
+  // six separate item arrays rather than just schemaViewerEntries.
   let schemaViewerSelected = { category: null, index: -1 };
   // Which top-level groups are expanded - reset on every fresh load (see
   // loadSchemaViewerConnection()) rather than persisted across
   // connections, since a group that made sense to collapse/expand for one
-  // dataset has no bearing on the next one opened. All five start
+  // dataset has no bearing on the next one opened. All six start
   // collapsed - the dialog opens landed on the pinned "Overview" entry
   // instead (see renderSchemaViewerEntryList()'s default-selection logic),
   // so there's no need for any group's own contents to already be
   // unfurled underneath it.
-  let schemaViewerExpanded = { tables: false, views: false, indexes: false, routines: false, grants: false };
+  let schemaViewerExpanded = { tables: false, views: false, indexes: false, routines: false, grants: false, relationships: false };
   // Views/Indexes/Routines/Grants parsed once per load (see
   // parseSchemaViews()/parseSchemaIndexes()/parseSchemaRoutines()/
   // parseSchemaGrants() below) - lists in the same spirit as
@@ -6339,6 +6977,17 @@ document.addEventListener('DOMContentLoaded', async () => {
   let schemaViewerIndexes = [];
   let schemaViewerRoutines = [];
   let schemaViewerGrants = [];
+  // schemaViewerRelationships: [{ table, column, detail }] - one row per
+  // line in the "Likely relationships (naming convention, unconfirmed):"
+  // global section (see parseSchemaRelationships() below), same
+  // "un-headed global section" trap Grants was promoted out of (see that
+  // section's own comment above) - it used to fall through, un-
+  // recognized, to the bottom of whichever table entry happened to be
+  // LAST. Distinct from schemaViewerNamingRelationships below, which
+  // feeds only the ER diagram and deliberately keeps just heuristic 1's
+  // single-target lines - this one keeps every line, verbatim, for its
+  // own tree group.
+  let schemaViewerRelationships = [];
   // Per-table metadata parsed once per load out of the "Row count
   // estimates:"/"Live row counts:"/"Column value samples:"/"Constraints:"
   // global sections (see parseSchemaRowCounts()/parseSchemaColumnSamples()/
@@ -6350,10 +6999,18 @@ document.addEventListener('DOMContentLoaded', async () => {
   // why that's always the last one). schemaViewerRowCounts: {
   // [tableName]: { live: {count, note}?, estimate: {count, note}? } }.
   // schemaViewerSamples/schemaViewerConstraints: { [tableName]: {
-  // [columnName]: text } }.
+  // [columnName]: text } }. schemaViewerComments, parsed from the
+  // "Comments:" global section (see parseSchemaComments() below), is the
+  // same per-table/per-column shape plus one extra field: { [tableName]: {
+  // table: text?, columns: { [columnName]: text } } } - `table` is that
+  // table's own "[table] NAME: description" catalog comment (rendered
+  // just under the detail heading, see schemaViewerTableCommentText),
+  // `columns` feeds the columns table's "Comments" column exactly like
+  // schemaViewerSamples/schemaViewerConstraints do for theirs.
   let schemaViewerRowCounts = {};
   let schemaViewerSamples = {};
   let schemaViewerConstraints = {};
+  let schemaViewerComments = {};
   // This connection's cached, LLM-written {"prose", "questions",
   // "generated_at"} pair (see GET /api/schema's own "overview" field,
   // config_routes.py) - null whenever nothing has been generated (or
@@ -6698,6 +7355,88 @@ document.addEventListener('DOMContentLoaded', async () => {
     return result;
   }
 
+  // Parses the SAME "Likely relationships (naming convention, unconfirmed):"
+  // global section as parseSchemaNamingRelationships() above, but for the
+  // Schema Viewer's own "Likely Relationships" tree group rather than the
+  // ER diagram - which means, unlike that function, this keeps EVERY line
+  // verbatim, both heuristics (see backends/base.py's
+  // find_naming_convention_relationships() for their full description):
+  // heuristic 1's "TABLE.COL -> likely relationship (unconfirmed):
+  // references OTHER_TABLE, ..." and heuristic 2's "TABLE.COL -> likely
+  // relationship (unconfirmed): same column name also appears in ..."
+  // lines alike. Before this existed, this whole section had no parser of
+  // its own at all and so, same as "Comments:" (see parseSchemaComments()
+  // below) and "Grants:" before its own tree group (see parseSchemaGrants()'s
+  // comment), just rode along un-stripped in whichever table entry's own
+  // "remainder" text happened to be shown last - looking like it belonged
+  // to that one table rather than describing the whole connection. Returns
+  // [{ table, column, detail }], `detail` being the line's own full
+  // "likely relationship (unconfirmed): ..." text (everything after the
+  // leading "TABLE.COL -> "), trimmed - shown as-is in the detail pane
+  // rather than re-worded, so nothing is lost relative to the raw text
+  // this replaces.
+  function parseSchemaRelationships(fullText) {
+    const result = [];
+    const body = extractNamedSchemaSection(fullText, 'Likely relationships');
+    if (!body) return result;
+    const re = /^ {2}(\S+)\.(\S+) -> (.+)$/;
+    body.split('\n').forEach((line) => {
+      const m = re.exec(line);
+      if (!m) return;
+      const [, table, column, detail] = m;
+      result.push({ table, column, detail: detail.trim() });
+    });
+    return result;
+  }
+
+  // Parses the "Comments:" global section (backends/*.py's catalog
+  // table/column comment queries - e.g. Postgres's pg_description,
+  // Oracle's ALL_TAB_COMMENTS/ALL_COL_COMMENTS, MySQL's
+  // information_schema.TABLES.TABLE_COMMENT/COLUMNS.COLUMN_COMMENT, and so
+  // on) into { [tableName]: { table: text?, columns: { [columnName]: text
+  // } } }. Two line shapes, identical across every dialect that emits this
+  // section: "  [table] NAME: description" (that table's own comment) and
+  // "  [column] TABLE.COL: description" (one column's own comment) - see
+  // any backends/*.py's own comment_lines.append(...) calls. The
+  // TABLE.COL split relies on the SAME greedy-regex backtracking
+  // parseSchemaNamingRelationships()/parseSchemaRelationships() above
+  // already lean on to land on the LAST dot rather than the first - needed
+  // because a schema-qualified table name (e.g. MSSQL's own
+  // schema_prefix, "dbo.Orders") already contains a dot of its own before
+  // the TABLE.COL separator's dot, and only the last one is ever the real
+  // separator (an unqualified column name never contains a dot itself).
+  // Before this existed, this whole section had no parser at all and so,
+  // same as "Likely relationships:" (see parseSchemaRelationships() above)
+  // and "Grants:" before its own tree group, just rode along un-stripped
+  // in whichever table entry's own "remainder" text happened to be shown
+  // last. Rather than getting its own tree group, though, this is folded
+  // directly into the existing table/column display (selectSchemaViewerEntry
+  // below) - a comment describes a specific table or column already shown
+  // elsewhere, unlike Grants/Likely relationships which describe
+  // permissions/relationships with no existing home of their own.
+  function parseSchemaComments(fullText) {
+    const result = {};
+    const body = extractNamedSchemaSection(fullText, 'Comments');
+    if (!body) return result;
+    const tableRe = /^ {2}\[table\] (\S+): (.+)$/;
+    const columnRe = /^ {2}\[column\] (\S+)\.(\S+): (.+)$/;
+    body.split('\n').forEach((line) => {
+      let m = tableRe.exec(line);
+      if (m) {
+        result[m[1]] = result[m[1]] || { columns: {} };
+        result[m[1]].table = m[2];
+        return;
+      }
+      m = columnRe.exec(line);
+      if (m) {
+        const [, tbl, col, desc] = m;
+        result[tbl] = result[tbl] || { columns: {} };
+        result[tbl].columns[col] = desc;
+      }
+    });
+    return result;
+  }
+
   // Builds a Mermaid erDiagram source string from this connection's own
   // already-parsed schema data - deterministic, no LLM involved (see
   // schema_cache.py's own module docstring for the full "why"): a real FK
@@ -7022,10 +7761,19 @@ document.addEventListener('DOMContentLoaded', async () => {
   // "Session:" -> unlabeled treatment for parseSchemaSessionInfo's own
   // result. '' when a dialect has no such source (e.g. backends/
   // mongodb_sql.py, backends/sheets.py) - never shown as a misleading
-  // zero/blank statistic.
+  // zero/blank statistic. Strips backends/base.py's format_dataset_size_
+  // line()'s own optional trailing "(note)" parenthetical (e.g.
+  // backends/databricks.py's "live count of the tables shown here only,
+  // not a schema-wide total - Databricks has no cheap catalog-only
+  // row-count statistic") - that caveat is aimed at the LLM reading the
+  // full schema prompt, not something worth showing an end user alongside
+  // a one-line UI fact ("Data Size: ~21.9K rows") - per an explicit
+  // request. Mirrors backends/base.py's own parse_dataset_size_line()
+  // exactly, including its same "note text never has its own parentheses"
+  // assumption - see that function's own comment.
   function parseSchemaDatasetSizeLine(fullText) {
     const m = /^Estimated dataset size: (.+)$/m.exec(fullText || '');
-    return m ? m[1] : '';
+    return m ? m[1].replace(/\s*\([^()]*\)$/, '') : '';
   }
 
   // Removes the "Session:"/"Estimated dataset size:" bare lines specifically
@@ -7131,20 +7879,23 @@ document.addEventListener('DOMContentLoaded', async () => {
     return counts.live ? ` (${formatted} rows)` : ` (~${formatted} rows, estimated)`;
   }
 
-  // The five top-level tree groups, in display order. `items()` returns
+  // The six top-level tree groups, in display order. `items()` returns
   // this load's array for that group; `label()` renders one item's own
-  // tree-row text (every group but Indexes/Grants just uses its plain
-  // name - Indexes are qualified by table, since an index name alone
-  // doesn't say which table it belongs to; Grants likewise, plus the
-  // privilege/grantee, since neither alone identifies one grant row;
-  // Tables also gets its row-count suffix, see schemaViewerRowCountSuffix()
-  // above).
+  // tree-row text (every group but Indexes/Grants/Likely Relationships
+  // just uses its plain name - Indexes are qualified by table, since an
+  // index name alone doesn't say which table it belongs to; Grants
+  // likewise, plus the privilege/grantee, since neither alone identifies
+  // one grant row; Likely Relationships likewise, qualified by
+  // table.column, since a naming-convention match is only meaningful
+  // together with which column it's about; Tables also gets its
+  // row-count suffix, see schemaViewerRowCountSuffix() above).
   const SCHEMA_VIEWER_GROUPS = [
     { key: 'tables', title: 'Tables', items: () => schemaViewerEntries.filter((e) => e.name !== null), label: (item) => `${item.name}${schemaViewerRowCountSuffix(item.name)}` },
     { key: 'views', title: 'Views', items: () => schemaViewerViews, label: (item) => item.name },
     { key: 'indexes', title: 'Indexes', items: () => schemaViewerIndexes, label: (item) => `${item.table}.${item.name}` },
     { key: 'routines', title: 'Routines', items: () => schemaViewerRoutines, label: (item) => item.name },
     { key: 'grants', title: 'Grants', items: () => schemaViewerGrants, label: (item) => `${item.table}: ${item.privilege} → ${item.grantee}` },
+    { key: 'relationships', title: 'Likely Relationships', items: () => schemaViewerRelationships, label: (item) => `${item.table}.${item.column}` },
   ];
 
   function renderSchemaViewerEntryList() {
@@ -7228,6 +7979,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       schemaViewerDetailHeading.textContent = heading || '';
       schemaViewerDetailHeading.title = '';
     }
+    if (schemaViewerTableCommentText) schemaViewerTableCommentText.classList.add('hidden');
     if (schemaViewerOverviewWrap) schemaViewerOverviewWrap.classList.add('hidden');
     if (schemaViewerColumnsWrap) schemaViewerColumnsWrap.classList.add('hidden');
     if (schemaViewerColumnsBody) schemaViewerColumnsBody.innerHTML = '';
@@ -7349,6 +8101,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       schemaViewerDetailHeading.textContent = 'Overview';
       schemaViewerDetailHeading.title = '';
     }
+    if (schemaViewerTableCommentText) schemaViewerTableCommentText.classList.add('hidden');
     if (schemaViewerColumnsWrap) schemaViewerColumnsWrap.classList.add('hidden');
     if (schemaViewerColumnsBody) schemaViewerColumnsBody.innerHTML = '';
     if (schemaViewerDetailText) {
@@ -7470,6 +8223,11 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (!g) return renderSchemaViewerSimpleDetail('', '');
       return renderSchemaViewerSimpleDetail(`${g.table} → ${g.grantee}`, g.detail);
     }
+    if (category === 'relationships') {
+      const r = schemaViewerRelationships[index];
+      if (!r) return renderSchemaViewerSimpleDetail('', '');
+      return renderSchemaViewerSimpleDetail(`${r.table}.${r.column}`, r.detail);
+    }
 
     // category === 'tables' (or an unrecognized/stale ref) - the original,
     // fuller detail: row count, the structured columns table (with its
@@ -7483,11 +8241,18 @@ document.addEventListener('DOMContentLoaded', async () => {
       const counts = entry.name ? schemaViewerRowCounts[entry.name] : null;
       schemaViewerDetailHeading.title = (counts?.live || counts?.estimate)?.note || '';
     }
+    const commentsForTable = (entry.name && schemaViewerComments[entry.name]) || null;
+    if (schemaViewerTableCommentText) {
+      const tableComment = commentsForTable?.table || '';
+      schemaViewerTableCommentText.textContent = tableComment;
+      schemaViewerTableCommentText.classList.toggle('hidden', !tableComment);
+    }
     if (schemaViewerOverviewWrap) schemaViewerOverviewWrap.classList.add('hidden');
 
     const { columns, remainder } = parseSchemaEntryColumns(entry.text || '');
     const samplesForTable = (entry.name && schemaViewerSamples[entry.name]) || {};
     const constraintsForTable = (entry.name && schemaViewerConstraints[entry.name]) || {};
+    const columnCommentsForTable = commentsForTable?.columns || {};
     if (schemaViewerColumnsWrap && schemaViewerColumnsBody) {
       if (columns.length > 0) {
         schemaViewerColumnsBody.innerHTML = columns.map((col) => `
@@ -7498,6 +8263,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             <td>${escapeHtml(col.attributes)}</td>
             <td>${escapeHtml(constraintsForTable[col.name] || '')}</td>
             <td class="schema-viewer-col-samples">${escapeHtml(samplesForTable[col.name] || '')}</td>
+            <td class="schema-viewer-col-comments">${escapeHtml(columnCommentsForTable[col.name] || '')}</td>
           </tr>`).join('');
         schemaViewerColumnsWrap.classList.remove('hidden');
       } else {
@@ -7506,23 +8272,28 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
     }
     if (schemaViewerDetailText) {
-      // Once the columns table (plus the row-count line above it) is
-      // showing them, don't also repeat that information as raw text
-      // below - strip those specific sections out (plus the "Session:"/
-      // "Estimated dataset size:" one-liners, now shown at the top of the
-      // Overview tab instead - see stripSchemaGlobalBareLines()'s own
-      // comment) and show only whatever is genuinely left (Triggers/
-      // Comments/... - not yet promoted to their own structured field, or
-      // their own tree group) or nothing at all. A dialect the column
-      // parser doesn't recognize (no columns found) still falls back to
-      // the complete, untouched raw text, same as before this table
-      // existed. "Grants" was the last of these global sections still
-      // falling through here unrecognized (see parseSchemaGrants()'s own
-      // comment) - now stripped too, since it has its own tree group.
+      // Once the columns table (plus the row-count line and table-level
+      // comment above it) is showing them, don't also repeat that
+      // information as raw text below - strip those specific sections out
+      // (plus the "Session:"/"Estimated dataset size:" one-liners, now
+      // shown at the top of the Overview tab instead - see
+      // stripSchemaGlobalBareLines()'s own comment) and show only
+      // whatever is genuinely left (Triggers/... - not yet promoted to
+      // their own structured field, or their own tree group) or nothing
+      // at all. A dialect the column parser doesn't recognize (no columns
+      // found) still falls back to the complete, untouched raw text, same
+      // as before this table existed. "Grants" was the last of these
+      // global sections still falling through here unrecognized (see
+      // parseSchemaGrants()'s own comment) before "Comments" (now folded
+      // into the columns table/table-comment note above - see
+      // parseSchemaComments()) and "Likely relationships" (now its own
+      // tree group - see parseSchemaRelationships()) were promoted out
+      // too, same reasoning each time.
       const shownText = columns.length > 0
         ? stripSchemaGlobalBareLines(stripNamedSchemaSections(remainder, [
           'Row count estimates', 'Live row counts', 'Column value samples', 'Constraints',
           'Indexes', 'Views', 'View definitions', 'Routines', 'Routine definitions', 'Grants',
+          'Comments', 'Likely relationships',
         ]))
         : (entry.text || '');
       schemaViewerDetailText.textContent = shownText;
@@ -7550,16 +8321,18 @@ document.addEventListener('DOMContentLoaded', async () => {
     schemaViewerIndexes = [];
     schemaViewerRoutines = [];
     schemaViewerGrants = [];
+    schemaViewerRelationships = [];
     schemaViewerRowCounts = {};
     schemaViewerSamples = {};
     schemaViewerConstraints = {};
+    schemaViewerComments = {};
     schemaViewerOverview = null;
     schemaViewerForeignKeys = [];
     schemaViewerNamingRelationships = [];
     schemaViewerSelected = { category: null, index: -1 };
     // See this variable's own top-of-file declaration comment for why
     // every group starts collapsed.
-    schemaViewerExpanded = { tables: false, views: false, indexes: false, routines: false, grants: false };
+    schemaViewerExpanded = { tables: false, views: false, indexes: false, routines: false, grants: false, relationships: false };
     if (schemaViewerEntryList) {
       schemaViewerEntryList.innerHTML = '<li class="schema-viewer-entry-empty text-center text-muted py-8">Loading...</li>';
     }
@@ -7635,10 +8408,12 @@ document.addEventListener('DOMContentLoaded', async () => {
       schemaViewerRowCounts = parseSchemaRowCounts(fullText);
       schemaViewerSamples = parseSchemaColumnSamples(fullText);
       schemaViewerConstraints = parseSchemaConstraints(fullText);
+      schemaViewerComments = parseSchemaComments(fullText);
       schemaViewerViews = parseSchemaViews(fullText);
       schemaViewerIndexes = parseSchemaIndexes(fullText);
       schemaViewerRoutines = parseSchemaRoutines(fullText);
       schemaViewerGrants = parseSchemaGrants(fullText);
+      schemaViewerRelationships = parseSchemaRelationships(fullText);
       // Deterministic ER-diagram inputs (see buildSchemaErDiagram() above) -
       // parsed once per load the same way every other global section is.
       schemaViewerForeignKeys = parseSchemaForeignKeys(fullText);
@@ -8486,6 +9261,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (resultsChartWrapper) resultsChartWrapper.classList.add('hidden');
     if (resultsTableWrapper) resultsTableWrapper.classList.remove('hidden');
     destroyResultsChart();
+    // The Summary tab's own inline mini-chart (see renderSummaryInlineChart())
+    // is rebuilt fresh on every render too, same as the full-tab chart above -
+    // a stale instance left over from a previous render must not leak into
+    // this one's canvas.
+    destroySummaryInlineChart();
     // Same reset-first posture as the toggle/chart-wrapper lines just
     // above - only the successful, non-empty tabular branch below ever
     // turns this back on, and only when THIS tab's own result was
@@ -8556,21 +9336,42 @@ document.addEventListener('DOMContentLoaded', async () => {
       let summaryHtml = result.tabLabel === 'Summary'
         ? renderMarkdownLiteSummaryTab(result.text || '')
         : renderMarkdownLite(result.text || '');
-      // The chart-discoverability link (see summaryChartInlineLinkHtml()'s
-      // own docstring) - appended straight onto the end of the summary
-      // text itself, as a trailing inline continuation of the prose
-      // ("...worth digging into. 📊 View as chart"), rather than a
-      // separate boxed callout sitting apart from the text underneath it.
-      // Rendered whenever THIS turn has a chartable tab somewhere. Gated
+      // Chart discoverability (see renderSummaryInlineChart()'s own
+      // docstring) - whenever THIS turn has a chartable tab somewhere,
+      // show an actual small rendering of its chart right in the Summary
+      // tab, rather than making the user click through to find it. Gated
       // on `!result.summaryPending` since "all databases" mode's Summary
       // tab can render before Phase C - and therefore before any tab's
-      // own visualization - has actually arrived.
-      if (result.tabLabel === 'Summary' && !result.summaryPending
-        && currentResultsList && currentResultsList.some((r) => r && r.visualization)) {
+      // own visualization - has actually arrived. `.find()` rather than
+      // `.some()` since rendering the chart needs the actual entry, not
+      // just the fact that one exists.
+      const chartableEntry = (result.tabLabel === 'Summary' && !result.summaryPending && currentResultsList)
+        ? currentResultsList.find((r) => r && r.visualization)
+        : null;
+      // Chart.js failed to load (see the `typeof Chart` guards throughout
+      // this file) - fall back to the old plain-text nudge rather than
+      // silently showing nothing for a chartable turn.
+      if (chartableEntry && typeof Chart === 'undefined') {
         summaryHtml += summaryChartInlineLinkHtml();
       }
       p.innerHTML = summaryHtml;
-      td.appendChild(p);
+      // A live preview sits BESIDE the summary text (see
+      // .summary-text-chart-row in style.css), not below it as a
+      // full-width block - so the two only share a row wrapper when
+      // there's an actual preview to place next to the text; otherwise
+      // the paragraph goes straight into td exactly as before. The chart
+      // itself isn't actually built here - just this empty row it'll live
+      // in - see the `chartRow` comment further down for why that has to
+      // wait.
+      let chartRow = null;
+      if (chartableEntry && typeof Chart !== 'undefined') {
+        chartRow = document.createElement('div');
+        chartRow.className = 'summary-text-chart-row';
+        chartRow.appendChild(p);
+        td.appendChild(chartRow);
+      } else {
+        td.appendChild(p);
+      }
 
       // Thumbs up/down feedback on the SUMMARY tab specifically (never a
       // per-database "Note" tab) - see summaryFeedbackButtonsHtml()'s own
@@ -8599,6 +9400,16 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       tr.appendChild(td);
       resultsBody.appendChild(tr);
+      // NOW that chartRow is actually attached to the live document (via
+      // td -> tr -> resultsBody just above) - only past this point does
+      // its <canvas> have a real, laid-out width for
+      // buildResultsChartConfig()'s own legend-scaling (see its `canvas`
+      // param comment) to read. Building the chart any earlier - e.g.
+      // back where chartRow itself was created, while it was still a
+      // detached element - would have measured a width of 0.
+      if (chartRow) {
+        renderSummaryInlineChart(chartRow, chartableEntry);
+      }
       setReportContext({
         category: 'wrong_result',
         databaseName: result.database && result.database.name,
@@ -8834,7 +9645,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       const isError = !!res.isError;
       const isText = !!res.isText;
       const isPending = !!res.isPending;
-      // Chart discoverability (see summaryChartInlineLinkHtml()'s own
+      // Chart discoverability (see renderSummaryInlineChart()'s own
       // docstring above): a subtle, persistent tag on whichever tab
       // actually carries a validated visualization, so a user who never
       // clicks the Summary tab's own inline chart link - or comes back to
@@ -8978,9 +9789,8 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // Shared by renderNoSqlResponse() below and Phase C's summary text (see
   // appendPhaseCSummaryToSummaryTab) - the "*** NO SQL ***" marker is an
-  // internal convention (also used server-side for translations-table
-  // logging, see translate_routes.py's record_all_databases_triage call
-  // sites) that a user should never actually see verbatim.
+  // internal convention (see translate_routes.py's _COMMON_FORMAT_RULES)
+  // that a user should never actually see verbatim.
   function stripNoSqlPrefix(rawText) {
     return (rawText || '').replace(/^\*\*\*\s*NO\s*SQL\s*\*\*\*\s*/i, '').trim();
   }
@@ -9488,6 +10298,14 @@ document.addEventListener('DOMContentLoaded', async () => {
   // building a new one on the same <canvas>, or the two silently overlap.
   let resultsChartInstance = null;
 
+  // Separate in-flight Chart.js instance for the Summary tab's own small
+  // inline preview (see renderSummaryInlineChart()) - deliberately distinct
+  // from resultsChartInstance above, since the two can be on screen at the
+  // same time (the Summary tab's preview canvas, and a full chart left
+  // rendered on a different, inactive tab's own <canvas>); destroying one
+  // must never tear down the other.
+  let summaryInlineChartInstance = null;
+
   const CHART_MAX_SERIES = 12; // sane cap on `series_column` grouping - see buildResultsChartConfig()'s own comment.
 
   // Chart.js reads plain color VALUES at construction time, not live CSS
@@ -9601,7 +10419,34 @@ document.addEventListener('DOMContentLoaded', async () => {
   // silently dropped rather than erroring, same "degrade gracefully"
   // posture the rest of this feature already takes toward imperfect LLM
   // output.
-  function buildResultsChartConfig(result, viz) {
+  // `compact`: renders the same chart with its axis titles suppressed (the
+  // legend/ticks/gridlines stay, since those still carry real information
+  // even small) - used for the Summary tab's small inline preview (see
+  // renderSummaryInlineChart()), where full axis titles would eat most of
+  // the little vertical space available. The full-tab chart view (see
+  // renderResultChart()) always calls this with compact left at its
+  // default (false).
+  //
+  // `containerWidth`: the real, already-laid-out pixel width of whatever
+  // box this chart is about to fill - read here purely to scale the
+  // legend's own font size to match, so a chart rendered small (the
+  // Summary tab's own preview, at roughly half the results area's width)
+  // doesn't carry the same fixed legend text size as the much larger
+  // full-tab view and end up with a legend that reads as oversized
+  // relative to the chart it's labeling. Deliberately NOT read from the
+  // <canvas> element's own clientWidth: Chart.js only resizes the canvas
+  // itself to fill its container as part of constructing the Chart
+  // instance (or later, via its own ResizeObserver) - at the point this
+  // function runs, BEFORE that instance exists, an unstyled <canvas> (see
+  // renderResultChart()'s own #resultsChartCanvas, which carries no CSS
+  // width of its own - Chart.js is what sizes it, always after the fact)
+  // still reports the browser's intrinsic default (300 CSS px), not its
+  // real eventual size. Each call site instead measures its own
+  // CSS-sized ANCESTOR - one whose width Chart.js never touches - and
+  // passes that plain number in. Left out entirely (or 0/falsy) falls
+  // back to Chart.js's own default size - the exact look this file had
+  // before per-size legend scaling existed.
+  function buildResultsChartConfig(result, viz, { compact = false, containerWidth = null } = {}) {
     const rows = result.rows || [];
     const colors = getChartSeriesColors();
     const axisColors = getChartAxisColors();
@@ -9635,11 +10480,30 @@ document.addEventListener('DOMContentLoaded', async () => {
     const yAxisTitle = axisTitleFor(primaryColumns);
     const y1AxisTitle = usesSecondAxis ? axisTitleFor(secondaryColumns) : null;
 
+    // Scales with the real rendered width (see this function's own
+    // `containerWidth` param comment) rather than a flat compact/full-size
+    // split - a chart resized to any width in between (e.g. the Summary
+    // preview growing or shrinking as the results area itself is resized)
+    // gets a legend that tracks it continuously instead of snapping
+    // between just two hardcoded sizes. 320px was chosen as the "Chart.js's
+    // own normal default (roughly 12px) starts to look right" reference
+    // width - below that the legend shrinks (never past 9px, where text
+    // stops being legible), above it it very slightly grows, capped at
+    // 14px so a much wider full-tab chart doesn't grow an oversized
+    // legend either.
+    const legendFontSize = containerWidth
+      ? Math.round(Math.max(9, Math.min(14, 12 * (containerWidth / 320))))
+      : 12;
     const commonOptions = {
       responsive: true,
       maintainAspectRatio: false,
       animation: false, // instant redraw on tab switch/theme toggle instead of a distracting re-animate
-      plugins: { legend: { display: multiSeries || multiY, labels: { color: axisColors.text } } },
+      plugins: {
+        legend: {
+          display: multiSeries || multiY,
+          labels: { color: axisColors.text, font: { size: legendFontSize }, boxWidth: legendFontSize, boxHeight: legendFontSize },
+        },
+      },
     };
 
     if (viz.chart_type === 'scatter') {
@@ -9666,15 +10530,15 @@ document.addEventListener('DOMContentLoaded', async () => {
         options: {
           ...commonOptions,
           scales: {
-            x: { title: { display: true, text: viz.x_column, color: axisColors.text }, ticks: { color: axisColors.text }, grid: { color: axisColors.grid } },
-            y: { title: { display: true, text: yAxisTitle, color: axisColors.text }, position: 'left', ticks: { color: axisColors.text }, grid: { color: axisColors.grid } },
+            x: { title: { display: !compact, text: viz.x_column, color: axisColors.text }, ticks: { color: axisColors.text }, grid: { color: axisColors.grid } },
+            y: { title: { display: !compact, text: yAxisTitle, color: axisColors.text }, position: 'left', ticks: { color: axisColors.text }, grid: { color: axisColors.grid } },
             // Only present when the real data actually calls for it (see
             // assignYAxisIds) - its own grid is suppressed
             // (drawOnChartArea: false) so it doesn't draw a second,
             // misaligned set of gridlines over the primary axis's own.
             ...(usesSecondAxis ? { y1: {
               type: 'linear', position: 'right',
-              title: { display: true, text: y1AxisTitle, color: axisColors.text },
+              title: { display: !compact, text: y1AxisTitle, color: axisColors.text },
               ticks: { color: axisColors.text }, grid: { drawOnChartArea: false },
             } } : {}),
           },
@@ -9715,15 +10579,15 @@ document.addEventListener('DOMContentLoaded', async () => {
       options: {
         ...commonOptions,
         scales: {
-          x: { title: { display: true, text: viz.x_column, color: axisColors.text }, ticks: { color: axisColors.text }, grid: { color: axisColors.grid } },
-          y: { title: { display: true, text: yAxisTitle, color: axisColors.text }, position: 'left', ticks: { color: axisColors.text }, grid: { color: axisColors.grid }, beginAtZero: true },
+          x: { title: { display: !compact, text: viz.x_column, color: axisColors.text }, ticks: { color: axisColors.text }, grid: { color: axisColors.grid } },
+          y: { title: { display: !compact, text: yAxisTitle, color: axisColors.text }, position: 'left', ticks: { color: axisColors.text }, grid: { color: axisColors.grid }, beginAtZero: true },
           // Only present when the real data actually calls for it (see
           // assignYAxisIds) - its own grid is suppressed
           // (drawOnChartArea: false) so it doesn't draw a second,
           // misaligned set of gridlines over the primary axis's own.
           ...(usesSecondAxis ? { y1: {
             type: 'linear', position: 'right',
-            title: { display: true, text: y1AxisTitle, color: axisColors.text },
+            title: { display: !compact, text: y1AxisTitle, color: axisColors.text },
             ticks: { color: axisColors.text }, grid: { drawOnChartArea: false }, beginAtZero: true,
           } } : {}),
         },
@@ -9738,6 +10602,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
+  function destroySummaryInlineChart() {
+    if (summaryInlineChartInstance) {
+      summaryInlineChartInstance.destroy();
+      summaryInlineChartInstance = null;
+    }
+  }
+
   // Draws `result.visualization` onto #resultsChartCanvas. Safe to call
   // only when both the canvas element and the Chart.js library itself are
   // actually available - see renderTableResult()'s own guard, which is the
@@ -9746,7 +10617,13 @@ document.addEventListener('DOMContentLoaded', async () => {
   function renderResultChart(result) {
     if (!resultsChartCanvas || typeof Chart === 'undefined' || !result || !result.visualization) return;
     destroyResultsChart();
-    const config = buildResultsChartConfig(result, result.visualization);
+    // resultsChartWrapper (already unhidden by the caller before this runs
+    // - see renderTableResult()'s own toggle-then-render order) is a
+    // plain CSS-flex box Chart.js never touches, unlike the canvas itself
+    // - see buildResultsChartConfig()'s own `containerWidth` comment for
+    // why that distinction matters here.
+    const containerWidth = resultsChartWrapper ? resultsChartWrapper.clientWidth : null;
+    const config = buildResultsChartConfig(result, result.visualization, { containerWidth });
     resultsChartInstance = new Chart(resultsChartCanvas.getContext('2d'), config);
   }
 
@@ -9760,6 +10637,17 @@ document.addEventListener('DOMContentLoaded', async () => {
     const result = currentResultsList && currentResultsList[activeResultIndex];
     if (result && result.visualization && result.chartView !== false) {
       renderResultChart(result);
+    }
+    // The Summary tab's own inline mini-chart (see renderSummaryInlineChart())
+    // reads the same live theme colors as the full-tab chart above, and
+    // needs the same refresh-on-theme-switch treatment. Re-rendering the
+    // whole tab (rather than reaching in and rebuilding just the <canvas>)
+    // is the simplest correct way to do that: renderTableResult() already
+    // knows how to find the chartable entry and rebuild the inline chart
+    // from scratch, so there's no separate rebuild path to keep in sync.
+    if (result && result.isText && result.tabLabel === 'Summary' && !result.summaryPending
+      && currentResultsList.some((r) => r && r.visualization)) {
+      renderTableResult(result);
     }
   }
 
@@ -9863,7 +10751,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
-  // --- Chart discoverability: Summary tab inline link + tab-strip badge ---
+  // --- Chart discoverability: Summary tab inline preview + tab-strip badge ---
   //
   // The Summary tab becomes the active tab the instant it's created (see
   // prependSingleModeSummaryTab()) - the model's own answer is the first
@@ -9872,13 +10760,13 @@ document.addEventListener('DOMContentLoaded', async () => {
   // happens to click around the tab strip on their own. Two things fix
   // that, together: buildResultsTabsNav() below tags that tab's own label
   // with a small chart badge (persistently visible whenever the user DOES
-  // look at the tab strip), and summaryChartInlineLinkHtml()/
-  // jumpToChartableResultTab() here append an explicit, clickable nudge
-  // onto the tail end of the Summary text itself - a plain inline link
-  // that reads as a continuation of the prose, not a separate boxed
-  // callout sitting apart from it (an earlier version of this feature
-  // used a standalone button below the text; it read as out-of-context
-  // clutter, so it was folded into the text itself instead).
+  // look at the tab strip), and renderSummaryInlineChart()/
+  // jumpToChartableResultTab() here render an actual small chart preview
+  // right under the Summary text, clickable straight through to the
+  // full-size version (summaryChartInlineLinkHtml() below is kept only as
+  // the plain-text fallback for the rare case Chart.js itself failed to
+  // load - see renderTableResult()'s isText branch, which is the only
+  // place that decides between the two).
 
   // Jumps straight to whichever result tab in the CURRENT turn carries a
   // validated visualization, and makes sure it lands showing the chart
@@ -9899,20 +10787,65 @@ document.addEventListener('DOMContentLoaded', async () => {
     renderTableResult(entry);
   }
 
-  // Appended directly onto the end of the Summary tab's own rendered text
-  // (see renderTableResult()'s isText branch, which concatenates this
-  // onto the same HTML string before it's ever assigned to the
-  // paragraph's innerHTML) whenever this turn's results include a
-  // chartable tab - a plain inline <button> styled as a text link (see
-  // .summary-chart-inline-link in style.css), so it reads as a natural
-  // trailing continuation of the summary itself rather than a UI control
-  // bolted on afterward. data-view-chart-trigger is handled by the same
-  // delegated #resultsBody click listener as the Report/feedback buttons
-  // below, for the same "rebuilt fresh on every render, so a persistent
-  // per-element listener would never survive a re-render" reason. Leading
-  // space keeps it from running into the summary's own last word.
+  // Fallback only (see the comment block above): appended directly onto
+  // the end of the Summary tab's own rendered text whenever Chart.js
+  // itself never loaded, so there's still SOME way to reach the chart tab
+  // even without a live preview to click on. A plain inline <button>
+  // styled as a text link (see .summary-chart-inline-link in style.css),
+  // so it reads as a natural trailing continuation of the summary itself
+  // rather than a UI control bolted on afterward. data-view-chart-trigger
+  // is handled by the same delegated #resultsBody click listener as the
+  // Report/feedback buttons below, for the same "rebuilt fresh on every
+  // render, so a persistent per-element listener would never survive a
+  // re-render" reason. Leading space keeps it from running into the
+  // summary's own last word.
   function summaryChartInlineLinkHtml() {
     return ' <button type="button" class="summary-chart-inline-link" data-view-chart-trigger>📊 View as chart</button>';
+  }
+
+  // The Summary tab's own small, clickable chart preview - renders
+  // beside the summary text, inside the shared `.summary-text-chart-row`
+  // flex wrapper (see renderTableResult()'s isText branch, the only call
+  // site, and that CSS rule's own comment on the side-by-side layout)
+  // whenever this turn has a chartable tab and Chart.js is actually
+  // available. Reuses buildResultsChartConfig() exactly as the full-tab
+  // chart view does (same data, same colors), just with `compact: true`
+  // to drop axis titles this small a preview has no room for, and
+  // `options.events = []` to turn off Chart.js's own hover/tooltip/click
+  // handling - the whole point is a small, inert picture that reads as
+  // "click me", not a second fully-interactive chart competing with the
+  // real one a tab over. The <canvas> is wrapped in a plain <button
+  // data-view-chart-trigger> (same delegated click handling, same
+  // jumpToChartableResultTab() destination as the old text-link fallback
+  // above) so clicking anywhere on the preview - not just a caption below
+  // it - jumps straight to the full, interactive chart on its own tab.
+  function renderSummaryInlineChart(container, entry) {
+    const wrapper = document.createElement('button');
+    wrapper.type = 'button';
+    wrapper.className = 'summary-chart-inline-preview';
+    wrapper.setAttribute('data-view-chart-trigger', '');
+    wrapper.setAttribute('aria-label', 'View as chart');
+
+    const canvas = document.createElement('canvas');
+    canvas.className = 'summary-chart-inline-preview-canvas';
+    wrapper.appendChild(canvas);
+    container.appendChild(wrapper);
+
+    // `container` must already be attached to the document by the time
+    // this runs (see renderTableResult()'s isText branch, the only call
+    // site, which appends the row to `td` - and `td`'s own `tr` to the
+    // live resultsBody - before calling this) for `wrapper.clientWidth`
+    // just below to read a real, laid-out size rather than 0. `wrapper`
+    // itself (not the canvas - see buildResultsChartConfig()'s own
+    // `containerWidth` comment) is what's actually CSS-sized (flex: 0 0
+    // 50% - see .summary-chart-inline-preview in style.css), so it's what
+    // gets measured for the legend-scaling passed in here.
+    const containerWidth = wrapper.clientWidth;
+    const config = buildResultsChartConfig(entry, entry.visualization, { compact: true, containerWidth });
+    config.options = config.options || {};
+    config.options.events = [];
+    destroySummaryInlineChart();
+    summaryInlineChartInstance = new Chart(canvas.getContext('2d'), config);
   }
 
   // --- Single-connection mode's own post-execution results summarization ---
@@ -10689,6 +11622,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     try {
     await fetchBackendConfig();
 
+    // Clear any SQL left over from a PREVIOUS turn unconditionally, not
+    // just via aiPrompt's 'input' listener (see its own setSqlQuery('')
+    // call further down) - that listener only fires on an actual edit
+    // keystroke, so submitting the very same, un-edited prompt text again
+    // (e.g. hitting Enter a second time, or clicking Translate without
+    // touching the box) never fired it, leaving the previous turn's SQL
+    // visibly sitting in the box for the whole in-flight duration of this
+    // new request, looking like a stale answer to a question that hasn't
+    // been answered yet.
+    setSqlQuery('');
     clearResultsDisplay();
     // Reset the "all databases" mode streaming state left over from a
     // PREVIOUS router_route turn - reset unconditionally so a stale
@@ -12102,6 +13045,14 @@ document.addEventListener('DOMContentLoaded', async () => {
   // particular request hit a normal, expected error".
   let startupClientBuildId = null;
   let newVersionBannerDismissed = false;
+  // Minutes between checkForNewClientVersion() polls, or 0 to disable the
+  // poll entirely - set from GET /api/config's own
+  // 'client_version_check_interval_minutes' field (see fetchBackendConfig()
+  // below), which mirrors CLIENT_VERSION_CHECK_INTERVAL_MINUTES (app_config.py)
+  // on the server. 5 here is just the fallback used if that config fetch
+  // itself fails - see the startup code near the bottom of this file that
+  // actually reads this to decide whether to start polling at all.
+  let clientVersionCheckIntervalMinutes = 5;
 
   async function fetchClientBuildId() {
     try {
@@ -12155,20 +13106,36 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
-  // Captured once, in the background - deliberately NOT awaited here so it
-  // never delays startup (fetchBackendConfig() and everything else below
-  // proceeds regardless of whether/when this resolves). If the server is
-  // down right at page load, this same call already shows the server-down
-  // banner immediately, via fetchClientBuildId()'s own markServerUnreachable()
-  // call above - no need to wait for the first interval tick.
-  fetchClientBuildId().then((id) => { startupClientBuildId = id; });
-
-  // 5 minutes: frequent enough to catch a deploy (or an outage) during a
-  // long-idle open tab, infrequent enough that it's not worth bothering
-  // with visibility-change-aware pausing.
-  setInterval(checkForNewClientVersion, 5 * 60 * 1000);
-
   await fetchBackendConfig();
+
+  // Configurable via CLIENT_VERSION_CHECK_INTERVAL_MINUTES (app_config.py),
+  // surfaced here as clientVersionCheckIntervalMinutes by the
+  // fetchBackendConfig() call just above. 0 means "don't poll at all", so
+  // this whole section - including the one-time startup check, not just the
+  // recurring interval - is skipped entirely. All the polling/banner code
+  // itself (fetchClientBuildId()/checkForNewClientVersion()/
+  // markServerUnreachable() etc. above) is left fully in place either way,
+  // so turning the env var back on later needs no code changes, just a
+  // restart.
+  //
+  // This now necessarily runs AFTER fetchBackendConfig() resolves - it used
+  // to fire in parallel with it, immediately and un-awaited, specifically
+  // so a server that's down right at page load would show the unmissable
+  // banner without waiting on anything else. Knowing whether to run this at
+  // all now requires that same config response, so that head start is the
+  // one trade-off of making this configurable. fetchBackendConfig() swallows
+  // its own errors (see its try/catch above) rather than throwing, so a
+  // failed config fetch still falls through to here with the safe fallback
+  // (clientVersionCheckIntervalMinutes's own default, 5 - same as this was
+  // hardcoded to before it became configurable) rather than getting stuck
+  // without ever polling.
+  if (clientVersionCheckIntervalMinutes > 0) {
+    // Captured once, in the background - deliberately NOT awaited here so
+    // it never delays anything else below.
+    fetchClientBuildId().then((id) => { startupClientBuildId = id; });
+
+    setInterval(checkForNewClientVersion, clientVersionCheckIntervalMinutes * 60 * 1000);
+  }
 
   // Brand-new session, nobody's told it what to do yet: walk them through
   // the UI with a short guided tour (prompt box -> SQL/Execute -> results ->

@@ -226,7 +226,7 @@ from flask import Blueprint, request, jsonify
 from app_config import (
     CONFIGURED_DBS, CONFIGURED_DB_GROUPS, DEFAULT_PRESET_ID, MAX_IN_SCOPE_CONNECTIONS,
     AUTH_ENABLED, IS_CLOUD_RUN, state_store,
-    ISSUE_REPORTING_ENABLED, CLIENT_BUILD_ID, logger,
+    ISSUE_REPORTING_ENABLED, CLIENT_BUILD_ID, CLIENT_VERSION_CHECK_INTERVAL_MINUTES, logger,
 )
 import os
 from auth import (
@@ -2850,6 +2850,14 @@ def handle_config():
         # the LLM, rather than carrying an independent hardcoded constant
         # that silently drifts if this env var is ever changed.
         'history_max_turns': HISTORY_MAX_TURNS,
+        # Minutes between client.js's periodic GET /api/client-version polls
+        # (new-version nudge + server-down detection) - see
+        # CLIENT_VERSION_CHECK_INTERVAL_MINUTES's own comment in
+        # app_config.py. 0 means "don't poll at all"; client.js reads this
+        # once, at startup, and never re-reads it even though this whole
+        # response gets refetched constantly (it's a deployment-time
+        # constant, not something that changes mid-session).
+        'client_version_check_interval_minutes': CLIENT_VERSION_CHECK_INTERVAL_MINUTES,
         'database_name': db_name,
         'username': username
     })
