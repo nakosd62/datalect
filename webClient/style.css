@@ -121,6 +121,29 @@
   --secondary-hover: #818cf8;
   --secondary-rgb: 99, 102, 241;
 
+  /* Plain <a> tags (help.html's GitHub/Replay-guided-tour links, the
+     custom-connection dialog's "see Documentation" note) never had their
+     own color rule anywhere in this file - they just rendered in the
+     browser's own default link blue (~#0000EE unvisited, ~#551A8B
+     visited), which is legible against the light theme's near-white
+     background but reads as barely-there against this theme's near-black
+     one (per explicit report - "very little contrast... looks fine in the
+     light theme"). Scoped to dark mode only for that reason: the light
+     theme's own block below just re-declares the classic browser-default
+     values verbatim, so nothing changes there. Distinct from --secondary
+     above (the "add a chart" link/sort-arrow color) on purpose - changing
+     --secondary's own value would have rippled into those unrelated
+     call sites; this is its own token specifically for "this text IS a
+     hyperlink" - also reused by .summary-chart-inline-link's own color
+     (the Summary tab's inline "view chart" trigger, styled as a plain
+     underlined link even though it's a <button> - see that rule's own
+     comment) so every hyperlink-styled element in the app, real <a> or
+     not, shares one legible dark-mode blue rather than two different
+     ones. */
+  --link-color: #8ab4f8;
+  --link-color-hover: #aecbfa;
+  --link-color-visited: #c58af9;
+
   --danger: #f87171;
   --danger-hover: #ef4444;
   --danger-glow: rgba(248, 113, 113, 0.15);
@@ -262,6 +285,15 @@
   --secondary: #4f46e5; /* see the dark theme's --secondary comment above */
   --secondary-hover: #4338ca;
   --secondary-rgb: 79, 70, 229;
+
+  /* Re-declares the plain browser-default link colors verbatim (not a
+     redesign) - see the dark theme's --link-color comment above for why
+     this token exists at all; the light theme was never part of the
+     complaint it was added for, so this side just keeps things looking
+     exactly like the un-styled default anchors did before. */
+  --link-color: #0000ee;
+  --link-color-hover: #0000ee;
+  --link-color-visited: #551a8b;
 
   --danger: #dc2626;
   --danger-hover: #b91c1c;
@@ -470,6 +502,24 @@ select {
 select:focus {
   border-color: var(--accent-cyan);
   box-shadow: 0 0 0 3px var(--accent-cyan-glow);
+}
+
+/* Base <a> color - see --link-color's own comment (near --secondary
+   above) for why this exists as its own token instead of just leaving
+   plain anchors at the browser default. A more specific rule elsewhere
+   (e.g. .custom-db-field-label a's `color: inherit`) still wins on
+   specificity, so this only actually reaches the handful of plain,
+   unstyled <a> tags that had no color rule at all before. */
+a {
+  color: var(--link-color);
+}
+
+a:hover {
+  color: var(--link-color-hover);
+}
+
+a:visited {
+  color: var(--link-color-visited);
 }
 
 /* .card - USED to be a "glassmorphism" panel (translucent blurred
@@ -825,44 +875,55 @@ textarea:focus {
   justify-content: flex-start;
   gap: 0.5rem;
   min-width: 0;
-  margin-left: 1.5rem;
+  /* 1.5rem bumped up 50% per explicit follow-up request. */
+  margin-left: 2.25rem;
 }
 
 .dataset-center-label {
-  font-size: 0.9375rem; /* .dataset-badge-prominent's own 0.8125rem * ~1.15, same math */
+  font-size: 0.9375rem; /* .header-badge-prominent's own 0.8125rem * ~1.15, same math */
   font-weight: 600;
   color: var(--text-secondary);
   white-space: nowrap;
   flex-shrink: 0;
 }
 
-/* The active dataset badge itself, made deliberately more prominent than
-   every other header control (per explicit request) instead of blending
-   in as just another same-sized pill among many - larger text than the
-   shared .status-badge default (0.8125rem), plus its own caret (below)
-   and separated info button (.dataset-info-btn above) so it reads as the
-   header's centerpiece rather than one option among several. First tried
-   at a full 30% bump (1.05625rem); dialed back to a more modest ~15%
-   (0.9375rem) per follow-up feedback that the larger size read as too
-   big. Everything else about the pill (background, border, padding
-   shape, connected/badge-disabled behavior) still comes from the shared
-   .status-badge/.connected/.badge-disabled rules elsewhere in this file -
-   this only overrides size. */
-.dataset-badge-prominent,
-.dataset-badge-prominent .conn-badge-text {
+/* Originally just the active dataset badge's own size bump, made
+   deliberately more prominent than every other header control (per
+   explicit request) instead of blending in as just another same-sized
+   pill among many - since extended to #modelTriggerBadge too (see
+   .model-picker-label's own comment below), per a later explicit request
+   that ALL header text/buttons/icons match this size, which is why the
+   class name itself dropped "dataset-" - it's the shared, header-wide
+   prominent size now, not something dataset-specific reused twice. Larger
+   text than the shared .status-badge default (0.8125rem), plus a matching
+   caret (below) and, for the dataset badge specifically, its own
+   separated info button (.dataset-info-btn above) so that pair together
+   still reads as the header's centerpiece. First tried at a full 30% bump
+   (1.05625rem); dialed back to a more modest ~15% (0.9375rem) per
+   follow-up feedback that the larger size read as too big. Everything
+   else about the pill (background, border, padding shape, connected/
+   badge-disabled behavior) still comes from the shared .status-badge/
+   .connected/.badge-disabled rules elsewhere in this file - this only
+   overrides size. */
+.header-badge-prominent,
+.header-badge-prominent .conn-badge-text {
   font-size: 0.9375rem;
 }
 
-.dataset-badge-prominent {
+.header-badge-prominent {
   gap: 0.5rem;
   padding: 0.3rem 1rem;
 }
 
 /* Slightly larger than the shared .status-badge default (8px) so the
    connected/disconnected dot stays visually proportionate to the
-   larger-than-usual name next to it instead of looking undersized -
-   not scaled by the exact same factor as the text, just nudged up. */
-.dataset-badge-prominent .status-dot {
+   larger-than-usual name next to it instead of looking undersized - not
+   scaled by the exact same factor as the text, just nudged up. Only
+   #configTriggerBadge actually has a .status-dot child (#modelTriggerBadge
+   has no connected/disconnected concept of its own) so in practice this
+   only ever applies to the dataset badge - left on the shared class anyway
+   so any future badge with its own dot picks this up for free. */
+.header-badge-prominent .status-dot {
   width: 10px;
   height: 10px;
 }
@@ -904,6 +965,24 @@ textarea:focus {
   text-overflow: ellipsis;
 }
 
+/* Sits as .header-actions' own direct child, right before
+   #modelPickerWrapper, so it picks up that row's existing 0.5rem gap for
+   free instead of needing its own spacing rule. Font-size now matches
+   .dataset-center-label's own 0.9375rem, per a later explicit request that
+   ALL header text/buttons/icons match the dataset label/badge's more
+   prominent scale rather than the plain .status-badge/.conn-badge-text
+   default (0.8125rem) - #modelTriggerBadge itself picked up the same bump
+   via .header-badge-prominent (see that class's own comment), so this
+   label and the badge text it's labeling grow together and stay in the
+   same proportion to each other as before. */
+.model-picker-label {
+  font-size: 0.9375rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
 .header-actions {
   display: flex;
   align-items: center;
@@ -921,10 +1000,14 @@ textarea:focus {
 .gear-btn, .help-btn, .history-btn, .feedback-btn, .more-menu-btn {
   background: var(--overlay-2);
   border: 1px solid var(--bg-card-border);
-  /* Halved from 0.35rem, alongside the circle's own width/height below and
-     the icon size further down - all three shrunk together so the circle
-     still just barely wraps the smaller icon, rather than leaving a
-     tiny icon floating inside an unchanged, now-oversized circle. */
+  /* Was halved from 0.35rem alongside the circle's own width/height below
+     and the icon size further down (all three shrunk together, per an
+     earlier explicit request, so the circle still just barely wrapped the
+     smaller icon). Left at 0.175rem even now that the circle has grown
+     back up to 29px (matching .dataset-info-btn, per a later explicit
+     request that these buttons match that button's more prominent scale):
+     the math still centers the larger 18px icon inside a 29px circle with
+     room to spare, so there was no need to grow the padding along with it. */
   padding: 0.175rem;
   border-radius: 50%;
   cursor: pointer;
@@ -932,8 +1015,8 @@ textarea:focus {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: clamp(18px, 2vw, 25px);
-  height: clamp(18px, 2vw, 25px);
+  width: 29px;
+  height: 29px;
   flex-shrink: 0;
 }
 
@@ -952,14 +1035,17 @@ textarea:focus {
   color: var(--accent-cyan);
 }
 
-/* Halved from clamp(20px, 2.2vw, 29px) per explicit request - the
-   surrounding circular button (.gear-btn etc. above) was shrunk to match
-   (its own width/height/padding halved the same way), so the circle still
-   just wraps this smaller glyph instead of leaving it floating, tiny,
-   inside an unchanged, now-oversized circle. */
+/* Was halved from clamp(20px, 2.2vw, 29px) per an earlier explicit
+   request, alongside the surrounding circular button (.gear-btn etc.
+   above), which was shrunk to match at the same time. Grown back up to a
+   fixed 18px now, matching .dataset-info-btn's own icon size, per a later
+   explicit request that these buttons match that button's more prominent
+   scale - the surrounding circle (above) grew back to 29px the same way,
+   so the icon still sits centered with the same proportion of breathing
+   room around it as before. */
 .gear-btn svg, .help-btn svg, .history-btn svg, .feedback-btn svg, .more-menu-btn svg {
-  width: clamp(10px, 1.1vw, 14.5px);
-  height: clamp(10px, 1.1vw, 14.5px);
+  width: 18px;
+  height: 18px;
 }
 
 .gear-btn:hover {
@@ -1291,7 +1377,11 @@ textarea:focus {
 .crbot-icon-wrapper {
   display: flex;
   align-items: center;
-  gap: 0.5rem;
+  /* Pulled in from 0.5rem to as tight as the icon's own drop-shadow halo
+     allows (see the filter below) - any closer and the label started
+     visually overlapping the glow instead of just sitting near it, per
+     explicit "as close as you can" follow-up request. */
+  gap: 0.15rem;
   justify-content: center;
   /* MONOCHROME PASS (see index.html's own comment on the mascot svg) -
      `color` resolves every currentColor shape in that svg. First tried
@@ -1341,7 +1431,23 @@ textarea:focus {
 .header-icon-label .full-text {
   display: flex;
   flex-direction: column;
-  color: var(--text-secondary);
+  /* Centers the two stacked rows ("Meaning" / "in Data") on each other
+     rather than left-aligning them - per explicit follow-up request. A
+     flex column's default align-items (stretch) would otherwise stretch
+     both rows to the width of the longer one and leave the shorter row's
+     own text sitting flush left within that stretched box; `center`
+     instead sizes each row to its own text and centers the narrower one
+     under/over the wider one. */
+  align-items: center;
+  text-align: center;
+  /* BRAND-BLUE PASS (per explicit follow-up request, superseding the
+     MONOCHROME PASS above): the exact funnel blue sampled from the concept
+     artwork itself (transparent_full_logo_master.png's dominant funnel-arm
+     color, rgb(0, 135, 243)) rather than a theme token, since this is
+     meant to read as "the icon's own color" specifically, not a neutral
+     UI-text tone - and unlike --text-secondary, this stays the same fixed
+     blue in both light and dark mode. */
+  color: #0087f3;
   font-size: 0.9375rem;
   line-height: 1.15;
   font-weight: 600;
@@ -1349,9 +1455,10 @@ textarea:focus {
 
 .header-icon-label .short-text {
   display: none;
-  /* Same MONOCHROME PASS as .full-text above - kept in sync with it so the
-     mobile/narrow-viewport label doesn't go back to green on its own. */
-  color: var(--text-secondary);
+  /* Same BRAND-BLUE PASS as .full-text above - kept in sync with it so the
+     mobile/narrow-viewport label doesn't go back to a different color on
+     its own. */
+  color: #0087f3;
   font-size: 0.85rem;
   font-weight: 700;
 }
@@ -1390,21 +1497,25 @@ textarea:focus {
   /* At this width .header-actions has already collapsed most of its own
      controls into the triple-dot menu (see below), but the dataset center
      column still has to share the row with the model badge and that menu
-     button - reverting the badge/info-button's enlargement here (rather
-     than at 768px, where there's still enough room to keep it prominent)
-     is what keeps that three-way split from overflowing on a phone-width
-     screen. .status-badge's own 168px max-width above still applies on
-     top of this, truncating a long dataset name with an ellipsis rather
-     than ever actually overflowing. */
-  .dataset-badge-prominent,
-  .dataset-badge-prominent .conn-badge-text {
+     button - reverting the dataset badge/info-button's enlargement here
+     (rather than at 768px, where there's still enough room to keep it
+     prominent) is what keeps that three-way split from overflowing on a
+     phone-width screen. Only the dataset badge needs this rule: the model
+     badge is already gone from this row at this width (folded into the
+     more-menu by the 900px breakpoint above), so there's nothing left of
+     .header-badge-prominent here to revert on its behalf. .status-badge's
+     own 168px max-width above still applies on top of this, truncating a
+     long dataset name with an ellipsis rather than ever actually
+     overflowing. */
+  .header-badge-prominent,
+  .header-badge-prominent .conn-badge-text {
     font-size: 0.8125rem;
   }
-  .dataset-badge-prominent {
+  .header-badge-prominent {
     padding: 0.2rem 0.75rem;
     gap: 0.35rem;
   }
-  .dataset-badge-prominent .status-dot {
+  .header-badge-prominent .status-dot {
     width: 8px;
     height: 8px;
   }
@@ -1445,6 +1556,7 @@ textarea:focus {
    in client.js) are a second, independent presentation of the exact same
    underlying selection, not a reparented copy of this one. */
 @media (max-width: 900px) {
+  .header-actions > .model-picker-label,
   .header-actions > .model-picker-wrapper,
   .header-actions > .help-btn,
   .header-actions > .history-btn,
@@ -2128,32 +2240,15 @@ textarea:focus {
   color: var(--text-secondary);
 }
 
-/* Action row at the top of the Help modal (currently just "Replay guided
-   tour" - see replayTourBtn in client.js). */
-.help-modal-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.5rem;
-  padding: 0.6rem 1.25rem;
-  border-bottom: 1px solid var(--bg-card-border);
-  background: var(--overlay-1);
-}
-
-.restore-quick-prompts-btn {
-  background: transparent;
-  border: 1px solid var(--bg-card-border);
-  color: var(--accent-cyan);
-  font-size: 0.8rem;
-  padding: 0.3rem 0.75rem;
-  border-radius: 999px;
-  cursor: pointer;
-  transition: var(--transition);
-}
-
-.restore-quick-prompts-btn:hover {
-  background: var(--accent-cyan-glow);
-  border-color: var(--accent-cyan);
-}
+/* .help-modal-actions (the action row that used to sit above
+   #helpModalBody, holding just a "Replay guided tour" button) and
+   .restore-quick-prompts-btn (that button's own pill styling, reused from
+   an even older, already-removed sample-prompts-restore button) are both
+   gone now that #replayTourBtn is a plain inline link inside help.html's
+   own text instead - see openHelpModal()/wireHelpModalLinks() in
+   client.js and #helpModalBody's own comment in index.html. Neither class
+   has any other element using it, so both rules were removed rather than
+   left as dead CSS. */
 
 .modal-body {
   padding: 1.25rem;
@@ -2564,7 +2659,7 @@ textarea.report-issue-preview:focus {
    currently ACTIVE connection, so there's no other connection it could
    mean and no config dialog underneath it to get stuck behind. Sized up
    from the old nested version's 18px (badge-
-   matched) - see .dataset-badge-prominent's own comment for how its
+   matched) - see .header-badge-prominent's own comment for how its
    enlargement (and this icon's matching one) were sized. */
 .dataset-info-btn {
   display: inline-flex;
@@ -3134,20 +3229,39 @@ textarea.report-issue-preview:focus {
   background-color: rgba(var(--danger-rgb), 0.12);
 }
 
-/* Fallback-only nudge (see client.js's summaryChartInlineLinkHtml()'s own
-   comment) for the rare case Chart.js itself failed to load, so there's
-   still some way to reach the chart tab. Appended straight onto the tail
-   end of the summary text itself (inside the same <p>, not a separate
-   element below it), so it reads as a plain inline text link continuing
-   the prose rather than a standalone UI control. Deliberately unstyled as
-   a "button" (no border/background/pill) and instead just looks like
-   clickable text, matching how a link would sit inline. */
+/* Two different call sites share this class, both rendering a click-to-
+   jump-to-a-chart trigger as plain inline text rather than a standalone UI
+   control - deliberately unstyled as a "button" (no border/background/
+   pill), just clickable text matching how a real link would sit inline:
+     - client.js's applyInlineChartLinks() - the NORMAL case: converts the
+       summarization prompts' own model-planted "[<phrase>](chart:<index>)"
+       markup, found IN THE MIDDLE of "summary"/"per_database"/
+       "cross_database" wherever the model made the point that chart
+       illustrates, into exactly this. This is the actual text-to-chart
+       integration the "visualizations" paragraph's whole design is built
+       around (see chart_helpers.py's _clean_visualization docstring).
+     - client.js's summaryChartInlineLinkHtml() - a FALLBACK, appended
+       straight onto the tail end of the summary text itself (inside the
+       same <p>, not a separate element below it) only for the rare case
+       Chart.js itself failed to load, so there's still some way to reach
+       the chart tab even with no live preview to click.
+   Both are handled by the same delegated data-view-chart-trigger click
+   listener (jumpToChartableResultTab()) regardless of which one produced
+   a given instance. */
 .summary-chart-inline-link {
   display: inline;
   padding: 0;
   border: none;
   background: none;
-  color: var(--secondary);
+  /* --link-color, not --secondary - this reads as a hyperlink (underlined,
+     clickable inline text) even though the element itself is a <button>,
+     so it shares the same dedicated "this IS a hyperlink" token as every
+     real <a> in the app instead of the unrelated --secondary/--secondary-
+     hover pair (still used elsewhere in this file for the sort-arrow icon
+     and this same feature's OWN preview-card hover border - see
+     --link-color's own comment near --secondary in the :root palette for
+     the full reasoning). */
+  color: var(--link-color);
   font-size: inherit;
   font-family: inherit;
   text-decoration: underline;
@@ -3156,7 +3270,7 @@ textarea.report-issue-preview:focus {
 }
 
 .summary-chart-inline-link:hover {
-  color: var(--secondary-hover);
+  color: var(--link-color-hover);
 }
 
 /* One card in the Summary tab's own chart-preview grid (see client.js's
@@ -3175,8 +3289,22 @@ textarea.report-issue-preview:focus {
    like a small chart rather than a link or pill. */
 .summary-chart-inline-preview {
   display: block;
-  flex: 0 0 50%;
-  min-width: 220px;
+  /* Base/fallback size: half of the original 50% per explicit follow-up
+     request (quarter area, since .summary-chart-inline-preview-canvas-box's
+     aspect-ratio is resolved from THIS element's own width - see that
+     rule's own comment below). This 25% is what applies whenever 4 or
+     fewer cards are on screen at once (4 * 25% = 100%, still exactly one
+     row). renderSummaryInlineChart() in client.js overrides flex-basis
+     inline, per card, whenever there are MORE than 4 - per its own
+     explicit "always side by side, never wrap" follow-up - shrinking every
+     card just enough that all of them still share the one row instead of
+     wrapping to a second. min-width is deliberately NOT set here (a fixed
+     floor would fight that same "always fit them all" goal once there are
+     enough cards that even a small floor stops them all fitting) -
+     .summary-chart-preview-grid's own `flex-wrap: nowrap` below is what
+     actually enforces the single row; this rule only supplies the normal-
+     count default size. */
+  flex: 0 0 25%;
   padding: 0.4rem;
   border: 1px solid var(--bg-card-border);
   border-radius: 8px;
@@ -3191,21 +3319,28 @@ textarea.report-issue-preview:focus {
   background-color: rgba(var(--secondary-rgb), 0.06);
 }
 
-/* Chart.js needs an explicit-height positioned ancestor to size its
-   canvas against (see .results-chart-wrapper's own comment above) - an
-   aspect-ratio here (rather than a fixed pixel height, as this rule used
-   before) is what makes the preview's height scale right along with its
-   now-proportional width above, instead of staying fixed while only the
-   width grows. Chart.js's own legend/tick text size scales right along
-   with it too - see buildResultsChartConfig()'s own comment on reading
-   the real canvas width at render time - so the whole preview grows or
-   shrinks as one proportional unit rather than the chart "content"
-   staying a fixed size inside a resized box. */
+/* The actual explicit-height positioned ancestor Chart.js sizes its canvas
+   against (see .results-chart-wrapper's own comment above, and
+   renderSummaryInlineChart()'s own comment in client.js for why this has
+   to be a SEPARATE box from the canvas rather than the aspect-ratio living
+   on the canvas itself, as this used to be set up - that version fed a
+   runaway resize loop that made the preview grow taller forever). The
+   aspect-ratio here is resolved purely from this box's WIDTH, never from
+   the canvas's own rendered size, so nothing Chart.js's resize logic does
+   to the canvas can ever change this box's height back. Still scales
+   proportionally with the card's own ~50%-of-grid width exactly as before. */
+.summary-chart-inline-preview-canvas-box {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 2 / 1;
+}
+
 .summary-chart-inline-preview-canvas {
   display: block;
-  width: 100%;
-  height: auto;
-  aspect-ratio: 2 / 1;
+  position: absolute;
+  inset: 0;
+  width: 100% !important;
+  height: 100% !important;
 }
 
 /* Names which result a given preview card belongs to (see client.js's
@@ -3223,16 +3358,19 @@ textarea.report-issue-preview:focus {
 }
 
 /* The grid of chart-preview cards themselves (see client.js's
-   renderSummaryInlineChart(), called once per chartable entry) - wraps as
+   renderSummaryInlineChart(), called once per chartable entry) - holds as
    many .summary-chart-inline-preview cards as this turn actually has,
-   two per row at each card's own ~50% width above and wrapping onto
-   further rows as needed, rather than assuming there's ever only one.
-   Sits INSIDE .summary-text-chart-row, below the summary text (see that
-   rule's own comment) - only ever built when there's at least one actual
-   preview to place. */
+   ALWAYS side by side in one row (per explicit follow-up request), never
+   wrapping to a second row - `nowrap` here is what enforces that; the
+   shrinking that keeps them from overflowing once there are more than 4 is
+   handled per-card by renderSummaryInlineChart()'s own inline flex-basis
+   override (see .summary-chart-inline-preview's own comment above). Sits
+   INSIDE .summary-text-chart-row, below the summary text (see that rule's
+   own comment) - only ever built when there's at least one actual preview
+   to place. */
 .summary-chart-preview-grid {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   gap: 0.9rem;
   width: 100%;
 }
@@ -3407,27 +3545,6 @@ tr.report-issue-row td {
 
 .result-tab-btn--pending:not(.active) {
   animation: pulse 2s ease-in-out infinite;
-}
-
-/* A tab whose result carries a validated chart visualization (see client.js's
-   buildResultsTabsNav() - the badge emoji itself is appended to the label
-   text, this class is just the subtle color tint alongside it) - tinted with
-   --secondary rather than --danger/--primary since this isn't a warning or a
-   success signal, just "there's more to see here". Mirrors
-   .result-tab-btn--error's own base/hover/active state trio above. */
-.result-tab-btn--chartable {
-  color: var(--secondary);
-}
-
-.result-tab-btn--chartable:hover:not(.active) {
-  background-color: rgba(var(--secondary-rgb), 0.12);
-  color: var(--secondary-hover);
-}
-
-.result-tab-btn--chartable.active {
-  background-color: var(--surface-1);
-  color: var(--secondary);
-  box-shadow: inset 0 -2px 0 var(--secondary);
 }
 
 .results-table-wrapper {

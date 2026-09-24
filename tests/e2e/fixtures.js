@@ -259,6 +259,31 @@ const test = isolatedTest.extend({
   },
 });
 
+/** Same as `test` above, but also forces the "Show SQL" preference on
+ * before every navigation. client.js now defaults this to OFF (hidden) -
+ * see SHOW_SQL_STORAGE_KEY/loadShowSqlPreference() - but most of this
+ * suite predates that change and drives the app straight through the SQL
+ * box itself: #runBtn, #reportSqlBtn/#reportSqlGoodBtn, reading/seeding
+ * generated SQL via #sqlQuery/CodeMirror, etc. Rather than touch every one
+ * of those call sites (and every test that clicks/asserts on them),
+ * whichever spec needs the SQL box visible imports `testShowSqlVisible` in
+ * place of `test` (aliased back to the name `test` at the require site) -
+ * every other default here (onboarding skip, GA/Chart.js isolation, the
+ * /api/ping|execute|translate|chat-history|summarize-result(s) mocks)
+ * still applies unchanged. show-sql-toggle.spec.js deliberately keeps
+ * using the plain `test` fixture instead, since its own tests are
+ * specifically about that real (now-hidden) default. */
+const testShowSqlVisible = test.extend({
+  page: async ({ page }, use) => {
+    await page.addInitScript(() => {
+      try {
+        window.localStorage.setItem('datalectShowSql', '1');
+      } catch (e) { /* ignore */ }
+    });
+    await use(page);
+  },
+});
+
 /** Navigate to the app and wait for its initial fetchBackendConfig() call
  * (fired at the end of client.js's DOMContentLoaded handler) to fully
  * settle - not just for the connection badge text to appear.
@@ -346,4 +371,4 @@ async function mockExecute(page, { results, error, status, failedStatement, fail
   });
 }
 
-module.exports = { test, isolatedTest, expect, gotoApp, mockTranslate, mockExecute };
+module.exports = { test, isolatedTest, testShowSqlVisible, expect, gotoApp, mockTranslate, mockExecute };

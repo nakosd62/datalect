@@ -36,7 +36,11 @@
 // could see this stale turn served back by a real, unmocked
 // hydrateChatHistoryFromServer() call in some other spec file.
 
-const { test, expect, gotoApp, mockTranslate, mockExecute } = require('./fixtures');
+// Uses testShowSqlVisible (aliased to `test`) rather than the plain `test`
+// fixture - see that fixture's own comment in fixtures.js - since this
+// suite drives the app through the SQL box itself (#runBtn), which
+// client.js now hides by default.
+const { testShowSqlVisible: test, expect, gotoApp, mockTranslate, mockExecute } = require('./fixtures');
 
 /** Mirrors translate-execute.spec.js's own currentSql()/normalizedSql() -
  * not exported from fixtures.js, so redefined locally here too. */

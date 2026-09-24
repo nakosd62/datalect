@@ -73,6 +73,7 @@ from app_config import logger, state_store, MAX_TRANSLATION_ATTEMPTS
 from backends import get_backend
 from backends.base import SCHEMA_TABLES_ONLY, derive_tables_only_schema_text
 from connection_router import run_triage_call, _extract_json_object
+from db import resolve_dataset_identity
 from llm_providers import LlmCallFailed, format_llm_error_for_user
 from prompt_loader import load_prompt
 # See this module's docstring above for why this is `import translate_routes`
@@ -455,6 +456,11 @@ def generate_sql_for_connection(descriptor, prompt, history, provider, client, m
         while True:
             try:
                 generated_sql, usage_info = provider.call(client, model, llm_input, system_instruction)
+                dataset_type, dataset_name = resolve_dataset_identity(descriptor, user_identity)
+                state_store.record_llm_usage(
+                    user_identity, "sqlgen", model, usage_info,
+                    dataset_type=dataset_type, dataset_name=dataset_name,
+                )
                 break
             except Exception as e:
                 retry_action = provider.classify_error(e)
@@ -980,7 +986,8 @@ def _no_sql_language_mismatch(generated_sql, expected_language_code):
 
 
 def triage_single_dataset_question(schema_block, prompt, provider, client, model,
-                                    history=None, api_key=None, tried_keys=None, using_byok=False):
+                                    history=None, api_key=None, tried_keys=None, using_byok=False,
+                                    user_identity=None, dataset_type=None, dataset_name=None):
     """Single-dataset mode's own Call 1: decides which of general
     knowledge/schema questions/help questions/real SQL generation `prompt`
     needs, given `schema_block` (this dataset's own SHALLOW/overview
@@ -1005,11 +1012,17 @@ def triage_single_dataset_question(schema_block, prompt, provider, client, model
       {"outcome": "schema", "usage": <dict|None>}
       {"outcome": "help", "usage": <dict|None>}
       {"outcome": "sql", "usage": <dict|None>}
-      {"outcome": "failed", "api_error": <bool>, "error": <exception|None>}"""
+      {"outcome": "failed", "api_error": <bool>, "error": <exception|None>,
+       "language_mismatch_text": <str|None>}
+
+    `user_identity`/`dataset_type`/`dataset_name` are forwarded as-is to
+    run_triage_call - see its own docstring for how it uses them to log
+    this call's own "triage" row via state_store.record_llm_usage."""
     return (yield from run_triage_call(
         1, schema_block, prompt, provider, client, model,
         history=history, max_connections=1,
         api_key=api_key, tried_keys=tried_keys, using_byok=using_byok,
+        user_identity=user_identity, dataset_type=dataset_type, dataset_name=dataset_name,
     ))
 
 

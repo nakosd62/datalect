@@ -32,7 +32,11 @@
 // since it's a small, self-contained helper and the two files are
 // deliberately independent).
 
-const { test, expect, gotoApp, mockTranslate } = require('./fixtures');
+// Uses testShowSqlVisible (aliased to `test`) rather than the plain `test`
+// fixture - see that fixture's own comment in fixtures.js - since this
+// suite drives the app through the SQL box itself (#runBtn), which
+// client.js now hides by default.
+const { testShowSqlVisible: test, expect, gotoApp, mockTranslate } = require('./fixtures');
 
 const FIVE_MINUTES_MS = 5 * 60 * 1000;
 

@@ -623,18 +623,19 @@ def test_no_sql_reply_in_wrong_language_is_retried_and_corrected(app_factory, mo
 
 def test_no_sql_reply_still_wrong_language_after_retry_fails_the_turn(app_factory, monkeypatch):
     """Same "general" outcome as the test above, but both of Call 1's own
-    attempts come back in German. Mirrors triage_all_mode_question's own
-    "still wrong language after retrying" convention (see that function's
-    docstring): this collapses into the SAME generic
-    _TRIAGE_FAILURE_TEXT apology dataset-group mode's own triage failure
-    already shows, rather than a specific "kept coming back in German"
-    message - a deliberate, pre-existing convention this redesign reuses
-    rather than inventing a third way to report a triage-level failure.
-    Still reported as `success: True` (an apology IS a complete, valid
-    single-dataset turn, same as every other triage outcome), unlike Call
-    2's OWN language-mismatch-exhausted failure (still `success: False`
-    with the specific language names - see
-    test_openai_... /Claude equivalents further down, unchanged)."""
+    attempts come back in German. Mirrors run_triage_call's own "still
+    wrong language after retrying" convention (see that function's
+    docstring): this now shows the SPECIFIC "kept coming back in German
+    instead of English, even after retrying" message (run_triage_call's
+    own language_mismatch_text), not the generic _TRIAGE_FAILURE_TEXT
+    apology this used to collapse into - see run_triage_call's own
+    docstring for why that swallowed reason was a user-reported gap ("I
+    can't get it to tell me why") this fixes. Still reported as
+    `success: True` (this IS a complete, valid single-dataset turn, same
+    as every other triage outcome), unlike Call 2's OWN language-
+    mismatch-exhausted failure (still `success: False` with the specific
+    language names - see test_openai_... /Claude equivalents further
+    down, unchanged)."""
     env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
@@ -656,7 +657,11 @@ def test_no_sql_reply_still_wrong_language_after_retry_fails_the_turn(app_factor
     assert resp.status_code == 200
     retry_events, data = parse_translate_stream(resp)
     assert data['success'] is True
-    assert data['sql'] == env.translate_routes._TRIAGE_FAILURE_TEXT
+    assert data['sql'] == (
+        "*** NO SQL *** The response kept coming back in German instead of English, "
+        "even after retrying."
+    )
+    assert data['sql'] != env.translate_routes._TRIAGE_FAILURE_TEXT
     assert len(harness.generate_calls) == 2
 
     # A triage-only outcome (Call 2 never runs) is never recorded at all -
@@ -3933,33 +3938,37 @@ def test_column_looks_numeric_requires_ninety_percent_of_non_null_values(app_env
 def test_clean_visualization_rejects_an_invalid_chart_type(app_env):
     chartable = {"columns": ["day", "n"], "rows": [{"day": "Mon", "n": 1}, {"day": "Tue", "n": 2}]}
     raw = {"chart_type": "pie", "x_column": "day", "y_columns": ["n"], "series_column": None}
-    assert app_env.translate_routes._clean_visualization(raw, chartable) is None
+    assert app_env.translate_routes._clean_visualization(raw, chartable, "n by day") is None
 
 
 def test_clean_visualization_rejects_a_hallucinated_column_name(app_env):
     chartable = {"columns": ["day", "n"], "rows": [{"day": "Mon", "n": 1}, {"day": "Tue", "n": 2}]}
     # x_column not among the real result set's columns at all.
     raw = {"chart_type": "bar", "x_column": "made_up_column", "y_columns": ["n"], "series_column": None}
-    assert app_env.translate_routes._clean_visualization(raw, chartable) is None
+    assert app_env.translate_routes._clean_visualization(raw, chartable, "n by day") is None
 
     # A hallucinated y_column is simply dropped from the list rather than
     # invalidating the whole decision - but if that leaves y_columns empty,
     # the whole visualization is rejected (nothing left to actually chart).
     raw = {"chart_type": "bar", "x_column": "day", "y_columns": ["made_up_column"], "series_column": None}
-    assert app_env.translate_routes._clean_visualization(raw, chartable) is None
+    assert app_env.translate_routes._clean_visualization(raw, chartable, "n by day") is None
 
 
 def test_clean_visualization_rejects_a_non_numeric_y_column(app_env):
     chartable = {"columns": ["day", "label"], "rows": [{"day": "Mon", "label": "a"}, {"day": "Tue", "label": "b"}]}
     raw = {"chart_type": "line", "x_column": "day", "y_columns": ["label"], "series_column": None}
-    assert app_env.translate_routes._clean_visualization(raw, chartable) is None
+    assert app_env.translate_routes._clean_visualization(raw, chartable, "n by day") is None
 
 
 def test_clean_visualization_drops_an_invalid_series_column_but_keeps_the_rest(app_env):
     chartable = {"columns": ["day", "n"], "rows": [{"day": "Mon", "n": 1}, {"day": "Tue", "n": 2}]}
-    raw = {"chart_type": "bar", "x_column": "day", "y_columns": ["n"], "series_column": "not_a_real_column"}
-    cleaned = app_env.translate_routes._clean_visualization(raw, chartable)
-    assert cleaned == {"chart_type": "bar", "x_column": "day", "y_columns": ["n"], "series_column": None}
+    raw = {
+        "chart_type": "bar", "x_column": "day", "y_columns": ["n"], "series_column": "not_a_real_column",
+    }
+    cleaned = app_env.translate_routes._clean_visualization(raw, chartable, "n by day")
+    assert cleaned == {
+        "chart_type": "bar", "x_column": "day", "y_columns": ["n"], "series_column": None, "caption": "n by day",
+    }
 
 
 def test_clean_visualization_accepts_a_genuinely_valid_decision(app_env):
@@ -3967,9 +3976,29 @@ def test_clean_visualization_accepts_a_genuinely_valid_decision(app_env):
         "columns": ["day", "n", "region"],
         "rows": [{"day": "Mon", "n": 1, "region": "east"}, {"day": "Tue", "n": 2, "region": "west"}],
     }
-    raw = {"chart_type": "line", "x_column": "day", "y_columns": ["n"], "series_column": "region"}
-    cleaned = app_env.translate_routes._clean_visualization(raw, chartable)
-    assert cleaned == {"chart_type": "line", "x_column": "day", "y_columns": ["n"], "series_column": "region"}
+    raw = {
+        "chart_type": "line", "x_column": "day", "y_columns": ["n"], "series_column": "region",
+    }
+    cleaned = app_env.translate_routes._clean_visualization(raw, chartable, "n trending by day")
+    assert cleaned == {
+        "chart_type": "line", "x_column": "day", "y_columns": ["n"], "series_column": "region",
+        "caption": "n trending by day",
+    }
+
+
+def test_clean_visualization_rejects_a_missing_caption(app_env):
+    # `caption` is what links a chart back to a specific claim in the
+    # summary text (per this feature's own explicit design goal - see
+    # _clean_visualization's own docstring) - it's no longer read off `raw`
+    # at all (see _extract_chart_link_captions' own tests for the text-
+    # parsing/validation side of this), so this only exercises the
+    # caller-facing contract: an otherwise perfectly valid decision with no
+    # caption resolved for it (None) is rejected exactly like a
+    # hallucinated column would be, not silently defaulted to some generic
+    # placeholder.
+    chartable = {"columns": ["day", "n"], "rows": [{"day": "Mon", "n": 1}, {"day": "Tue", "n": 2}]}
+    raw = {"chart_type": "bar", "x_column": "day", "y_columns": ["n"], "series_column": None}
+    assert app_env.translate_routes._clean_visualization(raw, chartable, None) is None
 
 
 def test_clean_visualization_is_none_when_chartable_entry_is_none(app_env):
@@ -3977,7 +4006,56 @@ def test_clean_visualization_is_none_when_chartable_entry_is_none(app_env):
     # outright if the server-side gate never made charting possible for
     # this turn in the first place.
     raw = {"chart_type": "bar", "x_column": "day", "y_columns": ["n"], "series_column": None}
-    assert app_env.translate_routes._clean_visualization(raw, None) is None
+    assert app_env.translate_routes._clean_visualization(raw, None, "n by day") is None
+
+
+def test_extract_chart_link_captions_finds_the_models_own_inline_link(app_env):
+    text = "Signups trended upward, reaching [14 by Tuesday](chart:0) before leveling off."
+    assert app_env.translate_routes._extract_chart_link_captions(text) == {0: "14 by Tuesday"}
+
+
+def test_extract_chart_link_captions_finds_multiple_links_across_multiple_texts(app_env):
+    # Mirrors "all databases" mode's real call shape: several per_database
+    # paragraphs plus an optional cross_database one, passed as separate
+    # positional arguments - a None entry (a turn with no cross_database
+    # paragraph) is skipped, not an error.
+    extract = app_env.translate_routes._extract_chart_link_captions
+    text_a = "Sales DB's revenue grew [18% in Q3](chart:0)."
+    text_b = "Support DB logged [12 open tickets](chart:1) this week."
+    assert extract(text_a, text_b, None) == {0: "18% in Q3", 1: "12 open tickets"}
+
+
+def test_extract_chart_link_captions_ignores_a_non_numeric_index(app_env):
+    text = "Something notable happened [here](chart:abc)."
+    assert app_env.translate_routes._extract_chart_link_captions(text) == {}
+
+
+def test_extract_chart_link_captions_rejects_a_blank_or_overlong_caption(app_env):
+    extract = app_env.translate_routes._extract_chart_link_captions
+    assert extract("See [   ](chart:0) for details.") == {}
+    long_phrase = "x" * 101
+    assert extract(f"See [{long_phrase}](chart:0) for details.") == {}
+
+
+def test_extract_chart_link_captions_returns_empty_dict_for_no_matches(app_env):
+    assert app_env.translate_routes._extract_chart_link_captions("Nothing chart-related here at all.") == {}
+    assert app_env.translate_routes._extract_chart_link_captions(None, "") == {}
+
+
+def test_clean_visualizations_drops_a_chartable_entry_with_no_matching_inline_link(app_env):
+    # The core enforcement this whole redesign exists for: a "visualizations"
+    # entry with a real, structurally valid chart choice is still dropped
+    # back to a table when the text never actually links to it - the
+    # inline link is what makes a chart appear, not the JSON entry alone.
+    chartable = {"columns": ["day", "n"], "rows": [{"day": "Mon", "n": 1}, {"day": "Tue", "n": 2}]}
+    raw = {"0": {"chart_type": "bar", "x_column": "day", "y_columns": ["n"], "series_column": None}}
+    unlinked_text = "Signups looked healthy this week overall."
+    assert app_env.translate_routes._clean_visualizations(raw, {0: chartable}, unlinked_text) == {}
+
+    linked_text = "Signups trended upward, reaching [14 by Tuesday](chart:0)."
+    assert app_env.translate_routes._clean_visualizations(raw, {0: chartable}, linked_text) == {
+        0: {"chart_type": "bar", "x_column": "day", "y_columns": ["n"], "series_column": None, "caption": "14 by Tuesday"},
+    }
 
 
 def test_clean_single_summary_response_returns_none_for_unparseable_json(app_env):
@@ -4030,9 +4108,11 @@ def test_summarize_result_endpoint_returns_a_validated_visualization_for_a_genui
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     harness.queue_response(FakeGenaiResponse(json.dumps({
-        "summary": "Signups trended upward across the week.",
+        "summary": "Signups trended upward across the week, reaching [14 by Tuesday](chart:0).",
         "visualizations": {
-            "0": {"chart_type": "line", "x_column": "day", "y_columns": ["signups"], "series_column": None},
+            "0": {
+                "chart_type": "line", "x_column": "day", "y_columns": ["signups"], "series_column": None,
+            },
         },
     })))
 
@@ -4052,12 +4132,23 @@ def test_summarize_result_endpoint_returns_a_validated_visualization_for_a_genui
     assert resp.status_code == 200
     _retry_events, data = parse_translate_stream(resp)
     assert data['success'] is True
-    assert data['summary'] == '*** NO SQL *** Signups trended upward across the week.'
+    # The model's own inline "[...](chart:0)" link survives verbatim in the
+    # delivered "summary" text - the client is what converts it into a
+    # clickable trigger (see client.js's applyInlineChartLinks), never the
+    # server.
+    assert data['summary'] == (
+        '*** NO SQL *** Signups trended upward across the week, reaching [14 by Tuesday](chart:0).'
+    )
     # Over the wire, json.dumps stringifies the dict's int keys - see
     # _clean_visualizations' own docstring for why the key is "0" here
     # but an int (0) when calling that function directly in-process.
+    # "caption" is derived from the inline link above, not from a separate
+    # JSON field the model no longer sends.
     assert data['visualizations'] == {
-        "0": {"chart_type": "line", "x_column": "day", "y_columns": ["signups"], "series_column": None},
+        "0": {
+            "chart_type": "line", "x_column": "day", "y_columns": ["signups"], "series_column": None,
+            "caption": "14 by Tuesday",
+        },
     }
 
 
@@ -4079,10 +4170,17 @@ def test_summarize_result_endpoint_returns_a_chart_for_each_qualifying_result_of
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     harness.queue_response(FakeGenaiResponse(json.dumps({
-        "summary": "Signups trended upward, and revenue split evenly across regions.",
+        "summary": (
+            "Signups trended upward, reaching [14 by Tuesday](chart:0), and revenue split "
+            "[evenly across regions](chart:1)."
+        ),
         "visualizations": {
-            "0": {"chart_type": "line", "x_column": "day", "y_columns": ["signups"], "series_column": None},
-            "1": {"chart_type": "bar", "x_column": "region", "y_columns": ["revenue"], "series_column": None},
+            "0": {
+                "chart_type": "line", "x_column": "day", "y_columns": ["signups"], "series_column": None,
+            },
+            "1": {
+                "chart_type": "bar", "x_column": "region", "y_columns": ["revenue"], "series_column": None,
+            },
         },
     })))
 
@@ -4113,8 +4211,14 @@ def test_summarize_result_endpoint_returns_a_chart_for_each_qualifying_result_of
     _retry_events, data = parse_translate_stream(resp)
     assert data['success'] is True
     assert data['visualizations'] == {
-        "0": {"chart_type": "line", "x_column": "day", "y_columns": ["signups"], "series_column": None},
-        "1": {"chart_type": "bar", "x_column": "region", "y_columns": ["revenue"], "series_column": None},
+        "0": {
+            "chart_type": "line", "x_column": "day", "y_columns": ["signups"], "series_column": None,
+            "caption": "14 by Tuesday",
+        },
+        "1": {
+            "chart_type": "bar", "x_column": "region", "y_columns": ["revenue"], "series_column": None,
+            "caption": "evenly across regions",
+        },
     }
 
 
@@ -4429,11 +4533,17 @@ def test_triage_single_dataset_question_still_wrong_language_after_retry_fails_w
     result = _drain(tr.triage_single_dataset_question(
         "Table: users", "how many tables?", provider, client=None, model="m",
     ))
-    # Same generic-apology convention as triage_all_mode_question's own
-    # still-wrong-language-after-retry case - api_error False, no specific
-    # error text, so stream_translation()'s own caller shows the fixed
-    # _TRIAGE_FAILURE_TEXT apology rather than naming the languages.
-    assert result == {"outcome": "failed", "api_error": False, "error": None}
+    # api_error stays False (no real API/capacity problem, every attempt got
+    # a real response back) - but UNLIKE the genuinely-unparseable-both-
+    # times case, this one has an honest, user-safe reason to give
+    # (language_mismatch_text), which stream_translation()'s own caller now
+    # shows instead of the generic _TRIAGE_FAILURE_TEXT apology - see
+    # run_triage_call's own docstring for why this fixes a user-reported
+    # "I can't get it to tell me why" gap.
+    assert result == {
+        "outcome": "failed", "api_error": False, "error": None,
+        "language_mismatch_text": "The response kept coming back in German instead of English, even after retrying.",
+    }
     assert len(provider.calls) == 2
 
 
@@ -4445,6 +4555,11 @@ def test_triage_single_dataset_question_unparseable_both_times_fails_without_api
     ))
     assert result["outcome"] == "failed"
     assert result["api_error"] is False
+    # Distinct from the language-mismatch flavor of this same api_error=False
+    # bucket above - raw unparseable model output has no clean, user-safe
+    # reason to surface, so this stays None (the caller falls back to the
+    # generic _TRIAGE_FAILURE_TEXT apology, same as before this fix).
+    assert result["language_mismatch_text"] is None
     assert len(provider.calls) == 2
 
 

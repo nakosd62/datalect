@@ -41,7 +41,7 @@ import json
 import re
 import time
 
-from app_config import logger, MAX_IN_SCOPE_CONNECTIONS, MAX_TRANSLATION_ATTEMPTS, TRANSLATION_RETRY_DELAY_SECONDS
+from app_config import logger, state_store, MAX_IN_SCOPE_CONNECTIONS, MAX_TRANSLATION_ATTEMPTS, TRANSLATION_RETRY_DELAY_SECONDS
 # Shared with translate_routes.py's own language-verification machinery
 # (_no_sql_language_mismatch/_summarize_with_retry there) - see
 # language_detect.py's own module docstring for why this lives in its own
@@ -439,7 +439,8 @@ def _build_triage_question_prompt(prompt):
 
 def run_triage_call(num_candidates, schema_block, prompt, provider, client, model,
                      history=None, max_connections=MAX_IN_SCOPE_CONNECTIONS,
-                     api_key=None, tried_keys=None, using_byok=False):
+                     api_key=None, tried_keys=None, using_byok=False, user_identity=None,
+                     dataset_type=None, dataset_name=None):
     """Unified triage call - Call 1 for BOTH single-dataset mode
     (translate_routes.py's triage_single_dataset_question, a thin wrapper
     around this function with num_candidates fixed at 1) and Phase A of
@@ -483,7 +484,8 @@ def run_triage_call(num_candidates, schema_block, prompt, provider, client, mode
       {"outcome": "sql", "indices": [...], "message": <str|None>,
        "database_prompts": {int_index: str, ...},
        "usage": <dict|None>}  # num_candidates > 1 only
-      {"outcome": "failed", "api_error": <bool>, "error": <exception|None>}
+      {"outcome": "failed", "api_error": <bool>, "error": <exception|None>,
+       "language_mismatch_text": <str|None>}
 
     `schema_block` is built by the CALLER using whichever convention its
     own mode already uses (single-dataset mode's own plain overview-text
@@ -544,19 +546,54 @@ def run_triage_call(num_candidates, schema_block, prompt, provider, client, mode
         real SQL against a database the user never asked about (multi-
         candidate mode) or treating an ambiguous prompt as answerable
         when it might not be (single-dataset mode).
-      api_error=False: every attempt got a real response back, but it
-        was unparseable garbage both times - genuinely nothing more
-        useful to try.
+      api_error=False: every attempt got a real response back, but either
+        it was unparseable garbage both times (genuinely nothing more
+        useful to try - "language_mismatch_text" below is None in this
+        case) or it parsed fine both times but stayed in the wrong
+        language even after one corrective retry ("language_mismatch_text"
+        is then a clean, user-safe sentence naming the mismatch - see
+        that field's own description below).
     A "failed" outcome also carries an "error" key: the raw exception the
     LLM call finally failed with when api_error=True, or None when
-    api_error=False.
+    api_error=False - deliberately None even for the unparseable-garbage
+    api_error=False case above, since `text!r`-style raw model output
+    isn't safe/meaningful to show a real end user.
+    A "failed" outcome also carries a "language_mismatch_text" key: a
+    short, human-readable sentence (e.g. "The response kept coming back
+    in German instead of English, even after retrying.") when the failure
+    was specifically the persistent-wrong-language case, or None for
+    every other "failed" reason. Unlike "error", this IS safe to show the
+    end user directly - it's server-written prose, never raw model
+    output - and doing so is exactly what fixes the "why" gap a user
+    reported: previously this reason was computed (see this function's
+    own logging) but never returned, so every api_error=False failure -
+    "genuinely couldn't parse the response" and "responded in the wrong
+    language twice in a row" alike - showed the identical generic apology
+    with no way to tell the two apart. Mirrors generate_sql_for_
+    connection's own LlmCallFailed message for the identical failure mode
+    in Phase B, and summarize_all_mode_results' own `error` return for
+    Phase C - this was the one call site of the three that didn't.
 
     `api_key`/`tried_keys` mirror generate_sql_for_connection's own
     parameters of the same name: both optional, defaulting to a freshly
     picked key / a fresh single-key set when omitted. `using_byok`, like
     generate_sql_for_connection's own parameter of the same name, forces
     the key-rotation budget down to exactly 1 (there's no second key of
-    the user's own to rotate to)."""
+    the user's own to rotate to).
+
+    `user_identity`, when the caller has one, is forwarded to
+    state_store.record_llm_usage() as this call's own "triage" row the
+    moment the underlying provider.call() actually succeeds - see that
+    method's docstring for why this is a separate ledger from the
+    "translations" table (which never logs triage calls at all). None
+    (a caller with no real identity to attribute this to, e.g. a bare
+    unit test) records under "global", same fallback every other
+    state_store method already uses. `dataset_type`/`dataset_name` are
+    that same row's dataset identity, resolved by the CALLER (via
+    db.py's resolve_dataset_identity for single-dataset mode's own one
+    connection, or resolve_group_identity for group mode's whole
+    candidate set) and passed straight through - this function has no
+    connection descriptor of its own to resolve one from."""
     single = num_candidates == 1
     system_instruction = (
         _SINGLE_DATASET_TRIAGE_SYSTEM_INSTRUCTION if single
@@ -581,6 +618,12 @@ def run_triage_call(num_candidates, schema_block, prompt, provider, client, mode
 
     last_error = None
     api_error = False
+    # Set only by the persistent-language-mismatch branch below, once the
+    # one corrective retry is exhausted and the response is STILL in the
+    # wrong language - see the final `return` at the bottom of this
+    # function for why this needs its OWN field rather than reusing
+    # `error`.
+    language_mismatch_text = None
     for attempt in range(2):
         llm_input = provider.build_llm_input(history or [], schema_block, question_prompt_content)
         text = None
@@ -589,6 +632,10 @@ def run_triage_call(num_candidates, schema_block, prompt, provider, client, mode
             try:
                 text, usage = provider.call(client, model, llm_input, system_instruction)
                 api_error = False
+                state_store.record_llm_usage(
+                    user_identity, "triage", model, usage,
+                    dataset_type=dataset_type, dataset_name=dataset_name,
+                )
                 break
             except Exception as e:
                 last_error = e
@@ -708,9 +755,26 @@ def run_triage_call(num_candidates, schema_block, prompt, provider, client, mode
                 continue
             # The one corrective retry is exhausted and the response STILL
             # came back in the wrong language - counts as an overall
-            # triage failure (the caller's existing fixed apology text,
-            # api_error=False) rather than silently returning text already
-            # confirmed to be in the wrong language.
+            # triage failure (api_error=False, same bucket as the
+            # unparseable-both-times case below) rather than silently
+            # returning text already confirmed to be in the wrong
+            # language. UNLIKE that other api_error=False case though,
+            # there IS something honest and safe to tell the user here -
+            # this was a real, correctly-formed response, just in the
+            # wrong language, not raw unparseable model output - so this
+            # sets language_mismatch_text (mirrors generate_sql_for_
+            # connection's own LlmCallFailed message for the identical
+            # failure mode in Phase B, and summarize_all_mode_results'
+            # own `error` return for Phase C) rather than leaving the
+            # caller to show the same generic _TRIAGE_FAILURE_TEXT apology
+            # it shows for genuinely unparseable garbage. Previously this
+            # only set `last_error` (log-only, since `error` below is
+            # None whenever api_error is False) - the caller had no way
+            # to distinguish "the model tried and answered in the wrong
+            # language" from "the model returned garbage neither attempt
+            # could even parse," and always showed the same uninformative
+            # apology for both, which is exactly the "I can't get it to
+            # tell me why" gap this fixes.
             logger.warning(
                 "Triage response still came back in %s instead of %s after retrying - "
                 "failing triage rather than serving a known-wrong-language response",
@@ -718,6 +782,10 @@ def run_triage_call(num_candidates, schema_block, prompt, provider, client, mode
             )
             last_error = f"response was still written in {actual_name} instead of {expected_name} after retrying"
             api_error = False
+            language_mismatch_text = (
+                f"The response kept coming back in {actual_name} instead of {expected_name}, "
+                f"even after retrying."
+            )
             break
         last_error = f"unparseable triage response: {text!r}"
         api_error = False
@@ -727,6 +795,7 @@ def run_triage_call(num_candidates, schema_block, prompt, provider, client, mode
         "outcome": "failed",
         "api_error": api_error,
         "error": last_error if api_error else None,
+        "language_mismatch_text": language_mismatch_text,
     }
 
 

@@ -654,6 +654,71 @@ class StateStore(ABC):
         than always being a single parseable Postgres URL."""
 
     @abstractmethod
+    def record_llm_usage(self, user_id, call_type, model, usage, dataset_type=None, dataset_name=None):
+        """Logs the token cost of exactly ONE real provider.call() -
+        every single LLM call this app ever makes, not just the ones that
+        end up producing a SQL translation. This is a SEPARATE ledger from
+        record_translation()/the "translations" table above, which serves
+        a different purpose (a per-NL->SQL-attempt audit trail, keyed by
+        the resolved database and carrying the SQL text itself) and, by
+        deliberate design, never logs Phase A/triage calls at all - see
+        translate_routes.py's stream_translation, the "Phase A (triage) is
+        deliberately NEVER recorded" comment. This table is the opposite:
+        purely about LLM cost/usage visibility, so it logs every call -
+        triage, sqlgen, AND summary - uniformly, with no notion of
+        success/failure or the SQL/text that came out of it.
+
+        `call_type` is one of "triage", "sqlgen", or "summary" - the three
+        kinds of LLM call this app makes:
+          "triage": connection_router.py's run_triage_call - Call 1 for
+            both single-dataset mode and "all databases"/group mode.
+          "sqlgen": the actual NL->SQL generation call - either
+            stream_translation()'s own inline single-connection Call 2, or
+            sql_generation.py's generate_sql_for_connection (Phase B's
+            per-connection fan-out in dataset-group mode).
+          "summary": summarize_routes.py's shared _summarize_with_retry -
+            Phase C's per-turn summarization call, used identically by
+            both single-connection mode and "all databases" mode.
+
+        `user_id` is the same already-resolved identity every other method
+        on this class takes (auth.py's get_current_user_identity - a real
+        signed-in user id, "anonymous:<session_id>" for an anonymous
+        visitor, or "global" for a local deployment with no auth) - passed
+        through _effective_user() here purely as a defensive fallback,
+        exactly like record_translation above, not because callers are
+        expected to ever pass something that still needs resolving.
+
+        `usage` is the shared usage_dict every provider's call() returns
+        (see llm_providers.py's LlmProvider.call docstring) - always
+        carrying "input_tokens"/"output_tokens"/"total_tokens"/
+        "thinking_tokens"/"cached_content_tokens", read defensively here
+        (missing/None treated as 0) so a provider that can't report one of
+        these (e.g. Claude's thinking_tokens) never breaks this logging.
+        Called ONCE per successful provider.call() return, regardless of
+        what happens to that call's result afterward (a parse failure, a
+        language-mismatch retry, etc.) - real tokens were spent either
+        way, so this is a strictly more complete cost record than
+        "translations" rows ever were, which sometimes log 0 usage for a
+        call that failed outright and sometimes skip a row entirely (any
+        triage call, by design).
+
+        `dataset_type`/`dataset_name` identify WHAT this call was actually
+        about, same (db_type, db_name) shape record_translation's own
+        columns already use - db.py's resolve_dataset_identity() resolves
+        this pair for a call tied to exactly one connection (sqlgen calls
+        always are; triage/summary are too in single-dataset mode), and
+        its sibling resolve_group_identity() resolves it for a call that
+        spans a whole configured dataset group at once (group-mode
+        triage's own multi-candidate call, and "all databases" mode's
+        Phase C summary call - dataset_type is then the fixed marker
+        "Dataset Group", never a dialect name, since a group can span
+        several dialects). Both default to None for a caller with no
+        real dataset/group to attribute the call to (e.g. a bare unit
+        test) - stored as-is, NULL, rather than coerced to a placeholder
+        string, so a genuinely-unknown row stays visibly distinct from one
+        that legitimately resolved to some real, human-readable name."""
+
+    @abstractmethod
     def get_chat_history(self, user_id):
         """Returns {"buckets": {bucket_key: [turns...]}, "active_bucket_key":
         str} - every persisted conversation bucket this identity has ever
@@ -866,6 +931,28 @@ class SqliteStateStore(StateStore):
                         total_tokens INTEGER,
                         thinking_tokens INTEGER,
                         cached_content_tokens INTEGER,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                """)
+
+                # Separate from "translations" above on purpose - see
+                # StateStore.record_llm_usage's docstring for why this is
+                # its own table (every LLM call, including triage/summary
+                # calls "translations" deliberately never logs, rather than
+                # only NL->SQL attempts).
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS llm_usage (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id TEXT,
+                        call_type TEXT,
+                        dataset_type TEXT,
+                        dataset_name TEXT,
+                        model TEXT,
+                        input_tokens INTEGER,
+                        cached_content_tokens INTEGER,
+                        thinking_tokens INTEGER,
+                        output_tokens INTEGER,
+                        total_tokens INTEGER,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     );
                 """)
@@ -1614,6 +1701,29 @@ class SqliteStateStore(StateStore):
         except Exception:
             logger.exception("Error recording translation")
 
+    def record_llm_usage(self, user_id, call_type, model, usage, dataset_type=None, dataset_name=None):
+        effective_user = _effective_user(user_id)
+        usage = usage or {}
+        try:
+            with self._connect() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO llm_usage (
+                        user_id, call_type, dataset_type, dataset_name, model, input_tokens,
+                        cached_content_tokens, thinking_tokens, output_tokens, total_tokens
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    effective_user, call_type, dataset_type, dataset_name, model,
+                    usage.get("input_tokens") or 0,
+                    usage.get("cached_content_tokens") or 0,
+                    usage.get("thinking_tokens") or 0,
+                    usage.get("output_tokens") or 0,
+                    usage.get("total_tokens") or 0,
+                ))
+                conn.commit()
+        except Exception:
+            logger.exception("Error recording LLM usage")
+
     def get_chat_history(self, user_id):
         effective_user = _effective_user(user_id)
         buckets = {}
@@ -2129,6 +2239,26 @@ class FirestoreStateStore(StateStore):
             })
         except Exception:
             logger.exception("Error recording translation in Firestore")
+
+    def record_llm_usage(self, user_id, call_type, model, usage, dataset_type=None, dataset_name=None):
+        effective_user = _effective_user(user_id)
+        usage = usage or {}
+        try:
+            self.client.collection("llm_usage").add({
+                "user_id": effective_user,
+                "call_type": call_type,
+                "dataset_type": dataset_type,
+                "dataset_name": dataset_name,
+                "model": model,
+                "input_tokens": usage.get("input_tokens") or 0,
+                "cached_content_tokens": usage.get("cached_content_tokens") or 0,
+                "thinking_tokens": usage.get("thinking_tokens") or 0,
+                "output_tokens": usage.get("output_tokens") or 0,
+                "total_tokens": usage.get("total_tokens") or 0,
+                "created_at": firestore.SERVER_TIMESTAMP,
+            })
+        except Exception:
+            logger.exception("Error recording LLM usage in Firestore")
 
     def get_chat_history(self, user_id):
         effective_user = _effective_user(user_id)

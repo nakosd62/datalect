@@ -43,7 +43,11 @@
 // does, or every sign-in/sign-out in these tests would resolve to the
 // same identity and never actually switch buckets at all).
 
-const { test, expect, gotoApp, mockTranslate, mockExecute } = require('./fixtures');
+// Uses testShowSqlVisible (aliased to `test`) rather than the plain `test`
+// fixture - see that fixture's own comment in fixtures.js - since this
+// suite drives the app through the SQL box itself (#runBtn), which
+// client.js now hides by default.
+const { testShowSqlVisible: test, expect, gotoApp, mockTranslate, mockExecute } = require('./fixtures');
 
 function fakeIdToken(email, expiresInSeconds = 3600, extraClaims = {}) {
   const header = Buffer.from(JSON.stringify({ alg: 'none', typ: 'JWT' })).toString('base64url');

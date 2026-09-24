@@ -457,8 +457,8 @@ test.describe('chart dual y-axes for wildly different scales', () => {
 // jumpToChartableResultTab() (the Summary tab's own small, clickable chart
 // preview - rendered directly under the summary text, not a separate boxed
 // callout elsewhere on the page).
-test.describe('single-connection mode: chart discoverability (tab badge + Summary inline chart preview)', () => {
-  test('a chartable result gets a badge on its own tab, and a small chart preview at the end of the Summary text', async ({ page }) => {
+test.describe('single-connection mode: chart discoverability (Summary inline chart preview)', () => {
+  test('a chartable result gets a small chart preview at the end of the Summary text', async ({ page }) => {
     await mockTranslate(page, { sql: 'SELECT day, signups FROM daily_signups;' });
     await mockExecute(page, { results: CHARTABLE_RESULTS });
     await mockSummarizeResult(page, {
@@ -482,13 +482,6 @@ test.describe('single-connection mode: chart discoverability (tab badge + Summar
     expect(await page.evaluate(() => window.__lastChartConfig.type)).toBe('line');
     expect(await page.evaluate(() => window.__lastChartConfig.data.labels)).toEqual(['Mon', 'Tue', 'Wed']);
     expect(await page.evaluate(() => window.__chartInstanceCount)).toBe(1);
-
-    // The data tab (index 1) carries the badge - both the CSS hook and the
-    // literal emoji in its own label text (see buildResultsTabsNav()'s
-    // comment on why the badge isn't color-only).
-    const dataTab = page.locator('#resultsTabsNav .result-tab-btn').nth(1);
-    await expect(dataTab).toHaveClass(/result-tab-btn--chartable/);
-    await expect(dataTab).toContainText('📊');
   });
 
   test('the compact preview drops axis titles that the full-tab chart shows', async ({ page }) => {
@@ -549,7 +542,7 @@ test.describe('single-connection mode: chart discoverability (tab badge + Summar
     expect(await page.evaluate(() => window.__chartInstanceCount)).toBe(1);
   });
 
-  test('no badge and no inline chart preview at all when the result is not chartable', async ({ page }) => {
+  test('no inline chart preview at all when the result is not chartable', async ({ page }) => {
     await mockTranslate(page, { sql: 'SELECT COUNT(*) AS n FROM signups;' });
     await mockExecute(page, { results: [{ columns: ['n'], rows: [{ n: 42 }], rowCount: 1 }] });
     await mockSummarizeResult(page, {
@@ -564,9 +557,6 @@ test.describe('single-connection mode: chart discoverability (tab badge + Summar
 
     await expect(page.locator('.summary-chart-inline-preview')).toHaveCount(0);
     await expect(page.locator('.summary-chart-inline-link')).toHaveCount(0);
-    const dataTab = page.locator('#resultsTabsNav .result-tab-btn').nth(1);
-    await expect(dataTab).not.toHaveClass(/result-tab-btn--chartable/);
-    await expect(dataTab).not.toContainText('📊');
   });
 
   test('a multi-statement script with two independently chartable results gets its own captioned preview for each, each jumping to its own tab', async ({ page }) => {
@@ -603,10 +593,6 @@ test.describe('single-connection mode: chart discoverability (tab badge + Summar
     await page.locator('#aiPrompt').fill('how did signups and revenue look this week');
     await page.locator('#aiPrompt').press('Enter');
     await expect(page.locator('.response-text')).toContainText('Signups trended upward', { timeout: 10000 });
-
-    // Both statements' own tabs carry the badge.
-    await expect(page.locator('#resultsTabsNav .result-tab-btn').nth(1)).toHaveClass(/result-tab-btn--chartable/);
-    await expect(page.locator('#resultsTabsNav .result-tab-btn').nth(2)).toHaveClass(/result-tab-btn--chartable/);
 
     // Two previews on the Summary tab, each with its own distinguishing
     // caption (only shown at all once there's more than one preview).

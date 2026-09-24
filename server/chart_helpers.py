@@ -48,14 +48,17 @@ namespace, so they remain reachable as translate_routes.<name> - in
 particular for every existing test's `app_env.translate_routes.<name>` /
 `env.translate_routes.<name>` attribute access (_CHART_MIN_ROWS,
 _pick_chartable_results, _clean_visualization, _clean_visualizations,
-_column_looks_numeric are all referenced this way in
-tests/server/test_translate_routes.py). No other module imports any of
-these names directly today.
+_column_looks_numeric, _extract_chart_link_captions are all referenced
+this way in tests/server/test_translate_routes.py). No other module
+imports any of these names directly today.
 
 Entirely self-contained: pure functions over plain dicts/lists, no I/O, no
 LLM calls, and no imports of their own beyond what's already in scope from
-Python's builtins.
+Python's builtins (plus `re`, used only by _extract_chart_link_captions
+below).
 """
+
+import re
 
 
 _CHART_MIN_ROWS = 2
@@ -188,14 +191,99 @@ def _describe_chartable_results(chartable_by_index, label_for_index):
     return "\n".join(lines) + "\n"
 
 
-def _clean_visualization(raw, chartable_entry):
+_CAPTION_MAX_CHARS = 100
+
+# Matches the model's own inline "[<short phrase>](chart:<index>)" link -
+# see both summarization prompts' "visualizations" paragraph - wherever it
+# appears in a piece of summary/per-database/cross-database text. Group 1
+# is the bracketed caption phrase; group 2 is everything after "chart:" up
+# to the closing paren, re-validated as a real int index by
+# _extract_chart_link_captions below rather than trusted as-is here (a
+# regex alone can't tell "chart:1" from "chart:one" or "chart:1 "). The
+# caption group is capped at _CAPTION_MAX_CHARS characters so a model that
+# ignores the length guidance in prose can't make this pattern match
+# across an entire paragraph by never closing its "]" until much later.
+_CHART_LINK_PATTERN = re.compile(r"\[([^\[\]\n]{1,%d})\]\(chart:([^()\s]*)\)" % _CAPTION_MAX_CHARS)
+
+
+def _clean_caption(raw_caption):
+    """Validates one candidate caption string - the bracketed phrase from a
+    single regex match of _CHART_LINK_PATTERN above, or (defensively) any
+    other candidate a caller passes directly - independent of every other
+    chart-shape field, so it's pulled out into its own tiny helper rather
+    than inlined into its caller's body.
+
+    Must be a non-empty (after stripping) string, and short: capped at
+    _CAPTION_MAX_CHARS - a caption is meant to be a POINTER to a specific
+    claim already made in the text (e.g. "Apple Pay's 20% completion
+    rate"), not a restatement of it, so an overlong value here is treated
+    as the model padding rather than pointing, and rejected the same as a
+    missing/blank one. Returns the stripped string, or None on any
+    failure - never raises."""
+    if not isinstance(raw_caption, str):
+        return None
+    caption = raw_caption.strip()
+    if not caption or len(caption) > _CAPTION_MAX_CHARS:
+        return None
+    return caption
+
+
+def _extract_chart_link_captions(*texts):
+    """Scans one or more pieces of real summary text - single-connection
+    mode's "summary", or "all databases" mode's "per_database" paragraphs
+    plus its optional "cross_database" one - for the model's own inline
+    "[<short phrase>](chart:<index>)" link (see both summarization
+    prompts' "visualizations" paragraph for the exact contract) and
+    returns {int_index: caption} for every one found.
+
+    THIS is now the sole source of a visualization's caption - there is no
+    separate "caption" field in the model's JSON "visualizations" object
+    any more (see _clean_visualization's own docstring for why: a caption
+    that lives only in structured JSON can be filled in by the model
+    without ever actually being integrated into the text a person reads,
+    which is exactly the "chart and text stay disjoint" failure mode this
+    whole feature exists to close). Extracting it from a real link found
+    IN the text instead makes the connection unfakeable by construction -
+    a caption only exists here because the exact same markup is also a
+    live, clickable pointer sitting at that precise spot in the prose.
+
+    A text argument that isn't a non-empty string (most commonly
+    "cross_database", which is often None) is simply skipped, not an
+    error - every caller passes its own full set of text fields as
+    positional arguments regardless of which ones are populated this
+    turn. When the SAME index is linked more than once across the given
+    texts (an edge case - the model was never asked to do this), the LAST
+    match encountered wins; single-connection mode only ever passes one
+    text anyway, so this only matters for "all databases" mode's multiple
+    per-database paragraphs.
+
+    Returns {} (never None) when nothing matches - callers already treat
+    an empty dict as "no captions available", the same as everywhere else
+    in this module."""
+    captions = {}
+    for text in texts:
+        if not isinstance(text, str) or not text:
+            continue
+        for match in _CHART_LINK_PATTERN.finditer(text):
+            try:
+                index = int(match.group(2))
+            except (TypeError, ValueError):
+                continue
+            caption = _clean_caption(match.group(1))
+            if caption is not None:
+                captions[index] = caption
+    return captions
+
+
+def _clean_visualization(raw, chartable_entry, caption):
     """Validates the model's own single "visualization" choice against the
     REAL executed result it's supposed to describe - `chartable_entry`, one
     value out of _pick_chartable_results(...)'s own returned dict, the
     exact same entry _describe_chartable_results rendered into the prompt
     for this same index. Returns a cleaned
       {"chart_type": "bar"|"line"|"scatter", "x_column": <str>,
-       "y_columns": [<str>, ...], "series_column": <str>|None}
+       "y_columns": [<str>, ...], "series_column": <str>|None,
+       "caption": <str>}
     or None (meaning: show a table, not a chart, for this one entry) -
     never raises. Called once per qualifying index by _clean_visualizations
     below, which is what actually parses the model's "visualizations"
@@ -222,8 +310,27 @@ def _clean_visualization(raw, chartable_entry):
     structural problem with "x_column" or an empty "y_columns" after
     filtering invalidates this one entry's visualization (returns None,
     falls back to a table for just that entry) rather than partially
-    rendering something the model didn't actually intend."""
-    if chartable_entry is None or not isinstance(raw, dict):
+    rendering something the model didn't actually intend.
+
+    `caption` is REQUIRED, not optional - a missing one (None) invalidates
+    this whole visualization exactly like a hallucinated x_column does,
+    rather than falling back to some generic "Query N" placeholder. Unlike
+    every other field validated here, `caption` is NOT read off `raw` -
+    the caller (_clean_visualizations below) already extracted and cleaned
+    it from the model's own inline "[...](chart:N)" link, found in the
+    real "summary"/"per_database"/"cross_database" TEXT rather than in
+    this JSON object at all (see _extract_chart_link_captions' own
+    docstring for why). This is deliberate, not an oversight: this
+    feature's entire point (per its own explicit design goal - see the
+    "visualizations" paragraph in prompts/summary_single_connection.txt and
+    prompts/summary_all_databases.txt) is that a chart only earns its place
+    in the summary BECAUSE the text already points to it, in a form the
+    user can actually click - a visualization the model never linked from
+    the text has, by construction, failed to demonstrate that connection,
+    so it gets the same treatment as any other structurally invalid
+    decision: dropped back to a plain table for that one entry, never a
+    reason to fail the whole response."""
+    if chartable_entry is None or not isinstance(raw, dict) or caption is None:
         return None
     chart_type = raw.get("chart_type")
     if chart_type not in ("bar", "line", "scatter"):
@@ -256,18 +363,30 @@ def _clean_visualization(raw, chartable_entry):
     return {
         "chart_type": chart_type, "x_column": x_column,
         "y_columns": y_columns, "series_column": series_column,
+        "caption": caption,
     }
 
 
-def _clean_visualizations(raw, chartable_by_index):
+def _clean_visualizations(raw, chartable_by_index, *link_texts):
     """Validates the model's own "visualizations" object (see
     _describe_chartable_results/{_SINGLE_SUMMARY_SYSTEM_INSTRUCTION,
     _SUMMARY_SYSTEM_INSTRUCTION}'s own paragraph on it) against the REAL
     executed entries in `chartable_by_index` (see _pick_chartable_results) -
     the same dict _describe_chartable_results rendered into the prompt the
     model actually saw. Returns {index: <_clean_visualization's own shape>}
-    - only for indices that are BOTH a real key of `chartable_by_index` AND
-    pass _clean_visualization's own per-entry validation.
+    - only for indices that are ALL of: a real key of `chartable_by_index`,
+    linked from `link_texts` (see below), AND pass _clean_visualization's
+    own per-entry validation.
+
+    `link_texts` is the caller's own real "summary" text (single-connection
+    mode - one positional argument), or "per_database"'s paragraphs plus
+    "cross_database" (all-databases mode - several positional arguments,
+    "cross_database" often None) - passed straight to
+    _extract_chart_link_captions to find each index's own caption, which is
+    ALSO this function's proof that the text actually links to that index
+    at all (a chartable, "visualizations"-listed index with no inline link
+    anywhere in `link_texts` gets no caption, and _clean_visualization then
+    invalidates it for exactly that reason - see its own docstring).
 
     Every other key the model might have written (a hallucinated index, an
     index that was never chartable, or a value that doesn't survive
@@ -283,6 +402,7 @@ def _clean_visualizations(raw, chartable_by_index):
     chartable this turn) returns {} - no charts, not a parse failure."""
     if not isinstance(raw, dict) or not chartable_by_index:
         return {}
+    link_captions = _extract_chart_link_captions(*link_texts)
     cleaned = {}
     for key, value in raw.items():
         try:
@@ -291,7 +411,7 @@ def _clean_visualizations(raw, chartable_by_index):
             continue
         if index not in chartable_by_index:
             continue
-        viz = _clean_visualization(value, chartable_by_index[index])
+        viz = _clean_visualization(value, chartable_by_index[index], link_captions.get(index))
         if viz is not None:
             cleaned[index] = viz
     return cleaned

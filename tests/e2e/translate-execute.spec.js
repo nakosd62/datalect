@@ -5,7 +5,11 @@
 // so this never needs a real Gemini key or a real target database. Every
 // other request (page load, /api/config) hits the real Flask server.
 
-const { test, expect, gotoApp, mockTranslate, mockExecute } = require('./fixtures');
+// Uses testShowSqlVisible (aliased to `test`) rather than the plain `test`
+// fixture - see that fixture's own comment in fixtures.js - since this
+// suite drives the app through the SQL box itself (#runBtn, #sqlQuery/
+// CodeMirror), which client.js now hides by default.
+const { testShowSqlVisible: test, expect, gotoApp, mockTranslate, mockExecute } = require('./fixtures');
 
 function currentSql(page) {
   // Mirrors client.js's own getSqlQuery(): CodeMirror (loaded from a CDN -

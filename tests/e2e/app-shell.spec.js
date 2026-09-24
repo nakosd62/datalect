@@ -12,7 +12,10 @@ test.describe('app shell', () => {
 
     await expect(page).toHaveTitle(/Datalect/);
     await expect(page.locator('#aiPrompt')).toBeVisible();
-    await expect(page.locator('#runBtn')).toBeVisible();
+    // The SQL box (and its #runBtn) is hidden by default now - see "Show
+    // SQL" in client.js/SHOW_SQL_STORAGE_KEY - so it's asserted absent here
+    // rather than visible; show-sql-toggle.spec.js covers turning it back on.
+    await expect(page.locator('#editorPaneSql')).toHaveClass(/hidden/);
     await expect(page.locator('#configTriggerBadge')).toBeVisible();
     await expect(page.locator('#helpBtn')).toBeVisible();
     await expect(page.locator('#historyBtn')).toBeVisible();
@@ -44,10 +47,13 @@ test.describe('app shell', () => {
     await page.locator('#helpBtn').click();
     await expect(page.locator('#helpModal')).not.toHaveClass(/hidden/);
     await expect(page.locator('#restoreQuickPromptsBtn')).toHaveCount(0);
-    // #replayTourBtn is a distinct, still-live feature that happens to
-    // share the old .restore-quick-prompts-btn CSS class as a styling
-    // hook - that class surviving on IT is fine; only the dedicated
-    // sample-prompts-restore button (a separate id) is asserted gone above.
+    // #replayTourBtn is a distinct, still-live feature - only the dedicated
+    // sample-prompts-restore button (a separate id, and never reused for
+    // anything else) is asserted gone above. It's now an inline link inside
+    // help.html's own fetched text rather than a static button in
+    // index.html (see openHelpModal()/wireHelpModalLinks() in client.js),
+    // so this waits on the async fetch/render like any other doc content -
+    // toBeVisible()'s own polling handles that with no extra code needed.
     await expect(page.locator('#replayTourBtn')).toBeVisible();
   });
 

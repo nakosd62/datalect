@@ -23,7 +23,11 @@
 // network involved either way - see the "analytics: network isolation"
 // describe block below for a dedicated test of that block itself.
 
-const { test, expect, gotoApp, mockTranslate, mockExecute } = require('./fixtures');
+// Uses testShowSqlVisible (aliased to `test`) rather than the plain `test`
+// fixture - see that fixture's own comment in fixtures.js - since this
+// suite drives the app through the SQL box itself (#runBtn,
+// #reportSqlBtn/#reportSqlGoodBtn), which client.js now hides by default.
+const { testShowSqlVisible: test, expect, gotoApp, mockTranslate, mockExecute } = require('./fixtures');
 
 /** Every {..params} object gtag('event', name, params) pushed for the
  * given event name, in firing order. */

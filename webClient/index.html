@@ -46,15 +46,21 @@
     })();
   </script>
 
-  <!-- Datalect favicon set (see webClient/favicon.svg for the source artwork).
-       favicon.ico covers older browsers; the sized PNGs are for browsers that
-       prefer PNG; apple-touch-icon.png is used when the site is added to an
-       iOS/iPadOS home screen. -->
-  <link rel="icon" href="favicon.ico" sizes="any">
-  <link rel="icon" type="image/svg+xml" href="favicon.svg">
-  <link rel="icon" type="image/png" sizes="32x32" href="favicon-32x32.png">
-  <link rel="icon" type="image/png" sizes="16x16" href="favicon-16x16.png">
-  <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
+  <!-- LOGO CONCEPT REVIEW (per explicit request - NOT a final swap): points
+       at the new "-concept" asset set (funnel/spark artwork) instead of the
+       original robot-mascot favicon.ico/.svg/-16x16/-32x32/apple-touch-icon
+       above, which are left completely untouched on disk so this is a
+       one-line revert (just restore this block) if the concept doesn't
+       stick. The favicon files themselves have the falling squares removed
+       per that same request - they got muddy at 16-32px in an earlier
+       concept pass, so this variant only simplifies at favicon sizes; the
+       header logo and apple-touch-icon (both large enough to keep the
+       detail) still show the full design. -->
+  <link rel="icon" href="favicon-concept.ico" sizes="any">
+  <link rel="icon" type="image/svg+xml" href="favicon-concept.svg">
+  <link rel="icon" type="image/png" sizes="32x32" href="favicon-concept-32x32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="favicon-concept-16x16.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon-concept.png">
   
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -82,22 +88,19 @@
       <div class="crbot-header">
         <div class="crbot-title-group">
           <div class="crbot-icon-wrapper">
-            <!-- Datalect brand mark (logo.svg) - replaces the old placeholder icon above.
-                 viewBox/paths are the artwork as supplied; only width/height are set here
-                 to fit the existing 40x40 header slot. -->
-            <!-- MONOCHROME PASS (per explicit request - the mascot's green
-                 family (#047857/#10b981/#34d399/#065f46) read as "off" next
-                 to the app's now-neutral-graphite chrome). Every shape that
-                 used to carry one of those greens now uses currentColor
-                 instead, resolved by .crbot-icon-wrapper's own `color: var
-                 (--text-primary)` in style.css - white in dark mode, near-
-                 black in light mode, same as the rest of the app's body
-                 text (deliberately NOT --accent-cyan, which still aliases to
-                 the brand green in light mode - that would have undone this
-                 exact complaint the moment someone switched themes). The
-                 remaining fixed colors (#ffffff eyes/highlights, #0f172a
-                 pupils, #1e293b body/stack3 fill) are unchanged - they were
-                 never part of the green family, just contrast details. -->
+            <!-- LOGO CONCEPT REVIEW (per explicit request - NOT a final
+                 swap): the original robot-mascot inline svg is preserved
+                 below inside a template tag (inert - never parsed as
+                 renderable DOM or fetched as a resource, but still valid
+                 markup, unlike wrapping it in an HTML comment - that svg has
+                 its own internal comments scattered through it, and HTML
+                 comments don't nest, so a wrapping comment would have
+                 silently ended at the first inner comment's own closing
+                 delimiter and let everything after it leak out as real,
+                 rendered markup). Reverting is just deleting the img tag
+                 below and moving this template's content back out into its
+                 place. -->
+            <template id="mascot-svg-backup">
             <svg width="60" height="60" viewBox="0 0 128 128" fill="none" xmlns="http://www.w3.org/2000/svg">
                 <g transform="translate(14, 20)">
                     <!-- Agent Icon -->
@@ -146,14 +149,16 @@
                     </g>
                 </g>
             </svg>
+            </template>
+            <img src="logo-concept.png" width="60" height="60" alt="Datalect logo concept">
 
             <div class="header-icon-label">
               <div class="label-line">
                 <!-- Two stacked lines instead of one - see .full-text's own
                      comment in style.css for the font-size/color reasoning. -->
                 <span class="full-text">
-                  <span class="full-text-row">talk to</span>
-                  <span class="full-text-row">your data</span>
+                  <span class="full-text-row">Meaning</span>
+                  <span class="full-text-row">in Data</span>
                 </span>
                 <span class="short-text"></span>
               </div>
@@ -172,7 +177,7 @@
         -->
         <div class="crbot-dataset-center">
           <span class="dataset-center-label">Dataset:</span>
-          <div id="configTriggerBadge" class="status-badge connected clickable-badge dataset-badge-prominent" title="Connection Info (Click to configure)" aria-haspopup="dialog" aria-expanded="false">
+          <div id="configTriggerBadge" class="status-badge connected clickable-badge header-badge-prominent" title="Connection Info (Click to configure)" aria-haspopup="dialog" aria-expanded="false">
             <span id="connDbDot" class="status-dot"></span>
             <span id="connDbName" class="conn-badge-text"></span>
             <!-- Chevron affordance, same glyph/rotate-on-open language as
@@ -224,8 +229,9 @@
                #modelModal popup dialog - clicking the badge drops a
                provider-grouped list right below it; clicking an option
                selects and saves immediately, no separate Save step. -->
+          <span class="model-picker-label">Model:</span>
           <div id="modelPickerWrapper" class="model-picker-wrapper">
-            <div id="modelTriggerBadge" class="status-badge connected clickable-badge" title="Model Info (Click to choose)" aria-haspopup="listbox" aria-expanded="false">
+            <div id="modelTriggerBadge" class="status-badge connected clickable-badge header-badge-prominent" title="Model Info (Click to choose)" aria-haspopup="listbox" aria-expanded="false">
               <span id="modelBadgeName" class="conn-badge-text"></span>
               <!-- Chevron-down affordance so the badge itself reads as "a
                    dropdown selector, click to open" rather than plain,
@@ -236,7 +242,7 @@
                    .model-badge-caret's [aria-expanded="true"] rule in
                    style.css), tracking the very same aria-expanded
                    attribute client.js already toggles on this element. -->
-              <svg class="model-badge-caret" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <svg class="model-badge-caret" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                 <polyline points="6 9 12 15 18 9"></polyline>
               </svg>
             </div>
@@ -466,9 +472,11 @@
         <h2 class="modal-title">💡 Help & Documentation</h2>
         <button id="helpModalCloseBtn" class="modal-close-btn" type="button">&times;</button>
       </div>
-      <div class="help-modal-actions">
-        <button type="button" id="replayTourBtn" class="restore-quick-prompts-btn">&#8635; Replay guided tour</button>
-      </div>
+      <!-- #replayTourBtn used to live here as its own toolbar button; it's
+           now an inline link inside help.html itself (see openHelpModal()/
+           wireHelpModalLinks() in client.js), right next to the "Use this
+           link to get a walkthrough of the application:" sentence it
+           belongs to, so #helpModalBody is the whole modal body again. -->
       <div id="helpModalBody" class="modal-body help-dialog-body">
         <p class="text-muted">Loading documentation...</p>
       </div>

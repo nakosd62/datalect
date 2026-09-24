@@ -471,9 +471,13 @@ def test_triage_still_wrong_language_after_retry_fails_without_api_error(monkeyp
 
     # Mirrors _summarize_with_retry's/stream_translation()'s own "never
     # knowingly serve a response in the wrong language" guarantee: both
-    # attempts wrong-language must fail triage outright (the caller's
-    # existing fixed apology, api_error=False - same bucket as the
-    # unparseable-both-times case), not silently leak the known-wrong text.
+    # attempts wrong-language must fail triage outright (api_error=False,
+    # same bucket as the unparseable-both-times case), not silently leak
+    # the known-wrong text. UNLIKE that other api_error=False case,
+    # though, "language_mismatch_text" carries a clean, user-safe reason -
+    # see run_triage_call's own docstring - so the caller (translate_
+    # routes.py) can show something more honest than the generic
+    # _TRIAGE_FAILURE_TEXT apology for this specific failure.
     monkeypatch.setattr(
         connection_router_module, "detect_language",
         lambda text: "de" if "Datenbanken" in text else ("en" if text == "how many databases?" else None),
@@ -491,7 +495,10 @@ def test_triage_still_wrong_language_after_retry_fails_without_api_error(monkeyp
         len(candidates), "schema block", "how many databases?", provider, client=None, model="m",
     ))
 
-    assert result == {"outcome": "failed", "api_error": False, "error": None}
+    assert result == {
+        "outcome": "failed", "api_error": False, "error": None,
+        "language_mismatch_text": "The response kept coming back in German instead of English, even after retrying.",
+    }
     assert len(provider.calls) == 2
 
 
@@ -723,6 +730,11 @@ def test_triage_unparseable_response_is_not_reported_as_api_error():
     assert result["api_error"] is False
     # Nothing genuinely went wrong at the API level - no exception to report.
     assert result["error"] is None
+    # Distinct from the language-mismatch flavor of this same api_error=False
+    # bucket (see test_triage_still_wrong_language_after_retry_fails_
+    # without_api_error above) - raw unparseable model output has no clean,
+    # user-safe reason to surface, so this stays None too.
+    assert result["language_mismatch_text"] is None
     assert len(provider.calls) == 2
 
 
@@ -1510,6 +1522,47 @@ def test_group_mode_failed_outcome_returns_fixed_apology_text_not_candidate_zero
     assert 'Sales Postgres' not in data['sql']
     assert 'router_route' not in data
     assert 'connection_selection' not in data
+
+
+def test_group_mode_still_wrong_language_after_retry_shows_honest_message_not_generic_apology(
+    app_factory, tmp_path, monkeypatch,
+):
+    """End-to-end regression guard for the OTHER half of the same bug
+    report test_group_mode_resource_exhausted_triage_shows_honest_message_
+    not_generic_apology fixes: a persistent wrong-language "general" answer
+    must show run_triage_call's own language_mismatch_text (see that
+    function's docstring), NOT the same generic _TRIAGE_FAILURE_TEXT
+    apology reserved for a genuinely unparseable response (see the
+    candidate-zero-fallback test above, which must keep getting that exact
+    text)."""
+    env = _two_preset_env(app_factory, tmp_path)
+    login_as(env.client, "alice@example.com")
+    _set_group_mode(env.client)
+
+    import connection_router
+    _fake_detect = lambda text: "de" if "Datenbanken" in text else ("en" if text else None)
+    _fake_describe = lambda code: {"de": "German", "en": "English"}.get(code, code)
+    monkeypatch.setattr(connection_router, "detect_language", _fake_detect)
+    monkeypatch.setattr(connection_router, "describe_language", _fake_describe)
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(_gemini_ok(
+        '{"action": "general", "answer": "Sie haben 2 Datenbanken konfiguriert."}'
+    ))
+    harness.queue_response(_gemini_ok(
+        '{"action": "general", "answer": "Immer noch 2 Datenbanken."}'
+    ))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'how many databases do I have?'})
+    _, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    assert len(harness.generate_calls) == 2  # triage's own bounded retry, then "failed"
+    assert data['sql'] == (
+        "*** NO SQL *** The response kept coming back in German instead of English, "
+        "even after retrying."
+    )
+    assert data['sql'] != env.translate_routes._TRIAGE_FAILURE_TEXT
 
 
 def test_group_mode_resource_exhausted_triage_shows_honest_message_not_generic_apology(
@@ -2576,11 +2629,18 @@ def test_summarize_results_endpoint_returns_a_chart_for_each_qualifying_database
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     harness.queue_response(_gemini_ok(json.dumps({
         "label": "Results Summary",
-        "per_database": {"0": "Sales trended upward.", "1": "Campaigns split evenly."},
+        "per_database": {
+            "0": "Sales trended [upward](chart:0).",
+            "1": "Campaigns split [evenly](chart:1).",
+        },
         "cross_database": None,
         "visualizations": {
-            "0": {"chart_type": "line", "x_column": "day", "y_columns": ["revenue"], "series_column": None},
-            "1": {"chart_type": "bar", "x_column": "campaign", "y_columns": ["clicks"], "series_column": None},
+            "0": {
+                "chart_type": "line", "x_column": "day", "y_columns": ["revenue"], "series_column": None,
+            },
+            "1": {
+                "chart_type": "bar", "x_column": "campaign", "y_columns": ["clicks"], "series_column": None,
+            },
         },
     })))
 
@@ -2599,8 +2659,14 @@ def test_summarize_results_endpoint_returns_a_chart_for_each_qualifying_database
     _retry_events, data = parse_translate_stream(resp)
     assert data['success'] is True
     assert data['visualizations'] == {
-        "0": {"chart_type": "line", "x_column": "day", "y_columns": ["revenue"], "series_column": None},
-        "1": {"chart_type": "bar", "x_column": "campaign", "y_columns": ["clicks"], "series_column": None},
+        "0": {
+            "chart_type": "line", "x_column": "day", "y_columns": ["revenue"], "series_column": None,
+            "caption": "upward",
+        },
+        "1": {
+            "chart_type": "bar", "x_column": "campaign", "y_columns": ["clicks"], "series_column": None,
+            "caption": "evenly",
+        },
     }
 
 

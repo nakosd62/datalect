@@ -28,6 +28,7 @@ import pandas as pd
 import pytest
 
 from export_state import (
+    VALID_TABLES,
     fetch_datastore,
     fetch_sqlite,
     export_datastore,
@@ -120,6 +121,96 @@ def test_fetch_sqlite_skips_empty_tables(tmp_path):
     conn.close()
 
     assert fetch_sqlite(db_path, "all") == {}
+
+
+# ==========================================
+# llm_usage - the token-usage tracking table (separate from "translations",
+# see state_store.py's StateStore.record_llm_usage docstring), covered on
+# its own here to confirm export_state.py needs no table-specific logic to
+# support a new table beyond being told it's valid (VALID_TABLES/the
+# --table CLI choices) - fetch_sqlite/export_sqlite themselves are already
+# fully generic over column names/table names.
+# ==========================================
+
+def test_valid_tables_includes_llm_usage():
+    assert "llm_usage" in VALID_TABLES
+
+
+def _make_llm_usage_sqlite_db(tmp_path, filename="state.db"):
+    db_path = str(tmp_path / filename)
+    conn = sqlite3.connect(db_path)
+    # Same column shape/order as state_store.py's own CREATE TABLE - not
+    # alphabetical, same "leaks straight into SELECT * order" case
+    # sort_columns_alphabetically exists to normalize away.
+    conn.execute("""
+        CREATE TABLE llm_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT,
+            call_type TEXT,
+            dataset_type TEXT,
+            dataset_name TEXT,
+            model TEXT,
+            input_tokens INTEGER,
+            cached_content_tokens INTEGER,
+            thinking_tokens INTEGER,
+            output_tokens INTEGER,
+            total_tokens INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.execute(
+        "INSERT INTO llm_usage ("
+        "user_id, call_type, dataset_type, dataset_name, model, "
+        "input_tokens, cached_content_tokens, thinking_tokens, output_tokens, total_tokens"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("anonymous:abc123", "triage", "postgres", "E-Commerce Store", "gemini-3.6-flash", 100, 10, 5, 20, 120),
+    )
+    conn.commit()
+    conn.close()
+    return db_path
+
+
+def test_fetch_sqlite_exports_llm_usage_table_alphabetically(tmp_path):
+    db_path = _make_llm_usage_sqlite_db(tmp_path)
+    results = fetch_sqlite(db_path, "llm_usage")
+
+    assert list(results.keys()) == ["llm_usage"]
+    assert list(results["llm_usage"].columns) == [
+        "cached_content_tokens", "call_type", "created_at", "dataset_name", "dataset_type",
+        "id", "input_tokens", "model", "output_tokens", "thinking_tokens", "total_tokens", "user_id",
+    ]
+    row = results["llm_usage"].iloc[0]
+    assert row["call_type"] == "triage"
+    assert row["dataset_type"] == "postgres"
+    assert row["dataset_name"] == "E-Commerce Store"
+    assert row["user_id"] == "anonymous:abc123"
+    assert row["total_tokens"] == 120
+
+
+def test_fetch_sqlite_all_includes_llm_usage_alongside_other_tables(tmp_path):
+    db_path = _make_sqlite_db(tmp_path)
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE llm_usage (call_type TEXT, model TEXT)")
+    conn.execute("INSERT INTO llm_usage VALUES ('summary', 'gpt-6-sol')")
+    conn.commit()
+    conn.close()
+
+    results = fetch_sqlite(db_path, "all")
+
+    assert set(results.keys()) == {"translations", "sessions", "llm_usage"}
+
+
+def test_export_sqlite_writes_llm_usage_csv_with_alphabetical_header(tmp_path):
+    db_path = _make_llm_usage_sqlite_db(tmp_path)
+    output_dir = str(tmp_path / "out")
+    os.makedirs(output_dir)
+
+    export_sqlite(db_path, "llm_usage", output_dir)
+
+    with open(os.path.join(output_dir, "llm_usage.csv"), newline="") as f:
+        header = next(csv.reader(f))
+    assert header == sorted(header)
+    assert "call_type" in header and "dataset_type" in header and "dataset_name" in header
 
 
 # ==========================================

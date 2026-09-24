@@ -11,7 +11,11 @@
 // would actually need a live connection.
 
 const crypto = require('crypto');
-const { test, expect, gotoApp, mockTranslate, mockExecute } = require('./fixtures');
+// Uses testShowSqlVisible (aliased to `test`) rather than the plain `test`
+// fixture - see that fixture's own comment in fixtures.js - since this
+// suite drives the app through the SQL box itself (#runBtn), which
+// client.js now hides by default.
+const { testShowSqlVisible: test, expect, gotoApp, mockTranslate, mockExecute } = require('./fixtures');
 
 /** A syntactically-valid but entirely fake service-account key, generated
  * fresh - never a real credential. Google's own libraries only need it to

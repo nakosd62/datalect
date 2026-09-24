@@ -7,7 +7,7 @@
 // SHOW_SQL_STORAGE_KEY in client.js), unlike auto_sql_execute, so this
 // suite proves the OPPOSITE of preferences-modal.spec.js's "survives a
 // reload even with localStorage cleared" theme/auto-execute tests: Show
-// SQL resets to its default (visible) once localStorage is cleared, since
+// SQL resets to its default (hidden) once localStorage is cleared, since
 // there's no server fallback for it at all.
 //
 // Against the REAL Flask server, same reasoning as preferences-modal.spec.js -
@@ -23,68 +23,68 @@ async function openPreferencesModal(page) {
 }
 
 test.describe('show SQL preference', () => {
-  test('is visible by default, with its checkbox checked in Preferences', async ({ page }) => {
+  test('is hidden by default, with its checkbox unchecked in Preferences', async ({ page }) => {
     await gotoApp(page);
-    await expect(page.locator('#editorPaneSql')).not.toHaveClass(/hidden/);
+    await expect(page.locator('#editorPaneSql')).toHaveClass(/hidden/);
 
     await openPreferencesModal(page);
-    await expect(page.locator('#showSqlCheckbox')).toBeChecked();
+    await expect(page.locator('#showSqlCheckbox')).not.toBeChecked();
     await expect(page.locator('#showSqlCheckbox')).not.toBeDisabled();
   });
 
-  test('unchecking it and saving hides the SQL box/divider and grows the NL prompt box to full width', async ({ page }) => {
+  test('checking it and saving shows the SQL box/divider and shrinks the NL prompt box back down', async ({ page }) => {
     await gotoApp(page);
     const nlWidthBefore = (await page.locator('#editorPaneNl').boundingBox()).width;
 
     await openPreferencesModal(page);
-    await page.locator('#showSqlCheckbox').uncheck();
+    await page.locator('#showSqlCheckbox').check();
     await page.locator('#preferencesSaveBtn').click();
 
-    await expect(page.locator('#editorPaneSql')).toHaveClass(/hidden/);
-    await expect(page.locator('#editorPanesResizer')).toHaveClass(/hidden/);
+    await expect(page.locator('#editorPaneSql')).not.toHaveClass(/hidden/);
+    await expect(page.locator('#editorPanesResizer')).not.toHaveClass(/hidden/);
 
     const nlWidthAfter = (await page.locator('#editorPaneNl').boundingBox()).width;
-    expect(nlWidthAfter).toBeGreaterThan(nlWidthBefore * 1.5);
+    expect(nlWidthAfter).toBeLessThan(nlWidthBefore / 1.5);
 
     // Clean up so this doesn't leak into other tests via shared localStorage
     // within the same worker/context.
     await openPreferencesModal(page);
-    await page.locator('#showSqlCheckbox').check();
+    await page.locator('#showSqlCheckbox').uncheck();
     await page.locator('#preferencesSaveBtn').click();
   });
 
   test('persists across a reload (localStorage), unlike a one-off in-memory toggle', async ({ page }) => {
     await gotoApp(page);
     await openPreferencesModal(page);
-    await page.locator('#showSqlCheckbox').uncheck();
+    await page.locator('#showSqlCheckbox').check();
     await page.locator('#preferencesSaveBtn').click();
 
     await gotoApp(page);
-    await expect(page.locator('#editorPaneSql')).toHaveClass(/hidden/);
+    await expect(page.locator('#editorPaneSql')).not.toHaveClass(/hidden/);
     await openPreferencesModal(page);
-    await expect(page.locator('#showSqlCheckbox')).not.toBeChecked();
+    await expect(page.locator('#showSqlCheckbox')).toBeChecked();
 
     // Clean up.
-    await page.locator('#showSqlCheckbox').check();
+    await page.locator('#showSqlCheckbox').uncheck();
     await page.locator('#preferencesSaveBtn').click();
   });
 
-  test('resets to visible once localStorage is cleared - no server-side fallback for this one, unlike theme/auto-execute', async ({ page }) => {
+  test('resets to hidden once localStorage is cleared - no server-side fallback for this one, unlike theme/auto-execute', async ({ page }) => {
     await gotoApp(page);
     await openPreferencesModal(page);
-    await page.locator('#showSqlCheckbox').uncheck();
+    await page.locator('#showSqlCheckbox').check();
     await page.locator('#preferencesSaveBtn').click();
-    await expect(page.locator('#editorPaneSql')).toHaveClass(/hidden/);
+    await expect(page.locator('#editorPaneSql')).not.toHaveClass(/hidden/);
 
     await page.evaluate(() => window.localStorage.removeItem('datalectShowSql'));
     await gotoApp(page);
-    await expect(page.locator('#editorPaneSql')).not.toHaveClass(/hidden/);
+    await expect(page.locator('#editorPaneSql')).toHaveClass(/hidden/);
   });
 
   test('is never sent to the server - the /api/config save payload has no trace of it', async ({ page }) => {
     await gotoApp(page);
     await openPreferencesModal(page);
-    await page.locator('#showSqlCheckbox').uncheck();
+    await page.locator('#showSqlCheckbox').check();
 
     const configRequest = page.waitForRequest(
       (req) => req.url().includes('/api/config') && req.method() === 'POST'
@@ -97,16 +97,13 @@ test.describe('show SQL preference', () => {
 
     // Clean up.
     await openPreferencesModal(page);
-    await page.locator('#showSqlCheckbox').check();
+    await page.locator('#showSqlCheckbox').uncheck();
     await page.locator('#preferencesSaveBtn').click();
   });
 
-  test('a translation still works end-to-end with the SQL box hidden', async ({ page }) => {
+  test('a translation still works end-to-end with the SQL box hidden (the default)', async ({ page }) => {
     await mockTranslate(page, { sql: 'SELECT * FROM users LIMIT 10;' });
     await gotoApp(page);
-    await openPreferencesModal(page);
-    await page.locator('#showSqlCheckbox').uncheck();
-    await page.locator('#preferencesSaveBtn').click();
     await expect(page.locator('#editorPaneSql')).toHaveClass(/hidden/);
 
     await page.locator('#aiPrompt').fill('show me the first 10 users');
@@ -116,11 +113,6 @@ test.describe('show SQL preference', () => {
     // not silently reveal it again.
     await page.waitForTimeout(300);
     await expect(page.locator('#editorPaneSql')).toHaveClass(/hidden/);
-
-    // Clean up.
-    await openPreferencesModal(page);
-    await page.locator('#showSqlCheckbox').check();
-    await page.locator('#preferencesSaveBtn').click();
   });
 });
 
@@ -129,9 +121,9 @@ test.describe('show SQL / auto-execute linked rule', () => {
     await gotoApp(page);
     await openPreferencesModal(page);
 
-    // Start from a known state: auto-execute on, Show SQL off (also
-    // exercises that turning auto-execute off overrides an explicitly-off
-    // Show SQL, not just a default-on one).
+    // Start from a known state: auto-execute on, Show SQL off (its default -
+    // also exercises that turning auto-execute off overrides an off Show
+    // SQL regardless of whether that's the default or an explicit choice).
     const autoExecCheckbox = page.locator('#autoSqlExecuteCheckbox');
     if (!(await autoExecCheckbox.isChecked())) await autoExecCheckbox.check();
     await page.locator('#showSqlCheckbox').uncheck();

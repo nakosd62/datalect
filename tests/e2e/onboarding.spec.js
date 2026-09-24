@@ -81,11 +81,11 @@ test.describe('first-run onboarding', () => {
     // showing at all) still fails instead of looping forever.
     const title = page.locator('#tourTooltipTitle');
     for (let i = 0; i < 10; i++) {
-      if ((await title.textContent())?.includes('AI model')) break;
+      if ((await title.textContent())?.includes('responding to your questions')) break;
       await page.locator('#tourNextBtn').click();
     }
-    await expect(title).toHaveText('This is the AI model translating your questions');
-    await expect(page.locator('#tourTooltipBody')).toContainText('Google, Anthropic, OpenAI');
+    await expect(title).toHaveText('This is the model responding to your questions');
+    await expect(page.locator('#tourTooltipBody')).toContainText('Google, Anthropic, and OpenAI');
 
     // The spotlight is actually positioned over the model badge, not some
     // other element - regression guard against the step existing but
@@ -115,11 +115,11 @@ test.describe('first-run onboarding', () => {
     // Help/History/Preferences/sign-in/feedback).
     const title = page.locator('#tourTooltipTitle');
     for (let i = 0; i < 10; i++) {
-      if ((await title.textContent())?.includes('Peek at its schema')) break;
+      if ((await title.textContent())?.includes('dataset description')) break;
       await page.locator('#tourNextBtn').click();
     }
-    await expect(title).toHaveText('Peek at its schema anytime');
-    await expect(page.locator('#tourTooltipBody')).toContainText('"i" icon next to the badge');
+    await expect(title).toHaveText('Peek at the dataset description');
+    await expect(page.locator('#tourTooltipBody')).toContainText('sample questions you may ask');
 
     // The spotlight is actually positioned over the small standalone info
     // button, not the badge next to it - same regression guard as the
@@ -148,7 +148,7 @@ test.describe('first-run onboarding', () => {
       await page.locator('#tourNextBtn').click();
     }
     await expect(title).toHaveText('Make it yours');
-    await expect(page.locator('#tourTooltipBody')).toContainText('dark and light mode');
+    await expect(page.locator('#tourTooltipBody')).toContainText('dark & light mode');
 
     // The spotlight is actually positioned over the gear button, not some
     // other element - same regression guard as the model-badge test.
@@ -171,12 +171,12 @@ test.describe('first-run onboarding', () => {
       await page.locator('#tourNextBtn').click();
     }
     await expect(title).toContainText('preferences');
-    await expect(page.locator('#tourTooltipBody')).toContainText('preferences (color theme and auto-execute)');
+    await expect(page.locator('#tourTooltipBody')).toContainText('your preferences');
     // The model badge is ALSO folded into this same combined step at this
     // width (see .header-actions > .model-picker-wrapper in style.css) -
     // its own always-separate wide-header step (checked below) never
     // appears here, so its mention has to live in this body text instead.
-    await expect(page.locator('#tourTooltipBody')).toContainText('switch the AI model');
+    await expect(page.locator('#tourTooltipBody')).toContainText('switch the model');
   });
 
   test('on a narrow (mobile) header, the model badge\'s own step never appears - it is folded into the combined more-menu step above', async ({ page }) => {
@@ -192,7 +192,7 @@ test.describe('first-run onboarding', () => {
       if ((await nextBtn.textContent()) === 'Done') break;
       await nextBtn.click();
     }
-    expect(seenTitles.some((t) => t === 'This is the AI model translating your questions')).toBe(false);
+    expect(seenTitles.some((t) => t === 'This is the model responding to your questions')).toBe(false);
   });
 
   test('the tour includes a step spotlighting the Send Feedback button, only when the feature is configured', async ({ page }) => {
@@ -206,11 +206,11 @@ test.describe('first-run onboarding', () => {
     // tests above.
     const title = page.locator('#tourTooltipTitle');
     for (let i = 0; i < 10; i++) {
-      if ((await title.textContent())?.includes('Let us know')) break;
+      if ((await title.textContent())?.includes('Have feedback')) break;
       await page.locator('#tourNextBtn').click();
     }
-    await expect(title).toHaveText('Something not right? Let us know');
-    await expect(page.locator('#tourTooltipBody')).toContainText('send feedback');
+    await expect(title).toHaveText('Have feedback?');
+    await expect(page.locator('#tourTooltipBody')).toContainText('Send us feedback');
     await expect(page.locator('#tourNextBtn')).toHaveText('Done');
 
     // Regression guard against the step existing but pointing at the wrong
@@ -237,7 +237,7 @@ test.describe('first-run onboarding', () => {
       if ((await nextBtn.textContent()) === 'Done') break;
       await nextBtn.click();
     }
-    expect(seenTitles.some((t) => t?.includes('Let us know'))).toBe(false);
+    expect(seenTitles.some((t) => t?.includes('Have feedback'))).toBe(false);
   });
 
   test('on a narrow (mobile) header, the combined more-menu tour step mentions Send Feedback only when the feature is configured', async ({ page }) => {
@@ -333,5 +333,63 @@ test.describe('first-run onboarding', () => {
     expect(combined).not.toContain('sample prompt');
     expect(combined).not.toContain('quick prompt');
     expect(combined).not.toContain('example prompt');
+  });
+
+  // "Show SQL" (client.js's SHOW_SQL_STORAGE_KEY) now defaults to hidden -
+  // #editorPaneSql (and its .sql-bubble child the tour used to always
+  // spotlight) stays in the DOM either way, just display:none, so
+  // getTourSteps() has to actually check visibility rather than just
+  // querySelector()-ing for it; these two tests cover both sides of that.
+  test('the tour never spotlights the (hidden, default) SQL box, and the Preferences step covers it instead', async ({ page }) => {
+    await page.goto('/');
+    await expect(page.locator('#tourOverlay')).not.toHaveClass(/hidden/);
+    await expect(page.locator('#editorPaneSql')).toHaveClass(/hidden/);
+
+    // One single forward walk - checking the gear-button step's body
+    // in-place when reached, rather than a second pass afterward, since
+    // clicking Next/Done again once the tour has already reached its last
+    // step closes it (finishTour()), leaving nothing left to click.
+    const title = page.locator('#tourTooltipTitle');
+    const nextBtn = page.locator('#tourNextBtn');
+    const seenTitles = [];
+    let sawPrefsStep = false;
+    for (let i = 0; i < 20; i++) {
+      const currentTitle = await title.textContent();
+      seenTitles.push(currentTitle);
+      if (currentTitle === 'Make it yours') {
+        sawPrefsStep = true;
+        await expect(page.locator('#tourTooltipBody')).toContainText('whether it is shown at all');
+      }
+      if ((await nextBtn.textContent()) === 'Done') break;
+      await nextBtn.click();
+    }
+    expect(seenTitles).not.toContain("We'll turn that into SQL");
+    expect(sawPrefsStep).toBe(true);
+  });
+
+  test('the tour spotlights the SQL box when Show SQL has already been turned on', async ({ page }) => {
+    await page.addInitScript(() => {
+      window.localStorage.setItem('datalectShowSql', '1');
+    });
+    await page.goto('/');
+    await expect(page.locator('#tourOverlay')).not.toHaveClass(/hidden/);
+    await expect(page.locator('#editorPaneSql')).not.toHaveClass(/hidden/);
+
+    const title = page.locator('#tourTooltipTitle');
+    const nextBtn = page.locator('#tourNextBtn');
+    for (let i = 0; i < 10; i++) {
+      if ((await title.textContent()) === "We'll turn that into SQL") break;
+      await nextBtn.click();
+    }
+    await expect(title).toHaveText("We'll turn that into SQL");
+
+    // Same spotlight-position regression guard as the model-badge/gear
+    // tests above - the step exists AND points at the real, now-visible box.
+    const sqlBox = await page.locator('.sql-bubble').boundingBox();
+    await expect(async () => {
+      const spotlightBox = await page.locator('#tourSpotlight').boundingBox();
+      expect(Math.abs(spotlightBox.x - sqlBox.x)).toBeLessThan(10);
+      expect(Math.abs(spotlightBox.y - sqlBox.y)).toBeLessThan(10);
+    }).toPass({ timeout: 2000 });
   });
 });

@@ -22,7 +22,11 @@
 // own, via route.fetch(). POST /api/report-issue is always mocked (no
 // spec here should ever depend on - or risk - a real SMTP send).
 
-const { test, expect, gotoApp, mockTranslate, mockExecute } = require('./fixtures');
+// Uses testShowSqlVisible (aliased to `test`) rather than the plain `test`
+// fixture - see that fixture's own comment in fixtures.js - since this
+// suite drives the app through the SQL box itself (#runBtn,
+// #reportSqlBtn/#reportSqlGoodBtn), which client.js now hides by default.
+const { testShowSqlVisible: test, expect, gotoApp, mockTranslate, mockExecute } = require('./fixtures');
 
 async function mockIssueReportingEnabled(page, enabled) {
   await page.route('**/api/config', async (route) => {

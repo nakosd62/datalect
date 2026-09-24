@@ -78,7 +78,7 @@ from auth import get_or_create_session_id, get_current_user_identity, apply_sess
 from db import (
     resolve_conn_str, get_database_schema, record_translation,
     resolve_in_scope_descriptors, build_router_candidate_summaries,
-    resolve_descriptor_by_reference,
+    resolve_descriptor_by_reference, resolve_dataset_identity, resolve_group_identity,
 )
 from backends import get_backend
 from backends.base import SCHEMA_TABLES_ONLY, derive_tables_only_schema_text
@@ -363,6 +363,7 @@ from summarize_routes import (
 from chart_helpers import (
     _CHART_MIN_ROWS, _column_looks_numeric, _pick_chartable_results,
     _describe_chartable_results, _clean_visualization, _clean_visualizations,
+    _extract_chart_link_captions,
 )
 
 
@@ -625,10 +626,20 @@ def translate_query():
                 # num_candidates == len(candidate_summaries) and the
                 # multi-candidate schema block, instead of through that
                 # thin single-dataset-only wrapper.
+                #
+                # dataset_type/dataset_name attribute this call's own
+                # llm_usage row to the whole configured group being routed
+                # across (db.py's resolve_group_identity), not any single
+                # one of its member connections - this call hasn't picked
+                # one yet, that's the whole point of it.
+                group_dataset_type, group_dataset_name = resolve_group_identity(
+                    session_data.get('in_scope_group_id') or ''
+                )
                 triage_result = yield from run_triage_call(
                     len(candidate_summaries), _build_candidate_schema_block(candidate_summaries),
                     prompt, provider, client, llm_model, history=history,
-                    api_key=api_key, using_byok=bool(byok_key),
+                    api_key=api_key, using_byok=bool(byok_key), user_identity=user_identity,
+                    dataset_type=group_dataset_type, dataset_name=group_dataset_name,
                 )
                 # Phase A's own elapsed time and LLM usage, isolated from
                 # whatever Phase B work (if any) happens next below - NOT
@@ -677,26 +688,36 @@ def translate_query():
                     # running real SQL against a database the user never
                     # asked about, so this shows a fixed apology instead.
                     # WHICH apology depends on WHY it failed (see
-                    # triage_all_mode_question's docstring): "api_error"
+                    # run_triage_call's own docstring): "api_error"
                     # distinguishes a real technical/capacity failure (the
                     # LLM call itself raised and its own retry budget -
                     # key rotation and/or transient-error retries - ran
                     # out, e.g. every configured Gemini key was out of
-                    # capacity) from a response that genuinely came back
-                    # unparseable both times. These used to be
-                    # indistinguishable, both showing _TRIAGE_FAILURE_TEXT
-                    # - actively misleading for the api_error case, since
-                    # it reads as "I couldn't understand your question"
-                    # when the honest answer is a real, specific API/
-                    # capacity problem - format_llm_error_for_user() below
-                    # builds that message from triage_result["error"] (the
-                    # raw exception - see triage_all_mode_question's
-                    # docstring), including the actual provider error text,
-                    # not just a generic "try again" apology.
+                    # capacity) from a response that came back unusable
+                    # for one of two reasons that USED to be conflated:
+                    # genuinely unparseable garbage both times (nothing
+                    # honest to say beyond the generic _TRIAGE_FAILURE_TEXT
+                    # apology - "language_mismatch_text" is None here), or
+                    # a real, well-formed response that just stayed in the
+                    # wrong language even after one corrective retry (a
+                    # user-reported gap: this used to show the exact same
+                    # generic apology, with the actual reason computed but
+                    # discarded server-side, leaving no way to tell the two
+                    # failures apart or ever learn "why"). format_llm_error_
+                    # for_user() below builds the api_error message from
+                    # triage_result["error"] (the raw exception - see run_
+                    # triage_call's docstring), including the actual
+                    # provider error text; language_mismatch_text is
+                    # already a clean, server-written, user-safe sentence
+                    # (see run_triage_call's own docstring for why it's
+                    # safe to show directly, unlike the unparseable case's
+                    # raw model output) shown the same way.
                     if triage_result.get("api_error"):
                         generated_sql = "*** NO SQL *** " + format_llm_error_for_user(
                             provider, llm_model, triage_result["error"], using_byok=bool(byok_key)
                         )
+                    elif triage_result.get("language_mismatch_text"):
+                        generated_sql = "*** NO SQL *** " + triage_result["language_mismatch_text"]
                     else:
                         generated_sql = _TRIAGE_FAILURE_TEXT
                     triage_log_text = generated_sql
@@ -1060,9 +1081,11 @@ def translate_query():
             # below already gives. client.js needs no changes for this -
             # 'retrying' is already handled generically regardless of which
             # server-side call produced it.
+            single_dataset_type, single_dataset_name = resolve_dataset_identity(conn_str, user_identity)
             triage_result = yield from triage_single_dataset_question(
                 triage_schema_block, prompt, provider, client, llm_model, history=history,
-                api_key=api_key, using_byok=bool(byok_key),
+                api_key=api_key, using_byok=bool(byok_key), user_identity=user_identity,
+                dataset_type=single_dataset_type, dataset_name=single_dataset_name,
             )
             triage_duration = round(1000 * (time.perf_counter() - triage_start_time))
             triage_usage = dict(triage_result.get("usage") or {})
@@ -1120,16 +1143,18 @@ def translate_query():
                     # guess at "general"/"schema"/"help"/"sql": a wrong
                     # guess here could mean silently running real SQL the
                     # user never actually asked for. WHICH apology depends
-                    # on WHY it failed - same "api_error" distinction (and
-                    # the same format_llm_error_for_user()/_TRIAGE_FAILURE_
-                    # TEXT choice between them) as dataset-group mode's own
-                    # triage failure handling above; see triage_single_
-                    # dataset_question's docstring for what "api_error"
-                    # means here.
+                    # on WHY it failed - same "api_error"/
+                    # "language_mismatch_text" distinction (and the same
+                    # three-way choice between them) as dataset-group
+                    # mode's own triage failure handling above; see
+                    # run_triage_call's own docstring for what each of
+                    # those means.
                     if triage_result.get("api_error"):
                         generated_sql = "*** NO SQL *** " + format_llm_error_for_user(
                             provider, llm_model, triage_result["error"], using_byok=bool(byok_key)
                         )
+                    elif triage_result.get("language_mismatch_text"):
+                        generated_sql = "*** NO SQL *** " + triage_result["language_mismatch_text"]
                     else:
                         generated_sql = _TRIAGE_FAILURE_TEXT
 
@@ -1246,6 +1271,10 @@ def translate_query():
                     while True:
                         try:
                             raw_response, usage_info = provider.call(client, llm_model, llm_input, system_instruction)
+                            state_store.record_llm_usage(
+                                user_identity, "sqlgen", llm_model, usage_info,
+                                dataset_type=single_dataset_type, dataset_name=single_dataset_name,
+                            )
                             break
                         except Exception as e:
                             retry_action = provider.classify_error(e)

@@ -613,10 +613,43 @@ def _resolve_database_name(descriptor, user_id):
     return get_conn_identifier(descriptor)
 
 
-def record_translation(user_id, conn_str, nl_prompt, sql_command, gemini_model, duration, input_tokens, output_tokens, total_tokens, thinking_tokens, cached_content_tokens):
+def resolve_dataset_identity(conn_str, user_id=None):
+    """(dataset_type, dataset_name) for a single connection - descriptor or
+    legacy raw string, same as get_conn_identifier/_resolve_database_name
+    above accept - e.g. ("postgres", "E-Commerce Store"). This is exactly
+    the same (db_type, db_name) pair record_translation below has always
+    resolved and logged for the "translations" table, pulled out into its
+    own small public helper so record_llm_usage's own callers (triage,
+    Phase B sqlgen fan-out, summary) can tag a usage row with the same
+    human-readable dataset identity without duplicating this lookup or
+    reaching into _resolve_database_name (a private helper) directly."""
     descriptor = _to_descriptor(conn_str)
     db_type = (descriptor or {}).get("type") or "postgres"
     db_name = _resolve_database_name(descriptor, user_id)
+    return db_type, db_name
+
+
+def resolve_group_identity(group_id):
+    """(dataset_type, dataset_name) for a dataset GROUP - the "all
+    databases" mode counterpart to resolve_dataset_identity above, for a
+    call (triage's own multi-candidate call, or Phase C's multi-database
+    summary call) that's attributable to a whole configured group rather
+    than any one connection. dataset_type is always the fixed marker
+    "Dataset Group" (matching webClient/client.js's own getBadgeTypeLabel
+    - the header badge's identical "(Dataset Group)" suffix for a group-
+    mode session), never a dialect name, since a group can span several
+    dialects at once. dataset_name is the group's own configured "name"
+    (e.g. "Sports"), or the same "Dataset Group" fallback when group_id
+    doesn't match any configured group (removed/renamed mid-session - see
+    _resolve_group_configured_descriptors' own docstring for this same
+    "stale group_id" case)."""
+    group = next((g for g in CONFIGURED_DB_GROUPS if g.get("id") == group_id), None)
+    name = (group or {}).get("name") or "Dataset Group"
+    return "Dataset Group", name
+
+
+def record_translation(user_id, conn_str, nl_prompt, sql_command, gemini_model, duration, input_tokens, output_tokens, total_tokens, thinking_tokens, cached_content_tokens):
+    db_type, db_name = resolve_dataset_identity(conn_str, user_id)
     state_store.record_translation(
         user_id, db_type, db_name, nl_prompt, sql_command, gemini_model,
         duration, input_tokens, output_tokens, total_tokens, thinking_tokens, cached_content_tokens

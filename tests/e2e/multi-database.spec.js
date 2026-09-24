@@ -20,7 +20,11 @@
 // wiring, with the real per-field validation already covered server-side
 // by tests/server/test_connection_scope.py.
 
-const { test, expect, gotoApp } = require('./fixtures');
+// Uses testShowSqlVisible (aliased to `test`) rather than the plain `test`
+// fixture - see that fixture's own comment in fixtures.js - since this
+// suite drives the app through the SQL box itself (#runBtn), which
+// client.js now hides by default.
+const { testShowSqlVisible: test, expect, gotoApp } = require('./fixtures');
 
 function buildConfigState() {
   return {

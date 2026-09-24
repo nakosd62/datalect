@@ -67,7 +67,10 @@ from flask import Blueprint, request, jsonify, Response, stream_with_context
 
 from app_config import logger, state_store, MAX_TRANSLATION_ATTEMPTS
 from auth import get_or_create_session_id, get_current_user_identity, apply_session_cookie
-from db import resolve_conn_str, get_database_schema, resolve_descriptor_by_reference
+from db import (
+    resolve_conn_str, get_database_schema, resolve_descriptor_by_reference,
+    resolve_dataset_identity, resolve_group_identity,
+)
 from backends.base import derive_tables_only_schema_text
 from connection_router import is_label_only_response, strip_markdown_fence
 # `import translate_routes` (the module, not `from translate_routes import
@@ -323,7 +326,7 @@ def _default_language_text_extractor(parsed):
 def _summarize_with_retry(prompt_content, schema_block, system_instruction, provider, client, model,
                            api_key=None, tried_keys=None, using_byok=False, log_label="Summarization",
                            expected_language_code=None, content_parser=None, language_text_extractor=None,
-                           invalid_content_error=None):
+                           invalid_content_error=None, user_identity=None, dataset_type=None, dataset_name=None):
     """Shared bounded-retry machinery behind BOTH summarize_all_mode_results
     ("all databases" mode's Phase C, below) and summarize_single_
     connection_results (single-connection mode's own equivalent, added
@@ -449,7 +452,17 @@ def _summarize_with_retry(prompt_content, schema_block, system_instruction, prov
     the app's "*** NO SQL ***" convention, or the "**Name:**" per-database
     tagging reconstructed by /api/summarize-results below) - that stays
     the caller's job, exactly as it always has, so it lives in exactly one
-    place per caller."""
+    place per caller.
+
+    `user_identity`/`dataset_type`/`dataset_name`, when given, log this
+    call's own "summary" row via state_store.record_llm_usage() the
+    moment provider.call() actually succeeds - see that method's
+    docstring. Both callers resolve dataset_type/dataset_name themselves
+    before delegating here (single-connection mode via db.py's
+    resolve_dataset_identity for its one connection, "all databases" mode
+    via resolve_group_identity for the whole group being summarized
+    across) since this shared function has no connection/group of its
+    own to resolve one from."""
     content_parser = content_parser or _default_content_parser
     language_text_extractor = language_text_extractor or _default_language_text_extractor
     if api_key is None:
@@ -466,6 +479,10 @@ def _summarize_with_retry(prompt_content, schema_block, system_instruction, prov
         while True:
             try:
                 text, usage = provider.call(client, model, llm_input, system_instruction)
+                state_store.record_llm_usage(
+                    user_identity, "summary", model, usage,
+                    dataset_type=dataset_type, dataset_name=dataset_name,
+                )
                 break
             except Exception as e:
                 last_error = e
@@ -686,7 +703,16 @@ def _clean_summary_response(raw_text, num_databases, chartable_by_index=None):
     meant to be written when the question genuinely asks for something
     spanning multiple databases): a missing, non-string, or blank value
     simply becomes None, never a reason to invalidate the rest of a
-    response that otherwise checks out."""
+    response that otherwise checks out.
+
+    _clean_visualizations is handed every per_database paragraph plus
+    cross_database (already-cleaned, stripped text - not the model's raw
+    JSON) as its own link_texts, so it can find each chart's caption from
+    the model's inline "[...](chart:N)" link wherever it actually landed -
+    see chart_helpers.py's _extract_chart_link_captions/_clean_visualization
+    docstrings for why a chart with no such link anywhere in this turn's
+    text never survives validation, regardless of what "visualizations"
+    itself says."""
     if not raw_text:
         return None
     cleaned = strip_markdown_fence(raw_text)
@@ -720,7 +746,9 @@ def _clean_summary_response(raw_text, num_databases, chartable_by_index=None):
     cross_database = parsed.get("cross_database")
     cross_database = cross_database.strip() if isinstance(cross_database, str) and cross_database.strip() else None
 
-    visualizations = _clean_visualizations(parsed.get("visualizations"), chartable_by_index or {})
+    visualizations = _clean_visualizations(
+        parsed.get("visualizations"), chartable_by_index or {}, *per_database.values(), cross_database,
+    )
 
     return {
         "label": label, "per_database": per_database, "cross_database": cross_database,
@@ -757,7 +785,8 @@ def _summary_language_text(parsed):
 
 
 def summarize_all_mode_results(user_question, database_results, provider, client, model, user_identity=None,
-                                api_key=None, tried_keys=None, using_byok=False):
+                                api_key=None, tried_keys=None, using_byok=False,
+                                dataset_type=None, dataset_name=None):
     """"All databases" mode's Phase C - see the section comment above for
     the fuller picture of when/why this runs. A brief, structured answer
     to `user_question` - one short paragraph per database, over the
@@ -803,7 +832,14 @@ def summarize_all_mode_results(user_question, database_results, provider, client
     ({"label", "per_database", "cross_database", "visualizations"} - see
     its docstring), never the model's raw JSON text. See
     _summarize_with_retry's docstring for the exact meaning of `error` on
-    failure."""
+    failure.
+
+    `dataset_type`/`dataset_name` (new, alongside `user_identity`) are
+    this turn's own llm_usage row's dataset identity - the route handler
+    resolves these via db.py's resolve_group_identity (this call spans
+    every in-scope database in the group at once, never just one) and
+    passes them straight through to _summarize_with_retry, which is what
+    actually logs the row once the call succeeds."""
     expected_language_code = translate_routes._detect_language(user_question)
     chartable_by_index = _pick_chartable_results(database_results)
     prompt_content = _build_summary_prompt(
@@ -818,6 +854,7 @@ def summarize_all_mode_results(user_question, database_results, provider, client
         content_parser=_make_summary_content_parser(num_databases, chartable_by_index),
         language_text_extractor=_summary_language_text,
         invalid_content_error="response was not valid, complete per-database summary JSON",
+        user_identity=user_identity, dataset_type=dataset_type, dataset_name=dataset_name,
     ))
 
 
@@ -923,9 +960,13 @@ def summarize_results():
         if callable(close_fn):
             cancel_token, cancel_handle = cancel_registry.register(session_id, close_fn)
         try:
+            group_dataset_type, group_dataset_name = resolve_group_identity(
+                session_data.get('in_scope_group_id') or ''
+            )
             parsed, usage, error = yield from summarize_all_mode_results(
                 prompt, database_results, provider, client, llm_model, user_identity=user_identity,
                 api_key=api_key, using_byok=bool(byok_key),
+                dataset_type=group_dataset_type, dataset_name=group_dataset_name,
             )
         finally:
             if cancel_token is not None:
@@ -1204,10 +1245,13 @@ def _clean_single_summary_response(raw_text, chartable_by_index):
     same as a missing per-database paragraph does for Phase C - since
     there's nothing sensible to show in its place. "visualizations", by
     contrast, is validated leniently: _clean_visualizations silently drops
-    any entry that's invalid/unknown/absent rather than ever invalidating
-    the whole response - an empty {} result is always a fine, valid
-    outcome, never a reason to retry - only "summary" itself failing
-    validation is."""
+    any entry that's invalid/unknown/absent - including any entry whose
+    index is never linked from "summary" itself via the model's own inline
+    "[...](chart:N)" markup, its ONE actual source of a caption now (see
+    chart_helpers.py's _extract_chart_link_captions/_clean_visualization
+    docstrings) - rather than ever invalidating the whole response; an
+    empty {} result is always a fine, valid outcome, never a reason to
+    retry - only "summary" itself failing validation is."""
     if not raw_text:
         return None
     cleaned = strip_markdown_fence(raw_text)
@@ -1223,7 +1267,7 @@ def _clean_single_summary_response(raw_text, chartable_by_index):
         return None
     summary = summary.strip()
 
-    visualizations = _clean_visualizations(parsed.get("visualizations"), chartable_by_index)
+    visualizations = _clean_visualizations(parsed.get("visualizations"), chartable_by_index, summary)
     return {"summary": summary, "visualizations": visualizations}
 
 
@@ -1248,7 +1292,8 @@ def _single_summary_language_text(parsed):
 
 
 def summarize_single_connection_results(user_question, schema, sql, statement_results, provider, client, model,
-                                         api_key=None, tried_keys=None, using_byok=False):
+                                         api_key=None, tried_keys=None, using_byok=False,
+                                         user_identity=None, dataset_type=None, dataset_name=None):
     """Single-connection mode's equivalent of summarize_all_mode_results
     above - see this file's "Single-connection mode's own post-execution
     results summarization" section comment for the fuller picture, and
@@ -1286,7 +1331,14 @@ def summarize_single_connection_results(user_question, schema, sql, statement_re
     into a plain summary string; that stays the caller's job (see
     stream_summarize_result below), exactly the same "parsed, not
     presentation-wrapped" contract summarize_all_mode_results' own
-    {"label", "per_database", "cross_database"} return already has."""
+    {"label", "per_database", "cross_database"} return already has.
+
+    `user_identity`/`dataset_type`/`dataset_name` (new) are this turn's
+    own llm_usage row's identity - the route handler resolves dataset_
+    type/dataset_name via db.py's resolve_dataset_identity for this
+    session's one connection and passes them straight through to
+    _summarize_with_retry, which actually logs the row once the call
+    succeeds."""
     expected_language_code = translate_routes._detect_language(user_question)
     chartable_by_index = _pick_chartable_results(statement_results)
     prompt_content = _build_single_summary_prompt(
@@ -1300,6 +1352,7 @@ def summarize_single_connection_results(user_question, schema, sql, statement_re
                                "shape, or \"summary\" itself was empty/label-only",
         api_key=api_key, tried_keys=tried_keys, using_byok=using_byok,
         log_label="Single-connection results summarization", expected_language_code=expected_language_code,
+        user_identity=user_identity, dataset_type=dataset_type, dataset_name=dataset_name,
     ))
 
 
@@ -1381,6 +1434,7 @@ def summarize_result():
         # definition.
         conn_str = resolve_conn_str(data.get('database_url'), user_identity)
         schema = get_summary_schema_text(conn_str, user_identity)
+        summary_dataset_type, summary_dataset_name = resolve_dataset_identity(conn_str, user_identity)
 
         start_time = time.perf_counter()
         client = provider.make_client(api_key)
@@ -1391,7 +1445,8 @@ def summarize_result():
         try:
             parsed, usage, error = yield from summarize_single_connection_results(
                 prompt, schema, sql, statement_results, provider, client, llm_model, api_key=api_key,
-                using_byok=bool(byok_key),
+                using_byok=bool(byok_key), user_identity=user_identity,
+                dataset_type=summary_dataset_type, dataset_name=summary_dataset_name,
             )
         finally:
             if cancel_token is not None:

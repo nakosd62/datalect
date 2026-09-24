@@ -725,8 +725,9 @@ document.addEventListener('DOMContentLoaded', async () => {
   // like THEME_STORAGE_KEY - see SHOW_SQL_STORAGE_KEY below), unlike
   // auto_sql_execute: nothing server-side reads or reacts to this, it's
   // purely a local layout choice, so there's nothing for the backend to
-  // know. Defaults to visible.
-  let showSqlEnabled = true;
+  // know. Defaults to hidden (overwritten below by loadShowSqlPreference()
+  // before first use, but kept consistent with that default here too).
+  let showSqlEnabled = false;
   // True when running on Cloud Run and the current request has no verified
   // login (i.e. the backend resolved it to a per-session "anonymous:..."
   // identity - see auth.py's ANONYMOUS_USER_ID_PREFIX). Anonymous users get
@@ -1373,6 +1374,29 @@ document.addEventListener('DOMContentLoaded', async () => {
     return helpContentPromise;
   }
 
+  // "Replay guided tour" now lives as a plain <a id="replayTourBtn"> inline
+  // inside help.html's own text (right next to the "Use this link to get a
+  // walkthrough of the application:" sentence it's documenting), rather
+  // than a separate toolbar button above #helpModalBody - see index.html's
+  // own comment at #helpModalBody for the "why". Because it's part of the
+  // fetched HTML fragment, it only exists in the DOM once
+  // helpModalBody.innerHTML has actually been set, and a fresh innerHTML
+  // assignment (every open, even from the cached promise) wipes out
+  // whatever listener a previous open attached - so this has to be called
+  // again after every such assignment, not just once at page load like the
+  // old static button's listener was.
+  function wireHelpModalLinks() {
+    if (!helpModalBody) return;
+    const replayLink = helpModalBody.querySelector('#replayTourBtn');
+    if (replayLink) {
+      replayLink.addEventListener('click', (e) => {
+        e.preventDefault();
+        helpModal.classList.add('hidden');
+        startGuidedTour();
+      });
+    }
+  }
+
   function openHelpModal() {
     if (!helpModal) return;
     helpModal.classList.remove('hidden');
@@ -1381,6 +1405,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     loadHelpContent()
       .then(html => {
         helpModalBody.innerHTML = html;
+        wireHelpModalLinks();
       })
       .catch(err => {
         helpModalBody.innerHTML = '<p class="text-muted">Sorry, the documentation could not be loaded. Please try again.</p>';
@@ -1640,12 +1665,31 @@ document.addEventListener('DOMContentLoaded', async () => {
   // object covering all three state variables together (editorAreaHeightPx/
   // nlPaneWidthPx/nlPaneHeightPx) so a single read/write covers both
   // dividers regardless of which one actually moved.
+  // "Show SQL" itself (SHOW_SQL_STORAGE_KEY/applySqlPaneVisibility/
+  // setShowSqlEnabled/the initial showSqlEnabled = .../applySqlPaneVisibility(...)
+  // call) still lives further down, in its own SHOW SQL section - only
+  // loadShowSqlPreference() itself is hoisted up here too (a pure
+  // localStorage read, no DOM dependency), because editorAreaHeightPx's own
+  // default just below needs to know it: in the wide/side-by-side layout,
+  // editorAreaHeightPx doubles as the NL box's own height (see
+  // applyEditorPaneHeights()), and the SQL box's long-standing 100px
+  // default only makes sense once the SQL box itself is actually visible.
+  const SHOW_SQL_STORAGE_KEY = 'datalectShowSql';
+  function loadShowSqlPreference() {
+    try {
+      const stored = window.localStorage.getItem(SHOW_SQL_STORAGE_KEY);
+      return stored === null ? false : stored === '1'; // unset -> default hidden
+    } catch (e) {
+      return false; // localStorage unavailable - default to hidden either way
+    }
+  }
+
   const MIN_EDITOR_AREA_PX = 56;      // matches .speech-bubble-wrapper.sql-bubble's own CSS min-height fallback
   const MIN_RESULTS_AREA_PX = 150;    // leaves room for the results toolbar + a couple of rows
   const MIN_NL_PANE_WIDTH_PX = 260;   // side-by-side layout, width split
   const MIN_SQL_PANE_WIDTH_PX = 300;  // a bit more than the NL pane's - room for the Execute/report-button overlay
-  const MIN_NL_PANE_HEIGHT_PX = 40;   // stacked layout, height split - about one line + padding
-  const DEFAULT_NL_PANE_HEIGHT_PX = 44; // this box's own natural/compact height (34px textarea + 4px+4px padding + 1px+1px border)
+  const MIN_NL_PANE_HEIGHT_PX = 40;   // stacked layout, height split - kept <= DEFAULT_NL_PANE_HEIGHT_PX below, so a drag/reflow clamp can never override the default upward
+  const DEFAULT_NL_PANE_HEIGHT_PX = 70; // this box's own default height (stacked layout, and - see editorAreaHeightPx below - also the wide layout whenever Show SQL starts hidden)
   const EDITOR_PANES_RESIZER_HIT_PX = 9;
   const ARROW_STEP_PX = 24;
   const EDITOR_LAYOUT_STORAGE_KEY = 'datalectEditorLayout';
@@ -1694,7 +1738,18 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   const savedEditorLayout = loadEditorLayoutPreference();
 
-  let editorAreaHeightPx = readSavedPx(savedEditorLayout && savedEditorLayout.editorAreaHeightPx, 100); // the SQL box's own height - default matches its long-standing 100px CSS default
+  let editorAreaHeightPx = readSavedPx(
+    savedEditorLayout && savedEditorLayout.editorAreaHeightPx,
+    // The SQL box's own height, matching its long-standing 100px CSS
+    // default - but ONLY once the SQL box is actually visible from the
+    // start (see loadShowSqlPreference() above). With Show SQL now
+    // defaulting to hidden, this same variable doubles as the NL box's
+    // OWN height in the wide/side-by-side layout (see
+    // applyEditorPaneHeights() below), so it starts at the NL box's own
+    // compact default instead - the 100px figure has nothing to do with
+    // an invisible SQL box.
+    loadShowSqlPreference() ? 100 : DEFAULT_NL_PANE_HEIGHT_PX
+  );
   let nlPaneWidthPx = readSavedPx(savedEditorLayout && savedEditorLayout.nlPaneWidthPx, null);     // side-by-side layout only - null means "default 50/50, no custom flex-basis yet"
   let nlPaneHeightPx = readSavedPx(savedEditorLayout && savedEditorLayout.nlPaneHeightPx, DEFAULT_NL_PANE_HEIGHT_PX); // stacked layout only
 
@@ -1968,18 +2023,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   // own comment in style.css for the wide (side-by-side) layout; the
   // stacked layout needs no extra handling, since hiding the SQL pane there
   // just leaves the NL pane as the sole block already filling that column.
+  // SHOW_SQL_STORAGE_KEY/loadShowSqlPreference() themselves are declared
+  // earlier now (see that declaration's own comment) - only the rest of
+  // this section (applying/setting the preference) still lives here.
   // ===========================================================================
-  const SHOW_SQL_STORAGE_KEY = 'datalectShowSql';
-
-  function loadShowSqlPreference() {
-    try {
-      const stored = window.localStorage.getItem(SHOW_SQL_STORAGE_KEY);
-      return stored === null ? true : stored === '1'; // unset -> default visible
-    } catch (e) {
-      return true; // localStorage unavailable - default to visible either way
-    }
-  }
-
   function applySqlPaneVisibility(visible) {
     if (editorPaneSql) editorPaneSql.classList.toggle('hidden', !visible);
     if (editorPanesResizer) editorPanesResizer.classList.toggle('hidden', !visible);
@@ -2005,7 +2052,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
-  // Applies whatever was saved (or the default, visible) as soon as the
+  // Applies whatever was saved (or the default, hidden) as soon as the
   // editor panes themselves exist - before the very first paint the user
   // actually interacts with, same spirit as syncEditorLayoutMode() just
   // above.
@@ -3104,9 +3151,42 @@ document.addEventListener('DOMContentLoaded', async () => {
     return { count, label: 'Multiple databases', names };
   }
 
+  // The header badge's own "(<type>)" suffix (per explicit request: "exactly
+  // how it shows in the dataset selector dialog") - reuses the exact same
+  // dialect_name/type fallback chain renderPresetOption() above already
+  // uses for that dialog's own "<name> (<type>)" rows, and "Dataset Group"
+  // for group mode matches renderGroupOption()'s own "(Dataset Group)"
+  // parenthetical there too, so the badge and the dialog never disagree on
+  // what a given selection is called. Returns '' (no parenthetical at all)
+  // for the legacy multi-select subset, which can mix presets of different
+  // dialects and custom connections - there's no single accurate type to
+  // show for that case, unlike an admin-curated group (always presets only,
+  // per summarizeInScopeConnections' own comment) or a single connection.
+  function getBadgeTypeLabel(data, matchedPreset) {
+    if (data?.in_scope_mode === 'group') return 'Dataset Group';
+    const presetIds = data?.in_scope_preset_ids || [];
+    const customKeys = data?.in_scope_custom_connection_keys || [];
+    if (presetIds.length + customKeys.length > 1) return '';
+    if (data?.active_is_custom) {
+      // Custom connections never get a server-computed dialect_name (that's
+      // a preset-only field added by config_routes.py's
+      // _redact_preset_for_client() - see renderPresetOption()'s own
+      // comment) - data.active_database_type is the closest (raw, e.g.
+      // "postgres" rather than "PostgreSQL") equivalent still on hand.
+      return data?.active_database_type || '';
+    }
+    return matchedPreset?.dialect_name || matchedPreset?.type || '';
+  }
+
   async function updateConnectionDetails(data) {
     const badge = document.getElementById('configTriggerBadge');
     const inScopeSummary = summarizeInScopeConnections(data);
+    // Computed up here (rather than only in the authenticated-user path
+    // below, where this used to live) so the anonymous-user branch just
+    // below can also use it for its own badge type suffix - CONFIGURED_DBS
+    // (redacted, but dialect_name/type survive redaction) and
+    // data.active_preset_id are both available for anonymous sessions too.
+    const matchedPreset = CONFIGURED_DBS.find(db => db.id === data?.active_preset_id);
 
     if (isAnonymousUser && !data?.active_is_custom) {
       // The backend withholds a PRESET's username/connection string from
@@ -3120,8 +3200,10 @@ document.addEventListener('DOMContentLoaded', async () => {
       // path an authenticated user gets, below.
       if (badge) badge.style.display = '';
       const anonDbLabel = inScopeSummary.label || data?.database_name || 'Database';
+      const anonTypeLabel = getBadgeTypeLabel(data, matchedPreset);
+      const anonBadgeText = anonTypeLabel ? `${anonDbLabel} (${anonTypeLabel})` : anonDbLabel;
       if (connDbName) {
-        connDbName.textContent = data?.active_connection_missing ? `⚠ ${anonDbLabel}` : anonDbLabel;
+        connDbName.textContent = data?.active_connection_missing ? `⚠ ${anonBadgeText}` : anonBadgeText;
       }
       if (configTriggerBadge) {
         configTriggerBadge.title = data?.active_connection_missing
@@ -3145,7 +3227,6 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     if (badge) badge.style.display = '';
 
-    const matchedPreset = CONFIGURED_DBS.find(db => db.id === data.active_preset_id);
     // Matching by the preset's stable "id" (not URL) also works for
     // anonymous users, whose CONFIGURED_DBS entries never carry a "url" at
     // all (see the redacted configured_databases the server sends them). A
@@ -3190,8 +3271,16 @@ document.addEventListener('DOMContentLoaded', async () => {
         : `Connected to: ${dbDisplayName} (Click to configure)`;
     }
 
+    // Badge type suffix (per explicit request: "(Postgres)" etc., exactly
+    // matching the dataset selector dialog's own "<name> (<type>)" rows -
+    // see getBadgeTypeLabel()'s own comment above) - appended only when
+    // there's an actual single type to show; the legacy multi-select
+    // subset (mixed dialects/custom connections, no single accurate type)
+    // shows just the plain name, same as before this feature existed.
+    const typeLabel = getBadgeTypeLabel(data, matchedPreset);
+
     if (connDbName) {
-      connDbName.textContent = dbDisplayName;
+      connDbName.textContent = typeLabel ? `${dbDisplayName} (${typeLabel})` : dbDisplayName;
     }
 
     document.title = `Datalect`;
@@ -5794,7 +5883,15 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   function getTourSteps() {
     const promptWrapper = aiPrompt ? aiPrompt.closest('.speech-bubble-wrapper') : null;
-    const sqlWrapper = document.querySelector('.sql-bubble');
+    // Show SQL (see SHOW_SQL_STORAGE_KEY/applySqlPaneVisibility() above)
+    // defaults to OFF now, and .sql-bubble stays in the DOM (just
+    // display:none via #editorPaneSql's own .hidden class) even then - so
+    // querySelector() alone would still find it and spotlight a zero-size
+    // rect, same failure mode the isNarrowHeader comment just below heads
+    // off for the header buttons. Only offer this step at all when the box
+    // is genuinely visible; the prefsBtn/moreMenuBtn steps further down
+    // tell the tourgoer where to turn it on otherwise.
+    const sqlWrapper = showSqlEnabled ? document.querySelector('.sql-bubble') : null;
     const resultsCard = document.querySelector('.table-card');
     const historyNav = document.querySelector('.inline-history-nav');
     const authContainer = googleAuthEnabled ? document.getElementById('g_id_signin') : null;
@@ -5815,54 +5912,54 @@ document.addEventListener('DOMContentLoaded', async () => {
       {
         target: promptWrapper,
         title: 'Ask your question here',
-        body: "Type what you want to know in plain English or any other language and hit Enter."
+        body: "Type what you want to know in  English or any other language and hit Enter."
       },
       {
         target: sqlWrapper,
         title: "We'll turn that into SQL",
-        body: "We'll translate your question into a SQL query here. Review it - or edit it by hand - then click Execute to run it."
+        body: "We'll translate your question into a SQL query here. Review it or edit it, then click Execute to run it."
       },
       {
         target: resultsCard,
         title: 'Your results land here',
-        body: 'Query results show up in this table, ready to scroll through or use to ask a follow-up question.'
+        body: 'Results are ready to scroll through, visualize, or use to ask a follow-up question.'
       },
       {
         target: historyNav,
         title: 'Step back through past turns',
-        body: 'Use these arrows to move back and forward through your recent prompts, SQL, and results - handy for revisiting or tweaking an earlier question.'
+        body: 'Move back and forward through your recent prompts, SQL, and results.'
       },
       {
         target: configTriggerBadge,
-        title: "This is the database you are connected to",
-        body: "Click this badge to switch to any pre-configured database or connect to your own."
+        title: "This is the dataset you are addressing",
+        body: "Switch to any pre-configured dataset or connect to your own."
       },
       {
         target: datasetSchemaViewerBtn,
-        title: 'Peek at its schema anytime',
-        body: 'Click the "i" icon next to the badge to see this dataset\'s tables, columns, and an ER diagram - without switching which dataset you\'re connected to.'
+        title: 'Peek at the dataset description',
+        body: 'Review what the dataset is about, sample questions you may ask, and it\'s detailed schema.'
       },
       ...(isNarrowHeader ? [{
         target: moreMenuBtn,
-        title: 'Model, help, history, preferences & sign-in live here',
+        title: 'Model selector, help, history, preferences & sign-in live here',
         body: isAnonymousUser
-          ? `Tap this menu to switch the AI model (grouped by provider), see the full docs, your past translations, your preferences (color theme and auto-execute)${feedbackMenuClause} and to sign in with Google so your connections and history follow you across devices.`
-          : `Tap this menu to switch the AI model (grouped by provider), see the full docs, your past translations, your preferences (color theme and auto-execute)${feedbackMenuClause} and to sign out.`
+          ? `Tap this menu to switch the model, see the doc, your past translations, your preferences ${feedbackMenuClause} and to sign in.`
+          : `Tap this menu to switch the model, see the doc, your past translations, your preferences ${feedbackMenuClause} and to sign out.`
       }] : [
       {
         target: modelTriggerBadge,
-        title: "This is the AI model translating your questions",
-        body: "Click this badge to switch between the available models, grouped by provider (Google, Anthropic, OpenAI)."
+        title: "This is the model responding to your questions",
+        body: "Switch between the available models from Google, Anthropic, and OpenAI."
       },
       {
         target: prefsBtn,
         title: 'Make it yours',
-        body: 'Click this gear icon to switch between dark and light mode, and to control whether generated SQL runs automatically.'
+        body: 'Switch between dark & light mode, control whether generated SQL runs automatically and whether it is shown at all.'
       },
       {
         target: historyBtn,
         title: 'Reset your conversations',
-        body: 'Review your past conversation and delete past turns for any dataset whenever you want a clean slate.'
+        body: 'Review and purge past conversation turns with any dataset.'
       },
       {
         target: authContainer,
@@ -5873,13 +5970,13 @@ document.addEventListener('DOMContentLoaded', async () => {
       },
       {
         target: helpBtn,
-        title: 'Stuck? Full docs are here',
-        body: 'Come back to this Help button anytime for the full walkthrough, tips on multi-turn conversations, and more.'
+        title: 'Stuck? Click here',
+        body: 'Come back anytime for this walkthrough and mode details.'
       },
       {
         target: ISSUE_REPORTING_ENABLED ? sendFeedbackBtn : null,
-        title: 'Something not right? Let us know',
-        body: 'Click this button anytime to send feedback, or report a translation, SQL query, or result that looks wrong.'
+        title: 'Have feedback?',
+        body: 'Send us feedback or report that something looks wrong.'
       }
       ])
     ];
@@ -6051,16 +6148,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
-  // "Replay guided tour" - lives inside the Help modal so anyone - not
-  // just during development - can re-run the walkthrough without digging
-  // through localStorage.
-  const replayTourBtn = document.getElementById('replayTourBtn');
-  if (replayTourBtn && helpModal) {
-    replayTourBtn.addEventListener('click', () => {
-      helpModal.classList.add('hidden');
-      startGuidedTour();
-    });
-  }
+  // "Replay guided tour" itself is wired by wireHelpModalLinks() (see that
+  // function's own comment, near openHelpModal() above) every time
+  // help.html's fetched content is rendered into #helpModalBody, since it's
+  // now a link inside that fragment rather than a static button here that
+  // could be looked up once at page load.
 
   // ===========================================================================
   // 7. HISTORY MODAL: see loadChatHistorySummary()/renderChatHistoryBucketList()/
@@ -9715,14 +9807,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       const isError = !!res.isError;
       const isText = !!res.isText;
       const isPending = !!res.isPending;
-      // Chart discoverability (see renderSummaryInlineChart()'s own
-      // docstring above): a subtle, persistent tag on whichever tab
-      // actually carries a validated visualization, so a user who never
-      // clicks the Summary tab's own inline chart link - or comes back to
-      // this turn later - can still tell at a glance from the tab strip
-      // alone.
-      const isChartable = !!res.visualization;
-      btn.className = `result-tab-btn ${idx === activeResultIndex ? 'active' : ''} ${isError ? 'result-tab-btn--error' : ''} ${isPending ? 'result-tab-btn--pending' : ''} ${isChartable ? 'result-tab-btn--chartable' : ''}`.trim();
+      btn.className = `result-tab-btn ${idx === activeResultIndex ? 'active' : ''} ${isError ? 'result-tab-btn--error' : ''} ${isPending ? 'result-tab-btn--pending' : ''}`.trim();
 
       const sqlText = res.query || res.sql || res.statement || '';
       // Multi-database question-answering: a result tagged with which
@@ -9767,11 +9852,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         const rowLabel = res.truncated
           ? `${count.toLocaleString()}+ rows`
           : (count === 1 ? '1 row' : `${count} rows`);
-        // The chart badge is appended to the label text itself (not just
-        // the `.result-tab-btn--chartable` color class) so it survives
-        // being read as plain text (title attribute, screen readers,
-        // narrow layouts that might otherwise strip a background tint).
-        btn.textContent = `${dbLabel}Query ${queryNumber} (${rowLabel})${isChartable ? ' 📊' : ''}`;
+        btn.textContent = `${dbLabel}Query ${queryNumber} (${rowLabel})`;
       }
 
       btn.addEventListener('click', () => {
@@ -9881,20 +9962,61 @@ document.addEventListener('DOMContentLoaded', async () => {
   // to show up as literal asterisks/underscores/backticks now that this
   // was rendered via .textContent. Escapes HTML first (this is LLM
   // output, not trusted markup) then applies a deliberately small set of
-  // inline substitutions - not a full Markdown parser (no lists, links,
-  // or headings), just the emphasis these replies actually use. Newlines
-  // are left untouched - .response-text's `white-space: pre-wrap` already
-  // renders them as line breaks, same as before this function existed.
-  // Does NOT know anything about the "All databases" mode section-label
-  // convention (see renderMarkdownLiteSummaryTab() below for that) - this
-  // is the plain version, safe to use on any free-text reply, including
-  // ones that were never asked to carry a label at all.
+  // inline substitutions - not a full Markdown parser (no lists or
+  // headings, and no GENERIC links - see applyInlineChartLinks below for
+  // the one specific link form this DOES understand), just the emphasis
+  // these replies actually use. Newlines are left untouched -
+  // .response-text's `white-space: pre-wrap` already renders them as line
+  // breaks, same as before this function existed. Does NOT know anything
+  // about the "All databases" mode section-label convention (see
+  // renderMarkdownLiteSummaryTab() below for that) - this is the plain
+  // version, safe to use on any free-text reply, including ones that were
+  // never asked to carry a label at all.
   function renderMarkdownLite(rawText) {
     return applyInlineMarkdown(escapeHtml(rawText));
   }
 
+  // Converts the summarization prompts' own "[<short phrase>](chart:<index>)"
+  // inline link (see server/prompts/summary_single_connection.txt and
+  // summary_all_databases.txt's "visualizations" paragraph) into the exact
+  // same kind of clickable trigger summaryChartInlineLinkHtml()'s own
+  // fallback link already renders below - same class
+  // (.summary-chart-inline-link, styled as plain underlined inline text,
+  // not a bolted-on button - see that rule's own comment in style.css) and
+  // the SAME data-view-chart-trigger/jumpToChartableResultTab() delegated
+  // click handling, so this needs no new plumbing beyond this one
+  // substitution. This is what actually integrates a chart with the prose
+  // that earned it: the model plants this link ITSELF, mid-sentence,
+  // wrapping the exact short phrase that makes the point the chart
+  // illustrates (e.g. "...Apple Pay's 2-of-10 completion rate..."), so the
+  // reader clicks the very words describing the finding, not a generic
+  // "view chart" link bolted on afterward - unlike the fallback link,
+  // there's deliberately no leading space or emoji added here, since the
+  // bracketed text already sits exactly where the model wrote it inline,
+  // with whatever surrounding spacing/punctuation the sentence already
+  // has. `index` is left exactly as the model wrote it (not validated
+  // against currentResultsList here) - jumpToChartableResultTab() already
+  // treats an unrecognized/invalid index defensively (falls back to the
+  // first chartable tab) rather than assuming every trigger it receives is
+  // necessarily well-formed, which also covers the case where the server
+  // dropped this exact index from "visualizations" during validation (the
+  // model's own text-embedded link survives verbatim in "summary"/
+  // "per_database"/"cross_database" either way - see chart_helpers.py's
+  // _clean_visualization docstring). Run BEFORE the emphasis substitutions
+  // below (not that it matters much either way, since "[", "]", "(", ")"
+  // never collide with "*"/"_"/backtick) so a caption phrase that itself
+  // contains "**bold**" still gets bolded inside the resulting button
+  // label.
+  function applyInlineChartLinks(escapedHtml) {
+    return escapedHtml.replace(
+      /\[([^\[\]\n]+)\]\(chart:([^()\s]+)\)/g,
+      (_match, label, index) => `<button type="button" class="summary-chart-inline-link" data-view-chart-trigger="${index}">${label}</button>`
+    );
+  }
+
   function applyInlineMarkdown(escapedHtml) {
     let html = escapedHtml;
+    html = applyInlineChartLinks(html);
     // Code spans first, so a literal asterisk/underscore inside one isn't
     // then misread as emphasis syntax by the patterns below.
     html = html.replace(/`([^`\n]+)`/g, '<code>$1</code>');
@@ -10864,7 +10986,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
-  // --- Chart discoverability: Summary tab inline previews + tab-strip badges ---
+  // --- Chart discoverability: Summary tab inline previews ---
   //
   // The Summary tab becomes the active tab the instant it's created (see
   // prependSingleModeSummaryTab()) - the model's own answer is the first
@@ -10872,10 +10994,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   // on some OTHER, now-inactive tab is otherwise invisible unless the user
   // happens to click around the tab strip on their own - and now there can
   // be MORE than one such tab in the same turn (see chart_helpers.py's
-  // _pick_chartable_results). Two things fix that, together:
-  // buildResultsTabsNav() below tags each qualifying tab's own label with
-  // a small chart badge (persistently visible whenever the user DOES look
-  // at the tab strip), and renderSummaryInlineChart()/
+  // _pick_chartable_results). renderSummaryInlineChart()/
   // jumpToChartableResultTab() here render one small chart preview per
   // qualifying entry, stacked in a grid right under the Summary text (see
   // .summary-chart-preview-grid in style.css), each independently
@@ -10883,7 +11002,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   // (summaryChartInlineLinkHtml() below is kept only as the plain-text
   // fallback - one link per entry, same as the previews - for the rare
   // case Chart.js itself failed to load - see renderTableResult()'s isText
-  // branch, which is the only place that decides between the two).
+  // branch, which is the only place that decides between the two). The
+  // result tabs themselves (buildResultsTabsNav()) are otherwise
+  // unmarked - no color tint or badge - a chart's only tab-strip-visible
+  // effect is via the previews/links above.
 
   // Jumps straight to ONE SPECIFIC result tab in the CURRENT turn - the
   // one at `index`, always a currentResultsList index that genuinely
@@ -10938,17 +11060,33 @@ document.addEventListener('DOMContentLoaded', async () => {
     return ` <button type="button" class="summary-chart-inline-link" data-view-chart-trigger="${index}">📊 ${label}</button>`;
   }
 
-  // A short caption naming which result a Summary-tab preview belongs to
-  // - only actually shown once there's more than one preview on screen at
+  // A short caption naming which result a Summary-tab preview belongs to -
+  // only actually shown once there's more than one preview on screen at
   // once (see renderSummaryInlineChart()'s own use of `total`), since a
-  // single preview is already unambiguous without one. "all databases"
-  // mode's own entries carry `.database.name` (see execute_routes.py/
-  // buildAllModeSummaryPayload); single-connection mode's don't, so those
-  // fall back to the same "Query N" (1-based) convention buildResultsTabsNav()
-  // already uses for its own tab labels.
+  // single preview is already unambiguous without one.
+  //
+  // Prefers `entry.visualization.caption` - the server's own short phrase
+  // (see chart_helpers.py's _clean_caption/_clean_visualization and both
+  // summarization prompts' "visualizations" paragraph) naming the SPECIFIC
+  // point in the summary text this chart illustrates, e.g. "Apple Pay's
+  // 2-of-10 completion rate" - this is what actually integrates the chart
+  // with the summary instead of leaving them disjoint: a reader can match
+  // the caption's own wording back to the sentence it came from. Falls
+  // back to the older generic "Query N" convention (still used for
+  // #resultsTabsNav's own tab labels) only when no caption survived
+  // validation - a defensive fallback for a stale cached turn from before
+  // "caption" existed, never the normal path once a fresh turn's own
+  // validated visualization (which now REQUIRES a caption to exist at all -
+  // see _clean_visualization's own docstring) is what's actually attached
+  // here. "all databases" mode's own entries additionally carry
+  // `.database.name` (see execute_routes.py/buildAllModeSummaryPayload),
+  // prepended the same way the old fallback always did.
   function chartPreviewCaption(entry, queryNumber) {
     const dbName = entry && entry.database && entry.database.name;
-    return dbName ? `${dbName} - Query ${queryNumber}` : `Query ${queryNumber}`;
+    const serverCaption = entry && entry.visualization && entry.visualization.caption;
+    const fallback = dbName ? `${dbName} - Query ${queryNumber}` : `Query ${queryNumber}`;
+    if (!serverCaption) return fallback;
+    return dbName ? `${dbName} - ${serverCaption}` : serverCaption;
   }
 
   // ONE of the Summary tab's own small, clickable chart previews - renders
@@ -10985,9 +11123,53 @@ document.addEventListener('DOMContentLoaded', async () => {
     wrapper.setAttribute('data-view-chart-trigger', String(index));
     wrapper.setAttribute('aria-label', `View ${chartPreviewCaption(entry, queryNumber)} as chart`);
 
+    // Per-card width: the CSS default (.summary-chart-inline-preview's own
+    // `flex: 0 0 25%`) is the normal "half size in each dimension" card,
+    // and 4 of those exactly fill one row (4 * 25% = 100%) - but that flat
+    // 25% ignores the `gap` .summary-chart-preview-grid spends BETWEEN
+    // cards, so even at exactly 4 cards the row is actually `4 * 25% + 3 *
+    // gap` wide, wider than its own container. That overflowed harmlessly
+    // before (the grid's old `flex-wrap: wrap` just dropped the excess
+    // onto a second row) but can't once the grid is `nowrap` (per the
+    // "always fit every chart on one row" follow-up request) - `nowrap`
+    // alone doesn't shrink anything, it only refuses to wrap, so without
+    // this the cards would simply overflow the pane. This computes each
+    // card's actual share of the row - `100% minus every gap this many
+    // cards need, divided by the card count` - and takes whichever is
+    // smaller of that and the normal 25%, so a handful of cards still get
+    // the normal half-size default (the calc share is comfortably above
+    // 25% for total <= ~3) while enough cards to exceed one row at 25%
+    // each (4 or more, once gaps are counted) shrink just enough that
+    // every one of them still lands in the single row instead of any
+    // wrapping or spilling past the pane's edge.
+    const GRID_GAP_REM = 0.9;
+    wrapper.style.flex = `0 0 min(25%, calc((100% - ${(total - 1) * GRID_GAP_REM}rem) / ${total}))`;
+
+    // Chart.js (responsive:true/maintainAspectRatio:false, see
+    // buildResultsChartConfig()) measures its canvas's OWN PARENT to decide
+    // how tall to render, then keeps re-measuring via an internal
+    // ResizeObserver. That parent must have a height that does NOT itself
+    // depend on the canvas's rendered size, or the two feed each other in
+    // a runaway loop - each resize nudges the parent's content-driven
+    // height up slightly, which triggers another resize, which nudges it
+    // up again, forever (this is exactly the "chart keeps growing the more
+    // you scroll" bug reported live). The canvas used to sit directly in
+    // `wrapper` with `aspect-ratio`/`height:auto` on the CANVAS itself
+    // (style.css) - CSS alone renders that fine once, but the instant
+    // Chart.js's resize logic sets an explicit pixel height back onto the
+    // canvas, `wrapper` (which sizes to fit its content) picks up that new
+    // height as ITS OWN, and the loop begins. Fixed the same way
+    // .results-chart-wrapper already does it for the full-tab chart (see
+    // that rule's own comment in style.css): a dedicated box whose
+    // aspect-ratio is resolved from its WIDTH alone (never the canvas's
+    // height), with the canvas absolutely positioned to fill it - so
+    // nothing the canvas does can ever change the box's own size.
+    const canvasBox = document.createElement('div');
+    canvasBox.className = 'summary-chart-inline-preview-canvas-box';
     const canvas = document.createElement('canvas');
     canvas.className = 'summary-chart-inline-preview-canvas';
-    wrapper.appendChild(canvas);
+    canvasBox.appendChild(canvas);
+    wrapper.appendChild(canvasBox);
     if (total > 1) {
       const caption = document.createElement('span');
       caption.className = 'summary-chart-inline-preview-caption';
