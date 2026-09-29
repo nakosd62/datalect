@@ -346,79 +346,6 @@ test.describe('schema viewer', () => {
     await expect(page.locator('#schemaViewerDetailText')).toContainText('SHOW VIEW privilege');
   });
 
-  test('the "Grants:" global section gets its own tree group, instead of being left at the bottom of the last table', async ({ page }) => {
-    // Regression test for a real bug: Grants used to be an entirely
-    // unrecognized global section (unlike Constraints/Indexes/Views/
-    // Routines, which all already have their own promoted treatment) -
-    // it just rode along in whichever table entry's own raw-text
-    // "remainder" happened to be shown last, reading as if it belonged to
-    // that one table rather than describing the whole connection.
-    await gotoApp(page);
-    await mockSchema(page, {
-      entries: [
-        { name: 'customers', heading: 'Table: customers', text: 'Table: customers\n  id integer NOT NULL' },
-        { name: 'orders', heading: 'Table: orders', text: (
-          'Table: orders\n  id integer NOT NULL\n\n' +
-          'Grants:\n' +
-          '  Grant SELECT on orders to app_readonly\n' +
-          '  Grant INSERT on orders to app_writer'
-        ) },
-      ],
-    });
-    await openSchemaViewer(page);
-
-    // Not left behind in the "orders" table's own raw-text pane any more.
-    await page.locator('.schema-viewer-group-header', { hasText: 'Tables' }).click();
-    await page.locator('.schema-viewer-entry-item', { hasText: 'orders' }).click();
-    await expect(page.locator('#schemaViewerDetailText')).not.toContainText('Grant SELECT');
-    await expect(page.locator('#schemaViewerDetailText')).not.toContainText('Grants:');
-
-    // Its own separate, collapsible "Grants (2)" group instead.
-    const grantsHeader = page.locator('.schema-viewer-group-header', { hasText: 'Grants' });
-    await expect(grantsHeader).toContainText('Grants (2)');
-    await grantsHeader.click();
-    const grantItems = page.locator('.schema-viewer-entry-item', { hasText: 'orders:' });
-    await expect(grantItems).toHaveCount(2);
-    await expect(grantItems.nth(0)).toContainText('orders: SELECT → app_readonly');
-    await expect(grantItems.nth(1)).toContainText('orders: INSERT → app_writer');
-
-    await grantItems.nth(0).click();
-    await expect(page.locator('#schemaViewerDetailHeading')).toHaveText('orders → app_readonly');
-    await expect(page.locator('#schemaViewerDetailText')).toHaveText('Grant SELECT on orders to app_readonly');
-  });
-
-  test('Snowflake\'s differently-shaped "Grants (current role):" lines parse into the same Grants group', async ({ page }) => {
-    await gotoApp(page);
-    await mockSchema(page, {
-      dialect: 'Snowflake',
-      entries: [
-        { name: 'orders', heading: 'Table: orders', text: (
-          'Table: orders\n  id integer NOT NULL\n\n' +
-          'Grants (current role):\n' +
-          '  orders: SELECT, INSERT (role ACCOUNTADMIN)'
-        ) },
-      ],
-    });
-    await openSchemaViewer(page);
-
-    const grantsHeader = page.locator('.schema-viewer-group-header', { hasText: 'Grants' });
-    await expect(grantsHeader).toContainText('Grants (1)');
-    await grantsHeader.click();
-    await expect(page.locator('.schema-viewer-entry-item[data-category="grants"]')).toContainText('orders: SELECT, INSERT → role ACCOUNTADMIN');
-  });
-
-  test('a dialect with no Grants section at all (e.g. BigQuery) leaves the Grants group out of the tree entirely', async ({ page }) => {
-    await gotoApp(page);
-    await mockSchema(page, {
-      dialect: 'BigQuery',
-      entries: [
-        { name: 'orders', heading: 'Table: orders', text: 'Table: orders\n  id integer NOT NULL' },
-      ],
-    });
-    await openSchemaViewer(page);
-    await expect(page.locator('.schema-viewer-group-header', { hasText: 'Grants' })).toHaveCount(0);
-  });
-
   test('the "Comments:" global section is folded into the table/column display, instead of being left at the bottom of the last table', async ({ page }) => {
     // Regression test for a real bug (Oracle/etc. schemas): table and
     // column catalog comments used to be an entirely unrecognized global
@@ -461,7 +388,7 @@ test.describe('schema viewer', () => {
   });
 
   test('the "Likely relationships (naming convention, unconfirmed):" global section gets its own tree group, instead of being left at the bottom of the last table', async ({ page }) => {
-    // Regression test for the same class of bug as Grants/Comments above -
+    // Regression test for the same class of bug as Comments above -
     // this section had no parser of its own at all before this, so it
     // fell through unrecognized to the bottom of the last table entry's
     // raw text, describing the whole connection but looking like it only

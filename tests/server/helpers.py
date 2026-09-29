@@ -144,6 +144,37 @@ _ENV_VARS_TO_CLEAR = [
     # would make an otherwise-unrelated test start returning 429s under
     # repeated requests, a confusing failure to debug.
     "RATE_LIMIT_TRANSLATE", "RATE_LIMIT_EXECUTE",
+    # backends/base.py's shared per-backend row/connect-timeout knobs and
+    # db.py's/connection_router.py's schema/routing size knobs - cleared
+    # for the same reason as every other env-derived constant above: a
+    # developer's real shell/.env plausibly has these set for their own
+    # local tuning, which would otherwise silently leak into any test that
+    # doesn't explicitly pass its own `env`. This specific group was the
+    # actual root cause of a real cross-test-pollution bug: none of these
+    # were cleared, so once ANY module-level import anywhere in this whole
+    # test session triggered app_config.py's real (not-yet-neutralized)
+    # `load_dotenv(override=True)` - which happens at collection time,
+    # before the first test's monkeypatch ever gets to patch it out, if
+    # any test file imports something that pulls in app_config.py at its
+    # own top level rather than inside a function - the repo's real `.env`
+    # got loaded into this whole process's os.environ once, permanently,
+    # and every one of these still-uncleared values then silently leaked
+    # into unrelated tests for the rest of the run (e.g. a real
+    # EXECUTE_RESULTS_MAX_ROWS/DB_CONNECT_TIMEOUT_SECONDS overriding the
+    # hardcoded default several backend tests assert against, a real
+    # DATABASE_DEFAULT that doesn't match a test's own synthetic presets
+    # logging an unexpected ERROR line, or a real
+    # SHEETS_SERVICE_ACCOUNT_CREDENTIALS_FILE making backends.sheets
+    # attempt genuine Google OAuth instead of the test's intended fake/
+    # no-credentials path). Fixing config_routes.py's own dotenv exposure
+    # is a separate, larger change; clearing every env-derived constant
+    # here closes the actual symptom regardless of which module happens to
+    # trigger the real load_dotenv() first.
+    "EXECUTE_RESULTS_MAX_ROWS", "SUMMARY_RESULTS_MAX_ROWS", "DB_CONNECT_TIMEOUT_SECONDS",
+    "MAX_IN_SCOPE_CONNECTIONS", "DATABASE_DEFAULT", "ROUTER_MAX_TABLE_NAMES_PER_CONNECTION",
+    "SCHEMA_FREQUENT_VALUES_LIMIT", "SCHEMA_FREQUENT_VALUE_MIN_FRACTION",
+    "SHEETS_SERVICE_ACCOUNT_CREDENTIALS_FILE", "SHEETS_READ_TIMEOUT_SECONDS",
+    "SHEETS_SCHEMA_SAMPLE_ROWS", "CLIENT_VERSION_CHECK_INTERVAL_MINUTES",
 ]
 
 # A syntactically valid (but obviously throwaway, fixed/shared) Fernet
@@ -1716,3 +1747,24 @@ class _FakeFirestoreQueryModule:
 
 def days_ago(n):
     return datetime.now(timezone.utc) - timedelta(days=n)
+
+
+def normalize_prompt_whitespace(text):
+    """Collapses every run of whitespace in `text` (including a line break
+    a human inserted purely to reflow a long server/prompts/*.txt line for
+    readability - see prompt_loader.py's own docstring on why load_prompt()
+    never normalizes this itself, so that whitespace reaches this text
+    completely unchanged) down to a single space. A test that asserts one
+    of these prompt constants CONTAINS a specific phrase should search
+    inside `normalize_prompt_whitespace(instruction)` rather than
+    `instruction` directly, so the assertion keeps passing regardless of
+    exactly where within that phrase a reflow happened to land a line
+    break - real regression guards for these tests are about the actual
+    WORDING an LLM sees, which reflowing never changes (see this
+    conversation's own live example: reflowing triage_multi_candidate.txt
+    and summary_single_connection.txt each split a phrase one of these
+    tests checked for verbatim, failing the test despite the model-facing
+    meaning being identical either way). Never use this to compare two
+    full prompts for byte-for-byte equality - only to search one for a
+    substring that's meant to survive reflowing."""
+    return " ".join(text.split())

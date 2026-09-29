@@ -433,7 +433,8 @@ def translate_query():
     # branch below, connection_router.triage_all_mode_question (its name
     # predates and is independent of this user-facing "group" concept -
     # see that module's own docstring), and _run_phase_b_fanout: a triage
-    # call decides "answer" (table names alone are enough), "route"
+    # call decides "answer" (no real data needs to be queried - the
+    # connections' own schema and/or general knowledge is enough), "route"
     # (generate and execute real SQL against one or more specific
     # connections, in parallel), or "failed" (fixed apology text, no
     # fallback guess). Unconditional whenever in_scope_mode is "group",
@@ -554,9 +555,10 @@ def translate_query():
                 # "All databases" mode's real two-phase flow (see
                 # connection_router.triage_all_mode_question and
                 # _run_phase_b_fanout above): a triage call decides
-                # whether the question can be answered directly from
-                # table names alone, or genuinely needs real data from
-                # one or more specific connections - and if so, generates
+                # whether the question can be answered directly from the
+                # in-scope connections' own schema (or general knowledge)
+                # alone, or genuinely needs real data queried from one or
+                # more specific connections - and if so, generates
                 # and executes real SQL against each of them,
                 # independently and in parallel, exactly as if the user
                 # had selected each one directly and asked the question
@@ -1003,21 +1005,27 @@ def translate_query():
             # Two-call redesign (see the module-level section comment above
             # _SINGLE_DATASET_TRIAGE_SYSTEM_INSTRUCTION for the full
             # reasoning): Call 1 (triage_single_dataset_question) classifies
-            # `prompt` into general knowledge/schema/help/SQL using only
-            # this dataset's cheap SHALLOW schema; Call 2 (the JSON-
-            # enveloped SQL-generation call below, inlined here exactly the
-            # way this whole path already was before this redesign) only
-            # ever runs once Call 1 resolves to "sql", and only then pays
-            # the full DEEP schema fetch's cost. This mirrors dataset-group
-            # mode's own Phase A/Phase B split one level down - see that
-            # section comment for how closely.
+            # `prompt` into general knowledge/schema/help/SQL using this
+            # dataset's "tables_only" schema (see get_triage_schema_text) -
+            # full table/column names and types, no constraints/indexes/
+            # views/etc, no actual data/rows; Call 2 (the JSON-enveloped
+            # SQL-generation call below, inlined here exactly the way this
+            # whole path already was before this redesign) only ever runs
+            # once Call 1 resolves to "sql", and only then reaches for the
+            # full DEEP schema (get_llm_schema_text) - though since Call 1's
+            # own get_triage_schema_text fetches and caches that same deep
+            # schema under the hood to derive its tables_only view, Call 2
+            # ordinarily just reads it back from cache rather than paying
+            # for a second live fetch. This mirrors dataset-group mode's
+            # own Phase A/Phase B split one level down - see that section
+            # comment for how closely.
             #
             # First of this path's phase_status lines (see the module
-            # docstring above) - the shallow schema lookup is usually a
-            # cache hit and near-instant, but can be a real, visible wait on
-            # a cold cache or an explicit refresh_schema request, and the
-            # client has no other way to distinguish "still building the
-            # prompt" from "waiting on the model" without this.
+            # docstring above) - the schema lookup is usually a cache hit
+            # and near-instant, but can be a real, visible wait on a cold
+            # cache or an explicit refresh_schema request, and the client
+            # has no other way to distinguish "still building the prompt"
+            # from "waiting on the model" without this.
             yield json.dumps({
                 "status": "phase_status",
                 "phase": "schema",
@@ -1183,9 +1191,12 @@ def translate_query():
 
             # triage_result["outcome"] == "sql" from here on - Call 1
             # decided this prompt genuinely needs real SQL generated
-            # against real data, so (and only so) this now pays for the
-            # full DEEP schema fetch (unlike Call 1's own cheap shallow
-            # fetch above) and runs Call 2.
+            # against real data, so (and only so) this now reaches for the
+            # full DEEP schema (unlike Call 1's own tables_only-reduced
+            # view above) and runs Call 2 - ordinarily just a cache read at
+            # this point, since Call 1's own get_triage_schema_text call
+            # already fetched and cached this same deep schema moments ago
+            # to build that tables_only view.
             #
             # Call 1 (triage) is deliberately NEVER recorded in the
             # translations-table history/stats, even here where it decided

@@ -454,13 +454,13 @@ test.describe('analytics: dataset group mode fan-out', () => {
     // badge text connDbName shows, and no way to know which specific
     // database(s) will even be asked yet (translatePrompt() fires this
     // before the request is even sent).
-    const genericEvent = events.find((e) => e.database_name === 'Sales & Marketing');
+    const genericEvent = events.find((e) => e.database_name === 'Sales & Marketing (Dataset Group)');
     expect(genericEvent).toBeTruthy();
     expect(genericEvent.mode).toBe('group');
 
     // The two real per-database calls, fired once phase_a_route reveals
     // which connections the fan-out actually picked.
-    const perDatabase = events.filter((e) => e.database_name !== 'Sales & Marketing');
+    const perDatabase = events.filter((e) => e.database_name !== 'Sales & Marketing (Dataset Group)');
     expect(perDatabase.length).toBe(2);
     expect(perDatabase.every((e) => e.mode === 'group')).toBe(true);
     const byName = Object.fromEntries(perDatabase.map((e) => [e.database_name, e]));
@@ -632,11 +632,11 @@ test.describe('analytics: dataset group mode fan-out', () => {
     await expect.poll(async () => (await trackedEvents(page, 'sql_executed')).length).toBe(3);
     const events = await trackedEvents(page, 'sql_executed');
 
-    const genericEvent = events.find((e) => e.database_name === 'Sales & Marketing');
+    const genericEvent = events.find((e) => e.database_name === 'Sales & Marketing (Dataset Group)');
     expect(genericEvent).toBeTruthy();
     expect(genericEvent.trigger).toBe('manual');
 
-    const perDatabase = events.filter((e) => e.database_name !== 'Sales & Marketing');
+    const perDatabase = events.filter((e) => e.database_name !== 'Sales & Marketing (Dataset Group)');
     expect(perDatabase.length).toBe(2);
     expect(perDatabase.every((e) => e.trigger === 'manual')).toBe(true);
     const byName = Object.fromEntries(perDatabase.map((e) => [e.database_name, e]));

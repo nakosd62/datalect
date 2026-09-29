@@ -170,7 +170,6 @@ def test_preset_with_no_credential_uses_the_ambient_one_automatically(app_factor
 
     key_path = tmp_path / "ambient-key.json"
     key_path.write_text(make_service_account_key_json(client_email="ambient@proj.iam.gserviceaccount.com"))
-    monkeypatch.setenv("SHEETS_SERVICE_ACCOUNT_CREDENTIALS_FILE", str(key_path))
 
     path = write_database_presets_file(tmp_path, _preset_payload())
     env = app_factory(env={"DATABASE_PRESETS_FILE": path})
@@ -178,6 +177,18 @@ def test_preset_with_no_credential_uses_the_ambient_one_automatically(app_factor
 
     resp = env.client.post('/api/config', json={"preset_id": "sheets+Team Roster (Sheet)"})
     assert resp.status_code == 200
+
+    # Set AFTER app_factory(), not before: app_factory()/fresh_import()
+    # unconditionally clears SHEETS_SERVICE_ACCOUNT_CREDENTIALS_FILE (it's
+    # in helpers.py's own _ENV_VARS_TO_CLEAR, same as every other env-
+    # derived constant there) before applying its own `env=` dict, so a
+    # value set before this call would just get wiped out again - see
+    # _ambient_credentials_json()'s own docstring for why reading it live,
+    # right here, still works: it's a fresh os.environ.get() on every
+    # connect() call, not cached at import time, the same as every other
+    # app_env-fixture-based test in this file/test_config_sheets.py that
+    # sets this after its app is already built.
+    monkeypatch.setenv("SHEETS_SERVICE_ACCOUNT_CREDENTIALS_FILE", str(key_path))
 
     sheets_harness.queue_table(cols=[{"label": "A", "type": "string"}], rows=[["x"]])
     env.client.post('/api/execute', json={"sql": "select A"})

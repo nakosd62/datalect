@@ -368,7 +368,7 @@ class SheetsBackend(Backend):
         the live query get_schema() (deep) would also run. None of the new
         catalog-only attribute groups (identity markers, comments, row-
         count estimates, routine signatures, distribution keys, session
-        facts, widened grants, RLS/external flags) apply either - a single
+        facts, RLS/external flags) apply either - a single
         tab has no comparable catalog to source any of them from. So this
         IS the full get_schema_shallow()/get_schema() story for this
         backend; get_schema() below is a thin alias, not a separate deep

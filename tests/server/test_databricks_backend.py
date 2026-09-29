@@ -17,13 +17,13 @@ backends/databricks.py:
   1. table names (+ table_type, comment)   2. columns (+ is_identity,
      comment, partition_index)             3. constraints (best-effort)
   4. views (best-effort)                    5. routines (best-effort, TWO
-     queries: routines, then parameters)    6. grants (best-effort)
+     queries: routines, then parameters)
 No Indexes/Triggers/session-timezone/row-count-estimate/RLS-existence
 sections at all - see that module's own comments on why each was skipped
 as too uncertain to fabricate from this sandbox.
 
-get_schema() (deep) then runs _build_shallow_schema_parts() (the seven
-queries above, up to nine when routines succeed) and appends its own
+get_schema() (deep) then runs _build_shallow_schema_parts() (the six
+queries above, up to eight when routines succeed) and appends its own
 Phase 2 queries on a fresh cursor use, per kept table (in order): live
 COUNT(*), an optional combined MIN()/MAX() query (if it has numeric/date
 columns), an optional combined APPROX_COUNT_DISTINCT cardinality-gate query
@@ -82,12 +82,12 @@ def _pad_column_row(row):
 
 def _schema_responses(
     table_names, columns_rows, constraints=(), views=(),
-    routines=(), routine_params=(), grants=(),
+    routines=(), routine_params=(),
     table_types=None, table_comments=None,
 ):
     """Builds the fixed-order response queue _build_shallow_schema_parts()
     issues: table names (with table_type/comment) -> columns -> constraints
-    -> views -> routines -> routine params -> grants.
+    -> views -> routines -> routine params.
 
     `table_types`: optional {table_name: table_type} - defaults every name
     in `table_names` to 'MANAGED' (an ordinary table) unless overridden,
@@ -106,7 +106,6 @@ def _schema_responses(
         (list(views), None, -1),
         (list(routines), None, -1),
         (list(routine_params), None, -1),
-        (list(grants), None, -1),
     ]
 
 
@@ -534,62 +533,6 @@ def test_get_schema_shallow_partition_columns_section_absent_when_none():
     assert "Partition columns:" not in schema
 
 
-def test_get_schema_shallow_grants_section_renders():
-    conn, cursor = make_fake_pg_connection(_schema_responses(
-        table_names=["orders"],
-        columns_rows=[("orders", "id", "int", "NO")],
-        grants=[("analyst_role", "orders", "SELECT")],
-    ))
-    backend = DatabricksBackend()
-    schema = backend.get_schema_shallow(conn)
-    assert "Grants:" in schema
-    assert "Grant SELECT on orders to analyst_role" in schema
-
-
-def test_get_schema_shallow_grants_section_absent_when_no_grants():
-    conn, cursor = make_fake_pg_connection(_schema_responses(
-        table_names=["orders"],
-        columns_rows=[("orders", "id", "int", "NO")],
-    ))
-    backend = DatabricksBackend()
-    schema = backend.get_schema_shallow(conn)
-    assert "Grants:" not in schema
-
-
-def test_get_schema_shallow_survives_grants_query_failure():
-    class RaisingCursor:
-        def __init__(self):
-            self.calls = []
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-        def execute(self, sql, params=None):
-            self.calls.append(sql)
-            if "table_privileges" in sql:
-                raise Exception("table_privileges not visible to this role")
-
-        def fetchall(self):
-            last = self.calls[-1]
-            if "information_schema.tables" in last:
-                return [("orders", "MANAGED", None)]
-            if "information_schema.columns" in last:
-                return [("orders", "id", "int", "NO", "NO", None, None)]
-            return []
-
-    class RaisingConnection:
-        def cursor(self):
-            return RaisingCursor()
-
-    backend = DatabricksBackend()
-    schema = backend.get_schema_shallow(RaisingConnection())
-    assert "Table: orders" in schema
-    assert "Grants:" not in schema
-
-
 # --- get_schema_shallow() must never include Phase 2 (deep-only) content -----
 
 def test_get_schema_shallow_excludes_full_view_and_routine_bodies_and_phase2_sections():
@@ -613,9 +556,9 @@ def test_get_schema_shallow_excludes_full_view_and_routine_bodies_and_phase2_sec
     assert "Live row counts:" not in schema
     assert "Column value samples:" not in schema
     assert "Likely relationships" not in schema
-    # Exactly the seven Phase 1 queries (tables, columns, constraints, views,
-    # routines, routine params, grants) - no Phase 2 query was ever issued.
-    assert len(cursor.calls) == 7
+    # Exactly the six Phase 1 queries (tables, columns, constraints, views,
+    # routines, routine params) - no Phase 2 query was ever issued.
+    assert len(cursor.calls) == 6
 
 
 # --- get_schema() (deep): Phase 2 additions on top of the shallow content ----
@@ -656,7 +599,7 @@ def test_get_schema_deep_is_superset_of_shallow_plus_phase2_sampling():
     assert "id: range [1 .. 100]" in schema
     assert "status: frequent values = active (30), inactive (12)" in schema
 
-    assert len(cursor.calls) == 7 + 4
+    assert len(cursor.calls) == 6 + 4
 
 
 def test_get_schema_deep_skips_frequent_values_for_near_unique_column():
@@ -676,7 +619,7 @@ def test_get_schema_deep_skips_frequent_values_for_near_unique_column():
     assert "Column value samples:" in schema
     assert "id: range [1 .. 100]" in schema
     assert "frequent values" not in schema
-    assert len(cursor.calls) == 7 + 3
+    assert len(cursor.calls) == 6 + 3
 
 
 def test_get_schema_deep_naming_convention_relationships_section():
@@ -796,7 +739,7 @@ def test_get_schema_deep_skips_sampling_for_wide_tables_but_keeps_live_count():
     schema = backend.get_schema(conn)
     assert "Live row counts:" in schema and "wide: 7 rows (live, authoritative)" in schema
     assert "Column value samples:" not in schema
-    assert len(cursor.calls) == 7 + 1
+    assert len(cursor.calls) == 6 + 1
 
 
 def test_get_schema_deep_uses_approx_count_distinct_not_exact_count_distinct():
@@ -811,7 +754,7 @@ def test_get_schema_deep_uses_approx_count_distinct_not_exact_count_distinct():
     conn, cursor = make_fake_pg_connection(responses)
     backend = DatabricksBackend()
     backend.get_schema(conn)
-    cardinality_sql = cursor.calls[7 + 1][0]
+    cardinality_sql = cursor.calls[6 + 1][0]
     assert "APPROX_COUNT_DISTINCT" in cardinality_sql
     assert "COUNT(DISTINCT" not in cardinality_sql
 

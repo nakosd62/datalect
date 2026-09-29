@@ -1,8 +1,8 @@
 [
   {
-    "name": "Baseball (BigQuery)",
-    "preset_id": "bigquery-baseball",
-    "sql": "SELECT * FROM schedules LIMIT 1000"
+    "name": "Google Trends (BigQuery)",
+    "preset_id": "bigquery-google-trends",
+    "sql": "SELECT * FROM google_trends.top_terms LIMIT 1000"
   },
   {
     "name": "Employees (mySQL)",
@@ -10,9 +10,9 @@
     "sql": "SELECT * FROM employees LIMIT 1000"
   },
   {
-    "name": "Golf Stats (Postgres)",
-    "preset_id": "postgres-golf-stats",
-    "sql": "SELECT * FROM golf_player_performance LIMIT 1000"
+    "name": "Baseball (Postgres)",
+    "preset_id": "postgres-baseball",
+    "sql": "SELECT * FROM batting LIMIT 1000"
   },
   {
     "name": "Movie Rentals (Postgres)",

@@ -1106,7 +1106,7 @@ def test_split_schema_text_into_entries_empty_schema_text_returns_empty_list():
 # Backs the SCHEMA_TABLES_ONLY-gated "tables_only" schema kind (see
 # translate_routes.py's get_llm_schema_text): every table/table-family/tab
 # entry kept with its full per-table detail intact, every OTHER top-level
-# schema-object section (Constraints, Indexes, Views, Grants, ...) dropped.
+# schema-object section (Constraints, Indexes, Views, ...) dropped.
 # Deliberately NOT built on top of split_schema_text_into_entries - that
 # function's LAST entry runs all the way to len(schema_text), so it would
 # swallow every trailing non-table section into whichever table happened to

@@ -205,7 +205,7 @@ test.describe('multi-database question answering', () => {
     // name, not just the primary's ("Sales Postgres") name, since showing
     // one name would hide that the other connection is also in play for
     // this session's questions.
-    await expect(page.locator('#connDbName')).toHaveText('Sales & Marketing');
+    await expect(page.locator('#connDbName')).toHaveText('Sales & Marketing (Dataset Group)');
     await expect(page.locator('#configTriggerBadge')).toHaveAttribute(
       'title', 'In scope: Sales Postgres, Marketing Postgres (Click to configure)');
 
@@ -217,7 +217,7 @@ test.describe('multi-database question answering', () => {
     await expect(page.locator('#configModal')).toHaveClass(/hidden/);
     expect(state.in_scope_preset_ids).toEqual(['p-b']);
 
-    await expect(page.locator('#connDbName')).toHaveText('Marketing Postgres');
+    await expect(page.locator('#connDbName')).toHaveText('Marketing Postgres (postgres)');
     await expect(page.locator('#configTriggerBadge')).toHaveAttribute(
       'title', 'Connected to: Marketing Postgres (Click to configure)');
   });
@@ -241,7 +241,7 @@ test.describe('multi-database question answering', () => {
     });
     await gotoApp(page);
 
-    await expect(page.locator('#connDbName')).toHaveText('Sales & Marketing');
+    await expect(page.locator('#connDbName')).toHaveText('Sales & Marketing (Dataset Group)');
     await expect(page.locator('#configTriggerBadge')).toHaveAttribute(
       'title', 'In scope: Sales Postgres, Marketing Postgres (Click to configure)');
 
@@ -1545,17 +1545,18 @@ test.describe('multi-database question answering', () => {
     expect(rawHtml).not.toContain('SUMMARY_BLOCK');
   });
 
-  // Regression guard for the "Triage"/"Result Summary" section labels
-  // becoming language-agnostic (see connection_router.py's
-  // is_label_only_response and client.js's renderMarkdownLiteSummaryTab):
-  // the server now translates each label into the user's own question's
-  // language rather than always sending the literal English word, so the
-  // client can no longer detect what to bold by matching specific text -
-  // it has to work purely by POSITION (see those two functions'
-  // docstrings). Mocks both labels in Spanish specifically to prove this
-  // isn't hardcoded to English words anymore - a bug here would leave
-  // both labels rendered as plain, un-bolded text instead.
-  test('non-English triage and results-summary labels are still bolded, by position rather than by matching English words', async ({ page }) => {
+  // Regression guard for the "Triage"/"Results Summary" section labels no
+  // longer showing up in the rendered Summary tab at all (see client.js's
+  // renderMarkdownLiteSummaryTab): the server still asks the model for a
+  // "<label>\n\nbody" shape, translated into the user's own question's
+  // language, but the client now drops that leading label line (and the
+  // blank line separating it from the body) unconditionally instead of
+  // rendering it as a bolded heading. Works purely by POSITION (see that
+  // function's docstring), so it has to work for a translated label too,
+  // not just a hardcoded English word - mocks both labels in Spanish
+  // specifically to prove that: a bug here would leave a Spanish label
+  // showing up in the UI just as wrongly as an English one would.
+  test('non-English triage and results-summary labels are dropped from the rendered Summary tab, by position rather than by matching English words', async ({ page }) => {
     await mockConfig(page);
     await gotoApp(page);
 
@@ -1618,14 +1619,13 @@ test.describe('multi-database question answering', () => {
     await expect(summaryText).toContainText('Comprobando Sales Postgres y Marketing Postgres.');
     await expect(summaryText).toContainText('Los ingresos combinados son $700.');
 
-    // Both labels - triage's own leading one, and Phase C's own leading
-    // one after the join - are real bolded+underlined headings, not left
-    // as plain text the way an English-only word-matching regex would
-    // have left them.
-    const boldedLabels = summaryText.locator('strong u');
-    await expect(boldedLabels).toHaveCount(2);
-    await expect(boldedLabels.nth(0)).toHaveText('Diagnóstico');
-    await expect(boldedLabels.nth(1)).toHaveText('Resumen de resultados');
+    // Neither label - triage's own leading one, nor Phase C's own leading
+    // one after the join - shows up anywhere in the rendered text, and
+    // neither is left behind as a bolded+underlined heading either.
+    const rawText = await summaryText.evaluate((el) => el.textContent);
+    expect(rawText).not.toContain('Diagnóstico');
+    expect(rawText).not.toContain('Resumen de resultados');
+    await expect(summaryText.locator('strong u')).toHaveCount(0);
   });
 
   test('a Phase C summary with one bold-named paragraph per database renders as separate paragraphs with the names bolded', async ({ page }) => {
@@ -1705,11 +1705,12 @@ test.describe('multi-database question answering', () => {
     // "**" asterisks leaking through), and the two paragraphs are still
     // separated by a blank line in the underlying text - .response-text's
     // white-space: pre-wrap is what turns that into a genuine visible gap
-    // between them rather than one run-on paragraph. Scoped to exclude
-    // the two <strong><u>...</u></strong> section-heading labels (see the
-    // dedicated label test above) - this test is specifically about the
-    // per-database bold name convention.
-    await expect(summaryText.locator('strong:not(:has(u))')).toHaveText(['Sales Postgres:', 'Marketing Postgres:']);
+    // between them rather than one run-on paragraph. The "Triage"/
+    // "Results Summary" section-heading labels included in the mocked
+    // responses above are dropped entirely from display (see the
+    // dedicated label test above), so every remaining <strong> here is
+    // one of the two per-database names, with nothing left to scope out.
+    await expect(summaryText.locator('strong')).toHaveText(['Sales Postgres:', 'Marketing Postgres:']);
     const rawText = await summaryText.evaluate((el) => el.textContent);
     expect(rawText).toContain('Revenue was $500.\n\nMarketing Postgres:');
   });

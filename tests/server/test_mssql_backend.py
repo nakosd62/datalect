@@ -20,14 +20,12 @@ best-effort (try/except) for every other section - see backends/mssql.py:
   1. table names        2. columns             3. constraints (best-effort)
   4. views (best-effort) 5. identity (new)      6. comments (new)
   7. row count estimates (new)                  8. routines (new)
-  9. session facts/collation (new)              10. grants (new)
-  11. RLS flags (new)                           12. external tables flag (new)
+  9. session facts/collation (new)              10. RLS flags (new)
+  11. external tables flag (new)
 Indexes/Triggers are still no queries at all (deferred, same status
-backends/oracle.py's/backends/redshift.py's own first-pass gaps have) -
-Grants is no longer deferred, see backends/mssql.py's module docstring for
-why.
+backends/oracle.py's/backends/redshift.py's own first-pass gaps have).
 
-get_schema() (deep) then runs _build_shallow_schema_parts() (the twelve
+get_schema() (deep) then runs _build_shallow_schema_parts() (the eleven
 queries above) and appends its own Phase 2 queries on the same cursor use:
   per kept table (in order): live COUNT(*), an optional combined MIN()/MAX()
   query (if it has numeric/date columns), and up to
@@ -75,10 +73,10 @@ def _ms(monkeypatch):
 def _schema_responses(
     table_names, columns_rows, constraints=(), views=(),
     identity_columns=(), comments=(), row_count_estimates=(), routines=(),
-    session_collation=("SQL_Latin1_General_CP1_CI_AS",), grants=(), rls_flags=(),
+    session_collation=("SQL_Latin1_General_CP1_CI_AS",), rls_flags=(),
     external_tables=(),
 ):
-    """Queues _build_shallow_schema_parts()'s twelve Phase 1 responses in
+    """Queues _build_shallow_schema_parts()'s eleven Phase 1 responses in
     the exact order backends/mssql.py issues them (see this file's module
     docstring). `session_collation` defaults to a real one-row tuple
     (like backends/postgres.py's own `session_settings` default) so tests
@@ -95,7 +93,6 @@ def _schema_responses(
         (list(row_count_estimates), None, -1),
         (list(routines), None, -1),
         ([session_collation] if session_collation is not None else [], None, -1),
-        (list(grants), None, -1),
         (list(rls_flags), None, -1),
         (list(external_tables), None, -1),
     ]
@@ -793,18 +790,6 @@ def test_get_schema_shallow_session_facts_render_collation():
     assert "timezone" not in schema.lower()
 
 
-def test_get_schema_shallow_grants_render():
-    conn, cursor = make_fake_mssql_connection(_schema_responses(
-        table_names=["orders"],
-        columns_rows=[("orders", "id", "int", "NO", None)],
-        grants=[("app_user", "orders", "SELECT")],
-    ))
-    backend = MssqlBackend()
-    schema = backend.get_schema_shallow(conn)
-    assert "Grants:" in schema
-    assert "Grant SELECT on orders to app_user" in schema
-
-
 def test_get_schema_shallow_rls_and_external_table_flags_render_when_true():
     conn, cursor = make_fake_mssql_connection(_schema_responses(
         table_names=["accounts", "remote_orders"],
@@ -855,8 +840,8 @@ def test_get_schema_shallow_excludes_full_view_and_routine_bodies_and_phase2_sec
     assert "Live row counts:" not in schema
     assert "Column value samples:" not in schema
     assert "Likely relationships" not in schema
-    # Exactly the twelve Phase 1 queries - no Phase 2 query was ever issued.
-    assert len(cursor.calls) == 12
+    # Exactly the eleven Phase 1 queries - no Phase 2 query was ever issued.
+    assert len(cursor.calls) == 11
 
 
 # --- get_schema() (deep): Phase 2 additions on top of the shallow content ----
@@ -912,7 +897,7 @@ def test_get_schema_deep_is_superset_of_shallow_plus_phase2_sampling():
     # the same numbers _base_deep_responses() queues for the new query.
     assert "Estimated dataset size: ~1.9 MB" in schema
 
-    assert len(cursor.calls) == 12 + 1 + 4
+    assert len(cursor.calls) == 11 + 1 + 4
 
 
 def test_get_schema_deep_skips_frequent_values_for_near_unique_column():
@@ -933,7 +918,7 @@ def test_get_schema_deep_skips_frequent_values_for_near_unique_column():
     assert "Column value samples:" in schema
     assert "id: range [1 .. 100]" in schema
     assert "frequent values" not in schema
-    assert len(cursor.calls) == 12 + 1 + 3
+    assert len(cursor.calls) == 11 + 1 + 3
 
 
 def test_get_schema_deep_naming_convention_relationships_section():
@@ -994,7 +979,7 @@ def test_get_schema_deep_skips_sampling_for_wide_tables_but_keeps_live_count():
     schema = backend.get_schema(conn)
     assert "Live row counts:" in schema and "wide: 7 rows (live, authoritative)" in schema
     assert "Column value samples:" not in schema
-    assert len(cursor.calls) == 12 + 1 + 1
+    assert len(cursor.calls) == 11 + 1 + 1
 
 
 def test_get_schema_deep_qualifies_live_row_count_and_sample_lines_when_schema_configured():

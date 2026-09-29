@@ -32,7 +32,7 @@ import threading
 from app_config import DEFAULT_DESCRIPTOR, CONFIGURED_DBS, CONFIGURED_DB_GROUPS, DATABASE_PRESETS_FILE, state_store, logger
 from backends import get_backend
 from backends.base import (
-    extract_entry_names_from_schema_text, schema_text_was_truncated, schema_text_has_omitted_tables,
+    derive_tables_only_schema_text, schema_text_was_truncated, schema_text_has_omitted_tables,
     parse_dataset_size_line, SCHEMA_MAX_CHARS, SCHEMA_MAX_TABLES, SCHEMA_SIZE_CHARS_PER_TOKEN,
     quantize_schema_size_tokens,
 )
@@ -361,61 +361,68 @@ def _resolve_group_configured_descriptors(group_id, user_id):
 
 
 def build_router_candidate_summaries(in_scope_entries, user_id):
-    """Builds compact, table-name-only summaries for connection_router.py's
-    Phase A prompt - one {"name", "dialect", "table_names"} dict per entry
-    in `in_scope_entries` (see resolve_in_scope_descriptors), in the same
-    order, so Phase A's returned candidate indices line up positionally
-    with this list.
+    """Builds each in-scope connection's schema summary for connection_
+    router.py's Phase A prompt - one {"name", "dialect", "schema_text"}
+    dict per entry in `in_scope_entries` (see resolve_in_scope_
+    descriptors), in the same order, so Phase A's returned candidate
+    indices line up positionally with this list.
 
-    Deliberately never includes column-level schema - only enough for the
-    router to guess relevance from table/tab names and dialect.
+    `schema_text` is the SAME "tables_only" derivative summarization uses
+    (see summarize_routes.py's get_summary_schema_text and backends/
+    base.py's derive_tables_only_schema_text) - full table/column names
+    and types, with constraints, indexes, views, triggers, comments,
+    row-count estimates, routines, session facts, view/routine
+    definitions, live row counts, column value samples, and likely
+    relationships all left out. This used to be just a bare list of
+    table/tab names (backends/base.py's extract_entry_names_from_
+    schema_text) - not enough for the router to reliably tell whether a
+    question like "when did we last hear from this customer" is
+    answerable from a given connection, which needs to know there's
+    actually an email/customer_id/last_contacted_at column to look for,
+    not just that a table called "customers" exists.
 
     Deliberately NEVER connects to or queries a real database, and never
     writes anything new to schema_cache.py. This reads ONLY the
     already-cached DEEP schema entry for each in-scope connection (a
     plain schema_cache.get(cache_key) - the very same durable entry a real
     /api/translate call would use) and reduces it in-memory via
-    backends/base.py's extract_entry_names_from_schema_text. A connection
-    whose deep schema hasn't been cached yet (never selected/used, or a
-    preset whose startup prefetch hasn't finished) simply degrades to an
-    empty table_names list for this one triage pass - it starts
-    participating in triage the moment something else populates its deep
-    cache entry (its own first real use, a preset prefetch, or an explicit
-    "Refresh Schema"), same as a genuine fetch failure already degraded to
-    [] before this change.
+    derive_tables_only_schema_text. A connection whose deep schema hasn't
+    been cached yet (never selected/used, or a preset whose startup
+    prefetch hasn't finished) simply degrades to an empty schema_text for
+    this one triage pass - it starts participating fully in triage the
+    moment something else populates its deep cache entry (its own first
+    real use, a preset prefetch, or an explicit "Refresh Schema"), same as
+    a genuine fetch failure already degraded to "" before this change.
+    This is a deliberate trade-off, kept exactly as it was before this
+    function started sending tables_only instead of bare names: an
+    all-databases question's routing step stays guaranteed cheap and
+    side-effect-free (it never itself triggers a live per-table
+    introspection query against any in-scope connection, no matter how
+    many are in scope), at the cost of a connection nobody has used yet
+    being under-described to the router until it's warmed some other way.
 
-    This intentionally does NOT try to reconstruct a true Phase-1-only
-    ("shallow") subset of the cached text - the deep entry's Phase 2
-    sections (view/routine bodies, live row counts, sampling, ...) are
-    simply left in and ignored by extract_entry_names_from_schema_text's
-    heading-only regex, and whatever SCHEMA_MAX_CHARS truncation already
-    applied to the deep entry applies here too, as-is. There used to be a
-    genuinely separate, independently-fetched-and-cached "shallow" cache
-    entry (cache_key + "::shallow") specifically for this function, so an
-    all-dbs question wouldn't pay Phase 2's live-query cost per candidate
-    connection - but since the deep text was always a superset of that
-    Phase 1-only text anyway (same backends/base.py-shared two-phase
-    design every dialect follows), fetching and caching it separately was
-    pure waste: this reads the deep entry that's already sitting in the
-    cache instead, for free, with zero live queries of its own. See
-    get_schema_shallow() on each Backend subclass (still implemented,
+    There used to be a genuinely separate, independently-fetched-and-
+    cached "shallow" cache entry (cache_key + "::shallow") for this
+    function, back when it only needed table/tab names - removed because
+    the deep text was always a superset of that Phase 1-only text anyway.
+    See get_schema_shallow() on each Backend subclass (still implemented,
     still exercised by real tests) and the old ::shallow cache-key suffix
     handling in get_database_schema()/get_database_schema_with_reason()
-    below - both left in place, unused by this function now, in case a
-    genuine independent shallow fetch is ever needed again for some other
-    purpose."""
+    below - both left in place, unused by this function, in case a
+    genuinely independent shallow fetch is ever needed again for
+    something else."""
     if not in_scope_entries:
         return []
 
     def _summarize(entry):
         cache_key = get_conn_identifier(entry["descriptor"])
         schema_text = schema_cache.get(cache_key)
-        table_names = extract_entry_names_from_schema_text(schema_text) if schema_text else []
+        tables_only = derive_tables_only_schema_text(schema_text) if schema_text else ""
         try:
             dialect = get_backend(entry["descriptor"]).dialect_name
         except Exception:
             dialect = "SQL"
-        return {"name": entry["name"], "dialect": dialect, "table_names": table_names}
+        return {"name": entry["name"], "dialect": dialect, "schema_text": tables_only}
 
     results = [None] * len(in_scope_entries)
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(in_scope_entries)) as pool:
@@ -427,7 +434,7 @@ def build_router_candidate_summaries(in_scope_entries, user_id):
             except Exception:
                 logger.exception("Error building router candidate summary")
                 entry = in_scope_entries[index]
-                results[index] = {"name": entry["name"], "dialect": "SQL", "table_names": []}
+                results[index] = {"name": entry["name"], "dialect": "SQL", "schema_text": ""}
     return results
 
 
@@ -993,7 +1000,18 @@ def _generate_and_cache_schema_overview(descriptor, user_id, schema_text):
     leaves whichever overview (if any) was already cached in place -
     webClient's Schema Viewer treats a missing overview as "nothing to
     show yet," never as an error, so there's no user-visible harm in
-    quietly retrying on the next refresh instead."""
+    quietly retrying on the next refresh instead.
+
+    Logs this call's own "schema" row via state_store.record_llm_usage -
+    same as every other real provider.call() this app makes (see that
+    method's own docstring for the full list) - recorded immediately after
+    a successful call, before the parse-failure early return just below,
+    since real tokens were spent either way. dataset_type/dataset_name
+    come from resolve_dataset_identity(descriptor, user_id): this function
+    is only ever called with a single connection's own descriptor (never a
+    dataset group - see prime_schema_cache_with_reason's docstring), so
+    that's always the right resolver here, same as a single-connection
+    triage/sqlgen/summary call would use."""
     cache_key = get_conn_identifier(descriptor)
     try:
         provider, model, api_key = _resolve_overview_llm_call(user_id)
@@ -1002,7 +1020,12 @@ def _generate_and_cache_schema_overview(descriptor, user_id, schema_text):
         client = provider.make_client(api_key)
         schema_block = f"Database Schema:\n{schema_text}\n\n"
         llm_input = provider.build_llm_input([], schema_block, "Produce the JSON now.")
-        raw_text, _usage = provider.call(client, model, llm_input, _SCHEMA_OVERVIEW_SYSTEM_INSTRUCTION)
+        raw_text, usage = provider.call(client, model, llm_input, _SCHEMA_OVERVIEW_SYSTEM_INSTRUCTION)
+        dataset_type, dataset_name = resolve_dataset_identity(descriptor, user_id)
+        state_store.record_llm_usage(
+            user_id, "schema", model, usage,
+            dataset_type=dataset_type, dataset_name=dataset_name,
+        )
         overview = _parse_schema_overview_response(raw_text)
         if overview is None:
             return

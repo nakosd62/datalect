@@ -98,7 +98,7 @@ import pytest
 from helpers import (
     install_fake_bigquery, install_fake_mssql_connect, parse_translate_stream,
     parse_translate_stream_events, write_database_presets_file, login_as,
-    select_llm_provider, set_llm_byok_key,
+    select_llm_provider, set_llm_byok_key, normalize_prompt_whitespace,
 )
 
 
@@ -376,11 +376,16 @@ def test_single_dataset_mode_translate_sends_the_full_schema_by_default(app_fact
     resp = env.client.post('/api/translate', json={'prompt': 'show customers'})
     parse_translate_stream(resp)
 
-    # generate_calls[0] is Call 1 (triage), which only ever sees the cheap
-    # SHALLOW schema (get_triage_schema_text) - the full deep schema (and
-    # SCHEMA_TABLES_ONLY's own reduction of it) only ever reaches Call 2
-    # (generate_calls[1], get_llm_schema_text), which is what this test is
-    # actually about.
+    # generate_calls[0] is Call 1 (triage), which always sees the
+    # "tables_only" derivative (get_triage_schema_text) - full table/
+    # column detail, but never anything deeper like "Constraints:".
+    # SCHEMA_TABLES_ONLY's own (flag-gated) reduction only ever applies to
+    # Call 2 (generate_calls[1], get_llm_schema_text), which is what the
+    # rest of this test is actually about.
+    triage_schema_text = harness.generate_calls[0]["contents"][0].parts[0].text
+    assert "Table: customers" in triage_schema_text
+    assert "Constraints:" not in triage_schema_text
+
     schema_text = harness.generate_calls[1]["contents"][0].parts[0].text
     assert "Table: customers" in schema_text
     assert "Constraints:" in schema_text
@@ -1338,7 +1343,10 @@ def test_sheets_dialect_intro_still_forbids_comments_generally(app_env):
 # that the dialect intro keeps warning about exactly this mistake.
 
 def test_postgres_dialect_intro_warns_against_filter_on_combined_aggregate_expressions(app_env):
-    intro = app_env.translate_routes._DIALECT_PROMPT_INTROS["PostgreSQL"]
+    # normalize_prompt_whitespace collapses any line break a human reflow
+    # of server/prompts/dialects/postgresql.txt may have landed inside
+    # this literal example snippet (see that helper's own docstring).
+    intro = normalize_prompt_whitespace(app_env.translate_routes._DIALECT_PROMPT_INTROS["PostgreSQL"])
     assert "FILTER" in intro
     assert "(MAX(x) - MIN(x)) FILTER (WHERE ...)" in intro
 
@@ -1352,7 +1360,10 @@ def test_postgres_dialect_intro_warns_against_filter_on_combined_aggregate_expre
 # separate "cross_database" field for a paragraph spanning multiple
 # databases - the only place this behavior is actually specified.
 def test_summary_prompt_asks_for_one_paragraph_per_database(app_env):
-    instruction = app_env.translate_routes._SUMMARY_SYSTEM_INSTRUCTION
+    # normalize_prompt_whitespace collapses any line break a human reflow
+    # of server/prompts/summary_all_databases.txt may have landed inside
+    # one of these phrases (see that helper's own docstring).
+    instruction = normalize_prompt_whitespace(app_env.translate_routes._SUMMARY_SYSTEM_INSTRUCTION)
     assert "PER DATABASE" in instruction
     assert "brief" in instruction.lower()
     assert '"per_database"' in instruction
@@ -1375,7 +1386,10 @@ def test_summary_prompt_asks_for_one_paragraph_per_database(app_env):
 # response_that_is_just_the_result_summary_label for the server-side
 # retry that now catches that instead of silently showing a bare heading.
 def test_summary_prompt_requires_a_leading_translated_results_summary_line(app_env):
-    instruction = app_env.translate_routes._SUMMARY_SYSTEM_INSTRUCTION
+    # normalize_prompt_whitespace collapses any line break a human reflow
+    # of server/prompts/summary_all_databases.txt may have landed inside
+    # one of these phrases (see that helper's own docstring).
+    instruction = normalize_prompt_whitespace(app_env.translate_routes._SUMMARY_SYSTEM_INSTRUCTION)
     # Pluralized ("Results Summary", not "Result Summary") and, per the
     # instruction text, translated into the user's own question's
     # language rather than a fixed literal English phrase - see
@@ -1398,7 +1412,10 @@ def test_summary_prompt_requires_a_leading_translated_results_summary_line(app_e
 # test - this one guards the prompt TEXT the model actually gets, the only
 # place this instruction is ever expressed.
 def test_summary_prompt_instructs_explaining_an_error_not_just_acknowledging_it(app_env):
-    instruction = app_env.translate_routes._SUMMARY_SYSTEM_INSTRUCTION
+    # normalize_prompt_whitespace collapses any line break a human reflow
+    # of server/prompts/summary_all_databases.txt may have landed inside
+    # one of these phrases (see that helper's own docstring).
+    instruction = normalize_prompt_whitespace(app_env.translate_routes._SUMMARY_SYSTEM_INSTRUCTION)
     assert "briefly explain" in instruction.lower()
     assert "what the error suggests" in instruction.lower()
     assert "what could fix it" in instruction.lower()
@@ -3565,7 +3582,12 @@ def test_build_single_summary_prompt_formats_notes_and_errors_too(app_env):
 # (see test_build_single_summary_prompt_formats_notes_and_errors_too just
 # above). The model was never actually told what to do when it saw one.
 def test_single_summary_prompt_instructs_explaining_an_error_not_just_reporting_it(app_env):
-    instruction = app_env.translate_routes._SINGLE_SUMMARY_SYSTEM_INSTRUCTION
+    # normalize_prompt_whitespace collapses the line breaks a human reflow
+    # of server/prompts/summary_single_connection.txt may have landed
+    # inside one of these phrases (see that helper's own docstring) - a
+    # phrase-presence assertion like this one is about the model-facing
+    # WORDING, which reflowing never changes, not about exact line shape.
+    instruction = normalize_prompt_whitespace(app_env.translate_routes._SINGLE_SUMMARY_SYSTEM_INSTRUCTION)
     assert "an error explaining that it failed to execute" in instruction.lower()
     assert "briefly explain" in instruction.lower()
     assert "what the error suggests" in instruction.lower()
@@ -3587,7 +3609,12 @@ def test_single_summary_prompt_instructs_explaining_an_error_not_just_reporting_
 # (the "all databases" mode equivalent) - that one is untouched by this
 # fix and must keep requiring its own label line.
 def test_single_summary_prompt_no_longer_asks_for_a_leading_label_line(app_env):
-    instruction = app_env.translate_routes._SINGLE_SUMMARY_SYSTEM_INSTRUCTION
+    # normalize_prompt_whitespace collapses the line breaks a human reflow
+    # of server/prompts/summary_single_connection.txt may have landed
+    # inside one of these phrases (see that helper's own docstring) - a
+    # phrase-presence assertion like this one is about the model-facing
+    # WORDING, which reflowing never changes, not about exact line shape.
+    instruction = normalize_prompt_whitespace(app_env.translate_routes._SINGLE_SUMMARY_SYSTEM_INSTRUCTION)
     assert "do NOT prepend any section-heading label or title of your own" in instruction
     assert "the UI already shows this as its own \"Summary\" tab" in instruction
     assert "redundant, repeated title" in instruction
@@ -4435,27 +4462,36 @@ def test_parse_sql_generation_response_returns_none_for_unparseable_or_empty_tex
 
 # --- get_triage_schema_text ---------------------------------------------------
 
-def test_get_triage_schema_text_forwards_to_get_database_schema_with_deep_false(app_env, monkeypatch):
+def test_get_triage_schema_text_fetches_the_deep_schema_and_reduces_to_tables_only(app_env, monkeypatch):
     calls = []
+    deep_schema = (
+        "Table: customers\n  id integer NOT NULL\n\n"
+        "Constraints:\n  none\n"
+    )
 
     def _fake_get_database_schema(descriptor, user_identity, force_refresh=False, deep=True):
         calls.append({
             "descriptor": descriptor, "user_identity": user_identity,
             "force_refresh": force_refresh, "deep": deep,
         })
-        return "Table: users\nTable: orders"
+        return deep_schema
 
     monkeypatch.setattr(app_env.translate_routes, "get_database_schema", _fake_get_database_schema)
     result = app_env.translate_routes.get_triage_schema_text({"url": "sqlite:///x"}, "alice", force_refresh=True)
 
-    assert result == "Table: users\nTable: orders"
+    # Reduced to the tables_only derivative - full table/column detail
+    # kept, everything else (here, "Constraints:") dropped - the SAME
+    # derivative summarization uses (get_summary_schema_text).
+    assert result == "Table: customers\n  id integer NOT NULL"
+    assert "Constraints:" not in result
     assert len(calls) == 1
     assert calls[0]["descriptor"] == {"url": "sqlite:///x"}
     assert calls[0]["user_identity"] == "alice"
     assert calls[0]["force_refresh"] is True
-    # The whole point of this wrapper - always the cheap shallow fetch,
-    # never the deep one get_llm_schema_text uses.
-    assert calls[0]["deep"] is False
+    # Fetches the SAME full deep schema get_llm_schema_text uses (no
+    # deep=False/shallow fetch of its own anymore) - deep defaults to
+    # True, so this wrapper doesn't even need to pass it explicitly.
+    assert calls[0]["deep"] is True
 
 
 # --- triage_single_dataset_question -------------------------------------------

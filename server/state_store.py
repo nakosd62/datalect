@@ -665,11 +665,11 @@ class StateStore(ABC):
         translate_routes.py's stream_translation, the "Phase A (triage) is
         deliberately NEVER recorded" comment. This table is the opposite:
         purely about LLM cost/usage visibility, so it logs every call -
-        triage, sqlgen, AND summary - uniformly, with no notion of
+        triage, sqlgen, summary, AND schema - uniformly, with no notion of
         success/failure or the SQL/text that came out of it.
 
-        `call_type` is one of "triage", "sqlgen", or "summary" - the three
-        kinds of LLM call this app makes:
+        `call_type` is one of "triage", "sqlgen", "summary", or "schema" -
+        the four kinds of LLM call this app makes:
           "triage": connection_router.py's run_triage_call - Call 1 for
             both single-dataset mode and "all databases"/group mode.
           "sqlgen": the actual NL->SQL generation call - either
@@ -679,6 +679,14 @@ class StateStore(ABC):
           "summary": summarize_routes.py's shared _summarize_with_retry -
             Phase C's per-turn summarization call, used identically by
             both single-connection mode and "all databases" mode.
+          "schema": db.py's _generate_and_cache_schema_overview - the
+            best-effort {"prose", "questions"} overview generated once per
+            successful deep schema (re)fetch (startup preset prefetch, a
+            connection's config changing, or "Refresh Schema"), never per
+            chat turn. Always tied to exactly one connection (this call
+            never runs for a whole dataset group at once), so its
+            dataset_type/dataset_name always come from
+            resolve_dataset_identity(), never resolve_group_identity().
 
         `user_id` is the same already-resolved identity every other method
         on this class takes (auth.py's get_current_user_identity - a real

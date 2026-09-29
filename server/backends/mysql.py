@@ -46,10 +46,6 @@ assuming they're identical:
     KEY_COLUMN_USAGE (REFERENCED_TABLE_NAME/REFERENCED_COLUMN_NAME already
     live on KEY_COLUMN_USAGE itself in MySQL - no separate
     constraint_column_usage-style join needed, unlike Postgres).
-  - There is no role_table_grants: MySQL's equivalent is
-    information_schema.TABLE_PRIVILEGES (per-table grants; there's also
-    SCHEMA_PRIVILEGES for database-level grants, but table-level is the
-    closer match to what the Postgres backend surfaces).
 
 NOTE for reviewers: like backends/snowflake.py, this has been exercised
 against the fake DB-API harness in tests/server/helpers.py, not a real
@@ -576,24 +572,7 @@ class MySQLBackend(Backend):
                 view_lines = [f"  View {v[0]}" for v in views]
                 schema_parts.append("Views:\n" + "\n".join(view_lines))
 
-            # 5. Grants - MySQL's closest equivalent to Postgres's
-            # role_table_grants is information_schema.TABLE_PRIVILEGES
-            # (per-table grants; SCHEMA_PRIVILEGES also exists for
-            # database-level grants, but table-level is the closer match
-            # to what the Postgres backend surfaces here).
-            cursor.execute(f"""
-                SELECT GRANTEE, TABLE_NAME, PRIVILEGE_TYPE
-                FROM information_schema.TABLE_PRIVILEGES
-                WHERE TABLE_SCHEMA = DATABASE()
-                  AND TABLE_NAME IN ({format_strings})
-                ORDER BY TABLE_NAME, GRANTEE;
-            """, tuple(kept_names))
-            grants = cursor.fetchall()
-            if grants:
-                grant_lines = [f"  Grant {g[2]} on {g[1]} to {g[0]}" for g in grants]
-                schema_parts.append("Grants:\n" + "\n".join(grant_lines))
-
-            # 6. Triggers
+            # 5. Triggers
             cursor.execute(f"""
                 SELECT EVENT_OBJECT_TABLE, TRIGGER_NAME, EVENT_MANIPULATION, ACTION_STATEMENT
                 FROM information_schema.TRIGGERS
@@ -605,7 +584,7 @@ class MySQLBackend(Backend):
                 trig_lines = [f"  [{t[0]}] {t[1]} ({t[2]}): {t[3]}" for t in triggers]
                 schema_parts.append("Triggers:\n" + "\n".join(trig_lines))
 
-            # 7. Table comments + row count estimate (new) - both live on
+            # 6. Table comments + row count estimate (new) - both live on
             # the exact same information_schema.TABLES row per kept table,
             # so one query covers two new attribute groups (table/column
             # comments, and the row-count estimate) instead of two separate
@@ -656,7 +635,7 @@ class MySQLBackend(Backend):
             if estimate_lines:
                 schema_parts.append("Row count estimates:\n" + "\n".join(estimate_lines))
 
-            # 8. Routines (new) - existence + signature only, no body (see
+            # 7. Routines (new) - existence + signature only, no body (see
             # get_schema()'s "Routine definitions" section for the full-body
             # deep-only counterpart, reusing ROUTINE_DEFINITION fetched here
             # rather than re-querying it). Not scoped to kept_names (like
@@ -700,7 +679,7 @@ class MySQLBackend(Backend):
             except Exception:
                 pass
 
-            # 9. Session timezone / default collation (new) - one line for
+            # 8. Session timezone / default collation (new) - one line for
             # the whole connection, not per-table. @@session.time_zone is
             # the session's effective timezone (what TIMESTAMP arithmetic
             # and NOW()/CURRENT_TIMESTAMP resolve against);

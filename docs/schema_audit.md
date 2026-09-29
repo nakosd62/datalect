@@ -1,5 +1,7 @@
 # Schema Introspection Audit — how thoroughly each backend captures schema
 
+> **Update (2026-09-25):** Grants-based schema introspection, discussed throughout this document as a checklist item and as a candidate for narrowing (see "The audit's grants gap is worth narrowing" below), was removed entirely from every backend. The database's own execution-time permission error is considered sufficient feedback if generated SQL can't run - a pre-emptive grants dump in the prompt is no longer part of the product. References to "grants" below describe history, not current behavior.
+
 Scope: `server/backends/{base,postgres,mysql,mssql,oracle,redshift,snowflake,databricks,bigquery,mongodb_sql,sheets}.py`, cross-checked against `server/translate_routes.py` and `server/db.py`. Every finding below is grounded in the actual `get_schema()` code, not assumption — file/line references are given so anything here can be re-verified directly.
 
 ## The baseline the question is measured against

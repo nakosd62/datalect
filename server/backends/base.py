@@ -67,7 +67,7 @@ SCHEMA_MAX_CHARS = int(os.environ.get("SCHEMA_MAX_SCHEMA_CHARS", 100_000))
 # deep schema text for every /api/translate (and related) call - identical
 # per-table detail (columns, types, everything else under a table's own
 # heading), but every OTHER top-level schema-object section (Constraints,
-# Indexes, Views, Grants, and so on) stripped out, purely to cut down input
+# Indexes, Views, and so on) stripped out, purely to cut down input
 # token cost. Off by default, so an unset/blank/anything-other-than-"true"
 # value leaves every existing deployment's prompts byte-for-byte unchanged.
 # Read once at import time like every other SCHEMA_* flag here, so flipping
@@ -1019,7 +1019,7 @@ def split_schema_text_into_entries(schema_text):
 # schema_text - "top-level" meaning flush against the left margin, as
 # opposed to a continuation line belonging to the entry above it. Every
 # backend indents every continuation line it ever emits - a column
-# definition, a constraint/index/view/grant/trigger/comment/routine
+# definition, a constraint/index/view/trigger/comment/routine
 # listing, a sampled value, a naming-convention relationship (see e.g.
 # postgres.py's `f"  {col_name} {data_type} ..."`, mongodb_sql.py's
 # `f"  {col.column_name} {col.type_name} ..."`, bigquery.py's nested
@@ -1031,7 +1031,7 @@ def split_schema_text_into_entries(schema_text):
 # negative lookahead, since derive_tables_only_schema_text (below) wants
 # to know where the first section that ISN'T one of those two things
 # begins, without hardcoding the long, backend-specific list of actual
-# non-table section names (Constraints/Indexes/Views/Grants/Triggers/
+# non-table section names (Constraints/Indexes/Views/Triggers/
 # Comments/Row count estimates/Routines/Session/View definitions/Routine
 # definitions/Live row counts/Column value samples/Estimated dataset
 # size/Likely relationships/... - mongodb_sql.py and sheets.py don't even
@@ -1047,7 +1047,7 @@ def derive_tables_only_schema_text(schema_text):
     table/table-family/tab entries - full per-table detail (columns,
     types, everything else indented under that table's own heading) kept
     exactly as-is, but every OTHER top-level schema-object section that
-    follows (Constraints, Indexes, Views, Grants, Triggers, Comments, Row
+    follows (Constraints, Indexes, Views, Triggers, Comments, Row
     count estimates, Routines, Session, View definitions, Routine
     definitions, Live row counts, Column value samples, Likely
     relationships, and any backend-specific ones like Clustering keys or
@@ -1194,7 +1194,7 @@ class Backend(ABC):
     @abstractmethod
     def get_schema(self, connection):
         """Return a text description of the schema (tables, constraints,
-        indexes, views, grants, triggers, or the closest per-backend
+        indexes, views, triggers, or the closest per-backend
         equivalents) suitable for inclusion in the Gemini prompt. Return
         None/empty if nothing could be introspected - the caller (db.py)
         owns deciding what fallback text to show and whether to cache it.
@@ -1214,8 +1214,8 @@ class Backend(ABC):
         get_schema()'s text - same tables/columns/constraints/indexes plus
         the new catalog-only attributes (identity markers, comments, row-
         count estimates, routine existence+signature without bodies,
-        distribution/partition/clustering keys, session facts, widened
-        grants, RLS/external flags), but view/routine bodies are named/
+        distribution/partition/clustering keys, session facts,
+        RLS/external flags), but view/routine bodies are named/
         signatured only, never rendered in full here.
 
         Used for connections that may not even be selected for SQL

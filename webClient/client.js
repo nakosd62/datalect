@@ -1765,7 +1765,24 @@ document.addEventListener('DOMContentLoaded', async () => {
   function applyEditorPaneHeights() {
     if (sqlContainer) sqlContainer.style.height = `${editorAreaHeightPx}px`;
     if (nlWrapper) {
-      nlWrapper.style.height = isWideEditorLayout()
+      // In the stacked (narrow) layout, nlWrapper's height is normally
+      // governed independently by nlPaneHeightPx (via
+      // #editorPanesResizer), NOT by editorAreaHeightPx - see this
+      // function's neighboring comments. But when the SQL pane is hidden,
+      // #editorPaneSql and #editorPanesResizer are both display:none, so
+      // #resultsPanesResizer's drag (which only ever touches
+      // editorAreaHeightPx/sqlContainer) was resizing an invisible box and
+      // producing no visible effect at all - verified live, this is
+      // exactly the "the divider only works if the SQL box is visible" bug
+      // report. The wide/side-by-side layout already avoids this (it
+      // always ties nlWrapper to editorAreaHeightPx regardless of SQL
+      // visibility - see editorAreaHeightPx's own comment above, "doubles
+      // as the NL box's own height"); this extends the same rule to the
+      // narrow layout whenever SQL is hidden there too, so
+      // #resultsPanesResizer always resizes whichever pane is actually the
+      // visible one.
+      const sqlHidden = editorPaneSql ? editorPaneSql.classList.contains('hidden') : false;
+      nlWrapper.style.height = (isWideEditorLayout() || sqlHidden)
         ? `${editorAreaHeightPx}px`
         : `${nlPaneHeightPx}px`;
     }
@@ -1867,6 +1884,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     let dragStartNlWidthPx = 0;
     let dragStartNlHeightPx = 0;
     let activeMoveHandler = null;
+    let activePointerId = null;
 
     function onDragMoveWide(e) {
       applyNlPaneWidthPx(dragStartNlWidthPx + (e.clientX - dragStartPos));
@@ -1877,19 +1895,40 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     function stopDragging() {
-      if (activeMoveHandler) document.removeEventListener('mousemove', activeMoveHandler);
-      document.removeEventListener('mouseup', stopDragging);
+      if (activeMoveHandler) document.removeEventListener('pointermove', activeMoveHandler);
+      document.removeEventListener('pointerup', stopDragging);
+      document.removeEventListener('pointercancel', stopDragging);
+      if (activePointerId !== null) {
+        try { editorPanesResizer.releasePointerCapture(activePointerId); } catch (err) { /* never captured - fine */ }
+      }
       editorPanesResizer.classList.remove('editor-panes-resizer--dragging');
       document.body.style.userSelect = '';
       document.body.style.cursor = '';
       activeMoveHandler = null;
+      activePointerId = null;
       saveEditorLayoutPreference();
     }
 
-    editorPanesResizer.addEventListener('mousedown', (e) => {
+    // Pointer Events (not mousedown/mousemove/mouseup) so this works for
+    // touch and pen the same as mouse - verified live that mousedown-only
+    // handlers never fire at all on a touch-only device (phone), which is
+    // exactly why this divider was completely un-draggable there before.
+    // Move/up listeners still live on `document`, same as the old mouse
+    // code and for the same reason (a fast drag can outrun the resizer's
+    // own thin hit area) - setPointerCapture() below is only a best-effort
+    // extra (and wrapped in try/catch: verified live that it can throw for
+    // a pointer id the browser doesn't yet consider "active" - a synthetic
+    // event triggered exactly that during testing - so nothing here may
+    // depend on it succeeding). touch-action: none in style.css is the
+    // other, load-bearing half of this fix - without it, a touchstart here
+    // is free to be interpreted as a page scroll before any pointermove
+    // arrives.
+    editorPanesResizer.addEventListener('pointerdown', (e) => {
       e.preventDefault();
       editorPanesResizer.classList.add('editor-panes-resizer--dragging');
       document.body.style.userSelect = 'none';
+      activePointerId = e.pointerId;
+      try { editorPanesResizer.setPointerCapture(e.pointerId); } catch (err) { /* best-effort only */ }
 
       if (isWideEditorLayout()) {
         dragStartPos = e.clientX;
@@ -1903,8 +1942,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         activeMoveHandler = onDragMoveNarrow;
       }
 
-      document.addEventListener('mousemove', activeMoveHandler);
-      document.addEventListener('mouseup', stopDragging);
+      document.addEventListener('pointermove', activeMoveHandler);
+      document.addEventListener('pointerup', stopDragging);
+      document.addEventListener('pointercancel', stopDragging);
     });
 
     // Keyboard equivalent (role="separator" + tabindex="0" in index.html
@@ -1948,6 +1988,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     let dragStartY = 0;
     let dragStartHeightPx = 0;
+    let activePointerId = null;
 
     function onDragMove(e) {
       const desiredPx = dragStartHeightPx + (e.clientY - dragStartY);
@@ -1956,23 +1997,39 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     function stopDragging() {
-      document.removeEventListener('mousemove', onDragMove);
-      document.removeEventListener('mouseup', stopDragging);
+      document.removeEventListener('pointermove', onDragMove);
+      document.removeEventListener('pointerup', stopDragging);
+      document.removeEventListener('pointercancel', stopDragging);
+      if (activePointerId !== null) {
+        try { resultsPanesResizer.releasePointerCapture(activePointerId); } catch (err) { /* never captured - fine */ }
+      }
       resultsPanesResizer.classList.remove('results-panes-resizer--dragging');
       document.body.style.userSelect = '';
       document.body.style.cursor = '';
+      activePointerId = null;
       saveEditorLayoutPreference();
     }
 
-    resultsPanesResizer.addEventListener('mousedown', (e) => {
+    // Pointer Events, not mousedown/mousemove/mouseup - see
+    // #editorPanesResizer's own comment in initEditorPanesResizer() above
+    // for why (touch never fired mousedown at all), why move/up stay bound
+    // to `document` rather than the resizer itself, and why
+    // setPointerCapture() below is wrapped in try/catch (best-effort only -
+    // verified live that it can throw for a pointer id the browser doesn't
+    // yet consider "active"). touch-action: none (style.css) is the
+    // load-bearing half of this fix.
+    resultsPanesResizer.addEventListener('pointerdown', (e) => {
       e.preventDefault();
       dragStartY = e.clientY;
       dragStartHeightPx = editorAreaHeightPx;
       resultsPanesResizer.classList.add('results-panes-resizer--dragging');
       document.body.style.userSelect = 'none';
       document.body.style.cursor = 'row-resize';
-      document.addEventListener('mousemove', onDragMove);
-      document.addEventListener('mouseup', stopDragging);
+      activePointerId = e.pointerId;
+      try { resultsPanesResizer.setPointerCapture(e.pointerId); } catch (err) { /* best-effort only */ }
+      document.addEventListener('pointermove', onDragMove);
+      document.addEventListener('pointerup', stopDragging);
+      document.addEventListener('pointercancel', stopDragging);
     });
 
     resultsPanesResizer.addEventListener('keydown', (e) => {
@@ -2031,6 +2088,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (editorPaneSql) editorPaneSql.classList.toggle('hidden', !visible);
     if (editorPanesResizer) editorPanesResizer.classList.toggle('hidden', !visible);
     if (editorPanesRow) editorPanesRow.classList.toggle('sql-hidden', !visible);
+    // Re-applies nlWrapper's height using the now-current visibility, since
+    // applyEditorPaneHeights() picks which variable (editorAreaHeightPx vs
+    // nlPaneHeightPx) governs it based on this same hidden state - see its
+    // own comment. Without this, toggling Show SQL while in the narrow
+    // layout would leave the NL box's height stuck on whichever variable
+    // was authoritative before the toggle, until the next drag/resize.
+    applyEditorPaneHeights();
     if (visible && sqlEditor) {
       // CodeMirror mis-measures itself while its container sits under
       // display:none (a well-known CodeMirror gotcha, same reasoning as
@@ -2645,12 +2709,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (resultsChartWrapper) resultsChartWrapper.classList.add('hidden');
     if (resultsTableWrapper) resultsTableWrapper.classList.remove('hidden');
     destroyResultsChart();
-    // Same reasoning: the Summary tab's own inline mini-chart preview(s)
-    // (see renderSummaryInlineChart()) sit on <canvas> elements inside
-    // resultsBody, which this function just wiped via innerHTML above -
-    // those Chart.js instances would otherwise leak (and their old canvas
-    // references would be stale) rather than being cleanly destroyed.
-    destroySummaryInlineCharts();
     // Same reasoning as the chart reset just above - a truncation notice
     // left over from the PREVIOUS turn's result must not linger through a
     // "cleared" results area either.
@@ -6653,13 +6711,15 @@ document.addEventListener('DOMContentLoaded', async () => {
         const direction = summaryFeedbackTrigger.dataset.summaryFeedbackTrigger;
         openReportIssueModal({ category: direction === 'up' ? 'summary_thumbs_up' : 'summary_thumbs_down' });
       }
-      // The Summary tab's "View as chart" inline link/preview (see
-      // summaryChartInlineLinkHtml()/renderSummaryInlineChart()/
-      // jumpToChartableResultTab()) - same delegated-listener reasoning as
-      // the two triggers above. The trigger's own value is which
-      // currentResultsList index it targets (there can be more than one
-      // now, one per chartable result this turn), read straight off the
-      // dataset attribute and handed to jumpToChartableResultTab().
+      // The Summary tab's inline "[phrase](chart:N)" links (see
+      // applyInlineChartLinks()/jumpToChartableResultTab()) - the model
+      // plants these itself, inline in its own prose, wrapping the exact
+      // phrase that makes the point a chart illustrates. Same
+      // delegated-listener reasoning as the two triggers above. The
+      // trigger's own value is which currentResultsList index it targets
+      // (there can be more than one now, one per chartable result this
+      // turn), read straight off the dataset attribute and handed to
+      // jumpToChartableResultTab().
       const viewChartTrigger = e.target.closest('[data-view-chart-trigger]');
       if (viewChartTrigger) jumpToChartableResultTab(viewChartTrigger.dataset.viewChartTrigger);
     });
@@ -7016,23 +7076,21 @@ document.addEventListener('DOMContentLoaded', async () => {
   // one, filtering by name and body text) - just a plain, full list of
   // every entry.
   //
-  // The list itself is a 2-level tree: up to six top-level groups
-  // (Tables/Views/Indexes/Routines/Grants/Likely Relationships, each
+  // The list itself is a 2-level tree: up to five top-level groups
+  // (Tables/Views/Indexes/Routines/Likely Relationships, each
   // labeled with its own item count and collapsible - see
   // schemaViewerExpanded below), each holding the matching items parsed
   // out of this connection's schema text. Tables come from the same
   // Table:/Table family:/Tab: entries the columns table (etc.) already
-  // uses; Views/Indexes/Routines/Grants/Likely Relationships come from
+  // uses; Views/Indexes/Routines/Likely Relationships come from
   // their own global sections (see parseSchemaViews()/
-  // parseSchemaIndexes()/parseSchemaRoutines()/parseSchemaGrants()/
+  // parseSchemaIndexes()/parseSchemaRoutines()/
   // parseSchemaRelationships() below) the same way Row count
   // estimates/Constraints/Column value samples do. A group this
   // dialect/connection has none of (most dialects have no Indexes section
-  // at all - see parseSchemaIndexes()'s own comment; only Postgres/MySQL/
-  // Databricks/Oracle/MSSQL/Redshift emit Grants at all - see
-  // parseSchemaGrants()'s own comment) is left out of the tree entirely
-  // (see renderSchemaViewerEntryList()) rather than shown as an empty,
-  // non-expandable "(0)" row.
+  // at all - see parseSchemaIndexes()'s own comment) is left out of the
+  // tree entirely (see renderSchemaViewerEntryList()) rather than shown as
+  // an empty, non-expandable "(0)" row.
   // ===========================================================================
 
   // This request's own connection reference ({kind: 'preset'|'custom', id})
@@ -7042,43 +7100,36 @@ document.addEventListener('DOMContentLoaded', async () => {
   // function's parameters.
   let schemaViewerCurrentRef = { kind: '', id: '' };
   let schemaViewerEntries = [];
-  // { category: 'tables'|'views'|'indexes'|'routines'|'grants'|
+  // { category: 'tables'|'views'|'indexes'|'routines'|
   // 'relationships'|null, index: number } - which single leaf in the tree
   // is selected, if any. Replaces a bare index now that the list holds
-  // six separate item arrays rather than just schemaViewerEntries.
+  // five separate item arrays rather than just schemaViewerEntries.
   let schemaViewerSelected = { category: null, index: -1 };
   // Which top-level groups are expanded - reset on every fresh load (see
   // loadSchemaViewerConnection()) rather than persisted across
   // connections, since a group that made sense to collapse/expand for one
-  // dataset has no bearing on the next one opened. All six start
+  // dataset has no bearing on the next one opened. All five start
   // collapsed - the dialog opens landed on the pinned "Overview" entry
   // instead (see renderSchemaViewerEntryList()'s default-selection logic),
   // so there's no need for any group's own contents to already be
   // unfurled underneath it.
-  let schemaViewerExpanded = { tables: false, views: false, indexes: false, routines: false, grants: false, relationships: false };
-  // Views/Indexes/Routines/Grants parsed once per load (see
-  // parseSchemaViews()/parseSchemaIndexes()/parseSchemaRoutines()/
-  // parseSchemaGrants() below) - lists in the same spirit as
-  // schemaViewerEntries above, just for these other four tree groups.
+  let schemaViewerExpanded = { tables: false, views: false, indexes: false, routines: false, relationships: false };
+  // Views/Indexes/Routines parsed once per load (see
+  // parseSchemaViews()/parseSchemaIndexes()/parseSchemaRoutines()
+  // below) - lists in the same spirit as
+  // schemaViewerEntries above, just for these other three tree groups.
   // schemaViewerViews: [{ name, definition }]. schemaViewerIndexes:
   // [{ table, name, kind, detail }]. schemaViewerRoutines: [{ name,
-  // signature, returnType, body }]. schemaViewerGrants: [{ table,
-  // privilege, grantee, detail }] - one row per line in the "Grants:"
-  // global section (see parseSchemaGrants()'s own comment for why this
-  // needed its own tree group at all - it used to fall through, un-
-  // recognized, to the bottom of whichever table entry happened to be
-  // LAST, the same "un-headed global section" trap Constraints/Indexes/
-  // Views/Routines were already promoted out of).
+  // signature, returnType, body }].
   let schemaViewerViews = [];
   let schemaViewerIndexes = [];
   let schemaViewerRoutines = [];
-  let schemaViewerGrants = [];
   // schemaViewerRelationships: [{ table, column, detail }] - one row per
   // line in the "Likely relationships (naming convention, unconfirmed):"
   // global section (see parseSchemaRelationships() below), same
-  // "un-headed global section" trap Grants was promoted out of (see that
-  // section's own comment above) - it used to fall through, un-
-  // recognized, to the bottom of whichever table entry happened to be
+  // "un-headed global section" trap Constraints/Indexes/Views/Routines
+  // were already promoted out of (see above) - it used to fall through,
+  // un-recognized, to the bottom of whichever table entry happened to be
   // LAST. Distinct from schemaViewerNamingRelationships below, which
   // feeds only the ER diagram and deliberately keeps just heuristic 1's
   // single-target lines - this one keeps every line, verbatim, for its
@@ -7231,7 +7282,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   // top-level section (a "Header:" line, or occasionally a bare one-line
   // section with no body of its own, like the Session line get_schema()
   // emits) - every other schema_parts section (backends/*.py's own numbered
-  // comments describe the full list: Constraints, Indexes, Views, Grants,
+  // comments describe the full list: Constraints, Indexes, Views,
   // Triggers, Comments, Row count estimates, Live row counts, Column value
   // samples, and so on) renders exclusively blank or 2-/4-space-indented
   // lines underneath its own header. This is the same "what marks a
@@ -7462,8 +7513,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   // relationship (unconfirmed): same column name also appears in ..."
   // lines alike. Before this existed, this whole section had no parser of
   // its own at all and so, same as "Comments:" (see parseSchemaComments()
-  // below) and "Grants:" before its own tree group (see parseSchemaGrants()'s
-  // comment), just rode along un-stripped in whichever table entry's own
+  // below), just rode along un-stripped in whichever table entry's own
   // "remainder" text happened to be shown last - looking like it belonged
   // to that one table rather than describing the whole connection. Returns
   // [{ table, column, detail }], `detail` being the line's own full
@@ -7502,14 +7552,14 @@ document.addEventListener('DOMContentLoaded', async () => {
   // the TABLE.COL separator's dot, and only the last one is ever the real
   // separator (an unqualified column name never contains a dot itself).
   // Before this existed, this whole section had no parser at all and so,
-  // same as "Likely relationships:" (see parseSchemaRelationships() above)
-  // and "Grants:" before its own tree group, just rode along un-stripped
-  // in whichever table entry's own "remainder" text happened to be shown
-  // last. Rather than getting its own tree group, though, this is folded
-  // directly into the existing table/column display (selectSchemaViewerEntry
-  // below) - a comment describes a specific table or column already shown
-  // elsewhere, unlike Grants/Likely relationships which describe
-  // permissions/relationships with no existing home of their own.
+  // same as "Likely relationships:" (see parseSchemaRelationships() above),
+  // just rode along un-stripped in whichever table entry's own "remainder"
+  // text happened to be shown last. Rather than getting its own tree
+  // group, though, this is folded directly into the existing table/column
+  // display (selectSchemaViewerEntry below) - a comment describes a
+  // specific table or column already shown elsewhere, unlike Likely
+  // relationships, which describes relationships with no existing home of
+  // its own.
   function parseSchemaComments(fullText) {
     const result = {};
     const body = extractNamedSchemaSection(fullText, 'Comments');
@@ -7709,17 +7759,17 @@ document.addEventListener('DOMContentLoaded', async () => {
   // The RHS fallback message for a view whose definition came back empty -
   // dialect-specific, since "the connected role may lack the privilege" is
   // vague to the point of unhelpful when the real, nameable cause differs
-  // by dialect and is usually NOT the same "SELECT on this object" grant a
-  // connection already needs to query the view's DATA in the first place:
+  // by dialect and is usually NOT the same "SELECT on this object" privilege
+  // a connection already needs to query the view's DATA in the first place:
   // Postgres's information_schema.views.view_definition (superseded by
   // pg_get_viewdef() server-side, but this message still covers a
   // genuinely revoked case) needs the role to at least see the view's
   // pg_class row; MySQL's INFORMATION_SCHEMA.VIEWS.VIEW_DEFINITION/SHOW
   // CREATE VIEW specifically needs the separate SHOW VIEW privilege (a
-  // real SELECT grant on the view's data does NOT imply this); SQL
+  // real SELECT privilege on the view's data does NOT imply this); SQL
   // Server's INFORMATION_SCHEMA.VIEWS.VIEW_DEFINITION/sys.sql_modules
   // specifically needs VIEW DEFINITION permission on that object (same
-  // "SELECT doesn't imply this" gap) - naming the actual missing grant
+  // "SELECT doesn't imply this" gap) - naming the actual missing privilege
   // turns this from an unfalsifiable catch-all into something an admin can
   // go check/fix. Every other dialect keeps the generic wording, since
   // none of the SQL backends here has an equivalent named, separate
@@ -7783,50 +7833,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       Object.keys(bodies).forEach((name) => routines.push({ name, signature: '', returnType: '', body: bodies[name] }));
     }
     return routines;
-  }
-
-  // Parses the "Grants:"/"Grants (current role):"/"Grants (best-effort -
-  // ...):" global section (see backends/*.py's own "N. Grants" comments -
-  // every SQL backend except BigQuery/mongodb_sql/sheets emits one, best-
-  // effort) into [{ table, privilege, grantee, detail }] - one row per
-  // line. Used to be entirely unrecognized by this file, which meant it
-  // fell through the "un-headed global section" trap every OTHER section
-  // here was already promoted out of (see extractNamedSchemaSection()'s
-  // own top-of-feature comment): it just rode along, un-stripped, in
-  // whichever table entry's own "remainder" text happened to be shown
-  // last (see renderSchemaViewerEntryDetail()'s stripNamedSchemaSections()
-  // call) - looking like it belonged to that one table rather than
-  // describing the whole connection. Now a real "Grants" tree group, same
-  // as Views/Indexes/Routines.
-  //
-  // Two line shapes exist across dialects (see e.g. backends/postgres.py's
-  // vs. backends/snowflake.py's own grant_lines list comprehension):
-  //   - Postgres/MySQL/Databricks/Oracle/MSSQL/Redshift: "  Grant {privilege}
-  //     on {table} to {grantee}" - one row per (table, grantee, privilege).
-  //   - Snowflake: "  {table}: {privilege[, privilege...]} (role {role})" -
-  //     one row per table, privileges already comma-joined for that role.
-  // A line matching neither shape (a future backend's own format) is
-  // skipped rather than guessed at - same "never throws, just yields
-  // fewer rows" leniency parseSchemaIndexes()/parseSchemaRoutines() apply
-  // to their own unrecognized lines.
-  function parseSchemaGrants(fullText) {
-    const grants = [];
-    const body = extractNamedSchemaSection(fullText, 'Grants');
-    if (!body) return grants;
-    const grantRe = /^ {2}Grant (\S+) on (\S+) to (\S+)$/;
-    const snowflakeRe = /^ {2}(\S+): (.+) \(role (.+)\)$/;
-    body.split('\n').forEach((line) => {
-      let m = grantRe.exec(line);
-      if (m) {
-        grants.push({ privilege: m[1], table: m[2], grantee: m[3], detail: line.trim() });
-        return;
-      }
-      m = snowflakeRe.exec(line);
-      if (m) {
-        grants.push({ table: m[1], privilege: m[2], grantee: `role ${m[3]}`, detail: line.trim() });
-      }
-    });
-    return grants;
   }
 
   // The "Session:" line (backends/*.py's own one-liner - session
@@ -7975,22 +7981,20 @@ document.addEventListener('DOMContentLoaded', async () => {
     return counts.live ? ` (${formatted} rows)` : ` (~${formatted} rows, estimated)`;
   }
 
-  // The six top-level tree groups, in display order. `items()` returns
+  // The five top-level tree groups, in display order. `items()` returns
   // this load's array for that group; `label()` renders one item's own
-  // tree-row text (every group but Indexes/Grants/Likely Relationships
+  // tree-row text (every group but Indexes/Likely Relationships
   // just uses its plain name - Indexes are qualified by table, since an
-  // index name alone doesn't say which table it belongs to; Grants
-  // likewise, plus the privilege/grantee, since neither alone identifies
-  // one grant row; Likely Relationships likewise, qualified by
-  // table.column, since a naming-convention match is only meaningful
-  // together with which column it's about; Tables also gets its
-  // row-count suffix, see schemaViewerRowCountSuffix() above).
+  // index name alone doesn't say which table it belongs to; Likely
+  // Relationships likewise, qualified by table.column, since a
+  // naming-convention match is only meaningful together with which column
+  // it's about; Tables also gets its row-count suffix, see
+  // schemaViewerRowCountSuffix() above).
   const SCHEMA_VIEWER_GROUPS = [
     { key: 'tables', title: 'Tables', items: () => schemaViewerEntries.filter((e) => e.name !== null), label: (item) => `${item.name}${schemaViewerRowCountSuffix(item.name)}` },
     { key: 'views', title: 'Views', items: () => schemaViewerViews, label: (item) => item.name },
     { key: 'indexes', title: 'Indexes', items: () => schemaViewerIndexes, label: (item) => `${item.table}.${item.name}` },
     { key: 'routines', title: 'Routines', items: () => schemaViewerRoutines, label: (item) => item.name },
-    { key: 'grants', title: 'Grants', items: () => schemaViewerGrants, label: (item) => `${item.table}: ${item.privilege} → ${item.grantee}` },
     { key: 'relationships', title: 'Likely Relationships', items: () => schemaViewerRelationships, label: (item) => `${item.table}.${item.column}` },
   ];
 
@@ -8314,11 +8318,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       const heading = `${r.name}(${r.signature})${r.returnType ? ` -> ${r.returnType}` : ''}`;
       return renderSchemaViewerSimpleDetail(heading, r.body || '(No body available for this routine.)');
     }
-    if (category === 'grants') {
-      const g = schemaViewerGrants[index];
-      if (!g) return renderSchemaViewerSimpleDetail('', '');
-      return renderSchemaViewerSimpleDetail(`${g.table} → ${g.grantee}`, g.detail);
-    }
     if (category === 'relationships') {
       const r = schemaViewerRelationships[index];
       if (!r) return renderSchemaViewerSimpleDetail('', '');
@@ -8378,17 +8377,15 @@ document.addEventListener('DOMContentLoaded', async () => {
       // their own structured field, or their own tree group) or nothing
       // at all. A dialect the column parser doesn't recognize (no columns
       // found) still falls back to the complete, untouched raw text, same
-      // as before this table existed. "Grants" was the last of these
-      // global sections still falling through here unrecognized (see
-      // parseSchemaGrants()'s own comment) before "Comments" (now folded
-      // into the columns table/table-comment note above - see
-      // parseSchemaComments()) and "Likely relationships" (now its own
-      // tree group - see parseSchemaRelationships()) were promoted out
-      // too, same reasoning each time.
+      // as before this table existed. "Comments" (now folded into the
+      // columns table/table-comment note above - see parseSchemaComments())
+      // and "Likely relationships" (now its own tree group - see
+      // parseSchemaRelationships()) were promoted out of this fallback
+      // text the same way.
       const shownText = columns.length > 0
         ? stripSchemaGlobalBareLines(stripNamedSchemaSections(remainder, [
           'Row count estimates', 'Live row counts', 'Column value samples', 'Constraints',
-          'Indexes', 'Views', 'View definitions', 'Routines', 'Routine definitions', 'Grants',
+          'Indexes', 'Views', 'View definitions', 'Routines', 'Routine definitions',
           'Comments', 'Likely relationships',
         ]))
         : (entry.text || '');
@@ -8416,7 +8413,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     schemaViewerViews = [];
     schemaViewerIndexes = [];
     schemaViewerRoutines = [];
-    schemaViewerGrants = [];
     schemaViewerRelationships = [];
     schemaViewerRowCounts = {};
     schemaViewerSamples = {};
@@ -8428,7 +8424,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     schemaViewerSelected = { category: null, index: -1 };
     // See this variable's own top-of-file declaration comment for why
     // every group starts collapsed.
-    schemaViewerExpanded = { tables: false, views: false, indexes: false, routines: false, grants: false, relationships: false };
+    schemaViewerExpanded = { tables: false, views: false, indexes: false, routines: false, relationships: false };
     if (schemaViewerEntryList) {
       schemaViewerEntryList.innerHTML = '<li class="schema-viewer-entry-empty text-center text-muted py-8">Loading...</li>';
     }
@@ -8508,7 +8504,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       schemaViewerViews = parseSchemaViews(fullText);
       schemaViewerIndexes = parseSchemaIndexes(fullText);
       schemaViewerRoutines = parseSchemaRoutines(fullText);
-      schemaViewerGrants = parseSchemaGrants(fullText);
       schemaViewerRelationships = parseSchemaRelationships(fullText);
       // Deterministic ER-diagram inputs (see buildSchemaErDiagram() above) -
       // parsed once per load the same way every other global section is.
@@ -8756,20 +8751,36 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     let dragStartX = 0;
     let dragStartWidthPx = 0;
+    let activePointerId = null;
 
     function onDragMove(e) {
       applyListPaneWidth(dragStartWidthPx + (e.clientX - dragStartX));
     }
 
     function stopDragging() {
-      document.removeEventListener('mousemove', onDragMove);
-      document.removeEventListener('mouseup', stopDragging);
+      document.removeEventListener('pointermove', onDragMove);
+      document.removeEventListener('pointerup', stopDragging);
+      document.removeEventListener('pointercancel', stopDragging);
+      if (activePointerId !== null) {
+        try { schemaViewerPanesResizer.releasePointerCapture(activePointerId); } catch (err) { /* never captured - fine */ }
+      }
       schemaViewerPanesResizer.classList.remove('schema-viewer-panes-resizer--dragging');
       document.body.style.userSelect = '';
       document.body.style.cursor = '';
+      activePointerId = null;
     }
 
-    schemaViewerPanesResizer.addEventListener('mousedown', (e) => {
+    // Pointer Events, not mousedown/mousemove/mouseup - see
+    // #editorPanesResizer's own comment (initEditorPanesResizer(), further
+    // up this file) for why: touch never fired mousedown at all, so this
+    // divider (like the other two) was completely un-draggable on a phone.
+    // Move/up listeners stay on `document` (same reason as the old
+    // mouse-only code: a fast drag can outrun the resizer's own thin hit
+    // area) - setPointerCapture() below is a best-effort extra only,
+    // wrapped in try/catch since it can throw for a pointer id the browser
+    // doesn't yet consider "active" (verified live with a synthetic
+    // pointer during testing).
+    schemaViewerPanesResizer.addEventListener('pointerdown', (e) => {
       e.preventDefault();
       dragStartX = e.clientX;
       dragStartWidthPx = schemaViewerListPane.getBoundingClientRect().width;
@@ -8779,8 +8790,11 @@ document.addEventListener('DOMContentLoaded', async () => {
       // briefly strays off the thin resizer itself mid-drag.
       document.body.style.userSelect = 'none';
       document.body.style.cursor = 'col-resize';
-      document.addEventListener('mousemove', onDragMove);
-      document.addEventListener('mouseup', stopDragging);
+      activePointerId = e.pointerId;
+      try { schemaViewerPanesResizer.setPointerCapture(e.pointerId); } catch (err) { /* best-effort only */ }
+      document.addEventListener('pointermove', onDragMove);
+      document.addEventListener('pointerup', stopDragging);
+      document.addEventListener('pointercancel', stopDragging);
     });
 
     // Keyboard equivalent for anyone not using a mouse (role="separator"
@@ -9004,6 +9018,45 @@ document.addEventListener('DOMContentLoaded', async () => {
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 15v4a3 3 0 0 0 3 3l4-9V2H5.72a2 2 0 0 0-2 1.7l-1.38 9a2 2 0 0 0 2 2.3zm7-13h2.67A2.31 2.31 0 0 1 22 4v7a2.31 2.31 0 0 1-2.33 2H17"></path></svg>
           </button>
         </span>
+      </div>`;
+  }
+
+  // Renders "suggested_searches" (see server/prompts/summary_single_
+  // connection.txt's and summary_all_databases.txt's own paragraph on it,
+  // and chart_helpers.py-style validation in summarize_routes.py's
+  // _clean_suggested_searches) as a small row of plain clickable links
+  // directly under the Summary tab's own text - NEVER inline within
+  // "summary" itself (that's reserved for the one specific "[phrase]
+  // (chart:N)" form - see applyInlineChartLinks), always at the bottom,
+  // regardless of where in the model's own JSON response the field
+  // happened to be. This is deliberately NOT a live search run by this
+  // app - nothing here is ever fetched server-side on the model's own
+  // say-so (see this feature's own design notes: the summarization call
+  // was never given a real web-search tool) - each link just opens the
+  // user's own browser on a plain Google search for that exact query,
+  // in a new tab, the same as if the user had typed it in themselves.
+  // `searches` may be undefined/null/empty (every non-"Summary" tab, and
+  // plenty of real Summary tabs too - see the prompts' own "far more
+  // often than not, leave this empty" guidance) - returns '' for all of
+  // those, same "nothing rendered at all" posture reportButtonHtml()/
+  // summaryFeedbackButtonsHtml() already use for their own disabled
+  // cases.
+  function suggestedSearchesHtml(searches) {
+    if (!Array.isArray(searches) || !searches.length) return '';
+    const links = searches
+      .map((query) => {
+        if (typeof query !== 'string' || !query.trim()) return '';
+        const trimmed = query.trim();
+        const url = `https://www.google.com/search?q=${encodeURIComponent(trimmed)}`;
+        return `<a class="summary-suggested-search-link" href="${url}" target="_blank" rel="noopener noreferrer">🔎 ${escapeHtml(trimmed)}</a>`;
+      })
+      .filter(Boolean)
+      .join('');
+    if (!links) return '';
+    return `
+      <div class="summary-suggested-searches">
+        <span class="summary-suggested-searches-label text-muted">Related searches:</span>
+        ${links}
       </div>`;
   }
 
@@ -9357,15 +9410,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (resultsChartWrapper) resultsChartWrapper.classList.add('hidden');
     if (resultsTableWrapper) resultsTableWrapper.classList.remove('hidden');
     destroyResultsChart();
-    // The Summary tab's own inline mini-chart preview(s) (see
-    // renderSummaryInlineChart()) are rebuilt fresh on every render too,
-    // same as the full-tab chart above - every stale instance left over
-    // from a previous render must not leak into this one's canvases. This
-    // one call up front (rather than the isText branch below trying to
-    // destroy-then-rebuild each preview one at a time) is what makes going
-    // from N previews to a different N - or to zero - always start from a
-    // clean slate.
-    destroySummaryInlineCharts();
     // Same reset-first posture as the toggle/chart-wrapper lines just
     // above - only the successful, non-empty tabular branch below ever
     // turns this back on, and only when THIS tab's own result was
@@ -9433,66 +9477,33 @@ document.addEventListener('DOMContentLoaded', async () => {
       // renderMarkdownLiteSummaryTab()'s own docstring) - a "Note" tab
       // (Phase B's own per-database '*** NO SQL ***' reply) never does,
       // so it's rendered plain like any other free-text reply.
-      let summaryHtml = result.tabLabel === 'Summary'
+      p.innerHTML = result.tabLabel === 'Summary'
         ? renderMarkdownLiteSummaryTab(result.text || '')
         : renderMarkdownLite(result.text || '');
-      // Chart discoverability (see renderSummaryInlineChart()'s own
-      // docstring) - whenever THIS turn has one or more chartable tabs,
-      // show an actual small rendering of EACH of their charts right in
-      // the Summary tab, rather than making the user click through to
-      // find them. Gated on `!result.summaryPending` since "all
-      // databases" mode's Summary tab can render before Phase C - and
-      // therefore before any tab's own visualization - has actually
-      // arrived. Every qualifying entry gets its own preview (not just
-      // the first) - a turn can now genuinely have more than one
-      // independently chartable result (see chart_helpers.py's
-      // _pick_chartable_results) - each carrying its own real
-      // currentResultsList index so its own preview can jump straight
-      // back to its own tab, not always the first one.
-      const chartableEntries = (result.tabLabel === 'Summary' && !result.summaryPending && currentResultsList)
-        ? (() => {
-          // Same "Query N" numbers the tab strip itself shows for these
-          // exact same tabs (see computeQueryNumbers' own docstring) -
-          // computed once here and threaded through so a preview/fallback
-          // link's own caption can never drift out of sync with what the
-          // tab strip says for that same tab.
-          const queryNumbers = computeQueryNumbers(currentResultsList);
-          return currentResultsList.reduce((acc, r, idx) => {
-            if (r && r.visualization) acc.push({ entry: r, index: idx, queryNumber: queryNumbers.get(idx) });
-            return acc;
-          }, []);
-        })()
-        : [];
-      // Chart.js failed to load (see the `typeof Chart` guards throughout
-      // this file) - fall back to the old plain-text nudge, one per
-      // qualifying entry, rather than silently showing nothing for a
-      // chartable turn.
-      if (chartableEntries.length && typeof Chart === 'undefined') {
-        chartableEntries.forEach(({ entry, index, queryNumber }) => {
-          summaryHtml += summaryChartInlineLinkHtml(entry, index, queryNumber, chartableEntries.length);
-        });
-      }
-      p.innerHTML = summaryHtml;
-      // A live preview grid sits BELOW the summary text (see
-      // .summary-text-chart-row/.summary-chart-preview-grid in style.css),
-      // not beside it - so the two only share a wrapper when there's at
-      // least one actual preview to place underneath; otherwise the
-      // paragraph goes straight into td exactly as before. The charts
-      // themselves aren't actually built here - just the empty grid
-      // they'll live in - see the `chartRow`/`previewGrid` comment
-      // further down for why that has to wait.
-      let chartRow = null;
-      let previewGrid = null;
-      if (chartableEntries.length && typeof Chart !== 'undefined') {
-        chartRow = document.createElement('div');
-        chartRow.className = 'summary-text-chart-row';
-        chartRow.appendChild(p);
-        previewGrid = document.createElement('div');
-        previewGrid.className = 'summary-chart-preview-grid';
-        chartRow.appendChild(previewGrid);
-        td.appendChild(chartRow);
-      } else {
-        td.appendChild(p);
+      // Chart discoverability on the Summary tab is just the model's own
+      // inline "[phrase](chart:N)" link, already turned into a clickable
+      // trigger by renderMarkdownLiteSummaryTab() -> applyInlineChartLinks()
+      // above (see that function's own docstring). This used to ALSO show a
+      // row of small preview charts underneath the text, one per chartable
+      // entry - removed per explicit request (they rendered poorly at that
+      // size and were redundant with the inline link: per
+      // chart_helpers.py's _clean_visualization, a result only ever reaches
+      // `result.visualization` at all BECAUSE the model already linked it
+      // inline, so every entry that would have gotten a preview already had
+      // a working link in the text above it, pointing at the exact same
+      // tab). Clicking that inline link still jumps straight to the
+      // result's own tab (see jumpToChartableResultTab()), where the full
+      // chart is one click away.
+      td.appendChild(p);
+
+      // Suggested follow-up web searches (see suggestedSearchesHtml()'s
+      // own docstring) - shown on the SUMMARY tab only, same restriction
+      // as the feedback row just below, since a per-database "Note" tab's
+      // `.suggestedSearches` is never set in the first place (only the
+      // Summary tab entry itself ever carries this field - see
+      // requestSingleModeResultsSummary()/requestAllModeResultsSummary()).
+      if (result.tabLabel === 'Summary') {
+        td.insertAdjacentHTML('beforeend', suggestedSearchesHtml(result.suggestedSearches));
       }
 
       // Thumbs up/down feedback on the SUMMARY tab specifically (never a
@@ -9522,24 +9533,6 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       tr.appendChild(td);
       resultsBody.appendChild(tr);
-      // NOW that previewGrid is actually attached to the live document
-      // (via chartRow -> td -> tr -> resultsBody just above) - only past
-      // this point does each <canvas> have a real, laid-out width for
-      // buildResultsChartConfig()'s own legend-scaling (see its `canvas`
-      // param comment) to read. Building any chart earlier - e.g. back
-      // where previewGrid itself was created, while it was still a
-      // detached element - would have measured a width of 0.
-      if (previewGrid) {
-        // Every previous render's own preview instances were already torn
-        // down once, up front, by this same function's own
-        // destroySummaryInlineCharts() call near the top - see that
-        // call's own comment for why a single clean-slate reset there,
-        // rather than a destroy-then-rebuild per entry here, is what
-        // correctly handles going from N previews to a different N.
-        chartableEntries.forEach(({ entry, index, queryNumber }) => {
-          renderSummaryInlineChart(previewGrid, entry, index, queryNumber, chartableEntries.length);
-        });
-      }
       setReportContext({
         category: 'wrong_result',
         databaseName: result.database && result.database.name,
@@ -9767,15 +9760,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   // real result or a failed statement), and skipping any leading or
   // interspersed isText ("Summary"/"Note") or isPending (all-mode's own
   // live-streaming placeholder) tabs entirely, since those never consume
-  // a query number. Computed once and shared by buildResultsTabsNav (the
-  // tab strip's own labels) and chartPreviewCaption (the Summary tab's own
-  // preview/fallback-link captions) so the two can never show a different
-  // number for the same tab - see chartableEntries' own comment in
-  // renderTableResult()'s isText branch for the regression this fixes: a
-  // single-connection turn with one query result AND a Summary tab used
-  // to label that one real tab "Query 2", never "Query 1", since the
-  // Summary tab itself occupied position 0 and the old code numbered
-  // straight off the raw array index.
+  // a query number. Fixes a real regression: a single-connection turn with
+  // one query result AND a Summary tab used to label that one real tab
+  // "Query 2", never "Query 1", since the Summary tab itself occupied
+  // position 0 and the old code numbered straight off the raw array index.
   function computeQueryNumbers(list) {
     const numbers = new Map();
     let queryNumber = 0;
@@ -9978,23 +9966,21 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // Converts the summarization prompts' own "[<short phrase>](chart:<index>)"
   // inline link (see server/prompts/summary_single_connection.txt and
-  // summary_all_databases.txt's "visualizations" paragraph) into the exact
-  // same kind of clickable trigger summaryChartInlineLinkHtml()'s own
-  // fallback link already renders below - same class
-  // (.summary-chart-inline-link, styled as plain underlined inline text,
-  // not a bolted-on button - see that rule's own comment in style.css) and
-  // the SAME data-view-chart-trigger/jumpToChartableResultTab() delegated
-  // click handling, so this needs no new plumbing beyond this one
-  // substitution. This is what actually integrates a chart with the prose
+  // summary_all_databases.txt's "visualizations" paragraph) into a
+  // clickable trigger - class .summary-chart-inline-link (plain underlined
+  // inline text, not a bolted-on button - see that rule's own comment in
+  // style.css) plus data-view-chart-trigger, wired to
+  // jumpToChartableResultTab() via the delegated #resultsBody click
+  // listener. This is what actually integrates a chart with the prose
   // that earned it: the model plants this link ITSELF, mid-sentence,
   // wrapping the exact short phrase that makes the point the chart
   // illustrates (e.g. "...Apple Pay's 2-of-10 completion rate..."), so the
   // reader clicks the very words describing the finding, not a generic
-  // "view chart" link bolted on afterward - unlike the fallback link,
-  // there's deliberately no leading space or emoji added here, since the
-  // bracketed text already sits exactly where the model wrote it inline,
-  // with whatever surrounding spacing/punctuation the sentence already
-  // has. `index` is left exactly as the model wrote it (not validated
+  // "view chart" link bolted on afterward - there's deliberately no
+  // leading space or emoji added here, since the bracketed text already
+  // sits exactly where the model wrote it inline, with whatever
+  // surrounding spacing/punctuation the sentence already has. `index` is
+  // left exactly as the model wrote it (not validated
   // against currentResultsList here) - jumpToChartableResultTab() already
   // treats an unrecognized/invalid index defensively (falls back to the
   // first chartable tab) rather than assuming every trigger it receives is
@@ -10070,19 +10056,22 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Renders the "All databases" mode Summary tab's text (see the `isText`
   // branch in renderTableResult(), and renderNoSqlResponse() for the
   // all-mode "answer" outcome, which shares this same leading-label
-  // convention) - a superset of renderMarkdownLite() that ALSO bolds
-  // +underlines the leading line of every block marked with
-  // SUMMARY_TAB_BLOCK_MARKER (see its own docstring for why marking is
-  // done explicitly by each caller rather than inferred by position).
-  // Never matches specific words - connection_router.py's
+  // convention) - a superset of renderMarkdownLite() that ALSO HIDES the
+  // leading label line of every block marked with SUMMARY_TAB_BLOCK_MARKER
+  // (see its own docstring for why marking is done explicitly by each
+  // caller rather than inferred by position). connection_router.py's
   // _TRIAGE_SYSTEM_INSTRUCTION / translate_routes.py's
-  // _SUMMARY_SYSTEM_INSTRUCTION both ask the model for a "<label line>
-  // \n\nbody" shape with the label written in the SAME LANGUAGE as the
-  // user's own question, so there is no fixed English word left to match
-  // against. Only call this for text where every block was actually
-  // marked; a plain single-connection reply or a per-database "Note" tab
-  // never marks anything and is rendered plain via renderMarkdownLite()
-  // instead.
+  // _SUMMARY_SYSTEM_INSTRUCTION both still ask the model for a "<label
+  // line>\n\nbody" shape (a short section-heading label like "Triage"/
+  // "Results Summary", translated into the user's own question's
+  // language) - this used to render that label as a bold+underlined
+  // pseudo-heading; the user asked for these per-section titles to no
+  // longer show up at all, so this now drops the label line (and the
+  // blank line that separated it from the body) entirely and shows only
+  // the body underneath it. Only call this for text where every block
+  // was actually marked; a plain single-connection reply or a
+  // per-database "Note" tab never marks anything and is rendered plain
+  // via renderMarkdownLite() instead.
   //
   // The marked line does NOT always have a body underneath it - a fixed,
   // single-sentence apology (e.g. translate_routes.py's own
@@ -10090,26 +10079,27 @@ document.addEventListener('DOMContentLoaded', async () => {
   // when all-mode triage's response couldn't be parsed at all) is marked
   // by its caller exactly like any other block (see renderNoSqlResponse()),
   // but is just one line with nothing after it - no "\n\n" for the "body
-  // follows" branch below to find. The regex used to require that blank
-  // line unconditionally, so a label-only block like this never matched at
-  // all: the marker's NUL characters (invisible once actually rendered in
-  // a browser) were left behind in the output, and the literal word
-  // "SUMMARY_BLOCK" showed up glued directly onto the apology text with no
-  // space - a real bug report ("SUMMARY_BLOCKI am not able to respond to
-  // your prompt."), root-caused and reproduced against this exact string
-  // before this fix. Matching `(\n[ \t]*\n|\n?$)` after the label - a real
-  // blank line (body follows), OR just running out of string (at most one
-  // trailing newline, no body) - covers both shapes with one regex; which
-  // alternative matched is what `hasBody` below distinguishes, so the
-  // blank-line separator is only re-inserted into the output when there
-  // is actually a body underneath it to separate from.
+  // follows" branch below to find. In that case the marked line IS the
+  // entire real message, not a dispensable title, so it's kept (just
+  // without the old bold/underline treatment, which never made sense for
+  // plain body text anyway) rather than dropped like a genuine label.
+  // Matching `(\n[ \t]*\n|\n?$)` after the label - a real blank line (body
+  // follows), OR just running out of string (at most one trailing
+  // newline, no body) - covers both shapes with one regex; which
+  // alternative matched is what `hasBody` below distinguishes.
   function renderMarkdownLiteSummaryTab(rawText) {
     let html = escapeHtml(rawText || '');
     html = html.replace(
       new RegExp(SUMMARY_TAB_BLOCK_MARKER + '[ \\t]*([^\\n]+)(\\n[ \\t]*\\n|\\n?$)', 'g'),
       (_match, label, sep) => {
         const hasBody = /\n[ \t]*\n/.test(sep);
-        return `<strong><u>${unwrapLabelEmphasis(label)}</u></strong>` + (hasBody ? '\n\n' : '');
+        // hasBody: a real "<label>\n\nbody" block - the label was only
+        // ever a section-heading title, now dropped entirely (along with
+        // its separating blank line) so just the body shows.
+        // !hasBody: nothing follows this line - it IS the message
+        // (e.g. a fixed apology) - keep it, unwrapping any stray
+        // **bold**/__bold__ the model may have wrapped it in.
+        return hasBody ? '' : unwrapLabelEmphasis(label);
       }
     );
     return applyInlineMarkdown(html);
@@ -10427,10 +10417,26 @@ document.addEventListener('DOMContentLoaded', async () => {
         // `.visualization` copy-through) - so mutating it in place here,
         // once, is enough to reach both the live tab(s) and history.
         attachVisualizationsToResultsList(executeResults, data.visualizations);
+        // Same "0-3 short search queries, never run server-side" field
+        // single-connection mode's own summarization carries (see
+        // requestSingleModeResultsSummary) - attached directly onto the
+        // live Summary tab entry (appendPhaseCSummaryToSummaryTab only
+        // patches `.text`, so this needs its own line) rather than
+        // threaded through a dedicated helper, since there's exactly one
+        // place that entry can be found from here.
+        const suggestedSearches = Array.isArray(data.suggested_searches) ? data.suggested_searches : [];
+        const summaryTabEntry = getSummaryTabEntry();
+        if (summaryTabEntry) {
+          summaryTabEntry.suggestedSearches = suggestedSearches;
+          if (currentResultsList[activeResultIndex] === summaryTabEntry) {
+            renderTableResult(summaryTabEntry);
+          }
+        }
         return {
           databaseSummaries: Array.isArray(data.database_summaries) ? data.database_summaries : [],
           crossDatabaseSummary: data.cross_database_summary || null,
           visualizations: data.visualizations || {},
+          suggestedSearches,
         };
       } else if (data && data.error) {
         appendPhaseCErrorToSummaryTab(data.error);
@@ -10508,18 +10514,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   // rendered. Chart.js requires destroy()ing an old instance before
   // building a new one on the same <canvas>, or the two silently overlap.
   let resultsChartInstance = null;
-
-  // In-flight Chart.js instances for the Summary tab's own small inline
-  // previews (see renderSummaryInlineChart()) - deliberately distinct
-  // from resultsChartInstance above, since the two can be on screen at the
-  // same time (the Summary tab's preview canvas(es), and a full chart left
-  // rendered on a different, inactive tab's own <canvas>); destroying one
-  // must never tear down the other. An ARRAY, not a single instance - the
-  // Summary tab can now show more than one preview at once (one per
-  // chartable entry - see chartableEntries in renderTableResult()'s isText
-  // branch), each with its own live Chart.js instance to track and tear
-  // down.
-  let summaryInlineChartInstances = [];
 
   const CHART_MAX_SERIES = 12; // sane cap on `series_column` grouping - see buildResultsChartConfig()'s own comment.
 
@@ -10634,25 +10628,15 @@ document.addEventListener('DOMContentLoaded', async () => {
   // silently dropped rather than erroring, same "degrade gracefully"
   // posture the rest of this feature already takes toward imperfect LLM
   // output.
-  // `compact`: renders the same chart with its axis titles suppressed (the
-  // legend/ticks/gridlines stay, since those still carry real information
-  // even small) - used for the Summary tab's small inline preview (see
-  // renderSummaryInlineChart()), where full axis titles would eat most of
-  // the little vertical space available. The full-tab chart view (see
-  // renderResultChart()) always calls this with compact left at its
-  // default (false).
-  //
   // `containerWidth`: the real, already-laid-out pixel width of whatever
   // box this chart is about to fill - read here purely to scale the
-  // legend's own font size to match, so a chart rendered small (the
-  // Summary tab's own preview, at roughly half the results area's width)
-  // doesn't carry the same fixed legend text size as the much larger
-  // full-tab view and end up with a legend that reads as oversized
-  // relative to the chart it's labeling. Deliberately NOT read from the
-  // <canvas> element's own clientWidth: Chart.js only resizes the canvas
-  // itself to fill its container as part of constructing the Chart
-  // instance (or later, via its own ResizeObserver) - at the point this
-  // function runs, BEFORE that instance exists, an unstyled <canvas> (see
+  // legend's own font size to match, so a chart rendered at an unusual
+  // width doesn't carry the same fixed legend text size regardless of how
+  // much room it actually has. Deliberately NOT read from the <canvas>
+  // element's own clientWidth: Chart.js only resizes the canvas itself to
+  // fill its container as part of constructing the Chart instance (or
+  // later, via its own ResizeObserver) - at the point this function runs,
+  // BEFORE that instance exists, an unstyled <canvas> (see
   // renderResultChart()'s own #resultsChartCanvas, which carries no CSS
   // width of its own - Chart.js is what sizes it, always after the fact)
   // still reports the browser's intrinsic default (300 CSS px), not its
@@ -10661,7 +10645,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   // passes that plain number in. Left out entirely (or 0/falsy) falls
   // back to Chart.js's own default size - the exact look this file had
   // before per-size legend scaling existed.
-  function buildResultsChartConfig(result, viz, { compact = false, containerWidth = null } = {}) {
+  function buildResultsChartConfig(result, viz, { containerWidth = null } = {}) {
     const rows = result.rows || [];
     const colors = getChartSeriesColors();
     const axisColors = getChartAxisColors();
@@ -10696,11 +10680,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     const y1AxisTitle = usesSecondAxis ? axisTitleFor(secondaryColumns) : null;
 
     // Scales with the real rendered width (see this function's own
-    // `containerWidth` param comment) rather than a flat compact/full-size
-    // split - a chart resized to any width in between (e.g. the Summary
-    // preview growing or shrinking as the results area itself is resized)
-    // gets a legend that tracks it continuously instead of snapping
-    // between just two hardcoded sizes. 320px was chosen as the "Chart.js's
+    // `containerWidth` param comment) rather than a flat two-size split -
+    // a chart resized to any width (e.g. the results area itself being
+    // resized) gets a legend that tracks it continuously instead of
+    // snapping between hardcoded sizes. 320px was chosen as the "Chart.js's
     // own normal default (roughly 12px) starts to look right" reference
     // width - below that the legend shrinks (never past 9px, where text
     // stops being legible), above it it very slightly grows, capped at
@@ -10745,15 +10728,15 @@ document.addEventListener('DOMContentLoaded', async () => {
         options: {
           ...commonOptions,
           scales: {
-            x: { title: { display: !compact, text: viz.x_column, color: axisColors.text }, ticks: { color: axisColors.text }, grid: { color: axisColors.grid } },
-            y: { title: { display: !compact, text: yAxisTitle, color: axisColors.text }, position: 'left', ticks: { color: axisColors.text }, grid: { color: axisColors.grid } },
+            x: { title: { display: true, text: viz.x_column, color: axisColors.text }, ticks: { color: axisColors.text }, grid: { color: axisColors.grid } },
+            y: { title: { display: true, text: yAxisTitle, color: axisColors.text }, position: 'left', ticks: { color: axisColors.text }, grid: { color: axisColors.grid } },
             // Only present when the real data actually calls for it (see
             // assignYAxisIds) - its own grid is suppressed
             // (drawOnChartArea: false) so it doesn't draw a second,
             // misaligned set of gridlines over the primary axis's own.
             ...(usesSecondAxis ? { y1: {
               type: 'linear', position: 'right',
-              title: { display: !compact, text: y1AxisTitle, color: axisColors.text },
+              title: { display: true, text: y1AxisTitle, color: axisColors.text },
               ticks: { color: axisColors.text }, grid: { drawOnChartArea: false },
             } } : {}),
           },
@@ -10794,15 +10777,15 @@ document.addEventListener('DOMContentLoaded', async () => {
       options: {
         ...commonOptions,
         scales: {
-          x: { title: { display: !compact, text: viz.x_column, color: axisColors.text }, ticks: { color: axisColors.text }, grid: { color: axisColors.grid } },
-          y: { title: { display: !compact, text: yAxisTitle, color: axisColors.text }, position: 'left', ticks: { color: axisColors.text }, grid: { color: axisColors.grid }, beginAtZero: true },
+          x: { title: { display: true, text: viz.x_column, color: axisColors.text }, ticks: { color: axisColors.text }, grid: { color: axisColors.grid } },
+          y: { title: { display: true, text: yAxisTitle, color: axisColors.text }, position: 'left', ticks: { color: axisColors.text }, grid: { color: axisColors.grid }, beginAtZero: true },
           // Only present when the real data actually calls for it (see
           // assignYAxisIds) - its own grid is suppressed
           // (drawOnChartArea: false) so it doesn't draw a second,
           // misaligned set of gridlines over the primary axis's own.
           ...(usesSecondAxis ? { y1: {
             type: 'linear', position: 'right',
-            title: { display: !compact, text: y1AxisTitle, color: axisColors.text },
+            title: { display: true, text: y1AxisTitle, color: axisColors.text },
             ticks: { color: axisColors.text }, grid: { drawOnChartArea: false }, beginAtZero: true,
           } } : {}),
         },
@@ -10815,17 +10798,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       resultsChartInstance.destroy();
       resultsChartInstance = null;
     }
-  }
-
-  // Tears down EVERY currently-live Summary-tab preview instance at once
-  // (see summaryInlineChartInstances' own declaration comment) - called
-  // once per Summary-tab render pass, before rebuilding the fresh set of
-  // previews for whatever chartable entries this render actually has, not
-  // once per individual preview (which would risk destroying an instance
-  // built earlier in the very same render pass).
-  function destroySummaryInlineCharts() {
-    summaryInlineChartInstances.forEach((instance) => instance.destroy());
-    summaryInlineChartInstances = [];
   }
 
   // Draws `result.visualization` onto #resultsChartCanvas. Safe to call
@@ -10856,19 +10828,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     const result = currentResultsList && currentResultsList[activeResultIndex];
     if (result && result.visualization && result.chartView !== false) {
       renderResultChart(result);
-    }
-    // The Summary tab's own inline mini-chart preview(s) (see
-    // renderSummaryInlineChart()) read the same live theme colors as the
-    // full-tab chart above, and need the same refresh-on-theme-switch
-    // treatment - EVERY preview currently showing, not just one.
-    // Re-rendering the whole tab (rather than reaching in and rebuilding
-    // each <canvas> individually) is the simplest correct way to do that:
-    // renderTableResult() already knows how to find every chartable entry
-    // and rebuild all of their inline previews from scratch, so there's no
-    // separate rebuild path to keep in sync.
-    if (result && result.isText && result.tabLabel === 'Summary' && !result.summaryPending
-      && currentResultsList.some((r) => r && r.visualization)) {
-      renderTableResult(result);
     }
   }
 
@@ -10905,7 +10864,20 @@ document.addEventListener('DOMContentLoaded', async () => {
       const index = Number(key);
       if (!Number.isInteger(index) || index < 0 || index >= list.length) return;
       const entry = list[index];
-      if (entry && typeof entry === 'object') entry.visualization = visualizationsByIndex[key];
+      if (entry && typeof entry === 'object') {
+        entry.visualization = visualizationsByIndex[key];
+        // The model's own inline "[phrase](chart:N)" link (see
+        // applyInlineChartLinks()) writes N as this SAME key - which is
+        // NOT necessarily this entry's own position in currentResultsList
+        // by the time that link is clicked (single-connection mode
+        // prepends a Summary tab at index 0 AFTER this function runs -
+        // see prependSingleModeSummaryTab() - shifting every real result
+        // down by one). jumpToChartableResultTab() below matches on this
+        // tagged value instead of assuming its own `index` argument is a
+        // literal currentResultsList position, so it still lands on the
+        // right tab regardless of whatever's prepended ahead of it.
+        entry.visualizationIndex = index;
+      }
     });
   }
 
@@ -10992,41 +10964,54 @@ document.addEventListener('DOMContentLoaded', async () => {
   // prependSingleModeSummaryTab()) - the model's own answer is the first
   // thing shown. That's exactly the problem for charting: a chart sitting
   // on some OTHER, now-inactive tab is otherwise invisible unless the user
-  // happens to click around the tab strip on their own - and now there can
-  // be MORE than one such tab in the same turn (see chart_helpers.py's
-  // _pick_chartable_results). renderSummaryInlineChart()/
-  // jumpToChartableResultTab() here render one small chart preview per
-  // qualifying entry, stacked in a grid right under the Summary text (see
-  // .summary-chart-preview-grid in style.css), each independently
-  // clickable straight through to its own full-size tab
-  // (summaryChartInlineLinkHtml() below is kept only as the plain-text
-  // fallback - one link per entry, same as the previews - for the rare
-  // case Chart.js itself failed to load - see renderTableResult()'s isText
-  // branch, which is the only place that decides between the two). The
-  // result tabs themselves (buildResultsTabsNav()) are otherwise
-  // unmarked - no color tint or badge - a chart's only tab-strip-visible
-  // effect is via the previews/links above.
+  // happens to click around the tab strip on their own. The fix is the
+  // model's own inline "[phrase](chart:N)" link (see
+  // applyInlineChartLinks()), planted directly in its prose wherever it
+  // makes the specific point a chart illustrates - jumpToChartableResultTab()
+  // below is what that link's click actually does. This used to ALSO be
+  // backed by a row of small, separately-rendered preview charts stacked
+  // under the Summary text (one per chartable entry, each independently
+  // clickable) - removed per explicit request: they rendered poorly at
+  // that size, and were never showing anything the inline link next to
+  // them didn't already say (see chart_helpers.py's _clean_visualization -
+  // a result only ever reaches `.visualization` at all because the model
+  // already linked it inline). The result tabs themselves
+  // (buildResultsTabsNav()) are otherwise unmarked - no color tint or
+  // badge - a chart's only tab-strip-visible effect is via the inline
+  // link's click.
 
   // Jumps straight to ONE SPECIFIC result tab in the CURRENT turn - the
   // one at `index`, always a currentResultsList index that genuinely
-  // carries a validated visualization (every caller below reads it off a
-  // chartableEntries entry it just built, never guesses) - and makes sure
-  // it lands showing the chart itself (not whatever Table/Chart state was
-  // left over from an earlier visit) - that's the whole point of the
-  // click. With more than one chartable result in the same turn, each
-  // preview/fallback-link's own trigger carries its OWN index (see
-  // data-view-chart-trigger's value below), so clicking the second
-  // preview jumps to the second chart's own tab, not always the first.
-  // `index` undefined/invalid (defensive only - shouldn't happen, since
-  // every trigger that calls this always carries a real index) falls back
-  // to the first chartable tab, the old single-chart behavior, rather
-  // than silently doing nothing.
+  // carries a validated visualization - and makes sure it lands showing
+  // the chart itself (not whatever Table/Chart state was left over from an
+  // earlier visit) - that's the whole point of the click. With more than
+  // one chartable result in the same turn, each inline link's own trigger
+  // carries its OWN index (see data-view-chart-trigger's value, set by
+  // applyInlineChartLinks()), so clicking the second link jumps to the
+  // second chart's own tab, not always the first. `index`
+  // undefined/invalid (defensive only - shouldn't happen, since every
+  // trigger that calls this always carries a real index) falls back to
+  // the first chartable tab, the old single-chart behavior, rather than
+  // silently doing nothing.
   function jumpToChartableResultTab(index) {
     if (!currentResultsList) return;
-    let idx = Number(index);
-    if (!Number.isInteger(idx) || !currentResultsList[idx] || !currentResultsList[idx].visualization) {
-      idx = currentResultsList.findIndex((r) => r && r.visualization);
-    }
+    // Matched by the tagged `visualizationIndex` (see
+    // attachVisualizationsToResultsList's own comment above for why `index`
+    // itself is NOT a currentResultsList position to look up directly) -
+    // a raw array-position lookup lands one tab off for single-connection
+    // mode's own Summary-tab prepend whenever there's more than one
+    // chartable result in the same turn (an earlier tab's own
+    // `.visualization` would satisfy a truthy check at the wrong
+    // position, rather than ever falling through to the "first chartable"
+    // fallback below). Falls back the same way as before when nothing
+    // matches (an out-of-range/malformed model index, or this list was
+    // never tagged at all) - always the first tab that's actually
+    // chartable, rather than jumping nowhere.
+    const requested = Number(index);
+    let idx = Number.isInteger(requested)
+      ? currentResultsList.findIndex((r) => r && r.visualization && r.visualizationIndex === requested)
+      : -1;
+    if (idx < 0) idx = currentResultsList.findIndex((r) => r && r.visualization);
     if (idx < 0) return;
     activeResultIndex = idx;
     const entry = currentResultsList[idx];
@@ -11034,165 +11019,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     syncPersistedChartView(entry, true);
     buildResultsTabsNav();
     renderTableResult(entry);
-  }
-
-  // Fallback only (see the comment block above): appended directly onto
-  // the end of the Summary tab's own rendered text whenever Chart.js
-  // itself never loaded, so there's still SOME way to reach each chart's
-  // own tab even without a live preview to click on - one link per
-  // chartable entry (`index` is that entry's own currentResultsList
-  // index, carried on data-view-chart-trigger so jumpToChartableResultTab()
-  // knows exactly which tab this particular link means), captioned "View
-  // as chart" alone when it's the only one, or numbered ("View chart 1 as
-  // chart", "View chart 2 as chart", ...) when there's more than one, so
-  // multiple fallback links are still distinguishable from each other. A
-  // plain inline <button> styled as a text link (see .summary-chart-
-  // inline-link in style.css), so it reads as a natural trailing
-  // continuation of the summary itself rather than a UI control bolted on
-  // afterward. data-view-chart-trigger is handled by the same delegated
-  // #resultsBody click listener as the Report/feedback buttons below, for
-  // the same "rebuilt fresh on every render, so a persistent per-element
-  // listener would never survive a re-render" reason. Leading space keeps
-  // it from running into the summary's own last word (or the previous
-  // link's own, when more than one is appended in a row).
-  function summaryChartInlineLinkHtml(entry, index, queryNumber, total) {
-    const label = total > 1 ? `View ${chartPreviewCaption(entry, queryNumber)}` : 'View as chart';
-    return ` <button type="button" class="summary-chart-inline-link" data-view-chart-trigger="${index}">📊 ${label}</button>`;
-  }
-
-  // A short caption naming which result a Summary-tab preview belongs to -
-  // only actually shown once there's more than one preview on screen at
-  // once (see renderSummaryInlineChart()'s own use of `total`), since a
-  // single preview is already unambiguous without one.
-  //
-  // Prefers `entry.visualization.caption` - the server's own short phrase
-  // (see chart_helpers.py's _clean_caption/_clean_visualization and both
-  // summarization prompts' "visualizations" paragraph) naming the SPECIFIC
-  // point in the summary text this chart illustrates, e.g. "Apple Pay's
-  // 2-of-10 completion rate" - this is what actually integrates the chart
-  // with the summary instead of leaving them disjoint: a reader can match
-  // the caption's own wording back to the sentence it came from. Falls
-  // back to the older generic "Query N" convention (still used for
-  // #resultsTabsNav's own tab labels) only when no caption survived
-  // validation - a defensive fallback for a stale cached turn from before
-  // "caption" existed, never the normal path once a fresh turn's own
-  // validated visualization (which now REQUIRES a caption to exist at all -
-  // see _clean_visualization's own docstring) is what's actually attached
-  // here. "all databases" mode's own entries additionally carry
-  // `.database.name` (see execute_routes.py/buildAllModeSummaryPayload),
-  // prepended the same way the old fallback always did.
-  function chartPreviewCaption(entry, queryNumber) {
-    const dbName = entry && entry.database && entry.database.name;
-    const serverCaption = entry && entry.visualization && entry.visualization.caption;
-    const fallback = dbName ? `${dbName} - Query ${queryNumber}` : `Query ${queryNumber}`;
-    if (!serverCaption) return fallback;
-    return dbName ? `${dbName} - ${serverCaption}` : serverCaption;
-  }
-
-  // ONE of the Summary tab's own small, clickable chart previews - renders
-  // into `container` (the shared `.summary-chart-preview-grid` wrapper -
-  // see renderTableResult()'s isText branch, the only call site, and that
-  // CSS rule's own comment on the grid-of-cards layout below the summary
-  // text) for a single chartable `entry` at its own currentResultsList
-  // `index`, whenever this turn has at least one chartable tab and
-  // Chart.js is actually available - called once per qualifying entry, so
-  // a turn with several independently chartable results gets one card per
-  // result, not just the first. Reuses buildResultsChartConfig() exactly
-  // as the full-tab chart view does (same data, same colors), just with
-  // `compact: true` to drop axis titles this small a preview has no room
-  // for, and `options.events = []` to turn off Chart.js's own hover/
-  // tooltip/click handling - the whole point is a small, inert picture
-  // that reads as "click me", not a second fully-interactive chart
-  // competing with the real one a tab over. The <canvas> is wrapped in a
-  // plain <button data-view-chart-trigger="{index}"> (same delegated
-  // click handling as the text-link fallback above, but now carrying
-  // THIS card's own index, since more than one can be on screen at once)
-  // so clicking anywhere on the card - not just its caption - jumps
-  // straight to that chart's own full, interactive tab. `total` (the
-  // number of chartable entries this render pass has, across every card)
-  // decides whether a caption is shown at all - see chartPreviewCaption's
-  // own comment on why one preview alone stays uncaptioned. The caller
-  // (renderTableResult()'s isText branch) is responsible for calling
-  // destroySummaryInlineCharts() ONCE before its own loop over every
-  // qualifying entry, not once per call here - see that function's own
-  // docstring for why.
-  function renderSummaryInlineChart(container, entry, index, queryNumber, total) {
-    const wrapper = document.createElement('button');
-    wrapper.type = 'button';
-    wrapper.className = 'summary-chart-inline-preview';
-    wrapper.setAttribute('data-view-chart-trigger', String(index));
-    wrapper.setAttribute('aria-label', `View ${chartPreviewCaption(entry, queryNumber)} as chart`);
-
-    // Per-card width: the CSS default (.summary-chart-inline-preview's own
-    // `flex: 0 0 25%`) is the normal "half size in each dimension" card,
-    // and 4 of those exactly fill one row (4 * 25% = 100%) - but that flat
-    // 25% ignores the `gap` .summary-chart-preview-grid spends BETWEEN
-    // cards, so even at exactly 4 cards the row is actually `4 * 25% + 3 *
-    // gap` wide, wider than its own container. That overflowed harmlessly
-    // before (the grid's old `flex-wrap: wrap` just dropped the excess
-    // onto a second row) but can't once the grid is `nowrap` (per the
-    // "always fit every chart on one row" follow-up request) - `nowrap`
-    // alone doesn't shrink anything, it only refuses to wrap, so without
-    // this the cards would simply overflow the pane. This computes each
-    // card's actual share of the row - `100% minus every gap this many
-    // cards need, divided by the card count` - and takes whichever is
-    // smaller of that and the normal 25%, so a handful of cards still get
-    // the normal half-size default (the calc share is comfortably above
-    // 25% for total <= ~3) while enough cards to exceed one row at 25%
-    // each (4 or more, once gaps are counted) shrink just enough that
-    // every one of them still lands in the single row instead of any
-    // wrapping or spilling past the pane's edge.
-    const GRID_GAP_REM = 0.9;
-    wrapper.style.flex = `0 0 min(25%, calc((100% - ${(total - 1) * GRID_GAP_REM}rem) / ${total}))`;
-
-    // Chart.js (responsive:true/maintainAspectRatio:false, see
-    // buildResultsChartConfig()) measures its canvas's OWN PARENT to decide
-    // how tall to render, then keeps re-measuring via an internal
-    // ResizeObserver. That parent must have a height that does NOT itself
-    // depend on the canvas's rendered size, or the two feed each other in
-    // a runaway loop - each resize nudges the parent's content-driven
-    // height up slightly, which triggers another resize, which nudges it
-    // up again, forever (this is exactly the "chart keeps growing the more
-    // you scroll" bug reported live). The canvas used to sit directly in
-    // `wrapper` with `aspect-ratio`/`height:auto` on the CANVAS itself
-    // (style.css) - CSS alone renders that fine once, but the instant
-    // Chart.js's resize logic sets an explicit pixel height back onto the
-    // canvas, `wrapper` (which sizes to fit its content) picks up that new
-    // height as ITS OWN, and the loop begins. Fixed the same way
-    // .results-chart-wrapper already does it for the full-tab chart (see
-    // that rule's own comment in style.css): a dedicated box whose
-    // aspect-ratio is resolved from its WIDTH alone (never the canvas's
-    // height), with the canvas absolutely positioned to fill it - so
-    // nothing the canvas does can ever change the box's own size.
-    const canvasBox = document.createElement('div');
-    canvasBox.className = 'summary-chart-inline-preview-canvas-box';
-    const canvas = document.createElement('canvas');
-    canvas.className = 'summary-chart-inline-preview-canvas';
-    canvasBox.appendChild(canvas);
-    wrapper.appendChild(canvasBox);
-    if (total > 1) {
-      const caption = document.createElement('span');
-      caption.className = 'summary-chart-inline-preview-caption';
-      caption.textContent = chartPreviewCaption(entry, queryNumber);
-      wrapper.appendChild(caption);
-    }
-    container.appendChild(wrapper);
-
-    // `container`'s own PARENT (`chartRow`, the `.summary-text-chart-row`
-    // wrapper) must already be attached to the document by the time this
-    // runs (see renderTableResult()'s isText branch, the only call site,
-    // which appends `chartRow` to `td` - and `td`'s own `tr` to the live
-    // resultsBody - before calling this) for `wrapper.clientWidth` just
-    // below to read a real, laid-out size rather than 0. `wrapper` itself
-    // (not the canvas - see buildResultsChartConfig()'s own
-    // `containerWidth` comment) is what's actually CSS-sized (flex: 0 0
-    // 50% - see .summary-chart-inline-preview in style.css), so it's what
-    // gets measured for the legend-scaling passed in here.
-    const containerWidth = wrapper.clientWidth;
-    const config = buildResultsChartConfig(entry, entry.visualization, { compact: true, containerWidth });
-    config.options = config.options || {};
-    config.options.events = [];
-    summaryInlineChartInstances.push(new Chart(canvas.getContext('2d'), config));
   }
 
   // --- Single-connection mode's own post-execution results summarization ---
@@ -11246,9 +11072,15 @@ document.addEventListener('DOMContentLoaded', async () => {
         return {
           summaryText: stripNoSqlPrefix(data.summary),
           visualizations: data.visualizations || {},
+          // Server's own {"suggested_searches": ["...", ...]} - see
+          // chart_helpers.py-style validation in _clean_suggested_searches
+          // (summarize_routes.py) - 0-3 short, plain search-engine queries
+          // the model itself never runs; suggestedSearchesHtml() below is
+          // what turns each one into a real clickable link.
+          suggestedSearches: Array.isArray(data.suggested_searches) ? data.suggested_searches : [],
         };
       } else if (data && data.error) {
-        return { summaryText: SUMMARY_TAB_BLOCK_MARKER + data.error, visualizations: {} };
+        return { summaryText: SUMMARY_TAB_BLOCK_MARKER + data.error, visualizations: {}, suggestedSearches: [] };
       }
       return null;
     } catch (err) {
@@ -11267,9 +11099,12 @@ document.addEventListener('DOMContentLoaded', async () => {
   // makes it the active tab - the "new leading Summary tab" placement
   // this feature's design confirmed. Safe to call with a falsy
   // `summaryText` (no-op), so callers don't need their own guard.
-  function prependSingleModeSummaryTab(summaryText) {
+  function prependSingleModeSummaryTab(summaryText, suggestedSearches) {
     if (!summaryText || !currentResultsList) return;
-    currentResultsList = [{ isText: true, tabLabel: 'Summary', text: summaryText }, ...currentResultsList];
+    currentResultsList = [
+      { isText: true, tabLabel: 'Summary', text: summaryText, suggestedSearches: suggestedSearches || [] },
+      ...currentResultsList,
+    ];
     activeResultIndex = 0;
     buildResultsTabsNav();
     renderTableResult(currentResultsList[activeResultIndex]);
@@ -11292,9 +11127,12 @@ document.addEventListener('DOMContentLoaded', async () => {
   // tab the user can click into if they want it, leaving the already-
   // rendered error exactly as it is. Safe to call with a falsy
   // `summaryText` (no-op), same as the function above.
-  function prependSingleModeSummaryTabPreservingActiveTab(summaryText) {
+  function prependSingleModeSummaryTabPreservingActiveTab(summaryText, suggestedSearches) {
     if (!summaryText || !currentResultsList) return;
-    currentResultsList = [{ isText: true, tabLabel: 'Summary', text: summaryText }, ...currentResultsList];
+    currentResultsList = [
+      { isText: true, tabLabel: 'Summary', text: summaryText, suggestedSearches: suggestedSearches || [] },
+      ...currentResultsList,
+    ];
     activeResultIndex += 1;
     buildResultsTabsNav();
   }
@@ -11339,6 +11177,11 @@ document.addEventListener('DOMContentLoaded', async () => {
       databaseSql: (notes && notes.databaseSql) || [],
       databaseSummaries: (summaryResult && summaryResult.databaseSummaries) || [],
       crossDatabaseSummary: (summaryResult && summaryResult.crossDatabaseSummary) || null,
+      // Not yet read back by restoreLatestTurn() below - same as
+      // databaseSummaries/crossDatabaseSummary just above (see this
+      // function's own docstring) - recorded now for parity/forward-
+      // compatibility, not because anything currently replays it.
+      suggestedSearches: (summaryResult && summaryResult.suggestedSearches) || [],
     };
     // Every database just noted/failed - translatePrompt()'s router_route
     // branch never sets modelEntry.text to anything but '' for this
@@ -12696,12 +12539,14 @@ document.addEventListener('DOMContentLoaded', async () => {
           // disabled for this extra round trip rather than re-enabling
           // before the Summary tab is actually ready.
           let singleModeSummary = null;
+          let singleModeSuggestedSearches = [];
           if (!allModeNotes && promptText !== "[Direct SQL Execution]" && Array.isArray(data.results) && data.results.length) {
             showAllModeSummarizingStatus();
             const summaryResult = await requestSingleModeResultsSummary(promptText, sql, data.results);
             hideAllModeStreamStatus();
             if (summaryResult) {
               singleModeSummary = summaryResult.summaryText;
+              singleModeSuggestedSearches = summaryResult.suggestedSearches || [];
               // Tags whichever of THIS turn's own result tabs each
               // visualization actually belongs to (zero, one, or several) -
               // see attachVisualizationsToResultsList's own docstring.
@@ -12714,7 +12559,7 @@ document.addEventListener('DOMContentLoaded', async () => {
               attachVisualizationsToResultsList(data.results, summaryResult.visualizations);
               attachVisualizationsToResultsList(summarizedResults, summaryResult.visualizations);
             }
-            if (singleModeSummary) prependSingleModeSummaryTab(singleModeSummary);
+            if (singleModeSummary) prependSingleModeSummaryTab(singleModeSummary, singleModeSuggestedSearches);
           }
 
           if (chatStore.getPending() && !chatStore.isPendingCurrent()) {
@@ -12731,6 +12576,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             pending.entry.results = summarizedResults;
             if (allModeNotes) captureAllModeHistory(pending.entry, allModeNotes, [], allModeSummaryResult);
             if (singleModeSummary) pending.entry.summary = singleModeSummary;
+            if (singleModeSummary) pending.entry.suggestedSearches = singleModeSuggestedSearches;
             // This turn was already pushed (as bare SQL, before it was
             // executed) - see chatStore.persistCurrent()'s own docstring
             // for why filling in its results afterward needs its own
@@ -12743,6 +12589,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             const modelEntry = { role: 'model', text: sql, results: summarizedResults };
             if (allModeNotes) captureAllModeHistory(modelEntry, allModeNotes, [], allModeSummaryResult);
             if (singleModeSummary) modelEntry.summary = singleModeSummary;
+            if (singleModeSummary) modelEntry.suggestedSearches = singleModeSuggestedSearches;
             pushActiveTurn(promptText, modelEntry);
             updateHistoryTurnsSubtitle();
           }
@@ -12888,6 +12735,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           // success branch uses.
           let singleModeSummary = null;
           let singleModeVisualizations = null;
+          let singleModeSuggestedSearches = [];
           if (promptText !== "[Direct SQL Execution]") {
             showAllModeSummarizingStatus();
             const summaryResult = await requestSingleModeResultsSummary(promptText, sql, statementResults);
@@ -12895,6 +12743,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (summaryResult) {
               singleModeSummary = summaryResult.summaryText;
               singleModeVisualizations = summaryResult.visualizations;
+              singleModeSuggestedSearches = summaryResult.suggestedSearches || [];
               // Tags whichever succeeded-before-the-failure statement(s)
               // each visualization belongs to (the failed statement itself
               // is never chartable - it's an {error} entry, so it can never
@@ -12912,7 +12761,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             // focus to the new Summary tab - see that helper's own
             // docstring for why this differs from the success path's
             // prependSingleModeSummaryTab.
-            if (singleModeSummary) prependSingleModeSummaryTabPreservingActiveTab(singleModeSummary);
+            if (singleModeSummary) prependSingleModeSummaryTabPreservingActiveTab(singleModeSummary, singleModeSuggestedSearches);
           }
 
           // Persist history - previously this entire branch never called
@@ -12936,6 +12785,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             pending.entry.text = sql;
             pending.entry.results = summarizedResults;
             if (singleModeSummary) pending.entry.summary = singleModeSummary;
+            if (singleModeSummary) pending.entry.suggestedSearches = singleModeSuggestedSearches;
             // Already-pushed turn, filled in afterward - see
             // chatStore.persistCurrent()'s own docstring.
             chatStore.persistCurrent();
@@ -12943,6 +12793,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           } else {
             const modelEntry = { role: 'model', text: sql, results: summarizedResults };
             if (singleModeSummary) modelEntry.summary = singleModeSummary;
+            if (singleModeSummary) modelEntry.suggestedSearches = singleModeSuggestedSearches;
             pushActiveTurn(promptText, modelEntry);
             updateHistoryTurnsSubtitle();
           }
@@ -12978,6 +12829,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           // meaningful happened for the model to reason over), in
           // addition to the existing "no real question" guard.
           let singleModeSummary = null;
+          let singleModeSuggestedSearches = [];
           if (reportable && promptText !== "[Direct SQL Execution]") {
             showAllModeSummarizingStatus();
             // No `.columns` anywhere in a bare `[{error}]` result set, so
@@ -12985,11 +12837,14 @@ document.addEventListener('DOMContentLoaded', async () => {
             // meaningful here, unlike the two branches above.
             const summaryResult = await requestSingleModeResultsSummary(promptText, sql, [{ error: errMsg }]);
             hideAllModeStreamStatus();
-            if (summaryResult) singleModeSummary = summaryResult.summaryText;
+            if (summaryResult) {
+              singleModeSummary = summaryResult.summaryText;
+              singleModeSuggestedSearches = summaryResult.suggestedSearches || [];
+            }
             // Preserves the active (error) tab - see that helper's own
             // docstring for why this differs from the success path's
             // prependSingleModeSummaryTab.
-            if (singleModeSummary) prependSingleModeSummaryTabPreservingActiveTab(singleModeSummary);
+            if (singleModeSummary) prependSingleModeSummaryTabPreservingActiveTab(singleModeSummary, singleModeSuggestedSearches);
           }
 
           // Persist history - previously this bare-failure branch never
@@ -13011,6 +12866,7 @@ document.addEventListener('DOMContentLoaded', async () => {
               pending.entry.text = sql;
               pending.entry.results = summarizedResults;
               if (singleModeSummary) pending.entry.summary = singleModeSummary;
+              if (singleModeSummary) pending.entry.suggestedSearches = singleModeSuggestedSearches;
               // Already-pushed turn, filled in afterward - see
               // chatStore.persistCurrent()'s own docstring.
               chatStore.persistCurrent();
@@ -13018,6 +12874,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             } else {
               const modelEntry = { role: 'model', text: sql, results: summarizedResults };
               if (singleModeSummary) modelEntry.summary = singleModeSummary;
+              if (singleModeSummary) modelEntry.suggestedSearches = singleModeSuggestedSearches;
               pushActiveTurn(promptText, modelEntry);
               updateHistoryTurnsSubtitle();
             }
@@ -13255,7 +13112,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             // executeSql()'s own `.summary` persist above) without a new
             // network call - same "no re-fetch on back/forward" posture
             // every other piece of a saved turn already has.
-            if (lastModelEntry.summary) prependSingleModeSummaryTab(lastModelEntry.summary);
+            if (lastModelEntry.summary) prependSingleModeSummaryTab(lastModelEntry.summary, lastModelEntry.suggestedSearches);
           } else {
             // Genuinely still awaiting its first execution.
             chatStore.setPending(lastModelEntry, normalizeSqlForCompare(sqlText));

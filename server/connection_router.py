@@ -14,14 +14,16 @@ triage_single_dataset_question) before this merge.
 
 Group mode's own half of this - deciding whether a natural-language
 question can be answered directly from the session's in-scope
-connections' names/dialects/table names alone (see db.py's
-resolve_in_scope_descriptors), or genuinely needs real data from one or
-more specific connections, and if so which ones - before any full,
-column-level schema is ever fetched or sent to the model - only runs at
-all when a session's in_scope_mode is "all". Single-dataset mode's own
-half runs for every other session, using this exact same retry-loop/
-parsing/key-rotation machinery with num_candidates fixed at 1 and no
-indices/database_prompts/message to resolve.
+connections' own schema (names, dialects, and full table/column detail -
+the same "tables_only" derivative summarization uses, see db.py's
+build_router_candidate_summaries) alone, or genuinely needs real data
+from one or more specific connections, and if so which ones - before any
+full DEEP schema (constraints/indexes/views/live data/etc) is ever
+fetched or sent to the model - only runs at all when a session's
+in_scope_mode is "all". Single-dataset mode's own half runs for every
+other session, using this exact same retry-loop/parsing/key-rotation
+machinery with num_candidates fixed at 1 and no indices/database_prompts/
+message to resolve.
 
 Deliberately reuses the SAME LlmProvider/client/model translate_routes.py
 already built for the main SQL-generation call, rather than a separate
@@ -59,14 +61,17 @@ from prompt_loader import load_prompt
 
 
 def _build_candidate_schema_block(candidate_summaries):
-    """Renders `candidate_summaries` (name/dialect/table-list per in-scope
-    connection - see run_triage_call's own docstring for exactly what this
-    is: names/dialects/table names only, no column-level detail) into its
-    own stable block - analogous to single-connection mode's schema_block
-    (translate_routes.py's generate_sql_for_connection builds the
-    identically-shaped f"Database Schema:\n{schema}\n\n") - meant to be
-    passed to provider.build_llm_input() as ITS schema_block parameter
-    rather than folded into the ever-changing new-prompt text.
+    """Renders `candidate_summaries` (name/dialect/schema_text per
+    in-scope connection - see run_triage_call's own docstring, and
+    db.py's build_router_candidate_summaries, for exactly what this is:
+    the same "tables_only" schema derivative summarization uses - full
+    table/column names and types, no constraints/indexes/views/etc, no
+    actual data/rows) into its own stable block - analogous to
+    single-connection mode's schema_block (translate_routes.py's
+    generate_sql_for_connection builds the identically-shaped
+    f"Database Schema:\n{schema}\n\n") - meant to be passed to
+    provider.build_llm_input() as ITS schema_block parameter rather than
+    folded into the ever-changing new-prompt text.
 
     This is what lets build_llm_input() place this block ahead of the
     history vector (see that function's own docstring on exactly where
@@ -76,21 +81,26 @@ def _build_candidate_schema_block(candidate_summaries):
     instructions> : <summary database schema of all databases> : <history
     vector> : <new user prompt>". Only ever built for the multi-candidate
     (group-mode) call site - single-dataset mode builds its own schema
-    block from a plain shallow-schema TEXT dump instead (see
+    block from a plain tables_only-schema TEXT dump instead (see
     translate_routes.py's get_triage_schema_text) - run_triage_call itself
     is agnostic to which convention produced the schema_block it's given;
     see that function's own docstring for why unifying the two schema-
     block-rendering conventions themselves was deliberately left out of
-    this merge."""
-    lines = ["Candidate database connections:"]
+    this merge.
+
+    A candidate with an empty schema_text (nothing cached yet for that
+    connection - see build_router_candidate_summaries' own docstring on
+    this deliberate degrade-to-empty behavior) is rendered with a plain
+    placeholder line rather than an empty block, so the model isn't left
+    guessing whether that candidate genuinely has no tables or its schema
+    just wasn't available yet."""
+    lines = ["Candidate database connections:", ""]
     for i, c in enumerate(candidate_summaries):
-        table_names = c.get("table_names") or []
-        shown = ", ".join(table_names) if table_names else "(no tables discovered)"
-        lines.append(
-            f"[{i}] name={c.get('name')!r} dialect={c.get('dialect')!r} tables={shown}"
-        )
-    lines.append("")
-    return "\n".join(lines) + "\n\n"
+        schema_text = (c.get("schema_text") or "").strip()
+        lines.append(f"[{i}] name={c.get('name')!r} dialect={c.get('dialect')!r}")
+        lines.append(schema_text if schema_text else "(no schema available yet for this connection)")
+        lines.append("")
+    return "\n".join(lines) + "\n"
 
 
 def strip_markdown_fence(text):
@@ -495,15 +505,19 @@ def run_triage_call(num_candidates, schema_block, prompt, provider, client, mode
     "indices", and to pick which of the two prompts/parsers above
     applies), not the candidates' own contents, so unifying the two
     different schema-block-rendering conventions themselves was
-    deliberately left out of this merge: a real difference in what each
-    mode already fetches/caches for its own schema summary (single-
-    dataset mode fetches a session-scoped shallow schema fresh, cheaply,
-    even on a cold cache; multi-candidate mode reads only whatever's
-    already cached from each connection's own deep-schema entry via
-    db.build_router_candidate_summaries, deliberately never triggering a
-    fetch of its own) - collapsing these into one shared representation
-    would have meant picking one of those two caching behaviors for both
-    modes, a real behavior change neither mode asked for.
+    deliberately left out of this merge. Both conventions now carry the
+    SAME kind of content - the "tables_only" schema derivative
+    summarization also uses (full table/column names and types, no
+    constraints/indexes/views/etc) - but they still differ in how they
+    fetch it: single-dataset mode fetches its own connection's deep
+    schema fresh (cheaply reused from cache on any later call for that
+    same connection - see get_triage_schema_text's own docstring),
+    while multi-candidate mode reads only whatever's already cached from
+    each connection's own deep-schema entry via db.build_router_
+    candidate_summaries, deliberately never triggering a fetch of its
+    own. Collapsing these into one shared representation would have meant
+    picking one of those two caching behaviors for both modes, a real
+    behavior change neither mode asked for.
 
     `history` (the session's ordinary, already-trimmed conversation turns)
     lets a follow-up question resolve a reference from the PRIOR triage

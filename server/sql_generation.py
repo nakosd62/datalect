@@ -12,11 +12,17 @@ stream_translation() (translate_query() in translate_routes.py) - those
 stay put for now as the last, most tangled piece of this whole refactor
 (see translate_routes.py's own docstring). Specifically:
 
-  - Dialect prompts (_DIALECT_PROMPT_INTROS et al) and the two format-rules
-    constants (_COMMON_FORMAT_RULES for dataset-group mode's older '*** NO
-    SQL ***'-marker convention, _SQL_GENERATION_FORMAT_RULES for single-
-    connection mode's newer JSON-enveloped Call 2) - both still used
-    directly by translate_query() too, hence the re-export back.
+  - Dialect prompts (_DIALECT_PROMPT_INTROS et al) and the shared format-
+    rules constant (_SQL_GENERATION_FORMAT_RULES, the JSON-enveloped
+    response contract both single-connection mode's Call 2 and dataset-
+    group mode's Phase B fan-out build their system_instruction from - see
+    generate_sql_for_connection's own docstring for why Phase B was
+    migrated onto it too) - still used directly by translate_query() too,
+    hence the re-export back. _COMMON_FORMAT_RULES (the older '*** NO SQL
+    ***'-marker convention Phase B used before that migration) is no
+    longer referenced by any code path in this module - see its own
+    definition below for why it's left in place as unfinished cleanup
+    rather than removed as part of this change.
 
   - Response cleanup: _clean_generated_sql (fence-stripping/chatter-
     tolerant SQL extraction) and _strip_no_sql_prefix, plus their
@@ -111,10 +117,18 @@ _DIALECT_PROMPT_INTROS = {
 }
 _DEFAULT_DIALECT_PROMPT_INTRO = _DIALECT_PROMPT_INTROS["PostgreSQL"]
 
-# The output-format/behavior rules that follow the dialect intro in the
-# system prompt - identical for every dialect, so it's pulled out once here
-# rather than duplicated per dialect entry above. See
-# server/prompts/sql_common_format_rules.txt for the actual wording.
+# The older '*** NO SQL ***'-marker-convention format rules that used to
+# follow the dialect intro for BOTH single-connection Call 2 (before its
+# own JSON-envelope redesign) and dataset-group mode's Phase B fan-out
+# (before generate_sql_for_connection was later migrated onto
+# _SQL_GENERATION_FORMAT_RULES too - see that function's own docstring for
+# why). As of that migration, nothing in this module still builds a
+# system_instruction from this constant - it's left defined (and
+# server/prompts/sql_common_format_rules.txt left on disk) rather than
+# deleted as part of that change, since removing a still-importable name
+# (translate_routes.py re-exports it - see this module's own docstring)
+# and its backing prompt file is its own separate cleanup, not bundled in
+# here.
 _COMMON_FORMAT_RULES = load_prompt("sql_common_format_rules.txt")
 
 
@@ -288,16 +302,18 @@ def get_llm_schema_text(descriptor, user_identity, force_refresh=False):
     this (same cache key, same cached full deep text either way) - this
     only trims what gets handed onward to the LLM from here.
 
-    Deliberately NOT used anywhere else schema_text reaches an LLM:
-    dataset-group mode's own Phase A triage (connection_router.py's
-    build_router_candidate_summaries) already uses its own much smaller
-    "shallow" candidate-summary representation, unrelated to this;
-    dataset-group mode's Phase B fanout (_run_phase_b_fanout via
-    generate_sql_for_connection below) always sees the full deep schema;
-    Phase C's cross-database summarization (_build_all_mode_schema_block)
-    and /api/summarize-results's own schema fetch (stream_summarize_
-    result) both always see the full deep schema too. SCHEMA_TABLES_ONLY
-    only ever affects this one path."""
+    Deliberately NOT used anywhere else schema_text reaches an LLM: both
+    triage call sites - this mode's own get_triage_schema_text below, and
+    dataset-group mode's Phase A (connection_router.py's build_router_
+    candidate_summaries) - and both summarization call sites (Phase C's
+    _build_all_mode_schema_block and /api/summarize-results's stream_
+    summarize_result, both via summarize_routes.py's get_summary_
+    schema_text) always reduce to the tables_only derivative
+    UNCONDITIONALLY, regardless of this flag. SCHEMA_TABLES_ONLY only
+    ever affects this one path - the one place that still sends the full
+    deep schema by default. Dataset-group mode's Phase B fanout
+    (_run_phase_b_fanout via generate_sql_for_connection below) always
+    sees the full deep schema too, same as this function's own default."""
     schema = translate_routes.get_database_schema(descriptor, user_identity, force_refresh=force_refresh)
     if SCHEMA_TABLES_ONLY:
         schema = derive_tables_only_schema_text(schema)
@@ -306,28 +322,49 @@ def get_llm_schema_text(descriptor, user_identity, force_refresh=False):
 
 def get_triage_schema_text(descriptor, user_identity, force_refresh=False):
     """Single-dataset mode's own Call 1 (triage_single_dataset_question,
-    see its own docstring below) - the ONLY call site that hands this
-    dataset's SHALLOW schema (deep=False - Phase 1/catalog-only, no live
-    per-table queries - see db.get_database_schema's own docstring) to an
-    LLM, mirroring dataset-group mode's own Phase A triage (connection_
-    router.build_router_candidate_summaries), which already fetches every
-    in-scope connection's schema this same cheap way for the identical
-    reason: classifying a prompt into general knowledge/schema/help/SQL
-    needs to know this dataset's shape (its dialect and table/tab names),
-    never real data or column-level/constraint/index detail, so there is
-    no reason to pay Phase 2's live-query cost before even knowing whether
-    real SQL generation (get_llm_schema_text below - the ONLY call site
-    that still fetches the full deep schema for this mode) will run at
-    all. Cached completely independently from get_llm_schema_text's own
-    deep fetch (see get_database_schema's cache_key/deep=False split) -
-    a cold triage-schema cache never forces a deep fetch, and vice versa.
+    see its own docstring below) - one of the two triage call sites (the
+    other being dataset-group mode's own Phase A, connection_router.py's
+    build_router_candidate_summaries) that hand triage the SAME
+    "tables_only" schema derivative summarization already uses (see
+    summarize_routes.py's get_summary_schema_text and backends/base.py's
+    derive_tables_only_schema_text): full table/column names and types,
+    with every other schema-object section (constraints, indexes, views,
+    triggers, comments, row-count estimates, routines, session facts,
+    view/routine definitions, live row counts, column value samples,
+    likely relationships) left out.
 
-    Deliberately NOT reduced further by SCHEMA_TABLES_ONLY (unlike
-    get_llm_schema_text above) - that flag's own derive_tables_only_
-    schema_text() reduction is meant to trim what an already-DEEP schema
-    hands an LLM; the shallow fetch here is already far smaller than even
-    that reduced form, so there is nothing left for it to usefully do."""
-    return translate_routes.get_database_schema(descriptor, user_identity, force_refresh=force_refresh, deep=False)
+    This used to send a catalog-only "shallow" fetch instead (deep=False
+    - dialect and table/tab names only, no columns at all) on the theory
+    that triage only needs to know a dataset's shape. In practice, plenty
+    of triage decisions need real column names to get right - deciding
+    whether "when did we last hear from this customer" is answerable from
+    this dataset at all, or which of several similarly-named tables a
+    group-mode question is actually about, routinely turns on there being
+    an email/customer_id/last_contacted_at column, not just a table
+    called "customers" existing. tables_only is the right middle ground:
+    it still never needs constraint/index/view-level detail or any actual
+    data/rows, but it gives triage the same column-level visibility real
+    SQL generation (get_llm_schema_text above) and summarization both
+    already get.
+
+    Fetches and caches the full DEEP schema (deep=True, get_database_
+    schema()'s own default) - the SAME cache entry get_llm_schema_text
+    above and every other deep-schema caller shares, rather than the old,
+    independently-cached shallow (deep=False, "::shallow" suffix) entry
+    this function used to request. A triage call and a SQL-generation
+    call for the same connection now share one fetch: whichever runs
+    first pays the (one-time, durably-cached-forever - see get_database_
+    schema's own docstring) cost of the real Phase 1 + Phase 2
+    introspection, and the other reuses it for free from cache - there is
+    no longer a separate "triage-schema cache" to go cold or warm on its
+    own. The old deep=False/"::shallow" fetch path itself is untouched by
+    this change (see get_database_schema's own docstring and
+    get_schema_shallow() on each Backend subclass) - still implemented
+    and still tested, simply with no remaining production caller now that
+    this function no longer uses it, in case a genuinely independent
+    shallow fetch is ever needed again for something else."""
+    schema = translate_routes.get_database_schema(descriptor, user_identity, force_refresh=force_refresh)
+    return derive_tables_only_schema_text(schema)
 
 
 def generate_sql_for_connection(descriptor, prompt, history, provider, client, model,
@@ -337,17 +374,26 @@ def generate_sql_for_connection(descriptor, prompt, history, provider, client, m
     what happens today when a user has that one connection selected and
     submits `prompt`: fetches its full (TTL-cached) schema via
     get_database_schema(), resolves its dialect intro, appends
-    _COMMON_FORMAT_RULES, builds llm_input via provider.build_llm_input(),
-    and runs the same transient-error/key-rotation retry loop
-    stream_translation()'s single-connection path has always run
-    (MAX_TRANSLATION_ATTEMPTS/TRANSLATION_RETRY_DELAY_SECONDS/
+    _SQL_GENERATION_FORMAT_RULES (the same JSON-enveloped response
+    contract stream_translation()'s single-connection Call 2 uses - see
+    this function's own inline comments above its retry loop for why
+    Phase B was migrated onto it too), builds llm_input via
+    provider.build_llm_input(), and runs the same transient-error/key-
+    rotation retry loop stream_translation()'s single-connection path has
+    always run (MAX_TRANSLATION_ATTEMPTS/TRANSLATION_RETRY_DELAY_SECONDS/
     provider.classify_error()/provider.get_key_pool_size()) before calling
     provider.call(). This is a standalone module-level function (not a
     refactor of stream_translation()'s inline code, which keeps its own
-    copy of this same logic for the single-connection path, separately
-    tested - see this module's docstring on the backward-compatibility
-    guarantee) so it can be safely reused by _run_phase_b_fanout below
-    without touching that existing, already-tested code path at all.
+    copy of this same retry-loop/JSON-parsing logic for the single-
+    connection path, separately tested - see this module's docstring on
+    the backward-compatibility guarantee) so it can be safely reused by
+    _run_phase_b_fanout below without touching that existing, already-
+    tested code path at all. The two implementations share the same
+    LLM-facing prompt/response CONTRACT since this migration, but stay
+    separate functions: this one's output still feeds _classify_
+    generation_outcome/_run_phase_b_fanout's own multi-connection
+    concatenation and per-connection failure isolation, which Call 2 has
+    no equivalent of.
 
     Generator: yields fully wire-encoded NDJSON progress lines
     (`json.dumps({"status": "retrying", ...}) + "\\n"`), identical in
@@ -388,13 +434,17 @@ def generate_sql_for_connection(descriptor, prompt, history, provider, client, m
     with no further changes. Never swallows anything; the caller decides
     how to handle it.
 
-    Also verifies the language of a '*** NO SQL ***'-prefixed free-text
-    reply (this connection couldn't confidently generate SQL, and said why)
+    Also verifies the language of a "cannot_answer_reason" free-text reply
+    (this connection couldn't confidently generate SQL, and said why)
     against `prompt`'s own detected language - see _no_sql_language_
     mismatch's docstring and this function's own inline comments above its
-    retry loop. A persistent mismatch after one corrective retry raises
-    LlmCallFailed too, same as any other exhausted-retry-budget failure
-    above - never returns known-wrong-language free text."""
+    retry loop. An unparseable JSON response and a language mismatch share
+    the same bounded 2-attempt budget, exactly like stream_translation()'s
+    own Call 2 loop - see that loop's own comments for why. A persistent
+    failure of either kind after one corrective retry raises LlmCallFailed
+    too, same as any other exhausted-retry-budget failure above - never
+    returns known-wrong-language free text, and never returns an
+    unparseable response as if it were real SQL."""
     schema = translate_routes.get_database_schema(descriptor, user_identity, force_refresh=force_schema_refresh)
 
     try:
@@ -403,9 +453,9 @@ def generate_sql_for_connection(descriptor, prompt, history, provider, client, m
         dialect_name = "PostgreSQL"
     dialect_intro = _DIALECT_PROMPT_INTROS.get(dialect_name, _DEFAULT_DIALECT_PROMPT_INTRO)
 
-    system_instruction = dialect_intro + _COMMON_FORMAT_RULES
+    system_instruction = dialect_intro + _SQL_GENERATION_FORMAT_RULES
     schema_block = f"Database Schema:\n{schema}\n\n"
-    new_prompt_content = f"User Request: {prompt}\n\nSQL Query:"
+    new_prompt_content = f"User Request: {prompt}\n\nJSON response:"
 
     if api_key is None:
         api_key = provider.pick_api_key()
@@ -425,23 +475,40 @@ def generate_sql_for_connection(descriptor, prompt, history, provider, client, m
     start_time = time.perf_counter()
     generated_sql = ""
     usage_info = {}
-    # Bounded 2-attempt outer loop - this function still uses the older
-    # '*** NO SQL ***'-marker convention (_COMMON_FORMAT_RULES), unlike
-    # stream_translation()'s single-connection Call 2 (which moved to a
-    # JSON "cannot_answer_reason" envelope) - but a free-text '*** NO SQL
-    # ***' reply here is exactly the same kind of prose that can drift
-    # into the wrong language under the same "foreign-language schema/data
-    # pulls the model along" failure mode _no_sql_language_mismatch was
-    # built to catch for that other call site (and for connection_router.
-    # py's triage_all_mode_question). This function - Phase B's per-
-    # connection SQL generation, reached once triage_all_mode_question has
-    # already routed a dataset-group-mode question here for real SQL - was
-    # never given that same check when it was added elsewhere, which is
-    # exactly the gap a user reported seeing in practice: a connection
-    # that couldn't confidently generate SQL would occasionally explain
-    # why in the wrong language, with nothing here to catch or correct it.
-    # Same "1 real attempt + 1 corrective retry" budget as those other two
-    # call sites.
+    # Bounded 2-attempt outer loop, sharing the SAME budget between an
+    # unparseable JSON response and a language mismatch on a
+    # "cannot_answer_reason" reply - mirrors stream_translation()'s own
+    # Call 2 loop exactly (this function was migrated onto the identical
+    # _SQL_GENERATION_FORMAT_RULES/_parse_sql_generation_response JSON
+    # contract Call 2 already used, replacing the older '*** NO SQL ***'-
+    # marker convention _COMMON_FORMAT_RULES this function used to rely on
+    # - see git history for that prior version). Two concrete reasons
+    # drove the migration, not just consistency with Call 2 for its own
+    # sake: first, a free-text '*** NO SQL ***' reply here was already
+    # known to be exactly the kind of prose that can drift into the wrong
+    # language under the same "foreign-language schema/data pulls the
+    # model along" failure mode _no_sql_language_mismatch was built to
+    # catch for other call sites (this function only got that same check
+    # bolted on after a real user-reported gap - a connection that
+    # couldn't confidently generate SQL would occasionally explain why in
+    # the wrong language, with nothing here to catch it, until
+    # _no_sql_language_mismatch was added below); second, and more
+    # fundamentally, the marker convention itself asks the model to
+    # reliably remember to prefix a reply with an exact literal string,
+    # which is precisely the reflexive-emission failure mode Call 2's own
+    # JSON redesign already eliminated by construction for single-
+    # connection mode - Phase B had no principled reason to keep carrying
+    # that same risk once Call 2 proved the JSON contract works under this
+    # exact retry/language-verification machinery. _classify_generation_
+    # outcome/_run_phase_b_fanout downstream are UNCHANGED by this
+    # migration: this function still returns a plain generated_sql string,
+    # either real SQL or a '*** NO SQL ***'-prefixed note re-synthesized
+    # from the JSON response's own "cannot_answer_reason" below - exactly
+    # like stream_translation() already does for Call 2's own
+    # generated_sql - so every consumer of this function's return value
+    # (the block-labeling/concatenation/failure-isolation logic below, and
+    # execute_routes.py's own marker-line parsing beyond that) needed zero
+    # changes.
     for language_attempt in range(2):
         llm_input = provider.build_llm_input(history, schema_block, new_prompt_content)
         # transient_attempt tracks the shared same-key/after-a-delay retry
@@ -455,7 +522,7 @@ def generate_sql_for_connection(descriptor, prompt, history, provider, client, m
         transient_attempt = 1
         while True:
             try:
-                generated_sql, usage_info = provider.call(client, model, llm_input, system_instruction)
+                raw_response, usage_info = provider.call(client, model, llm_input, system_instruction)
                 dataset_type, dataset_name = resolve_dataset_identity(descriptor, user_identity)
                 state_store.record_llm_usage(
                     user_identity, "sqlgen", model, usage_info,
@@ -506,56 +573,102 @@ def generate_sql_for_connection(descriptor, prompt, history, provider, client, m
                     time.sleep(retry_action["delay"])
                 continue
 
-        generated_sql = _clean_generated_sql(generated_sql)
-
-        # Real SQL never enters the language-mismatch check below at all -
-        # only a '*** NO SQL ***'-prefixed free-text reply (a "couldn't
-        # confidently generate SQL for this, here's why" explanation) is
-        # checked, same scoping _no_sql_language_mismatch's own docstring
-        # describes for its other two call sites.
-        stripped = generated_sql.strip()
-        if _NO_SQL_PREFIX_RE.match(stripped):
-            free_text = _strip_no_sql_prefix(stripped)
-            actual_language_code = _no_sql_language_mismatch(free_text, expected_language_code)
-            if actual_language_code is not None:
-                expected_name = translate_routes._describe_language(expected_language_code)
-                actual_name = translate_routes._describe_language(actual_language_code)
-                if language_attempt + 1 < 2:
-                    logger.warning(
-                        "Phase B connection generation's free-text reply came back in %s instead of "
-                        "the prompt's own %s (attempt %d/2) - discarding, retrying with an explicit "
-                        "correction",
-                        actual_name, expected_name, language_attempt + 1,
-                    )
-                    new_prompt_content = (
-                        f"{new_prompt_content}\n\nCORRECTION: your previous free-text reply to this "
-                        f"exact request was written in {actual_name}, which is WRONG - the request was "
-                        f"in {expected_name}, so your '*** NO SQL ***' reply must be written entirely "
-                        f"in {expected_name} this time. Write your full response again, from scratch, "
-                        f"entirely in {expected_name} this time."
-                    )
-                    continue
-                # The one corrective retry is exhausted and the reply
-                # STILL came back in the wrong language - mirrors Call 2's
-                # own "never knowingly serve a response in the wrong
-                # language" guarantee: this ONE connection fails outright
-                # (an honest, specific LlmCallFailed - caught by
-                # _run_phase_b_fanout's _run_one_timed, above, and surfaced
-                # as a per-connection generation_failures entry) rather
-                # than silently showing free text already confirmed to be
-                # in the wrong language. Every other selected connection in
-                # this same turn is unaffected - _run_phase_b_fanout runs
-                # each one independently.
+        parsed_generation = _parse_sql_generation_response(raw_response)
+        if parsed_generation is None:
+            # Unparseable JSON - shares this loop's own 2-attempt budget
+            # with the language-mismatch case below, rather than a
+            # separate budget of its own - same reasoning as
+            # stream_translation()'s own Call 2 loop.
+            if language_attempt + 1 < 2:
                 logger.warning(
-                    "Phase B connection generation's free-text reply still came back in %s instead of "
-                    "%s after retrying - failing this one connection rather than serving a "
-                    "known-wrong-language response",
-                    actual_name, expected_name,
+                    "Phase B connection generation's response could not be parsed as the required "
+                    "JSON object (attempt %d/2) - discarding, retrying with an explicit correction",
+                    language_attempt + 1,
                 )
-                raise LlmCallFailed(
-                    f"The response kept coming back in {actual_name} instead of {expected_name}, "
-                    f"even after retrying."
+                new_prompt_content = (
+                    f"{new_prompt_content}\n\nCORRECTION: your previous response could not be parsed - "
+                    f"it must be ONLY a JSON object with exactly one of \"sql\"/\"cannot_answer_reason\" "
+                    f"populated, no markdown fences, no other text. Respond again, from scratch, in "
+                    f"that exact shape."
                 )
+                continue
+            # The one corrective retry is exhausted and the response is
+            # STILL unparseable - this ONE connection fails outright (an
+            # honest, specific LlmCallFailed - caught by
+            # _run_phase_b_fanout's _run_one_timed, above, and surfaced as
+            # a per-connection generation_failures entry) rather than
+            # silently treating garbage as real SQL. Every other selected
+            # connection in this same turn is unaffected -
+            # _run_phase_b_fanout runs each one independently.
+            logger.warning(
+                "Phase B connection generation's response still unparseable after retrying - "
+                "failing this one connection"
+            )
+            raise LlmCallFailed(
+                "I wasn't able to produce a usable response to your prompt, even after retrying. "
+                "Try rephrasing your question."
+            )
+
+        if parsed_generation["outcome"] == "sql":
+            # Real SQL (already fence-stripped by _parse_sql_generation_
+            # response itself) - never enters the language-mismatch check
+            # below at all, same scoping _no_sql_language_mismatch's own
+            # docstring describes for its other call sites.
+            generated_sql = parsed_generation["sql"]
+            break
+
+        # "cannot_answer" - the closest surviving equivalent of the old
+        # design's '*** NO SQL ***' free-text replies (this function's own
+        # structured escape hatch for "I can't confidently generate SQL
+        # for this, and here's why" - see _SQL_GENERATION_FORMAT_RULES).
+        free_text = parsed_generation["reason"]
+        actual_language_code = _no_sql_language_mismatch(free_text, expected_language_code)
+        if actual_language_code is not None:
+            expected_name = translate_routes._describe_language(expected_language_code)
+            actual_name = translate_routes._describe_language(actual_language_code)
+            if language_attempt + 1 < 2:
+                logger.warning(
+                    "Phase B connection generation's free-text reply came back in %s instead of "
+                    "the prompt's own %s (attempt %d/2) - discarding, retrying with an explicit "
+                    "correction",
+                    actual_name, expected_name, language_attempt + 1,
+                )
+                new_prompt_content = (
+                    f"{new_prompt_content}\n\nCORRECTION: your previous free-text reply to this "
+                    f"exact request was written in {actual_name}, which is WRONG - the request was "
+                    f"in {expected_name}, so \"cannot_answer_reason\" must be written entirely in "
+                    f"{expected_name} this time. Write your full response again, from scratch, "
+                    f"entirely in {expected_name} this time."
+                )
+                continue
+            # The one corrective retry is exhausted and the reply
+            # STILL came back in the wrong language - mirrors Call 2's
+            # own "never knowingly serve a response in the wrong
+            # language" guarantee: this ONE connection fails outright
+            # (an honest, specific LlmCallFailed - caught by
+            # _run_phase_b_fanout's _run_one_timed, above, and surfaced
+            # as a per-connection generation_failures entry) rather
+            # than silently showing free text already confirmed to be
+            # in the wrong language. Every other selected connection in
+            # this same turn is unaffected - _run_phase_b_fanout runs
+            # each one independently.
+            logger.warning(
+                "Phase B connection generation's free-text reply still came back in %s instead of "
+                "%s after retrying - failing this one connection rather than serving a "
+                "known-wrong-language response",
+                actual_name, expected_name,
+            )
+            raise LlmCallFailed(
+                f"The response kept coming back in {actual_name} instead of {expected_name}, "
+                f"even after retrying."
+            )
+        # Re-synthesizes the old '*** NO SQL ***' marker convention purely
+        # as this function's OWN return-value shape - _classify_
+        # generation_outcome/_run_phase_b_fanout downstream (and
+        # execute_routes.py beyond that) still key off this exact prefix,
+        # unchanged by this migration - see this function's own docstring
+        # and the module-level comment above this retry loop.
+        generated_sql = "*** NO SQL *** " + free_text
         break
     end_time = time.perf_counter()
 
@@ -952,10 +1065,11 @@ def _no_sql_language_mismatch(generated_sql, expected_language_code):
 #
 # This exists because a real qwen2.5-coder:7b smoke test surfaced a
 # genuine architectural problem, not a prompt-wording one: the old single-
-# call design (_COMMON_FORMAT_RULES, still used unchanged by dataset-group
-# mode's own Phase B fan-out below - see generate_sql_for_connection - and
-# deliberately left that way, per this session's repeated agreement to
-# scope this redesign to the single-connection path only) asked ONE call
+# call design (_COMMON_FORMAT_RULES - originally kept in unchanged use by
+# dataset-group mode's own Phase B fan-out below too, deliberately left
+# that way when this redesign first shipped scoped to the single-
+# connection path only - see generate_sql_for_connection's own docstring
+# for the later migration that closed that gap) asked ONE call
 # to both classify (via a '*** NO SQL ***' free-text marker convention)
 # AND generate SQL in the same response - the model generated genuinely
 # correct SQL while ALSO spuriously prepending '*** NO SQL ***' to it,
@@ -1031,16 +1145,21 @@ def triage_single_dataset_question(schema_block, prompt, provider, client, model
 # module-level section comment above _SINGLE_DATASET_TRIAGE_SYSTEM_
 # INSTRUCTION) - identical for every dialect, so pulled out once here
 # rather than duplicated per dialect entry, same reasoning as
-# _COMMON_FORMAT_RULES. Deliberately a SEPARATE constant, not a
-# replacement for _COMMON_FORMAT_RULES - that one is still used, unchanged,
-# by generate_sql_for_connection (dataset-group mode's Phase B fan-out,
-# explicitly out of scope for this redesign - see this module's own
-# docstring). Call 2 is only ever reached once Call 1 has already decided
-# "sql" - it is never asked to classify anything itself, which is exactly
-# what removes the failure mode this redesign exists to fix: there is no
-# more '*** NO SQL ***' marker for a model to reflexively (and, in
-# practice, sometimes spuriously) emit, since the JSON envelope's OWN
-# SHAPE (exactly one of "sql"/"cannot_answer_reason" populated) is what
+# _COMMON_FORMAT_RULES. Originally a SEPARATE constant from
+# _COMMON_FORMAT_RULES, kept apart from it deliberately when this redesign
+# first shipped scoped to the single-connection path only - dataset-group
+# mode's own Phase B fan-out (generate_sql_for_connection) stayed on
+# _COMMON_FORMAT_RULES's older marker convention for a while after this
+# constant existed. That gap has SINCE been closed: generate_sql_for_
+# connection now builds its own system_instruction from this exact same
+# constant too (see its own docstring for why) - _COMMON_FORMAT_RULES
+# itself is no longer referenced by any code path in this module. Call 2
+# is only ever reached once Call 1 has already decided "sql" - it is never
+# asked to classify anything itself, which is exactly what removes the
+# failure mode this redesign exists to fix: there is no more '*** NO SQL
+# ***' marker for a model to reflexively (and, in practice, sometimes
+# spuriously) emit, since the JSON envelope's OWN SHAPE (exactly one of
+# "sql"/"cannot_answer_reason" populated) is what
 # the app now uses to tell "real SQL" and "can't confidently answer" apart,
 # not a literal string sharing space with the free text.
 _SQL_GENERATION_FORMAT_RULES = load_prompt("sql_generation_format_rules.txt")

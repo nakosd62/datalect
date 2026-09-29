@@ -14,7 +14,7 @@ backends/oracle.py, driven two ways:
 get_schema()'s query order is unconditional for tables/columns, then
 best-effort (try/except) for constraints/views - see backends/oracle.py:
   1. table names   2. columns   3. constraints (best-effort)   4. views (best-effort)
-No indexes/grants/triggers queries at all (left for follow-up, same status
+No indexes/triggers queries at all (left for follow-up, same status
 backends/snowflake.py's/backends/databricks.py's own gaps have).
 
 Unlike Postgres/MySQL/Snowflake/Databricks' connectors, python-oracledb's
@@ -119,16 +119,15 @@ def _pad_column_row(row):
 
 def _schema_responses(
     table_names, columns_rows, constraints=(), views=(), comments=(), routines=(),
-    session_facts=("+00:00", "AMERICA", "BINARY"), grants=(), external_tables=(),
+    session_facts=("+00:00", "AMERICA", "BINARY"), external_tables=(),
 ):
     """Response queue matching _build_shallow_schema_parts()'s own fixed,
     unconditional query order (see backends/oracle.py):
       1. table names (+ NUM_ROWS)   2. columns (+ identity marker)
       3. constraints (best-effort)  4. views (best-effort)
       5. comments (new, best-effort)      6. routines (new, best-effort)
-      7. session facts (new, best-effort) 8. grants (new, best-effort)
-      9. external tables (new, best-effort)
-    get_schema() (deep) then runs these same nine queries via
+      7. session facts (new, best-effort) 8. external tables (new, best-effort)
+    get_schema() (deep) then runs these same eight queries via
     _build_shallow_schema_parts() and appends its own Phase 2 queries on a
     fresh cursor use (cardinality stats, then per kept table: live count,
     optional min/max, optional frequent-value queries) - see
@@ -144,7 +143,6 @@ def _schema_responses(
         (list(comments), None, -1),
         (list(routines), None, -1),
         ([session_facts] if session_facts is not None else [], None, -1),
-        (list(grants), None, -1),
         (list(external_tables), None, -1),
     ]
 
@@ -721,70 +719,6 @@ def test_get_schema_shallow_session_facts_render():
     assert "Session: timezone=-05:00; territory=AMERICA; sort=BINARY_CI" in schema
 
 
-def test_get_schema_shallow_grants_render():
-    conn, cursor = make_fake_pg_connection(_schema_responses(
-        table_names=["ORDERS"],
-        columns_rows=[("ORDERS", "ID", "NUMBER", "N")],
-        grants=[("APP_USER", "ORDERS", "SELECT")],
-    ))
-    backend = OracleBackend()
-    schema = backend.get_schema_shallow(conn)
-    assert "Grants:" in schema
-    assert "Grant SELECT on ORDERS to APP_USER" in schema
-
-
-def test_get_schema_shallow_grants_section_absent_when_no_grants():
-    conn, cursor = make_fake_pg_connection(_schema_responses(
-        table_names=["ORDERS"],
-        columns_rows=[("ORDERS", "ID", "NUMBER", "N")],
-    ))
-    backend = OracleBackend()
-    schema = backend.get_schema_shallow(conn)
-    assert "Grants:" not in schema
-
-
-def test_get_schema_survives_grants_query_failure():
-    """Best-effort, mirrors every other new optional section: a role that
-    can't evaluate ALL_TAB_PRIVS still gets every other section, not a
-    failed schema fetch. See backends/oracle.py's Grants section comment
-    for why this was added now (rather than left deferred, as
-    Indexes/Triggers still are)."""
-    class RaisingCursor:
-        def __init__(self):
-            self.calls = []
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-        def execute(self, sql, params=None):
-            self.calls.append((sql, params))
-            if "all_tab_privs" in sql:
-                raise Exception("permission denied on ALL_TAB_PRIVS")
-
-        def fetchall(self):
-            sql = self.calls[-1][0]
-            if "all_tables" in sql:
-                return [("ORDERS", None)]
-            if "all_tab_columns" in sql:
-                return [("ORDERS", "ID", "NUMBER", "N", None)]
-            return []
-
-        def fetchone(self):
-            return None
-
-    class RaisingConnection:
-        def cursor(self):
-            return RaisingCursor()
-
-    backend = OracleBackend()
-    schema = backend.get_schema_shallow(RaisingConnection())
-    assert "Table: ORDERS" in schema
-    assert "Grants:" not in schema
-
-
 def test_get_schema_shallow_external_tables_render():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["EXT_LOGS"],
@@ -833,8 +767,8 @@ def test_get_schema_shallow_excludes_full_view_body_and_phase2_sections():
     assert "Live row counts:" not in schema
     assert "Column value samples:" not in schema
     assert "Likely relationships" not in schema
-    # Exactly the nine Phase 1 queries - no Phase 2 query was ever issued.
-    assert len(cursor.calls) == 9
+    # Exactly the eight Phase 1 queries - no Phase 2 query was ever issued.
+    assert len(cursor.calls) == 8
 
 
 # --- get_schema() (deep): Phase 2 additions on top of the shallow content --------
@@ -892,7 +826,7 @@ def test_get_schema_deep_is_superset_of_shallow_plus_phase2_sampling():
     # and bytes (2,000,000) is the new query's response.
     assert "Estimated dataset size: ~1.9 MB" in schema
 
-    assert len(cursor.calls) == 9 + 1 + 4
+    assert len(cursor.calls) == 8 + 1 + 4
 
 
 def test_get_schema_deep_skips_frequent_values_for_near_unique_column():
@@ -914,7 +848,7 @@ def test_get_schema_deep_skips_frequent_values_for_near_unique_column():
     assert "Column value samples:" in schema
     assert "ID: range [1 .. 100]" in schema
     assert "frequent values" not in schema
-    assert len(cursor.calls) == 9 + 1 + 3
+    assert len(cursor.calls) == 8 + 1 + 3
 
 
 def test_get_schema_deep_naming_convention_relationships_section():
@@ -968,7 +902,7 @@ def test_get_schema_deep_skips_sampling_for_wide_tables_but_keeps_live_count():
     schema = backend.get_schema(conn)
     assert "Live row counts:" in schema and "WIDE: 7 rows (live, authoritative)" in schema
     assert "Column value samples:" not in schema
-    assert len(cursor.calls) == 9 + 1 + 2
+    assert len(cursor.calls) == 8 + 1 + 2
 
 
 def test_get_schema_deep_dataset_size_sums_full_num_rows_by_table_not_just_kept_names():

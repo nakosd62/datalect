@@ -7,6 +7,34 @@ for the actual mechanics and why they're needed (app_config.py's
 import-time side effects, the hardcoded relative SQLite path, ...).
 """
 
+import os
+
+# Set BEFORE anything else in this file, and before pytest collects a
+# single test module in this directory - conftest.py is always imported
+# first, so this is the earliest point this whole test session gets a
+# chance to run any code at all. app_config.py's own module-level
+# `if os.environ.get("YDYL_SKIP_DOTENV") != "1": load_dotenv(override=True)`
+# is this exact escape hatch (see its own comment) - without setting it
+# here, a real, unguarded `load_dotenv(override=True)` can still fire
+# during COLLECTION, before fresh_import()'s per-test monkeypatch of
+# dotenv.load_dotenv ever gets a chance to run: any test file anywhere in
+# this directory that imports something pulling in app_config.py at its
+# own top level (module scope, not inside a test function) - e.g. `from
+# config_routes import _describe_config_diff` - triggers that real
+# load_dotenv() at import time, with the process's cwd still the real
+# repo root (pytest hasn't chdir'd into any test's tmp_path yet), so it
+# finds and loads the REAL repo-root `.env` into this whole process's
+# os.environ, permanently, for the rest of the run. Every _ENV_VARS_TO_
+# CLEAR entry in helpers.py only helps INSIDE fresh_import() - it does
+# nothing for a bare `.env` leak that happens before any test (or a
+# backend test that never calls fresh_import at all, e.g.
+# test_sheets_backend.py's direct `SheetsBackend().connect(...)` calls) -
+# so this is the one guard that actually closes the leak at its source,
+# regardless of which module happens to trigger the first real
+# app_config import, and regardless of whether the affected test goes
+# through fresh_import at all.
+os.environ["YDYL_SKIP_DOTENV"] = "1"
+
 import pytest
 
 from helpers import (

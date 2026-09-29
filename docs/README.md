@@ -8,7 +8,7 @@ web app backed by a small Flask API.
 - **NL → SQL** via your choice of Google Gemini, Anthropic Claude, or
   OpenAI (switchable per session from the model badge), grounded in a
   live introspection of your database schema (tables, columns,
-  constraints, indexes, views, grants, triggers).
+  constraints, indexes, views, triggers).
 - **Multi-turn conversations** — the last 10 turns (prompt, SQL, and
   results) are kept in memory so follow-up questions have context.
 - **Multi-database question answering** — mark 2+ connections in scope

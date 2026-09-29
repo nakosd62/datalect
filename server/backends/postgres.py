@@ -334,7 +334,7 @@ class PostgresBackend(Backend):
             # date-shard families (e.g. events_20240101 .. events_20241231
             # -> one "events" family) and capped to SCHEMA_MAX_TABLES
             # entries (see backends/base.py) *before* any column/constraint/
-            # index/view/grant/trigger query runs - those all get scoped to
+            # index/view/trigger query runs - those all get scoped to
             # this bounded set below, which is what actually keeps schema
             # fetching tractable on a dataset with a huge number of tables,
             # rather than fetching everything and truncating the text after
@@ -527,23 +527,7 @@ class PostgresBackend(Backend):
                 view_lines = [f"  View {v[0]}" for v in views]
                 schema_parts.append("Views:\n" + "\n".join(view_lines))
 
-            # 5. Role Grants
-            cursor.execute("""
-                SELECT
-                    grantee,
-                    table_name,
-                    privilege_type
-                FROM information_schema.role_table_grants
-                WHERE table_schema = current_schema()
-                  AND table_name = ANY(%s)
-                ORDER BY table_name, grantee;
-            """, (kept_names,))
-            grants = cursor.fetchall()
-            if grants:
-                grant_lines = [f"  Grant {g[2]} on {g[1]} to {g[0]}" for g in grants]
-                schema_parts.append("Grants:\n" + "\n".join(grant_lines))
-
-            # 6. Triggers
+            # 5. Triggers
             cursor.execute("""
                 SELECT
                     event_object_table,
@@ -559,7 +543,7 @@ class PostgresBackend(Backend):
                 trig_lines = [f"  [{t[0]}] {t[1]} ({t[2]}): {t[3]}" for t in triggers]
                 schema_parts.append("Triggers:\n" + "\n".join(trig_lines))
 
-            # 7. Comments (new) - table and column comments via Postgres's
+            # 6. Comments (new) - table and column comments via Postgres's
             # own catalog-description functions. Best-effort/try-except,
             # like every new optional section below (mirrors
             # backends/bigquery.py's own try/except-guarded optional
@@ -597,7 +581,7 @@ class PostgresBackend(Backend):
             except Exception:
                 pass
 
-            # 8. Row count estimate (new) - pg_class.reltuples, a free
+            # 7. Row count estimate (new) - pg_class.reltuples, a free
             # planner statistic (last ANALYZE's estimate, not a live scan -
             # see get_schema()'s "Live row counts" section for the
             # authoritative, deep-only counterpart). A never-analyzed table
@@ -621,7 +605,7 @@ class PostgresBackend(Backend):
             except Exception:
                 pass
 
-            # 9. Routines (new) - existence + signature only, no body (see
+            # 8. Routines (new) - existence + signature only, no body (see
             # get_schema()'s "Routine definitions" section for the full-body
             # deep-only counterpart, reusing routine_definition fetched here
             # rather than re-querying it). Not scoped to kept_names (like

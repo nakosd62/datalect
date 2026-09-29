@@ -122,9 +122,9 @@ def get_summary_schema_text(descriptor, user_identity):
     (single-dataset mode's own SQL-GENERATION path, which only reduces
     when that flag is explicitly turned on), summarizing an already-
     executed query's results never needs anything beyond what each
-    table/column means - never constraints, indexes, views, grants, or
-    any of the other schema-object sections a translate prompt can still
-    carry when SCHEMA_TABLES_ONLY is off - so this reduces every time,
+    table/column means - never constraints, indexes, views, or any of the
+    other schema-object sections a translate prompt can still carry when
+    SCHEMA_TABLES_ONLY is off - so this reduces every time,
     independent of that flag's setting.
 
     get_database_schema() itself is completely untouched by this (same
@@ -662,6 +662,64 @@ def _build_all_mode_schema_block(database_results, user_identity):
     return "Database schema for each database queried:\n\n" + "\n\n".join(blocks) + "\n\n"
 
 
+# Neither summarization prompt is ever given a real web-search tool - see
+# both prompts' own "suggested_searches" paragraph for why: this app
+# deliberately keeps that call limited to reasoning over the real rows/
+# schema it was already given (plus, separately, whatever it already
+# knows from training - see the general-knowledge-blending paragraph right
+# above "suggested_searches" in each prompt), rather than letting it fetch
+# arbitrary live pages mid-summary. "suggested_searches" is the
+# lighter-weight alternative: the model just NAMES a follow-up search
+# worth running, and the client (see webClient/client.js's
+# suggestedSearchesHtml()) turns that into a plain link the user clicks
+# themselves, opening their own browser's own search - nothing is ever
+# fetched server-side on the model's say-so.
+SUGGESTED_SEARCH_MAX_CHARS = 100
+SUGGESTED_SEARCH_MAX_COUNT = 3
+
+
+def _clean_suggested_searches(raw):
+    """Validates the model's own "suggested_searches" field - shared by
+    both summarization prompts, see either one's own paragraph on it -
+    into a list of 0-SUGGESTED_SEARCH_MAX_COUNT short, plain search-engine
+    query strings. Returns [] (never None) on anything short of a
+    genuinely usable list, including `raw` missing entirely or being the
+    wrong type - same leniency _clean_visualizations already established
+    for its own optional field: this is never a reason to invalidate the
+    rest of the response or trigger the caller's bounded retry, only
+    "summary"/"label"+"per_database" are.
+
+    Each item must be a non-empty (after stripping) string, capped at
+    SUGGESTED_SEARCH_MAX_CHARS characters - a search query is meant to be
+    a handful of words typed into a search box, not a restatement of
+    whatever point it follows up on, so an overlong value is DROPPED
+    entirely rather than truncated (truncating a query can turn a
+    sensible search into a nonsensical one, unlike a caption that's still
+    meaningful cut short). Deduplicated case-insensitively (the model has
+    no reason to suggest the same lookup twice in one turn) preserving
+    first-seen order, then capped at SUGGESTED_SEARCH_MAX_COUNT entries -
+    this is meant to surface a couple of genuinely useful follow-ups,
+    never a wall of links."""
+    if not isinstance(raw, list):
+        return []
+    cleaned = []
+    seen = set()
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        query = item.strip()
+        if not query or len(query) > SUGGESTED_SEARCH_MAX_CHARS:
+            continue
+        key = query.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(query)
+        if len(cleaned) >= SUGGESTED_SEARCH_MAX_COUNT:
+            break
+    return cleaned
+
+
 def _clean_summary_response(raw_text, num_databases, chartable_by_index=None):
     """Parses Phase C's structured JSON response (see
     _SUMMARY_SYSTEM_INSTRUCTION) into
@@ -749,10 +807,11 @@ def _clean_summary_response(raw_text, num_databases, chartable_by_index=None):
     visualizations = _clean_visualizations(
         parsed.get("visualizations"), chartable_by_index or {}, *per_database.values(), cross_database,
     )
+    suggested_searches = _clean_suggested_searches(parsed.get("suggested_searches"))
 
     return {
         "label": label, "per_database": per_database, "cross_database": cross_database,
-        "visualizations": visualizations,
+        "visualizations": visualizations, "suggested_searches": suggested_searches,
     }
 
 
@@ -891,7 +950,8 @@ def summarize_results():
       {"status": "done", "success": true, "summary": "...",
        "database_summaries": [{"kind", "id", "name", "text"}, ...],
        "cross_database_summary": "..." | null,
-       "visualizations": {"<index>": {"chart_type", "x_column", "y_columns", "series_column"}, ...}}
+       "visualizations": {"<index>": {"chart_type", "x_column", "y_columns", "series_column"}, ...},
+       "suggested_searches": ["...", ...]}
       or, on failure (retry/rotation budget exhausted, or 2 consecutive
       content-invalid responses):
       {"status": "done", "success": false, "error": "..."}
@@ -916,14 +976,18 @@ def summarize_results():
     paragraphs (newline-joined, so they render as sub-paragraphs nested
     under one heading rather than that heading repeating once per
     resultset), not one entry per resultset. "database_summaries",
-    "cross_database_summary", and "visualizations" are purely ADDITIVE new
-    fields alongside that unchanged "summary" string (Chunk 1's own
-    sql_blocks precedent) - the per-database split callers need to record
-    separate per-database turns later, the cross-database paragraph split
-    out on its own distinct from any one database's paragraph, and
-    "visualizations" (see _clean_visualizations) giving client.js zero or
-    more validated per-entry chart decisions to render instead of/alongside
-    the affected result tab's own table.
+    "cross_database_summary", "visualizations", and "suggested_searches"
+    are purely ADDITIVE new fields alongside that unchanged "summary"
+    string (Chunk 1's own sql_blocks precedent) - the per-database split
+    callers need to record separate per-database turns later, the
+    cross-database paragraph split out on its own distinct from any one
+    database's paragraph, "visualizations" (see _clean_visualizations)
+    giving client.js zero or more validated per-entry chart decisions to
+    render instead of/alongside the affected result tab's own table, and
+    "suggested_searches" (see _clean_suggested_searches) giving client.js
+    zero to a few model-suggested follow-up search queries to render as
+    plain clickable links under the summary text - never a live search
+    run by this server itself.
     The two early-validation returns below (missing API key, missing
     prompt/database_results) happen before any of this and keep their
     real plain-JSON 400 responses, exactly as /api/translate's own two
@@ -1080,6 +1144,7 @@ def summarize_results():
             # rows (see _clean_visualizations) - client.js trusts this at
             # face value, same as every other server response shape.
             'visualizations': parsed.get("visualizations") or {},
+            'suggested_searches': parsed.get("suggested_searches") or [],
         }) + "\n"
 
     # See concurrency_guard.py's own module docstring - TRANSLATE_GUARD,
@@ -1229,7 +1294,8 @@ def _clean_single_summary_response(raw_text, chartable_by_index):
     """Parses the single-connection summarization call's structured JSON
     response (see _SINGLE_SUMMARY_SYSTEM_INSTRUCTION) into
       {"summary": <non-empty str>, "visualizations": <_clean_visualizations'
-       shape - {index: _clean_visualization's shape}>}
+       shape - {index: _clean_visualization's shape}>,
+       "suggested_searches": <_clean_suggested_searches' shape - [<str>, ...]>}
     or None (unparseable, or "summary" itself is missing/invalid - the
     caller's bounded retry, via _summarize_with_retry's content_parser,
     treats None exactly like an empty/invalid response always was before
@@ -1268,7 +1334,8 @@ def _clean_single_summary_response(raw_text, chartable_by_index):
     summary = summary.strip()
 
     visualizations = _clean_visualizations(parsed.get("visualizations"), chartable_by_index, summary)
-    return {"summary": summary, "visualizations": visualizations}
+    suggested_searches = _clean_suggested_searches(parsed.get("suggested_searches"))
+    return {"summary": summary, "visualizations": visualizations, "suggested_searches": suggested_searches}
 
 
 def _make_single_summary_content_parser(chartable_by_index):
@@ -1325,8 +1392,8 @@ def summarize_single_connection_results(user_question, schema, sql, statement_re
     straight through unchanged - this function adds none of its own.
 
     Returns (parsed, usage, error) - `parsed` is exactly
-    _clean_single_summary_response's own {"summary", "visualizations"}
-    dict, or None on failure (see _summarize_with_retry's docstring for
+    _clean_single_summary_response's own {"summary", "visualizations",
+    "suggested_searches"} dict, or None on failure (see _summarize_with_retry's docstring for
     the exact meaning of `usage`/`error` in that case) - NOT yet unwrapped
     into a plain summary string; that stays the caller's job (see
     stream_summarize_result below), exactly the same "parsed, not
@@ -1471,12 +1538,13 @@ def summarize_result():
             return
 
         # `parsed` is summarize_single_connection_results' own
-        # {"summary", "visualizations"} dict (see its own docstring) - only
-        # "summary" gets the "*** NO SQL ***" prefix/translations-table
-        # logging treatment; "visualizations" (each entry already fully
-        # validated against the real executed columns/rows - see _clean_
-        # visualizations/_clean_visualization) rides along in the response
-        # as-is, keyed by the same 0-based statement_results index it was
+        # {"summary", "visualizations", "suggested_searches"} dict (see its
+        # own docstring) - only "summary" gets the "*** NO SQL ***" prefix/
+        # translations-table logging treatment; "visualizations" (each
+        # entry already fully validated against the real executed columns/
+        # rows - see _clean_visualizations/_clean_visualization) rides
+        # along in the response as-is, keyed by the same 0-based
+        # statement_results index it was
         # validated against, for client.js to render as a chart instead
         # of/alongside the results table for each qualifying Query Result.
         summary_text = "*** NO SQL *** " + parsed["summary"]
@@ -1485,8 +1553,10 @@ def summarize_result():
         # translations-table history/stats - see the comment on this
         # function's own failure branch above for why.
 
+        suggested_searches = parsed["suggested_searches"]
         yield json.dumps({
             'status': 'done', 'success': True, 'summary': summary_text, 'visualizations': visualizations,
+            'suggested_searches': suggested_searches,
         }) + "\n"
 
     def _stream_summarize_result_with_guard_release():

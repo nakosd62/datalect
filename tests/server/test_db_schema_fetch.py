@@ -364,19 +364,21 @@ def test_build_router_candidate_summaries_reads_only_the_cached_deep_entry_no_li
     # was always a superset of it anyway (see db.py's own docstring). Now
     # this reads ONLY whatever deep entry is already sitting in
     # schema_cache, in memory, and reduces it via
-    # extract_entry_names_from_schema_text - zero backend calls either way.
+    # derive_tables_only_schema_text - zero backend calls either way.
     app_factory()
-    db_module, fake = _install_fake_backend(
-        monkeypatch, schema_text="Table: customers\n  id integer NOT NULL",
+    deep_schema = (
+        "Table: customers\n  id integer NOT NULL\n\n"
+        "Constraints:\n  none\n"
     )
+    db_module, fake = _install_fake_backend(monkeypatch, schema_text=deep_schema)
     descriptor = {"type": "postgres", "url": "postgresql://u:p@host/db"}
 
-    # Nothing cached yet - degrades to an empty table list, still with no
+    # Nothing cached yet - degrades to an empty schema_text, still with no
     # backend call of any kind.
     summaries = db_module.build_router_candidate_summaries(
         [{"name": "My DB", "descriptor": descriptor}], user_id=None,
     )
-    assert summaries == [{"name": "My DB", "dialect": "SQL", "table_names": []}]
+    assert summaries == [{"name": "My DB", "dialect": "SQL", "schema_text": ""}]
     assert fake.get_schema_calls == 0
     assert fake.get_schema_shallow_calls == 0
 
@@ -389,7 +391,12 @@ def test_build_router_candidate_summaries_reads_only_the_cached_deep_entry_no_li
     summaries = db_module.build_router_candidate_summaries(
         [{"name": "My DB", "descriptor": descriptor}], user_id=None,
     )
-    assert summaries == [{"name": "My DB", "dialect": "SQL", "table_names": ["customers"]}]
+    # Reduced to the tables_only derivative - full table/column detail
+    # kept, "Constraints:" (and anything else past the table list) gone.
+    assert summaries == [{
+        "name": "My DB", "dialect": "SQL",
+        "schema_text": "Table: customers\n  id integer NOT NULL",
+    }]
     # Still no shallow call, and no SECOND deep call either - this was a
     # pure cache read, not a fetch of any kind.
     assert fake.get_schema_shallow_calls == 0

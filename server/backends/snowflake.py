@@ -56,7 +56,7 @@ exercised against a real Snowflake account yet - only against the fake
 DB-API harness in tests/server/helpers.py (see test_snowflake_backend.py).
 Treat the SQL/kwarg shapes here as a solid first draft, not as already
 battle-tested the way the other two backends are. This is doubly true for
-the newer, best-effort-only sections below (Grants, Row-level security /
+the newer, best-effort-only sections below (Row-level security /
 masking, Routines) - each is wrapped in try/except and degrades silently
 rather than failing the whole schema fetch, precisely because the exact
 catalog/SHOW-command shape for those is the least certain part of this
@@ -92,16 +92,15 @@ _KEY_PAIR_AUTHENTICATOR = "SNOWFLAKE_JWT"
 def _quote_ident(name):
     """Double-quotes a Snowflake identifier for interpolation into a plain
     SQL string (escaping an embedded '"' the way Snowflake itself expects),
-    for the Phase 2 per-table live-query section and the Phase 1 Grants
-    section below - mirrors backends/postgres.py's own `_quote_ident`
+    for the Phase 2 per-table live-query section below - mirrors
+    backends/postgres.py's own `_quote_ident`
     helper exactly, same reasoning: Snowflake's default paramstyle has no
     bind-parameter form for a bare identifier (table/column/role name), so
     a handful of genuinely dynamic statements are built as plain strings
     here rather than via a query-builder. `name` always comes from data
     this same connection already queried (kept_names / column names Phase
-    1 fetched, or CURRENT_ROLE()'s own return value) - never raw user
-    input - so this only needs to be correct, not defend against an
-    adversarial identifier."""
+    1 fetched) - never raw user input - so this only needs to be correct,
+    not defend against an adversarial identifier."""
     return '"' + str(name).replace('"', '""') + '"'
 
 
@@ -567,57 +566,7 @@ class SnowflakeBackend(Backend):
             except Exception:
                 pass
 
-            # 9. Grants (new) - scoped to the connection's own current role
-            # only ("widened current-user grants", per the plan - not a
-            # full grantee matrix). Snowflake has no INFORMATION_SCHEMA
-            # table-grants view the way Postgres's role_table_grants or
-            # MySQL's TABLE_PRIVILEGES do; SHOW GRANTS TO ROLE <role> is
-            # the documented way to list a role's effective privileges.
-            # IDENTIFIER()-free string interpolation here is safe (not
-            # user input) because `role` is CURRENT_ROLE()'s own return
-            # value, quoted via _quote_ident exactly like a kept_names
-            # table name is in the Phase 2 per-table queries below. SHOW
-            # GRANTS TO ROLE's documented column order is (created_on,
-            # privilege, granted_on, name, granted_to, grantee_name,
-            # grant_option, granted_by) - not verified against a real
-            # account (see module docstring), so this reads by position
-            # rather than by cursor.description name (a real DB-API
-            # description would let this be more robust, but every other
-            # query in this module already relies on positional tuple
-            # unpacking the same way, and description isn't populated for
-            # SHOW-command shaped result sets in every driver version).
-            # One line per table (privileges combined), not one line per
-            # privilege - per the plan's "not a full grantee matrix"
-            # guidance.
-            try:
-                cursor.execute("SELECT CURRENT_ROLE();")
-                role_row = cursor.fetchone()
-                role = role_row[0] if role_row else None
-                if role:
-                    cursor.execute(f"SHOW GRANTS TO ROLE {_quote_ident(role)};")
-                    grant_rows = cursor.fetchall()
-                    kept_upper = {n.upper() for n in kept_names}
-                    grants_by_table = {}
-                    for grow in grant_rows:
-                        if len(grow) < 4:
-                            continue
-                        privilege, granted_on, name = grow[1], grow[2], grow[3]
-                        if granted_on != "TABLE":
-                            continue
-                        simple_name = str(name).split(".")[-1].strip('"')
-                        if simple_name.upper() not in kept_upper:
-                            continue
-                        grants_by_table.setdefault(simple_name, set()).add(privilege)
-                    if grants_by_table:
-                        grant_lines = [
-                            f"  {tbl}: {', '.join(sorted(privs))} (role {role})"
-                            for tbl, privs in sorted(grants_by_table.items())
-                        ]
-                        schema_parts.append("Grants (current role):\n" + "\n".join(grant_lines))
-            except Exception:
-                pass
-
-            # 10. Row-level security (row access policies) / column
+            # 9. Row-level security (row access policies) / column
             # masking policies, plus external-table flag (rendered
             # separately above) (new). Snowflake's per-object attribution
             # (which table/column a given policy is actually attached to)

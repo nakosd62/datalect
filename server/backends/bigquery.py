@@ -670,12 +670,9 @@ class BigQueryBackend(Backend):
         # there's no real "session timezone"/"default collation" fact to
         # report here.
         #
-        # Grants: skipped entirely - BigQuery's IAM-based permission model
-        # doesn't map cleanly onto a simple current-user table-grants view
-        # the way SQL-standard information_schema.role_table_grants does
-        # for Postgres/MySQL, so this is left out rather than forced into
-        # an ill-fitting shape (per the plan: "skip unless a clearly safe
-        # catalog source turns up").
+        # Grants: not tracked - grants-based schema introspection has been
+        # removed product-wide (see the other backends' modules/history for
+        # why), not just skipped here for BigQuery-specific reasons.
         #
         # Column-level comments: skipped - INFORMATION_SCHEMA.COLUMN_FIELD_
         # PATHS.description is flagged in the recommendations doc as "less

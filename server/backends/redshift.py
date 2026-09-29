@@ -69,18 +69,6 @@ constraints, views), but does NOT copy two sections that don't apply here:
     without ever enforcing them at write time; the schema text says so
     explicitly, and translate_routes.py's dialect prompt intro repeats the
     same warning, so generated SQL doesn't assume DB-enforced integrity.
-  - Grants: previously deliberately omitted entirely, with a comment noting
-    information_schema.role_table_grants support is inconsistent across
-    Redshift versions/configurations (svv_relation_privileges may be the
-    more portable source). That concern hasn't gone away - it still isn't
-    verifiable from this sandbox against a real cluster - but rather than
-    keep deferring it outright, a "Grants" section is now attempted the
-    same try/except-wrapped, best-effort way the constraints/layout
-    sections already were: if role_table_grants behaves the way it does on
-    Postgres, the section renders; if it errors (unsupported view, a role
-    without catalog access, an older/differently-configured cluster), the
-    whole section is silently skipped, same as every other best-effort
-    section here - see "5. Grants" below.
 
 Scoped with current_schema() rather than a hardcoded 'public' the way
 backends/postgres.py hardcodes it - this dialect explicitly supports a
@@ -133,11 +121,9 @@ constraints/layout/views:
     live cluster reachable) - rather than skip it outright on suspicion
     alone, or force it uncritically, it's attempted and left to degrade
     silently (empty Routines section, no error) if the real shape differs
-    on a given cluster/version - mirrors this file's own established
-    Grants-style caution.
+    on a given cluster/version.
   - Session facts: current_setting('TimeZone') - identical mechanism to
     backends/postgres.py's own (Redshift is Postgres-derived here too).
-  - Grants: see above.
   - External tables: svv_external_tables (Redshift Spectrum) - flagged as
     an informational section, not scoped to kept_names (an external table
     is never a BASE TABLE in the connected schema's own information_schema.
@@ -698,35 +684,7 @@ class RedshiftBackend(Backend):
             except Exception:
                 pass
 
-            # 8. Grants (new) - see module docstring for why this used to
-            # be deliberately omitted outright, and why it's now attempted
-            # (try/except-wrapped, best-effort) instead: the underlying
-            # concern (role_table_grants support varies across Redshift
-            # versions/configurations) hasn't gone away, so a cluster/
-            # version where this errors just loses this one section, not
-            # the whole schema fetch.
-            try:
-                cursor.execute("""
-                    SELECT
-                        grantee,
-                        table_name,
-                        privilege_type
-                    FROM information_schema.role_table_grants
-                    WHERE table_schema = current_schema()
-                      AND table_name = ANY(%s)
-                    ORDER BY table_name, grantee;
-                """, (kept_names,))
-                grants = cursor.fetchall()
-                if grants:
-                    grant_lines = [f"  Grant {g[2]} on {g[1]} to {g[0]}" for g in grants]
-                    schema_parts.append(
-                        "Grants (best-effort - role_table_grants support varies across "
-                        "Redshift versions/configurations):\n" + "\n".join(grant_lines)
-                    )
-            except Exception:
-                pass
-
-            # 9. External tables (new) - Redshift Spectrum tables, via
+            # 8. External tables (new) - Redshift Spectrum tables, via
             # svv_external_tables. Not scoped to kept_names - an external
             # table is never a BASE TABLE in the connected schema's own
             # information_schema.tables, so it could never appear in

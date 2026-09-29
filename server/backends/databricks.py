@@ -67,8 +67,8 @@ exists at all, and backends/postgres.py's own _build_shallow_schema_parts
 for the worked pattern this mirrors.
 
 Every Unity Catalog information_schema column name referenced below (
-IS_IDENTITY, comment, partition_index, routines/parameters,
-table_privileges) is taken from Databricks' documented Unity Catalog
+IS_IDENTITY, comment, partition_index, routines/parameters) is taken from
+Databricks' documented Unity Catalog
 information_schema shape (which is itself closely ANSI/Postgres-shaped),
 not verified against a live workspace from this sandbox - see the module
 docstring above ("exercised against the fake DB-API harness ... not a real
@@ -560,31 +560,6 @@ class DatabricksBackend(Backend):
                     )
             except Exception:
                 routines = []
-
-            # 7. Grants (new) - Unity Catalog's information_schema.
-            # table_privileges (an ANSI-standard-named view, unlike
-            # Postgres's own non-standard role_table_grants) - scoped to
-            # kept_names, one line per (table, grantee, privilege), same
-            # "at most one line per table"-ish guidance as the plan this
-            # implements. Best-effort: Unity Catalog's permission model
-            # varies by metastore/workspace configuration, and a role
-            # without USE CATALOG/schema-level visibility into grants may
-            # not be able to query this at all.
-            try:
-                cursor.execute(f"""
-                    SELECT grantee, table_name, privilege_type
-                    FROM information_schema.table_privileges
-                    WHERE table_catalog = current_catalog()
-                      AND table_schema = current_schema()
-                      AND table_name IN ({in_fragment})
-                    ORDER BY table_name, grantee;
-                """, in_params)
-                grants = cursor.fetchall()
-                if grants:
-                    grant_lines = [f"  Grant {g[2]} on {g[1]} to {g[0]}" for g in grants]
-                    schema_parts.append("Grants:\n" + "\n".join(grant_lines))
-            except Exception:
-                pass
 
             # Deliberately no Indexes/Triggers sections: Databricks SQL has
             # no user-managed indexes to introspect (automatic file/

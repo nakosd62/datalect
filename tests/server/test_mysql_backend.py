@@ -9,11 +9,11 @@ get_schema()) issues its queries unconditionally and in a fixed order
 graceful degradation - see mysql.py itself), so responses are queued in the
 exact order it issues them:
   1. table names        2. columns             3. constraints
-  4. indexes            5. views                6. grants
-  7. triggers           8. table comments/rows (new)
-  9. routines (new)     10. session settings (new)
+  4. indexes            5. views                6. triggers
+  7. table comments/rows (new)
+  8. routines (new)     9. session settings (new)
 
-get_schema() (deep) then runs _build_shallow_schema_parts() (the ten queries
+get_schema() (deep) then runs _build_shallow_schema_parts() (the nine queries
 above) and appends its own Phase 2 queries on a fresh cursor use, per kept
 table (in order): live COUNT(*), an optional combined MIN()/MAX() query (if
 it has numeric/date columns), and - per eligible categorical column, up to
@@ -67,7 +67,7 @@ def _pad_column_row(row):
 
 
 def _schema_responses(
-    table_names, columns_rows, constraints=(), indexes=(), views=(), grants=(), triggers=(),
+    table_names, columns_rows, constraints=(), indexes=(), views=(), triggers=(),
     table_meta=(), routines=(), session_settings=("SYSTEM", "utf8mb4_general_ci"),
 ):
     return [
@@ -76,7 +76,6 @@ def _schema_responses(
         (list(constraints), None, -1),
         (list(indexes), None, -1),
         (list(views), None, -1),
-        (list(grants), None, -1),
         (list(triggers), None, -1),
         (list(table_meta), None, -1),
         (list(routines), None, -1),
@@ -143,20 +142,19 @@ def test_get_schema_views_section_is_not_scoped_to_kept_names():
     assert "customer_orders" in schema
 
 
-def test_get_schema_includes_constraints_indexes_grants_triggers():
+def test_get_schema_includes_constraints_indexes_triggers():
     conn, cursor = make_fake_mysql_connection(_schema_responses(
         table_names=["orders"],
         columns_rows=[("orders", "id", "int", "NO", None)],
         constraints=[("orders", "PRIMARY", "PRIMARY KEY", "id", None, None)],
         indexes=[("orders", "PRIMARY", "id", 0, 1)],
-        grants=[("app_user@%", "orders", "SELECT")],
         triggers=[("orders", "trg_audit", "INSERT", "CALL audit()")],
     ))
     backend = MySQLBackend()
     schema = backend.get_schema(conn)
     assert "Constraints:" in schema and "PRIMARY" in schema
     assert "Indexes:" in schema and "UNIQUE" in schema and "id" in schema
-    assert "Grants:" in schema and "Grant SELECT on orders to app_user@%" in schema
+    assert "Grants:" not in schema
     assert "Triggers:" in schema and "trg_audit" in schema
 
 
@@ -364,8 +362,8 @@ def test_get_schema_shallow_excludes_full_view_and_routine_bodies_and_phase2_sec
     assert "Live row counts:" not in schema
     assert "Column value samples:" not in schema
     assert "Likely relationships" not in schema
-    # Exactly the ten Phase 1 queries - no Phase 2 query was ever issued.
-    assert len(cursor.calls) == 10
+    # Exactly the nine Phase 1 queries - no Phase 2 query was ever issued.
+    assert len(cursor.calls) == 9
 
 
 # --- get_schema() (deep): Phase 2 additions on top of the shallow content ----
@@ -416,7 +414,7 @@ def test_get_schema_deep_is_superset_of_shallow_plus_phase2_sampling():
     # New schema-wide dataset-size line (Dataset size summary section).
     assert "Estimated dataset size: ~1.9 MB" in schema
 
-    assert len(cursor.calls) == 1 + 10 + 4
+    assert len(cursor.calls) == 1 + 9 + 4
 
 
 def test_get_schema_deep_skips_frequent_values_for_near_unique_column():
@@ -435,7 +433,7 @@ def test_get_schema_deep_skips_frequent_values_for_near_unique_column():
     assert "Column value samples:" in schema
     assert "id: range [1 .. 100]" in schema
     assert "frequent values" not in schema
-    assert len(cursor.calls) == 1 + 10 + 3
+    assert len(cursor.calls) == 1 + 9 + 3
 
 
 def test_get_schema_deep_naming_convention_relationships_section():
@@ -492,7 +490,7 @@ def test_get_schema_deep_skips_sampling_for_wide_tables_but_keeps_live_count():
     schema = backend.get_schema(conn)
     assert "Live row counts:" in schema and "wide: 7 rows (live, authoritative)" in schema
     assert "Column value samples:" not in schema
-    assert len(cursor.calls) == 1 + 10 + 1
+    assert len(cursor.calls) == 1 + 9 + 1
 
 
 def test_get_schema_deep_dataset_size_line_uses_schema_wide_totals_not_kept_names_scope():

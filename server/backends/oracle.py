@@ -854,52 +854,7 @@ class OracleBackend(Backend):
             except Exception:
                 pass
 
-            # 8. Grants (new) - ALL_TAB_PRIVS, scoped to the current
-            # schema/owner (TABLE_SCHEMA) and kept_names.
-            #
-            # Re-examining this module's own long-standing "Deliberately no
-            # Indexes/Triggers/Grants sections ... not verified against a
-            # real Oracle instance" caveat (previously right here, now
-            # updated - see below): that caveat was about never having
-            # written ANY grants query yet, not about ALL_TAB_PRIVS
-            # specifically being unsafe. ALL_TAB_PRIVS is a standard,
-            # always-present data-dictionary view (like every other ALL_*
-            # view this file already queries), it's inherently
-            # current-user-scoped by Oracle itself (it only ever shows
-            # privileges the connected user can actually see - grants made
-            # BY or TO them, or on objects they own - never another
-            # schema's private grant graph, so there's no risk of leaking
-            # more than the connected role could already see via SQL*Plus),
-            # and it's wrapped in this same try/except convention as every
-            # other optional section here - so a permissions edge case
-            # degrades to "skip this section" exactly like Constraints/
-            # Views above, never a failed schema fetch. That resolves the
-            # caveat in favor of adding a minimal grants query now, rather
-            # than leaving it deferred a second time (the plan this
-            # implements explicitly allows either choice here - this is the
-            # "add it safely" branch, not an override of the original
-            # reasoning).
-            #
-            # Indexes/Triggers remain out of scope for this pass (neither
-            # attribute is in the plan's Phase 1/Phase 2 tables this change
-            # implements) - still left for a future follow-up, unchanged
-            # from before.
-            try:
-                cursor.execute(f"""
-                    SELECT grantee, table_name, privilege
-                    FROM all_tab_privs
-                    WHERE table_schema = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')
-                      AND table_name IN ({in_fragment})
-                    ORDER BY table_name, grantee
-                """, in_params)
-                grant_rows = cursor.fetchall()
-                if grant_rows:
-                    grant_lines = [f"  Grant {priv} on {t} to {g}" for (g, t, priv) in grant_rows]
-                    schema_parts.append("Grants:\n" + "\n".join(grant_lines))
-            except Exception:
-                pass
-
-            # 9. External tables (new) - ALL_EXTERNAL_TABLES, cleanly
+            # 8. External tables (new) - ALL_EXTERNAL_TABLES, cleanly
             # introspectable, scoped to kept_names. No RLS/masking
             # equivalent is added here: Oracle's RLS (VPD, Virtual Private
             # Database) is enforced by a security policy FUNCTION attached

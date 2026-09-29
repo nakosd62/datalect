@@ -10,14 +10,14 @@ get_schema()) issues its queries unconditionally and in a fixed order
 degradation - see postgres.py itself), so responses are queued in the exact
 order it issues them:
   1. table names        2. columns            3. constraints
-  4. indexes             5. views               6. grants
-  7. triggers            8. comments (new)      9. row count estimates (new)
-  10. routines (new)     11. session settings (new)
-  12. RLS/federation flags (new)
+  4. indexes             5. views               6. triggers
+  7. comments (new)      8. row count estimates (new)
+  9. routines (new)      10. session settings (new)
+  11. RLS/federation flags (new)
 
-get_schema() (deep) then runs _build_shallow_schema_parts() (the twelve
+get_schema() (deep) then runs _build_shallow_schema_parts() (the eleven
 queries above) and appends its own Phase 2 queries on a fresh cursor use:
-  13. pg_stats n_distinct (shared, once)
+  12. pg_stats n_distinct (shared, once)
   then per kept table (in order): live COUNT(*), an optional combined
   MIN()/MAX() query (if it has numeric/date columns), and up to
   MAX_CATEGORICAL_SAMPLE_COLUMNS_PER_TABLE frequent-value GROUP BY queries
@@ -58,7 +58,7 @@ def _pad_column_row(row):
 
 
 def _schema_responses(
-    table_names, columns_rows, constraints=(), indexes=(), views=(), grants=(), triggers=(),
+    table_names, columns_rows, constraints=(), indexes=(), views=(), triggers=(),
     comments=(), row_count_estimates=(), routines=(), session_settings=("UTC", "en_US.UTF-8"),
     rls_flags=(),
 ):
@@ -68,7 +68,6 @@ def _schema_responses(
         (list(constraints), None, -1),
         (list(indexes), None, -1),
         (list(views), None, -1),
-        (list(grants), None, -1),
         (list(triggers), None, -1),
         (list(comments), None, -1),
         (list(row_count_estimates), None, -1),
@@ -362,20 +361,19 @@ def test_get_schema_reindents_a_multiline_view_definition_rather_than_leaving_it
     assert "View v: SELECT a.id,\n       a.name\n      FROM a;" in schema
 
 
-def test_get_schema_includes_constraints_indexes_grants_triggers():
+def test_get_schema_includes_constraints_indexes_triggers():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["orders"],
         columns_rows=[("orders", "id", "integer", "NO", None)],
         constraints=[("orders", "orders_pkey", "PRIMARY KEY", "id", None, None)],
         indexes=[("orders", "orders_pkey", "CREATE UNIQUE INDEX orders_pkey ON orders(id)")],
-        grants=[("app_user", "orders", "SELECT")],
         triggers=[("orders", "trg_audit", "INSERT", "EXECUTE FUNCTION audit()")],
     ))
     backend = PostgresBackend()
     schema = backend.get_schema(conn)
     assert "Constraints:" in schema and "orders_pkey" in schema
     assert "Indexes:" in schema and "CREATE UNIQUE INDEX" in schema
-    assert "Grants:" in schema and "Grant SELECT on orders to app_user" in schema
+    assert "Grants:" not in schema
     assert "Triggers:" in schema and "trg_audit" in schema
 
 
@@ -405,7 +403,7 @@ def test_get_schema_scan_query_uses_configured_scan_cap():
 def test_get_schema_shallow_every_query_is_scoped_via_current_schema_not_hardcoded_public():
     """Regression guard for the "schema" descriptor feature (see
     backends/postgres.py's connect()): every one of
-    _build_shallow_schema_parts()'s twelve catalog-only queries must follow
+    _build_shallow_schema_parts()'s eleven catalog-only queries must follow
     current_schema() - which reflects wherever connect()'s own `SET
     search_path` pointed, or plain 'public' when no override was ever set -
     rather than a literal 'public' that could never see a non-public schema
@@ -414,7 +412,7 @@ def test_get_schema_shallow_every_query_is_scoped_via_current_schema_not_hardcod
     search_path had been overridden.
 
     The one deliberate exception is the new session-settings query (query
-    #11): current_setting('TimeZone')/pg_database.datcollate describe the
+    #10): current_setting('TimeZone')/pg_database.datcollate describe the
     whole session/database, not a particular schema, so it has no
     current_schema() text to check - see postgres.py's own comment on that
     section."""
@@ -424,12 +422,11 @@ def test_get_schema_shallow_every_query_is_scoped_via_current_schema_not_hardcod
         constraints=[("orders", "orders_pkey", "PRIMARY KEY", "id", None, None)],
         indexes=[("orders", "orders_pkey", "CREATE UNIQUE INDEX orders_pkey ON orders(id)")],
         views=[("v", "SELECT 1")],
-        grants=[("app_user", "orders", "SELECT")],
         triggers=[("orders", "trg", "INSERT", "EXECUTE FUNCTION f()")],
     ))
     backend = PostgresBackend()
     backend.get_schema_shallow(conn)
-    assert len(cursor.calls) == 12
+    assert len(cursor.calls) == 11
     session_settings_calls = [c for c in cursor.calls if "current_setting" in c[0]]
     assert len(session_settings_calls) == 1
     for sql_text, _params in cursor.calls:
@@ -623,8 +620,8 @@ def test_get_schema_shallow_excludes_full_view_and_routine_bodies_and_phase2_sec
     assert "Live row counts:" not in schema
     assert "Column value samples:" not in schema
     assert "Likely relationships" not in schema
-    # Exactly the twelve Phase 1 queries - no Phase 2 query was ever issued.
-    assert len(cursor.calls) == 12
+    # Exactly the eleven Phase 1 queries - no Phase 2 query was ever issued.
+    assert len(cursor.calls) == 11
 
 
 # --- get_schema() (deep): Phase 2 additions on top of the shallow content ----
@@ -675,7 +672,7 @@ def test_get_schema_deep_is_superset_of_shallow_plus_phase2_sampling():
     # New schema-wide dataset-size line (Dataset size summary section).
     assert "Estimated dataset size: ~1.9 MB" in schema
 
-    assert len(cursor.calls) == 1 + 12 + 4
+    assert len(cursor.calls) == 1 + 11 + 4
 
 
 def test_get_schema_deep_skips_frequent_values_for_near_unique_column():
@@ -694,7 +691,7 @@ def test_get_schema_deep_skips_frequent_values_for_near_unique_column():
     assert "Column value samples:" in schema
     assert "id: range [1 .. 100]" in schema
     assert "frequent values" not in schema
-    assert len(cursor.calls) == 1 + 12 + 3
+    assert len(cursor.calls) == 1 + 11 + 3
 
 
 def test_get_schema_deep_naming_convention_relationships_section():
@@ -753,7 +750,7 @@ def test_get_schema_deep_skips_sampling_for_wide_tables_but_keeps_live_count():
     schema = backend.get_schema(conn)
     assert "Live row counts:" in schema and "wide: 7 rows (live, authoritative)" in schema
     assert "Column value samples:" not in schema
-    assert len(cursor.calls) == 1 + 12 + 2
+    assert len(cursor.calls) == 1 + 11 + 2
 
 
 def test_get_schema_deep_dataset_size_line_uses_schema_wide_totals_not_kept_names_scope():

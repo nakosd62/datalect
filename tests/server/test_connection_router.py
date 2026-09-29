@@ -27,8 +27,8 @@ import time
 import types as pytypes
 
 from helpers import (
-    login_as, parse_translate_stream, parse_translate_stream_events, set_llm_byok_key,
-    write_database_presets_file,
+    login_as, normalize_prompt_whitespace, parse_translate_stream, parse_translate_stream_events,
+    set_llm_byok_key, write_database_presets_file,
 )
 
 
@@ -179,15 +179,20 @@ class FakeApiError(Exception):
 def test_triage_prompt_requires_answer_and_message_to_lead_with_a_translated_label_line():
     from connection_router import _MULTI_CANDIDATE_TRIAGE_SYSTEM_INSTRUCTION
 
-    assert "TRANSLATED into the SAME LANGUAGE as the user's own" in _MULTI_CANDIDATE_TRIAGE_SYSTEM_INSTRUCTION
-    assert "\"answer\"" in _MULTI_CANDIDATE_TRIAGE_SYSTEM_INSTRUCTION and "\"message\"" in _MULTI_CANDIDATE_TRIAGE_SYSTEM_INSTRUCTION
+    # normalize_prompt_whitespace collapses any line break a human reflow
+    # of server/prompts/triage_multi_candidate.txt may have landed inside
+    # one of these phrases (see that helper's own docstring - this is a
+    # real, previously-hit case, not a hypothetical one).
+    instruction = normalize_prompt_whitespace(_MULTI_CANDIDATE_TRIAGE_SYSTEM_INSTRUCTION)
+    assert "TRANSLATED into the SAME LANGUAGE as the user's own" in instruction
+    assert "\"answer\"" in instruction and "\"message\"" in instruction
     # Explicitly never required of "database_prompts" - those are internal,
     # per-connection instructions the end user never sees.
-    assert "never \"database_prompts\"" in _MULTI_CANDIDATE_TRIAGE_SYSTEM_INSTRUCTION
+    assert "never \"database_prompts\"" in instruction
     # The label is explicitly called out as insufficient on its own - see
     # is_label_only_response's own docstring comment for the real failure
     # mode this guards against.
-    assert "is not a valid" in _MULTI_CANDIDATE_TRIAGE_SYSTEM_INSTRUCTION
+    assert "is not a valid" in instruction
 
 
 def test_parse_triage_response_treats_an_answer_of_just_a_label_line_as_unparseable():
@@ -922,7 +927,7 @@ def test_group_mode_triage_call_receives_conversation_history_so_a_followup_can_
     harness.queue_response(_gemini_ok(
         '{"action": "sql", "indices": [1], "message": "Checking Marketing Postgres."}'
     ))
-    harness.register_marker("campaigns", _gemini_ok("SELECT COUNT(*) FROM campaigns;"))
+    harness.register_marker("campaigns", _gemini_ok('{"sql": "SELECT COUNT(*) FROM campaigns;"}'))
     resp2 = env.client.post('/api/translate', json={
         'prompt': 'how large is this database',
         'history': [
@@ -998,7 +1003,7 @@ def test_group_mode_triage_candidate_summaries_precede_history_and_are_not_glued
     harness.queue_response(_gemini_ok(
         '{"action": "sql", "indices": [1], "message": "Checking Marketing Postgres."}'
     ))
-    harness.register_marker("campaigns", _gemini_ok("SELECT COUNT(*) FROM campaigns;"))
+    harness.register_marker("campaigns", _gemini_ok('{"sql": "SELECT COUNT(*) FROM campaigns;"}'))
     resp2 = env.client.post('/api/translate', json={
         'prompt': 'how large is this database',
         'history': [
@@ -1047,7 +1052,7 @@ def test_group_mode_phase_b_ignores_schema_tables_only_and_always_sends_the_full
     harness.queue_response(_gemini_ok(
         '{"action": "sql", "indices": [0], "message": "Checking Sales Postgres."}'
     ))
-    harness.register_marker("deals", _gemini_ok("SELECT * FROM deals;"))
+    harness.register_marker("deals", _gemini_ok('{"sql": "SELECT * FROM deals;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'how many deals do we have'})
     parse_translate_stream(resp)
@@ -1082,8 +1087,8 @@ def test_group_mode_route_outcome_runs_phase_b_in_parallel_for_both_selected_con
     ))
     # Marker-based (not FIFO) dispatch for the two Phase B calls, since
     # they genuinely race across threads - see GenaiHarness' docstring.
-    harness.register_marker("deals", _gemini_ok("SELECT * FROM deals;"))
-    harness.register_marker("campaigns", _gemini_ok("SELECT * FROM campaigns;"))
+    harness.register_marker("deals", _gemini_ok('{"sql": "SELECT * FROM deals;"}'))
+    harness.register_marker("campaigns", _gemini_ok('{"sql": "SELECT * FROM campaigns;"}'))
 
     # Deliberately avoids the words "deals"/"campaigns" in the prompt
     # itself - those words are also the harness's dispatch markers (each
@@ -1154,8 +1159,8 @@ def test_group_mode_route_outcome_falls_back_to_a_triage_labeled_message_when_th
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     harness.queue_response(_gemini_ok('{"action": "sql", "indices": [0, 1]}'))
-    harness.register_marker("deals", _gemini_ok("SELECT * FROM deals;"))
-    harness.register_marker("campaigns", _gemini_ok("SELECT * FROM campaigns;"))
+    harness.register_marker("deals", _gemini_ok('{"sql": "SELECT * FROM deals;"}'))
+    harness.register_marker("campaigns", _gemini_ok('{"sql": "SELECT * FROM campaigns;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'how is everything performing across the board'})
     _, data = parse_translate_stream(resp)
@@ -1178,8 +1183,8 @@ def test_group_mode_route_outcome_with_one_database_returning_no_sql_note(app_fa
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     harness.queue_response(_gemini_ok('{"action": "sql", "indices": [0, 1], "message": "Checking both."}'))
-    harness.register_marker("deals", _gemini_ok("SELECT * FROM deals;"))
-    harness.register_marker("campaigns", _gemini_ok("*** NO SQL *** Campaigns data doesn't cover this question."))
+    harness.register_marker("deals", _gemini_ok('{"sql": "SELECT * FROM deals;"}'))
+    harness.register_marker("campaigns", _gemini_ok('{"cannot_answer_reason": "Campaigns data doesn\'t cover this question."}'))
 
     # Avoids "deals"/"campaigns" in the prompt itself - see the comment on
     # the parallel-fanout test above for why that would break the
@@ -1219,7 +1224,7 @@ def test_group_mode_route_outcome_with_one_database_generation_failure_still_ret
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     harness.queue_response(_gemini_ok('{"action": "sql", "indices": [0, 1], "message": "Checking both."}'))
-    harness.register_marker("deals", _gemini_ok("SELECT * FROM deals;"))
+    harness.register_marker("deals", _gemini_ok('{"sql": "SELECT * FROM deals;"}'))
     # A plain RuntimeError has no .code/isn't a genai ServerError/timeout,
     # so _classify_gemini_error treats it as non-retryable - raised
     # immediately, no wasted extra queued/marked responses needed here.
@@ -1284,7 +1289,7 @@ def test_group_mode_route_outcome_all_databases_fail_or_note_returns_empty_sql_b
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     harness.queue_response(_gemini_ok('{"action": "sql", "indices": [0, 1], "message": "Checking both."}'))
-    harness.register_marker("deals", _gemini_ok("*** NO SQL *** Deals table has nothing relevant."))
+    harness.register_marker("deals", _gemini_ok('{"cannot_answer_reason": "Deals table has nothing relevant."}'))
     harness.register_marker("campaigns", RuntimeError("simulated failure"))
 
     resp = env.client.post('/api/translate', json={'prompt': 'irrelevant question'})
@@ -1383,8 +1388,8 @@ def test_group_mode_route_outcome_streams_phase_a_route_then_phase_b_connection_
     harness.queue_response(_gemini_ok(
         '{"action": "sql", "indices": [0, 1], "message": "Checking both."}'
     ))
-    harness.register_marker("deals", _gemini_ok("SELECT * FROM deals;"))
-    harness.register_marker("campaigns", _gemini_ok("*** NO SQL *** Campaigns data doesn't cover this question."))
+    harness.register_marker("deals", _gemini_ok('{"sql": "SELECT * FROM deals;"}'))
+    harness.register_marker("campaigns", _gemini_ok('{"cannot_answer_reason": "Campaigns data doesn\'t cover this question."}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'first database question, plus something else'})
     events = parse_translate_stream_events(resp)
@@ -1462,10 +1467,10 @@ def test_group_mode_route_outcome_streams_phase_b_connection_done_in_completion_
 
     def _slow_deals_response():
         time.sleep(0.3)
-        return _gemini_ok("SELECT * FROM deals;")
+        return _gemini_ok('{"sql": "SELECT * FROM deals;"}')
 
     harness.register_marker("deals", _slow_deals_response)
-    harness.register_marker("campaigns", _gemini_ok("SELECT * FROM campaigns;"))
+    harness.register_marker("campaigns", _gemini_ok('{"sql": "SELECT * FROM campaigns;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'first database question, plus something else'})
     events = parse_translate_stream_events(resp)
@@ -1679,7 +1684,7 @@ def test_group_mode_phase_b_generation_recovers_by_rotating_to_a_second_configur
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     harness.queue_response(_gemini_ok('{"action": "sql", "indices": [0], "message": "Checking Sales Postgres."}'))
     harness.queue_error(FakeApiError(429))  # Phase B's first attempt
-    harness.queue_response(_gemini_ok("SELECT * FROM deals;"))  # Phase B's rotated retry
+    harness.queue_response(_gemini_ok('{"sql": "SELECT * FROM deals;"}'))  # Phase B's rotated retry
 
     resp = env.client.post('/api/translate', json={'prompt': 'how many deals do we have'})
     _, data = parse_translate_stream(resp)
@@ -1692,6 +1697,198 @@ def test_group_mode_phase_b_generation_recovers_by_rotating_to_a_second_configur
     assert data['router_route'] is True
     assert data['generation_failures'] == []
     assert "-- database: preset:pg-a (Sales Postgres)\nSELECT * FROM deals;" in data['sql']
+
+
+# --- Phase B's own migration onto _SQL_GENERATION_FORMAT_RULES's JSON ------
+# envelope (generate_sql_for_connection used to build its system_
+# instruction from the older '*** NO SQL ***'-marker convention
+# (_COMMON_FORMAT_RULES) instead - see that function's own docstring for
+# the two reasons this was migrated onto the same JSON contract single-
+# connection mode's own Call 2 already used). Four regression guards
+# below, covering exactly the two new/changed failure modes this
+# introduces for Phase B specifically - an unparseable JSON response (new;
+# the old marker convention had no real equivalent of "unparseable", any
+# non-marker-prefixed text was just treated as SQL) and a language
+# mismatch on a "cannot_answer_reason" reply (pre-existing behavior,
+# previously untested at this exact call site despite the dedicated bug
+# fix that added it - see generate_sql_for_connection's own inline
+# comments above its retry loop).
+
+
+def test_group_mode_phase_b_generation_unparseable_response_is_retried_and_recovers(
+    app_factory, tmp_path, monkeypatch,
+):
+    """Single connection here (no ThreadPoolExecutor concurrency to race),
+    same deterministic FIFO-queue pattern as the key-rotation regression
+    test above - lets this test control exactly what Phase B's FIRST vs.
+    SECOND attempt returns, which a marker (matched on the connection's
+    own unchanging schema/prompt content, not attempt number) can't
+    distinguish on its own."""
+    presets_path = write_database_presets_file(tmp_path, [
+        {"id": "pg-a", "name": "Sales Postgres", "type": "postgres", "url": "postgresql://u:p@host-a:5432/a"},
+        {"id": "grp-a", "name": "Solo Group", "type": "dataset_group", "dataset_list": ["pg-a"]},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": presets_path, "GEMINI_PRESET_KEYS": "fake-key-1"})
+    login_as(env.client, "alice@example.com")
+    _set_group_mode(env.client, "grp-a")
+
+    import db as db_module
+    monkeypatch.setattr(db_module, "_fetch_database_schema",
+                         _schema_fetch_by_url({"postgresql://u:p@host-a:5432/a": "Table: deals\nid INTEGER\n"}))
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(_gemini_ok('{"action": "sql", "indices": [0], "message": "Checking Sales Postgres."}'))
+    harness.queue_response(_gemini_ok("not json"))  # Phase B's first attempt - unparseable
+    harness.queue_response(_gemini_ok('{"sql": "SELECT * FROM deals;"}'))  # Phase B's corrected retry
+
+    resp = env.client.post('/api/translate', json={'prompt': 'how many deals do we have'})
+    _, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    assert len(harness.generate_calls) == 3  # triage, then Phase B's 2 attempts
+    assert data['generation_failures'] == []
+    assert "-- database: preset:pg-a (Sales Postgres)\nSELECT * FROM deals;" in data['sql']
+    # The retry prompt actually sent to the model must carry the explicit
+    # correction - confirms this isn't a coincidental second attempt, but
+    # the unparseable-response retry actually firing.
+    second_prompt_text = harness.generate_calls[2]["contents"][-1].parts[0].text
+    assert "CORRECTION" in second_prompt_text and "could not be parsed" in second_prompt_text
+
+
+def test_group_mode_phase_b_generation_still_unparseable_after_retry_is_a_generation_failure(
+    app_factory, tmp_path, monkeypatch,
+):
+    """Two connections (same shape as the sibling RuntimeError-failure test
+    above) - "deals" answers normally, "campaigns" NEVER returns valid
+    JSON. register_marker's response isn't consumed on match (see
+    GenaiHarness's own docstring), so registering one unparseable reply
+    for "campaigns" naturally answers BOTH of Phase B's own attempts for
+    it the same way, exercising the exhausted-retry failure path without
+    needing FIFO ordering."""
+    env = _two_preset_env(app_factory, tmp_path)
+    login_as(env.client, "alice@example.com")
+    _set_group_mode(env.client)
+
+    import db as db_module
+    monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
+        "postgresql://u:p@host-a:5432/a": "Table: deals\nid INTEGER\n",
+        "postgresql://u:p@host-b:5432/b": "Table: campaigns\nid INTEGER\n",
+    }))
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(_gemini_ok('{"action": "sql", "indices": [0, 1], "message": "Checking both."}'))
+    harness.register_marker("deals", _gemini_ok('{"sql": "SELECT * FROM deals;"}'))
+    harness.register_marker("campaigns", _gemini_ok("not json"))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'give me a full breakdown from both'})
+    _, data = parse_translate_stream(resp)
+    assert data['success'] is True  # the OVERALL request still succeeds
+    assert data['router_route'] is True
+    assert "-- database: preset:pg-a (Sales Postgres)\nSELECT * FROM deals;" in data['sql']
+    assert "preset:pg-b" not in data['sql']
+    assert len(data['generation_failures']) == 1
+    failure = data['generation_failures'][0]
+    assert failure["kind"] == "preset" and failure["id"] == "pg-b" and failure["name"] == "Marketing Postgres"
+    assert failure["error"] == (
+        "I wasn't able to produce a usable response to your prompt, even after retrying. "
+        "Try rephrasing your question."
+    )
+    assert data['database_notes'] == []
+
+
+def test_group_mode_phase_b_generation_wrong_language_is_retried_and_corrected(
+    app_factory, tmp_path, monkeypatch,
+):
+    """Regression guard for the real user-reported gap generate_sql_for_
+    connection's own inline comments describe: a connection that couldn't
+    confidently generate SQL would occasionally explain why in the wrong
+    language. Single connection, same deterministic FIFO-queue reasoning
+    as the unparseable-response recovery test above."""
+    presets_path = write_database_presets_file(tmp_path, [
+        {"id": "pg-a", "name": "Sales Postgres", "type": "postgres", "url": "postgresql://u:p@host-a:5432/a"},
+        {"id": "grp-a", "name": "Solo Group", "type": "dataset_group", "dataset_list": ["pg-a"]},
+    ])
+    env = app_factory(env={"DATABASE_PRESETS_FILE": presets_path, "GEMINI_PRESET_KEYS": "fake-key-1"})
+    login_as(env.client, "alice@example.com")
+    _set_group_mode(env.client, "grp-a")
+
+    import db as db_module
+    monkeypatch.setattr(db_module, "_fetch_database_schema",
+                         _schema_fetch_by_url({"postgresql://u:p@host-a:5432/a": "Table: deals\nid INTEGER\n"}))
+
+    _fake_detect = lambda text: "de" if "Datenbank" in text else ("en" if text else None)
+    _fake_describe = lambda code: {"de": "German", "en": "English"}.get(code, code)
+    monkeypatch.setattr(env.translate_routes, "_detect_language", _fake_detect)
+    monkeypatch.setattr(env.translate_routes, "_describe_language", _fake_describe)
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(_gemini_ok('{"action": "sql", "indices": [0], "message": "Checking Sales Postgres."}'))
+    harness.queue_response(_gemini_ok(
+        '{"cannot_answer_reason": "Diese Frage bezieht sich nicht auf eine echte Datenbank."}'
+    ))
+    harness.queue_response(_gemini_ok(
+        '{"cannot_answer_reason": "This question is not actually about a real database."}'
+    ))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'how many deals do we have'})
+    _, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    assert len(harness.generate_calls) == 3  # triage, then Phase B's 2 attempts
+    assert data['generation_failures'] == []
+    assert data['database_notes'] == [{
+        "kind": "preset", "id": "pg-a", "name": "Sales Postgres",
+        "text": "This question is not actually about a real database.",
+    }]
+    second_prompt_text = harness.generate_calls[2]["contents"][-1].parts[0].text
+    assert "CORRECTION" in second_prompt_text and "German" in second_prompt_text
+
+
+def test_group_mode_phase_b_generation_still_wrong_language_after_retry_is_a_generation_failure(
+    app_factory, tmp_path, monkeypatch,
+):
+    """Same two-connection shape as the sibling still-unparseable test
+    above - "deals" answers normally, "campaigns" persistently explains
+    itself in the wrong language (register_marker's response isn't
+    consumed on match, so the same wrong-language reply naturally answers
+    both of Phase B's own attempts for it)."""
+    env = _two_preset_env(app_factory, tmp_path)
+    login_as(env.client, "alice@example.com")
+    _set_group_mode(env.client)
+
+    import db as db_module
+    monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
+        "postgresql://u:p@host-a:5432/a": "Table: deals\nid INTEGER\n",
+        "postgresql://u:p@host-b:5432/b": "Table: campaigns\nid INTEGER\n",
+    }))
+
+    _fake_detect = lambda text: "de" if "Kampagnen" in text else ("en" if text else None)
+    _fake_describe = lambda code: {"de": "German", "en": "English"}.get(code, code)
+    monkeypatch.setattr(env.translate_routes, "_detect_language", _fake_detect)
+    monkeypatch.setattr(env.translate_routes, "_describe_language", _fake_describe)
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(_gemini_ok('{"action": "sql", "indices": [0, 1], "message": "Checking both."}'))
+    harness.register_marker("deals", _gemini_ok('{"sql": "SELECT * FROM deals;"}'))
+    harness.register_marker("campaigns", _gemini_ok(
+        '{"cannot_answer_reason": "Die Kampagnen-Tabelle enthält hier nichts Relevantes."}'
+    ))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'give me a full breakdown from both'})
+    _, data = parse_translate_stream(resp)
+    assert data['success'] is True  # the OVERALL request still succeeds
+    assert data['router_route'] is True
+    assert "-- database: preset:pg-a (Sales Postgres)\nSELECT * FROM deals;" in data['sql']
+    assert "preset:pg-b" not in data['sql']
+    assert len(data['generation_failures']) == 1
+    failure = data['generation_failures'][0]
+    assert failure["kind"] == "preset" and failure["id"] == "pg-b" and failure["name"] == "Marketing Postgres"
+    assert failure["error"] == (
+        "The response kept coming back in German instead of English, even after retrying."
+    )
+    assert data['database_notes'] == []
 
 
 def test_group_mode_route_outcome_uses_byok_key_for_both_triage_and_phase_b(app_factory, tmp_path, monkeypatch):
@@ -1717,7 +1914,7 @@ def test_group_mode_route_outcome_uses_byok_key_for_both_triage_and_phase_b(app_
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     harness.queue_response(_gemini_ok('{"action": "sql", "indices": [0], "message": "Checking Sales Postgres."}'))
-    harness.queue_response(_gemini_ok("SELECT * FROM deals;"))
+    harness.queue_response(_gemini_ok('{"sql": "SELECT * FROM deals;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'how many deals do we have'})
     _, data = parse_translate_stream(resp)
@@ -1749,7 +1946,7 @@ def test_group_mode_with_only_one_configured_connection_still_runs_triage_and_ca
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     harness.queue_response(_gemini_ok('{"action": "sql", "indices": [0], "message": "Checking Sales Postgres."}'))
-    harness.register_marker("deals", _gemini_ok("SELECT * FROM deals;"))
+    harness.register_marker("deals", _gemini_ok('{"sql": "SELECT * FROM deals;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'how many deals do we have'})
     _, data = parse_translate_stream(resp)
@@ -1810,7 +2007,7 @@ def test_group_mode_dynamically_reflects_a_dataset_list_update(app_factory, tmp_
     next(g for g in env.config_routes.CONFIGURED_DB_GROUPS if g["id"] == "grp-a")["dataset_list"].append("pg-c")
 
     harness.queue_response(_gemini_ok('{"action": "sql", "indices": [1], "message": "Checking Ops Postgres."}'))
-    harness.register_marker("campaigns", _gemini_ok("SELECT * FROM campaigns;"))
+    harness.register_marker("campaigns", _gemini_ok('{"sql": "SELECT * FROM campaigns;"}'))
     resp3 = env.client.post('/api/translate', json={'prompt': 'ops figures please'})
     _, data3 = parse_translate_stream(resp3)
     assert data3['success'] is True
@@ -1859,7 +2056,7 @@ def test_group_mode_never_includes_a_newly_saved_custom_connection(app_factory, 
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     harness.queue_response(_gemini_ok('{"action": "sql", "indices": [0], "message": "Checking Sales Postgres."}'))
-    harness.register_marker("deals", _gemini_ok("SELECT * FROM deals;"))
+    harness.register_marker("deals", _gemini_ok('{"sql": "SELECT * FROM deals;"}'))
 
     resp3 = env.client.post('/api/translate', json={'prompt': 'sales figures please'})
     _, data3 = parse_translate_stream(resp3)
@@ -1907,7 +2104,7 @@ def test_group_mode_excludes_a_configured_preset_not_listed_in_the_groups_datase
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     harness.queue_response(_gemini_ok('{"action": "sql", "indices": [0], "message": "Checking Sales Postgres."}'))
-    harness.register_marker("deals", _gemini_ok("SELECT * FROM deals;"))
+    harness.register_marker("deals", _gemini_ok('{"sql": "SELECT * FROM deals;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'sales figures please'})
     _, data = parse_translate_stream(resp)
@@ -1934,7 +2131,7 @@ def test_group_mode_triage_never_fetches_live_and_only_uses_already_cached_deep_
     # build_router_candidate_summaries() (db.py) must NEVER connect to or
     # query a real database - it reads ONLY whatever deep schema entry is
     # already sitting in schema_cache for each in-scope connection, in
-    # memory, and degrades to an empty table-names list for a connection
+    # memory, and degrades to an empty schema_text for a connection
     # with nothing cached yet (as both start out here - a fresh
     # app_factory instance has a genuinely empty schema_cache, same as a
     # real restart) rather than ever falling back to a live fetch. This
@@ -1974,7 +2171,7 @@ def test_group_mode_triage_never_fetches_live_and_only_uses_already_cached_deep_
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     harness.queue_response(_gemini_ok('{"action": "sql", "indices": [0], "message": "Routing question."}'))
-    harness.register_marker("deals", _gemini_ok("SELECT * FROM deals;"))
+    harness.register_marker("deals", _gemini_ok('{"sql": "SELECT * FROM deals;"}'))
 
     # Deliberately avoids the words "deals"/"campaigns" in the user's own
     # prompt text, so the later assertion that neither table name reached
@@ -1991,8 +2188,8 @@ def test_group_mode_triage_never_fetches_live_and_only_uses_already_cached_deep_
     assert fetched_urls == ["postgresql://u:p@host-a:5432/a"]
 
     # And triage's own prompt reflects that: with nothing cached at triage
-    # time, neither candidate's real table names could have reached it -
-    # both degraded to an empty table list for that one pass.
+    # time, neither candidate's real schema could have reached it -
+    # both degraded to an empty schema_text for that one pass.
     triage_prompt_text = str(harness.generate_calls[0]["contents"])
     assert "deals" not in triage_prompt_text
     assert "campaigns" not in triage_prompt_text
@@ -2021,7 +2218,7 @@ def test_group_mode_route_phase_b_ignores_the_shared_history_and_uses_full_schem
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     harness.queue_response(_gemini_ok('{"action": "sql", "indices": [0], "message": "Checking Sales Postgres."}'))
-    harness.register_marker("deals", _gemini_ok("SELECT * FROM deals;"))
+    harness.register_marker("deals", _gemini_ok('{"sql": "SELECT * FROM deals;"}'))
 
     resp = env.client.post('/api/translate', json={
         'prompt': 'how many deals',
@@ -2063,7 +2260,7 @@ def test_group_mode_route_phase_b_uses_that_connections_own_history_from_connect
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     harness.queue_response(_gemini_ok('{"action": "sql", "indices": [0], "message": "Checking Sales Postgres."}'))
-    harness.register_marker("deals", _gemini_ok("SELECT * FROM deals;"))
+    harness.register_marker("deals", _gemini_ok('{"sql": "SELECT * FROM deals;"}'))
 
     resp = env.client.post('/api/translate', json={
         'prompt': 'how many deals this month',
@@ -2108,8 +2305,8 @@ def test_group_mode_route_phase_b_each_connection_gets_only_its_own_connection_h
     # and campaigns" prompt text, which itself contains both "deals" and
     # "campaigns" and would make a prompt-substring marker match either
     # call ambiguously.
-    harness.register_marker("Table: deals", _gemini_ok("SELECT * FROM deals;"))
-    harness.register_marker("Table: campaigns", _gemini_ok("SELECT * FROM campaigns;"))
+    harness.register_marker("Table: deals", _gemini_ok('{"sql": "SELECT * FROM deals;"}'))
+    harness.register_marker("Table: campaigns", _gemini_ok('{"sql": "SELECT * FROM campaigns;"}'))
 
     resp = env.client.post('/api/translate', json={
         'prompt': 'deals and campaigns',
@@ -2167,7 +2364,7 @@ def test_group_mode_route_phase_b_falls_back_to_empty_history_when_connection_hi
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     harness.queue_response(_gemini_ok('{"action": "sql", "indices": [0], "message": "Checking Sales Postgres."}'))
-    harness.register_marker("deals", _gemini_ok("SELECT * FROM deals;"))
+    harness.register_marker("deals", _gemini_ok('{"sql": "SELECT * FROM deals;"}'))
 
     resp = env.client.post('/api/translate', json={
         'prompt': 'how many deals',
@@ -2200,7 +2397,7 @@ def test_group_mode_route_phase_b_connection_history_is_capped_to_history_max_tu
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     harness.queue_response(_gemini_ok('{"action": "sql", "indices": [0], "message": "Checking Sales Postgres."}'))
-    harness.register_marker("deals", _gemini_ok("SELECT * FROM deals;"))
+    harness.register_marker("deals", _gemini_ok('{"sql": "SELECT * FROM deals;"}'))
 
     history = []
     for i in range(3):  # 3 turns offered, cap is 2 - the oldest must be dropped entirely
@@ -2249,8 +2446,8 @@ def test_group_mode_route_phase_b_uses_triages_per_connection_rewrite_not_the_or
         '"0": "Give me data from one table in this database.", '
         '"1": "Give me data from a different table in this database."}}'
     ))
-    harness.register_marker("deals", _gemini_ok("SELECT * FROM deals;"))
-    harness.register_marker("campaigns", _gemini_ok("SELECT * FROM campaigns;"))
+    harness.register_marker("deals", _gemini_ok('{"sql": "SELECT * FROM deals;"}'))
+    harness.register_marker("campaigns", _gemini_ok('{"sql": "SELECT * FROM campaigns;"}'))
 
     resp = env.client.post('/api/translate', json={
         'prompt': 'give me data from 2 tables each from a different database',
@@ -2303,8 +2500,8 @@ def test_group_mode_route_phase_b_falls_back_to_the_original_prompt_when_triage_
     harness.queue_response(_gemini_ok(
         '{"action": "sql", "indices": [0, 1], "message": "Checking both."}'
     ))
-    harness.register_marker("deals", _gemini_ok("SELECT * FROM deals;"))
-    harness.register_marker("campaigns", _gemini_ok("SELECT * FROM campaigns;"))
+    harness.register_marker("deals", _gemini_ok('{"sql": "SELECT * FROM deals;"}'))
+    harness.register_marker("campaigns", _gemini_ok('{"sql": "SELECT * FROM campaigns;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'the original question, verbatim'})
     _, data = parse_translate_stream(resp)
@@ -2337,8 +2534,8 @@ def test_group_mode_route_phase_b_calls_run_concurrently_not_serially(app_factor
             return _gemini_ok(text)
         return _make
 
-    harness.register_marker("deals", _slow("SELECT * FROM deals;"))
-    harness.register_marker("campaigns", _slow("SELECT * FROM campaigns;"))
+    harness.register_marker("deals", _slow('{"sql": "SELECT * FROM deals;"}'))
+    harness.register_marker("campaigns", _slow('{"sql": "SELECT * FROM campaigns;"}'))
 
     start = time.perf_counter()
     resp = env.client.post('/api/translate', json={'prompt': 'give me a full breakdown from both'})
@@ -2440,8 +2637,8 @@ def test_group_mode_route_outcome_logs_one_row_per_phase_b_connection_and_never_
     harness.queue_response(_gemini_ok(
         '{"action": "sql", "indices": [0, 1], "message": "Checking Sales Postgres and Marketing Postgres."}'
     ))
-    harness.register_marker("deals", _gemini_ok("SELECT * FROM deals;"))
-    harness.register_marker("campaigns", _gemini_ok("SELECT * FROM campaigns;"))
+    harness.register_marker("deals", _gemini_ok('{"sql": "SELECT * FROM deals;"}'))
+    harness.register_marker("campaigns", _gemini_ok('{"sql": "SELECT * FROM campaigns;"}'))
 
     resp = env.client.post('/api/translate', json={'prompt': 'how is everything performing across the board'})
     _, data = parse_translate_stream(resp)
@@ -2710,6 +2907,7 @@ def test_summarize_all_mode_results_includes_schema_for_each_in_scope_database(a
         "per_database": {0: "Sales is up 10%.", 1: "Marketing had no data."},
         "cross_database": None,
         "visualizations": {},
+        "suggested_searches": [],
     }
     schema_block = provider.calls[0]["llm_input"]["schema_block"]
     assert "Sales Postgres:\nTable: deals" in schema_block
@@ -2783,6 +2981,7 @@ def test_summarize_all_mode_results_returns_stripped_text_and_usage_on_success(a
         "per_database": {0: "Sales is up 10%, Marketing had no data."},
         "cross_database": None,
         "visualizations": {},
+        "suggested_searches": [],
     }
     assert usage == {}
     assert error is None
@@ -2838,7 +3037,7 @@ def test_summarize_all_mode_results_retries_a_retryable_error_and_succeeds_on_a_
     ))
     assert parsed == {
         "label": "Results Summary", "per_database": {0: "Sales is up 10%."}, "cross_database": None,
-        "visualizations": {},
+        "visualizations": {}, "suggested_searches": [],
     }
     assert error is None
     assert len(provider.calls) == 2
@@ -2875,7 +3074,7 @@ def test_summarize_all_mode_results_yields_a_retrying_line_for_key_rotation(app_
     parsed, usage, error = _drain(gen)
     assert parsed == {
         "label": "Results Summary", "per_database": {0: "Sales is up 10%."}, "cross_database": None,
-        "visualizations": {},
+        "visualizations": {}, "suggested_searches": [],
     }
     assert error is None
 
@@ -2907,7 +3106,7 @@ def test_summarize_all_mode_results_yields_a_retrying_line_for_a_transient_error
     parsed, usage, error = _drain(gen)
     assert parsed == {
         "label": "Results Summary", "per_database": {0: "Sales is up 10%."}, "cross_database": None,
-        "visualizations": {},
+        "visualizations": {}, "suggested_searches": [],
     }
     assert sleep_calls == [2.5]
 
@@ -2984,7 +3183,7 @@ def test_summarize_all_mode_results_retries_an_invalid_or_incomplete_json_respon
         ))
         assert parsed == {
         "label": "Results Summary", "per_database": {0: "Sales is up 10%."}, "cross_database": None,
-        "visualizations": {},
+        "visualizations": {}, "suggested_searches": [],
     }
         assert error is None
         assert len(provider.calls) == 2
@@ -2999,7 +3198,7 @@ def test_summarize_all_mode_results_retries_an_invalid_or_incomplete_json_respon
     ))
     assert parsed == {
         "label": "Results Summary", "per_database": {0: "fenced, but otherwise valid"}, "cross_database": None,
-        "visualizations": {},
+        "visualizations": {}, "suggested_searches": [],
     }
     assert len(provider.calls) == 1
 
@@ -3045,7 +3244,7 @@ def test_summarize_all_mode_results_wrong_language_is_retried_and_corrected(app_
     ))
     assert parsed == {
         "label": "Results Summary", "per_database": {0: "Sales are up 10%."}, "cross_database": None,
-        "visualizations": {},
+        "visualizations": {}, "suggested_searches": [],
     }
     assert error is None
     assert len(provider.calls) == 2
@@ -3441,7 +3640,7 @@ def test_group_mode_route_outcome_tolerates_a_real_usage_field_reported_as_none_
     harness = GenaiHarness()
     monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
     harness.queue_response(_gemini_ok('{"action": "sql", "indices": [0], "message": "Checking Sales Postgres."}'))
-    harness.register_marker("deals", _gemini_ok("SELECT * FROM deals;", thinking_tokens=None, cached_tokens=None))
+    harness.register_marker("deals", _gemini_ok('{"sql": "SELECT * FROM deals;"}', thinking_tokens=None, cached_tokens=None))
 
     resp = env.client.post('/api/translate', json={'prompt': 'show me some data from that database'})
     _, data = parse_translate_stream(resp)

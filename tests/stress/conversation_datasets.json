@@ -1,13 +1,16 @@
 [
-  {"name": "E-Comm Store (Postgres)", "preset_id": "postgres-ec-store"},
+  {"name": "E-Commerce Store 1 (Postgres)", "preset_id": "postgres-ec-store"},
   {"name": "Movie Rentals (Postgres)", "preset_id": "postgres-movie-rentals"},
-  {"name": "Golf Stats (Postgres)", "preset_id": "postgres-golf-stats"},
+  {"name": "World Stats (Postgres)", "preset_id": "postgres-world-stats"},
+  {"name": "Olympic Games (Postgres)", "preset_id": "postgres-olympics"},
+  {"name": "E-Commerce Store 2 (Postgres)", "preset_id": "postgres-thelook"},
+  {"name": "Baseball (Postgres)", "preset_id": "postgres-baseball"},
   {"name": "Employees (mySQL)", "preset_id": "mysql-employees"},
-  {"name": "HR Database (Oracle)", "preset_id": "oracle-hr-database"},
-  {"name": "Baseball (BigQuery)", "preset_id": "bigquery-baseball"},
-  {"name": "E-Commerce (Snowflake)", "preset_id": "snowflake-e-commerce"},
+  {"name": "Electronics Store (Oracle)", "preset_id": "oracle-sales-history"},
+  {"name": "AdventureWorks (MSSQL)", "preset_id": "mssql-saleslt"},
+  {"name": "Google Trends (BigQuery)", "preset_id": "bigquery-google-trends"},
   {"name": "NYC Taxi Rides (Databricks)", "preset_id": "databricks-nyctaxi"},
-  {"name": "TICKIT (Redshift)", "preset_id": "redshift-tickit"},
+  {"name": "Event Tickets (Redshift)", "preset_id": "redshift-tickit"},
   {"name": "US Sensus (Google Sheets)", "preset_id": "sheets-us-sensus"},
   {"name": "MFlix (MongoDB)", "preset_id": "mongodb-mflix"}
 ]

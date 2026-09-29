@@ -17,16 +17,14 @@ best-effort (try/except) for every other section, in this fixed order:
      (new, best-effort)   6. external tables (new, best-effort)
   7. procedures (new, best-effort)   8. functions (new, best-effort)
   9. session facts: CURRENT_TIMEZONE() (new, best-effort)
-  10. grants: CURRENT_ROLE() then SHOW GRANTS TO ROLE (new, best-effort - one
-      or two queries depending on whether a role came back)
-  11. row-level security / masking existence: SHOW ROW ACCESS POLICIES then
+  10. row-level security / masking existence: SHOW ROW ACCESS POLICIES then
       SHOW MASKING POLICIES (new, best-effort, independently try/excepted)
 No Indexes/Triggers queries at all (Snowflake has no user-managed indexes or
 triggers - see that module's docstring); the old comment-only "automatic
 micro-partition pruning/clustering instead" placeholder is now backed by a
 real query (section 5's clustering_key column).
 
-get_schema() (deep) then runs _build_shallow_schema_parts() (the eleven
+get_schema() (deep) then runs _build_shallow_schema_parts() (the ten
 query groups above) and appends its own Phase 2 queries on the same cursor,
 per kept table (in order): one combined COUNT(*) + APPROX_COUNT_DISTINCT(...)
 query (or a plain COUNT(*) alone for a too-wide table or one with no
@@ -69,7 +67,7 @@ def _sf(monkeypatch):
 def _schema_responses(
     table_names, columns_rows, constraints=(), views=(),
     table_metadata=(), external_tables=(), procedures=(), functions=(),
-    session_timezone="UTC", current_role="ANALYST_ROLE", grants=(),
+    session_timezone="UTC",
     row_access_policies=(), masking_policies=(),
 ):
     responses = [
@@ -83,11 +81,6 @@ def _schema_responses(
         (list(functions), None, -1),
         ([(session_timezone,)] if session_timezone is not None else [], None, -1),
     ]
-    if current_role is not None:
-        responses.append(([(current_role,)], None, -1))
-        responses.append((list(grants), None, -1))
-    else:
-        responses.append(([], None, -1))  # CURRENT_ROLE() returns no row
     responses.append((list(row_access_policies), None, -1))
     responses.append((list(masking_policies), None, -1))
     return responses
@@ -534,52 +527,6 @@ def test_get_schema_shallow_session_timezone_renders():
     assert "collation" not in schema.lower()
 
 
-def test_get_schema_shallow_grants_render_one_line_per_table_combining_privileges():
-    conn, cursor = make_fake_pg_connection(_schema_responses(
-        table_names=["ORDERS"],
-        columns_rows=[("ORDERS", "ID", "NUMBER", "NO")],
-        current_role="ANALYST_ROLE",
-        grants=[
-            (None, "SELECT", "TABLE", "MYDB.PUBLIC.ORDERS", None, None, None, None),
-            (None, "INSERT", "TABLE", "MYDB.PUBLIC.ORDERS", None, None, None, None),
-        ],
-    ))
-    backend = SnowflakeBackend()
-    schema = backend.get_schema_shallow(conn)
-    assert "Grants (current role):" in schema
-    assert "ORDERS: INSERT, SELECT (role ANALYST_ROLE)" in schema
-
-
-def test_get_schema_shallow_grants_filters_out_objects_not_in_kept_names():
-    conn, cursor = make_fake_pg_connection(_schema_responses(
-        table_names=["ORDERS"],
-        columns_rows=[("ORDERS", "ID", "NUMBER", "NO")],
-        current_role="ANALYST_ROLE",
-        grants=[
-            (None, "SELECT", "TABLE", "MYDB.PUBLIC.SOME_OTHER_TABLE", None, None, None, None),
-            (None, "USAGE", "SCHEMA", "MYDB.PUBLIC", None, None, None, None),
-        ],
-    ))
-    backend = SnowflakeBackend()
-    schema = backend.get_schema_shallow(conn)
-    assert "Grants (current role):" not in schema
-
-
-def test_get_schema_shallow_grants_section_absent_when_no_current_role():
-    conn, cursor = make_fake_pg_connection(_schema_responses(
-        table_names=["ORDERS"],
-        columns_rows=[("ORDERS", "ID", "NUMBER", "NO")],
-        current_role=None,
-    ))
-    backend = SnowflakeBackend()
-    schema = backend.get_schema_shallow(conn)
-    assert "Grants" not in schema
-    # SHOW GRANTS TO ROLE must never even have been issued - only
-    # CURRENT_ROLE() itself (which came back empty) - one fewer query than
-    # the default-role case.
-    assert len(cursor.calls) == 12
-
-
 def test_get_schema_shallow_rls_and_masking_flags_render_when_present():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["ORDERS"],
@@ -627,9 +574,8 @@ def test_get_schema_shallow_excludes_full_view_and_routine_bodies_and_phase2_sec
     assert "Live row counts:" not in schema
     assert "Column value samples:" not in schema
     assert "Likely relationships" not in schema
-    # Exactly the thirteen Phase 1 queries (default current_role present) -
-    # no Phase 2 query was ever issued.
-    assert len(cursor.calls) == 13
+    # Exactly the eleven Phase 1 queries - no Phase 2 query was ever issued.
+    assert len(cursor.calls) == 11
 
 
 # --- get_schema() (deep): Phase 2 additions on top of the shallow content ----
@@ -681,7 +627,7 @@ def test_get_schema_deep_is_superset_of_shallow_plus_phase2_sampling():
     # the same numbers _base_deep_responses() queues for the new query.
     assert "Estimated dataset size: ~1.9 MB" in schema
 
-    assert len(cursor.calls) == 13 + 1 + 3
+    assert len(cursor.calls) == 11 + 1 + 3
 
 
 def test_get_schema_deep_skips_frequent_values_for_near_unique_column():
@@ -700,7 +646,7 @@ def test_get_schema_deep_skips_frequent_values_for_near_unique_column():
     assert "Column value samples:" in schema
     assert "ID: range [1 .. 100]" in schema
     assert "frequent values" not in schema
-    assert len(cursor.calls) == 13 + 1 + 2
+    assert len(cursor.calls) == 11 + 1 + 2
 
 
 def test_get_schema_deep_naming_convention_relationships_section():
@@ -756,7 +702,7 @@ def test_get_schema_deep_skips_sampling_for_wide_tables_but_keeps_live_count():
     schema = backend.get_schema(conn)
     assert "Live row counts:" in schema and "WIDE: 7 rows (live, authoritative)" in schema
     assert "Column value samples:" not in schema
-    assert len(cursor.calls) == 13 + 1 + 1
+    assert len(cursor.calls) == 11 + 1 + 1
 
 
 def test_get_schema_deep_dataset_size_query_is_schema_wide_not_scoped_to_kept_names():

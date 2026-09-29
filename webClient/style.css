@@ -1637,6 +1637,13 @@ textarea:focus {
   min-width: 0;
   position: relative;
   cursor: row-resize;
+  /* Without this, a touchstart on the resizer is free to be interpreted as
+     a page scroll/pan gesture before the pointerdown handler in client.js
+     ever gets a pointermove to work with - the drag never starts on a
+     touch device (verified live: this resizer was completely unusable on
+     a phone until this was added). Mouse/pen drags don't need it, but it's
+     harmless for them. */
+  touch-action: none;
 }
 
 .editor-panes-resizer::after {
@@ -1757,6 +1764,9 @@ textarea:focus {
   min-width: 0;
   position: relative;
   cursor: row-resize;
+  /* See .editor-panes-resizer's own comment above - same touch-drag fix,
+     same reason. */
+  touch-action: none;
 }
 
 .results-panes-resizer::after {
@@ -3187,6 +3197,51 @@ textarea.report-issue-preview:focus {
   margin-top: 0.75rem;
 }
 
+/* client.js's suggestedSearchesHtml() - "suggested_searches" (see
+   server/prompts/summary_single_connection.txt's and summary_all_
+   databases.txt's own paragraph on it) rendered as a small row of plain
+   text links directly under the Summary tab's own text, ABOVE the "Was
+   this summary helpful?" feedback row (see .summary-feedback-row just
+   above - same flex/gap approach, its own row rather than merged into
+   that one, since this can wrap onto more than one line when there's
+   more than one suggested search, unlike the feedback icons). Each link
+   opens a plain Google search in a new tab - never a live search run by
+   this app itself (see suggestedSearchesHtml()'s own docstring) - styled
+   as a small pill (bordered, rounded) rather than plain inline underlined
+   text like .summary-chart-inline-link, so it doesn't read as though it
+   were part of the model's own prose the way a chart link deliberately
+   does - this is an added, clearly-separate suggestion, not a claim the
+   summary itself is making. */
+.summary-suggested-searches {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  margin-top: 0.75rem;
+}
+
+.summary-suggested-searches-label {
+  font-size: 0.75rem;
+}
+
+.summary-suggested-search-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.2rem 0.6rem;
+  border: 1px solid var(--bg-card-border);
+  border-radius: 999px;
+  font-size: 0.75rem;
+  color: var(--link-color);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.summary-suggested-search-link:hover {
+  color: var(--link-color-hover);
+  border-color: var(--link-color-hover);
+}
+
 .summary-feedback-label {
   font-size: 0.75rem;
 }
@@ -3229,25 +3284,26 @@ textarea.report-issue-preview:focus {
   background-color: rgba(var(--danger-rgb), 0.12);
 }
 
-/* Two different call sites share this class, both rendering a click-to-
-   jump-to-a-chart trigger as plain inline text rather than a standalone UI
-   control - deliberately unstyled as a "button" (no border/background/
-   pill), just clickable text matching how a real link would sit inline:
-     - client.js's applyInlineChartLinks() - the NORMAL case: converts the
-       summarization prompts' own model-planted "[<phrase>](chart:<index>)"
-       markup, found IN THE MIDDLE of "summary"/"per_database"/
-       "cross_database" wherever the model made the point that chart
-       illustrates, into exactly this. This is the actual text-to-chart
-       integration the "visualizations" paragraph's whole design is built
-       around (see chart_helpers.py's _clean_visualization docstring).
-     - client.js's summaryChartInlineLinkHtml() - a FALLBACK, appended
-       straight onto the tail end of the summary text itself (inside the
-       same <p>, not a separate element below it) only for the rare case
-       Chart.js itself failed to load, so there's still some way to reach
-       the chart tab even with no live preview to click.
-   Both are handled by the same delegated data-view-chart-trigger click
-   listener (jumpToChartableResultTab()) regardless of which one produced
-   a given instance. */
+/* client.js's applyInlineChartLinks() renders the summarization prompts'
+   own model-planted "[<phrase>](chart:<index>)" markup, found IN THE
+   MIDDLE of "summary"/"per_database"/"cross_database" wherever the model
+   made the point that chart illustrates, as one of these - a click-to-
+   jump-to-a-chart trigger styled as plain inline text rather than a
+   standalone UI control (deliberately unstyled as a "button" - no border/
+   background/pill - just clickable text matching how a real link would
+   sit inline). This is the actual text-to-chart integration the
+   "visualizations" paragraph's whole design is built around (see
+   chart_helpers.py's _clean_visualization docstring). Handled by the
+   delegated data-view-chart-trigger click listener
+   (jumpToChartableResultTab()) in client.js.
+   The Summary tab used to ALSO show a row of small preview-chart cards
+   underneath the text (one per chartable entry) - removed per explicit
+   request (they rendered poorly at that size, and were redundant with
+   this same inline link: a result only ever gets a `visualization` at all
+   because the model already linked it inline here - see
+   _clean_visualization's own docstring). Their CSS (.summary-chart-
+   inline-preview*, .summary-chart-preview-grid, .summary-text-chart-row)
+   was removed along with them. */
 .summary-chart-inline-link {
   display: inline;
   padding: 0;
@@ -3271,123 +3327,6 @@ textarea.report-issue-preview:focus {
 
 .summary-chart-inline-link:hover {
   color: var(--link-color-hover);
-}
-
-/* One card in the Summary tab's own chart-preview grid (see client.js's
-   renderSummaryInlineChart()/jumpToChartableResultTab()) - sits inside
-   .summary-chart-preview-grid just below (see that rule's own comment)
-   at roughly half the grid's width, so two cards sit side by side on a
-   normal-width pane and wrap to one per row on a narrower one (this
-   feature's first cut ran a single preview full-width underneath the
-   text; a later nit shrank it to a small fixed-width thumbnail; this
-   proportional width is what lets several cards share one row instead of
-   assuming there's ever only one). Reset to a plain, borderless block
-   first since the underlying element is a <button> (needed for the same
-   click-to-navigate/keyboard-focus behavior as every other
-   data-view-chart-trigger control in this file), then given a subtle
-   hover affordance so it still reads as clickable even though it looks
-   like a small chart rather than a link or pill. */
-.summary-chart-inline-preview {
-  display: block;
-  /* Base/fallback size: half of the original 50% per explicit follow-up
-     request (quarter area, since .summary-chart-inline-preview-canvas-box's
-     aspect-ratio is resolved from THIS element's own width - see that
-     rule's own comment below). This 25% is what applies whenever 4 or
-     fewer cards are on screen at once (4 * 25% = 100%, still exactly one
-     row). renderSummaryInlineChart() in client.js overrides flex-basis
-     inline, per card, whenever there are MORE than 4 - per its own
-     explicit "always side by side, never wrap" follow-up - shrinking every
-     card just enough that all of them still share the one row instead of
-     wrapping to a second. min-width is deliberately NOT set here (a fixed
-     floor would fight that same "always fit them all" goal once there are
-     enough cards that even a small floor stops them all fitting) -
-     .summary-chart-preview-grid's own `flex-wrap: nowrap` below is what
-     actually enforces the single row; this rule only supplies the normal-
-     count default size. */
-  flex: 0 0 25%;
-  padding: 0.4rem;
-  border: 1px solid var(--bg-card-border);
-  border-radius: 8px;
-  background: none;
-  cursor: pointer;
-  box-sizing: border-box;
-  transition: border-color 0.15s ease, background-color 0.15s ease;
-}
-
-.summary-chart-inline-preview:hover {
-  border-color: var(--secondary);
-  background-color: rgba(var(--secondary-rgb), 0.06);
-}
-
-/* The actual explicit-height positioned ancestor Chart.js sizes its canvas
-   against (see .results-chart-wrapper's own comment above, and
-   renderSummaryInlineChart()'s own comment in client.js for why this has
-   to be a SEPARATE box from the canvas rather than the aspect-ratio living
-   on the canvas itself, as this used to be set up - that version fed a
-   runaway resize loop that made the preview grow taller forever). The
-   aspect-ratio here is resolved purely from this box's WIDTH, never from
-   the canvas's own rendered size, so nothing Chart.js's resize logic does
-   to the canvas can ever change this box's height back. Still scales
-   proportionally with the card's own ~50%-of-grid width exactly as before. */
-.summary-chart-inline-preview-canvas-box {
-  position: relative;
-  width: 100%;
-  aspect-ratio: 2 / 1;
-}
-
-.summary-chart-inline-preview-canvas {
-  display: block;
-  position: absolute;
-  inset: 0;
-  width: 100% !important;
-  height: 100% !important;
-}
-
-/* Names which result a given preview card belongs to (see client.js's
-   chartPreviewCaption()) - only ever rendered at all when there's more
-   than one card in the grid at once, since a single card is already
-   unambiguous without one. Sits below the canvas, small and muted so it
-   reads as a caption rather than competing with the chart itself for
-   attention. */
-.summary-chart-inline-preview-caption {
-  display: block;
-  margin-top: 0.3rem;
-  font-size: 0.75rem;
-  color: var(--text-secondary);
-  text-align: center;
-}
-
-/* The grid of chart-preview cards themselves (see client.js's
-   renderSummaryInlineChart(), called once per chartable entry) - holds as
-   many .summary-chart-inline-preview cards as this turn actually has,
-   ALWAYS side by side in one row (per explicit follow-up request), never
-   wrapping to a second row - `nowrap` here is what enforces that; the
-   shrinking that keeps them from overflowing once there are more than 4 is
-   handled per-card by renderSummaryInlineChart()'s own inline flex-basis
-   override (see .summary-chart-inline-preview's own comment above). Sits
-   INSIDE .summary-text-chart-row, below the summary text (see that rule's
-   own comment) - only ever built when there's at least one actual preview
-   to place. */
-.summary-chart-preview-grid {
-  display: flex;
-  flex-wrap: nowrap;
-  gap: 0.9rem;
-  width: 100%;
-}
-
-/* Wraps the Summary tab's own text and (when this turn has any) its
-   chart preview grid together (see renderTableResult()'s isText branch) -
-   text on top, the grid of one-or-more preview cards stacked directly
-   underneath it (see .summary-chart-preview-grid just above), each full
-   width so cards can wrap and lay out independently of the text's own
-   width. Only ever built when there's at least one actual preview to
-   place - the plain-text summary (no chartable tab this turn) skips this
-   wrapper entirely and the paragraph goes straight into the cell, same as
-   always. */
-.summary-text-chart-row {
-  display: flex;
-  flex-direction: column;
-  gap: 0.9rem;
 }
 
 /* Wraps .report-issue-inline-btn when it has to be inserted as its own
@@ -4861,6 +4800,9 @@ tr.report-issue-row td {
   position: relative;
   cursor: col-resize;
   flex-shrink: 0;
+  /* See .editor-panes-resizer's own comment in the NL/SQL row section
+     above - same touch-drag fix, same reason. */
+  touch-action: none;
 }
 
 .schema-viewer-panes-resizer::after {

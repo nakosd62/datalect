@@ -334,7 +334,7 @@ class MongoSqlBackend(Backend):
         convention pass, built here rather than re-querying cursor.columns()
         a second time. No other Phase 1 attribute in the shared table
         (identity markers, comments, row-count estimates, routine
-        signatures, distribution keys, session facts, widened grants,
+        signatures, distribution keys, session facts,
         RLS/external flags) has a safe, driver-exposed catalog equivalent
         here worth fabricating - MongoDB Atlas SQL's ODBC surface is
         already narrower than a real RDBMS catalog, so this stays scoped to

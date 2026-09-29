@@ -654,7 +654,7 @@ test.describe('config modal', () => {
     });
 
     await gotoApp(page);
-    await expect(page.locator('#connDbName')).toHaveText('My Anonymous DB');
+    await expect(page.locator('#connDbName')).toHaveText('My Anonymous DB (postgres)');
 
     await openConfigModal(page);
     const row = page.locator('.custom-db-name-input').first();
@@ -673,7 +673,7 @@ test.describe('config modal', () => {
 
     await page.locator('#configSaveBtn').click();
     await expect(page.locator('#configModal')).toHaveClass(/hidden/);
-    await expect(page.locator('#connDbName')).toHaveText('My Postgres DB');
+    await expect(page.locator('#connDbName')).toHaveText('My Postgres DB (postgres)');
 
     // Re-opening confirms it round-tripped through the real server/state
     // store, not just local in-memory JS state.
@@ -718,7 +718,7 @@ test.describe('config modal', () => {
     await page.locator('#configSaveBtn').click();
 
     await expect(page.locator('#configModal')).toHaveClass(/hidden/);
-    await expect(page.locator('#connDbName')).toHaveText('Default DB');
+    await expect(page.locator('#connDbName')).toHaveText('Default DB (PostgreSQL)');
 
     await openConfigModal(page);
     await expect(page.locator('.custom-db-bq-project')).toHaveCount(0);
@@ -739,7 +739,7 @@ test.describe('config modal', () => {
     await page.locator('#configSaveBtn').click();
 
     await expect(page.locator('#configModal')).toHaveClass(/hidden/);
-    await expect(page.locator('#connDbName')).toHaveText('My BQ Conn');
+    await expect(page.locator('#connDbName')).toHaveText('My BQ Conn (bigquery)');
   });
 
   test('the service-account key never round-trips back into the page', async ({ page }) => {
@@ -846,7 +846,7 @@ test.describe('config modal', () => {
     await page.locator('#configSaveBtn').click();
 
     await expect(page.locator('#configModal')).toHaveClass(/hidden/);
-    await expect(page.locator('#connDbName')).toHaveText('Default DB');
+    await expect(page.locator('#connDbName')).toHaveText('Default DB (PostgreSQL)');
 
     await openConfigModal(page);
     await expect(page.locator('.custom-db-sf-account')).toHaveCount(0);
@@ -1025,7 +1025,7 @@ test.describe('config modal', () => {
     await page.locator('.custom-db-url-input').last().fill('postgresql://user:pass@localhost:5432/other');
     await page.locator('#configSaveBtn').click();
     await expect(page.locator('#configModal')).toHaveClass(/hidden/);
-    await expect(page.locator('#connDbName')).toHaveText('Other DB');
+    await expect(page.locator('#connDbName')).toHaveText('Other DB (postgres)');
 
     // Populate the prompt/SQL/results the same way translate-execute.spec.js
     // does, then confirm they're actually showing before asserting they get
@@ -1053,7 +1053,7 @@ test.describe('config modal', () => {
     await page.locator('#modalDbRadioGroup input[name="db_connection_option"][value^="preset:"]').first().check();
     await page.locator('#configSaveBtn').click();
     await expect(page.locator('#configModal')).toHaveClass(/hidden/);
-    await expect(page.locator('#connDbName')).toHaveText('Default DB');
+    await expect(page.locator('#connDbName')).toHaveText('Default DB (PostgreSQL)');
 
     await expect(page.locator('#aiPrompt')).toHaveValue('');
     expect(
@@ -1098,7 +1098,7 @@ test.describe('config modal', () => {
     await page.locator('.custom-db-url-input').last().fill('postgresql://user:pass@localhost:5432/other');
     await page.locator('#configSaveBtn').click();
     await expect(page.locator('#configModal')).toHaveClass(/hidden/);
-    await expect(page.locator('#connDbName')).toHaveText('Other DB');
+    await expect(page.locator('#connDbName')).toHaveText('Other DB (postgres)');
     await expect(page.locator('#aiPrompt')).toHaveValue('');
 
     await mockTranslate(page, { sql: 'SELECT * FROM orders;' });
@@ -1124,7 +1124,7 @@ test.describe('config modal', () => {
     await page.locator('#modalDbRadioGroup input[name="db_connection_option"][value^="preset:"]').first().check();
     await page.locator('#configSaveBtn').click();
     await expect(page.locator('#configModal')).toHaveClass(/hidden/);
-    await expect(page.locator('#connDbName')).toHaveText('Default DB');
+    await expect(page.locator('#connDbName')).toHaveText('Default DB (PostgreSQL)');
 
     await expect(page.locator('#aiPrompt')).toHaveValue('list users');
     expect(
@@ -1142,7 +1142,7 @@ test.describe('config modal', () => {
     await page.locator('#modalDbRadioGroup input[name="db_connection_option"][data-dbname="Other DB"]').check();
     await page.locator('#configSaveBtn').click();
     await expect(page.locator('#configModal')).toHaveClass(/hidden/);
-    await expect(page.locator('#connDbName')).toHaveText('Other DB');
+    await expect(page.locator('#connDbName')).toHaveText('Other DB (postgres)');
 
     await expect(page.locator('#aiPrompt')).toHaveValue('list orders');
     await expect(page.locator('#resultsHeader th')).toHaveText(['order_id']);
@@ -1231,7 +1231,7 @@ test.describe('config modal', () => {
 
     await page.locator('#configSaveBtn').click();
     await expect(page.locator('#configModal')).toHaveClass(/hidden/);
-    await expect(page.locator('#connDbName')).toHaveText('My MySQL DB');
+    await expect(page.locator('#connDbName')).toHaveText('My MySQL DB (mysql)');
 
     // Re-opening confirms it round-tripped through the real server/state
     // store as a MySQL connection specifically, not silently as Postgres
@@ -1359,7 +1359,7 @@ test.describe('config modal', () => {
     await page.locator('#configSaveBtn').click();
 
     await expect(page.locator('#configModal')).toHaveClass(/hidden/);
-    await expect(page.locator('#connDbName')).toHaveText('Default DB');
+    await expect(page.locator('#connDbName')).toHaveText('Default DB (PostgreSQL)');
 
     await openConfigModal(page);
     await expect(page.locator('.custom-db-dbx-hostname')).toHaveCount(0);
@@ -1464,7 +1464,7 @@ test.describe('config modal', () => {
     await page.locator('#configSaveBtn').click();
 
     await expect(page.locator('#configModal')).toHaveClass(/hidden/);
-    await expect(page.locator('#connDbName')).toHaveText('Default DB');
+    await expect(page.locator('#connDbName')).toHaveText('Default DB (PostgreSQL)');
 
     await openConfigModal(page);
     await expect(page.locator('.custom-db-ora-host')).toHaveCount(0);
@@ -1552,7 +1552,7 @@ test.describe('config modal', () => {
     await page.locator('#configSaveBtn').click();
 
     await expect(page.locator('#configModal')).toHaveClass(/hidden/);
-    await expect(page.locator('#connDbName')).toHaveText('Default DB');
+    await expect(page.locator('#connDbName')).toHaveText('Default DB (PostgreSQL)');
 
     await openConfigModal(page);
     await expect(page.locator('.custom-db-rs-host')).toHaveCount(0);
@@ -1656,7 +1656,7 @@ test.describe('config modal', () => {
     await page.locator('#configSaveBtn').click();
 
     await expect(page.locator('#configModal')).toHaveClass(/hidden/);
-    await expect(page.locator('#connDbName')).toHaveText('Default DB');
+    await expect(page.locator('#connDbName')).toHaveText('Default DB (PostgreSQL)');
 
     await openConfigModal(page);
     await expect(page.locator('.custom-db-ms-host')).toHaveCount(0);
@@ -1735,7 +1735,7 @@ test.describe('config modal', () => {
     await page.locator('#configSaveBtn').click();
 
     await expect(page.locator('#configModal')).toHaveClass(/hidden/);
-    await expect(page.locator('#connDbName')).toHaveText('Default DB');
+    await expect(page.locator('#connDbName')).toHaveText('Default DB (PostgreSQL)');
 
     await openConfigModal(page);
     await expect(page.locator('.custom-db-sh-url')).toHaveCount(0);
@@ -1818,7 +1818,7 @@ test.describe('config modal', () => {
     await page.locator('#configSaveBtn').click();
 
     await expect(page.locator('#configModal')).toHaveClass(/hidden/);
-    await expect(page.locator('#connDbName')).toHaveText('Default DB');
+    await expect(page.locator('#connDbName')).toHaveText('Default DB (PostgreSQL)');
 
     await openConfigModal(page);
     await expect(page.locator('.custom-db-mongo-uri')).toHaveCount(0);

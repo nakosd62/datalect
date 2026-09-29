@@ -21,14 +21,14 @@ the exact order it issues them:
   1. table names        2. columns             3. constraints
   4. distkey/sortkey/tbl_rows/stats_off (svv_table_info, widened)
   5. views               6. comments (new)      7. routines (new)
-  8. session timezone (new)   9. grants (new)   10. external tables (new)
+  8. session timezone (new)   9. external tables (new)
 No Indexes/Triggers queries at all - Redshift has no such concept. RLS is
 also not a Redshift concept, so there's no RLS section/query to fake here
 either (see backends/redshift.py's module docstring).
 
-get_schema() (deep) then runs _build_shallow_schema_parts() (the ten
+get_schema() (deep) then runs _build_shallow_schema_parts() (the nine
 queries above) and appends its own Phase 2 queries on a fresh cursor use:
-  11. pg_stats n_distinct (shared, once)
+  10. pg_stats n_distinct (shared, once)
   then per kept table (in order): live COUNT(*), an optional combined
   MIN()/MAX() query (if it has numeric/date columns), and up to
   MAX_CATEGORICAL_SAMPLE_COLUMNS_PER_TABLE frequent-value GROUP BY queries
@@ -73,7 +73,7 @@ def _pad_layout_row(row):
 
 def _schema_responses(
     table_names, columns_rows, constraints=(), layout=(), views=(),
-    comments=(), routines=(), session_settings=("UTC",), grants=(),
+    comments=(), routines=(), session_settings=("UTC",),
     external_tables=(),
 ):
     return [
@@ -85,7 +85,6 @@ def _schema_responses(
         (list(comments), None, -1),
         (list(routines), None, -1),
         ([session_settings] if session_settings is not None else [], None, -1),
-        (list(grants), None, -1),
         (list(external_tables), None, -1),
     ]
 
@@ -342,7 +341,7 @@ def test_get_schema_distribution_sort_keys_section():
 def test_get_schema_svv_table_info_query_failure_is_logged_not_swallowed(caplog):
     # Distribution/Sort Keys and Row count estimates both come from this
     # one svv_table_info query (Phase 1) - a failure here must not break
-    # the rest of the fetch (matches the constraints/routines/grants
+    # the rest of the fetch (matches the constraints/routines
     # query-failure tests elsewhere in this file), but it must also not be
     # swallowed silently: svv_table_info defaults to superuser-only
     # visibility in real Redshift, so the real, actionable cause (a
@@ -404,7 +403,7 @@ def test_get_schema_scopes_to_current_schema_not_hardcoded_public():
 def test_get_schema_shallow_every_query_is_scoped_via_current_schema_not_hardcoded_public():
     """Regression guard for the "schema" descriptor feature (see
     backends/redshift.py's connect()): every one of
-    _build_shallow_schema_parts()'s ten catalog-only queries must follow
+    _build_shallow_schema_parts()'s nine catalog-only queries must follow
     current_schema() rather than a literal 'public'. The one deliberate
     exception is the new session-timezone query (query #7):
     current_setting('TimeZone') describes the whole session, not a
@@ -417,11 +416,10 @@ def test_get_schema_shallow_every_query_is_scoped_via_current_schema_not_hardcod
         constraints=[("orders", "orders_pkey", "PRIMARY KEY", "id", None, None)],
         layout=[("orders", "KEY(customer_id)", "order_date")],
         views=[("v", "SELECT 1")],
-        grants=[("app_user", "orders", "SELECT")],
     ))
     backend = RedshiftBackend()
     backend.get_schema_shallow(conn)
-    assert len(cursor.calls) == 10
+    assert len(cursor.calls) == 9
     session_calls = [c for c in cursor.calls if "current_setting" in c[0]]
     assert len(session_calls) == 1
     for sql_text, _params in cursor.calls:
@@ -595,38 +593,6 @@ def test_get_schema_shallow_session_timezone_renders():
     assert "Session: timezone=America/New_York" in schema
 
 
-def test_get_schema_shallow_grants_render_when_query_succeeds():
-    conn, cursor = make_fake_pg_connection(_schema_responses(
-        table_names=["orders"],
-        columns_rows=[("orders", "id", "integer", "NO", None)],
-        grants=[("app_user", "orders", "SELECT")],
-    ))
-    backend = RedshiftBackend()
-    schema = backend.get_schema_shallow(conn)
-    assert "Grants" in schema
-    assert "Grant SELECT on orders to app_user" in schema
-    assert "role_table_grants support varies" in schema
-
-
-def test_get_schema_shallow_grants_query_error_degrades_gracefully():
-    """The exact concern the original module docstring raised (role_table_
-    grants support is inconsistent across Redshift versions/configurations)
-    - this test simulates that inconsistency actually manifesting as a
-    query error, and confirms it degrades to "skip this section" rather
-    than failing the whole schema fetch."""
-    responses = _schema_responses(
-        table_names=["orders"],
-        columns_rows=[("orders", "id", "integer", "NO", None)],
-    )
-    grants_index = 8  # 0-based: ... comments, routines, session, grants
-    responses[grants_index] = RuntimeError("permission denied for relation role_table_grants")
-    conn, cursor = make_fake_pg_connection(responses)
-    backend = RedshiftBackend()
-    schema = backend.get_schema_shallow(conn)
-    assert "Table: orders" in schema
-    assert "Grants" not in schema
-
-
 def test_get_schema_shallow_external_tables_render():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["orders"],
@@ -684,8 +650,8 @@ def test_get_schema_shallow_excludes_full_view_and_routine_bodies_and_phase2_sec
     assert "Live row counts:" not in schema
     assert "Column value samples:" not in schema
     assert "Likely relationships" not in schema
-    # Exactly the ten Phase 1 queries - no Phase 2 query was ever issued.
-    assert len(cursor.calls) == 10
+    # Exactly the nine Phase 1 queries - no Phase 2 query was ever issued.
+    assert len(cursor.calls) == 9
 
 
 # --- get_schema() (deep): Phase 2 additions on top of the shallow content ----
@@ -736,7 +702,7 @@ def test_get_schema_deep_is_superset_of_shallow_plus_phase2_sampling():
     # New schema-wide dataset-size line (Dataset size summary section).
     assert "Estimated dataset size: ~1.9 MB" in schema
 
-    assert len(cursor.calls) == 1 + 10 + 4
+    assert len(cursor.calls) == 1 + 9 + 4
 
 
 def test_get_schema_deep_skips_frequent_values_for_near_unique_column():
@@ -752,7 +718,7 @@ def test_get_schema_deep_skips_frequent_values_for_near_unique_column():
     assert "Column value samples:" in schema
     assert "id: range [1 .. 100]" in schema
     assert "frequent values" not in schema
-    assert len(cursor.calls) == 1 + 10 + 3
+    assert len(cursor.calls) == 1 + 9 + 3
 
 
 def test_get_schema_deep_naming_convention_relationships_section():
@@ -811,7 +777,7 @@ def test_get_schema_deep_skips_sampling_for_wide_tables_but_keeps_live_count():
     schema = backend.get_schema(conn)
     assert "Live row counts:" in schema and "wide: 7 rows (live, authoritative)" in schema
     assert "Column value samples:" not in schema
-    assert len(cursor.calls) == 1 + 10 + 2
+    assert len(cursor.calls) == 1 + 9 + 2
 
 
 def test_get_schema_deep_dataset_size_line_uses_schema_wide_totals_not_kept_names_scope():

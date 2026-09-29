@@ -85,25 +85,8 @@ first pass was narrowed too:
   SQL Server supports both (sys.indexes, sys.triggers) and they could be
   added later, but every dialect that could support "nice to have"
   introspection extras deferred at least one of them in its own first pass
-  too (Oracle deferred Grants; Redshift deferred Indexes/Triggers/Grants) -
-  this isn't a new gap, it's the same "ship core Tables/Columns/
-  Constraints/Views, defer the rest" precedent. Neither attribute was on
-  the two-phase schema-introspection plan's requested list (only Grants
-  was), so this narrower scope is deliberate, not an oversight.
-
-  Grants, unlike Indexes/Triggers, WAS on that plan's requested list, and
-  is no longer deferred: the original deferral note above (when this
-  module was first written) never argued the query itself was unsafe or
-  uncertain to write - it only said "ship the core sections first, the
-  same way every other dialect narrowed its own first pass." That's a
-  scope decision, not a correctness concern, so it doesn't block adding
-  Grants now that it's explicitly asked for. SQL Server's
-  INFORMATION_SCHEMA.TABLE_PRIVILEGES is the same ANSI-standard,
-  already-working shape backends/mysql.py's own Grants section already
-  uses (MySQL has no role_table_grants either) - already-visible-to-the-
-  caller semantics, no elevated catalog access needed, wrapped in the same
-  try/except every other optional section here uses. See
-  _build_shallow_schema_parts()'s "Grants" section below.
+  too - this isn't a new gap, it's the same "ship core Tables/Columns/
+  Constraints/Views, defer the rest" precedent.
 
 Which of "password" must never round-trip back to the frontend once saved
 is state_store.py's _CREDENTIAL_CONFIG_FIELDS' responsibility - "password"
@@ -861,31 +844,7 @@ class MssqlBackend(Backend):
             except Exception:
                 pass
 
-            # 9. Grants (new, no longer deferred) - see module docstring
-            # for why this one (unlike Indexes/Triggers, still deferred)
-            # is being added now. INFORMATION_SCHEMA.TABLE_PRIVILEGES is
-            # SQL Server's own ANSI-standard grants view (there's no
-            # role_table_grants here, same gap MySQL has - see
-            # backends/mysql.py's own Grants section, which this mirrors
-            # almost verbatim) - it already only reports grants visible to
-            # the connecting login, so this is inherently current-user-
-            # scoped without any extra WHERE clause needed.
-            try:
-                cursor.execute(f"""
-                    SELECT GRANTEE, TABLE_NAME, PRIVILEGE_TYPE
-                    FROM INFORMATION_SCHEMA.TABLE_PRIVILEGES
-                    WHERE TABLE_SCHEMA = COALESCE(%s, SCHEMA_NAME())
-                      AND TABLE_NAME IN ({format_strings})
-                    ORDER BY TABLE_NAME, GRANTEE;
-                """, (connection.mssql_schema,) + tuple(kept_names))
-                grants = cursor.fetchall()
-                if grants:
-                    grant_lines = [f"  Grant {g[2]} on {schema_prefix}{g[1]} to {g[0]}" for g in grants]
-                    schema_parts.append("Grants:\n" + "\n".join(grant_lines))
-            except Exception:
-                pass
-
-            # 10. RLS / external-table flags (new) - sys.security_policies
+            # 9. RLS / external-table flags (new) - sys.security_policies
             # (SQL Server 2016+) existence check via sys.security_predicates
             # for row-level security; sys.external_tables (PolyBase,
             # 2016+) for an external/federated table flag. Both are
