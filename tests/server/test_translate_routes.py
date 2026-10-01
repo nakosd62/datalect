@@ -1172,9 +1172,9 @@ def test_history_result_truncation_reaches_the_real_claude_call(app_factory, mon
     # Call 1 (triage) is the one that receives history (see the Gemini
     # version of this test above), so it's create_calls[0], not [1].
     messages = harness.create_calls[0]["messages"]
-    # Sole history turn is also the cache_control boundary (see the
-    # caching section below), so its content is block form.
-    history_text = messages[0]["content"][0]["text"]
+    # content is a plain string (prompt caching is off - see the note
+    # above _call_gemini in llm_providers.py).
+    history_text = messages[0]["content"]
     assert "[Query Result 1 - 9999 row(s) total, showing 2]" in history_text
     assert "[2]" not in history_text
     assert "[3]" not in history_text
@@ -1734,9 +1734,9 @@ def test_claude_dialect_intro_reaches_the_system_param(app_factory, tmp_path, mo
     parse_translate_stream(resp)  # drains the stream - see this file's module docstring
     # create_calls[1] - Call 2's own system param, where the dialect intro
     # lives (Call 1's triage system instruction is dialect-agnostic).
-    # system is a one-block list now (see test_claude_system_prompt_is_
-    # cache_control_marked below for why) rather than a plain string.
-    system_instruction = harness.create_calls[1]["system"][0]["text"]
+    # system is a plain string (prompt caching is off - see the note above
+    # _call_gemini in llm_providers.py).
+    system_instruction = harness.create_calls[1]["system"]
     assert "Microsoft SQL Server" in system_instruction
     assert "schema-qualified" in system_instruction
 
@@ -1770,10 +1770,10 @@ def test_claude_history_uses_assistant_role_and_appends_results(app_factory, mon
     assert messages[0]["role"] == "user"
     assert messages[0]["content"].endswith("show users")
     assert messages[1]["role"] == "assistant"
-    # messages[1] is the last history entry, so it's the cache_control
-    # boundary (see the dedicated cache-control tests below) - its content
-    # is block form now, not a plain string.
-    content_text = messages[1]["content"][0]["text"]
+    # content is a plain string (prompt caching is off, so there's no
+    # cache_control boundary to wrap it in a content block anymore - see
+    # the note above _call_gemini in llm_providers.py).
+    content_text = messages[1]["content"]
     assert "SELECT * FROM users;" in content_text
     assert "[Query Result 1" in content_text
     assert messages[2]["role"] == "user"
@@ -1783,9 +1783,7 @@ def test_claude_schema_precedes_history_and_is_not_glued_to_the_new_prompt(app_f
     """Regression guard for the system -> schema -> history -> new-prompt
     ordering translate_query() builds (see its long comment on why): when
     there IS history, the schema is prepended to the FIRST historical
-    message rather than glued onto the ever-changing new prompt - that's
-    what makes it a stable, repeatable prefix Claude's cache_control
-    marker (see the dedicated tests below) relies on."""
+    message rather than glued onto the ever-changing new prompt."""
     env = app_factory(env={"ANTHROPIC_API_KEY": "fake-key-1"})
     select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
@@ -1802,9 +1800,10 @@ def test_claude_schema_precedes_history_and_is_not_glued_to_the_new_prompt(app_f
     # with its own shallow schema block instead - not this test's concern.
     messages = harness.create_calls[1]["messages"]
     # A single-entry history means this message is both the first (schema
-    # prepended) AND the last historical turn (cache_control boundary) -
-    # content is block form, not a plain string, as a result.
-    assert messages[0]["content"][0]["text"] == "Database Schema:\nNo schema description available.\n\nshow users"
+    # prepended) AND the last historical turn - content is a plain string
+    # (prompt caching is off, so there's no cache_control boundary to wrap
+    # it in a content block anymore).
+    assert messages[0]["content"] == "Database Schema:\nNo schema description available.\n\nshow users"
     # The new prompt (last message) carries the prompt text but not the
     # schema - that was only ever attached once, up front.
     assert "Database Schema:" not in messages[-1]["content"]
@@ -1813,11 +1812,10 @@ def test_claude_schema_precedes_history_and_is_not_glued_to_the_new_prompt(app_f
 
 def test_claude_schema_attaches_to_new_prompt_when_there_is_no_history(app_factory, monkeypatch):
     """With no prior history the new prompt IS the first (and only)
-    message, so it carries the schema directly - but as two separate
-    content blocks (schema, then the new prompt), not one concatenated
-    string, so the schema half can be independently cache_control-marked
-    (see the dedicated cache-control tests below) even on a conversation's
-    very first call."""
+    message, so it carries the schema directly - concatenated into one
+    plain string, same as the Gemini/OpenAI no-history case, since prompt
+    caching is off (see the note above _call_gemini in llm_providers.py)
+    and there's no cache_control marker to place independently anymore."""
     env = app_factory(env={"ANTHROPIC_API_KEY": "fake-key-1"})
     select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
@@ -1830,30 +1828,28 @@ def test_claude_schema_attaches_to_new_prompt_when_there_is_no_history(app_facto
 
     messages = harness.create_calls[1]["messages"]
     assert len(messages) == 1
-    content = messages[0]["content"]
-    assert isinstance(content, list) and len(content) == 2
-    assert content[0]["text"] == "Database Schema:\nNo schema description available.\n\n"
     # "JSON response:" (Call 2's own new_prompt_content suffix - see
     # _SQL_GENERATION_FORMAT_RULES), not "SQL Query:" as before this
     # redesign.
-    assert content[1]["text"] == "User Request: show users\n\nJSON response:"
+    assert messages[0]["content"] == "Database Schema:\nNo schema description available.\n\nUser Request: show users\n\nJSON response:"
 
 
-# --- Claude prompt caching (cache_control) ---
+# --- Claude prompt caching (disabled) ---
 # Claude has no automatic/implicit caching the way Gemini 2.5+ does (see
-# _call_gemini's docstring) - a block is only ever cached if explicitly
-# marked with cache_control. These tests pin down where those markers
-# land: the system prompt always; the schema block always too, whether
-# that's prepended to the last already-accumulated history turn (when
-# there is history) or split into its own content block on a
-# conversation's very first call (when there isn't) - see
-# translate_query()'s comment on why concatenating the schema onto the
-# ever-changing new prompt and marking THAT would defeat the point. The
-# new prompt itself is never marked, in either case - it's guaranteed to
-# differ every call and would gain nothing from caching.
+# the note above _call_gemini in llm_providers.py) - a block is only ever
+# cached if explicitly marked with cache_control. This app used to mark
+# the system prompt and the schema block that way; real usage data showed
+# those writes dominating the bill with almost nothing recouped from
+# reads, so caching is now off across all three providers. These tests
+# pin down that nothing sent to Claude ever carries a cache_control marker
+# any more - the system prompt is a plain string, and every message's
+# content is a plain string too, whether that's the last already-
+# accumulated history turn (when there is history) or the schema-plus-
+# new-prompt message on a conversation's very first call (when there
+# isn't).
 
 
-def test_claude_system_prompt_is_cache_control_marked(app_factory, monkeypatch):
+def test_claude_system_prompt_has_no_cache_control_marker(app_factory, monkeypatch):
     env = app_factory(env={"ANTHROPIC_API_KEY": "fake-key-1"})
     select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
@@ -1864,13 +1860,12 @@ def test_claude_system_prompt_is_cache_control_marked(app_factory, monkeypatch):
     resp = env.client.post('/api/translate', json={'prompt': 'hi'})
     parse_translate_stream(resp)  # drains the stream - see this file's module docstring
 
-    system = harness.create_calls[0]["system"]
-    assert isinstance(system, list) and len(system) == 1
-    assert system[0]["type"] == "text"
-    assert system[0]["cache_control"] == {"type": "ephemeral"}
+    # Caching is off, so system is sent as a plain string, not a
+    # cache_control-marked content-block list.
+    assert isinstance(harness.create_calls[0]["system"], str)
 
 
-def test_claude_cache_control_marks_last_history_turn_not_the_new_prompt(app_factory, monkeypatch):
+def test_claude_never_marks_a_cache_control_boundary_on_history(app_factory, monkeypatch):
     env = app_factory(env={"ANTHROPIC_API_KEY": "fake-key-1"})
     select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
@@ -1890,23 +1885,19 @@ def test_claude_cache_control_marks_last_history_turn_not_the_new_prompt(app_fac
     # Call 1 (triage) also receives history, so create_calls[0] is checked.
     messages = harness.create_calls[0]["messages"]
     assert len(messages) == 5  # 4 history turns + the new prompt
-    # Only the last history turn (index 3) carries a cache_control marker -
-    # not any earlier turn, and not the new prompt appended after it.
+    # No message's content is ever a content-block list any more - every
+    # one, including the last history turn that used to be the
+    # cache_control boundary, is a plain string.
     for i, message in enumerate(messages):
-        is_marked = isinstance(message["content"], list)
-        assert is_marked == (i == 3), f"message {i} marked={is_marked}"
-    assert messages[3]["content"][0]["cache_control"] == {"type": "ephemeral"}
+        assert isinstance(message["content"], str), f"message {i} content is {type(message['content'])}"
 
 
-def test_claude_schema_block_is_cache_control_marked_even_with_no_history(app_factory, monkeypatch):
-    """With no history, the sole message still splits into two content
-    blocks (see test_claude_schema_attaches_to_new_prompt_when_there_is_no_history
-    above): the schema block IS cache_control-marked here - it's the
-    single largest, most-repeated-across-conversations block this app
-    sends, so it shouldn't have to wait for a second call to start being
-    cacheable. The new-prompt block right after it is left unmarked, since
-    it ends in the ever-changing prompt text and would gain nothing from
-    caching."""
+def test_claude_schema_and_new_prompt_are_one_unmarked_string_with_no_history(app_factory, monkeypatch):
+    """With no history, the sole message concatenates the schema and the
+    new prompt into one plain string (see
+    test_claude_schema_attaches_to_new_prompt_when_there_is_no_history
+    above) - caching is off, so there's no reason to split them into
+    separate content blocks any more."""
     env = app_factory(env={"ANTHROPIC_API_KEY": "fake-key-1"})
     select_llm_provider(env, "anthropic")
     harness = ClaudeHarness()
@@ -1919,10 +1910,7 @@ def test_claude_schema_block_is_cache_control_marked_even_with_no_history(app_fa
 
     messages = harness.create_calls[0]["messages"]
     assert len(messages) == 1
-    content = messages[0]["content"]
-    assert isinstance(content, list) and len(content) == 2
-    assert content[0]["cache_control"] == {"type": "ephemeral"}
-    assert "cache_control" not in content[1]
+    assert isinstance(messages[0]["content"], str)
 
 
 def test_claude_build_llm_input_with_no_history_and_no_schema_sends_one_unmarked_block(app_factory):
@@ -2265,9 +2253,10 @@ class OpenAiHarness:
         harness = self
 
         class FakeResponses:
-            def create(self, model, instructions, input):
+            def create(self, model, instructions, input, prompt_cache_options=None):
                 harness.create_calls.append(
                     {"model": model, "instructions": instructions, "input": input,
+                     "prompt_cache_options": prompt_cache_options,
                      "api_key": harness.client_api_keys[-1]}
                 )
                 if not harness.queue:
@@ -2468,11 +2457,10 @@ def test_openai_schema_precedes_history_and_is_not_glued_to_the_new_prompt(app_f
 
 
 def test_openai_schema_attaches_to_new_prompt_when_there_is_no_history(app_factory, monkeypatch):
-    """With no prior history, unlike Claude's two-content-block split
-    (there's no cache_control marker to place - see _call_openai's
-    docstring on why OpenAI's caching is automatic), the schema is simply
-    concatenated onto the new prompt in one plain string, same as Gemini's
-    no-history case."""
+    """With no prior history, the schema is simply concatenated onto the
+    new prompt in one plain string, same as Gemini's and (now that prompt
+    caching is off everywhere - see the note above _call_gemini in
+    llm_providers.py) Claude's no-history case."""
     env = app_factory(env={"OPENAI_API_KEY": "fake-key-1"})
     select_llm_provider(env, "openai")
     harness = OpenAiHarness()
@@ -2504,6 +2492,27 @@ def test_openai_reports_cached_tokens(app_factory, monkeypatch):
     _, data = parse_translate_stream(resp)
     assert data['success'] is True
     assert data['cached_content_tokens'] == 1234
+
+
+def test_openai_prompt_caching_is_disabled(app_factory, monkeypatch):
+    """_call_openai passes prompt_cache_options={"mode": "explicit"} with
+    no explicit breakpoints anywhere in `input` - per the SDK's own
+    PromptCacheOptions docstring, that means the request does not use
+    prompt caching at all. Regression guard for the real-money issue this
+    was turned off for: left at the SDK default ("implicit"), OpenAI
+    writes an automatic cache breakpoint on every call."""
+    env = app_factory(env={"OPENAI_API_KEY": "fake-key-1"})
+    select_llm_provider(env, "openai")
+    harness = OpenAiHarness()
+    monkeypatch.setattr(env.translate_routes.openai, "OpenAI", harness.make_client_class())
+    harness.queue_response(FakeOpenAiResponse('{"action": "sql"}'))
+    harness.queue_response(FakeOpenAiResponse('{"sql": "SELECT 1;"}'))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'hi'})
+    parse_translate_stream(resp)  # drains the stream - see this file's module docstring
+
+    for call in harness.create_calls:
+        assert call["prompt_cache_options"] == {"mode": "explicit"}
 
 
 def test_openai_reports_reasoning_tokens_as_thinking_tokens(app_factory, monkeypatch):

@@ -82,8 +82,8 @@ The bracketed phrase is written in the SAME LANGUAGE as the paragraph it sits in
 the parenthesized part is always the literal word "chart:" immediately followed by the EXACT string 
 index you are ALSO using for this same result in "visualizations" below (the SAME [index] "per_database" 
 is keyed by, e.g. "chart:1" for the key "1") - never any other URL, and never the 
-"chart:" prefix without a valid index after it. This is the ONLY situation where a link belongs 
-anywhere in "per_database"/"cross_database" - never write a real hyperlink for anything else. 
+"chart:" prefix without a valid index after it. This, together with the more general "result:" reference link described just below, are the ONLY situations where a link belongs 
+anywhere in "per_database"/"cross_database" - never write any other kind of hyperlink. 
 It is completely normal, and expected, for a database's result to be chartable yet get no link at all 
 - e.g. because its paragraph never got around to discussing that particular result in enough specific 
 detail, or discusses it only in passing. Never plant a link, or write a new sentence solely to plant one, 
@@ -115,6 +115,8 @@ If you are ever unsure whether a chart genuinely helps for a given result, or un
 something its paragraph specifically says, leave its key (and any link) out entirely 
 - a plain table is always an acceptable, safe default for that one result, and there is no penalty 
 for choosing it.
+
+A SEPARATE, more general inline link lets "per_database"/"cross_database" point back at the supporting data behind a claim, not only a charted one: reference ANY database's result above this way - chartable or not, whether or not you are also charting it - using the exact same Markdown link syntax as the chart link but with "result:" in place of "chart:". The index after "result:" is the SAME [index] each database's results block is already labeled with above - never invent or renumber it. Use this sparingly, never densely: link a GIVEN index AT MOST TWICE anywhere across "per_database" AND "cross_database" combined - that is a total across every sentence and paragraph, not twice per sentence - and once that budget is used, every later mention of the same database result is plain, unlinked text for the rest of the response, no matter how many more times it comes up. Prefer a lightweight trailing reference for most of these: a short parenthetical placed right after the sentence it supports, e.g. "Electronics Store reported 98,205,831.21 in sales revenue ([see data](result:0))." - the bracketed phrase inside the parentheses can be as short as "see data" or "source"; it never needs to restate the claim. Reserve a true inline anchor - wrapping the link directly around the one specific word or figure inside the sentence itself, e.g. "Electronics Store [reported](result:0) 98,205,831.21 in sales revenue" - for the single most important claim about that database's result, not every mention of it, and never both the inline and the trailing form for the same claim. Spread this ACROSS DIFFERENT databases rather than concentrating it on one: most substantive, data-backed claims should point back at SOME database result somewhere in "per_database"/"cross_database", but a paragraph carrying many links back to the same one reads as noise, not help, which is exactly what the twice-per-index cap above prevents. Skip linking entirely on a sentence that is not really about a specific result at all (e.g. a purely transitional or definitional one).
 
 "suggested_searches" is a list of 0-3 short, plain search-engine queries - the handful of words 
 you'd actually type into a search box, never a full question or sentence - for a REAL web search 

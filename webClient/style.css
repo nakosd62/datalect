@@ -3295,8 +3295,13 @@ textarea.report-issue-preview:focus {
    "visualizations" paragraph's whole design is built around (see
    chart_helpers.py's _clean_visualization docstring). Handled by the
    delegated data-view-chart-trigger click listener
-   (jumpToChartableResultTab()) in client.js.
-   The Summary tab used to ALSO show a row of small preview-chart cards
+   (jumpToChartableResultTab()) in client.js. This same class is also
+   reused, unchanged, by client.js's applyInlineResultLinks() for the
+   more general "[<phrase>](result:<index>)" reference link (handled by
+   the sibling data-view-result-trigger listener/jumpToResultTab()) - the
+   two read as the exact same kind of thing to the user by design, so
+   they share one class rather than a near-duplicate second one.
+   The Response tab used to ALSO show a row of small preview-chart cards
    underneath the text (one per chartable entry) - removed per explicit
    request (they rendered poorly at that size, and were redundant with
    this same inline link: a result only ever gets a `visualization` at all

@@ -755,7 +755,7 @@ test.describe('single-connection mode: post-execution results summarization', ()
     // this count is itself proof the Summary tab was actually prepended.
     const tabs = page.locator('#resultsTabsNav .result-tab-btn');
     await expect(tabs).toHaveCount(2);
-    await expect(tabs.nth(0)).toContainText('Summary');
+    await expect(tabs.nth(0)).toContainText('Response');
     await expect(tabs.nth(0)).toHaveClass(/active/);
     await expect(page.locator('.response-text')).toContainText('Signups are up sharply');
     // The server's internal "*** NO SQL ***" convention is stripped before
@@ -827,7 +827,7 @@ test.describe('single-connection mode: post-execution results summarization', ()
 
     const tabs = page.locator('#resultsTabsNav .result-tab-btn');
     await expect(tabs).toHaveCount(2);
-    await expect(tabs.nth(0)).toContainText('Summary');
+    await expect(tabs.nth(0)).toContainText('Response');
   });
 
   // Regression coverage for a bug: this summarization step used to be
@@ -860,7 +860,7 @@ test.describe('single-connection mode: post-execution results summarization', ()
     await expect(page.locator('#resultsBody')).toContainText('Execution Error');
     const tabs = page.locator('#resultsTabsNav .result-tab-btn');
     await expect(tabs).toHaveCount(2);
-    await expect(tabs.nth(0)).toContainText('Summary');
+    await expect(tabs.nth(0)).toContainText('Response');
     await expect(tabs.nth(0)).not.toHaveClass(/active/);
     await expect(tabs.nth(1)).toHaveClass(/active/);
     await expect(tabs.nth(1)).toContainText('Error');
@@ -891,7 +891,7 @@ test.describe('single-connection mode: post-execution results summarization', ()
     const tabs = page.locator('#resultsTabsNav .result-tab-btn');
     // Summary + the one succeeded statement + the one failed statement.
     await expect(tabs).toHaveCount(3);
-    await expect(tabs.nth(0)).toContainText('Summary');
+    await expect(tabs.nth(0)).toContainText('Response');
     await expect(tabs.nth(0)).not.toHaveClass(/active/);
     // The failed statement's own tab (last one) stays active - same "the
     // user needs to see this" jump renderResultsWithFailedStatement()

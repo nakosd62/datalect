@@ -574,7 +574,7 @@ test.describe('multi-database question answering', () => {
     await page.locator('#runBtn').click();
     const tabs = page.locator('#resultsTabsNav .result-tab-btn');
     await expect(tabs).toHaveCount(4);
-    await expect(tabs.nth(0)).toContainText('Summary');
+    await expect(tabs.nth(0)).toContainText('Response');
     await expect(tabs.nth(1)).toContainText('Support Postgres');
     await expect(tabs.nth(1)).toContainText('Note');
     await expect(tabs.nth(2)).toContainText('Sales Postgres');
@@ -838,7 +838,7 @@ test.describe('multi-database question answering', () => {
     // empty-sql test above already covers) rather than the Summary tab -
     // switch to it explicitly to check triage's routing message plus
     // Phase C's explanation of BOTH failures landed there.
-    await page.locator('.result-tab-btn').filter({ hasText: 'Summary' }).click();
+    await page.locator('.result-tab-btn').filter({ hasText: 'Response' }).click();
     const summaryText = page.locator('.response-text');
     await expect(summaryText).toContainText('Checking Sales Postgres and Marketing Postgres.');
     await expect(summaryText).toContainText('permissions problem');
@@ -915,7 +915,7 @@ test.describe('multi-database question answering', () => {
     await page.locator('#aiPrompt').press('Enter');
     await expect.poll(() => currentSql(page)).toContain('SELECT');
     await page.locator('#runBtn').click();
-    await page.locator('.result-tab-btn').filter({ hasText: 'Summary' }).click();
+    await page.locator('.result-tab-btn').filter({ hasText: 'Response' }).click();
     await expect(page.locator('.response-text')).toContainText('Both databases failed');
 
     let secondRequestBody = null;
@@ -1132,7 +1132,7 @@ test.describe('multi-database question answering', () => {
     await page.locator('#aiPrompt').press('Enter');
     await expect.poll(() => currentSql(page)).toContain('SELECT');
     await page.locator('#runBtn').click();
-    await page.locator('.result-tab-btn').filter({ hasText: 'Summary' }).click();
+    await page.locator('.result-tab-btn').filter({ hasText: 'Response' }).click();
     await expect(page.locator('.response-text')).toContainText('Revenue is $500');
 
     let secondRequestBody = null;
@@ -1775,7 +1775,7 @@ test.describe('multi-database question answering', () => {
     // tab, and a failure tab, no execution round-trip involved at all.
     const tabs = page.locator('#resultsTabsNav .result-tab-btn');
     await expect(tabs).toHaveCount(3);
-    await expect(tabs.nth(0)).toContainText('Summary');
+    await expect(tabs.nth(0)).toContainText('Response');
     await expect(tabs.nth(1)).toContainText('Sales Postgres');
     await expect(tabs.nth(1)).toContainText('Note');
     await expect(tabs.nth(2)).toContainText('Marketing Postgres');
@@ -1792,7 +1792,7 @@ test.describe('multi-database question answering', () => {
     // Phase C actually ran (not skipped) and its explanation landed on the
     // Summary tab underneath triage's own routing message.
     expect(summarizeCallCount).toBe(1);
-    await page.locator('.result-tab-btn').filter({ hasText: 'Summary' }).click();
+    await page.locator('.result-tab-btn').filter({ hasText: 'Response' }).click();
     await expect(page.locator('.response-text')).toContainText('The query could not be generated because of a permissions problem.');
   });
 
@@ -1844,7 +1844,7 @@ test.describe('multi-database question answering', () => {
     const tabs = page.locator('#resultsTabsNav .result-tab-btn');
     // Summary + pg-a's real result + pg-b's generation-failure tab.
     await expect(tabs).toHaveCount(3);
-    await expect(tabs.nth(0)).toContainText('Summary');
+    await expect(tabs.nth(0)).toContainText('Response');
     await expect(tabs.nth(1)).toContainText('Sales Postgres');
     await expect(tabs.nth(2)).toContainText('Marketing Postgres');
     await expect(tabs.nth(2)).toHaveClass(/result-tab-btn--error/);
@@ -1952,7 +1952,7 @@ test.describe('multi-database question answering', () => {
     // not disappear.
     await page.locator('#goForwardBtn').click();
     await expect(tabs).toHaveCount(3);
-    await expect(tabs.nth(0)).toContainText('Summary');
+    await expect(tabs.nth(0)).toContainText('Response');
     await expect(tabs.nth(1)).toContainText('Sales Postgres');
     await expect(tabs.nth(2)).toContainText('Marketing Postgres');
     await expect(page.locator('.response-text')).toContainText('Checking Sales Postgres and Marketing Postgres.');
@@ -2046,7 +2046,7 @@ test.describe('multi-database question answering', () => {
     // resolves, never the tab's position.
     const tabs = page.locator('#resultsTabsNav .result-tab-btn');
     await expect(tabs).toHaveCount(3);
-    await expect(tabs.nth(0)).toContainText('Summary');
+    await expect(tabs.nth(0)).toContainText('Response');
     await expect(tabs.nth(1)).toContainText('Sales Postgres');
     await expect(tabs.nth(2)).toContainText('Marketing Postgres');
     await expect(tabs.nth(2)).toContainText('Note');
@@ -2211,7 +2211,7 @@ test.describe('multi-database question answering', () => {
     // Postgres' second statement silently dropped).
     const tabs = page.locator('#resultsTabsNav .result-tab-btn');
     await expect(tabs).toHaveCount(4);
-    await expect(tabs.nth(0)).toContainText('Summary');
+    await expect(tabs.nth(0)).toContainText('Response');
     await expect(tabs.nth(1)).toContainText('Sales Postgres');
     await expect(tabs.nth(2)).toContainText('Sales Postgres');
     await expect(tabs.nth(3)).toContainText('Marketing Postgres');
@@ -2469,7 +2469,7 @@ test.describe('multi-database question answering', () => {
     await page.locator('#aiPrompt').press('Enter');
     await expect.poll(() => currentSql(page)).toContain('SELECT');
     await page.locator('#runBtn').click();
-    await page.locator('.result-tab-btn').filter({ hasText: 'Summary' }).click();
+    await page.locator('.result-tab-btn').filter({ hasText: 'Response' }).click();
     await expect(page.locator('.response-text')).toContainText('Sales Postgres has 1 deal');
 
     let secondRequestBody = null;
@@ -2577,7 +2577,7 @@ test.describe('multi-database question answering', () => {
     await page.locator('#aiPrompt').press('Enter');
     await expect.poll(() => currentSql(page)).toContain('SELECT');
     await page.locator('#runBtn').click();
-    await page.locator('.result-tab-btn').filter({ hasText: 'Summary' }).click();
+    await page.locator('.result-tab-btn').filter({ hasText: 'Response' }).click();
     await expect(page.locator('.response-text')).toContainText('Revenue is $500');
 
     // Switch to Sales Postgres (p-a) directly - the "sql" (executed)
@@ -2728,7 +2728,7 @@ test.describe('multi-database question answering', () => {
     await page.locator('#aiPrompt').press('Enter');
     await expect.poll(() => currentSql(page)).toContain('SELECT');
     await page.locator('#runBtn').click();
-    await page.locator('.result-tab-btn').filter({ hasText: 'Summary' }).click();
+    await page.locator('.result-tab-btn').filter({ hasText: 'Response' }).click();
     await expect(page.locator('.response-text')).toContainText('Revenue is $500');
 
     // Switch to Sales Postgres (p-a) directly and ask it a genuinely

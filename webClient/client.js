@@ -6722,6 +6722,13 @@ document.addEventListener('DOMContentLoaded', async () => {
       // jumpToChartableResultTab().
       const viewChartTrigger = e.target.closest('[data-view-chart-trigger]');
       if (viewChartTrigger) jumpToChartableResultTab(viewChartTrigger.dataset.viewChartTrigger);
+      // The Response tab's more general inline "[phrase](result:N)" links
+      // (see applyInlineResultLinks()/jumpToResultTab()) - same delegated-
+      // listener treatment as the chart trigger just above, its own
+      // sibling rather than a special case of it (see jumpToResultTab's
+      // own docstring for how the two differ).
+      const viewResultTrigger = e.target.closest('[data-view-result-trigger]');
+      if (viewResultTrigger) jumpToResultTab(viewResultTrigger.dataset.viewResultTrigger);
     });
   }
   // The header's "Send Feedback" button - a persistent element (unlike the
@@ -8983,11 +8990,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   // Thumbs up/down feedback row - shown under any direct, no-table model
-  // response: the Summary tab (see renderTableResult()'s own isText branch)
-  // - both "all databases" mode's own Summary tab (triage's routing message
+  // response: the Response tab (see renderTableResult()'s own isText branch)
+  // - both "all databases" mode's own Response tab (triage's routing message
   // + Phase C's own answer) and single-connection mode's equivalent (see
   // prependSingleModeSummaryTab()) render the exact same
-  // {isText:true, tabLabel:'Summary'} shape, so this one function covers
+  // {isText:true, tabLabel:'Response'} shape, so this one function covers
   // both - and a "*** NO SQL ***" conversational reply (see
   // renderNoSqlResponse() - the model's own direct answer instead of a
   // query, in either mode). Gated the same way reportButtonHtml() is -
@@ -9009,7 +9016,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (!ISSUE_REPORTING_ENABLED) return '';
     return `
       <div class="summary-feedback-row">
-        <span class="summary-feedback-label text-muted">Was this summary helpful?</span>
+        <span class="summary-feedback-label text-muted">Was this response helpful?</span>
         <span class="summary-feedback-btns">
           <button type="button" class="summary-feedback-btn summary-feedback-btn--up" data-summary-feedback-trigger="up" title="This summary was helpful">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.72a2 2 0 0 0 2-1.7l1.38-9a2 2 0 0 0-2-2.3zM7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3"></path></svg>
@@ -9035,8 +9042,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   // was never given a real web-search tool) - each link just opens the
   // user's own browser on a plain Google search for that exact query,
   // in a new tab, the same as if the user had typed it in themselves.
-  // `searches` may be undefined/null/empty (every non-"Summary" tab, and
-  // plenty of real Summary tabs too - see the prompts' own "far more
+  // `searches` may be undefined/null/empty (every non-"Response" tab, and
+  // plenty of real Response tabs too - see the prompts' own "far more
   // often than not, leave this empty" guidance) - returns '' for all of
   // those, same "nothing rendered at all" posture reportButtonHtml()/
   // summaryFeedbackButtonsHtml() already use for their own disabled
@@ -9451,7 +9458,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     // All-databases mode's own synthetic text tab entries (see
-    // renderAllModeCombinedResults() below) - a "Summary" tab built from
+    // renderAllModeCombinedResults() below) - a "Response" tab built from
     // the triage routing message, or a per-database "Note" tab built from
     // a '*** NO SQL ***' reply Phase B returned instead of real SQL.
     // Reuses the exact same `.response-cell`/`.response-text` markup
@@ -9473,14 +9480,14 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       const p = document.createElement('p');
       p.className = 'response-text';
-      // The "Summary" tab carries the leading-label convention (see
+      // The "Response" tab carries the leading-label convention (see
       // renderMarkdownLiteSummaryTab()'s own docstring) - a "Note" tab
       // (Phase B's own per-database '*** NO SQL ***' reply) never does,
       // so it's rendered plain like any other free-text reply.
-      p.innerHTML = result.tabLabel === 'Summary'
+      p.innerHTML = result.tabLabel === 'Response'
         ? renderMarkdownLiteSummaryTab(result.text || '')
         : renderMarkdownLite(result.text || '');
-      // Chart discoverability on the Summary tab is just the model's own
+      // Chart discoverability on the Response tab is just the model's own
       // inline "[phrase](chart:N)" link, already turned into a clickable
       // trigger by renderMarkdownLiteSummaryTab() -> applyInlineChartLinks()
       // above (see that function's own docstring). This used to ALSO show a
@@ -9497,24 +9504,24 @@ document.addEventListener('DOMContentLoaded', async () => {
       td.appendChild(p);
 
       // Suggested follow-up web searches (see suggestedSearchesHtml()'s
-      // own docstring) - shown on the SUMMARY tab only, same restriction
+      // own docstring) - shown on the RESPONSE tab only, same restriction
       // as the feedback row just below, since a per-database "Note" tab's
       // `.suggestedSearches` is never set in the first place (only the
-      // Summary tab entry itself ever carries this field - see
+      // Response tab entry itself ever carries this field - see
       // requestSingleModeResultsSummary()/requestAllModeResultsSummary()).
-      if (result.tabLabel === 'Summary') {
+      if (result.tabLabel === 'Response') {
         td.insertAdjacentHTML('beforeend', suggestedSearchesHtml(result.suggestedSearches));
       }
 
-      // Thumbs up/down feedback on the SUMMARY tab specifically (never a
+      // Thumbs up/down feedback on the RESPONSE tab specifically (never a
       // per-database "Note" tab) - see summaryFeedbackButtonsHtml()'s own
       // docstring. Rendered directly UNDER the summary text (not as a
       // heading above it), in both "all databases" mode (this tab's
       // routing message + Phase C answer) and single-connection mode (see
       // prependSingleModeSummaryTab()) - both build the exact same
-      // {isText:true, tabLabel:'Summary', ...} shape, so one check here
+      // {isText:true, tabLabel:'Response', ...} shape, so one check here
       // covers both. Gated on `!result.summaryPending`: "all databases"
-      // mode's Summary tab appears immediately with just triage's routing
+      // mode's Response tab appears immediately with just triage's routing
       // message, well before Phase C's real answer has actually rendered
       // underneath it (see renderAllModeCombinedResults'/
       // startAllModeStreaming's own `summaryPending` comments and
@@ -9522,10 +9529,10 @@ document.addEventListener('DOMContentLoaded', async () => {
       // clear it once Phase C has settled one way or another) - asking
       // "was this summary helpful" before there's even a Results Summary
       // to react to would be premature. Single-connection mode's own
-      // Summary tab (prependSingleModeSummaryTab) is only ever created
+      // Response tab (prependSingleModeSummaryTab) is only ever created
       // already fully formed, so it never sets this flag at all -
       // `undefined` is falsy, so it's unaffected by this gate.
-      if (result.tabLabel === 'Summary' && !result.summaryPending) {
+      if (result.tabLabel === 'Response' && !result.summaryPending) {
         td.insertAdjacentHTML('beforeend', summaryFeedbackButtonsHtml());
       }
 
@@ -9758,11 +9765,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   // that tab (see buildResultsTabsNav's own isError/default branches
   // below) - counting only entries that actually get a "Query N" label (a
   // real result or a failed statement), and skipping any leading or
-  // interspersed isText ("Summary"/"Note") or isPending (all-mode's own
+  // interspersed isText ("Response"/"Note") or isPending (all-mode's own
   // live-streaming placeholder) tabs entirely, since those never consume
   // a query number. Fixes a real regression: a single-connection turn with
-  // one query result AND a Summary tab used to label that one real tab
-  // "Query 2", never "Query 1", since the Summary tab itself occupied
+  // one query result AND a Response tab used to label that one real tab
+  // "Query 2", never "Query 1", since the Response tab itself occupied
   // position 0 and the old code numbered straight off the raw array index.
   function computeQueryNumbers(list) {
     const numbers = new Map();
@@ -9819,7 +9826,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         btn.textContent = `${dbLabel}${res.tabLabel || 'Fetching…'}`;
       } else if (isText) {
         // All-databases mode's own synthetic text tabs (see
-        // renderAllModeCombinedResults()) - a leading "Summary" tab (no
+        // renderAllModeCombinedResults()) - a leading "Response" tab (no
         // `.database`, so no name line) or a per-database "Note" tab (same
         // two-line convention as every other tab here).
         btn.textContent = `${dbLabel}${res.tabLabel || 'Note'}`;
@@ -9943,7 +9950,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   // Minimal, dependency-free Markdown-lite renderer for LLM free-text
-  // replies (single-connection NO-SQL answers, and the all-mode Summary/
+  // replies (single-connection NO-SQL answers, and the all-mode Response/
   // Note tabs - see renderNoSqlResponse() and the `isText` branch in
   // renderTableResult()) - these commonly come back with **bold**,
   // *italic*/_italic_ emphasis, and occasional `inline code`, which used
@@ -9951,8 +9958,9 @@ document.addEventListener('DOMContentLoaded', async () => {
   // was rendered via .textContent. Escapes HTML first (this is LLM
   // output, not trusted markup) then applies a deliberately small set of
   // inline substitutions - not a full Markdown parser (no lists or
-  // headings, and no GENERIC links - see applyInlineChartLinks below for
-  // the one specific link form this DOES understand), just the emphasis
+  // headings, and no GENERIC links - see applyInlineChartLinks/
+  // applyInlineResultLinks below for the two specific link forms this
+  // DOES understand), just the emphasis
   // these replies actually use. Newlines are left untouched -
   // .response-text's `white-space: pre-wrap` already renders them as line
   // breaks, same as before this function existed. Does NOT know anything
@@ -10000,9 +10008,38 @@ document.addEventListener('DOMContentLoaded', async () => {
     );
   }
 
+  // Converts the summarization prompts' own more general "[<short phrase>]
+  // (result:<index>)" inline link (see both prompts' paragraph just below
+  // the "visualizations"/chart one) into a clickable trigger - same
+  // .summary-chart-inline-link styling as a chart link (plain underlined
+  // inline text - see that rule's own comment in style.css, deliberately
+  // shared rather than duplicated so both kinds of reference read as the
+  // same thing to the user) plus its own data-view-result-trigger, wired
+  // to jumpToResultTab() via the delegated #resultsBody click listener.
+  // Unlike a chart link, this one never implies anything about
+  // "visualizations" at all - it exists purely so a claim in "summary"/
+  // "per_database"/"cross_database" can point back at ANY Query Result/
+  // database entry that backs it, charted or not, the same way a chart
+  // link points at a charted one. `index` is left exactly as the model
+  // wrote it (not validated against currentResultsList here), same
+  // defensive posture as applyInlineChartLinks above - jumpToResultTab()
+  // itself just no-ops on an unrecognized/invalid index rather than
+  // guessing. Run in the same pass as applyInlineChartLinks (see
+  // applyInlineMarkdown below) since the two patterns never overlap
+  // ("chart:" vs "result:" is unambiguous) and both must run before the
+  // emphasis substitutions, for the same reason applyInlineChartLinks
+  // already does.
+  function applyInlineResultLinks(escapedHtml) {
+    return escapedHtml.replace(
+      /\[([^\[\]\n]+)\]\(result:([^()\s]+)\)/g,
+      (_match, label, index) => `<button type="button" class="summary-chart-inline-link" data-view-result-trigger="${index}">${label}</button>`
+    );
+  }
+
   function applyInlineMarkdown(escapedHtml) {
     let html = escapedHtml;
     html = applyInlineChartLinks(html);
+    html = applyInlineResultLinks(html);
     // Code spans first, so a literal asterisk/underscore inside one isn't
     // then misread as emphasis syntax by the patterns below.
     html = html.replace(/`([^`\n]+)`/g, '<code>$1</code>');
@@ -10162,7 +10199,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   // restoration (restoreLatestTurn()) and for the manual-Execute-button
   // batched flow (executeSql()'s router-route branch, when auto-execute
   // was off) - live streaming turns render progressively instead, see
-  // startAllModeStreaming() and friends below. Merges a leading "Summary"
+  // startAllModeStreaming() and friends below. Merges a leading "Response"
   // text tab (built from the triage
   // call's routing message, when there is one), one "Note" text tab per
   // database that came back with a '*** NO SQL ***' reply instead of real
@@ -10187,7 +10224,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     // C-call-coming text - see summaryFeedbackButtonsHtml()'s own gating
     // on `!result.summaryPending`.
     const summaryTab = routingMessage
-      ? [{ isText: true, tabLabel: 'Summary', text: SUMMARY_TAB_BLOCK_MARKER + routingMessage, summaryPending: !!summaryPending }]
+      ? [{ isText: true, tabLabel: 'Response', text: SUMMARY_TAB_BLOCK_MARKER + routingMessage, summaryPending: !!summaryPending }]
       : [];
     const noteTabs = databaseNotes.map((n) => ({
       isText: true,
@@ -10284,14 +10321,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     return entries;
   }
 
-  // Patches Phase C's summary text into the Summary tab already built by
+  // Patches Phase C's summary text into the Response tab already built by
   // renderAllModeCombinedResults - re-renders in place only if that tab
   // happens to be the one currently showing, so it doesn't yank the user
   // back to a tab they've since navigated away from while this was in
   // flight.
   function appendPhaseCSummaryToSummaryTab(summaryText) {
     if (!currentResultsList || !currentResultsList.length) return;
-    const summaryEntry = currentResultsList.find((r) => r.isText && r.tabLabel === 'Summary');
+    const summaryEntry = currentResultsList.find((r) => r.isText && r.tabLabel === 'Response');
     if (!summaryEntry) return;
     // Phase C's own text always gets its own SUMMARY_TAB_BLOCK_MARKER
     // (see its docstring) so its leading label is bolded regardless of
@@ -10321,10 +10358,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   // detail underneath it reads as a distinct, secondary line - same
   // visual treatment as a real summary, just carrying an apology instead
   // of an answer, so the user sees WHY no summary appeared instead of the
-  // Summary tab just silently staying as triage's routing message forever.
+  // Response tab just silently staying as triage's routing message forever.
   function appendPhaseCErrorToSummaryTab(errorText) {
     if (!currentResultsList || !currentResultsList.length) return;
-    const summaryEntry = currentResultsList.find((r) => r.isText && r.tabLabel === 'Summary');
+    const summaryEntry = currentResultsList.find((r) => r.isText && r.tabLabel === 'Response');
     if (!summaryEntry) return;
     summaryEntry.text = summaryEntry.text
       ? `${summaryEntry.text}\n\n${SUMMARY_TAB_BLOCK_MARKER}${errorText}`
@@ -10370,7 +10407,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Returns { databaseSummaries, crossDatabaseSummary } on success -
   // translate_routes.py's /api/summarize-results now additionally returns
   // these two structured fields alongside the plain joined `summary` this
-  // function has always patched into the Summary tab (see that route's own
+  // function has always patched into the Response tab (see that route's own
   // docstring: `database_summaries` is one {kind, id, name, text} entry per
   // in-scope database, `cross_database_summary` is the separate paragraph
   // spanning more than one database, or null). Every call site forwards
@@ -10463,17 +10500,17 @@ document.addEventListener('DOMContentLoaded', async () => {
   // captureAllModeHistory() below.
   function getSummaryTabEntry() {
     if (!currentResultsList) return null;
-    return currentResultsList.find((r) => r.isText && r.tabLabel === 'Summary') || null;
+    return currentResultsList.find((r) => r.isText && r.tabLabel === 'Response') || null;
   }
 
   // Safety net for requestAllModeResultsSummary()'s own early-return cases
   // (nothing worth summarizing - every database noted/failed - or the
   // request itself errored/aborted) - none of those ever call
   // appendPhaseCSummaryToSummaryTab/appendPhaseCErrorToSummaryTab, so
-  // without this the Summary tab's `summaryPending` flag would stay true
+  // without this the Response tab's `summaryPending` flag would stay true
   // forever even though triage's routing message IS this turn's final,
-  // unchanging Summary tab content at that point - permanently hiding the
-  // "Was this summary helpful?" prompt for a turn that will never get a
+  // unchanging Response tab content at that point - permanently hiding the
+  // "Was this response helpful?" prompt for a turn that will never get a
   // real Phase C answer. Called after every requestAllModeResultsSummary()
   // call site, right alongside where each already re-reads
   // getSummaryTabEntry() to persist the (possibly unchanged) text into
@@ -10859,23 +10896,39 @@ document.addEventListener('DOMContentLoaded', async () => {
   // per-index visualization objects are attached to each independently,
   // by each call's own caller.
   function attachVisualizationsToResultsList(list, visualizationsByIndex) {
-    if (!visualizationsByIndex || !Array.isArray(list)) return;
-    Object.keys(visualizationsByIndex).forEach((key) => {
-      const index = Number(key);
-      if (!Number.isInteger(index) || index < 0 || index >= list.length) return;
-      const entry = list[index];
-      if (entry && typeof entry === 'object') {
-        entry.visualization = visualizationsByIndex[key];
+    if (!Array.isArray(list)) return;
+    // `resultIndex` is tagged on EVERY entry, unconditionally - even a
+    // turn with nothing chartable at all (`visualizationsByIndex` falsy
+    // or {}) still needs this, since the model's more general inline
+    // "[phrase](result:N)" reference link (see applyInlineResultLinks()/
+    // jumpToResultTab() below) can point at any Query Result/database
+    // entry, not only a charted one. This is the SAME 0-based index both
+    // summarization prompts' "Query Result N"/"[i] name" labels and
+    // "chart:N"/"result:N" inline links are keyed by (see chart_helpers.
+    // py's _pick_chartable_results/_describe_chartable_results and
+    // summarize_routes.py's _build_single_summary_prompt/_build_summary_
+    // prompt) - each entry's own position in THIS list, before whatever
+    // gets prepended ahead of it (a Response tab, most commonly).
+    const visByIndex = visualizationsByIndex || {};
+    list.forEach((entry, index) => {
+      if (!entry || typeof entry !== 'object') return;
+      entry.resultIndex = index;
+      const visualization = visByIndex[index];
+      if (visualization) {
+        entry.visualization = visualization;
         // The model's own inline "[phrase](chart:N)" link (see
         // applyInlineChartLinks()) writes N as this SAME key - which is
         // NOT necessarily this entry's own position in currentResultsList
         // by the time that link is clicked (single-connection mode
-        // prepends a Summary tab at index 0 AFTER this function runs -
+        // prepends a Response tab at index 0 AFTER this function runs -
         // see prependSingleModeSummaryTab() - shifting every real result
         // down by one). jumpToChartableResultTab() below matches on this
         // tagged value instead of assuming its own `index` argument is a
         // literal currentResultsList position, so it still lands on the
-        // right tab regardless of whatever's prepended ahead of it.
+        // right tab regardless of whatever's prepended ahead of it. Kept
+        // as its own field (rather than reusing `resultIndex` directly)
+        // so jumpToChartableResultTab()'s existing match condition below
+        // doesn't need to change.
         entry.visualizationIndex = index;
       }
     });
@@ -11021,6 +11074,35 @@ document.addEventListener('DOMContentLoaded', async () => {
     renderTableResult(entry);
   }
 
+  // The general-purpose sibling of jumpToChartableResultTab() just above -
+  // backs the model's own inline "[phrase](result:N)" reference link (see
+  // applyInlineResultLinks()), which can point at ANY Query Result/
+  // database entry, not only a charted one, so this jumps straight to
+  // that tab AS-IS (whatever Table/Chart state it already happens to be
+  // in) rather than forcing chart view the way jumpToChartableResultTab()
+  // does - that function's whole point is "show me the chart this text
+  // is about"; this one's is just "show me the tab this text is about".
+  // Matched by the same `resultIndex` tag attachVisualizationsToResultsList()
+  // now attaches to every entry (see its own docstring for why a raw
+  // array-position lookup would land one tab off once a Response tab is
+  // prepended ahead of it). No "first chartable tab" fallback the way
+  // jumpToChartableResultTab() has, since there's no single sensible
+  // default result to jump to for a plain reference link - an
+  // unrecognized/invalid index (a hallucinated or out-of-range model
+  // index, or a list that was never tagged at all) just no-ops, same as
+  // clicking a dead link would.
+  function jumpToResultTab(index) {
+    if (!currentResultsList) return;
+    const requested = Number(index);
+    const idx = Number.isInteger(requested)
+      ? currentResultsList.findIndex((r) => r && r.resultIndex === requested)
+      : -1;
+    if (idx < 0) return;
+    activeResultIndex = idx;
+    buildResultsTabsNav();
+    renderTableResult(currentResultsList[idx]);
+  }
+
   // --- Single-connection mode's own post-execution results summarization ---
   //
   // The single-connection equivalent of "all databases" mode's Phase C
@@ -11030,8 +11112,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   // insight over the real, untruncated results (server-side: /api/
   // summarize-result, singular - see translate_routes.py's docstring on
   // that route for why it's untruncated, unlike Phase C). Presented as a
-  // new LEADING "Summary" tab, same shape/label/marker convention as
-  // Phase C's own Summary tab, per this feature's own confirmed design
+  // new LEADING "Response" tab, same shape/label/marker convention as
+  // Phase C's own Response tab, per this feature's own confirmed design
   // (mirrors all-mode's Phase C presentation exactly).
 
   // Fire-and-await (see executeSql()'s call site - already inside an
@@ -11094,15 +11176,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
-  // Prepends a leading "Summary" tab onto currentResultsList (already
+  // Prepends a leading "Response" tab onto currentResultsList (already
   // built by renderMultiTurnResults() just before this is called) and
-  // makes it the active tab - the "new leading Summary tab" placement
+  // makes it the active tab - the "new leading Response tab" placement
   // this feature's design confirmed. Safe to call with a falsy
   // `summaryText` (no-op), so callers don't need their own guard.
   function prependSingleModeSummaryTab(summaryText, suggestedSearches) {
     if (!summaryText || !currentResultsList) return;
     currentResultsList = [
-      { isText: true, tabLabel: 'Summary', text: summaryText, suggestedSearches: suggestedSearches || [] },
+      { isText: true, tabLabel: 'Response', text: summaryText, suggestedSearches: suggestedSearches || [] },
       ...currentResultsList,
     ];
     activeResultIndex = 0;
@@ -11112,25 +11194,25 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // Same idea as prependSingleModeSummaryTab just above, for a FAILED
   // execution (see executeSql()'s two single-connection failure branches)
-  // - deliberately does NOT jump the active tab to the new Summary entry
+  // - deliberately does NOT jump the active tab to the new Response entry
   // the way the success-path helper above does. All-mode's own equivalent
   // (appendPhaseCSummaryToSummaryTab/appendPhaseCErrorToSummaryTab) never
   // disturbs whatever tab the user is currently looking at either - it
-  // only re-renders if the Summary tab HAPPENS to already be active - and
+  // only re-renders if the Response tab HAPPENS to already be active - and
   // the same reasoning applies here even more strongly: the tab the user
   // is looking at when this fires is the error itself, which is what
   // needs their attention. Silently swapping that out for an LLM-written
   // apology mid-read the moment the (often very fast, sometimes near-
   // instant) summarization call resolves would be a jarring, timing-
   // dependent surprise, not the helpful addition this feature is meant to
-  // be - so this only grows the tab strip with a new (inactive) "Summary"
+  // be - so this only grows the tab strip with a new (inactive) "Response"
   // tab the user can click into if they want it, leaving the already-
   // rendered error exactly as it is. Safe to call with a falsy
   // `summaryText` (no-op), same as the function above.
   function prependSingleModeSummaryTabPreservingActiveTab(summaryText, suggestedSearches) {
     if (!summaryText || !currentResultsList) return;
     currentResultsList = [
-      { isText: true, tabLabel: 'Summary', text: summaryText, suggestedSearches: suggestedSearches || [] },
+      { isText: true, tabLabel: 'Response', text: summaryText, suggestedSearches: suggestedSearches || [] },
       ...currentResultsList,
     ];
     activeResultIndex += 1;
@@ -11298,7 +11380,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     // there catches even the case where Phase C ends up with nothing to
     // summarize - see that function's own docstring.
     const summaryTab = allModeStreamState.routingMessage
-      ? [{ isText: true, tabLabel: 'Summary', text: SUMMARY_TAB_BLOCK_MARKER + allModeStreamState.routingMessage, summaryPending: true }]
+      ? [{ isText: true, tabLabel: 'Response', text: SUMMARY_TAB_BLOCK_MARKER + allModeStreamState.routingMessage, summaryPending: true }]
       : [];
     const placeholderTabs = connectionSelection.map((e) => ({
       isPending: true,

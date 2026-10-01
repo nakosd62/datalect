@@ -45,6 +45,48 @@ from helpers import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_state_store_cwd(monkeypatch, tmp_path):
+    """Autouse for EVERY test collected under this directory, regardless of
+    whether it uses app_factory/fresh_import at all - closes a real leak
+    found in production: state_store.py's SqliteStateStore stores its db
+    path as a plain relative string ("state/ydyl_state.db", see app_
+    config.py's TRANSLATION_STATS_DB_PATH) and calls sqlite3.connect() on
+    it FRESH on every single read/write, so it's the process's CURRENT cwd
+    at call time - not whatever cwd was in effect when the SqliteStateStore
+    object was constructed - that decides which file actually gets
+    touched. fresh_import() already handles this for any test that goes
+    through it (see its own docstring: chdir into a fresh tmp_path before
+    importing app_config) - but several bare unit tests (e.g. tests/server/
+    test_connection_router.py's several run_triage_call(...) tests) call
+    straight into business-logic functions that log real usage via
+    app_config.py's module-level `state_store` singleton, without ever
+    calling app_factory/fresh_import at all. Those tests were writing
+    real rows into the actual repo's real state/ydyl_state.db every time
+    this suite ran (call_type="triage", model="m" - the exact placeholder
+    those tests pass - root-caused from a real report of exactly that
+    turning up in production).
+
+    Chdir'ing into `tmp_path` (pytest's own fresh, empty per-test
+    directory) before every single test closes this regardless of which
+    test it is or whether it happens to call fresh_import() itself - and
+    doing so is always safe to combine with that: fresh_import() receives
+    the SAME tmp_path instance for this same test (pytest caches a
+    fixture's value per test, however many other fixtures request it), so
+    its own monkeypatch.chdir call is just a harmless re-chdir into the
+    directory this fixture already moved into, not a conflicting second
+    location. The "state" subdirectory is pre-created here too (mirroring
+    what state_store.init() would otherwise do, but that method is never
+    called at all by the bare tests this fixture exists for) so a bare
+    test's own record_llm_usage()/etc. call actually succeeds into an
+    isolated tmp file instead of silently failing (record_llm_usage
+    swallows its own exceptions - see its own try/except - so this isn't
+    required for isolation itself, only to avoid spurious "Error recording
+    LLM usage" log noise during a normal test run)."""
+    monkeypatch.chdir(tmp_path)
+    os.makedirs(os.path.join(tmp_path, "state"), exist_ok=True)
+
+
 @pytest.fixture
 def app_factory(monkeypatch, tmp_path):
     """Returns a callable `build(env=None, register_blueprints=True)` that

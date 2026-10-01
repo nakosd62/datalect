@@ -688,6 +688,29 @@ def build_openai_history_messages(history):
     return messages
 
 
+# --- Prompt caching: intentionally disabled for all three providers ------
+#
+# All three provider calls below used to lean on prompt caching (Claude
+# explicitly via cache_control markers, OpenAI/Gemini via each SDK's
+# automatic "implicit caching"). Real usage data showed writes dominating
+# the bill with almost nothing recouped from reads - at this app's current
+# call volume, the same stable prefix rarely recurs before a cache entry's
+# TTL expires (Claude's default is 5 minutes, OpenAI's is a fixed 30 -
+# there's no way to lengthen either), so nearly every call pays a write
+# without ever getting read back.
+#
+# Claude and OpenAI both expose a real request-level opt-out, used below:
+# Claude by simply never marking a content block cache_control (a block is
+# only ever cached if explicitly marked), OpenAI via
+# prompt_cache_options={"mode": "explicit"} with no breakpoints placed (see
+# _call_openai's docstring). Gemini has no such opt-out in this SDK - its
+# implicit caching applies unconditionally server-side, and the only
+# caching-related field GenerateContentConfig exposes (`cached_content`) is
+# for a separate, opt-in "pre-created cache object" flow this app doesn't
+# use - so _call_gemini below is unchanged and Gemini calls may still
+# incur cache-write costs that this codebase has no lever to turn off.
+
+
 def _call_gemini(client, model, contents, system_instruction):
     """One Gemini generate_content call. Returns (text, usage_dict) - the
     usage_dict shape is shared with _call_claude below so the retry loop
@@ -701,7 +724,12 @@ def _call_gemini(client, model, contents, system_instruction):
     stream_translation() already does structurally (putting the large,
     stable schema/history content ahead of the ever-changing new prompt).
     Cache hits are reported back via usage_metadata.cached_content_token_count,
-    surfaced below the same way a real cache read is for Claude."""
+    surfaced below the same way a real cache read is for Claude.
+
+    Unlike _call_claude/_call_openai below, there is no request-level way
+    to turn this off (see the note above _call_gemini) - the only
+    caching-related field on GenerateContentConfig is `cached_content`,
+    for an unrelated opt-in flow this app doesn't use."""
     response = client.models.generate_content(
         model=model,
         contents=contents,
@@ -736,22 +764,16 @@ def _call_gemini(client, model, contents, system_instruction):
 
 
 def _mark_claude_cache_boundary(message):
-    """Converts a plain {"role", "content": <str>} message (the shape
-    build_claude_history_messages()/translate_query() build) into
-    Anthropic's content-block form, with an ephemeral cache_control marker
-    on that block. Claude has no automatic/implicit caching the way Gemini
-    2.5+ does (see _call_gemini's docstring and this module's docstring) -
-    a block only ever gets cached if explicitly marked like this. Marking
-    it here means everything up to and including this message - system
-    prompt, schema, and all history through this point - becomes a
-    candidate cached prefix; see translate_query()'s comment on why the
-    last already-accumulated history turn (not the ever-changing new
-    prompt at the end) is the right message to mark."""
-    message["content"] = [{
-        "type": "text",
-        "text": message["content"],
-        "cache_control": {"type": "ephemeral"},
-    }]
+    """Formerly converted a plain {"role", "content": <str>} message into
+    Anthropic's content-block form with an ephemeral cache_control marker,
+    making everything up to and including this message a candidate cached
+    prefix (system prompt, schema, and all history through this point).
+    Prompt caching is currently turned off for all three providers (see
+    the note above _call_gemini), so this is now a no-op that leaves
+    `message` untouched - kept, rather than removed or uncalled, so
+    build_llm_input()'s call site doesn't need to change and re-enabling
+    caching later is a one-line revert of this function's body."""
+    pass
 
 
 def _call_claude(client, model, messages, system_instruction):
@@ -765,21 +787,15 @@ def _call_claude(client, model, messages, system_instruction):
     low-variance SQL generation anyway, and these models are tuned for
     that by default without needing temperature pinned to near-0.
 
-    The system prompt (dialect_intro + the fixed formatting rules) is sent
-    as its own cache_control-marked block - it's identical on every call
-    for a given dialect, so caching it benefits every session using that
-    dialect, not just one conversation. Below Anthropic's per-model
-    minimum cacheable size (1024 tokens for Sonnet, more for Haiku) this
-    marker is simply a no-op - no error, the content just isn't written to
-    the cache - so marking it unconditionally is always safe."""
+    Prompt caching is turned off (see the note above _call_gemini for
+    why): system is sent as a plain string, not a cache_control-marked
+    content block. Anthropic only ever writes to the cache when a block
+    is explicitly marked like that, so a plain string here guarantees
+    this call never pays a cache-write cost."""
     response = client.messages.create(
         model=model,
         max_tokens=4096,
-        system=[{
-            "type": "text",
-            "text": system_instruction,
-            "cache_control": {"type": "ephemeral"},
-        }],
+        system=system_instruction,
         messages=messages,
     )
     text = "".join(block.text for block in response.content if block.type == "text").strip()
@@ -819,19 +835,25 @@ def _call_openai(client, model, llm_input, system_instruction):
     this app defaults to, and real OpenAI in general) reject sampling
     parameters outright rather than silently ignoring them.
 
-    No explicit cache markers here either, unlike _call_claude's
-    cache_control blocks: like Gemini 2.5+ (see _call_gemini's docstring),
-    OpenAI's prompt caching is on by default for supported models with no
-    opt-in call or parameter required - `instructions` (this app's fixed,
-    per-dialect system prompt) plus the stable leading portion of `input`
-    this app already structures schema/history to form (see
-    translate_query()'s comment on why the schema goes as far to the front
-    as possible) is exactly the kind of repeated, stable prefix that gets
-    reused automatically."""
+    Prompt caching is turned off here (see the note above _call_gemini for
+    why): unlike Gemini, OpenAI's Responses API takes a
+    `prompt_cache_options` param that can disable caching outright, passed
+    below as {"mode": "explicit"} with no explicit breakpoints anywhere in
+    `input` - per the SDK's own PromptCacheOptions docstring, that means
+    "the request does not use prompt caching" at all. Left at the default
+    ("implicit"), OpenAI would instead write an automatic cache breakpoint
+    on every single call - `instructions` (this app's fixed, per-dialect
+    system prompt) plus the stable leading portion of `input` this app
+    already structures schema/history to form (see translate_query()'s
+    comment on why the schema goes as far to the front as possible) is
+    exactly the kind of repeated, stable prefix that default would target,
+    which is exactly the write-without-recouping-the-read pattern that
+    made this worth turning off."""
     response = client.responses.create(
         model=model,
         instructions=system_instruction,
         input=llm_input,
+        prompt_cache_options={"mode": "explicit"},
     )
     text = (response.output_text or "").strip()
     usage = response.usage
@@ -1106,30 +1128,23 @@ class ClaudeProvider(LlmProvider):
         messages = build_claude_history_messages(history)
         if messages:
             messages[0]["content"] = schema_block + messages[0]["content"]
-            # Marks the end of the accumulated (stable) prefix - see
-            # _mark_claude_cache_boundary's docstring and this module's
-            # (formerly translate_query()'s) comment on why the last
-            # already-accumulated history turn, not the ever-changing new
-            # prompt, is the right message to mark.
+            # Formerly marked the end of the accumulated (stable) prefix
+            # for caching - now a no-op (see _mark_claude_cache_boundary's
+            # docstring and the note above _call_gemini on why caching is
+            # off). Kept as a call site so re-enabling it later is a
+            # one-line change in that function alone.
             _mark_claude_cache_boundary(messages[-1])
             messages.append({"role": "user", "content": new_prompt_content})
         elif schema_block:
-            # A conversation's very first call - split into two content
-            # blocks on one message so the schema half can still be
-            # cache_control-marked independently of the ever-different new
-            # prompt right after it (see _mark_claude_cache_boundary's
-            # docstring for why concatenating the two into one marked
-            # string would be wrong).
+            # A conversation's very first call - with caching off there's
+            # no reason to split the schema into its own content block
+            # anymore (that split only ever existed so the schema half
+            # could be cache_control-marked independently - see the note
+            # above _call_gemini), so it's concatenated into one plain
+            # string, same as the history branch above.
             messages.append({
                 "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": schema_block,
-                        "cache_control": {"type": "ephemeral"},
-                    },
-                    {"type": "text", "text": new_prompt_content},
-                ],
+                "content": schema_block + new_prompt_content,
             })
         else:
             # No history AND no schema block at all - e.g.
