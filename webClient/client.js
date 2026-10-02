@@ -8032,6 +8032,21 @@ document.addEventListener('DOMContentLoaded', async () => {
         </button>
       </li>`;
 
+    // Pinned "ER Diagram" row, right under Overview - see
+    // renderSchemaViewerDiagramDetail()'s own docstring for why this used
+    // to just be the last block inside the Overview tab instead. Unlike
+    // Overview, this one is left out entirely (same "nothing useful to
+    // click into" reasoning the collapsible groups below already use)
+    // when this load has no relationships to diagram at all, rather than
+    // shown as an empty row that just says so.
+    const hasDiagram = schemaViewerHasDiagram();
+    const diagramItem = hasDiagram ? `
+      <li>
+        <button type="button" class="schema-viewer-entry-item schema-viewer-overview-item${schemaViewerSelected.category === 'diagram' ? ' active' : ''}" data-category="diagram" data-index="0" title="ER Diagram">
+          ER Diagram
+        </button>
+      </li>` : '';
+
     const groupsHtml = groups.map((g) => {
       const expanded = schemaViewerExpanded[g.key];
       const children = expanded ? g.list.map((item, index) => `
@@ -8050,7 +8065,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         </li>`;
     }).join('');
 
-    schemaViewerEntryList.innerHTML = overviewItem + groupsHtml;
+    schemaViewerEntryList.innerHTML = overviewItem + diagramItem + groupsHtml;
 
     schemaViewerEntryList.querySelectorAll('.schema-viewer-group-header').forEach((btn) => {
       btn.addEventListener('click', () => {
@@ -8070,6 +8085,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     // rather than the first table, the way this used to default before
     // Overview existed.
     const stillValid = schemaViewerSelected.category === 'overview'
+      || (schemaViewerSelected.category === 'diagram' && hasDiagram)
       || (schemaViewerSelected.category
         && groups.find((g) => g.key === schemaViewerSelected.category)?.list[schemaViewerSelected.index] !== undefined);
     if (!stillValid) {
@@ -8236,21 +8252,10 @@ document.addEventListener('DOMContentLoaded', async () => {
       <li><button type="button" class="schema-viewer-suggested-question" data-question="${escapeHtml(q)}">${escapeHtml(q)}</button></li>
     `).join('');
 
-    // Whether there's actually a diagram to show - computed up front
-    // (same inputs/logic renderSchemaErDiagram() below uses) so the whole
-    // "diagram-wrap" block, not just its inner placeholder text, can be
-    // left out entirely when there's nothing to diagram, rather than
-    // rendering an empty-looking box with a "no relationships" message
-    // inside it.
-    const tableNames = schemaViewerEntries.filter((e) => e.name !== null).map((e) => e.name);
-    const hasDiagram = !!buildSchemaErDiagram(tableNames, schemaViewerForeignKeys, schemaViewerNamingRelationships);
-
-    // Diagram last: the facts block, the AI prose, and the suggested
-    // questions are all short, text-first ways to get oriented quickly;
-    // the ER diagram is the most visually heavy element here (and the one
-    // most likely to need real vertical scroll room for a schema with
-    // several tables), so it goes at the very bottom of the Overview tab
-    // rather than between the prose and the questions.
+    // The ER diagram used to render at the very bottom of this tab - it's
+    // now its own pinned "ER Diagram" tree row right under this one (see
+    // renderSchemaViewerDiagramDetail() below and renderSchemaViewerEntryList()'s
+    // own comment on that row), so this tab stays prose + questions only.
     schemaViewerOverviewWrap.innerHTML = `
       ${statsHtml}
       <p class="schema-viewer-overview-prose">${escapeHtml(schemaViewerOverview.prose || '')}</p>
@@ -8258,10 +8263,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         <div class="schema-viewer-overview-questions-block">
           <div class="schema-viewer-overview-questions-title">Questions you could ask</div>
           <ul class="schema-viewer-overview-questions">${questionsHtml}</ul>
-        </div>` : ''}
-      ${hasDiagram ? `
-        <div class="schema-viewer-overview-diagram-wrap">
-          <div class="schema-viewer-overview-diagram" id="schemaViewerErDiagram"><p class="text-muted schema-viewer-overview-empty">Rendering diagram...</p></div>
         </div>` : ''}
     `;
 
@@ -8286,15 +8287,64 @@ document.addEventListener('DOMContentLoaded', async () => {
         translatePrompt();
       });
     });
+  }
 
-    // Only bother actually rendering (a real, non-trivial Mermaid call)
-    // when the diagram-wrap block above was actually included -
-    // renderSchemaErDiagram() would otherwise just no-op on a missing
-    // #schemaViewerErDiagram container anyway, but skipping the call
-    // entirely makes that "nothing to do here" explicit at the call site
-    // rather than implicit in a function most readers would expect to
-    // always find a container.
-    if (hasDiagram) renderSchemaErDiagram();
+  // Whether this load actually has an ER diagram to show - same inputs/
+  // logic renderSchemaErDiagram() itself uses, computed independently
+  // here (rather than cached) wherever something needs to know in
+  // advance, so it stays correct across a schema reload without needing
+  // its own invalidation. Used both to decide whether the pinned "ER
+  // Diagram" tree row shows up at all (renderSchemaViewerEntryList()) and
+  // to validate a stale selection pointing at it (same function).
+  function schemaViewerHasDiagram() {
+    const tableNames = schemaViewerEntries.filter((e) => e.name !== null).map((e) => e.name);
+    return !!buildSchemaErDiagram(tableNames, schemaViewerForeignKeys, schemaViewerNamingRelationships);
+  }
+
+  // Fills the detail pane for the pinned "ER Diagram" entry - just the
+  // deterministically-built (never LLM-generated) ER diagram, rendered via
+  // Mermaid (see buildSchemaErDiagram()/renderSchemaErDiagram() above).
+  // Used to be the last block inside the Overview tab (see
+  // renderSchemaViewerOverviewDetail() above); split out into its own
+  // pinned tree row, right under Overview, per an explicit request - a
+  // schema with a lot of relationships made for a long scroll past the
+  // prose/questions to get to it, and it's substantial enough content to
+  // deserve its own place in the tree rather than living at the bottom of
+  // another entry's tab. Shares schemaViewerOverviewWrap as its mount
+  // point (a plain generic container, not actually Overview-specific) and
+  // the same #schemaViewerErDiagram render target renderSchemaErDiagram()
+  // already queries - safe, since only one category's content is ever in
+  // that wrap at a time.
+  function renderSchemaViewerDiagramDetail() {
+    if (schemaViewerDetailHeading) {
+      schemaViewerDetailHeading.textContent = 'ER Diagram';
+      schemaViewerDetailHeading.title = '';
+    }
+    if (schemaViewerTableCommentText) schemaViewerTableCommentText.classList.add('hidden');
+    if (schemaViewerColumnsWrap) schemaViewerColumnsWrap.classList.add('hidden');
+    if (schemaViewerColumnsBody) schemaViewerColumnsBody.innerHTML = '';
+    if (schemaViewerDetailText) {
+      schemaViewerDetailText.textContent = '';
+      schemaViewerDetailText.classList.add('hidden');
+    }
+    if (!schemaViewerOverviewWrap) return;
+    schemaViewerOverviewWrap.classList.remove('hidden');
+
+    if (!schemaViewerHasDiagram()) {
+      // Defensive only - the tree row that leads here is itself left out
+      // whenever this is false (see renderSchemaViewerEntryList()), so in
+      // practice this only shows if the underlying schema changed out
+      // from under an already-selected diagram row.
+      schemaViewerOverviewWrap.innerHTML = '<p class="text-muted schema-viewer-overview-empty">No table relationships were detected to diagram.</p>';
+      return;
+    }
+
+    schemaViewerOverviewWrap.innerHTML = `
+      <div class="schema-viewer-overview-diagram-wrap">
+        <div class="schema-viewer-overview-diagram" id="schemaViewerErDiagram"><p class="text-muted schema-viewer-overview-empty">Rendering diagram...</p></div>
+      </div>
+    `;
+    renderSchemaErDiagram();
   }
 
   function selectSchemaViewerEntry(category, index) {
@@ -8305,6 +8355,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     if (category === 'overview') {
       return renderSchemaViewerOverviewDetail();
+    }
+    if (category === 'diagram') {
+      return renderSchemaViewerDiagramDetail();
     }
     if (category === 'views') {
       const view = schemaViewerViews[index];
@@ -10321,23 +10374,117 @@ document.addEventListener('DOMContentLoaded', async () => {
     return entries;
   }
 
+  // New combine step (server/combine_routes.py) - runs BEFORE Phase C,
+  // only when triage set "needs_combination": true (connection_router.py's
+  // "sql" outcome) AND there are at least two real (non-note, non-failure)
+  // results to actually relate - the second half is re-checked here
+  // client-side too (same as combine_routes.py's own _combinable_entries),
+  // purely so a turn with only one real result never even makes the round
+  // trip, not as a substitute for the server's own check.
+  //
+  // On success, APPENDS a new entry onto `executeResults` (mutating it in
+  // place, same convention attachVisualizationsToResultsList already
+  // uses) tagged with the position it now occupies - since executeResults
+  // is always the FIRST segment buildAllModeSummaryPayload concatenates
+  // into `database_results`, this is the exact same "[i]" index Phase C's
+  // own prompt and client.js's result:N/chart:N links already use for
+  // every other database's own result, so the combined tab is reachable
+  // through that same mechanism with no changes to it. Also pushes the
+  // identical object onto currentResultsList (see appendCombinedResultTab)
+  // so it renders as one more tab, same shape as any other database
+  // result (buildResultsTabsNav reads res.database.name/res.rowCount/
+  // res.truncated generically - nothing new needed there either).
+  //
+  // Never throws, never blocks the turn - a failed/skipped/rejected
+  // combine is logged (console.warn/console.error) and Phase C simply
+  // runs over the per-database results exactly as it would have anyway,
+  // same "honest failure, don't block the rest of the turn" posture
+  // appendPhaseCErrorToSummaryTab already gives a failed Phase C itself.
+  async function requestAllModeCombinedResults(notes, executeResults, executeFailures) {
+    if (!notes || !notes.prompt || !notes.needsCombination) return;
+    const databaseResults = buildAllModeSummaryPayload(notes, executeResults, executeFailures);
+    const combinableCount = databaseResults.filter((e) => 'columns' in e).length;
+    if (combinableCount < 2) return;
+
+    try {
+      const response = await fetch('/api/combine-results', {
+        method: 'POST',
+        headers: getApiHeaders(),
+        credentials: 'same-origin',
+        signal: currentAbortController ? currentAbortController.signal : undefined,
+        body: JSON.stringify({ prompt: notes.prompt, database_results: databaseResults }),
+      });
+      const data = await readNdjsonStream(response, (evt) => {
+        if (evt.status === 'retrying') showRetryStatus(evt);
+      });
+      if (response.ok && data && data.success && !data.skipped && data.result) {
+        const r = data.result;
+        const combinedEntry = {
+          statement: r.sql || '',
+          columns: r.columns || [],
+          rows: r.rows || [],
+          rowCount: r.rowCount,
+          // Plain "Combined Dataset" rather than naming every source
+          // database (e.g. "Combined (Sales Postgres + Marketing
+          // Postgres)") - the per-database tabs already right next to it
+          // make the sources obvious, and the parenthesized list got
+          // long/cluttered with more than two databases.
+          database: { kind: 'combined', id: 'combined', name: 'Combined Dataset' },
+          resultIndex: executeResults.length,
+        };
+        if (r.truncated) combinedEntry.truncated = true;
+        executeResults.push(combinedEntry);
+        appendCombinedResultTab(combinedEntry);
+      } else if (data && data.error) {
+        // Never shown as its own UI element - same posture this
+        // function's own sibling (requestAllModeResultsSummary)'s catch
+        // block below takes for a technical failure: Phase C still runs
+        // over the per-database results exactly as it would have anyway.
+        console.warn('Could not combine all-mode results:', data.error);
+      }
+    } catch (err) {
+      if (err && err.name === 'AbortError') return;
+      console.error('Failed to combine all-mode results:', err);
+    }
+  }
+
+  // Adds ONE more tab to the already-built currentResultsList (rather than
+  // rebuilding it from scratch the way renderAllModeCombinedResults does) -
+  // used only by requestAllModeCombinedResults above, since by the time it
+  // resolves every per-database tab has already been built (progressively,
+  // for the live-streaming path, or all at once for the pendingAllModeNotes
+  // fallback) and Phase C itself never adds new tabs, only patches the
+  // Response tab's own text in place (appendPhaseCSummaryToSummaryTab) -
+  // this is the one case that genuinely needs a new tab to appear after
+  // the initial render.
+  function appendCombinedResultTab(combinedEntry) {
+    if (!currentResultsList) return;
+    currentResultsList.push(combinedEntry);
+    buildResultsTabsNav();
+  }
+
   // Patches Phase C's summary text into the Response tab already built by
   // renderAllModeCombinedResults - re-renders in place only if that tab
   // happens to be the one currently showing, so it doesn't yank the user
   // back to a tab they've since navigated away from while this was in
-  // flight.
+  // flight. REPLACES triage's own routing message rather than appending
+  // underneath it (the previous behavior) - once Phase C's real answer is
+  // in, the "Checking X, Y, Z because..." routing line has served its
+  // purpose (telling the user something was happening while they waited)
+  // and just reads as clutter sitting above the actual answer, per
+  // explicit request. A Response tab entry only ever exists here with a
+  // routing message already in `.text` to begin with (see
+  // renderAllModeCombinedResults' own `summaryTab` - it's never created
+  // at all when there's no routingMessage), so there's no case where
+  // this would discard something else.
   function appendPhaseCSummaryToSummaryTab(summaryText) {
     if (!currentResultsList || !currentResultsList.length) return;
     const summaryEntry = currentResultsList.find((r) => r.isText && r.tabLabel === 'Response');
     if (!summaryEntry) return;
     // Phase C's own text always gets its own SUMMARY_TAB_BLOCK_MARKER
-    // (see its docstring) so its leading label is bolded regardless of
-    // whether there's already a leading block (triage's own message) to
-    // join it underneath - renderMarkdownLiteSummaryTab() no longer
-    // infers anything by position, only by this explicit marking.
-    summaryEntry.text = summaryEntry.text
-      ? `${summaryEntry.text}\n\n${SUMMARY_TAB_BLOCK_MARKER}${summaryText}`
-      : `${SUMMARY_TAB_BLOCK_MARKER}${summaryText}`;
+    // (see its docstring) so its leading label is bolded - renderMarkdownLiteSummaryTab()
+    // infers nothing by position, only by this explicit marking.
+    summaryEntry.text = `${SUMMARY_TAB_BLOCK_MARKER}${summaryText}`;
     // The Results Summary section has now actually rendered - see
     // summaryFeedbackButtonsHtml()'s own gating on `!result.summaryPending`
     // for why this must stay true (hiding the thumbs-up/down prompt) right
@@ -10363,9 +10510,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (!currentResultsList || !currentResultsList.length) return;
     const summaryEntry = currentResultsList.find((r) => r.isText && r.tabLabel === 'Response');
     if (!summaryEntry) return;
-    summaryEntry.text = summaryEntry.text
-      ? `${summaryEntry.text}\n\n${SUMMARY_TAB_BLOCK_MARKER}${errorText}`
-      : `${SUMMARY_TAB_BLOCK_MARKER}${errorText}`;
+    // Same "replace, don't append underneath" treatment as
+    // appendPhaseCSummaryToSummaryTab's identical line above, and for the
+    // same reason - triage's routing message has served its purpose by
+    // the time Phase C settles, success or failure alike.
+    summaryEntry.text = `${SUMMARY_TAB_BLOCK_MARKER}${errorText}`;
     // See appendPhaseCSummaryToSummaryTab's identical line just above -
     // Phase C settled (with an apology instead of an answer, but settled
     // all the same), so the feedback prompt can appear now.
@@ -11828,6 +11977,12 @@ document.addEventListener('DOMContentLoaded', async () => {
       // trackAllModeFanoutExecute()'s own per-connection dialect lookup
       // (see findConnectionType()'s call site further down).
       connectionPrompts: state.connectionOrder || [],
+      // Triage's own "needs_combination" (connection_router.py) - only
+      // ever present on the TERMINAL line (state.terminalData), never on
+      // the earlier "phase_a_route" event startAllModeStreaming() itself
+      // was called with, so it's read from there rather than carried
+      // since this turn started.
+      needsCombination: !!(state.terminalData && state.terminalData.needs_combination),
     };
 
     // Phase C - see requestAllModeResultsSummary's docstring. Awaited so
@@ -11838,6 +11993,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     // beforehand (as it used to) - this is a real, separate LLM call that
     // can take a moment, and previously nothing on screen indicated the
     // app was still working during it.
+    // New combine step (see its own docstring) - runs BEFORE Phase C so a
+    // successful combine's own tab/entry is already part of
+    // state.executeResults by the time requestAllModeResultsSummary below
+    // builds its own database_results payload from it, letting Phase C
+    // reference it the same way it references any other database's result.
+    await requestAllModeCombinedResults(notes, state.executeResults, state.executeFailures);
     showAllModeSummarizingStatus();
     const summaryResult = await requestAllModeResultsSummary(notes, state.executeResults, state.executeFailures);
     hideAllModeStreamStatus();
@@ -12107,6 +12268,12 @@ document.addEventListener('DOMContentLoaded', async () => {
             // Threaded through for the same per-connection dialect lookup
             // as databaseSql's own sibling comment above.
             connectionPrompts: data.connection_selection || [],
+            // Triage's own "needs_combination" (connection_router.py) -
+            // threaded through so the pendingAllModeNotes fallback's own
+            // Phase C call sites below can also run the new combine step
+            // (requestAllModeCombinedResults) before Phase C, exactly like
+            // the live-streaming path's maybeFinalize() does.
+            needsCombination: !!data.needs_combination,
           };
           // GA fan-out tracking (see trackAllModeFanoutTranslate's own
           // comment) - this is the rare no-live-stream fallback (never
@@ -12132,9 +12299,11 @@ document.addEventListener('DOMContentLoaded', async () => {
             // bare routing message even when every selected database
             // failed outright. Mirrors maybeFinalize()'s own ordering for
             // the live-streaming path: run Phase C, let it patch the
-            // Summary tab in place, THEN capture history off the tab's
-            // own final text (routingMessage plus whatever Phase C added)
-            // rather than off the bare pre-Phase-C routing message.
+            // Summary tab in place (replacing triage's own routing message
+            // with Phase C's real text - see appendPhaseCSummaryToSummaryTab/
+            // appendPhaseCErrorToSummaryTab), THEN capture history off the
+            // tab's own final text rather than off the bare pre-Phase-C
+            // routing message.
             const allModeNotes = pendingAllModeNotes;
             renderAllModeCombinedResults({
               notes: allModeNotes,
@@ -12598,6 +12767,11 @@ document.addEventListener('DOMContentLoaded', async () => {
             // earlier, data-free guess at it. showAllModeSummarizingStatus()
             // gives this real network round trip a visible indicator -
             // previously there was none at all on this fallback path.
+            // See maybeFinalize()'s identical hook for the full reasoning -
+            // this fallback branch needs its own copy since it never goes
+            // through maybeFinalize() at all (see pendingAllModeNotes' own
+            // declaration comment on when this branch runs).
+            await requestAllModeCombinedResults(allModeNotes, data.results, []);
             showAllModeSummarizingStatus();
             allModeSummaryResult = await requestAllModeResultsSummary(allModeNotes, data.results, []);
             hideAllModeStreamStatus();
@@ -12740,6 +12914,8 @@ document.addEventListener('DOMContentLoaded', async () => {
             summaryPending: true,
           });
           pendingAllModeNotes = null;
+          // See maybeFinalize()'s identical hook for the full reasoning.
+          await requestAllModeCombinedResults(allModeNotes, executeResults, executeFailures);
           showAllModeSummarizingStatus();
           const summaryResult = await requestAllModeResultsSummary(allModeNotes, executeResults, executeFailures);
           hideAllModeStreamStatus();

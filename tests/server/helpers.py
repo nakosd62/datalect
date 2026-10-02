@@ -47,6 +47,13 @@ _APP_MODULE_NAMES = [
     "translate_routes", "chat_history_routes", "report_routes",
     "db", "schema_cache", "state_store", "connection_router", "cancel_registry",
     "concurrency_guard", "rate_limiter",
+    # The combine step's own module (server/combine_routes.py) - dropped
+    # here for the same reason summarize_routes is just below: it computes
+    # its own env-derived constants (COMBINE_SAMPLE_ROWS/COMBINE_RESULTS_
+    # MAX_ROWS/COMBINE_EXECUTE_TIMEOUT_SECONDS) at import time, so a stale
+    # cached copy from a previous test's env would otherwise silently leak
+    # into this one.
+    "combine_routes",
     # Shared by translate_routes.py and connection_router.py (see its own
     # module docstring for why it's a separate module rather than living in
     # either one) - dropped here for the exact same reason translate_routes.py
@@ -258,8 +265,9 @@ def fresh_import(monkeypatch, tmp_path, env=None, register_blueprints=True, mock
     Returns a SimpleNamespace with at least `.app_config`; when
     register_blueprints=True (the default) also `.auth`, `.config_routes`,
     `.execute_routes`, `.translate_routes`, `.summarize_routes`,
-    `.cancel_registry`, `.concurrency_guard`, `.rate_limiter`, and `.client`
-    (a Flask test client with state_store.init() already called).
+    `.combine_routes`, `.cancel_registry`, `.concurrency_guard`,
+    `.rate_limiter`, and `.client` (a Flask test client with
+    state_store.init() already called).
     """
     os.makedirs(tmp_path, exist_ok=True)
     monkeypatch.chdir(tmp_path)
@@ -319,6 +327,7 @@ def fresh_import(monkeypatch, tmp_path, env=None, register_blueprints=True, mock
         import execute_routes
         import translate_routes
         import summarize_routes
+        import combine_routes
         import chat_history_routes
         import report_routes
         import cancel_registry
@@ -335,6 +344,7 @@ def fresh_import(monkeypatch, tmp_path, env=None, register_blueprints=True, mock
         for bp in (
             auth.auth_bp, config_routes.config_bp, execute_routes.execute_bp,
             translate_routes.translate_bp, summarize_routes.summarize_bp,
+            combine_routes.combine_bp,
             chat_history_routes.chat_history_bp, report_routes.report_bp,
         ):
             app_config.app.register_blueprint(bp)
@@ -345,6 +355,7 @@ def fresh_import(monkeypatch, tmp_path, env=None, register_blueprints=True, mock
         ns.execute_routes = execute_routes
         ns.translate_routes = translate_routes
         ns.summarize_routes = summarize_routes
+        ns.combine_routes = combine_routes
         ns.report_routes = report_routes
         ns.cancel_registry = cancel_registry
         ns.concurrency_guard = concurrency_guard

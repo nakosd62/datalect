@@ -36,9 +36,17 @@ or adding/changing/removing it via INSERT/UPDATE/DELETE/DDL (e.g. "add a new cus
 and the connected user's own permissions allow; you are not restricted to read-only questions. 
 This is also the correct choice whenever you're genuinely unsure which of the four outcomes applies. 
 Pick which connection(s) are relevant, most-relevant first (most questions need exactly ONE; 
-only include more than one when the question genuinely needs data from more than one - there is no 
-cross-database join, each is queried independently). Never pick more than __MAX_IN_SCOPE_CONNECTIONS__ 
-connections.
+only include more than one when the question genuinely needs data from more than one). Each picked 
+connection is still queried completely independently, in its own separate call, exactly as before - 
+but when the question genuinely requires RELATING rows across the connections you picked, rather than 
+each one just answering its own separate slice (e.g. "join customers from Sales with their campaign 
+activity in Marketing", "which products appear in both databases", "combine this month's orders from 
+both regions into one table"), set "needs_combination": true (see the JSON contract below) so a later 
+step can actually join/union the real results once they come back from each connection. Leave it false 
+or omit it for the ordinary case where each connection just answers its own independent piece of the 
+question - most multi-connection questions are this, not a combination, e.g. "how many customers in 
+Sales and how many leads in Marketing" needs two independent counts, no combination at all. Never pick 
+more than __MAX_IN_SCOPE_CONNECTIONS__ connections.
 
 For outcome 4, ALSO rewrite the user's own prompt into a separate, self-contained instruction for EACH 
 connection you picked, in "database_prompts" (a JSON object keyed by that connection's index as a string). 
@@ -55,6 +63,14 @@ as the same prompt, only reworded if needed to drop any reference to picking/ide
 (already decided here, not that connection's job to re-decide) 
 - e.g. "how large is this database" -> "how large is this database?" is fine verbatim once only 
 one connection is being asked. Every index you put in "indices" needs its own entry here - do not omit any.
+
+When "needs_combination" is true, make sure every affected connection's own "database_prompts" rewrite 
+still asks for whatever shared column a later join/union will actually need (a shared id, email, name, 
+or date to match rows on, or - for a union - simply the same kind of row from each side), even if that 
+connection's own slice of the question, read in isolation, would not otherwise think to select it. A 
+rewritten prompt that drops the one column the combination depends on makes the later step impossible 
+no matter how good its own reasoning is, so err on the side of explicitly naming that shared column in 
+each affected connection's own rewritten instruction.
 
 A question can mix a part these connections can genuinely answer with a separate part that's 
 really just general knowledge - e.g. "list countries with the highest GDP and their head of state" 
@@ -100,6 +116,9 @@ for the end user: name the real database name(s) you're about to check, AND brie
 e.g. (for an English prompt) 'Triage\n\nChecking Sales Postgres, since it has an orders table and 
 the prompt asks about recent purchases.' A message whose second part only names the database(s) 
 with no reason is NOT acceptable - always include the brief why.>", 
+"needs_combination": <true iff the question genuinely requires relating rows ACROSS the picked 
+connections rather than each independently answering its own slice - see outcome 4's own description 
+above; false (or simply omit this field) for the ordinary case>, 
 "database_prompts": {"<index as a string>": "<that connection's own self-contained rewritten prompt 
 - plain text, no "Triage" line, this one is never shown to the end user>", ...one entry per index 
 in "indices"...}}

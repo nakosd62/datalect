@@ -154,11 +154,16 @@
 
             <div class="header-icon-label">
               <div class="label-line">
-                <!-- Two stacked lines instead of one - see .full-text's own
-                     comment in style.css for the font-size/color reasoning. -->
+                <!-- Two stacked lines: the "Datalect" wordmark (bigger,
+                     bolder) over its "Meaning in Data" tagline (smaller,
+                     lighter), sized so the two rows read as roughly the
+                     same width rather than the short word looking lost
+                     under the longer phrase - see .full-text-row--brand/
+                     --tagline's own comment in style.css for the exact
+                     sizing. -->
                 <span class="full-text">
-                  <span class="full-text-row">Meaning</span>
-                  <span class="full-text-row">in Data</span>
+                  <span class="full-text-row full-text-row--brand">Datalect</span>
+                  <span class="full-text-row full-text-row--tagline">Meaning in Data</span>
                 </span>
                 <span class="short-text"></span>
               </div>
@@ -629,13 +634,19 @@
                  here. Hidden whenever the selected table has no table-level
                  comment, or a non-table entry is selected. -->
             <div id="schemaViewerTableCommentText" class="schema-viewer-table-comment hidden"></div>
-            <!-- Pinned "Overview" entry's content (see
-                 renderSchemaViewerOverviewDetail() in client.js): the
-                 cached LLM-written prose + suggested questions, and a
-                 deterministically-built (never LLM-generated) ER diagram
-                 rendered via Mermaid - filled in/emptied entirely by JS,
-                 this is just the mount point. Hidden whenever any other
-                 entry (a table/view/index/routine) is selected instead. -->
+            <!-- Shared mount point for the pinned "Overview" entry's
+                 content (see renderSchemaViewerOverviewDetail() in
+                 client.js: the cached LLM-written prose + suggested
+                 questions) AND the pinned "ER Diagram" entry right under
+                 it (see renderSchemaViewerDiagramDetail(): the
+                 deterministically-built, never LLM-generated ER diagram
+                 rendered via Mermaid - it used to live at the bottom of
+                 the Overview entry's own content here, now it's a
+                 separate tree row with its own content, reusing this same
+                 generic wrap). Filled in/emptied entirely by JS, this is
+                 just the mount point - only one of the two is ever in it
+                 at a time. Hidden whenever any other entry (a table/view/
+                 index/routine) is selected instead. -->
             <div id="schemaViewerOverviewWrap" class="schema-viewer-overview-wrap hidden"></div>
             <!-- Structured column table (see parseSchemaEntryColumns() in
                  client.js) - hidden whenever the selected entry's text

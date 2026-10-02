@@ -1407,37 +1407,35 @@ textarea:focus {
   white-space: nowrap;
 }
 
-/* Two stacked lines ("talk to" / "your data", see index.html's
-   full-text-row spans) rather than the old single "Talk to your Data"
-   line - font-size shrunk from the old 1.2rem so the pair together still
-   fits the vertical space the 60x60 header icon (.crbot-icon-wrapper's svg)
-   takes up beside them, instead of the label growing taller than its icon
-   now that it's two lines. (0.9375rem = the original 0.75rem bumped up
-   25% per explicit follow-up request - still comfortably under the icon's
-   height at this line-height, just less cramped than the initial pass.)
-   Color was #10b981 (the literal emerald-500 hex then hardcoded on the
-   header svg's own robot head/arms - see index.html) so this label read
-   as the icon's own color specifically. MONOCHROME PASS (per explicit
-   request, same one covering the svg itself): tried var(--text-primary)
-   first - white in dark mode, near-black in light mode - rather than
-   var(--accent-cyan), which still aliases to the brand green in light
-   mode and would have brought the green back the moment someone switched
-   themes; then backed off to var(--text-secondary) per an explicit
-   follow-up (that full-contrast pair read as too stark/"sharp"), matching
-   .dataset-center-label's own muted tone right next to this icon. Still
-   reads as "the icon's own color", since the svg resolves its own
-   currentColor shapes from this exact same token via .crbot-icon-wrapper's
-   `color` in this file. */
+/* Two stacked lines - the "Datalect" wordmark over its "Meaning in Data"
+   tagline (see index.html's full-text-row--brand/--tagline spans),
+   replacing the old two-line "Meaning" / "in Data" split (itself a
+   replacement for an even older single "Talk to your Data" line) - font
+   sizing (see .full-text-row--brand/--tagline below) keeps the pair
+   together still comfortably under the vertical space the 60x60 header
+   icon (.crbot-icon-wrapper's svg) takes up beside them, same as both
+   those previous versions. Color was #10b981 (the literal emerald-500 hex
+   then hardcoded on the header svg's own robot head/arms - see
+   index.html) so this label read as the icon's own color specifically.
+   MONOCHROME PASS (per explicit request, same one covering the svg
+   itself): tried var(--text-primary) first - white in dark mode, near-
+   black in light mode - rather than var(--accent-cyan), which still
+   aliases to the brand green in light mode and would have brought the
+   green back the moment someone switched themes; then backed off to
+   var(--text-secondary) per an explicit follow-up (that full-contrast
+   pair read as too stark/"sharp"), matching .dataset-center-label's own
+   muted tone right next to this icon. Still reads as "the icon's own
+   color", since the svg resolves its own currentColor shapes from this
+   exact same token via .crbot-icon-wrapper's `color` in this file. */
 .header-icon-label .full-text {
   display: flex;
   flex-direction: column;
-  /* Centers the two stacked rows ("Meaning" / "in Data") on each other
-     rather than left-aligning them - per explicit follow-up request. A
-     flex column's default align-items (stretch) would otherwise stretch
-     both rows to the width of the longer one and leave the shorter row's
-     own text sitting flush left within that stretched box; `center`
-     instead sizes each row to its own text and centers the narrower one
-     under/over the wider one. */
+  /* Centers the two stacked rows on each other rather than left-aligning
+     them - per explicit follow-up request. A flex column's default
+     align-items (stretch) would otherwise stretch both rows to the width
+     of the longer one and leave the shorter row's own text sitting flush
+     left within that stretched box; `center` instead sizes each row to
+     its own text and centers the narrower one under/over the wider one. */
   align-items: center;
   text-align: center;
   /* BRAND-BLUE PASS (per explicit follow-up request, superseding the
@@ -1446,11 +1444,41 @@ textarea:focus {
      color, rgb(0, 135, 243)) rather than a theme token, since this is
      meant to read as "the icon's own color" specifically, not a neutral
      UI-text tone - and unlike --text-secondary, this stays the same fixed
-     blue in both light and dark mode. */
+     blue in both light and dark mode. Kept on the shared .full-text
+     wrapper rather than repeated on each row below - still the wordmark
+     row's own color (it has no color rule of its own, so it inherits
+     this), though the tagline row now overrides it with its own mustard
+     color instead (see .full-text-row--tagline below). */
   color: #0087f3;
-  font-size: 0.9375rem;
   line-height: 1.15;
-  font-weight: 600;
+}
+
+/* "Datalect" - the bigger, bolder wordmark row (see index.html). Sized
+   relative to .full-text-row--tagline below so the two rows read as
+   roughly the same on-screen width despite "Datalect" (8 characters)
+   being much shorter than "Meaning in Data" (15) - a short word at the
+   same weight/size as a long tagline would look visually lost above it,
+   per explicit request that the two lines "take the same space". */
+.full-text-row--brand {
+  font-size: 1.2rem;
+  font-weight: 700;
+}
+
+/* "Meaning in Data" - the smaller, lighter tagline row (see index.html) -
+   one line now (used to be split "Meaning" / "in Data" across two rows),
+   sized down from the wordmark above by roughly the same ratio as the
+   two strings' own character-count difference, so the shorter/bigger
+   word on top and the longer/smaller phrase below end up about the same
+   width rather than one dwarfing the other.
+   Color overrides the brand-blue it would otherwise inherit from
+   .full-text - #f79806, sampled directly from logo-concept.png's own
+   four-pointed star beneath the funnel (per explicit request to match
+   it), rather than a guessed/generic "mustard" value. The wordmark row
+   above is unaffected and stays brand-blue. */
+.full-text-row--tagline {
+  font-size: 0.65rem;
+  font-weight: 500;
+  color: #f79806;
 }
 
 .header-icon-label .short-text {
@@ -5080,26 +5108,30 @@ tr.report-issue-row td {
   border-bottom: none;
 }
 
-/* Pinned "Overview" tree row (see renderSchemaViewerEntryList() in
-   client.js) - a slightly bolder weight than an ordinary
-   .schema-viewer-entry-item leaf, closer to .schema-viewer-group-header's
-   own weight, so it visually reads as the tree's own top/default entry
-   rather than just another table name. Sits above every collapsible
-   group, outside .schema-viewer-group-children, so it's never affected
-   by any group's own expand/collapse state. */
+/* Pinned "Overview"/"ER Diagram" tree rows (see
+   renderSchemaViewerEntryList() in client.js) - a slightly bolder weight
+   than an ordinary .schema-viewer-entry-item leaf, closer to
+   .schema-viewer-group-header's own weight, so the two of them visually
+   read as the tree's own top/default entries rather than just another
+   table name. Sit above every collapsible group, outside
+   .schema-viewer-group-children, so neither is ever affected by any
+   group's own expand/collapse state. Shared by both rows rather than a
+   dedicated "diagram" variant since they're the same visual tier. */
 .schema-viewer-overview-item {
   font-weight: 600;
   font-family: inherit;
 }
 
-/* Mount point for the pinned "Overview" entry's content (see
-   renderSchemaViewerOverviewDetail() in client.js) - prose, then the ER
-   diagram, then suggested questions, stacked top to bottom. Occupies the
-   same flex slot .schema-viewer-columns-wrap/.schema-viewer-detail-text
-   occupy for every other entry (only one of the three is ever visible at
-   once - see that function's own hidden/shown toggling), scrollable as
-   one unit since the diagram can get tall for a schema with many
-   relationships. */
+/* Shared mount point for the pinned "Overview" entry's content (see
+   renderSchemaViewerOverviewDetail() in client.js: prose, then suggested
+   questions) and the pinned "ER Diagram" entry's content right under it
+   (see renderSchemaViewerDiagramDetail(): just the diagram - it used to
+   render at the bottom of this same wrap when Overview was selected,
+   now it's its own tree row). Occupies the same flex slot
+   .schema-viewer-columns-wrap/.schema-viewer-detail-text occupy for every
+   other entry (only one of the three is ever visible at once - see that
+   function's own hidden/shown toggling), scrollable as one unit since the
+   diagram can get tall for a schema with many relationships. */
 .schema-viewer-overview-wrap {
   flex: 1 1 auto;
   min-height: 0;

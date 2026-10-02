@@ -590,7 +590,7 @@ test.describe('multi-database question answering', () => {
     await expect(page.locator('.response-text')).toContainText('Support Postgres has nothing relevant');
   });
 
-  test('after execution, a Phase C summary is fetched and appended underneath the Summary tab\'s routing message', async ({ page }) => {
+  test('after execution, a Phase C summary is fetched and replaces the Response tab\'s routing message', async ({ page }) => {
     await mockConfig(page);
     await gotoApp(page);
 
@@ -669,12 +669,14 @@ test.describe('multi-database question answering', () => {
       name: 'Marketing Postgres', sql: 'SELECT * FROM campaigns', rowCount: 1,
     });
 
-    // The Summary tab (still the default active tab - no failures here)
-    // shows BOTH the routing message and, once Phase C resolves, the new
-    // summary text underneath it - the "*** NO SQL *** " prefix is
-    // stripped the same way any other no-SQL reply's is before display.
+    // The Response tab (still the default active tab - no failures here)
+    // shows ONLY Phase C's real summary once it resolves - triage's own
+    // routing message has served its purpose by now and is replaced, not
+    // kept underneath it (see appendPhaseCSummaryToSummaryTab) - the
+    // "*** NO SQL *** " prefix is stripped the same way any other no-SQL
+    // reply's is before display.
     const summaryText = page.locator('.response-text');
-    await expect(summaryText).toContainText('Checking Sales Postgres and Marketing Postgres.');
+    await expect(summaryText).not.toContainText('Checking Sales Postgres and Marketing Postgres.');
     await expect(summaryText).toContainText('Combined revenue across both databases is $700.');
   });
 
@@ -835,12 +837,13 @@ test.describe('multi-database question answering', () => {
 
     // With two failures and nothing successful, the default active tab is
     // the first failure (same "surface what needs attention" default the
-    // empty-sql test above already covers) rather than the Summary tab -
-    // switch to it explicitly to check triage's routing message plus
-    // Phase C's explanation of BOTH failures landed there.
+    // empty-sql test above already covers) rather than the Response tab -
+    // switch to it explicitly to check Phase C's explanation of BOTH
+    // failures landed there, replacing triage's own routing message
+    // (see appendPhaseCSummaryToSummaryTab).
     await page.locator('.result-tab-btn').filter({ hasText: 'Response' }).click();
     const summaryText = page.locator('.response-text');
-    await expect(summaryText).toContainText('Checking Sales Postgres and Marketing Postgres.');
+    await expect(summaryText).not.toContainText('Checking Sales Postgres and Marketing Postgres.');
     await expect(summaryText).toContainText('permissions problem');
     await expect(summaryText).toContainText('campaigns table does not exist');
   });
@@ -1308,9 +1311,9 @@ test.describe('multi-database question answering', () => {
     await page.locator('#reportIssueSendBtn').click();
 
     await expect(page.locator('#reportIssueModal')).toBeHidden();
-    // Neither the routing message nor Phase C's own summary text (both
-    // currently on screen) ever reach the request body - same privacy
-    // posture as the single-connection variant.
+    // Phase C's own summary text (the only thing on screen now that it
+    // has replaced triage's routing message) never reaches the request
+    // body - same privacy posture as the single-connection variant.
     expect(reportBody).toEqual({
       category: 'summary_thumbs_down',
       details: 'The combined total looked off.',
@@ -1789,8 +1792,8 @@ test.describe('multi-database question answering', () => {
     expect(executeCallCount).toBe(0);
     expect(await currentSql(page)).toBe('');
 
-    // Phase C actually ran (not skipped) and its explanation landed on the
-    // Summary tab underneath triage's own routing message.
+    // Phase C actually ran (not skipped) and its explanation replaced
+    // triage's own routing message on the Response tab.
     expect(summarizeCallCount).toBe(1);
     await page.locator('.result-tab-btn').filter({ hasText: 'Response' }).click();
     await expect(page.locator('.response-text')).toContainText('The query could not be generated because of a permissions problem.');
@@ -1947,15 +1950,17 @@ test.describe('multi-database question answering', () => {
     await expect(page.locator('.response-text')).toContainText('both have customer data');
 
     // Step forward again - this is the exact bug report: every tab (the
-    // Summary tab WITH its Phase C summary text, plus both per-database
+    // Response tab WITH its Phase C summary text, plus both per-database
     // result tabs, correctly labeled) must come back exactly as it was,
-    // not disappear.
+    // not disappear. Triage's routing message was replaced by Phase C's
+    // summary before this turn was ever captured into history, so it
+    // must not reappear on restore either.
     await page.locator('#goForwardBtn').click();
     await expect(tabs).toHaveCount(3);
     await expect(tabs.nth(0)).toContainText('Response');
     await expect(tabs.nth(1)).toContainText('Sales Postgres');
     await expect(tabs.nth(2)).toContainText('Marketing Postgres');
-    await expect(page.locator('.response-text')).toContainText('Checking Sales Postgres and Marketing Postgres.');
+    await expect(page.locator('.response-text')).not.toContainText('Checking Sales Postgres and Marketing Postgres.');
     await expect(page.locator('.response-text')).toContainText('Sales Postgres has 42 customers and Marketing Postgres has 17.');
 
     await tabs.nth(1).click();
@@ -2126,6 +2131,214 @@ test.describe('multi-database question answering', () => {
     await expect.poll(() => executeCalls.length).toBe(2);
     expect(executeCalls.some((c) => c.sql.includes('preset:p-a'))).toBe(true);
     expect(executeCalls.some((c) => c.sql.includes('preset:p-b'))).toBe(true);
+    await expect(tabs.nth(1)).toContainText('Sales Postgres');
+    await expect(tabs.nth(2)).toContainText('Marketing Postgres');
+  });
+
+  // --- combine step (server/combine_routes.py): JOIN/UNION over already-
+  // fetched result sets, inserted between /api/execute and /api/summarize-
+  // results whenever triage's own terminal "done" line set
+  // "needs_combination": true (see connection_router.py's "sql" outcome
+  // and requestAllModeCombinedResults()'s own docstring in client.js) ---
+
+  function combineTriageNdjson() {
+    return [
+      {
+        status: 'phase_a_route', routing_message: 'Checking both.',
+        connection_selection: [
+          { kind: 'preset', id: 'p-a', name: 'Sales Postgres' },
+          { kind: 'preset', id: 'p-b', name: 'Marketing Postgres' },
+        ],
+      },
+      {
+        status: 'phase_b_connection_done', kind: 'preset', id: 'p-a', name: 'Sales Postgres',
+        outcome: 'sql', sql: '-- database: preset:p-a (Sales Postgres)\nSELECT * FROM deals;',
+      },
+      {
+        status: 'phase_b_connection_done', kind: 'preset', id: 'p-b', name: 'Marketing Postgres',
+        outcome: 'sql', sql: '-- database: preset:p-b (Marketing Postgres)\nSELECT * FROM campaigns;',
+      },
+      {
+        status: 'done', success: true, router_route: true, routing_message: 'Checking both.',
+        sql:
+          '-- database: preset:p-a (Sales Postgres)\nSELECT * FROM deals;\n\n' +
+          '-- database: preset:p-b (Marketing Postgres)\nSELECT * FROM campaigns;',
+        database_notes: [], generation_failures: [],
+        connection_selection: [
+          { kind: 'preset', id: 'p-a', name: 'Sales Postgres' },
+          { kind: 'preset', id: 'p-b', name: 'Marketing Postgres' },
+        ],
+        // Only ever present on this terminal line, never on the earlier
+        // phase_a_route event above - see maybeFinalize()'s own comment
+        // in client.js on why it's read from state.terminalData.
+        needs_combination: true,
+      },
+    ].map((e) => JSON.stringify(e)).join('\n') + '\n';
+  }
+
+  async function mockCombineExecute(page) {
+    await page.route('**/api/execute', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      const body = route.request().postDataJSON();
+      const isA = body.sql.includes('preset:p-a');
+      await route.fulfill({
+        status: 200, contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          results: [
+            isA
+              ? { statement: 'SELECT * FROM deals', columns: ['customer_id'], rows: [{ customer_id: 1 }, { customer_id: 2 }], rowCount: 2,
+                  database: { kind: 'preset', id: 'p-a', name: 'Sales Postgres' } }
+              : { statement: 'SELECT * FROM campaigns', columns: ['cust_id'], rows: [{ cust_id: 2 }], rowCount: 1,
+                  database: { kind: 'preset', id: 'p-b', name: 'Marketing Postgres' } },
+          ],
+        }),
+      });
+    });
+  }
+
+  test('needs_combination triggers /api/combine-results after execute and before summarize, and a successful combine becomes a new, correctly-labeled tab', async ({ page }) => {
+    await mockConfig(page, { ...buildConfigState(), auto_sql_execute: true });
+    await gotoApp(page);
+
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({ status: 200, contentType: 'application/x-ndjson', body: combineTriageNdjson() });
+    });
+    await mockCombineExecute(page);
+
+    let combineRequestBody = null;
+    let combineCalled = false;
+    let summarizeCalledBeforeCombine = false;
+    await page.route('**/api/combine-results', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      combineRequestBody = route.request().postDataJSON();
+      combineCalled = true;
+      await route.fulfill({
+        status: 200, contentType: 'application/x-ndjson',
+        body: JSON.stringify({
+          status: 'done', success: true, skipped: false,
+          result: {
+            columns: ['customer_id', 'cust_id'], rows: [{ customer_id: 2, cust_id: 2 }], rowCount: 1,
+            sql: 'SELECT r0.customer_id, r1.cust_id FROM results_0 r0 JOIN results_1 r1 ON r0.customer_id = r1.cust_id',
+          },
+        }) + '\n',
+      });
+    });
+    await page.route('**/api/summarize-results', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      if (!combineCalled) summarizeCalledBeforeCombine = true;
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ success: true, summary: '' }) });
+    });
+
+    await page.locator('#aiPrompt').fill('which customers are in both');
+    await page.locator('#aiPrompt').press('Enter');
+
+    // The combined tab only ever shows up once /api/combine-results has
+    // actually resolved - poll for the final tab count rather than
+    // asserting immediately after Enter.
+    const tabs = page.locator('#resultsTabsNav .result-tab-btn');
+    await expect(tabs).toHaveCount(4);
+    await expect(tabs.nth(0)).toContainText('Response');
+    await expect(tabs.nth(1)).toContainText('Sales Postgres');
+    await expect(tabs.nth(2)).toContainText('Marketing Postgres');
+    await expect(tabs.nth(3)).toContainText('Combined Dataset');
+
+    expect(summarizeCalledBeforeCombine).toBe(false);
+    expect(combineRequestBody.prompt).toBe('which customers are in both');
+    expect(combineRequestBody.database_results).toHaveLength(2);
+    expect(combineRequestBody.database_results[0].name).toBe('Sales Postgres');
+    expect(combineRequestBody.database_results[1].name).toBe('Marketing Postgres');
+    expect(combineRequestBody.database_results[0].columns).toEqual(['customer_id']);
+    expect(combineRequestBody.database_results[1].columns).toEqual(['cust_id']);
+
+    await tabs.nth(3).click();
+    await expect(page.locator('#resultsBody td')).toHaveText(['2', '2']);
+  });
+
+  test('a combined tab is reachable through the same result:N inline-link mechanism every other database result already uses', async ({ page }) => {
+    await mockConfig(page, { ...buildConfigState(), auto_sql_execute: true });
+    await gotoApp(page);
+
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({ status: 200, contentType: 'application/x-ndjson', body: combineTriageNdjson() });
+    });
+    await mockCombineExecute(page);
+    await page.route('**/api/combine-results', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200, contentType: 'application/x-ndjson',
+        body: JSON.stringify({
+          status: 'done', success: true, skipped: false,
+          result: { columns: ['customer_id'], rows: [{ customer_id: 2 }], rowCount: 1, sql: 'SELECT 2' },
+        }) + '\n',
+      });
+    });
+    await page.route('**/api/summarize-results', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200, contentType: 'application/json',
+        // resultIndex 2 == the combined entry's own position in
+        // executeResults (Sales=0, Marketing=1, Combined=2) - see
+        // requestAllModeCombinedResults()'s own "resultIndex:
+        // executeResults.length" in client.js.
+        body: JSON.stringify({ success: true, summary: 'See the [combined total](result:2) for the overlap.' }),
+      });
+    });
+
+    await page.locator('#aiPrompt').fill('which customers are in both');
+    await page.locator('#aiPrompt').press('Enter');
+
+    const tabs = page.locator('#resultsTabsNav .result-tab-btn');
+    await expect(tabs).toHaveCount(4);
+
+    const link = page.locator('.summary-chart-inline-link');
+    await expect(link).toHaveText('combined total');
+    await link.click();
+
+    // Tab index 3 (Response, Sales, Marketing, Combined) is the combined
+    // tab's position in the rendered strip, which is one ahead of its
+    // own resultIndex of 2 because of the prepended Response tab - see
+    // jumpToResultTab()'s own docstring on this exact offset.
+    await expect(tabs.nth(3)).toHaveClass(/active/);
+    await expect(page.locator('#resultsBody td')).toHaveText(['2']);
+  });
+
+  test('a failed combine step never blocks the turn or adds a tab - Phase C still runs over the per-database results alone', async ({ page }) => {
+    await mockConfig(page, { ...buildConfigState(), auto_sql_execute: true });
+    await gotoApp(page);
+
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({ status: 200, contentType: 'application/x-ndjson', body: combineTriageNdjson() });
+    });
+    await mockCombineExecute(page);
+    await page.route('**/api/combine-results', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200, contentType: 'application/x-ndjson',
+        body: JSON.stringify({
+          status: 'done', success: false, error: 'These results share no column that identifies the same entity.',
+        }) + '\n',
+      });
+    });
+    let summaryCalled = false;
+    await page.route('**/api/summarize-results', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      summaryCalled = true;
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ success: true, summary: 'Sales Postgres has 2 customers and Marketing Postgres has 1.' }) });
+    });
+
+    await page.locator('#aiPrompt').fill('which customers are in both');
+    await page.locator('#aiPrompt').press('Enter');
+
+    await expect(page.locator('.response-text')).toContainText('Sales Postgres has 2 customers and Marketing Postgres has 1.');
+    expect(summaryCalled).toBe(true);
+
+    // No third database tab - only Response, Sales, Marketing.
+    const tabs = page.locator('#resultsTabsNav .result-tab-btn');
+    await expect(tabs).toHaveCount(3);
     await expect(tabs.nth(1)).toContainText('Sales Postgres');
     await expect(tabs.nth(2)).toContainText('Marketing Postgres');
   });

@@ -360,7 +360,7 @@ def _parse_multi_candidate_triage_response(text, num_candidates, max_connections
       {"outcome": "schema"}
       {"outcome": "help"}
       {"outcome": "sql", "indices": <non-empty list>, "message": <str|None>,
-       "database_prompts": {int_index: non_empty_str, ...}}
+       "database_prompts": {int_index: non_empty_str, ...}, "needs_combination": <bool>}
       None  # unparseable, or doesn't fit any of the four shapes - caller retries
     Never raises. Mirrors _parse_single_dataset_triage_response's own
     "general"/"schema"/"help" handling exactly - this is genuinely the
@@ -429,9 +429,16 @@ def _parse_multi_candidate_triage_response(text, num_candidates, max_connections
         if message is not None and message_is_label_only:
             message = None
         database_prompts = _clean_database_prompts(parsed.get("database_prompts"), indices)
+        # Purely additive - a bool the model may set when the question needs rows actually
+        # RELATED across the picked connections (a join/union), not just answered independently
+        # by each (see this prompt's own "needs_combination" paragraph). Coerced to a plain bool
+        # here so every caller downstream (translate_routes.py's extra_fields, eventually a
+        # combine-results step) can treat a missing/malformed value the same as an explicit
+        # False, never a crash on an unexpected type.
+        needs_combination = bool(parsed.get("needs_combination")) and len(indices) > 1
         return {
             "outcome": "sql", "indices": indices, "message": message,
-            "database_prompts": database_prompts,
+            "database_prompts": database_prompts, "needs_combination": needs_combination,
         }
 
     return None
@@ -492,7 +499,7 @@ def run_triage_call(num_candidates, schema_block, prompt, provider, client, mode
       {"outcome": "help", "usage": <dict|None>}
       {"outcome": "sql", "usage": <dict|None>}  # num_candidates == 1 only
       {"outcome": "sql", "indices": [...], "message": <str|None>,
-       "database_prompts": {int_index: str, ...},
+       "database_prompts": {int_index: str, ...}, "needs_combination": <bool>,
        "usage": <dict|None>}  # num_candidates > 1 only
       {"outcome": "failed", "api_error": <bool>, "error": <exception|None>,
        "language_mismatch_text": <str|None>}

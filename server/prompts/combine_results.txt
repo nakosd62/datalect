@@ -1,0 +1,48 @@
+You previously helped generate and run real SQL against two or more separate databases for a single
+"all databases" mode question. Each database's own real result set has now been loaded, in memory, as
+its own named view in a single DuckDB session - DuckDB speaks ANSI-standard SQL with the usual JOIN/
+UNION/WITH/aggregate/window-function support, same as any other SQL database. You are given the user's
+ORIGINAL question and, for each database's result, its view name, its real column names/inferred types,
+its real total row count (and, if that count was capped, how many of those rows you're actually being
+shown as a sample), and a few sample rows.
+
+Your job: write exactly ONE single SQL statement (a plain SELECT, or a WITH ... SELECT, nothing else)
+that actually RELATES these views to answer the question - joining them on whatever column(s) represent
+the same real-world thing across them (even if named differently in each, e.g. "customer_id" in one and
+"cust_id" in the other), or unioning them into one combined table, or both, whichever the question
+actually calls for. Reference the views ONLY by the exact view names given to you (e.g. "results_0",
+"results_1") - never by the database's own real name, which is not a valid table reference here.
+
+Several of the columns you're shown may be strings that actually represent another type - every date/
+timestamp value coming out of any of these databases is already a plain ISO-format string, and every
+decimal/numeric value is already a plain number - by the time you see it here, not the original driver's
+own type. If a join or filter predicate depends on treating one of these as its real type (comparing two
+dates, for instance), CAST it explicitly (e.g. CAST(results_0.signup_date AS DATE)) rather than relying
+on an implicit string comparison that would silently misbehave. The same caution applies to a join key
+whose two sides don't share an obvious common type (e.g. a numeric id on one side, a numeric-looking
+string on the other) - CAST both sides to the same type rather than leaving the mismatch for DuckDB to
+guess at.
+
+If, having actually looked at the real columns available, there is no plausible shared key to join these
+views on, and the question isn't simply asking for a union of same-shaped rows either - genuinely nothing
+here lets you relate them - do not guess at a join key that doesn't really correspond to the same thing
+across both sides just to produce a result. Report this honestly instead (see "error" below) rather than
+silently returning a wrong or misleading combination.
+
+Respond with ONLY a single JSON object - no markdown code fences, no other text before or after it -
+shaped exactly like ONE of these two forms:
+
+{"success": true, "sql": "<the single SQL statement described above>"}
+
+{"success": false, "error": "<one short, honest sentence, for the end user, explaining in plain language
+why these results couldn't actually be combined - e.g. naming the columns you looked at and why none of
+them correspond to the same thing across both sides>"}
+
+CRITICAL: "error" (only, when present) MUST be written in the SAME LANGUAGE as the user's original
+question below, never the language of any table/column name or any data value you were shown. "sql"
+itself is always plain SQL regardless of the question's language.
+
+The statement you write will actually be executed, read-only, against exactly the views described above
+and nothing else - it cannot create, modify, or delete anything, attach another database, read or write
+any file, or load any extension, and an attempt to do any of that will simply be rejected before it ever
+runs. Write a plain, single read-only SELECT/WITH statement only.

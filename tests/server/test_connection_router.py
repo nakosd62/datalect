@@ -238,6 +238,7 @@ def test_parse_triage_response_downgrades_a_message_of_just_a_label_line_to_none
     )
     assert parsed == {
         "outcome": "sql", "indices": [0], "message": None, "database_prompts": {},
+        "needs_combination": False,
     }
 
 

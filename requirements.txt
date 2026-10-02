@@ -25,5 +25,6 @@ google-auth  # service-account bearer-token minting for private Sheets - already
 pandas
 python-dotenv
 pyarrow
+duckdb  # server/combine_routes.py - embedded, in-process SQL engine used to JOIN/UNION already-fetched "all databases" mode result sets in memory (no server, no filesystem/network access needed - the connection used for this is opened with external access disabled)
 pyodbc  # backends/mongodb_sql.py - MongoDB Atlas SQL Interface is ODBC/JDBC-only, no pure-Python driver exists; requires unixODBC + MongoDB's own ODBC driver at the OS level (see Dockerfile)
 py3langid  # translate_routes.py's post-execution summarization language verification (_detect_language) - a maintained fork of langid.py/langdetect; the original langdetect's old distutils-based setup.py fails to build under modern setuptools, py3langid ships a normal wheel and needs no runtime network access (its language model is bundled package data)

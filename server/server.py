@@ -26,6 +26,7 @@ from auth import auth_bp, enforce_authentication, refresh_auth_session_cookie
 from config_routes import config_bp
 from translate_routes import translate_bp
 from summarize_routes import summarize_bp
+from combine_routes import combine_bp
 from execute_routes import execute_bp
 from chat_history_routes import chat_history_bp
 from report_routes import report_bp
@@ -41,7 +42,7 @@ app.before_request(enforce_authentication)
 # alive. See auth.py's refresh_auth_session_cookie()/auth_session.py.
 app.after_request(refresh_auth_session_cookie)
 
-for bp in (auth_bp, config_bp, translate_bp, summarize_bp, execute_bp, chat_history_bp, report_bp):
+for bp in (auth_bp, config_bp, translate_bp, summarize_bp, combine_bp, execute_bp, chat_history_bp, report_bp):
     app.register_blueprint(bp)
 
 

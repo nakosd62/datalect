@@ -230,7 +230,7 @@ test.describe('schema viewer', () => {
     await expect(page.locator('.schema-viewer-overview-stats')).toHaveCount(0);
   });
 
-  test('the ER diagram section is omitted entirely when no relationships were detected, rather than shown empty', async ({ page }) => {
+  test('the pinned "ER Diagram" tree row is omitted entirely when no relationships were detected, rather than shown empty', async ({ page }) => {
     await gotoApp(page);
     // Two independent tables, no "Constraints:" FK section and no "Likely
     // relationships" naming-convention section at all - buildSchemaErDiagram()
@@ -245,10 +245,11 @@ test.describe('schema viewer', () => {
     await openSchemaViewer(page);
 
     await expect(page.locator('.schema-viewer-overview-prose')).toBeVisible();
+    await expect(page.locator('.schema-viewer-entry-item[data-category="diagram"]')).toHaveCount(0);
     await expect(page.locator('.schema-viewer-overview-diagram-wrap')).toHaveCount(0);
   });
 
-  test('the ER diagram section renders when a real foreign key relationship exists', async ({ page }) => {
+  test('a real foreign key relationship gives the schema a pinned "ER Diagram" tree row, right under Overview', async ({ page }) => {
     await gotoApp(page);
     await mockSchema(page, {
       entries: [
@@ -262,40 +263,24 @@ test.describe('schema viewer', () => {
     });
     await openSchemaViewer(page);
 
+    // The default landing spot is still Overview, with its own content
+    // (prose, no diagram) and no diagram-wrap rendered into it yet.
     await expect(page.locator('.schema-viewer-overview-prose')).toBeVisible();
+    await expect(page.locator('.schema-viewer-overview-diagram-wrap')).toHaveCount(0);
+
+    // "ER Diagram" sits immediately under "Overview" - the first two
+    // pinned rows in the tree, both above every collapsible group.
+    const pinnedRows = page.locator('#schemaViewerEntryList > li > .schema-viewer-overview-item');
+    await expect(pinnedRows).toHaveCount(2);
+    await expect(pinnedRows.nth(0)).toHaveText('Overview');
+    await expect(pinnedRows.nth(1)).toHaveText('ER Diagram');
+
+    // Selecting it swaps the detail pane over to just the diagram - no
+    // prose/questions mixed in alongside it any more.
+    await pinnedRows.nth(1).click();
+    await expect(page.locator('#schemaViewerDetailHeading')).toHaveText('ER Diagram');
     await expect(page.locator('.schema-viewer-overview-diagram-wrap')).toHaveCount(1);
-  });
-
-  test('the ER diagram renders at the bottom of the Overview tab, after the suggested questions', async ({ page }) => {
-    await gotoApp(page);
-    await mockSchema(page, {
-      entries: [
-        { name: 'orders', heading: 'Table: orders', text: (
-          'Table: orders\n  id integer NOT NULL\n  customer_id integer NOT NULL\n\n' +
-          'Constraints:\n  [orders] fk_orders_customer (FOREIGN KEY): customer_id -> customers(id)'
-        ) },
-        { name: 'customers', heading: 'Table: customers', text: 'Table: customers\n  id integer NOT NULL' },
-      ],
-      overview: {
-        prose: 'Orders reference customers.',
-        questions: ['How many orders per customer?'],
-        generated_at: '2026-01-01T00:00:00Z',
-      },
-    });
-    await openSchemaViewer(page);
-
-    // Prose, then the suggested-questions block, then the diagram last -
-    // the diagram is the most visually heavy element here, so it goes at
-    // the very bottom rather than between the prose and the questions.
-    const children = await page.locator('#schemaViewerOverviewWrap > *').evaluateAll(
-      (els) => els.map((el) => el.className),
-    );
-    const proseIndex = children.findIndex((c) => c.includes('schema-viewer-overview-prose'));
-    const questionsIndex = children.findIndex((c) => c.includes('schema-viewer-overview-questions-block'));
-    const diagramIndex = children.findIndex((c) => c.includes('schema-viewer-overview-diagram-wrap'));
-    expect(proseIndex).toBeGreaterThanOrEqual(0);
-    expect(questionsIndex).toBeGreaterThan(proseIndex);
-    expect(diagramIndex).toBeGreaterThan(questionsIndex);
+    await expect(page.locator('.schema-viewer-overview-prose')).toHaveCount(0);
   });
 
   test('a multi-line view definition renders in full, not truncated to its own first line', async ({ page }) => {

@@ -929,6 +929,17 @@ def translate_query():
                         "database_notes": database_notes,
                         "generation_failures": generation_failures,
                         "sql_blocks": sql_by_database,
+                        # Triage's own "needs_combination" (see
+                        # connection_router.py's _parse_multi_candidate_
+                        # triage_response) - tells the client whether to
+                        # call the new /api/combine-results step once
+                        # /api/execute's own real rows come back, to
+                        # actually JOIN/UNION them rather than just
+                        # independently summarizing each database's own
+                        # slice. Always present (defaults False) so an
+                        # older/newer client on either side of this field
+                        # being added just sees a plain bool either way.
+                        "needs_combination": bool(triage_result.get("needs_combination")),
                     }
                     # Phase A's own text isn't real SQL - "route" just
                     # means it decided real data was needed and picked
