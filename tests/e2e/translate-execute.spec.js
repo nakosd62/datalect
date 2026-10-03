@@ -1113,8 +1113,16 @@ test.describe('single-connection mode: post-execution results summarization', ()
     // - summarizeResultForHistory()'s error branch preserves it so that
     // stepping back to this turn later still renders a real error box
     // (renderTableResult()'s isError branch) instead of silently falling
-    // through to "No dataset returned".
-    expect(failedTurn.results).toContainEqual({ error: 'relation "does_not_exist" does not exist', isError: true });
+    // through to "No dataset returned". resultIndex: 1 is also expected
+    // here (not just {error, isError}) - this branch's own
+    // attachVisualizationsToResultsList(summarizedResults, ...) call tags
+    // EVERY entry with its 0-based position unconditionally, including a
+    // failed one, so the model's inline "[phrase](result:N)" reference
+    // link (applyInlineResultLinks()/jumpToResultTab()) can still point at
+    // the failed statement's own tab specifically - see that function's
+    // own docstring. This is the second (index 1) of the two entries:
+    // index 0's own successful `SELECT 1` statement, index 1 this one.
+    expect(failedTurn.results).toContainEqual({ error: 'relation "does_not_exist" does not exist', isError: true, resultIndex: 1 });
     // The Summary tab's own explanation (Phase C's single-connection
     // equivalent) is preserved on the turn too - see Gap 2's fix on the
     // server side (build_gemini_history_contents et al. now append a

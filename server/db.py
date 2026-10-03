@@ -439,13 +439,24 @@ def build_router_candidate_summaries(in_scope_entries, user_id):
 
 
 def build_group_schema_summaries(group_id, user_id):
-    """Builds the dataset-group Schema Viewer's own table (see webClient/
-    client.js's openGroupSchemaViewer()/loadGroupSchemaViewer()) - one
-    {"id", "name", "type", "data_size", "schema_size_tokens", "available"}
-    dict per preset in the group's own "dataset_list", in that same order
-    (app_config.py's CONFIGURED_DB_GROUPS is looked up fresh on every call,
-    same "read live" property _resolve_group_configured_descriptors above
-    documents).
+    """Builds the dataset-group Schema Viewer's own per-member list (see
+    webClient/client.js's openGroupSchemaViewer()/loadGroupSchemaViewer())
+    - one {"id", "name", "type", "data_size", "schema_size_tokens",
+    "available", "overview"} dict per preset in the group's own
+    "dataset_list", in that same order (app_config.py's
+    CONFIGURED_DB_GROUPS is looked up fresh on every call, same "read
+    live" property _resolve_group_configured_descriptors above documents).
+
+    "overview" (added alongside the Schema Viewer's "Datasets" tree node -
+    see config_routes.py's handle_get_group_schema()) is this member's OWN
+    cached single-connection {"prose", "questions", "generated_at"}
+    overview, or None if none has been generated for it yet - a plain
+    schema_cache.get_overview() read, never regenerated or force-fetched
+    here (see _summarize()'s own comment below). Distinct from the
+    GROUP's own overview (get_cached_group_overview()/
+    _generate_and_cache_group_schema_overview() further down this module),
+    which describes the group as a whole and is surfaced as this same
+    route's own separate top-level "overview" field, not per-row here.
 
     Returns None (not an empty list) when group_id doesn't match any
     configured group at all - the caller (config_routes.py's
@@ -512,6 +523,19 @@ def build_group_schema_summaries(group_id, user_id):
             resolved.append({"id": preset_id, "name": name, "descriptor": descriptor})
 
     def _summarize(entry):
+        # "overview" (added alongside this function's pre-existing fields)
+        # is this MEMBER's own cached single-connection overview (see
+        # _generate_and_cache_schema_overview() below) - a plain
+        # schema_cache.get_overview() read, same "informational, never
+        # triggers anything" posture as every other field here. Read
+        # unconditionally, even on the "available": False branch just
+        # below - a member whose schema fetch just failed may still have
+        # an overview cached from an earlier, successful fetch, and
+        # webClient's group Schema Viewer (the "Datasets" tree node) wants
+        # to show that rather than nothing. Never generates a missing
+        # one - see get_cached_group_overview()'s own docstring for why
+        # this whole feature only ever reads what's already there.
+        overview = schema_cache.get_overview(get_conn_identifier(entry["descriptor"]))
         try:
             dialect = get_backend(entry["descriptor"]).dialect_name
         except Exception:
@@ -521,12 +545,14 @@ def build_group_schema_summaries(group_id, user_id):
             return {
                 "id": entry["id"], "name": entry["name"], "type": dialect,
                 "data_size": None, "schema_size_tokens": None, "available": False,
+                "overview": overview,
             }
         return {
             "id": entry["id"], "name": entry["name"], "type": dialect,
             "data_size": parse_dataset_size_line(schema_text),
             "schema_size_tokens": quantize_schema_size_tokens(len(schema_text) / SCHEMA_SIZE_CHARS_PER_TOKEN),
             "available": True,
+            "overview": overview,
         }
 
     results = [None] * len(resolved)
@@ -543,6 +569,7 @@ def build_group_schema_summaries(group_id, user_id):
                     results[index] = {
                         "id": entry["id"], "name": entry["name"], "type": "SQL",
                         "data_size": None, "schema_size_tokens": None, "available": False,
+                        "overview": None,
                     }
     return {"id": group.get("id"), "name": group.get("name"), "datasets": results}
 
@@ -1033,6 +1060,211 @@ def _generate_and_cache_schema_overview(descriptor, user_id, schema_text):
         schema_cache.set_overview(cache_key, overview)
     except Exception:
         logger.exception("Schema overview generation failed for %s", cache_key)
+
+
+# --- Schema overview, dataset-GROUP variant (prose + suggested questions) ---
+# Same design _SCHEMA_OVERVIEW_SYSTEM_INSTRUCTION's own section header
+# above documents, extended to describe a whole configured dataset group
+# at once rather than one connection - webClient's dataset-group Schema
+# Viewer (see build_group_schema_summaries() above) gets its own
+# "Overview" tree entry, pinned the same way a single connection's does,
+# powered by this.
+#
+# Unlike a single connection, a group has no "Refresh Schema" of its own
+# to regenerate this in lockstep with (each member is its own
+# independently-cached connection, refreshed on its own) - so this is
+# ONLY ever triggered by an explicit user action: config_routes.py's POST
+# /api/config/refresh-schema, kind="group" (that route's own docstring
+# has the full kind="group" branch) - the group dialog's previously-
+# disabled Refresh Schema button, now repurposed for exactly this. Never
+# generated automatically, and never as a side effect of a plain GET
+# /api/schema/group - that route only ever reads whatever's already
+# cached (get_cached_group_overview() below), same "nothing to show yet,
+# not an error" posture a single connection's own GET /api/schema takes
+# for ITS overview before any refresh has ever run.
+
+
+def _group_overview_cache_key(group_id):
+    """schema_cache.py's get_overview()/set_overview() are keyed by a
+    plain opaque string - every real connection's own key comes from
+    get_conn_identifier() (e.g. "user@host:port/dbname" for Postgres,
+    "project.dataset" for BigQuery), which can never collide with this
+    format: a CONFIGURED_DB_GROUPS id is an admin-chosen short slug, never
+    a connection string. Prefixing it with "group::" keeps a group's
+    overview in the exact same durable storage this module already uses
+    for every connection's own overview - no schema_cache.py/
+    state_store.py changes needed at all - while guaranteeing this key can
+    never collide with a real connection's cache_key."""
+    return f"group::{group_id}"
+
+
+def get_cached_group_overview(group_id):
+    """Read-only lookup of group_id's cached {"prose", "questions",
+    "generated_at"} overview dict (see
+    _generate_and_cache_group_schema_overview() below), or None if one
+    has never been successfully generated yet - same "absence means
+    nothing to report" convention every other overview lookup in this app
+    already uses. Used only by config_routes.py's GET /api/schema/group -
+    that route never triggers generation itself, see this section's own
+    header comment for why."""
+    return schema_cache.get_overview(_group_overview_cache_key(group_id))
+
+
+_GROUP_SCHEMA_OVERVIEW_SYSTEM_INSTRUCTION = (
+    "You are analyzing a SET of related database schemas - a curated "
+    "\"dataset group\" a user can ask questions across in one database "
+    "exploration tool - to prepare a short overview for someone about to "
+    "explore this group. Each member dataset below was introspected "
+    "independently and may use a different SQL dialect.\n"
+    "Respond with ONLY a single JSON object - no markdown code fences, no "
+    "text before or after it - of exactly this shape:\n"
+    '{"prose": "<2-4 sentence plain-English description of what this '
+    'GROUP of datasets, taken together, is likely about, and how the '
+    'member datasets relate to or complement one another>", '
+    '"questions": ["<question 1>", "<question 2>", "<question 3>", '
+    '"<question 4>"]}\n'
+    "\"prose\" should read naturally and describe the group's likely "
+    "overall purpose/domain at a glance - NOT a dataset-by-dataset "
+    "listing (each member dataset is already shown separately in this "
+    "tool, so do not just restate each one's own name/purpose in turn).\n"
+    "\"questions\" should contain 3 to 5 specific, genuinely interesting "
+    "natural-language questions a user could actually ask about THIS "
+    "GROUP - prefer ones that plausibly draw on more than one member "
+    "dataset at once where that's plausible (this tool can combine "
+    "results across them), referencing real table/column names where it "
+    "reads naturally - each one concrete enough that it could be "
+    "translated into a real query, not generic questions that could "
+    "apply to any database.\n"
+    "Most of these should read like a precise, analytical request, but "
+    "include AT LEAST ONE - and ideally two - that a real person would "
+    "actually say out loud instead: casual, first-person, or exploratory "
+    "in phrasing rather than a technical restatement of a table or "
+    "column, while still being something this exact group of datasets "
+    "could plausibly help answer. Do not label, flag, or otherwise call "
+    "out which questions are which - just mix them in naturally within "
+    "the list.\n"
+    "Write both fields in English regardless of the language any table/"
+    "column names happen to use.\n"
+)
+
+
+def _build_group_overview_schema_block(member_summaries):
+    """Formats a list of {"name", "dialect", "schema_text", "overview_prose"}
+    dicts (see _generate_and_cache_group_schema_overview()'s own
+    construction of this list just below) into one combined block for the
+    group-overview LLM call: each member's name and dialect as a heading,
+    its tables_only schema text underneath, and - when that member
+    already has its own cached single-connection overview - that
+    overview's prose folded in as extra context right after it (never its
+    suggested questions - those are specific to exploring that ONE
+    dataset alone, not useful context for writing the group's own). A
+    member whose own schema couldn't be fetched is still listed by name/
+    dialect, with an explicit "(schema unavailable)" placeholder rather
+    than silently vanishing from the group's own description - the model
+    should still know this member exists even if it can't see inside it."""
+    parts = []
+    for member in member_summaries:
+        block = f"### Dataset: {member['name']} ({member['dialect']})\n{member['schema_text'] or '(schema unavailable)'}"
+        if member.get("overview_prose"):
+            block += f"\n\nExisting summary of {member['name']}: {member['overview_prose']}"
+        parts.append(block)
+    return "\n\n".join(parts)
+
+
+def _generate_and_cache_group_schema_overview(group_id, user_id):
+    """Best-effort: generates and caches a short LLM-written {"prose",
+    "questions"} pair describing the WHOLE dataset group named by
+    group_id - the group-mode counterpart to
+    _generate_and_cache_schema_overview() above; see this section's own
+    header comment for when this is (and isn't) called, and
+    schema_cache.py's module docstring for the shared cache design this
+    reuses via _group_overview_cache_key() above, unchanged.
+
+    Input is each member's own "tables_only" schema text - the same
+    cheap-to-send derivative build_router_candidate_summaries() above
+    already uses for Phase A triage (full table/column names and types,
+    nothing else) - plus, for a member that already has its own cached
+    single-connection overview, that overview's prose folded in as extra
+    context (see _build_group_overview_schema_block()'s own docstring).
+    Reads ONLY each member's already-cached deep schema entry (via
+    get_database_schema(), which itself fetches-and-caches on a miss, the
+    same as any other caller) and its already-cached overview (a plain
+    schema_cache.get_overview() read) - never force-refreshes a member's
+    schema, and never triggers generating a missing MEMBER overview, as a
+    side effect of regenerating the GROUP's own overview; both stay
+    whatever they already were.
+
+    Deliberately recomputes each member's dialect/schema_text here rather
+    than calling build_group_schema_summaries() and reusing its return
+    value: that function's contract is the dialog's lightweight per-row
+    summary (name/dialect/data_size/schema_size_tokens/available/overview)
+    for every OTHER caller, and threading "also give me tables_only text"
+    through it purely for this one caller would complicate that contract
+    for no benefit - the two really are independent reads of the same
+    underlying cached schema entries.
+
+    Swallows every failure (no API key configured for the resolved
+    provider, a transient LLM error, a response that doesn't parse into
+    the expected shape, a group_id that no longer matches any configured
+    group, ...) rather than raising - same "never blocking, never user-
+    visible as a crash" posture _generate_and_cache_schema_overview()
+    above already has. Returns True if a fresh overview was generated and
+    cached, False otherwise - config_routes.py's own POST /api/config/
+    refresh-schema (kind="group") reports success/failure off of this
+    return value, not off this function ever raising."""
+    group = next((g for g in CONFIGURED_DB_GROUPS if g.get("id") == group_id), None)
+    if group is None:
+        return False
+
+    member_ids = group.get("dataset_list") or []
+    member_summaries = []
+    for preset_id in member_ids:
+        descriptor, name = resolve_descriptor_by_reference("preset", preset_id, user_id)
+        if descriptor is None:
+            continue
+        try:
+            dialect = get_backend(descriptor).dialect_name
+        except Exception:
+            dialect = "SQL"
+        schema_text = get_database_schema(descriptor, user_id, deep=True)
+        tables_only = (
+            derive_tables_only_schema_text(schema_text)
+            if schema_text and schema_text != _SCHEMA_FETCH_FAILED else ""
+        )
+        member_overview = schema_cache.get_overview(get_conn_identifier(descriptor))
+        member_summaries.append({
+            "name": name,
+            "dialect": dialect,
+            "schema_text": tables_only,
+            "overview_prose": (member_overview or {}).get("prose"),
+        })
+
+    if not member_summaries:
+        return False
+
+    cache_key = _group_overview_cache_key(group_id)
+    try:
+        provider, model, api_key = _resolve_overview_llm_call(user_id)
+        if not api_key:
+            return False
+        client = provider.make_client(api_key)
+        schema_block = f"Dataset Group Schemas:\n{_build_group_overview_schema_block(member_summaries)}\n\n"
+        llm_input = provider.build_llm_input([], schema_block, "Produce the JSON now.")
+        raw_text, usage = provider.call(client, model, llm_input, _GROUP_SCHEMA_OVERVIEW_SYSTEM_INSTRUCTION)
+        dataset_type, dataset_name = resolve_group_identity(group_id)
+        state_store.record_llm_usage(
+            user_id, "schema", model, usage,
+            dataset_type=dataset_type, dataset_name=dataset_name,
+        )
+        overview = _parse_schema_overview_response(raw_text)
+        if overview is None:
+            return False
+        overview["generated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        schema_cache.set_overview(cache_key, overview)
+        return True
+    except Exception:
+        logger.exception("Group schema overview generation failed for %s", cache_key)
+        return False
 
 
 def prefetch_all_preset_schemas():

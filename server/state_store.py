@@ -679,14 +679,20 @@ class StateStore(ABC):
           "summary": summarize_routes.py's shared _summarize_with_retry -
             Phase C's per-turn summarization call, used identically by
             both single-connection mode and "all databases" mode.
-          "schema": db.py's _generate_and_cache_schema_overview - the
-            best-effort {"prose", "questions"} overview generated once per
-            successful deep schema (re)fetch (startup preset prefetch, a
-            connection's config changing, or "Refresh Schema"), never per
-            chat turn. Always tied to exactly one connection (this call
-            never runs for a whole dataset group at once), so its
-            dataset_type/dataset_name always come from
-            resolve_dataset_identity(), never resolve_group_identity().
+          "schema": the best-effort {"prose", "questions"} overview call -
+            db.py's _generate_and_cache_schema_overview for a single
+            connection (generated once per successful deep schema
+            (re)fetch: startup preset prefetch, a connection's config
+            changing, or "Refresh Schema" - never per chat turn), tagged
+            via resolve_dataset_identity(); or db.py's
+            _generate_and_cache_group_schema_overview for a whole
+            configured dataset GROUP at once (generated only by an
+            explicit POST /api/config/refresh-schema with kind="group" -
+            see that function's own docstring for why a group has no
+            equivalent in-lockstep refresh trigger of its own), tagged via
+            resolve_group_identity() instead - dataset_type is then the
+            fixed "Dataset Group" marker, same as a group-mode triage/
+            summary call's own usage row.
 
         `user_id` is the same already-resolved identity every other method
         on this class takes (auth.py's get_current_user_identity - a real

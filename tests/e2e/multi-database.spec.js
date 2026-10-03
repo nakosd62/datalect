@@ -1552,13 +1552,29 @@ test.describe('multi-database question answering', () => {
   // longer showing up in the rendered Summary tab at all (see client.js's
   // renderMarkdownLiteSummaryTab): the server still asks the model for a
   // "<label>\n\nbody" shape, translated into the user's own question's
-  // language, but the client now drops that leading label line (and the
-  // blank line separating it from the body) unconditionally instead of
-  // rendering it as a bolded heading. Works purely by POSITION (see that
-  // function's docstring), so it has to work for a translated label too,
-  // not just a hardcoded English word - mocks both labels in Spanish
-  // specifically to prove that: a bug here would leave a Spanish label
-  // showing up in the UI just as wrongly as an English one would.
+  // language, but the client drops that leading label line (and the blank
+  // line separating it from the body) unconditionally instead of
+  // rendering it as a bolded heading - done by explicit
+  // SUMMARY_TAB_BLOCK_MARKER tagging at each call site, not by guessing
+  // from a line's position or matching specific English words (see that
+  // function's own docstring for why position-based inference was tried
+  // and abandoned - it misfired on a Phase C summary paragraph that
+  // happened to look just as label-shaped as a real label). Mocks both
+  // labels in Spanish specifically to prove this isn't hardcoded to
+  // English words: a bug here would leave a Spanish label showing up in
+  // the UI just as wrongly as an English one would.
+  //
+  // Also covers appendPhaseCSummaryToSummaryTab's own "replace, don't
+  // append" behavior (see its docstring): triage's own routing message is
+  // only ever shown while Phase C is still in flight - once Phase C's
+  // real Results Summary resolves, that routing message is gone entirely,
+  // not left sitting above the real answer underneath it (an earlier
+  // version of this test expected both to show at once, back when this
+  // function appended instead of replacing). Uses a manually-gated
+  // /api/summarize-results route (same pattern as the feedback-buttons
+  // test above) so both the "triage only" and "Phase C replaced it"
+  // states are actually observable, rather than racing Phase C's own
+  // near-instant mock resolution.
   test('non-English triage and results-summary labels are dropped from the rendered Summary tab, by position rather than by matching English words', async ({ page }) => {
     await mockConfig(page);
     await gotoApp(page);
@@ -1600,8 +1616,15 @@ test.describe('multi-database question answering', () => {
         }),
       });
     });
+
+    // Held open until releaseSummarize() below - lets this test observe
+    // triage's own routing message BEFORE it's replaced, the same pattern
+    // the feedback-buttons test above uses.
+    let releaseSummarize;
+    const summarizeGate = new Promise((resolve) => { releaseSummarize = resolve; });
     await page.route('**/api/summarize-results', async (route) => {
       if (route.request().method() !== 'POST') return route.fallback();
+      await summarizeGate;
       await route.fulfill({
         status: 200,
         contentType: 'application/json',
@@ -1618,14 +1641,22 @@ test.describe('multi-database question answering', () => {
 
     await page.locator('#runBtn').click();
 
+    // Triage's own label ("Diagnóstico") never shows, only its body text -
+    // while Phase C is still held open.
     const summaryText = page.locator('.response-text');
     await expect(summaryText).toContainText('Comprobando Sales Postgres y Marketing Postgres.');
-    await expect(summaryText).toContainText('Los ingresos combinados son $700.');
+    let rawText = await summaryText.evaluate((el) => el.textContent);
+    expect(rawText).not.toContain('Diagnóstico');
+    await expect(summaryText.locator('strong u')).toHaveCount(0);
 
-    // Neither label - triage's own leading one, nor Phase C's own leading
-    // one after the join - shows up anywhere in the rendered text, and
-    // neither is left behind as a bolded+underlined heading either.
-    const rawText = await summaryText.evaluate((el) => el.textContent);
+    // Let Phase C resolve - its own label ("Resumen de resultados") never
+    // shows either, and its body text REPLACES triage's routing message
+    // entirely (appendPhaseCSummaryToSummaryTab's own "replace, don't
+    // append" behavior) rather than appearing underneath it.
+    releaseSummarize();
+    await expect(summaryText).toContainText('Los ingresos combinados son $700.');
+    rawText = await summaryText.evaluate((el) => el.textContent);
+    expect(rawText).not.toContain('Comprobando Sales Postgres y Marketing Postgres.');
     expect(rawText).not.toContain('Diagnóstico');
     expect(rawText).not.toContain('Resumen de resultados');
     await expect(summaryText.locator('strong u')).toHaveCount(0);

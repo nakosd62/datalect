@@ -577,17 +577,19 @@
       </div>
       <div id="schemaViewerBody" class="modal-body schema-viewer-body">
         <div id="schemaViewerNotice" class="schema-viewer-notice hidden"></div>
-        <!-- Dataset-group variant (see client.js's openGroupSchemaViewer()/
-             loadGroupSchemaViewer(), shown instead of the LHS/RHS panes
-             below whenever the "i" icon on the dataset badge is clicked
-             while a dataset group - not a single preset/custom connection -
-             is the selected option): one flat table, no tree/detail split,
-             since there's no single connection's tables/views/indexes/
-             routines to browse here - just one row per dataset in the
-             group's own "dataset_list" (name/type/data size/schema size).
-             Hidden by default; toggled opposite #schemaViewerPanesWrap by
-             loadGroupSchemaViewer()/loadSchemaViewerConnection() depending
-             on which variant is currently open. -->
+        <!-- RETIRED dataset-group variant: used to show instead of the
+             LHS/RHS panes below whenever the "i" icon on the dataset badge
+             was clicked while a dataset group - not a single preset/custom
+             connection - was the selected option, as one flat table (one
+             row per dataset in the group's own "dataset_list" - name/type/
+             data size/schema size), no tree/detail split. The group dialog
+             now shares the SAME #schemaViewerPanesWrap below instead (see
+             client.js's openGroupSchemaViewer()/loadGroupSchemaViewer()/
+             renderGroupSchemaViewerEntryList() - a pinned "Overview" +
+             collapsible "Datasets" tree node, matching the single-
+             connection dialog's own organization), so this table is left in
+             place structurally but permanently hidden - never toggled back
+             on by anything any more. -->
         <div id="schemaViewerGroupTableWrap" class="schema-viewer-group-table-wrap hidden">
           <table class="schema-viewer-group-table">
             <thead>

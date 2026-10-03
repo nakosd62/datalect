@@ -1141,6 +1141,30 @@ textarea:focus {
   50% { box-shadow: 0 0 0 6px var(--accent-cyan-glow); }
 }
 
+/* "The active dataset just changed" cue on #configTriggerBadge
+   (client.js's flashDatasetBadge()) - fired when clicking a MEMBER
+   dataset's suggested question inside a dataset group's Schema Viewer
+   switches the active connection over to that member (see
+   renderGroupMemberOverviewDetail()/switchActiveConnectionToPreset() in
+   client.js). Deliberately a FINITE pulse (3 cycles, then stops) rather
+   than .help-btn-attention's infinite one above - that one marks a
+   standing "there's something to discover here" state that only goes away
+   once the user acts; this one is a one-off "this just happened" cue, so
+   it has to actually end. Reuses the same --accent-cyan-glow ring look
+   (and the same 2s-per-cycle timing) for a consistent "something here just
+   got your attention" visual language rather than inventing a second one.
+   flashDatasetBadge() removes the class via this animation's own
+   'animationend' event, not a hand-tuned setTimeout, so the JS and the
+   3-cycle duration here can never drift out of sync with each other. */
+.dataset-badge-flash {
+  animation: dataset-badge-flash-pulse 2s ease-in-out 3;
+}
+
+@keyframes dataset-badge-flash-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 var(--accent-cyan-glow); }
+  50% { box-shadow: 0 0 0 6px var(--accent-cyan-glow); }
+}
+
 /* Generic "grayed out, not clickable right now" look, shared by two
    unrelated situations client.js triggers independently:
    - .icon-disabled on the history button: an anonymous-user restricted
@@ -4764,11 +4788,16 @@ tr.report-issue-row td {
 }
 
 /* A member whose schema fetch failed outright (db.py's
-   build_group_schema_summaries() "available": false - see
-   renderGroupSchemaViewerRow() in client.js) - dimmed, with a title
-   tooltip on the row explaining why its two size columns read "—", same
-   "something's wrong with just this one row" posture the rest of this
-   feature takes rather than failing the whole dialog over one bad member. */
+   build_group_schema_summaries() "available": false) - dimmed, with a
+   title tooltip explaining why, same "something's wrong with just this one
+   row" posture the rest of this feature takes rather than failing the
+   whole dialog over one bad member. Originally a <tr> class (the group
+   dialog's old flat-table layout, client.js's now-retired
+   renderGroupSchemaViewerRow()); reused as-is on the "Datasets" tree's own
+   per-member <button> row now that the group dialog shares the
+   Overview/Datasets tree layout instead (see
+   renderGroupSchemaViewerEntryList() in client.js) - opacity applies the
+   same way to either element. */
 .schema-viewer-group-row--unavailable {
   opacity: 0.55;
 }

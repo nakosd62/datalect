@@ -7241,6 +7241,32 @@ document.addEventListener('DOMContentLoaded', async () => {
   // an actual in-flight request should.
   let schemaViewerRefreshInFlight = false;
 
+  // --- Dataset-group Schema Viewer: Overview/Datasets tree -----------------
+  // Mirrors the single-connection state above, but for group mode
+  // (openGroupSchemaViewer()), which now shares the SAME panes layout
+  // (schemaViewerPanesWrap) instead of its own flat table - its own pinned
+  // "Overview" (the whole group's own LLM-written overview) and a single
+  // collapsible "Datasets" tree group listing each member by name (see
+  // renderSchemaViewerEntryList()'s group-mode branch below). No Tables/
+  // Views/Indexes/Routines/Likely Relationships/ER Diagram in this mode at
+  // all - those describe ONE connection's own structure, and a group spans
+  // several.
+  let schemaViewerMode = 'connection'; // 'connection' | 'group'
+  // GET /api/schema/group's own per-member list (db.py's
+  // build_group_schema_summaries() - id/name/type/data_size/
+  // schema_size_tokens/available/overview), in dataset_list order.
+  let schemaViewerGroupDatasets = [];
+  // The GROUP's own cached {"prose", "questions", "generated_at"} overview
+  // (db.py's get_cached_group_overview()) - distinct from any one member's
+  // own overview, which lives on that member's own entry in
+  // schemaViewerGroupDatasets above instead. null until "Refresh Schema"
+  // (repurposed as "Refresh Overview" in this mode - see
+  // openGroupSchemaViewer()) has generated one at least once.
+  let schemaViewerGroupOverview = null;
+  // Whether the "Datasets" tree group is expanded - same per-load reset as
+  // schemaViewerExpanded above (see openGroupSchemaViewer()).
+  let schemaViewerGroupDatasetsExpanded = false;
+
   // Matches one column's rendered line, in the "  {name} {type} {NULL|NOT
   // NULL}[ {whatever the dialect appends next}]" shape essentially every
   // SQL-family backend's get_schema()/get_schema_shallow() commits to for
@@ -8007,6 +8033,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   function renderSchemaViewerEntryList() {
     if (!schemaViewerEntryList) return;
+    if (schemaViewerMode === 'group') {
+      return renderGroupSchemaViewerEntryList();
+    }
     // A group this dialect/connection simply has none of (most
     // non-Postgres/MySQL dialects have no Indexes section at all - see
     // parseSchemaIndexes()'s own comment) is left out of the tree
@@ -8093,6 +8122,73 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
+  // Group-mode counterpart to the connection-mode tree above - just two
+  // top-level rows: a pinned "Overview" (the whole group's own LLM-written
+  // summary, category 'group-overview') and a single collapsible
+  // "Datasets" group listing each member by name (category 'dataset' +
+  // index - clicking one shows THAT member's own cached overview, see
+  // selectSchemaViewerEntry()'s 'dataset' branch and
+  // renderGroupMemberOverviewDetail() below). A member with
+  // "available": false (its own schema fetch failed - see db.py's
+  // build_group_schema_summaries()) is still listed and clickable (it may
+  // still have its own overview cached from an earlier successful fetch -
+  // see that function's own docstring), just visually dimmed with an
+  // explanatory tooltip, the same treatment the old flat table's own
+  // renderGroupSchemaViewerRow() gave an unavailable row.
+  function renderGroupSchemaViewerEntryList() {
+    const overviewItem = `
+      <li>
+        <button type="button" class="schema-viewer-entry-item schema-viewer-overview-item${schemaViewerSelected.category === 'group-overview' ? ' active' : ''}" data-category="group-overview" data-index="0" title="Overview">
+          Overview
+        </button>
+      </li>`;
+
+    const expanded = schemaViewerGroupDatasetsExpanded;
+    const children = expanded ? schemaViewerGroupDatasets.map((dataset, index) => {
+      const unavailable = dataset.available === false;
+      const label = dataset.name || dataset.id || '';
+      const title = unavailable ? `${label} (could not fetch schema for this dataset)` : label;
+      return `
+        <li>
+          <button type="button" class="schema-viewer-entry-item${unavailable ? ' schema-viewer-group-row--unavailable' : ''}${schemaViewerSelected.category === 'dataset' && schemaViewerSelected.index === index ? ' active' : ''}" data-category="dataset" data-index="${index}" title="${escapeHtml(title)}">
+            ${escapeHtml(label)}
+          </button>
+        </li>`;
+    }).join('') : '';
+
+    const datasetsGroupHtml = `
+      <li class="schema-viewer-tree-group">
+        <button type="button" class="schema-viewer-group-header${expanded ? ' expanded' : ''}" data-group="datasets" aria-expanded="${expanded}">
+          <svg class="schema-viewer-group-caret" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 6 15 12 9 18"></polyline></svg>
+          <span>Datasets (${schemaViewerGroupDatasets.length})</span>
+        </button>
+        ${expanded && schemaViewerGroupDatasets.length > 0 ? `<ul class="schema-viewer-group-children">${children}</ul>` : ''}
+      </li>`;
+
+    schemaViewerEntryList.innerHTML = overviewItem + datasetsGroupHtml;
+
+    schemaViewerEntryList.querySelectorAll('.schema-viewer-group-header').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        schemaViewerGroupDatasetsExpanded = !schemaViewerGroupDatasetsExpanded;
+        renderGroupSchemaViewerEntryList();
+      });
+    });
+    schemaViewerEntryList.querySelectorAll('.schema-viewer-entry-item').forEach((btn) => {
+      btn.addEventListener('click', () => selectSchemaViewerEntry(btn.dataset.category, Number(btn.dataset.index)));
+    });
+
+    // Same "default to the pinned Overview row whenever the previous
+    // selection no longer applies" logic the connection-mode tree above
+    // has - lands on the group's own Overview on a fresh load, or when a
+    // previously-selected member index no longer exists (e.g. the group's
+    // own dataset_list shrank between loads).
+    const stillValid = schemaViewerSelected.category === 'group-overview'
+      || (schemaViewerSelected.category === 'dataset' && schemaViewerGroupDatasets[schemaViewerSelected.index] !== undefined);
+    if (!stillValid) {
+      selectSchemaViewerEntry('group-overview', 0);
+    }
+  }
+
   // Fills the detail pane's heading + plain-text body for a Views/Indexes/
   // Routines selection - none of those get the Tables-only column table/
   // row-count treatment, just a heading and whatever descriptive text is
@@ -8110,6 +8206,110 @@ document.addEventListener('DOMContentLoaded', async () => {
       schemaViewerDetailText.textContent = text || '';
       schemaViewerDetailText.classList.toggle('hidden', !(text || '').trim());
     }
+  }
+
+  // Shared by every "Overview"-shaped detail pane (the single-connection
+  // Overview entry, the group's own Overview entry, and a member dataset's
+  // overview inside a group - renderSchemaViewerOverviewDetail()/
+  // renderGroupOverviewDetail()/renderGroupMemberOverviewDetail() below):
+  // builds the inner HTML for an {prose, questions} overview object (or
+  // the empty-state message when there isn't one yet), WITHOUT wiring up
+  // the suggested-question buttons - callers do that themselves afterward
+  // via wireSuggestedQuestionButtons() below, since what a click should
+  // actually do differs by caller (run against the active connection
+  // as-is vs. switch to a different member first). statsHtml is prepended
+  // verbatim when given (the single-connection caller's own limit-warnings
+  // block - see renderSchemaViewerStatsBlockHtml()); the group callers have
+  // no such block and pass '' for it.
+  function buildOverviewContentHtml(statsHtml, overview, emptyMessage) {
+    if (!overview) {
+      return `${statsHtml || ''}<p class="text-muted schema-viewer-overview-empty">${emptyMessage}</p>`;
+    }
+    const questions = overview.questions || [];
+    const questionsHtml = questions.map((q) => `
+      <li><button type="button" class="schema-viewer-suggested-question" data-question="${escapeHtml(q)}">${escapeHtml(q)}</button></li>
+    `).join('');
+    return `
+      ${statsHtml || ''}
+      <p class="schema-viewer-overview-prose">${escapeHtml(overview.prose || '')}</p>
+      ${questions.length > 0 ? `
+        <div class="schema-viewer-overview-questions-block">
+          <div class="schema-viewer-overview-questions-title">Questions you could ask</div>
+          <ul class="schema-viewer-overview-questions">${questionsHtml}</ul>
+        </div>` : ''}
+    `;
+  }
+
+  // Binds every ".schema-viewer-suggested-question" button currently inside
+  // `container` (freshly re-rendered via buildOverviewContentHtml() above,
+  // so there's nothing to unbind first) to `onPick(question)`. Split out
+  // from buildOverviewContentHtml() itself only because that function
+  // returns a plain HTML string (assigned via .innerHTML= by each caller)
+  // rather than live DOM nodes - the buttons have to actually exist in the
+  // document before addEventListener can run.
+  function wireSuggestedQuestionButtons(container, onPick) {
+    if (!container) return;
+    container.querySelectorAll('.schema-viewer-suggested-question').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const question = btn.dataset.question || '';
+        if (!question) return;
+        onPick(question);
+      });
+    });
+  }
+
+  // Common up-front reset every Overview-shaped detail pane needs before
+  // filling in schemaViewerOverviewWrap with its own content - the same
+  // "hide every OTHER detail-pane piece" steps renderSchemaViewerOverviewDetail()
+  // used to do inline. Returns false (having done nothing further) when
+  // schemaViewerOverviewWrap itself isn't even in the DOM, matching that
+  // function's own original early return.
+  function resetSchemaViewerDetailPaneForOverview(heading) {
+    if (schemaViewerDetailHeading) {
+      schemaViewerDetailHeading.textContent = heading || '';
+      schemaViewerDetailHeading.title = '';
+    }
+    if (schemaViewerTableCommentText) schemaViewerTableCommentText.classList.add('hidden');
+    if (schemaViewerColumnsWrap) schemaViewerColumnsWrap.classList.add('hidden');
+    if (schemaViewerColumnsBody) schemaViewerColumnsBody.innerHTML = '';
+    if (schemaViewerDetailText) {
+      schemaViewerDetailText.textContent = '';
+      schemaViewerDetailText.classList.add('hidden');
+    }
+    if (!schemaViewerOverviewWrap) return false;
+    schemaViewerOverviewWrap.classList.remove('hidden');
+    return true;
+  }
+
+  // The suggested-question click behavior for any overview that describes
+  // the CURRENTLY ACTIVE connection or group as-is (the single-connection
+  // Overview entry, and the group's own Overview entry - a group-wide
+  // question is meant to run with the group itself as the active scope,
+  // same as before this tree existed) - exactly
+  // renderSchemaViewerOverviewDetail()'s original inline click handler,
+  // unchanged, just promoted to a shared function so
+  // renderGroupOverviewDetail() can reuse it too. A MEMBER dataset's own
+  // overview (renderGroupMemberOverviewDetail() below) does NOT use this -
+  // it switches the active connection first (see
+  // switchActiveConnectionToPreset()) since a member's question is about
+  // that member, not about the group as a whole.
+  function runSuggestedQuestionAgainstActiveScope(question) {
+    if (!aiPrompt) return;
+    // The Schema Viewer is now only ever opened for the ACTIVE
+    // connection/group (see datasetSchemaViewerBtn's and the "OPEN SCHEMA
+    // VIEWER" sentinel's own click handlers - the old per-row "?"
+    // buttons that could open it for a connection other than the
+    // active one are gone), so translatePrompt() below is guaranteed
+    // to run this question against the same scope the user was just
+    // looking at. closeConfigModal() is defensive/cheap insurance in
+    // case it happened to be open underneath - it used to be the
+    // actual cause of a second dialog blocking the results view back
+    // when this dialog could be launched from inside it.
+    closeSchemaViewer();
+    closeConfigModal();
+    aiPrompt.value = question;
+    setSqlQuery('');
+    translatePrompt();
   }
 
   // Fills the detail pane for the pinned "Overview" entry: the cached
@@ -8220,19 +8420,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function renderSchemaViewerOverviewDetail() {
-    if (schemaViewerDetailHeading) {
-      schemaViewerDetailHeading.textContent = 'Overview';
-      schemaViewerDetailHeading.title = '';
-    }
-    if (schemaViewerTableCommentText) schemaViewerTableCommentText.classList.add('hidden');
-    if (schemaViewerColumnsWrap) schemaViewerColumnsWrap.classList.add('hidden');
-    if (schemaViewerColumnsBody) schemaViewerColumnsBody.innerHTML = '';
-    if (schemaViewerDetailText) {
-      schemaViewerDetailText.textContent = '';
-      schemaViewerDetailText.classList.add('hidden');
-    }
-    if (!schemaViewerOverviewWrap) return;
-    schemaViewerOverviewWrap.classList.remove('hidden');
+    if (!resetSchemaViewerDetailPaneForOverview('Overview')) return;
 
     // Limit-warnings block (SCHEMA_MAX_TABLES/SCHEMA_MAX_SCHEMA_CHARS) -
     // see renderSchemaViewerStatsBlockHtml()'s own comment (the size/
@@ -8242,50 +8430,81 @@ document.addEventListener('DOMContentLoaded', async () => {
     // overview has been generated yet, since none of it depends on that.
     const statsHtml = renderSchemaViewerStatsBlockHtml();
 
-    if (!schemaViewerOverview) {
-      schemaViewerOverviewWrap.innerHTML = `${statsHtml}<p class="text-muted schema-viewer-overview-empty">No overview has been generated yet for this connection. Click &ldquo;Refresh Schema&rdquo; above to generate one.</p>`;
-      return;
-    }
-
-    const questions = schemaViewerOverview.questions || [];
-    const questionsHtml = questions.map((q) => `
-      <li><button type="button" class="schema-viewer-suggested-question" data-question="${escapeHtml(q)}">${escapeHtml(q)}</button></li>
-    `).join('');
-
     // The ER diagram used to render at the very bottom of this tab - it's
     // now its own pinned "ER Diagram" tree row right under this one (see
     // renderSchemaViewerDiagramDetail() below and renderSchemaViewerEntryList()'s
     // own comment on that row), so this tab stays prose + questions only.
-    schemaViewerOverviewWrap.innerHTML = `
-      ${statsHtml}
-      <p class="schema-viewer-overview-prose">${escapeHtml(schemaViewerOverview.prose || '')}</p>
-      ${questions.length > 0 ? `
-        <div class="schema-viewer-overview-questions-block">
-          <div class="schema-viewer-overview-questions-title">Questions you could ask</div>
-          <ul class="schema-viewer-overview-questions">${questionsHtml}</ul>
-        </div>` : ''}
-    `;
+    schemaViewerOverviewWrap.innerHTML = buildOverviewContentHtml(
+      statsHtml, schemaViewerOverview,
+      'No overview has been generated yet for this connection. Click &ldquo;Refresh Schema&rdquo; above to generate one.',
+    );
+    wireSuggestedQuestionButtons(schemaViewerOverviewWrap, runSuggestedQuestionAgainstActiveScope);
+  }
 
-    schemaViewerOverviewWrap.querySelectorAll('.schema-viewer-suggested-question').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        const question = btn.dataset.question || '';
-        if (!question || !aiPrompt) return;
-        // The Schema Viewer is now only ever opened for the ACTIVE
-        // connection (see datasetSchemaViewerBtn's and the "OPEN SCHEMA
-        // VIEWER" sentinel's own click handlers - the old per-row "?"
-        // buttons that could open it for a connection other than the
-        // active one are gone), so translatePrompt() below is guaranteed
-        // to run this question against the same dataset the user was just
-        // looking at. closeConfigModal() is defensive/cheap insurance in
-        // case it happened to be open underneath - it used to be the
-        // actual cause of a second dialog blocking the results view back
-        // when this dialog could be launched from inside it.
-        closeSchemaViewer();
-        closeConfigModal();
-        aiPrompt.value = question;
-        setSqlQuery('');
-        translatePrompt();
-      });
+  // Fills the detail pane for the group's own pinned "Overview" entry - the
+  // group-wide LLM-written prose + suggested questions (db.py's
+  // _generate_and_cache_group_schema_overview(), surfaced via GET
+  // /api/schema/group's "overview" field - see schemaViewerGroupOverview's
+  // own declaration comment above). No limit-warnings stats block here
+  // (that's a per-connection SCHEMA_MAX_TABLES/SCHEMA_MAX_SCHEMA_CHARS
+  // concept - a group has no single schema text of its own to measure), and
+  // a question click runs against the GROUP itself as the active scope
+  // (runSuggestedQuestionAgainstActiveScope() - same as the single-
+  // connection Overview above), since this is the group's own summary, not
+  // any one member's.
+  function renderGroupOverviewDetail() {
+    if (!resetSchemaViewerDetailPaneForOverview('Overview')) return;
+    schemaViewerOverviewWrap.innerHTML = buildOverviewContentHtml(
+      '', schemaViewerGroupOverview,
+      'No overview has been generated yet for this dataset group. Click &ldquo;Refresh Overview&rdquo; above to generate one.',
+    );
+    wireSuggestedQuestionButtons(schemaViewerOverviewWrap, runSuggestedQuestionAgainstActiveScope);
+  }
+
+  // Fills the detail pane for one MEMBER dataset selected under the
+  // group's "Datasets" tree node - that member's own already-cached
+  // single-connection overview (schemaViewerGroupDatasets[index].overview,
+  // from GET /api/schema/group's per-member "overview" field - see
+  // build_group_schema_summaries() in db.py), never generated from here;
+  // there's no per-member "refresh" control inside a group dialog, only
+  // the group-wide one pinned under "Overview" above. A member with no
+  // cached overview yet (or whose schema couldn't be fetched at all - see
+  // dataset.available) shows the same empty-state message, pointing at
+  // opening that dataset on its own to generate one, since that's the only
+  // place generation for a single connection happens.
+  //
+  // Unlike the two Overview entries above, a question clicked here is
+  // about THIS member specifically, not the group or whatever connection
+  // happens to be active right now - so instead of
+  // runSuggestedQuestionAgainstActiveScope(), it first switches the active
+  // connection over to this member (switchActiveConnectionToPreset()) and
+  // flashes the dataset badge (flashDatasetBadge()) as a visible, non-modal
+  // "this is what just happened" cue, then runs the question exactly the
+  // same way the other two do once that switch resolves.
+  function renderGroupMemberOverviewDetail(index) {
+    const dataset = schemaViewerGroupDatasets[index];
+    if (!resetSchemaViewerDetailPaneForOverview(dataset ? (dataset.name || dataset.id || 'Dataset') : 'Dataset')) return;
+    if (!dataset) {
+      schemaViewerOverviewWrap.innerHTML = '<p class="text-muted schema-viewer-overview-empty">This dataset is no longer part of the group.</p>';
+      return;
+    }
+    const emptyMessage = dataset.available === false
+      ? 'This dataset’s schema could not be fetched, so no overview is available. Open it on its own from the dataset picker to investigate.'
+      : 'No overview has been generated yet for this dataset. Open it on its own from the dataset picker and click &ldquo;Refresh Schema&rdquo; to generate one.';
+    schemaViewerOverviewWrap.innerHTML = buildOverviewContentHtml('', dataset.overview, emptyMessage);
+    wireSuggestedQuestionButtons(schemaViewerOverviewWrap, async (question) => {
+      // Flashed right away (purely visual, no reason to wait on the save),
+      // but the actual question MUST wait for the switch to actually land
+      // server-side first - translatePrompt() (inside
+      // runSuggestedQuestionAgainstActiveScope()) runs against whatever
+      // connection the session's active scope names AT THAT MOMENT, so
+      // firing it before switchActiveConnectionToPreset()'s own POST
+      // /api/config resolves would race and could easily run this
+      // question against the connection that was active before the click
+      // instead of this member.
+      flashDatasetBadge();
+      await switchActiveConnectionToPreset(dataset.id);
+      runSuggestedQuestionAgainstActiveScope(question);
     });
   }
 
@@ -8355,6 +8574,12 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     if (category === 'overview') {
       return renderSchemaViewerOverviewDetail();
+    }
+    if (category === 'group-overview') {
+      return renderGroupOverviewDetail();
+    }
+    if (category === 'dataset') {
+      return renderGroupMemberOverviewDetail(index);
     }
     if (category === 'diagram') {
       return renderSchemaViewerDiagramDetail();
@@ -8620,12 +8845,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (!schemaViewerModal || !kind || !id) return;
     trackEvent('schema_viewer_viewed', { kind });
     if (schemaViewerModalTitleText) schemaViewerModalTitleText.textContent = name || 'Schema Viewer';
-    // Undoes openGroupSchemaViewer()'s own layout switch (below) in case
-    // the LAST time this shared modal was opened, it was for a dataset
-    // group - this modal instance persists across opens, so without this
-    // a single-connection open right after a group one would still be
-    // showing the group's flat table underneath, with the LHS/RHS panes
-    // still hidden.
+    // Undoes openGroupSchemaViewer()'s own mode switch (below) in case the
+    // LAST time this shared modal was opened, it was for a dataset group -
+    // this modal instance persists across opens, so without this a
+    // single-connection open right after a group one would still be in
+    // group mode underneath (schemaViewerMode gates which tree
+    // renderSchemaViewerEntryList() builds - see that function's own
+    // group-mode branch).
+    schemaViewerMode = 'connection';
     schemaViewerGroupTableWrap?.classList.add('hidden');
     schemaViewerPanesWrap?.classList.remove('hidden');
     if (schemaViewerFactsLine) schemaViewerFactsLine.classList.remove('hidden');
@@ -8643,84 +8870,81 @@ document.addEventListener('DOMContentLoaded', async () => {
   // counterpart to openSchemaViewer() above, opened instead of it whenever
   // the "i" icon on the dataset badge is clicked while a dataset group
   // (not a single preset/custom connection) is the selected option (see
-  // datasetSchemaViewerBtn's own click handler). Unlike a single
-  // connection, there's no per-group "dialect" to upgrade the title with
-  // once a fetch resolves and no single connection's tables/views/indexes/
-  // routines to browse - the title is fixed up front (never upgraded) and
-  // the body shows a flat table (schemaViewerGroupTableWrap) instead of
-  // the LHS/RHS panes, so this swaps that layout in directly rather than
-  // going through loadSchemaViewerConnection() at all.
+  // datasetSchemaViewerBtn's own click handler). Used to show a flat
+  // summary table of its own (schemaViewerGroupTableWrap) instead of the
+  // LHS/RHS panes a single connection gets - now shares that SAME panes
+  // layout instead, with its own pinned "Overview" (the group's own
+  // LLM-written overview) + collapsible "Datasets" tree node (see
+  // renderGroupSchemaViewerEntryList() above and loadGroupSchemaViewer()
+  // below), matching the single-connection dialog's own organization per
+  // an explicit request. schemaViewerGroupTableWrap/schemaViewerGroupTableBody
+  // (index.html) are retired by this - left in place structurally rather
+  // than removed outright, but never shown again.
   //
-  // The header's Refresh Schema button/status line stay in the layout
-  // (kept as-is structurally - see index.html's own comment) but are
-  // deliberately inert here for now: POST /api/config/refresh-schema only
-  // ever resolves a single preset/custom connection by {kind, id}, with no
-  // "refresh every member of this group" mode of its own yet, and there is
-  // no single "last refreshed" timestamp that would even mean anything for
-  // several independently-cached datasets at once. Disabling the button
-  // (with an explanatory tooltip) rather than hiding it entirely reads as
-  // "not available for this kind of selection yet", not "gone" - a real
-  // per-group refresh is left for later work to add.
+  // The header's Refresh Schema button is repurposed as "Refresh Overview"
+  // in this mode (generates/regenerates the GROUP's own overview via POST
+  // /api/config/refresh-schema's kind="group" branch - db.py's
+  // _generate_and_cache_group_schema_overview()) rather than disabled, per
+  // an explicit request that generation only ever happen when this button
+  // is clicked (never automatically on open) - see the refresh button's own
+  // click handler below for the kind==='group' branch that actually POSTs
+  // it.
   function openGroupSchemaViewer(groupId, groupName) {
     if (!schemaViewerModal || !groupId) return;
     trackEvent('schema_viewer_viewed', { kind: 'group' });
     if (schemaViewerModalTitleText) {
       schemaViewerModalTitleText.textContent = groupName ? `${groupName} (Dataset Group)` : 'Dataset Group';
     }
-    // No subheader for this variant at all (no data-size/schema-size facts
-    // line - those are now the group table's own per-row columns instead).
+    // No facts line for this variant - there's no single data-size/schema-
+    // size pair for a whole group the way there is for one connection; each
+    // member's own pair is shown on its own "Datasets" tree row instead
+    // (see renderGroupSchemaViewerEntryList()).
     if (schemaViewerFactsLine) {
       schemaViewerFactsLine.innerHTML = '';
       schemaViewerFactsLine.classList.add('hidden');
     }
-    schemaViewerPanesWrap?.classList.add('hidden');
-    schemaViewerGroupTableWrap?.classList.remove('hidden');
+    schemaViewerMode = 'group';
+    schemaViewerGroupTableWrap?.classList.add('hidden');
+    schemaViewerPanesWrap?.classList.remove('hidden');
     schemaViewerCurrentRef = { kind: 'group', id: groupId };
+    // Same per-load reset loadSchemaViewerConnection() does for the
+    // connection-mode state above, scoped to this mode's own state instead -
+    // every fresh group open (or re-open of a different group while this
+    // same modal instance is reused) starts collapsed, on the pinned
+    // Overview row, with no stale data from whatever was open last time.
+    schemaViewerGroupDatasets = [];
+    schemaViewerGroupOverview = null;
+    schemaViewerGroupDatasetsExpanded = false;
+    schemaViewerSelected = { category: 'group-overview', index: 0 };
+    if (schemaViewerEntryList) {
+      schemaViewerEntryList.innerHTML = '<li class="schema-viewer-entry-empty text-center text-muted py-8">Loading...</li>';
+    }
+    if (schemaViewerDetailHeading) schemaViewerDetailHeading.textContent = '';
+    if (schemaViewerColumnsWrap) schemaViewerColumnsWrap.classList.add('hidden');
+    if (schemaViewerColumnsBody) schemaViewerColumnsBody.innerHTML = '';
+    if (schemaViewerDetailText) schemaViewerDetailText.innerHTML = '';
+    if (schemaViewerOverviewWrap) schemaViewerOverviewWrap.innerHTML = '';
     if (schemaViewerRefreshBtn) {
       schemaViewerRefreshBtn.classList.remove('hidden');
-      schemaViewerRefreshBtn.disabled = true;
-      schemaViewerRefreshBtn.title = "Refreshing a whole dataset group at once isn't available yet - open one of its datasets on its own to refresh it.";
+      schemaViewerRefreshBtn.disabled = false;
+      schemaViewerRefreshBtn.title = "Generate (or regenerate) this dataset group's own AI-written overview (bypasses the cache)";
     }
-    if (schemaViewerRefreshBtnLabel) schemaViewerRefreshBtnLabel.textContent = 'Refresh Schema';
+    if (schemaViewerRefreshBtnLabel) schemaViewerRefreshBtnLabel.textContent = 'Refresh Overview';
     setSchemaViewerRefreshStatus('');
     schemaViewerModal.classList.remove('hidden');
     bringModalToFront(schemaViewerModal);
     loadGroupSchemaViewer(groupId);
   }
 
-  // Renders one row of schemaViewerGroupTableBody for a single
-  // /api/schema/group dataset entry (see db.py's
-  // build_group_schema_summaries() for exactly what each field means).
-  // "available": false (a member whose schema fetch failed outright - see
-  // that function's own docstring) shows em-dashes for both size columns
-  // rather than blanks, with the row dimmed and a title tooltip - the same
-  // "something's wrong with just this one, not the whole group" posture
-  // build_group_schema_summaries() itself takes by not failing the whole
-  // request over one bad member.
-  function renderGroupSchemaViewerRow(dataset) {
-    const dataSize = dataset.data_size ? escapeHtml(dataset.data_size) : '&mdash;';
-    const schemaTokens = typeof dataset.schema_size_tokens === 'number'
-      ? dataset.schema_size_tokens.toLocaleString()
-      : '&mdash;';
-    const unavailableTitle = dataset.available === false
-      ? ' title="Could not fetch schema for this dataset."' : '';
-    const rowClass = dataset.available === false ? ' class="schema-viewer-group-row--unavailable"' : '';
-    return `
-      <tr${rowClass}${unavailableTitle}>
-        <td>${escapeHtml(dataset.name || dataset.id || '')}</td>
-        <td>${escapeHtml(dataset.type || 'SQL')}</td>
-        <td>${dataSize}</td>
-        <td>${schemaTokens}</td>
-      </tr>
-    `;
-  }
-
+  // Fetches GET /api/schema/group for one group id and renders it into the
+  // Overview/Datasets tree (renderGroupSchemaViewerEntryList() above) -
+  // the group-mode counterpart to loadSchemaViewerConnection(), shared by
+  // the initial load (openGroupSchemaViewer()) and the repurposed "Refresh
+  // Overview" button's re-fetch after a successful POST /api/config/
+  // refresh-schema (kind="group").
   async function loadGroupSchemaViewer(groupId) {
     const myToken = ++schemaViewerRequestToken;
     setSchemaViewerNotice('');
-    if (schemaViewerGroupTableBody) {
-      schemaViewerGroupTableBody.innerHTML = '<tr><td colspan="4" class="text-center text-muted py-8">Loading...</td></tr>';
-    }
     try {
       const response = await fetch(`/api/schema/group?id=${encodeURIComponent(groupId)}`, {
         headers: getApiHeaders(), credentials: 'same-origin',
@@ -8730,7 +8954,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       if (!response.ok || !data.success) {
         setSchemaViewerNotice(data.error || `Server returned status ${response.status}`, true);
-        if (schemaViewerGroupTableBody) schemaViewerGroupTableBody.innerHTML = '';
+        schemaViewerGroupDatasets = [];
+        schemaViewerGroupOverview = null;
+        renderSchemaViewerEntryList();
         return;
       }
 
@@ -8742,18 +8968,85 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (schemaViewerModalTitleText && data.name) {
         schemaViewerModalTitleText.textContent = `${data.name} (Dataset Group)`;
       }
-      const datasets = data.datasets || [];
-      if (schemaViewerGroupTableBody) {
-        schemaViewerGroupTableBody.innerHTML = datasets.length > 0
-          ? datasets.map(renderGroupSchemaViewerRow).join('')
-          : '<tr><td colspan="4" class="text-center text-muted py-8">This dataset group has no datasets in it.</td></tr>';
-      }
+      schemaViewerGroupDatasets = data.datasets || [];
+      schemaViewerGroupOverview = data.overview || null;
+      renderSchemaViewerEntryList();
+      // renderGroupSchemaViewerEntryList() only re-selects on its own when
+      // the PREVIOUS selection no longer applies (e.g. a stale member
+      // index) - re-selecting explicitly here as well makes sure the detail
+      // pane actually reflects this just-loaded data even when the
+      // selection itself didn't change (the common case: still sitting on
+      // the pinned Overview row set by openGroupSchemaViewer() before this
+      // fetch resolved).
+      selectSchemaViewerEntry(schemaViewerSelected.category, schemaViewerSelected.index);
     } catch (err) {
       if (myToken !== schemaViewerRequestToken) return;
       console.error('Failed to fetch group schema summary:', err);
       setSchemaViewerNotice(err.message || 'Failed to reach the backend service.', true);
-      if (schemaViewerGroupTableBody) schemaViewerGroupTableBody.innerHTML = '';
+      schemaViewerGroupDatasets = [];
+      schemaViewerGroupOverview = null;
+      renderSchemaViewerEntryList();
     }
+  }
+
+  // Switches the ACTIVE connection over to a specific preset, by id - used
+  // when a MEMBER dataset's suggested question is clicked inside a dataset
+  // group's Schema Viewer (renderGroupMemberOverviewDetail() above): the
+  // question is about that one member, not the group as a whole, so the
+  // active scope needs to actually become that member before
+  // runSuggestedQuestionAgainstActiveScope() runs it. Reuses the exact same
+  // triggerConfigSave() the dataset picker's own radio buttons call, rather
+  // than hand-building a new POST /api/config payload here - that function
+  // already handles every dialect's own payload-building, completeness
+  // checks, and session-save plumbing, so reimplementing any slice of that
+  // for just this one case would risk subtly diverging from it (e.g. for a
+  // structured dialect's credential-reuse rules). Finds the matching radio
+  // input among renderDbRadioButtons()'s own rendered options (always
+  // present in the DOM once fetchBackendConfig() has run at least once -
+  // see that function's own docstring - even while the config modal itself
+  // is hidden) and only triggers a save if it wasn't already the checked
+  // one (switching among members and back is a no-op, not a redundant
+  // save). Silently does nothing if no matching radio exists (shouldn't
+  // normally happen - every preset a group can show a member for is also
+  // one of renderDbRadioButtons()'s own entries), since there's no good way
+  // to surface an error from inside a suggested-question click.
+  async function switchActiveConnectionToPreset(presetId) {
+    if (!presetId) return;
+    const radio = document.querySelector(`input[name="db_connection_option"][value="preset:${CSS.escape(presetId)}"]`);
+    if (!radio || radio.checked) return;
+    radio.checked = true;
+    await triggerConfigSave({ closeModal: false });
+  }
+
+  // Visible, non-modal "the active dataset just changed" cue for
+  // switchActiveConnectionToPreset() above - a plain radio-button save
+  // already updates configTriggerBadge's own text (via
+  // updateConnectionDetails(), inside triggerConfigSave()), but that's easy
+  // to miss while attention is still on the Schema Viewer dialog sitting on
+  // top of it. A popup/confirmation dialog would say the same thing more
+  // insistently but was explicitly ruled out as too annoying for this;
+  // this instead gives the badge a brief, finite pulse - a handful of
+  // cycles of the same --accent-cyan-glow box-shadow .help-btn-attention
+  // already uses for its own PERMANENT onboarding glow, just bounded this
+  // time (see style.css's .dataset-badge-flash/@keyframes
+  // dataset-badge-flash-pulse). Removed via the animation's own
+  // 'animationend' event rather than a hand-tuned setTimeout, so cleanup
+  // can never outlive (or cut short) however long the CSS itself actually
+  // defines the animation to run. Forces a reflow before re-adding the
+  // class so calling this again mid-flash (e.g. clicking a second member's
+  // question right after the first) restarts the pulse from scratch rather
+  // than being a no-op (the class would otherwise already be present, and
+  // re-adding an already-present class doesn't restart a CSS animation
+  // that's still running).
+  function flashDatasetBadge() {
+    if (!configTriggerBadge) return;
+    configTriggerBadge.classList.remove('dataset-badge-flash');
+    void configTriggerBadge.offsetWidth;
+    configTriggerBadge.classList.add('dataset-badge-flash');
+    configTriggerBadge.addEventListener('animationend', function onDone() {
+      configTriggerBadge.classList.remove('dataset-badge-flash');
+      configTriggerBadge.removeEventListener('animationend', onDone);
+    }, { once: true });
   }
 
   function closeSchemaViewer() {
@@ -8880,7 +9173,13 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Both presets and custom connections can be refreshed here (see POST
   // /api/config/refresh-schema's own docstring in config_routes.py -
   // resolves either kind via the same {kind, id} reference this viewer
-  // already addresses connections by everywhere else).
+  // already addresses connections by everywhere else) - and, as of the
+  // Overview/Datasets tree for groups, a whole dataset GROUP too (that same
+  // route's kind="group" branch - db.py's
+  // _generate_and_cache_group_schema_overview()), repurposed from its old
+  // permanently-disabled placeholder in this mode to the one and only
+  // trigger for (re)generating a group's own overview, per an explicit
+  // request that this never happen automatically.
   //
   // Deliberately blocking, matching the POST route's own docstring on why
   // it's synchronous rather than a background job: both this button AND
@@ -8895,6 +9194,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     schemaViewerRefreshBtn.addEventListener('click', async () => {
       const { kind, id } = schemaViewerCurrentRef;
       if (!kind || !id) return;
+      const isGroup = kind === 'group';
+      const finishedLabel = isGroup ? '↻ Refresh Overview' : '↻ Refresh Schema';
       schemaViewerRefreshInFlight = true;
       schemaViewerRefreshBtn.disabled = true;
       if (schemaViewerModalCloseBtn) schemaViewerModalCloseBtn.disabled = true;
@@ -8908,15 +9209,21 @@ document.addEventListener('DOMContentLoaded', async () => {
         });
         const data = await response.json().catch(() => ({}));
         if (!response.ok || !data.success) {
-          setSchemaViewerRefreshStatus(data.error || 'Failed to refresh schema.', true);
+          setSchemaViewerRefreshStatus(data.error || (isGroup ? 'Failed to refresh this dataset group’s overview.' : 'Failed to refresh schema.'), true);
           return;
         }
-        // Reloads this connection's entries so the columns table/tree
-        // reflect the just-refreshed schema, and also picks up the new
-        // cached_at timestamp for the status line below the button -
-        // no separate success message needed, the fresh "Last refreshed:"
-        // time IS the confirmation.
-        await loadSchemaViewerConnection(kind, id);
+        // Reloads this connection's (or, in group mode, this group's)
+        // entries so the tree/detail pane reflect the just-refreshed data,
+        // and also picks up the new cached_at timestamp for the status
+        // line below the button (connection mode only - a group has no
+        // single "last refreshed" moment of its own) - no separate success
+        // message needed, the fresh tree content (or "Last refreshed:"
+        // time) IS the confirmation.
+        if (isGroup) {
+          await loadGroupSchemaViewer(id);
+        } else {
+          await loadSchemaViewerConnection(kind, id);
+        }
       } catch (err) {
         console.error('Failed to refresh schema:', err);
         setSchemaViewerRefreshStatus(err.message || 'Failed to reach the backend service.', true);
@@ -8924,7 +9231,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         schemaViewerRefreshInFlight = false;
         schemaViewerRefreshBtn.disabled = false;
         if (schemaViewerModalCloseBtn) schemaViewerModalCloseBtn.disabled = false;
-        if (schemaViewerRefreshBtnLabel) schemaViewerRefreshBtnLabel.textContent = '↻ Refresh Schema';
+        if (schemaViewerRefreshBtnLabel) schemaViewerRefreshBtnLabel.textContent = finishedLabel;
       }
     });
   }

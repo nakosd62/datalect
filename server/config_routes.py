@@ -238,7 +238,8 @@ from db import (
     prime_schema_cache, prime_schema_cache_with_reason, SCHEMA_FETCH_FAILURE_REASON_EMPTY,
     SCHEMA_FETCH_FAILURE_REASON_TIMEOUT, visible_configured_dbs,
     get_database_schema_with_reason, resolve_descriptor_by_reference,
-    build_group_schema_summaries,
+    build_group_schema_summaries, get_cached_group_overview,
+    _generate_and_cache_group_schema_overview,
 )
 from backends import get_backend
 from backends.base import (
@@ -1506,10 +1507,25 @@ def handle_refresh_schema():
     handleRefreshSchemaClick() in client.js) still works unchanged, as
     sugar for kind="custom"/id=connection_key.
 
+    kind="group" (id=a CONFIGURED_DB_GROUPS id) is a third, deliberately
+    different addressing mode, added alongside the dataset-group Schema
+    Viewer's own "Overview" tree entry: unlike a preset/custom connection,
+    a dataset group has no schema of its own to re-fetch (each member is
+    its own independently-cached connection, refreshed on its own, one at
+    a time, via this exact route with kind="preset") - so this branch
+    does something narrower: it (re)generates and caches just the
+    GROUP-level overview (db.py's _generate_and_cache_group_schema_overview,
+    see that function's own docstring for the full design/inputs). This is
+    the ONLY way that overview is ever (re)generated - see that function's
+    header comment for why a group has no equivalent in-lockstep refresh
+    trigger of its own the way a single connection's overview does. The
+    group dialog's own "Refresh Schema" button - previously disabled,
+    since there was nothing for it to do - now points at exactly this.
+
     This is a deliberately blocking, synchronous call (per the frontend's
     own "Refresh Schema" buttons - see webClient/client.js) - no
     background job/polling here, the request just takes as long as the
-    introspection itself does.
+    introspection (or, for kind="group", the one LLM call) itself does.
     """
     session_id = get_or_create_session_id()
     user_identity = get_current_user_identity(session_id)
@@ -1519,6 +1535,32 @@ def handle_refresh_schema():
     if not kind:
         # Legacy shape - see this route's own docstring.
         kind, ref_id = 'custom', (data.get('connection_key') or '').strip()
+
+    if kind == 'group':
+        if not ref_id:
+            resp = jsonify({'success': False, 'error': 'Missing dataset group id.'})
+            return apply_session_cookie(resp, session_id), 400
+        if not any(g.get('id') == ref_id for g in CONFIGURED_DB_GROUPS):
+            resp = jsonify({'success': False, 'error': 'Dataset group not found.'})
+            return apply_session_cookie(resp, session_id), 404
+        try:
+            ok = _generate_and_cache_group_schema_overview(ref_id, user_identity)
+        except Exception:
+            logger.exception("Error generating group overview for %r", ref_id)
+            ok = False
+        if ok:
+            resp = jsonify({'success': True})
+            return apply_session_cookie(resp, session_id), 200
+        resp = jsonify({
+            'success': False,
+            'error': (
+                "Could not generate an overview for this dataset group right now. "
+                "This can happen if none of its member datasets have a usable schema "
+                "yet, or if the overview LLM call itself failed - try again in a "
+                "moment."
+            ),
+        })
+        return apply_session_cookie(resp, session_id), 502
 
     if kind not in ('preset', 'custom') or not ref_id:
         resp = jsonify({'success': False, 'error': 'Missing connection_key, or kind/id.'})
@@ -1787,7 +1829,22 @@ def handle_get_group_schema():
     treated differently from a real, configured group with zero valid
     members (which returns 200 with an empty "datasets" list instead - a
     group that exists but is left with nothing to show, not a bad
-    reference)."""
+    reference).
+
+    Also includes a top-level 'overview' field (an {"prose", "questions",
+    "generated_at"} object, or null) - the GROUP's own cached, LLM-written
+    summary/example-questions pair (db.py's get_cached_group_overview()/
+    _generate_and_cache_group_schema_overview() - see the latter's own
+    docstring for the full design), powering the Schema Viewer's pinned
+    "Overview" tree entry for a dataset group exactly the way GET
+    /api/schema's own 'overview' field already does for a single
+    connection. null whenever nothing has been generated yet - a group
+    whose "Refresh Schema" (the only way this is ever generated - see
+    that function's docstring for why) has never been clicked - rendered
+    client-side as "nothing to show yet," never an error, same posture
+    the single-connection viewer already takes. This route never
+    generates it itself - a plain cache read, exactly like every other
+    field here."""
     session_id = get_or_create_session_id()
     user_identity = get_current_user_identity(session_id)
 
@@ -1807,6 +1864,7 @@ def handle_get_group_schema():
         'id': summary['id'],
         'name': summary['name'],
         'datasets': summary['datasets'],
+        'overview': get_cached_group_overview(group_id),
     })
     return apply_session_cookie(resp, session_id), 200
 
