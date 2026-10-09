@@ -259,7 +259,7 @@ def _identity_marker_from_column_default(column_default):
 
 
 class RedshiftBackend(Backend):
-    dialect_name = "Amazon Redshift SQL"
+    dialect_name = "Amazon Redshift"
 
     # Redshift supports a bare "SELECT 1" (Postgres-derived, no FROM
     # required) - the base class's default is correct as-is, no override

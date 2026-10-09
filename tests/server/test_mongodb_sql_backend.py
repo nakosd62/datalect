@@ -138,9 +138,9 @@ def _install_fake_pyodbc_connect(monkeypatch, connection):
 
 # --- dialect_name / liveness_sql ---------------------------------------------
 
-def test_dialect_name_is_mongodb_atlas_sql():
+def test_dialect_name_is_mongodb_atlas():
     # Must match the _DIALECT_PROMPT_INTROS key in translate_routes.py.
-    assert MongoSqlBackend.dialect_name == "MongoDB Atlas SQL"
+    assert MongoSqlBackend.dialect_name == "MongoDB Atlas"
 
 
 def test_liveness_sql_is_unmodified_bare_select_1():

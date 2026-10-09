@@ -73,12 +73,43 @@ TRANSLATION_TIMEOUT_SECONDS = float(os.environ.get("TRANSLATION_TIMEOUT_SECONDS"
 # default, read independently at import time.
 HISTORY_RESULT_MAX_ROWS = int(os.environ.get("HISTORY_RESULT_MAX_ROWS", 10))
 
+# Caps Gemini's own internal "extended thinking" token spend (see
+# _call_gemini's thinking_config below) - Gemini-only, per explicit
+# request; Claude/OpenAI aren't given an equivalent cap here. 500 is a
+# deliberately modest budget for this app's own SQL-translation prompts
+# (short, structured asks - not open-ended reasoning), which otherwise has
+# no cap at all (Gemini's own per-model default can run into the
+# thousands). A real Gemini response's thoughts_token_count is already
+# tracked in _call_gemini's usage dict either way, so this value shows up
+# in that same accounting, just bounded now. Google's own
+# GenerateContentConfig(thinking_config=...) accepts this per-call - no
+# circular-import reasoning needed here the way TRANSLATION_TIMEOUT_
+# SECONDS/HISTORY_RESULT_MAX_ROWS above have, since nothing in
+# translate_routes.py reads this; still read live from the env (not
+# hardcoded) so an operator can retune it without a code change.
+GEMINI_THINKING_BUDGET = int(os.environ.get("GEMINI_THINKING_BUDGET", 500))
+
 
 def get_gemini_api_keys():
     """Collect Gemini API keys from GEMINI_PRESET_KEYS (comma-separated;
-    a single key is just a one-item list)."""
+    a single key is just a one-item list) - the load-balanced-pool case.
+    Falls back to the single standard GOOGLE_API_KEY var if that's not
+    set, same fallback pattern as get_claude_api_keys()/
+    get_openai_api_keys(), for an app configured with exactly one paid
+    Gemini key rather than a pool. GEMINI_PRESET_KEYS stays fully in
+    place and unchanged when it IS set - this fallback only matters when
+    it's entirely unset/blank. See GeminiProvider.supports_key_rotation
+    for how this distinction also turns off Gemini's key-rotation retry
+    (see _classify_gemini_error) in the GOOGLE_API_KEY-only case, so it's
+    treated exactly like ANTHROPIC_API_KEY/OPENAI_API_KEY: no random
+    selection among several keys (there's only ever one here) and no
+    rotate-to-a-different-key retry on a capacity error."""
     preset_keys_env = os.environ.get("GEMINI_PRESET_KEYS", "")
-    return [k.strip() for k in preset_keys_env.split(",") if k.strip()]
+    keys = [k.strip() for k in preset_keys_env.split(",") if k.strip()]
+    if keys:
+        return keys
+    single = os.environ.get("GOOGLE_API_KEY", "").strip()
+    return [single] if single else []
 
 
 def pick_gemini_api_key(exclude=None):
@@ -90,6 +121,11 @@ def pick_gemini_api_key(exclude=None):
     already in `exclude`, falls back to the full pool rather than
     returning None, so a request with more retry attempts than
     configured keys still retries something instead of giving up early.
+    With only the GOOGLE_API_KEY single-key fallback configured (see
+    get_gemini_api_keys()), this is a one-item list and so returns that
+    same key every time - functionally no different from
+    pick_claude_api_key()/pick_openai_api_key() in their own single-key
+    case.
     """
     keys = get_gemini_api_keys()
     if not keys:
@@ -253,7 +289,12 @@ def _gemini_error_code(exc):
 #     different configured key almost certainly isn't, so that retry fires
 #     immediately (delay=0) rather than sitting idle waiting out a limit a
 #     different key was never subject to. This is Gemini's ONLY - see
-#     _classify_claude_error, which never sets this. Transient server-side
+#     _classify_claude_error, which never sets this - and only meaningful
+#     when GEMINI_PRESET_KEYS actually configures a pool in the first
+#     place (see GeminiProvider.supports_key_rotation): running off the
+#     single GOOGLE_API_KEY fallback instead, there's no second key to
+#     rotate to, so a 429 there is treated exactly like Claude's/OpenAI's
+#     own rate-limit case just below instead. Transient server-side
 #     errors aren't key-related at all, so they retry with the same key
 #     instead - and since nothing changed about the request, they DO wait
 #     out TRANSLATION_RETRY_DELAY_SECONDS first, on the theory the same
@@ -262,23 +303,37 @@ def _gemini_error_code(exc):
 # request, invalid model, auth failure - these fail the same way every
 # time, so retrying wastes the attempt budget).
 
-def _classify_gemini_error(exc):
+def _classify_gemini_error(exc, supports_rotation=True):
     """Decide whether/how to retry a failed Gemini call. Returns a retry
-    action dict (see policy comment above) or None to raise immediately."""
+    action dict (see policy comment above) or None to raise immediately.
+
+    `supports_rotation` is GeminiProvider.supports_key_rotation - True
+    when GEMINI_PRESET_KEYS actually configures a pool of several keys,
+    False when Gemini is instead running off the single GOOGLE_API_KEY
+    fallback (see get_gemini_api_keys()). It only changes the 429 case
+    below."""
     code = _gemini_error_code(exc)
 
-    # 429 - per-key rate limit / capacity exhausted. Rotate to a
-    # different configured key so the next attempt isn't just hitting
-    # the same limit again - and since that next attempt uses a key that
-    # was never subject to the limit that just failed, there's nothing to
-    # wait out: it retries immediately (delay=0), not after
-    # TRANSLATION_RETRY_DELAY_SECONDS (that delay is reserved for the 5xx
-    # case below, where the same key retries against the same problem).
-    # This rotate_key retry draws from its own budget - one attempt per
-    # configured Gemini key - entirely independent of
-    # MAX_TRANSLATION_ATTEMPTS (see stream_translation()'s retry loop).
+    # 429 - per-key rate limit / capacity exhausted. With an actual
+    # configured pool (supports_rotation), rotate to a different key so
+    # the next attempt isn't just hitting the same limit again - and
+    # since that next attempt uses a key that was never subject to the
+    # limit that just failed, there's nothing to wait out: it retries
+    # immediately (delay=0), not after TRANSLATION_RETRY_DELAY_SECONDS
+    # (that delay is reserved for the 5xx case below, where the same key
+    # retries against the same problem). This rotate_key retry draws from
+    # its own budget - one attempt per configured Gemini key - entirely
+    # independent of MAX_TRANSLATION_ATTEMPTS (see stream_translation()'s
+    # retry loop). Without a pool (GOOGLE_API_KEY only), there's no
+    # different key to rotate to, so this is treated exactly like
+    # Claude's/OpenAI's own RateLimitError handling instead - same key,
+    # wait out TRANSLATION_RETRY_DELAY_SECONDS, no random selection and no
+    # key-rotation retry, per that fallback's own explicit design (see
+    # get_gemini_api_keys()'s docstring).
     if code == 429:
-        return {"rotate_key": True, "delay": 0}
+        if supports_rotation:
+            return {"rotate_key": True, "delay": 0}
+        return {"rotate_key": False, "delay": TRANSLATION_RETRY_DELAY_SECONDS}
 
     # 5xx - transient, server-side hiccup (e.g. the plain "500 INTERNAL"
     # Gemini occasionally throws) unrelated to which key was used, so the
@@ -729,7 +784,13 @@ def _call_gemini(client, model, contents, system_instruction):
     Unlike _call_claude/_call_openai below, there is no request-level way
     to turn this off (see the note above _call_gemini) - the only
     caching-related field on GenerateContentConfig is `cached_content`,
-    for an unrelated opt-in flow this app doesn't use."""
+    for an unrelated opt-in flow this app doesn't use.
+
+    thinking_config caps Gemini's own internal "extended thinking" spend at
+    GEMINI_THINKING_BUDGET tokens (see that constant's own comment) -
+    Gemini-only; Claude/OpenAI have no equivalent cap set anywhere in this
+    module. The actual tokens spent (bounded by this cap) are still read
+    back via usage.thoughts_token_count below, same as before this existed."""
     response = client.models.generate_content(
         model=model,
         contents=contents,
@@ -739,6 +800,7 @@ def _call_gemini(client, model, contents, system_instruction):
             # See the long comment on automatic_function_calling further
             # down in the original file history - unchanged from before.
             automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+            thinking_config=types.ThinkingConfig(thinking_budget=GEMINI_THINKING_BUDGET),
         )
     )
     text = response.text.strip() if response.text else ""
@@ -933,16 +995,18 @@ class LlmProvider(ABC):
     #: Exact 400 response text when this provider has no API key configured.
     missing_key_error = None
 
-    #: True only for a provider this app is known to configure a POOL of
-    #: keys for (Gemini, via GEMINI_PRESET_KEYS) - gates whether a
-    #: classify_error() result with rotate_key=True is even meaningful.
-    #: Claude/OpenAI both leave this False; their classify_error()
-    #: implementations never return rotate_key=True in the first place (see
+    #: True only for a provider this app is known to configure an actual
+    #: POOL of several keys for - gates whether a classify_error() result
+    #: with rotate_key=True is even meaningful. Claude/OpenAI both leave
+    #: this permanently False; their classify_error() implementations
+    #: never return rotate_key=True in the first place (see
     #: _classify_claude_error's/_classify_openai_error's docstrings), so
-    #: this is really a second, defensive line of documentation rather than
-    #: something stream_translation()'s retry loop strictly needs to check -
-    #: but see get_key_pool_size() below for the one place it's used
-    #: directly.
+    #: this is really a second, defensive line of documentation for them
+    #: rather than something stream_translation()'s retry loop strictly
+    #: needs to check. Gemini (see GeminiProvider below) is the one
+    #: exception, and even there it's a live property, not a fixed True -
+    #: see that override's own docstring for why. See get_key_pool_size()
+    #: below for the one place this is used directly.
     supports_key_rotation = False
 
     @abstractmethod
@@ -1063,7 +1127,24 @@ class GeminiProvider(LlmProvider):
     # here, with this list's first entry as the model actually used.
     fallback_models = ["gemini-3.6-flash"]
     missing_key_error = "Google API key is not configured."
-    supports_key_rotation = True
+
+    @property
+    def supports_key_rotation(self):
+        """True only when GEMINI_PRESET_KEYS actually configures a pool of
+        Gemini keys to rotate through on a capacity error - NOT simply
+        whether this provider is Gemini. A live property (reparsed on
+        every access, same reasoning as preset_models/default_model above
+        and get_gemini_api_keys() itself) rather than a fixed class
+        attribute, because this can change between requests in tests (and
+        in principle between deploys) depending on whether that env var is
+        actually set. When it's blank/unset, Gemini is instead running off
+        the single GOOGLE_API_KEY fallback (see get_gemini_api_keys()) and
+        is deliberately treated exactly like Claude/OpenAI: no key pool to
+        rotate through, so get_key_pool_size() below falls back to 1 (same
+        as Claude's/OpenAI's own permanently-False case) and
+        _classify_gemini_error's 429 case waits and retries the same key
+        instead of rotating - see that function's own docstring."""
+        return bool(os.environ.get("GEMINI_PRESET_KEYS", "").strip())
 
     def get_api_keys(self):
         return get_gemini_api_keys()
@@ -1096,7 +1177,7 @@ class GeminiProvider(LlmProvider):
         return _call_gemini(client, model, llm_input, system_instruction)
 
     def classify_error(self, exc):
-        return _classify_gemini_error(exc)
+        return _classify_gemini_error(exc, supports_rotation=self.supports_key_rotation)
 
     def error_category(self, exc):
         return _gemini_error_category(exc)

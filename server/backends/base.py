@@ -1160,7 +1160,7 @@ class Backend(ABC):
     """One implementation per supported SQL dialect/database product."""
 
     #: Human-readable dialect name meant to be interpolated into the
-    #: Gemini system prompt (e.g. "PostgreSQL", "BigQuery Standard SQL")
+    #: Gemini system prompt (e.g. "PostgreSQL", "Google BigQuery")
     #: so the model knows which SQL flavor to generate. Not wired into
     #: translate_routes.py yet - that prompt is still hardcoded to
     #: Postgres; parameterizing it by dialect_name is the next step after

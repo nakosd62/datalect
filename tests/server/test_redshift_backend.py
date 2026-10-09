@@ -97,8 +97,8 @@ def test_liveness_sql_is_the_base_class_default():
     assert RedshiftBackend.liveness_sql == "SELECT 1"
 
 
-def test_dialect_name_is_amazon_redshift_sql():
-    assert RedshiftBackend.dialect_name == "Amazon Redshift SQL"
+def test_dialect_name_is_amazon_redshift():
+    assert RedshiftBackend.dialect_name == "Amazon Redshift"
 
 
 # --- connect(): required fields, defaults, always-on TLS --------------------

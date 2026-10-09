@@ -15,7 +15,7 @@ import uuid
 
 from flask import Blueprint, request, jsonify, g
 
-from app_config import GOOGLE_CLIENT_ID, AUTH_ENABLED, IS_CLOUD_RUN, logger
+from app_config import GOOGLE_CLIENT_ID, AUTH_ENABLED, IS_CLOUD_RUN, SUPERUSER_EMAILS, logger
 from auth_session import (
     SESSION_COOKIE_NAME,
     SESSION_MAX_AGE_SECONDS,
@@ -72,6 +72,48 @@ def is_anonymous_user(user_identity):
     ANONYMOUS_USER_ID_PREFIX), so this checks the prefix rather than an
     exact match against a single shared value."""
     return bool(user_identity) and user_identity.startswith(ANONYMOUS_USER_ID_PREFIX)
+
+
+def is_superuser(user_identity):
+    """True if `user_identity` may perform superuser-only actions -
+    currently just one: refreshing the schema (or, for a dataset group,
+    the group-level overview) of an admin-configured PRESET or GROUP, as
+    opposed to one of the current user's own saved custom connections
+    (which stay refreshable by anyone - see config_routes.py's
+    handle_refresh_schema()). A preset/group isn't owned by any one user
+    at all - it's a shared, admin-configured resource everyone can
+    query - so "can refresh it" has to be a separate, coarser permission
+    rather than the per-row ownership check resolve_descriptor_by_
+    reference() already does for a custom connection.
+
+    Gated on IS_CLOUD_RUN specifically, not AUTH_ENABLED/GOOGLE_CLIENT_ID -
+    per an explicit request that the two deployment shapes behave
+    differently on purpose:
+
+    - Local deployment (not Cloud Run): every session is a superuser,
+      full stop, regardless of GOOGLE_CLIENT_ID (a developer might still
+      have Google Sign-In configured locally just to test that UI - see
+      this same reasoning already applied to SESSION_SIGNING_KEY/
+      DB_CONFIG_ENCRYPTION_KEY in app_config.py). There's only ever one
+      real operator in this mode - the person running the app on their
+      own machine - the same trust posture every other admin-only
+      surface here already has locally (presets.json itself is just a
+      file on disk only that person can edit anyway).
+    - Cloud Run deployment: superuser status is opt-in, explicit, and
+      requires actually being logged in - SUPERUSER_EMAILS (app_config.py)
+      must name this exact, VERIFIED email (case-insensitive), or nothing
+      is a superuser at all. Deliberately fails closed rather than
+      defaulting every signed-in user to superuser just because an
+      operator forgot to configure it. An anonymous identity
+      (is_anonymous_user - Cloud Run with no verified login at all) and a
+      falsy identity both short-circuit to False before the set lookup,
+      since neither is ever a real, logged-in email SUPERUSER_EMAILS
+      could name."""
+    if not IS_CLOUD_RUN:
+        return True
+    if not user_identity or is_anonymous_user(user_identity):
+        return False
+    return user_identity.strip().lower() in SUPERUSER_EMAILS
 
 
 def get_or_create_session_id():
@@ -182,6 +224,10 @@ def get_current_user_identity(session_id=None):
 # function names below and in config_routes.py.
 EXEMPT_ENDPOINTS = {
     'index',
+    # Infrastructure liveness/readiness probes (Cloud Monitoring uptime
+    # checks, Cloud Run health checks) - see server.py's health() docstring.
+    # No session/user concept applies, same posture as 'index'/'static'.
+    'health',
     'auth.get_current_user_status',
     'auth.logout',
     'static',

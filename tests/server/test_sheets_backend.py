@@ -48,7 +48,7 @@ def _conn():
 def test_dialect_name_matches_translate_routes_key():
     # Must match the _DIALECT_PROMPT_INTROS key in translate_routes.py
     # exactly - that lookup is keyed by this attribute.
-    assert SheetsBackend.dialect_name == "Google Visualization API Query Language"
+    assert SheetsBackend.dialect_name == "Google Sheets"
 
 
 def test_liveness_sql_is_a_bounded_select():

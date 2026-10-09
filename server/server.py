@@ -19,7 +19,7 @@ guard, register each blueprint, serve the SPA shell, and run.
 import os
 import threading
 
-from flask import send_from_directory
+from flask import jsonify, send_from_directory
 
 from app_config import app, state_store
 from auth import auth_bp, enforce_authentication, refresh_auth_session_cookie
@@ -49,6 +49,39 @@ for bp in (auth_bp, config_bp, translate_bp, summarize_bp, combine_bp, execute_b
 @app.route('/')
 def index():
     return send_from_directory(app.static_folder, 'index.html')
+
+
+@app.route('/health')
+def health():
+    """Deliberate no-op liveness check for infrastructure probes (Cloud
+    Monitoring uptime checks, Cloud Run health checks, load balancer
+    backends, etc.) - deliberately separate from '/' so those probes
+    never load webClient/index.html, and therefore never execute its GA4
+    tag. A probe hitting '/' every few minutes from Cloud Run's own
+    region (us-central1 - physically Council Bluffs, Iowa) was previously
+    indistinguishable in Google Analytics from a real visitor: no cookie
+    persists between probe requests, so GA4 counted it as a brand-new
+    user, every single day, forever. This route returns plain JSON, never
+    the SPA shell, so nothing here can fire a GA event no matter how
+    often (or from where) it's polled.
+
+    Used to also prove the configured state store (SQLite locally,
+    Firestore on Cloud Run) was reachable, via state_store.list_cached_
+    schema_texts() - removed on purpose: on Firestore that call is a full
+    collection scan of schema_cache (self.client.collection("schema_cache").
+    stream()), which bills/counts ONE READ PER DOCUMENT currently in that
+    collection, not a flat O(1) cost. An infrastructure probe hitting this
+    route on a fixed schedule (e.g. a 1-minute Cloud Monitoring uptime
+    check) turned into a constant, ever-growing Firestore read load as
+    schema_cache accumulated entries (every preset, every dataset group,
+    every custom connection ever cached, leftover ::shallow-suffix keys)
+    - observed at ~3,000 reads/hour against a collection with no real
+    user activity at all. A real readiness check belongs back here once
+    a properly CHEAP one is designed (e.g. a single dedicated sentinel
+    document, or a query bounded with .limit(1)) - until then this is a
+    bare, literally free 200, same as it would be with no state store
+    dependency configured at all."""
+    return jsonify({'status': 'ok'}), 200
 
 
 # Runs at IMPORT time, not just under `if __name__ == '__main__'` below -

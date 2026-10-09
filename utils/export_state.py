@@ -6,7 +6,13 @@ from datetime import datetime
 import pandas as pd
 
 
-VALID_TABLES = ["translations", "sessions", "db_connections", "chat_history", "llm_usage"]
+# The six collections/tables this app actually uses (see
+# utils/migrate_firestore_to_default_db.py's own docstring, which lists
+# the same six as its own --collections default) - schema_cache was
+# missing here for a while (this utility predates that collection), so
+# "export everything" silently never included it even once the rest of
+# this file was pointed at the right database.
+VALID_TABLES = ["translations", "sessions", "db_connections", "chat_history", "llm_usage", "schema_cache"]
 
 
 # ==========================================
@@ -59,17 +65,17 @@ def sort_columns_alphabetically(df):
     runs - regardless of source, and with no exceptions for "well-known"
     columns like doc_id/_source.
 
-    This matters most for Datastore/Firestore: pd.DataFrame(list_of_dicts)
-    (see fetch_datastore) takes its column order from whichever row it
+    This matters most for Firestore: pd.DataFrame(list_of_dicts) (see
+    fetch_firestore) takes its column order from whichever row it
     processes first, then appends any new keys later rows introduce - and
-    neither a Datastore entity's own property order (dict(entity) just
-    reflects however the client library happened to deserialize that
-    document's fields, not a documented stable ordering) nor its query row
-    order (query.fetch() here has no explicit .order()) is guaranteed
+    neither a document's own field order (doc.to_dict() just reflects
+    however the client library happened to deserialize that document's
+    fields, not a documented stable ordering) nor its query row order
+    (collection.stream() here has no explicit .order()) is guaranteed
     stable between two separate export runs, even against unchanged
     underlying data. SQLite's `SELECT *` column order is already stable
     (schema-defined), so this is a no-op there in practice - but it's
-    applied uniformly anyway (fetch_sqlite, fetch_datastore, and the
+    applied uniformly anyway (fetch_sqlite, fetch_firestore, and the
     unioned output in export_union all call this) so there's a single,
     simple, always-true rule rather than "stable except when it isn't."
     """
@@ -77,83 +83,109 @@ def sort_columns_alphabetically(df):
 
 
 # ==========================================
-# Datastore Fetch/Export Handlers
+# Firestore Fetch/Export Handlers
 # ==========================================
-def fetch_datastore(target_table, namespace=None):
+def fetch_firestore(target_table, namespace=None):
     """
-    Queries Datastore/Firestore-in-Datastore-mode and returns
-    {lowercased_kind_name: DataFrame} for every matching Kind that has
-    at least one entity. Returns {} (and prints diagnostics) on any
-    connection/import failure rather than raising, so callers (e.g. the
-    union path) can treat "Datastore unavailable" the same as "no rows".
+    Queries this app's actual Firestore database - the exact same
+    google.cloud.firestore client/collection/document API
+    server/state_store.py's FirestoreStateStore uses, against the
+    project's "(default)" database (no `database=` argument - see
+    app_config.py's own Firestore-client comment: this app has exactly
+    one Firestore database to talk to) - and returns
+    {lowercased_collection_name: DataFrame} for every matching collection
+    that has at least one document. Returns {} (and prints diagnostics)
+    on any connection/import failure rather than raising, so callers
+    (e.g. the union path) can treat "Firestore unavailable" the same as
+    "no rows".
+
+    Was previously named fetch_datastore() and implemented with
+    google.cloud.datastore.Client (project="grand-cosmos-716",
+    database="ydyl") - broken on two independent counts after this app's
+    own Firestore migration (see app_config.py's Firestore-client comment
+    and utils/migrate_firestore_to_default_db.py's docstring):
+    (1) "ydyl" is the OLD, no-longer-written-to database - every bit of
+    this app's real state has lived in the project's "(default)" database
+    since that migration (done specifically to stop paying for "ydyl" as
+    a second billed database), so pointing here read an increasingly
+    stale, frozen snapshot rather than anything current. (2) More
+    fundamentally: that migration script's own docstring is explicit that
+    both "ydyl" and "(default)" are Firestore NATIVE mode databases - the
+    same mode this real implementation needs - and GCP's Datastore-mode
+    client API does not operate against a Native-mode database at all,
+    regardless of which database name it's given. Every call the old
+    implementation made would fail outright, caught by its own broad
+    except-and-return-{} (same shape still used below), so the failure
+    was completely silent: `export_state.sh` with no arguments (--store
+    all, the default) exited looking successful while quietly exporting
+    zero Firestore rows.
+
+    `namespace` is accepted for backward CLI-flag compatibility but is a
+    Datastore-only concept with no Firestore Native equivalent, so it's
+    ignored here - every one of this app's own collections lives at the
+    top level, ungated by any namespace, so this was never actually
+    exercised against real data anyway.
     """
     try:
-        from google.cloud import datastore
+        from google.cloud import firestore
     except ImportError:
-        print("Error: 'google-cloud-datastore' package is required.")
-        print("Install it via: python -m pip install google-cloud-datastore")
+        print("Error: 'google-cloud-firestore' package is required.")
+        print("Install it via: python -m pip install google-cloud-firestore")
         return {}
 
     try:
-        client = datastore.Client(project="grand-cosmos-716", database="ydyl", namespace=namespace)
+        client = firestore.Client(project="grand-cosmos-716")
 
-        # Fetch actual Kind names in database
-        kind_query = client.query(kind="__kind__")
-        kind_query.keys_only()
-        existing_kinds = [
-            entity.key.id_or_name
-            for entity in kind_query.fetch()
-            if entity.key.id_or_name and not entity.key.id_or_name.startswith("__")
-        ]
+        # Fetch actual collection names in the database.
+        existing_collections = [collection.id for collection in client.collections()]
 
-        # Determine target kinds (case-insensitive matching)
+        # Determine target collections (case-insensitive matching).
         if target_table == "all":
-            kinds_to_export = existing_kinds if existing_kinds else ["Translations", "Sessions", "db_connections", "chat_history", "llm_usage"]
+            collections_to_export = existing_collections if existing_collections else list(VALID_TABLES)
         else:
-            matched = [k for k in existing_kinds if k.lower() == target_table.lower()]
-            kinds_to_export = matched if matched else [target_table]
+            matched = [c for c in existing_collections if c.lower() == target_table.lower()]
+            collections_to_export = matched if matched else [target_table]
 
-        kinds_to_export = list(dict.fromkeys(kinds_to_export))
+        collections_to_export = list(dict.fromkeys(collections_to_export))
 
         results = {}
-        for kind in kinds_to_export:
-            query = client.query(kind=kind)
-            entities = list(query.fetch())
+        for collection_name in collections_to_export:
+            docs = list(client.collection(collection_name).stream())
 
-            if not entities:
+            if not docs:
                 continue
 
             records = []
-            for entity in entities:
-                data = dict(entity)
-                data["doc_id"] = entity.key.id_or_name or entity.key.id
+            for doc in docs:
+                data = doc.to_dict() or {}
+                data["doc_id"] = doc.id
                 records.append(data)
 
             df = pd.DataFrame(records)
             df = sort_columns_alphabetically(df)
 
-            results[kind.lower()] = normalize_datetime_columns(df)
+            results[collection_name.lower()] = normalize_datetime_columns(df)
 
-        if not results and existing_kinds:
-            print(f"[Datastore] No matching records found. Available Kinds detected in database: {existing_kinds}")
+        if not results and existing_collections:
+            print(f"[Firestore] No matching records found. Available collections detected in database: {existing_collections}")
 
         return results
 
     except Exception as e:
-        print(f"[Datastore Error] Failed to export data: {e}")
+        print(f"[Firestore Error] Failed to export data: {e}")
         return {}
 
 
-def export_datastore(target_table, output_dir, namespace=None):
-    data = fetch_datastore(target_table, namespace=namespace)
+def export_firestore(target_table, output_dir, namespace=None):
+    data = fetch_firestore(target_table, namespace=namespace)
     if not data:
-        print("[Datastore] No matching records found.")
+        print("[Firestore] No matching records found.")
         return
 
     for name, df in data.items():
         filename = os.path.join(output_dir, f"{name}.csv")
         df.to_csv(filename, index=False)
-        print(f"[Datastore] Exported {len(df)} records from Kind '{name}' -> {filename}")
+        print(f"[Firestore] Exported {len(df)} records from collection '{name}' -> {filename}")
 
 
 # ==========================================
@@ -219,21 +251,21 @@ def export_sqlite(db_path, target_table, output_dir):
 
 
 # ==========================================
-# Combined (Datastore + SQLite) Export Handler
+# Combined (Firestore + SQLite) Export Handler
 # ==========================================
 def export_union(target_table, output_dir, db_path, namespace=None):
     """
-    Fetches from both stores and, for every table/Kind name present in
-    either, unions the rows into a single CSV (outer join on columns, so
-    a field only present in one store is just left blank for rows from
+    Fetches from both stores and, for every table/collection name present
+    in either, unions the rows into a single CSV (outer join on columns,
+    so a field only present in one store is just left blank for rows from
     the other). A '_source' column records which store each row came
     from, since the same table name in different stores/instances is not
     guaranteed to share row identity.
     """
-    datastore_data = fetch_datastore(target_table, namespace=namespace)
+    firestore_data = fetch_firestore(target_table, namespace=namespace)
     sqlite_data = fetch_sqlite(db_path, target_table)
 
-    table_names = sorted(set(datastore_data) | set(sqlite_data))
+    table_names = sorted(set(firestore_data) | set(sqlite_data))
     if not table_names:
         print("[Union] No matching records found in either store.")
         return
@@ -241,8 +273,8 @@ def export_union(target_table, output_dir, db_path, namespace=None):
     for name in table_names:
         frames = []
 
-        if name in datastore_data:
-            df = datastore_data[name].copy()
+        if name in firestore_data:
+            df = firestore_data[name].copy()
             df.insert(0, "_source", "firestore")
             frames.append(df)
 
@@ -252,11 +284,11 @@ def export_union(target_table, output_dir, db_path, namespace=None):
             frames.append(df)
 
         # Individual frames are already alphabetically sorted (both
-        # fetch_datastore and fetch_sqlite apply sort_columns_alphabetically
+        # fetch_firestore and fetch_sqlite apply sort_columns_alphabetically
         # themselves), but pd.concat(sort=False) takes the FIRST frame's
         # column order as its base and only appends the other frame's
         # columns that aren't already present - so a column unique to
-        # sqlite_data would land after every datastore_data column instead
+        # sqlite_data would land after every firestore_data column instead
         # of in true alphabetical position. Re-sorting the combined result
         # is what actually guarantees one global alphabetical order for the
         # union output, regardless of which store contributed which column.
@@ -275,14 +307,14 @@ def export_union(target_table, output_dir, db_path, namespace=None):
 # ==========================================
 def main():
     parser = argparse.ArgumentParser(
-        description="Export application state from Datastore or SQLite into a timestamped directory."
+        description="Export application state from Firestore or SQLite into a timestamped directory."
     )
 
     parser.add_argument(
         "--store",
         choices=["firestore", "sqlite", "all"],
         default="all",
-        help='Specify the storage engine to dump from (firestore/datastore, sqlite, or all - unioned '
+        help="Specify the storage engine to dump from (firestore, sqlite, or all - unioned "
              "into one CSV per table). Default: 'all'."
     )
 
@@ -302,7 +334,8 @@ def main():
     parser.add_argument(
         "--namespace",
         default=None,
-        help="Optional Datastore namespace."
+        help="Deprecated/unused - Firestore Native has no namespace concept. Kept only so an "
+             "old invocation that still passes --namespace doesn't hard-fail on an unknown flag."
     )
 
     args = parser.parse_args()
@@ -314,8 +347,8 @@ def main():
 
     if args.store == "all":
         export_union(args.table, output_dir, args.db_path, namespace=args.namespace)
-    elif args.store in ["firestore", "datastore"]:
-        export_datastore(args.table, output_dir, namespace=args.namespace)
+    elif args.store == "firestore":
+        export_firestore(args.table, output_dir, namespace=args.namespace)
     elif args.store == "sqlite":
         export_sqlite(args.db_path, args.table, output_dir)
 

@@ -109,6 +109,20 @@ module.exports = {
       // shell config, not on this app's actual code. Blanked here so the
       // suite's declared default is what these vars actually resolve to,
       // for every developer, regardless of what their own shell exports.
+      //
+      // DATABASE_PRESETS_FILE in particular must stay unset here, not just
+      // blanked: every spec in this directory shares the ONE webServer
+      // process/port above, so pinning it to the repo's real presets.json
+      // (tried once, to make live-demo.spec.js's World-Stats-preset
+      // dependency deterministic) silently changes the default active
+      // connection and schema-viewer/dataset-group behavior for EVERY
+      // OTHER spec too - broke 14 previously-passing tests across
+      // config-modal.spec.js, chat-history-persistence.spec.js, and
+      // schema-viewer.spec.js, all of which assume the single-synthetic-
+      // "Default DB" fallback this comment describes. There is no
+      // per-spec-file override of this shared server's env in this
+      // config, so this one has to lose - see live-demo.spec.js's own
+      // removal for the rest of that story.
       DEFAULT_MODEL: '',
       GOOGLE_MODELS: '',
       ANTHROPIC_MODELS: '',

@@ -68,9 +68,9 @@ def _quote_ident(name):
 
 
 # --- Phase 2 sampling/min-max column-type buckets ---------------------------
-# Expressed in BigQuery Standard SQL's own INFORMATION_SCHEMA.COLUMNS.data_type
+# Expressed in GoogleSQL's own INFORMATION_SCHEMA.COLUMNS.data_type
 # spelling (unlike Postgres's information_schema, BigQuery's data_type is
-# already the bare Standard SQL type name, e.g. "INT64"/"STRING", not a
+# already the bare GoogleSQL type name, e.g. "INT64"/"STRING", not a
 # longer SQL-standard phrase) - narrower than "every conceivable type" on
 # purpose: an ill-fitting MIN()/MAX() or frequent-value GROUP BY on the
 # wrong shape of column is more likely to error or produce noise than a
@@ -198,7 +198,7 @@ def _table_storage_failure_reason(exc):
 
 
 class BigQueryBackend(Backend):
-    dialect_name = "BigQuery Standard SQL"
+    dialect_name = "Google BigQuery"
 
     def connect(self, descriptor):
         # No connect-only timeout kwarg here - see backends/base.py's

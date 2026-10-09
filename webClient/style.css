@@ -400,7 +400,13 @@ body {
 .app-container {
   max-width: 1400px;
   width: 100%;
-  height: 100dvh;
+  /* flex: 1 (not a fixed height: 100dvh) so .app-container shrinks to fill
+     whatever room is left under #liveDemoStrip when that's visible, rather
+     than overflowing the locked html/body 100dvh and getting clipped by
+     body's overflow: hidden - see .live-demo-strip's own comment below for
+     the other half of this. */
+  flex: 1;
+  min-height: 0;
   margin: 0 auto;
   padding: 0.5rem 1.5rem 0.25rem 1.5rem;
   display: flex;
@@ -1915,7 +1921,7 @@ textarea:focus {
   border: none !important;
   box-shadow: none !important;
   color: var(--prompt-text) !important;
-  font-family: var(--font-mono) !important;
+  font-family: var(--font-sans) !important;
   font-size: 0.85rem;
   line-height: 1.25;
   /* Top padding bumped from 0.25rem to 0.5rem to match #sqlQuery's own
@@ -2300,6 +2306,89 @@ textarea:focus {
 
 .tour-skip-btn:hover {
   color: var(--text-secondary);
+}
+
+/* Live Demo Mode's own status banner (#liveDemoStrip) - a separate,
+   real-data onboarding flow, never nested inside/sharing styles with
+   .tour-overlay above. Deliberately NOT a blocking spotlight overlay like
+   the tour: Live Demo Mode drives the real app end to end, including a
+   real live translate+execute+summarize call with real, variable network
+   latency, so a strip the user can see past (and dismiss with Cancel)
+   reads better than a modal sitting on "waiting". See client.js's "LIVE
+   DEMO MODE" section.
+
+   A full-width banner, by explicit request for maximum visibility - now
+   laid out in normal flow (not position: fixed) so it PUSHES .app-container
+   down rather than covering it/.crbot-header. This works because <body> is
+   itself a column flexbox (see "html, body" / "body" above) and, once the
+   modals and #tourOverlay are excluded (every one of them is its own
+   position: fixed overlay, so none of them participate in body's normal
+   flow), #liveDemoStrip and .app-container are body's only two flex
+   children. `order: -1` below renders the strip first regardless of its
+   DOM position (it sits near the end of <body>, after those fixed
+   overlays, purely so it stays grouped with the rest of this feature's
+   markup) and .app-container's own `flex: 1; min-height: 0;` (see its
+   rule) lets it shrink to fill whatever space remains underneath, instead
+   of overflowing the locked 100dvh viewport and getting clipped.
+
+   z-index: 2100 is there so the banner keeps showing - sharp, un-blurred,
+   above the dimmed/blurred scrim - while a modal (#configModal,
+   #schemaViewerModal, etc.) is open over it, rather than being greyed out
+   underneath. Flex items respect z-index even at their default
+   `position: static` (per the flexbox spec), so this works without also
+   giving the strip `position: relative`. .modal-overlay's own z-index is
+   1000 and .tour-overlay's is 2000 (both above) - 2100 clears both, since
+   a modal or the schema viewer can still be open while the live demo is
+   mid-script driving them. */
+.live-demo-strip {
+  order: -1;
+  z-index: 2100;
+  flex: 0 0 auto;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
+  width: 100%;
+  background: var(--primary);
+  padding: 1rem 1.5rem;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+}
+
+.live-demo-strip.hidden {
+  display: none;
+}
+
+.live-demo-strip-caption {
+  font-size: 1.1rem;
+  font-weight: 600;
+  line-height: 1.4;
+  color: var(--on-primary);
+  text-align: center;
+  max-width: 70ch;
+}
+
+.live-demo-strip-cancel {
+  flex: 0 0 auto;
+  background: rgba(0, 0, 0, 0.15);
+  /* A fixed translucent white, not a var(--on-primary)-derived tint: in
+     light mode --on-primary flips to white and --primary stays a
+     medium-dark green either way (see :root vs :root[data-theme="light"]
+     above), so a white-based border reads consistently against this
+     button's --primary background in both themes - no --on-primary-rgb
+     token exists in this file to key off instead. */
+  border: 1px solid rgba(255, 255, 255, 0.4);
+  border-radius: 999px;
+  color: var(--on-primary);
+  font-size: 0.85rem;
+  font-weight: 700;
+  cursor: pointer;
+  padding: 0.45rem 1.1rem;
+  transition: var(--transition);
+}
+
+.live-demo-strip-cancel:hover {
+  background: rgba(0, 0, 0, 0.3);
 }
 
 /* .help-modal-actions (the action row that used to sit above
@@ -3553,7 +3642,7 @@ tr.report-issue-row td {
 .results-table-wrapper table {
   width: 100%;
   border-collapse: collapse;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-family: var(--font-sans);
   font-size: 0.8125rem;
   color: var(--text-table);
   text-align: left;
@@ -3625,7 +3714,7 @@ tr.report-issue-row td {
   white-space: pre-wrap !important;
   word-break: break-word;
   line-height: 1.5;
-  font-family: var(--font-mono, monospace);
+  font-family: var(--font-sans);
 }
 
 /* Table/Chart toggle (see client.js's renderTableResult()/
@@ -4436,7 +4525,7 @@ tr.report-issue-row td {
 
 .response-text {
   color: var(--text-primary);
-  font-family: var(--font-mono);
+  font-family: var(--font-sans);
   font-size: 0.9rem;
   line-height: 1.5;
   white-space: pre-wrap;

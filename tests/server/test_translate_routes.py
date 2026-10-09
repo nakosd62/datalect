@@ -496,7 +496,7 @@ def test_bigquery_dialect_intro_used_when_active_connection_is_bigquery(app_fact
     # generate_calls[1] - Call 2's own system instruction is where the
     # dialect intro lives (see the Postgres test above for why).
     system_instruction = harness.generate_calls[1]["config"].system_instruction
-    assert "BigQuery Standard SQL" in system_instruction
+    assert "GoogleSQL" in system_instruction
     assert "_TABLE_SUFFIX" in system_instruction
 
 
@@ -906,6 +906,44 @@ def test_translation_retry_delay_seconds_defaults_to_1(app_env):
     assert app_env.translate_routes.TRANSLATION_RETRY_DELAY_SECONDS == 1
 
 
+def test_gemini_thinking_budget_defaults_to_500(app_env):
+    assert app_env.translate_routes.GEMINI_THINKING_BUDGET == 500
+
+
+def test_gemini_calls_set_the_configured_thinking_budget(app_factory, monkeypatch):
+    """Every Gemini generate_content call caps extended-thinking spend via
+    GenerateContentConfig(thinking_config=...) - see _call_gemini's own
+    docstring. Checks both Call 1 (triage) and Call 2 (SQL generation),
+    same as the dialect-intro system_instruction tests above check both."""
+    env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(FakeGenaiResponse('{"action": "sql"}'))
+    harness.queue_response(FakeGenaiResponse('{"sql": "SELECT 1;"}'))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'hi'})
+    parse_translate_stream(resp)  # drains the stream
+    assert len(harness.generate_calls) == 2
+    for call in harness.generate_calls:
+        assert call["config"].thinking_config.thinking_budget == 500
+
+
+def test_gemini_thinking_budget_env_var_overrides_default(app_factory, monkeypatch):
+    env = app_factory(env={
+        "GEMINI_PRESET_KEYS": "fake-key-1",
+        "GEMINI_THINKING_BUDGET": "128",
+    })
+    assert env.translate_routes.GEMINI_THINKING_BUDGET == 128
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(FakeGenaiResponse('{"action": "sql"}'))
+    harness.queue_response(FakeGenaiResponse('{"sql": "SELECT 1;"}'))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'hi'})
+    parse_translate_stream(resp)
+    assert harness.generate_calls[-1]["config"].thinking_config.thinking_budget == 128
+
+
 def test_max_translation_attempts_env_var_overrides_default(app_factory, monkeypatch):
     # Uses a 500 (transient, same-key/delay path) rather than a 429, since
     # MAX_TRANSLATION_ATTEMPTS governs only the shared transient-error
@@ -1040,6 +1078,76 @@ def test_pick_gemini_api_key_falls_back_to_full_pool_when_all_excluded(app_facto
     env = app_factory(env={"GEMINI_PRESET_KEYS": "key-a"})
     picked = env.translate_routes.pick_gemini_api_key(exclude={"key-a"})
     assert picked == "key-a"
+
+
+# --- GOOGLE_API_KEY: single-key fallback, treated like ANTHROPIC_API_KEY/
+# OPENAI_API_KEY rather than the GEMINI_PRESET_KEYS pool (see
+# get_gemini_api_keys()'s and GeminiProvider.supports_key_rotation's own
+# docstrings in llm_providers.py) ------------------------------------------
+
+def test_get_gemini_api_keys_falls_back_to_google_api_key_when_preset_unset(app_factory):
+    env = app_factory(env={"GOOGLE_API_KEY": "google-key-1"})
+    assert env.translate_routes.get_gemini_api_keys() == ["google-key-1"]
+    assert env.translate_routes.pick_gemini_api_key() == "google-key-1"
+
+
+def test_get_gemini_api_keys_prefers_preset_pool_over_google_api_key(app_factory):
+    # GEMINI_PRESET_KEYS wins when both are set - GOOGLE_API_KEY is only a
+    # fallback for when there's no pool configured at all.
+    env = app_factory(env={
+        "GEMINI_PRESET_KEYS": "preset-key-1,preset-key-2",
+        "GOOGLE_API_KEY": "google-key-1",
+    })
+    assert env.translate_routes.get_gemini_api_keys() == ["preset-key-1", "preset-key-2"]
+
+
+def test_gemini_supports_key_rotation_is_false_with_only_google_api_key(app_factory):
+    env = app_factory(env={"GOOGLE_API_KEY": "google-key-1"})
+    provider = env.translate_routes.get_llm_provider("google")
+    assert provider.supports_key_rotation is False
+    assert provider.get_key_pool_size() == 1
+
+
+def test_gemini_supports_key_rotation_is_true_with_preset_keys(app_factory):
+    env = app_factory(env={"GEMINI_PRESET_KEYS": "preset-key-1,preset-key-2"})
+    provider = env.translate_routes.get_llm_provider("google")
+    assert provider.supports_key_rotation is True
+    assert provider.get_key_pool_size() == 2
+
+
+def test_gemini_with_only_google_api_key_never_rotates_and_retries_with_delay(app_factory, monkeypatch):
+    """With no GEMINI_PRESET_KEYS pool configured - just the single
+    GOOGLE_API_KEY fallback - a 429 is treated exactly like Claude's/
+    OpenAI's own rate-limit case (see test_claude_429_never_rotates_key_
+    and_retries_with_delay above): same key, wait out
+    TRANSLATION_RETRY_DELAY_SECONDS, no key rotation at all. Contrast with
+    test_429_rotates_key_and_retries_immediately_with_no_delay, which is
+    the GEMINI_PRESET_KEYS-pool case."""
+    env = app_factory(env={
+        "GOOGLE_API_KEY": "google-key-1",
+        "TRANSLATION_RETRY_DELAY_SECONDS": "2.5",
+    })
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    sleep_calls = []
+    monkeypatch.setattr(env.translate_routes.time, "sleep", lambda secs: sleep_calls.append(secs))
+    # Call 1 (triage) succeeds immediately - this exercises Call 2's own
+    # retry, same reasoning as the Claude/OpenAI equivalents above.
+    harness.queue_response(FakeGenaiResponse('{"action": "sql"}'))
+    harness.queue_error(FakeApiError(429))
+    harness.queue_response(FakeGenaiResponse('{"sql": "SELECT 1;"}'))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'hi'})
+    assert resp.status_code == 200
+    retry_events, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    # Same key reused - only ever one genai.Client(...) construction, since
+    # there's only one key configured at all.
+    assert len(harness.client_api_keys) == 1
+    assert len(retry_events) == 1
+    assert retry_events[0]["rotatedKey"] is False
+    assert retry_events[0]["delaySeconds"] == 2.5
+    assert sleep_calls == [2.5]
 
 
 # --- History result-row truncation for the LLM (HISTORY_RESULT_MAX_ROWS) ---
@@ -1329,7 +1437,7 @@ def test_history_entry_with_no_summary_or_results_is_unaffected(app_env):
 # contradiction for this test to guard against beyond the plain rule itself.
 
 def test_sheets_dialect_intro_still_forbids_comments_generally(app_env):
-    intro = app_env.translate_routes._DIALECT_PROMPT_INTROS["Google Visualization API Query Language"]
+    intro = app_env.translate_routes._DIALECT_PROMPT_INTROS["Google Sheets"]
     assert "NEVER add any comments" in intro
 
 

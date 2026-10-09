@@ -217,13 +217,13 @@ just covers the env vars for the three that exist today.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `GEMINI_API_KEY` / `GOOGLE_API_KEY` | — | A single Gemini API key. Either name works. |
-| `GEMINI_PRESET_KEYS` | — | Comma-separated list of additional Gemini API keys. The app picks one at random per request and, on a rate-limit (429) error, automatically retries with a different key from the pool — immediately, with no delay, for up to one attempt per configured key (this budget is independent of `MAX_TRANSLATION_ATTEMPTS` above and is a Gemini-only mechanism; no other provider rotates keys this way). See [`translate_routes.py`](./server/translate_routes.py) for the full retry policy. |
+| `GOOGLE_API_KEY` | — | A single Gemini API key — treated exactly like `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` below: no random selection among multiple keys (there's only ever one), and a rate-limit (429) error just waits and retries this same key, same as every other provider's single key (no key-rotation retry - see `GEMINI_PRESET_KEYS` just below for the one case that's different). Only used as a fallback when `GEMINI_PRESET_KEYS` isn't set. |
+| `GEMINI_PRESET_KEYS` | — | Comma-separated list of additional Gemini API keys - an actual pool, taking priority over `GOOGLE_API_KEY` above when set. The app picks one at random per request and, on a rate-limit (429) error, automatically retries with a different key from the pool — immediately, with no delay, for up to one attempt per configured key (this budget is independent of `MAX_TRANSLATION_ATTEMPTS` above and is a Gemini-only mechanism; no other provider rotates keys this way). See [`translate_routes.py`](./server/translate_routes.py) for the full retry policy. |
 | `GOOGLE_MODELS` | `gemini-3.6-flash` | Comma-separated list of models this provider can use. The **first** entry is the default used for translation (per-request override: `gemini_model` or the generic `model`; per-session override via the model-selection UI), unless `DEFAULT_MODEL` above names a different model from this same list. The full list is what the model-selection UI offers for Google. |
+| `GEMINI_THINKING_BUDGET` | `500` | Caps Gemini's own internal "extended thinking" spend, in tokens, for a single call — a Gemini-only setting; Claude/OpenAI have no equivalent cap here. See `_call_gemini` in [`llm_providers.py`](./server/llm_providers.py). |
 
-At least one of `GEMINI_API_KEY`, `GOOGLE_API_KEY`, or
-`GEMINI_PRESET_KEYS` must be set, or `/api/translate` returns a 400
-("Google API key is not configured").
+At least one of `GOOGLE_API_KEY` or `GEMINI_PRESET_KEYS` must be set, or
+`/api/translate` returns a 400 ("Google API key is not configured").
 
 #### Anthropic (Claude)
 
@@ -682,8 +682,8 @@ run alongside `./run_server.sh`'s normal dev server.
 
 ## Troubleshooting
 
-- **"Google API key is not configured."** — set `GEMINI_API_KEY`,
-  `GOOGLE_API_KEY`, or `GEMINI_PRESET_KEYS`.
+- **"Google API key is not configured."** — set `GOOGLE_API_KEY` or
+  `GEMINI_PRESET_KEYS`.
 - **Cloud Run deploy fails at startup with a `RuntimeError` about
   Firestore** — `GCP_PROJECT_ID` (or equivalent) isn't resolving to a
   project with a `ydyl` Firestore database, or the service account

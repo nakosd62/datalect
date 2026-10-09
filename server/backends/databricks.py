@@ -185,7 +185,7 @@ def _is_near_unique_approx(distinct_count, live_count):
 
 
 class DatabricksBackend(Backend):
-    dialect_name = "Databricks SQL"
+    dialect_name = "Databricks"
 
     def connect(self, descriptor):
         descriptor = descriptor or {}

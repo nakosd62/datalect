@@ -1,6 +1,6 @@
 """
 GET /api/config's 'configured_databases' entries each carry a display-only
-'dialect_name' field (e.g. "PostgreSQL", "BigQuery Standard SQL") alongside
+'dialect_name' field (e.g. "PostgreSQL", "Google BigQuery") alongside
 the pre-existing raw 'type' key (e.g. "postgres", "bigquery") -
 config_routes.py's own _redact_preset_for_client()/_preset_dialect_name()
 helpers, added so client.js's connection picker (renderDbRadioButtons())
@@ -36,7 +36,7 @@ def test_configured_databases_carries_the_right_dialect_name_per_dialect(app_fac
     assert by_id["my-a"]["type"] == "mysql"
     assert by_id["my-a"]["dialect_name"] == "MySQL"
     assert by_id["bq-a"]["type"] == "bigquery"
-    assert by_id["bq-a"]["dialect_name"] == "BigQuery Standard SQL"
+    assert by_id["bq-a"]["dialect_name"] == "Google BigQuery"
 
 
 def test_configured_databases_dialect_name_survives_anonymous_redaction(app_factory, tmp_path):

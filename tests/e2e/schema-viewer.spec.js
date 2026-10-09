@@ -208,14 +208,14 @@ test.describe('schema viewer', () => {
     await expect(warnings.nth(1)).toContainText('SCHEMA_MAX_TABLES');
   });
 
-  test('a dialect with no cheap dataset-size estimate (e.g. MongoDB Atlas SQL, Google Sheets) omits that part rather than showing a misleading zero, and never shows session info at all', async ({ page }) => {
+  test('a dialect with no cheap dataset-size estimate (e.g. MongoDB Atlas, Google Sheets) omits that part rather than showing a misleading zero, and never shows session info at all', async ({ page }) => {
     await gotoApp(page);
     // No "Estimated dataset size:" line at all in the schema text - see
     // backends/mongodb_sql.py's/backends/sheets.py's own comments on why
     // neither backend ever emits one. The "Session: ..." line IS present
     // here, to prove it's parsed without error but still never rendered.
     const schemaText = 'Table: orders\n  id integer NOT NULL\n\nSession: timezone=UTC';
-    await mockSchema(page, { dialect: 'MongoDB Atlas SQL', schemaText, truncated: false, hasOmittedTables: false });
+    await mockSchema(page, { dialect: 'MongoDB Atlas', schemaText, truncated: false, hasOmittedTables: false });
     await openSchemaViewer(page);
 
     const factsLine = page.locator('#schemaViewerFactsLine');
@@ -540,7 +540,7 @@ test.describe('dataset group schema viewer', () => {
     return state;
   }
 
-  async function mockGroupSchema(page, { id = 'grp-ab', name = 'Sales & Marketing', datasets, status, error } = {}) {
+  async function mockGroupSchema(page, { id = 'grp-ab', name = 'Sales & Marketing', datasets, overview = null, status, error } = {}) {
     const finalDatasets = datasets || [
       { id: 'p-a', name: 'Sales Postgres', type: 'PostgreSQL', data_size: '~2.4 GB', schema_size_tokens: 320, available: true },
       { id: 'p-b', name: 'Marketing Postgres', type: 'PostgreSQL', data_size: null, schema_size_tokens: 150, available: true },
@@ -556,7 +556,7 @@ test.describe('dataset group schema viewer', () => {
       }
       await route.fulfill({
         status: 200, contentType: 'application/json',
-        body: JSON.stringify({ success: true, kind: 'group', id, name, datasets: finalDatasets }),
+        body: JSON.stringify({ success: true, kind: 'group', id, name, datasets: finalDatasets, overview }),
       });
     });
   }
@@ -577,27 +577,40 @@ test.describe('dataset group schema viewer', () => {
     await expect(page.locator('#schemaViewerFactsLine')).toBeEmpty();
   });
 
-  test('the main area is a flat name/type/data-size/schema-size table, not the LHS/RHS panes', async ({ page }) => {
+  test('the main area is the Overview/Datasets tree, not the old flat table', async ({ page }) => {
+    // Supersedes the old flat name/type/data-size/schema-size table - the
+    // group dialog was rebuilt to share the single-connection dialog's own
+    // pinned-Overview + collapsible-tree layout (see openGroupSchemaViewer()/
+    // renderGroupSchemaViewerEntryList() in client.js) instead of a bespoke
+    // table, so a group and a single connection now look and behave the
+    // same way other than what's inside the tree.
     await mockConfig(page);
     await mockGroupSchema(page);
     await gotoApp(page);
     await openSchemaViewerBtn(page);
 
-    await expect(page.locator('#schemaViewerPanesWrap')).toHaveClass(/hidden/);
-    await expect(page.locator('#schemaViewerGroupTableWrap')).not.toHaveClass(/hidden/);
+    await expect(page.locator('#schemaViewerGroupTableWrap')).toHaveClass(/hidden/);
+    await expect(page.locator('#schemaViewerPanesWrap')).not.toHaveClass(/hidden/);
 
-    const headers = page.locator('.schema-viewer-group-table th');
-    await expect(headers).toHaveText(['Name', 'Type', 'Data Size', 'Schema Size (tokens)']);
+    // Pinned "Overview" row, selected by default on a fresh open.
+    const overviewRow = page.locator('.schema-viewer-entry-item.schema-viewer-overview-item');
+    await expect(overviewRow).toHaveText('Overview');
+    await expect(overviewRow).toHaveClass(/active/);
 
-    const rows = page.locator('#schemaViewerGroupTableBody tr');
-    await expect(rows).toHaveCount(2);
-    await expect(rows.nth(0).locator('td')).toHaveText(['Sales Postgres', 'PostgreSQL', '~2.4 GB', '320']);
-    // p-b's mocked data_size is null - shown as an em-dash, never a blank
-    // cell or a misleading "null"/"0".
-    await expect(rows.nth(1).locator('td')).toHaveText(['Marketing Postgres', 'PostgreSQL', '—', '150']);
+    // "Datasets (N)" is collapsed by default - no member rows yet.
+    const datasetsHeader = page.locator('.schema-viewer-group-header');
+    await expect(datasetsHeader).toContainText('Datasets (2)');
+    await expect(page.locator('.schema-viewer-group-children')).toHaveCount(0);
+
+    // Expanding it lists each member, by name, in order.
+    await datasetsHeader.click();
+    const memberRows = page.locator('.schema-viewer-group-children .schema-viewer-entry-item');
+    await expect(memberRows).toHaveCount(2);
+    await expect(memberRows.nth(0)).toHaveText('Sales Postgres');
+    await expect(memberRows.nth(1)).toHaveText('Marketing Postgres');
   });
 
-  test('a dataset whose schema fetch failed shows em-dashes and a dimmed row, without breaking the rest of the table', async ({ page }) => {
+  test('a dataset whose schema fetch failed is dimmed in the Datasets tree, with an explanatory tooltip, without breaking the rest of the list', async ({ page }) => {
     await mockConfig(page);
     await mockGroupSchema(page, {
       datasets: [
@@ -608,20 +621,30 @@ test.describe('dataset group schema viewer', () => {
     await gotoApp(page);
     await openSchemaViewerBtn(page);
 
-    const rows = page.locator('#schemaViewerGroupTableBody tr');
-    await expect(rows.nth(0)).toHaveClass(/schema-viewer-group-row--unavailable/);
-    await expect(rows.nth(0).locator('td')).toHaveText(['Sales Postgres', 'PostgreSQL', '—', '—']);
-    await expect(rows.nth(1)).not.toHaveClass(/schema-viewer-group-row--unavailable/);
-    await expect(rows.nth(1).locator('td')).toHaveText(['Marketing Postgres', 'PostgreSQL', '~500 MB', '90']);
+    await page.locator('.schema-viewer-group-header').click();
+    const memberRows = page.locator('.schema-viewer-group-children .schema-viewer-entry-item');
+    await expect(memberRows.nth(0)).toHaveClass(/schema-viewer-group-row--unavailable/);
+    await expect(memberRows.nth(0)).toHaveAttribute('title', /could not fetch schema for this dataset/);
+    await expect(memberRows.nth(1)).not.toHaveClass(/schema-viewer-group-row--unavailable/);
+    await expect(memberRows.nth(1)).toHaveText('Marketing Postgres');
+
+    // Selecting the failed member doesn't break anything either - it shows
+    // its own empty-state message instead of a cached overview that was
+    // never fetched.
+    await memberRows.nth(0).click();
+    await expect(page.locator('.schema-viewer-overview-empty')).toContainText('schema could not be fetched');
   });
 
-  test('a group with no datasets shows a plain empty-state row instead of an empty table', async ({ page }) => {
+  test('a group with no datasets shows a plain empty-state row under "Datasets (0)" instead of an empty table', async ({ page }) => {
     await mockConfig(page);
     await mockGroupSchema(page, { datasets: [] });
     await gotoApp(page);
     await openSchemaViewerBtn(page);
 
-    await expect(page.locator('#schemaViewerGroupTableBody')).toContainText('This dataset group has no datasets in it.');
+    const datasetsHeader = page.locator('.schema-viewer-group-header');
+    await expect(datasetsHeader).toContainText('Datasets (0)');
+    await datasetsHeader.click();
+    await expect(page.locator('.schema-viewer-group-children')).toContainText('This dataset group has no datasets in it.');
   });
 
   test('a fetch error surfaces in the notice bar, same as the single-connection viewer', async ({ page }) => {
@@ -634,7 +657,11 @@ test.describe('dataset group schema viewer', () => {
     await expect(page.locator('#schemaViewerNotice')).not.toHaveClass(/hidden/);
   });
 
-  test('the Refresh Schema button and its status line stay in the header, but the button is disabled with an explanatory tooltip', async ({ page }) => {
+  test('the Refresh Schema button is repurposed as "Refresh Overview" and enabled for a group', async ({ page }) => {
+    // Supersedes the old "disabled, no group-wide overview concept yet"
+    // behavior - the button now drives the group's own AI-written overview
+    // (POST /api/config/refresh-schema with kind: 'group' - see
+    // openGroupSchemaViewer()'s own refresh-button setup in client.js).
     await mockConfig(page);
     await mockGroupSchema(page);
     await gotoApp(page);
@@ -642,20 +669,46 @@ test.describe('dataset group schema viewer', () => {
 
     const refreshBtn = page.locator('#schemaViewerRefreshBtn');
     await expect(refreshBtn).toBeVisible();
-    await expect(refreshBtn).toBeDisabled();
-    await expect(refreshBtn).toHaveAttribute('title', /isn't available yet/);
+    await expect(refreshBtn).toBeEnabled();
+    await expect(refreshBtn).toHaveAttribute('title', /AI-written overview/);
+    await expect(page.locator('#schemaViewerRefreshBtnLabel')).toHaveText('Refresh Overview');
     // No single "last refreshed" timestamp exists for a whole group at
     // once - the status line stays in the layout (see index.html's own
-    // comment) but shows nothing here.
+    // comment) but shows nothing until an actual refresh round-trip.
     await expect(page.locator('#schemaViewerRefreshStatus')).toHaveText('');
   });
 
-  test('opening the group viewer, closing it, then opening a specific preset\'s own viewer shows the LHS/RHS panes again, not a leftover group table', async ({ page }) => {
+  test('clicking "Refresh Overview" regenerates the group\'s overview and reloads the tree', async ({ page }) => {
+    await mockConfig(page);
+    await mockGroupSchema(page);
+    await gotoApp(page);
+    await openSchemaViewerBtn(page);
+
+    let refreshBody = null;
+    await page.route('**/api/config/refresh-schema', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      refreshBody = route.request().postDataJSON();
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ success: true }) });
+    });
+    await mockGroupSchema(page, {
+      datasets: [
+        { id: 'p-a', name: 'Sales Postgres', type: 'PostgreSQL', data_size: '~2.4 GB', schema_size_tokens: 320, available: true },
+        { id: 'p-b', name: 'Marketing Postgres', type: 'PostgreSQL', data_size: null, schema_size_tokens: 150, available: true },
+      ],
+      overview: { prose: 'This group spans sales and marketing data.', questions: ['What were last quarter\'s top campaigns?'] },
+    });
+
+    await page.locator('#schemaViewerRefreshBtn').click();
+    await expect(page.locator('#schemaViewerOverviewWrap')).toContainText('This group spans sales and marketing data.');
+    expect(refreshBody).toMatchObject({ kind: 'group', id: 'grp-ab' });
+  });
+
+  test('opening the group viewer, closing it, then opening a specific preset\'s own viewer shows its own tree, not a leftover group tree', async ({ page }) => {
     // Regression guard for the shared-modal layout switch (openSchemaViewer()'s
-    // own reset of schemaViewerGroupTableWrap/schemaViewerPanesWrap) - this
-    // modal instance persists across opens, so a single-connection open
-    // right after a group one must not still be showing the previous
-    // group's flat table underneath, with the LHS/RHS panes still hidden.
+    // own reset of schemaViewerMode/schemaViewerGroupDatasets*) - this modal
+    // instance persists across opens, so a single-connection open right
+    // after a group one must not still be showing the previous group's own
+    // Overview/Datasets tree underneath.
     await mockConfig(page, { ...buildGroupConfigState(), in_scope_mode: 'single', in_scope_group_id: '' });
     await mockGroupSchema(page);
     await mockSchema(page, { name: 'Sales Postgres', dialect: 'PostgreSQL' });
@@ -674,7 +727,9 @@ test.describe('dataset group schema viewer', () => {
     await expect(page.locator('#configModal')).toHaveClass(/hidden/);
 
     await openSchemaViewerBtn(page);
-    await expect(page.locator('#schemaViewerGroupTableWrap')).not.toHaveClass(/hidden/);
+    await expect(page.locator('#schemaViewerGroupTableWrap')).toHaveClass(/hidden/);
+    await expect(page.locator('#schemaViewerPanesWrap')).not.toHaveClass(/hidden/);
+    await expect(page.locator('.schema-viewer-group-header')).toContainText('Datasets (2)');
     await page.locator('#schemaViewerModalCloseBtn').click();
     await expect(page.locator('#schemaViewerModal')).toHaveClass(/hidden/);
 
@@ -689,5 +744,7 @@ test.describe('dataset group schema viewer', () => {
     await expect(page.locator('#schemaViewerGroupTableWrap')).toHaveClass(/hidden/);
     await expect(page.locator('#schemaViewerPanesWrap')).not.toHaveClass(/hidden/);
     await expect(page.locator('#schemaViewerModalTitleText')).toContainText('Sales Postgres in PostgreSQL');
+    // No leftover "Datasets" tree group from the previous group-mode open.
+    await expect(page.locator('.schema-viewer-group-header')).toHaveCount(0);
   });
 });

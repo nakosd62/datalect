@@ -45,7 +45,6 @@
       } catch (e) { /* localStorage unavailable - default (dark) theme */ }
     })();
   </script>
-
   <!-- LOGO CONCEPT REVIEW (per explicit request - NOT a final swap): points
        at the new "-concept" asset set (funnel/spark artwork) instead of the
        original robot-mascot favicon.ico/.svg/-16x16/-32x32/apple-touch-icon
@@ -64,6 +63,12 @@
   
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <!-- Inter (--font-sans, the app's own UI text) and Fira Code (--font-mono,
+       the SQL editor/CodeMirror) - the only two families the app uses. A
+       per-user UI Font preference (a Preferences dialog selector between
+       Inter and five alternatives) briefly existed here and was removed
+       per explicit request - Inter alone was judged fine, with no need to
+       expose a choice. See git history if that's ever wanted back. -->
   <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
   
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/codemirror.min.css">
@@ -875,6 +880,21 @@
         </div>
       </div>
     </div>
+  </div>
+
+  <!-- Live Demo Mode's own status strip - a separate, real-data onboarding
+       flow, NOT the quick tour above (see #tourOverlay) and never nested
+       inside it. Unlike the tour's blocking spotlight overlay, this is a
+       small, non-blocking corner strip: Live Demo Mode drives the REAL app
+       (real dataset picker, real Schema Viewer, a real live translate +
+       execute + summarize call), which has real, variable network latency
+       a blocking modal would make feel broken sitting on "waiting". See
+       client.js's "LIVE DEMO MODE" section and demo-script.json for the
+       full design (also written up in this repo's own
+       demo-mode-onboarding-design.md). -->
+  <div id="liveDemoStrip" class="live-demo-strip hidden">
+    <span id="liveDemoStripCaption" class="live-demo-strip-caption"></span>
+    <button type="button" id="liveDemoStripCancelBtn" class="live-demo-strip-cancel">Cancel</button>
   </div>
 
   <script src="https://cdn.jsdelivr.net/npm/sql-formatter@15.4.0/dist/sql-formatter.min.js"></script>

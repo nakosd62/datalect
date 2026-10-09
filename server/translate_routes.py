@@ -278,6 +278,7 @@ from llm_providers import (
     _call_gemini, _mark_claude_cache_boundary, _call_claude, _call_openai,
     LlmProvider, GeminiProvider, ClaudeProvider, OpenAiProvider,
     _LLM_PROVIDERS, _default_fleet_provider, get_llm_provider, list_llm_providers_info,
+    GEMINI_THINKING_BUDGET,
 )
 
 # The google-genai/anthropic/openai/httpx SDK imports above (and httpx2,

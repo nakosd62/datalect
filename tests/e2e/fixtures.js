@@ -119,13 +119,18 @@ const isolatedTest = base.test.extend({
 });
 
 /** The default for most specs: state isolation + onboarding/tour skipped +
- * a safe default /api/execute mock installed. */
+ * Live Demo Mode skipped (see client.js's "LIVE DEMO MODE" section - it
+ * would otherwise auto-trigger on its own a couple seconds after load for
+ * any spec that didn't already seed ydylOnboardingSeen itself, driving a
+ * real translate/execute/summarize call no spec here expects) + a safe
+ * default /api/execute mock installed. */
 const test = isolatedTest.extend({
   page: async ({ page }, use) => {
     await page.addInitScript(() => {
       try {
         window.localStorage.setItem('ydylOnboardingSeen', '1');
         window.localStorage.setItem('ydylHelpPulseDismissed', '1');
+        window.localStorage.setItem('ydylLiveDemoSeen', '1');
       } catch (e) { /* ignore */ }
     });
     // client.js's checkDbStatus() fires a real GET /api/ping call after

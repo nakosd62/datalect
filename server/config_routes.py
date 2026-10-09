@@ -231,7 +231,7 @@ from app_config import (
 import os
 from auth import (
     get_or_create_session_id, get_current_user_identity, apply_session_cookie,
-    is_anonymous_user,
+    is_anonymous_user, is_superuser,
 )
 from db import (
     get_conn_identifier, resolve_active_descriptor, invalidate_schema_cache,
@@ -1522,6 +1522,21 @@ def handle_refresh_schema():
     group dialog's own "Refresh Schema" button - previously disabled,
     since there was nothing for it to do - now points at exactly this.
 
+    Authorization: kind="custom" stays open to any signed-in user -
+    resolve_descriptor_by_reference() already scopes it to this request's
+    OWN saved connections, so there's nothing to additionally gate.
+    kind="preset" and kind="group" are different in kind, not just in
+    code path - a preset or dataset group is a shared, admin-configured
+    resource with no single owner, so "can refresh THIS one" isn't a
+    meaningful per-row check the way it is for a custom connection; the
+    only sound gate is coarser: is a superuser asking at all (see
+    auth.py's is_superuser()). Without this, any signed-in (or even
+    anonymous, on a deployment that allows it) user could force a live
+    re-introspection of every admin-configured database on demand -
+    unwanted load/cost against production systems the app's own operator
+    chose to connect, triggerable by literally anyone who can reach the
+    app.
+
     This is a deliberately blocking, synchronous call (per the frontend's
     own "Refresh Schema" buttons - see webClient/client.js) - no
     background job/polling here, the request just takes as long as the
@@ -1535,6 +1550,20 @@ def handle_refresh_schema():
     if not kind:
         # Legacy shape - see this route's own docstring.
         kind, ref_id = 'custom', (data.get('connection_key') or '').strip()
+
+    # Superuser-only past this point for kind="preset"/"group" - see this
+    # route's own docstring ("Authorization" section) for why a custom
+    # connection's own per-user ownership check isn't the right model for
+    # a shared, admin-configured preset or dataset group. Checked before
+    # any kind-specific validation/resolution below so a non-superuser
+    # gets the same 403 regardless of whether the id they guessed happens
+    # to exist - this is a permission failure, not a "not found" one.
+    if kind in ('preset', 'group') and not is_superuser(user_identity):
+        resp = jsonify({
+            'success': False,
+            'error': 'Only a superuser can refresh schema for a preset dataset or dataset group.',
+        })
+        return apply_session_cookie(resp, session_id), 403
 
     if kind == 'group':
         if not ref_id:
@@ -2791,6 +2820,14 @@ def handle_config():
         'session_id': session_id,
         'user_id': user_identity,
         'authenticated': is_authenticated,
+        # Lets webClient/client.js disable (with an explanatory tooltip,
+        # rather than a confusing 403 after the fact) the "Refresh
+        # Schema"/"Refresh Overview" button for a preset or dataset group
+        # when this user isn't one - see auth.py's is_superuser() and
+        # this route's own POST /api/config/refresh-schema handler, which
+        # is what actually enforces this; this field is a UX nicety only,
+        # never itself a security boundary.
+        'is_superuser': is_superuser(user_identity),
         'is_cloud_run': IS_CLOUD_RUN,
         'configured_databases': configured_dbs,
         'configured_database_groups': configured_database_groups,

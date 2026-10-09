@@ -176,7 +176,7 @@ def test_never_touched_session_honors_database_default_pointing_at_non_postgres_
     assert data["active_preset_id"] == "bq-a"
     assert data["in_scope_preset_ids"] == ["bq-a"]
     assert {
-        "id": "bq-a", "name": "BigQuery A", "type": "bigquery", "dialect_name": "BigQuery Standard SQL",
+        "id": "bq-a", "name": "BigQuery A", "type": "bigquery", "dialect_name": "Google BigQuery",
     } in data["configured_databases"]
 
 

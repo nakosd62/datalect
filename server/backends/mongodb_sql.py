@@ -239,7 +239,7 @@ def _reject_if_not_read_only(stmt_clean):
 
 
 class MongoSqlBackend(Backend):
-    dialect_name = "MongoDB Atlas SQL"
+    dialect_name = "MongoDB Atlas"
 
     def connect(self, descriptor):
         # _packed_url() reassembles the four descriptor fields (or passes

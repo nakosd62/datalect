@@ -100,10 +100,19 @@ GCP_PROJECT_ID = (
 IS_CLOUD_RUN = bool(os.environ.get("K_SERVICE"))
 
 # --- 2. Firestore Initialization --------------------------------------------
+# Uses the project's DEFAULT Firestore database (no `database=` argument -
+# the client library resolves that to "(default)" on its own) rather than
+# the separate named database "ydyl" this app used to point at. GCP bills
+# each additional named database in a project on its own, independent of
+# the default one's usage - state (sessions/custom connections/translation
+# history) was migrated from "ydyl" into the default database via
+# utils/migrate_firestore_to_default_db.py specifically to get off that
+# second bill, so there is deliberately no FIRESTORE_DATABASE_ID knob here:
+# this app has exactly one Firestore database to talk to again.
 firestore_client = None
 if GCP_PROJECT_ID:
     try:
-        firestore_client = firestore.Client(project=GCP_PROJECT_ID, database="ydyl")
+        firestore_client = firestore.Client(project=GCP_PROJECT_ID)
         logger.info("Initialized Firestore client for project '%s'.", GCP_PROJECT_ID)
     except Exception:
         logger.exception("Error initializing Firestore client")
@@ -111,6 +120,23 @@ if GCP_PROJECT_ID:
 # --- Authentication & State Configuration -----------------------------------
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
 AUTH_ENABLED = bool(GOOGLE_CLIENT_ID)
+
+# Emails allowed to perform superuser-only actions - currently just one:
+# triggering a schema refresh for an admin-configured preset or dataset
+# group, as opposed to one of the current user's OWN saved custom
+# connections (see config_routes.py's handle_refresh_schema() and auth.py's
+# is_superuser() for the full design). Comma-separated, case-insensitive,
+# whitespace around each entry ignored. Only consulted at all on Cloud Run
+# (see is_superuser() - a local deployment has no such list to configure,
+# every session is simply a superuser there); on Cloud Run, unset/empty
+# means nobody qualifies - deliberately fails closed rather than silently
+# granting every signed-in user superuser status just because an operator
+# forgot to set this.
+SUPERUSER_EMAILS = {
+    email.strip().lower()
+    for email in os.environ.get("SUPERUSER_EMAILS", "").split(",")
+    if email.strip()
+}
 
 # Startup / Module Scope Guard
 if IS_CLOUD_RUN and not firestore_client:

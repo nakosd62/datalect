@@ -95,15 +95,15 @@ import translate_routes
 
 _DIALECT_PROMPT_FILENAMES = {
     "PostgreSQL": "postgresql",
-    "BigQuery Standard SQL": "bigquery_standard_sql",
+    "Google BigQuery": "google_bigquery",
     "Snowflake SQL": "snowflake_sql",
     "MySQL": "mysql",
-    "Databricks SQL": "databricks_sql",
+    "Databricks": "databricks_sql",
     "Oracle Database": "oracle_database",
-    "Amazon Redshift SQL": "amazon_redshift_sql",
+    "Amazon Redshift": "amazon_redshift_sql",
     "Microsoft SQL Server": "microsoft_sql_server",
-    "Google Visualization API Query Language": "google_visualization_api_query_language",
-    "MongoDB Atlas SQL": "mongodb_atlas_sql",
+    "Google Sheets": "google_sheets",
+    "MongoDB Atlas": "mongodb_atlas_sql",
 }
 # Each dialect's own prompt intro - the dialect-specific gotchas/syntax
 # rules a model needs before generating SQL for it - now lives as its own

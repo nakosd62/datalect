@@ -1501,7 +1501,14 @@ test.describe('multi-database question answering', () => {
 
     await expect(page.locator('#schemaViewerModal')).not.toHaveClass(/hidden/);
     await expect(page.locator('#schemaViewerModalTitleText')).toHaveText('Sales & Marketing (Dataset Group)');
-    await expect(page.locator('#schemaViewerGroupTableWrap')).not.toHaveClass(/hidden/);
+    // Supersedes the old flat-table assertion - the group dialog now
+    // shares the single-connection dialog's own Overview/Datasets tree
+    // layout (see schema-viewer.spec.js's "dataset group schema viewer"
+    // tests), so the flat table stays permanently hidden and the tree
+    // panes show instead.
+    await expect(page.locator('#schemaViewerGroupTableWrap')).toHaveClass(/hidden/);
+    await expect(page.locator('#schemaViewerPanesWrap')).not.toHaveClass(/hidden/);
+    await expect(page.locator('.schema-viewer-group-header')).toContainText('Datasets (2)');
     await expect(page.locator('.response-text')).toHaveCount(0);
   });
 

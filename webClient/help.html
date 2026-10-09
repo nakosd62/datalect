@@ -6,6 +6,10 @@
     <a href="#" id="replayTourBtn">&#8635; Replay guided tour</a>
     </p>
     <p>
+    Or see the agent fetch a real answer from a real dataset, live:
+    <a href="#" id="replayLiveDemoBtn">&#8635; Replay live demo</a>
+    </p>
+    <p>
     Read the text below for further explanation of some of the concepts.
     </p>
     
@@ -26,13 +30,16 @@
     Your custom database connections are kept private and secure. If you do not log in, your custom 
     connections are scoped to your current browser session only - nobody else can see or use them. 
     If you log in, your connections are scoped to your account instead, so they follow you across 
-    sessions and devices, but are still never visible to any other user. Sensitive fields - passwords, 
-    service-account keys, private keys, access tokens - are encrypted at rest in the App's state database, 
-    and are never sent back to your browser once saved. 
+    sessions and devices, but are still never visible to any other user. Sensitive fields 
+    - passwords, service-account keys, private keys, access tokens - are encrypted at rest in the 
+    App's state database, and are never sent back to your browser once saved. 
     </p>
     <p>
-    Datasets can be defined as groups of other datasets. Some such demo datasets are offered out of the box.
-    In that case, the agent decides which dataset to contact for each user prompt. 
+    Datasets can be defined as groups of other datasets. Some such datasets are offered out of 
+    the box. In future versions, users will be able to define their own composite datasets. 
+    In composite datasets, the agent decides which constituent datasets to contact and may also 
+    'blend' results from datasets in its memory when that is necessary in order to answer the 
+    user prompt.
     </p>
     
     <h3>Multi-Turn Conversations</h3>

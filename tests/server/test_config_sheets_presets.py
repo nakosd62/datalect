@@ -103,7 +103,7 @@ def test_valid_preset_appears_in_configured_databases_with_no_credential_fields(
     assert data['configured_databases'] == [
         {
             "id": "sheets+Team Roster (Sheet)", "name": "Team Roster (Sheet)", "type": "sheets",
-            "dialect_name": "Google Visualization API Query Language",
+            "dialect_name": "Google Sheets",
         }
     ]
 
@@ -150,7 +150,7 @@ def test_preset_with_credentials_json_still_redacted_to_id_name_type(app_factory
     assert data['configured_databases'] == [
         {
             "id": "sheets+Private Roster", "name": "Private Roster", "type": "sheets",
-            "dialect_name": "Google Visualization API Query Language",
+            "dialect_name": "Google Sheets",
         }
     ]
 

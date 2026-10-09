@@ -747,6 +747,18 @@ document.addEventListener('DOMContentLoaded', async () => {
   // deployments).
   let googleAuthEnabled = false;
 
+  // Mirrors GET/POST /api/config's own 'is_superuser' field (see auth.py's
+  // is_superuser()/config_routes.py's handle_config()) - UX only, never a
+  // security boundary of its own: lets the Schema Viewer disable (with an
+  // explanatory tooltip, rather than firing the request and getting back a
+  // confusing 403) its "Refresh Schema"/"Refresh Overview" button for a
+  // PRESET or dataset GROUP when this signed-in user isn't one. A custom
+  // connection's own Refresh Schema stays enabled regardless - that one's
+  // already scoped server-side to connections this user themselves saved
+  // (see POST /api/config/refresh-schema's own docstring), so there's
+  // nothing for this flag to additionally gate there.
+  let currentUserIsSuperuser = false;
+
   function getDatabaseNameFromUrl(urlStr) {
     if (!urlStr) return "Custom";
     try {
@@ -1393,6 +1405,17 @@ document.addEventListener('DOMContentLoaded', async () => {
         e.preventDefault();
         helpModal.classList.add('hidden');
         startGuidedTour();
+      });
+    }
+    // "Replay live demo" - manual entry point for Live Demo Mode (see the
+    // "LIVE DEMO MODE" section above). Always runs on click, regardless of
+    // hasSeenLiveDemo() - a deliberate replay request should always replay.
+    const replayLiveDemoLink = helpModalBody.querySelector('#replayLiveDemoBtn');
+    if (replayLiveDemoLink) {
+      replayLiveDemoLink.addEventListener('click', (e) => {
+        e.preventDefault();
+        helpModal.classList.add('hidden');
+        runLiveDemo();
       });
     }
   }
@@ -3461,6 +3484,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         googleAuthEnabled = true;
         initGoogleAuth(data.google_client_id);
       }
+      currentUserIsSuperuser = Boolean(data.is_superuser);
 
       if (data.active_database_url) {
         ACTIVE_DB_URL = data.active_database_url;
@@ -4517,7 +4541,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       // so a never-touched session's one radio shows checked exactly as
       // before this feature existed.
       const isSelected = !groupSelected && IN_SCOPE_PRESET_IDS.includes(db.id);
-      // dialect_name (e.g. "PostgreSQL", "BigQuery Standard SQL") is a
+      // dialect_name (e.g. "PostgreSQL", "Google BigQuery") is a
       // display-only field added by config_routes.py's
       // _redact_preset_for_client() alongside the raw "type" key - shown in
       // parentheses so every preset in this list reads as "<name> (<type>)",
@@ -5161,7 +5185,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     // for it.
     const isCompleteSimpleUrlDb = (db) => db && db.type !== 'bigquery' && db.type !== 'snowflake' && db.type !== 'databricks' && db.type !== 'oracle' && db.type !== 'redshift' && db.type !== 'mssql' && db.type !== 'sheets' && db.type !== 'MongoDB'
       && db.url && db.url.trim() !== "";
-    // MongoDB Atlas SQL is a hybrid: a real url (like Postgres/MySQL)
+    // MongoDB Atlas is a hybrid: a real url (like Postgres/MySQL)
     // PLUS separate structured config fields (like every dialect above)
     // - see backends/mongodb_sql.py's and config_routes.py's module
     // docstrings. Same "freshly entered, or already saved server-side"
@@ -6125,6 +6149,17 @@ document.addEventListener('DOMContentLoaded', async () => {
       window.removeEventListener('resize', tourResizeHandler);
       tourResizeHandler = null;
     }
+    // See tourAutoStartedPendingLiveDemo's own declaration comment (LIVE
+    // DEMO MODE section below) - only the real auto-started first-run
+    // tour chains into the live demo; a manual "Replay guided tour" click
+    // never does.
+    if (tourAutoStartedPendingLiveDemo) {
+      tourAutoStartedPendingLiveDemo = false;
+      if (!hasSeenLiveDemo()) {
+        markLiveDemoSeen();
+        runLiveDemo();
+      }
+    }
   }
 
   if (tourNextBtn) {
@@ -6211,6 +6246,314 @@ document.addEventListener('DOMContentLoaded', async () => {
   // help.html's fetched content is rendered into #helpModalBody, since it's
   // now a link inside that fragment rather than a static button here that
   // could be looked up once at page load.
+
+  // ===========================================================================
+  // 6.5. LIVE DEMO MODE - a separate, real-data onboarding flow. NOT the
+  // quick tour above (#tourOverlay/getTourSteps()/startGuidedTour()),
+  // which this section never touches or reuses - see this repo's own
+  // demo-mode-onboarding-design.md for the full writeup this implements.
+  //
+  // Reads webClient/demo-script.json (plain JSON, meant to be hand-edited
+  // without ever touching this file) and drives the REAL app end to end:
+  // the real dataset picker (switchActiveConnectionToPreset(), the same
+  // function a real suggested-question click already uses elsewhere in
+  // this file), the real Schema Viewer (openSchemaViewer() via a real
+  // .click() on datasetSchemaViewerBtn), a real live translate call
+  // (translatePrompt()), and the real post-execution summary/chart
+  // pipeline (requestSingleModeResultsSummary() et al., already wired
+  // unconditionally into every single-connection turn - see
+  // translatePrompt()/executeSql() above). Nothing here fakes a result,
+  // a chart, or a successful run: a genuine failure in the live translate
+  // call is left to show exactly the way it already does for any real
+  // user (translatePrompt()/executeSql() render their own real error UI),
+  // not papered over with a canned fallback query.
+  // ===========================================================================
+
+  const LIVE_DEMO_SEEN_KEY = 'ydylLiveDemoSeen';
+  const LIVE_DEMO_SCRIPT_URL = 'demo-script.json';
+
+  function hasSeenLiveDemo() {
+    try {
+      return localStorage.getItem(LIVE_DEMO_SEEN_KEY) === '1';
+    } catch (e) {
+      return true; // localStorage unavailable (private mode, etc.) - don't nag
+    }
+  }
+  function markLiveDemoSeen() {
+    try {
+      localStorage.setItem(LIVE_DEMO_SEEN_KEY, '1');
+    } catch (e) { /* ignore */ }
+  }
+
+  const liveDemoStrip = document.getElementById('liveDemoStrip');
+  const liveDemoStripCaption = document.getElementById('liveDemoStripCaption');
+  const liveDemoStripCancelBtn = document.getElementById('liveDemoStripCancelBtn');
+
+  let liveDemoScriptPromise = null;
+  function loadLiveDemoScript() {
+    if (!liveDemoScriptPromise) {
+      liveDemoScriptPromise = fetch(LIVE_DEMO_SCRIPT_URL)
+        .then((r) => {
+          if (!r.ok) throw new Error(`HTTP ${r.status} fetching ${LIVE_DEMO_SCRIPT_URL}`);
+          return r.json();
+        });
+    }
+    return liveDemoScriptPromise;
+  }
+
+  let liveDemoRunning = false;
+  let liveDemoAborted = false;
+
+  function showLiveDemoCaption(text) {
+    if (!liveDemoStrip) return;
+    if (liveDemoStripCaption) liveDemoStripCaption.textContent = text || '';
+    liveDemoStrip.classList.remove('hidden');
+  }
+  function hideLiveDemoStrip() {
+    if (liveDemoStrip) liveDemoStrip.classList.add('hidden');
+  }
+
+  function liveDemoDelay(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  // Polls `predicate` until it's truthy or `timeoutMs` elapses - every
+  // call site treats this as best-effort pacing against real, variable-
+  // latency DOM/network state (a modal's own open animation, the Schema
+  // Viewer's async schema fetch), not a hard precondition, so a timeout
+  // just lets the script move on rather than ever throwing.
+  function liveDemoWaitFor(predicate, { timeoutMs = 4000, interval = 80 } = {}) {
+    return new Promise((resolve) => {
+      const start = Date.now();
+      (function poll() {
+        if (liveDemoAborted) return resolve(false);
+        let ok = false;
+        try { ok = !!predicate(); } catch (e) { ok = false; }
+        if (ok) return resolve(true);
+        if (Date.now() - start >= timeoutMs) return resolve(false);
+        setTimeout(poll, interval);
+      })();
+    });
+  }
+
+  // Types `text` into aiPrompt one character at a time, dispatching a
+  // real 'input' event after each one so aiPrompt's own input listener
+  // (clearResultsDisplay()/setSqlQuery('')) runs exactly as it would for
+  // a real keystroke - purely a visual-realism touch over an instant
+  // aiPrompt.value = text, per this feature's own design doc.
+  async function liveDemoTypePrompt(text, speedMs) {
+    if (!aiPrompt) return;
+    aiPrompt.value = '';
+    aiPrompt.dispatchEvent(new Event('input', { bubbles: true }));
+    for (let i = 0; i < text.length; i++) {
+      if (liveDemoAborted) return;
+      aiPrompt.value += text[i];
+      aiPrompt.dispatchEvent(new Event('input', { bubbles: true }));
+      await liveDemoDelay(speedMs);
+    }
+  }
+
+  async function runLiveDemoStep(step, script) {
+    switch (step.type) {
+      case 'start':
+        // The very first step, by explicit request: shows an intro
+        // caption (set by the loop in runLiveDemo() below, same as every
+        // other step) explaining what's about to happen, and holding it
+        // on screen for its own demo-script.json "holdMs" before the real
+        // steps below start driving the app - see the generic holdMs
+        // handling just below this switch.
+        //
+        // Also blanks whatever's currently in the prompt box, SQL editor,
+        // and results area - a visitor could easily have left real
+        // content sitting there (their own typed question, a stale
+        // result) right before clicking into the demo, and that should
+        // never bleed into it. Same clearing primitives startNewTurn()
+        // uses below (#newTurnBtn's own handler), but called directly
+        // here rather than through that function itself: startNewTurn()
+        // also resets PINNED_CONNECTIONS, flips viewingBlankSlate, moves
+        // focus into aiPrompt, and fires a 'new_turn_clicked' analytics
+        // event - all real side effects tied to an actual user click that
+        // don't belong to an automated demo starting up.
+        if (aiPrompt) aiPrompt.value = '';
+        setSqlQuery('');
+        clearResultsDisplay();
+        break;
+      case 'open_connection_picker': {
+        if (!configTriggerBadge || !configModal) return;
+        configTriggerBadge.click();
+        await liveDemoWaitFor(() => !configModal.classList.contains('hidden'));
+        break;
+      }
+      case 'select_connection': {
+        if (script.connectionId) {
+          await switchActiveConnectionToPreset(script.connectionId);
+        }
+        closeConfigModal();
+        break;
+      }
+      case 'open_schema_viewer': {
+        if (!datasetSchemaViewerBtn || !schemaViewerModal) return;
+        datasetSchemaViewerBtn.click();
+        await liveDemoWaitFor(() => !schemaViewerModal.classList.contains('hidden'));
+        // The schema itself loads asynchronously after the modal opens.
+        // The pinned Overview/ER-diagram rows render immediately on open,
+        // regardless of whether the real schema fetch has finished - so
+        // waiting for "any entry" (as this used to) resolved instantly and
+        // let browse_schema run before the real "Tables" group (built from
+        // SCHEMA_VIEWER_GROUPS, which drops a group entirely while it has
+        // zero items) ever existed, leaving it nothing to expand or click.
+        // Wait for that real group header specifically - a real schema
+        // introspection + cached-overview fetch can take a few seconds,
+        // hence the longer timeout.
+        await liveDemoWaitFor(
+          () => schemaViewerEntryList && schemaViewerEntryList.querySelector('[data-group="tables"]'),
+          { timeoutMs: 8000 }
+        );
+        break;
+      }
+      case 'browse_schema': {
+        if (!schemaViewerEntryList) return;
+        const groupHeader = schemaViewerEntryList.querySelector('[data-group="tables"]');
+        if (groupHeader && !groupHeader.classList.contains('expanded')) {
+          groupHeader.click();
+        }
+        const highlights = Array.isArray(script.schemaHighlights) ? script.schemaHighlights : [];
+        for (const tableName of highlights) {
+          if (liveDemoAborted) return;
+          const row = Array.from(schemaViewerEntryList.querySelectorAll('[data-category="tables"]'))
+            .find((btn) => (btn.textContent || '').trim().startsWith(tableName));
+          if (row) {
+            row.click();
+            await liveDemoDelay(900);
+          }
+        }
+        break;
+      }
+      case 'close_schema_viewer': {
+        closeSchemaViewer();
+        break;
+      }
+      case 'enter_prompt': {
+        await liveDemoTypePrompt(script.question || '', step.typingSpeedMs || 30);
+        break;
+      }
+      case 'run': {
+        if (liveDemoAborted) return;
+        // The real translate -> execute -> summarize pipeline - see
+        // translatePrompt()/executeSql()/requestSingleModeResultsSummary()
+        // above. A real failure here is deliberately left to render its
+        // own real error UI (not caught/papered over here) - see this
+        // function's own header comment and runLiveDemo()'s catch below.
+        await translatePrompt();
+        break;
+      }
+      case 'wait_for_results': {
+        // translatePrompt() (the 'run' step above) already resolves only
+        // once execution AND the automatic post-execution summary call
+        // have both finished, so there's nothing left to wait ON here -
+        // this step's own action is a genuine no-op. Its real job is
+        // carrying the demo-script.json "holdMs" that controls how long
+        // the Summary/Response tab sits on screen, readable, before the
+        // next step (click_chart_link) jumps the view over to the
+        // chart - see the generic holdMs handling just below this
+        // switch. Kept as its own script step (rather than folding that
+        // pause into click_chart_link's own holdMs, applied AFTER it
+        // runs) so the pause happens BEFORE the chart click, while the
+        // reader is still looking at the summary.
+        break;
+      }
+      case 'click_chart_link': {
+        if (liveDemoAborted) return;
+        // The model's own real, inline "[phrase](chart:N)" link, if it
+        // happened to write one for THIS run's actual results (see
+        // applyInlineChartLinks()) - clicking it exercises the exact same
+        // delegated #resultsBody handler a genuine click does.
+        const inlineLink = resultsBody ? resultsBody.querySelector('[data-view-chart-trigger]') : null;
+        if (inlineLink) {
+          inlineLink.click();
+        } else {
+          // No inline link this particular run (the model didn't judge
+          // anything chart-worthy this time, or nothing in these results
+          // ever qualified at all) - jumpToChartableResultTab() is the
+          // exact same real function that link's click would have
+          // called; calling it directly with no index is its own
+          // documented "first chartable tab" fallback, and a harmless
+          // no-op (never a faked chart) when nothing in this turn's
+          // results qualifies.
+          jumpToChartableResultTab();
+        }
+        break;
+      }
+      case 'end':
+        // Another no-op action - this step's whole job is carrying its
+        // own demo-script.json "holdMs", which controls how long the
+        // closing caption stays on screen before runLiveDemo()'s own
+        // finally block hides the strip once this (the last) step
+        // finishes. Without a holdMs here, the strip would disappear the
+        // instant this caption is shown.
+      default:
+        break;
+    }
+    if (!liveDemoAborted && step.holdMs) {
+      await liveDemoDelay(step.holdMs);
+    }
+  }
+
+  async function runLiveDemo() {
+    if (liveDemoRunning) return;
+    if (!liveDemoStrip) return; // markup not present - nothing to drive visually
+    let script;
+    try {
+      script = await loadLiveDemoScript();
+    } catch (err) {
+      console.error('Failed to load live demo script:', err);
+      return;
+    }
+    liveDemoRunning = true;
+    liveDemoAborted = false;
+    trackEvent('live_demo_started', {});
+    try {
+      for (const step of (script.steps || [])) {
+        if (liveDemoAborted) break;
+        if (step.caption) showLiveDemoCaption(step.caption);
+        await runLiveDemoStep(step, script);
+      }
+    } catch (err) {
+      // Per this feature's own design: a real failure (e.g. the live
+      // translate call erroring out) is left to show exactly the way it
+      // already would for any real user - translatePrompt()/executeSql()
+      // render their own real error UI before this ever rejects, so
+      // there's nothing to recover or fall back to here. Just stop the
+      // script early rather than pushing on to later steps that assume a
+      // successful run.
+      console.error('Live demo stopped early:', err);
+    } finally {
+      liveDemoRunning = false;
+      hideLiveDemoStrip();
+      trackEvent('live_demo_finished', { aborted: liveDemoAborted });
+    }
+  }
+
+  function cancelLiveDemo() {
+    liveDemoAborted = true;
+    hideLiveDemoStrip();
+  }
+
+  if (liveDemoStripCancelBtn) {
+    liveDemoStripCancelBtn.addEventListener('click', cancelLiveDemo);
+  }
+
+  // Auto-play sequencing: a brand-new visitor sees the quick tour first
+  // (unchanged - see ONBOARDING_SEEN_KEY above), then the live demo right
+  // after it finishes/is skipped - this flag is set ONLY by the real
+  // auto-start branch near this file's end (never by a manual "Replay
+  // guided tour" click from the help modal), so finishing a manually-
+  // replayed tour later never re-triggers the live demo. A visitor who's
+  // already seen the tour (an existing user the first time this feature
+  // ships, or anyone back for a later session) but hasn't seen the live
+  // demo yet gets it on its own - see the auto-start branch itself for
+  // that case.
+  let tourAutoStartedPendingLiveDemo = false;
 
   // ===========================================================================
   // 7. HISTORY MODAL: see loadChatHistorySummary()/renderChatHistoryBucketList()/
@@ -8162,7 +8505,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           <svg class="schema-viewer-group-caret" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 6 15 12 9 18"></polyline></svg>
           <span>Datasets (${schemaViewerGroupDatasets.length})</span>
         </button>
-        ${expanded && schemaViewerGroupDatasets.length > 0 ? `<ul class="schema-viewer-group-children">${children}</ul>` : ''}
+        ${expanded ? `<ul class="schema-viewer-group-children">${schemaViewerGroupDatasets.length > 0 ? children : '<li class="schema-viewer-entry-empty text-center text-muted py-8">This dataset group has no datasets in it.</li>'}</ul>` : ''}
       </li>`;
 
     schemaViewerEntryList.innerHTML = overviewItem + datasetsGroupHtml;
@@ -8857,8 +9200,19 @@ document.addEventListener('DOMContentLoaded', async () => {
     schemaViewerPanesWrap?.classList.remove('hidden');
     if (schemaViewerFactsLine) schemaViewerFactsLine.classList.remove('hidden');
     if (schemaViewerRefreshBtnLabel) schemaViewerRefreshBtnLabel.textContent = 'Refresh Schema';
+    // A preset is a shared, admin-configured connection with no single
+    // owner - unlike a custom connection (always this user's own, so
+    // always refreshable), refreshing IT is a superuser-only action (see
+    // auth.py's is_superuser()/POST /api/config/refresh-schema's own
+    // "Authorization" docstring section) - disabled here with an
+    // explanatory tooltip rather than left enabled only to 403 after the
+    // request round-trips.
+    const presetRefreshBlocked = kind === 'preset' && !currentUserIsSuperuser;
     if (schemaViewerRefreshBtn) {
-      schemaViewerRefreshBtn.title = "Re-fetch this connection's schema (bypasses the cache)";
+      schemaViewerRefreshBtn.disabled = presetRefreshBlocked;
+      schemaViewerRefreshBtn.title = presetRefreshBlocked
+        ? 'Only a superuser can refresh schema for a preset dataset.'
+        : "Re-fetch this connection's schema (bypasses the cache)";
     }
     schemaViewerModal.classList.remove('hidden');
     bringModalToFront(schemaViewerModal);
@@ -8924,10 +9278,17 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (schemaViewerColumnsBody) schemaViewerColumnsBody.innerHTML = '';
     if (schemaViewerDetailText) schemaViewerDetailText.innerHTML = '';
     if (schemaViewerOverviewWrap) schemaViewerOverviewWrap.innerHTML = '';
+    // Same superuser-only gate as the single-connection Refresh Schema
+    // button above (openSchemaViewer()) - a dataset group is just as much
+    // a shared, admin-configured resource as a preset, with no single
+    // owner a per-user check could apply to.
+    const groupRefreshBlocked = !currentUserIsSuperuser;
     if (schemaViewerRefreshBtn) {
       schemaViewerRefreshBtn.classList.remove('hidden');
-      schemaViewerRefreshBtn.disabled = false;
-      schemaViewerRefreshBtn.title = "Generate (or regenerate) this dataset group's own AI-written overview (bypasses the cache)";
+      schemaViewerRefreshBtn.disabled = groupRefreshBlocked;
+      schemaViewerRefreshBtn.title = groupRefreshBlocked
+        ? 'Only a superuser can refresh schema for a dataset group.'
+        : "Generate (or regenerate) this dataset group's own AI-written overview (bypasses the cache)";
     }
     if (schemaViewerRefreshBtnLabel) schemaViewerRefreshBtnLabel.textContent = 'Refresh Overview';
     setSchemaViewerRefreshStatus('');
@@ -13928,8 +14289,22 @@ document.addEventListener('DOMContentLoaded', async () => {
   // DB config -> history -> help). Every later visit (once ONBOARDING_SEEN_KEY
   // is set) leaves this alone.
   if (!hasSeenOnboarding()) {
+    tourAutoStartedPendingLiveDemo = true;
     startGuidedTour();
     markOnboardingSeen();
+  } else if (!hasSeenLiveDemo()) {
+    // A visitor who's already seen the tour (an existing user the first
+    // time this feature ships, or anyone back for a later session) but
+    // hasn't seen the live demo yet gets it on its own, a couple seconds
+    // after load so the page has settled first - see
+    // tourAutoStartedPendingLiveDemo's own comment for the other, chained
+    // case (brand-new visitor: tour first, then this).
+    liveDemoDelay(1500).then(() => {
+      if (!hasSeenLiveDemo()) {
+        markLiveDemoSeen();
+        runLiveDemo();
+      }
+    });
   }
 
   if (aiPrompt) aiPrompt.focus();

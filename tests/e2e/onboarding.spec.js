@@ -37,6 +37,18 @@ async function trackedEvents(page, name) {
 }
 
 test.describe('first-run onboarding', () => {
+  // Live Demo Mode (client.js's "LIVE DEMO MODE" section) auto-chains right
+  // after a real, auto-started first-run tour finishes/is skipped - several
+  // tests below do exactly that (skip immediately, click through to "Done").
+  // Pre-seeding its own seen-flag here keeps this file scoped to just the
+  // tour (Live Demo Mode has no e2e coverage of its own any more - see
+  // playwright.config.js's DATABASE_PRESETS_FILE comment for why).
+  test.beforeEach(async ({ page }) => {
+    await page.addInitScript(() => {
+      try { window.localStorage.setItem('ydylLiveDemoSeen', '1'); } catch (e) { /* ignore */ }
+    });
+  });
+
   test('a brand-new visitor sees the guided tour, and can skip it', async ({ page }) => {
     await page.goto('/');
     await expect(page.locator('#tourOverlay')).not.toHaveClass(/hidden/);

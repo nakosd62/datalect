@@ -200,7 +200,7 @@ def _parse_gviz_response(text):
 
 
 class SheetsBackend(Backend):
-    dialect_name = "Google Visualization API Query Language"
+    dialect_name = "Google Sheets"
 
     # A truly empty tab against "select * limit 1" is untested live - see
     # module docstring - but this is the same one-row liveness probe every

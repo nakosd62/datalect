@@ -193,7 +193,7 @@ test.describe('config modal', () => {
     const configuredDatabases = [
       { id: 'p-0', name: 'One', type: 'postgres', dialect_name: 'PostgreSQL' },
       { id: 'p-1', name: 'Two', type: 'mysql', dialect_name: 'MySQL' },
-      { id: 'p-2', name: 'Three', type: 'bigquery', dialect_name: 'BigQuery Standard SQL' },
+      { id: 'p-2', name: 'Three', type: 'bigquery', dialect_name: 'Google BigQuery' },
     ];
     await page.route('**/api/config', async (route) => {
       if (route.request().method() !== 'GET') return route.fallback();
@@ -228,7 +228,7 @@ test.describe('config modal', () => {
 
     const columns = page.locator('.preset-column');
     await expect(columns.nth(0).locator('.radio-label')).toHaveText(['One (PostgreSQL)', 'Two (MySQL)']);
-    await expect(columns.nth(1).locator('.radio-label')).toHaveText(['Three (BigQuery Standard SQL)']);
+    await expect(columns.nth(1).locator('.radio-label')).toHaveText(['Three (Google BigQuery)']);
   });
 
   test('two presets of the same dialect split one-per-column instead of both landing on one side', async ({ page }) => {
@@ -477,7 +477,7 @@ test.describe('config modal', () => {
     // in some separate block of its own.
     const configuredDatabases = [
       { id: 'p-a', name: 'Sales Postgres', type: 'postgres', dialect_name: 'PostgreSQL' },
-      { id: 'p-b', name: 'Marketing Warehouse', type: 'bigquery', dialect_name: 'BigQuery Standard SQL' },
+      { id: 'p-b', name: 'Marketing Warehouse', type: 'bigquery', dialect_name: 'Google BigQuery' },
     ];
     const configuredDatabaseGroups = [
       { id: 'grp-ab', name: 'Sales & Marketing', dataset_list: ['p-a', 'p-b'] },
@@ -527,7 +527,7 @@ test.describe('config modal', () => {
 
     const columns = page.locator('.preset-column');
     await expect(columns.nth(0).locator('.radio-label')).toHaveText([
-      'Sales Postgres (PostgreSQL)', 'Marketing Warehouse (BigQuery Standard SQL)',
+      'Sales Postgres (PostgreSQL)', 'Marketing Warehouse (Google BigQuery)',
     ]);
     await expect(columns.nth(1).locator('.radio-label')).toHaveText(['Sales & Marketing (Dataset Group)']);
     await expect(page.locator('.all-databases-option .radio-label')).toHaveText(['Sales & Marketing (Dataset Group)']);
@@ -1761,7 +1761,7 @@ test.describe('config modal', () => {
     await expect(page.locator('.custom-db-sh-url').last()).toHaveValue('https://docs.google.com/spreadsheets/d/1AbCdEf2345/edit');
   });
 
-  // MongoDB Atlas SQL coverage below is deliberately narrow, for the same
+  // MongoDB Atlas coverage below is deliberately narrow, for the same
   // network-call-safety reason as the SQL Server/Redshift/Oracle/
   // Databricks/Snowflake blocks above - connect() (called during
   // config_routes.py's post-save identity check) opens a real ODBC/TCP

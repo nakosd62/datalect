@@ -104,7 +104,7 @@ _ENV_VARS_TO_CLEAR = [
     "SCHEMA_MAX_SCHEMA_CHARS", "SCHEMA_SHARD_MIN_GROUP_SIZE", "SCHEMA_TABLES_ONLY", "LOG_LEVEL",
     "CRBOT_HOSTNAME", "CRBOT_PORT", "MAX_TRANSLATION_ATTEMPTS", "TRANSLATION_RETRY_DELAY_SECONDS",
     "TRANSLATION_TIMEOUT_SECONDS", "SQL_EXECUTE_TIMEOUT_SECONDS",
-    "HISTORY_RESULT_MAX_ROWS", "HISTORY_MAX_TURNS",
+    "HISTORY_RESULT_MAX_ROWS", "HISTORY_MAX_TURNS", "GEMINI_THINKING_BUDGET",
     # Anthropic (Claude) provider path (translate_routes.py's
     # AnthropicProvider - note there's no LLM_PROVIDER env var anymore to
     # select it; see helpers.select_llm_provider()) - cleared for the same
@@ -372,6 +372,21 @@ def fresh_import(monkeypatch, tmp_path, env=None, register_blueprints=True, mock
             @app_config.app.route('/')
             def index():
                 return send_from_directory(app_config.app.static_folder, 'index.html')
+
+        # Mirrors server.py's own '/health' route registration (the
+        # Cloud Monitoring/Cloud Run liveness probe endpoint - see its own
+        # docstring, which explains why this is now a deliberate no-op
+        # rather than a real state-store check) for the same reason as
+        # the 'index' mirror just above: not a blueprint, so not picked
+        # up by the register_blueprint loop, but 'health' is in
+        # EXEMPT_ENDPOINTS, so any test exercising auth gating needs the
+        # real route to exist, not just the name.
+        if "health" not in app_config.app.view_functions:
+            from flask import jsonify
+
+            @app_config.app.route('/health')
+            def health():
+                return jsonify({'status': 'ok'}), 200
 
     app_config.state_store.init()
     app_config.app.config["TESTING"] = True
