@@ -808,10 +808,22 @@ def _clean_summary_response(raw_text, num_databases, chartable_by_index=None):
         parsed.get("visualizations"), chartable_by_index or {}, *per_database.values(), cross_database,
     )
     suggested_searches = _clean_suggested_searches(parsed.get("suggested_searches"))
+    # Optional (see _SUMMARY_SYSTEM_INSTRUCTION's own "general_knowledge_
+    # note" paragraph) - the model's own short note on a general-knowledge
+    # fact it blended into "per_database"/"cross_database" beyond the
+    # actual result rows (e.g. each country's current head of state, added
+    # to answer a population question). None (not "") when absent/blank,
+    # same "a real None vs. an empty string are distinguishable"
+    # convention used elsewhere for a similarly optional field.
+    general_knowledge_note = parsed.get("general_knowledge_note")
+    general_knowledge_note = (
+        general_knowledge_note.strip() if isinstance(general_knowledge_note, str) and general_knowledge_note.strip() else None
+    )
 
     return {
         "label": label, "per_database": per_database, "cross_database": cross_database,
         "visualizations": visualizations, "suggested_searches": suggested_searches,
+        "general_knowledge_note": general_knowledge_note,
     }
 
 
@@ -1145,6 +1157,11 @@ def summarize_results():
             # face value, same as every other server response shape.
             'visualizations': parsed.get("visualizations") or {},
             'suggested_searches': parsed.get("suggested_searches") or [],
+            # See _clean_summary_response's own docstring - the model's
+            # OPTIONAL note on a general-knowledge fact it blended into
+            # this summary beyond the actual result rows. None when it
+            # didn't need one.
+            'general_knowledge_note': parsed.get("general_knowledge_note"),
         }) + "\n"
 
     # See concurrency_guard.py's own module docstring - TRANSLATE_GUARD,
@@ -1335,7 +1352,18 @@ def _clean_single_summary_response(raw_text, chartable_by_index):
 
     visualizations = _clean_visualizations(parsed.get("visualizations"), chartable_by_index, summary)
     suggested_searches = _clean_suggested_searches(parsed.get("suggested_searches"))
-    return {"summary": summary, "visualizations": visualizations, "suggested_searches": suggested_searches}
+    # See _clean_summary_response's identical field (summarize_all_mode_
+    # results' own sibling) - the model's OPTIONAL note on a general-
+    # knowledge fact it blended into "summary" beyond the actual result
+    # rows.
+    general_knowledge_note = parsed.get("general_knowledge_note")
+    general_knowledge_note = (
+        general_knowledge_note.strip() if isinstance(general_knowledge_note, str) and general_knowledge_note.strip() else None
+    )
+    return {
+        "summary": summary, "visualizations": visualizations, "suggested_searches": suggested_searches,
+        "general_knowledge_note": general_knowledge_note,
+    }
 
 
 def _make_single_summary_content_parser(chartable_by_index):
@@ -1557,6 +1585,11 @@ def summarize_result():
         yield json.dumps({
             'status': 'done', 'success': True, 'summary': summary_text, 'visualizations': visualizations,
             'suggested_searches': suggested_searches,
+            # See _clean_single_summary_response's own docstring - the
+            # model's OPTIONAL note on a general-knowledge fact it blended
+            # into "summary" beyond the actual result rows. None when it
+            # didn't need one.
+            'general_knowledge_note': parsed.get("general_knowledge_note"),
         }) + "\n"
 
     def _stream_summarize_result_with_guard_release():

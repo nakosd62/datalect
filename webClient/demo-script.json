@@ -4,16 +4,16 @@
   "question": "Which 10 countries had the highest GDP per capita in 2020?",
   "schemaHighlights": ["countries", "wdi_indicators"],
   "steps": [
-    { "type": "start", "caption": "This is a live walkthrough — not a recording. We'll pick a dataset, explore its schema, and ask it a real question.", "holdMs": 10000 },
-    { "type": "open_connection_picker", "caption": "First, let's pick a dataset out of all that have been configured.", "holdMs": 10000 },
-    { "type": "select_connection", "caption": "We'll use World Stats — real GDP, population, and development data for every country.", "holdMs": 10000 },
-    { "type": "open_schema_viewer", "caption": "Here's what's actually inside it.", "holdMs": 10000 },
-    { "type": "browse_schema", "holdMs": 10000 },
-    { "type": "close_schema_viewer", "caption": "Now let's start interrogating the selected dataset.", "holdMs": 5000 },
+    { "type": "start", "caption": "This is a live walkthrough — not a recording. We'll pick a datasource, explore its schema, and ask it a real question.", "holdMs": 8000 },
+    { "type": "open_connection_picker", "caption": "First, let's pick a datasource out of all that have been configured.", "holdMs": 8000 },
+    { "type": "select_connection", "caption": "We'll use World Economics — real GDP, population, and development data for every country.", "holdMs": 8000 },
+    { "type": "open_schema_viewer", "caption": "Here's what's actually inside it.", "holdMs": 8000 },
+    { "type": "browse_schema", "holdMs": 8000 },
+    { "type": "close_schema_viewer", "caption": "Now let's start interrogating the selected datasource.", "holdMs": 5000 },
     { "type": "enter_prompt", "caption": "You type or speak a question in your mind.", "typingSpeedMs": 150 },
-    { "type": "run", "caption": "The Datalect Agent translates this into database commands and fetches the results from the database that hosts the dataset." },
-    { "type": "wait_for_results", "caption": "Gives you the answer to your question in plain language.", "holdMs": 10000 },
-    { "type": "click_chart_link", "caption": "And allows you to see the supporting data evidence." , "holdMs": 10000 },
-    { "type": "end", "caption": "That was a live run against a real database. Try a question of your own!", "holdMs": 10000 }
+    { "type": "run", "caption": "The Datalect Agent translates this into database commands and fetches the results from the database that hosts the datasource." },
+    { "type": "wait_for_results", "caption": "Gives you the answer to your question in plain language.", "holdMs": 8000 },
+    { "type": "click_chart_link", "caption": "And allows you to see the supporting data evidence." , "holdMs": 8000 },
+    { "type": "end", "caption": "That was a live run against a real database. Try a question of your own!", "holdMs": 8000 }
   ]
 }

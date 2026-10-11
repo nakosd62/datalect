@@ -20,10 +20,12 @@ import hashlib
 import json
 import logging
 import os
+import secrets
 import sqlite3
 from abc import ABC, abstractmethod
 
 from cryptography.fernet import Fernet
+from google.api_core.exceptions import AlreadyExists
 from google.cloud import firestore
 
 # Reuses the same logger name/config server.py sets up (root logger stays
@@ -428,6 +430,88 @@ def _decode_chat_turns(value, schema_version):
     return value if isinstance(value, list) else None
 
 
+# --- Public shares (the header "Share" button's own storage) ---------------
+#
+# A SEPARATE table/collection from chat_history just above, even though the
+# payload each one row holds is the exact same shape client.js's chatStore
+# already uses for a turn ({userEntry, modelEntry} - see captureAllModeHistory()/
+# pushTurn() for how that object is built) - this is similar to that same
+# user history/memory mechanism, just not partitioned by user_id the way
+# every other table in this module is. A share is a frozen, point-in-time
+# snapshot (the prompt, SQL, dataset/model display labels, and the ACTUAL
+# fetched results/summary) meant to be opened by anyone holding the short
+# share_id, including a visitor with no session/identity of their own at all
+# - partitioning it by user_id the way chat_history is would make it
+# unreadable by exactly the people a "Share" link exists for. The STORED row
+# never changes once written and never carries a credential either way; what
+# a viewer's own browser does with it afterwards - for a shared admin preset
+# or dataset group, switching the viewer's OWN session to that same dataset
+# and dropping the turn into their OWN editable chat_history, so they can
+# keep going from it - is a client-side/share_routes.py-level decision, not
+# something this storage layer concerns itself with (see share_routes.py's
+# own module docstring for the full reasoning, including why a private/
+# custom connection can never be reached this way). See share_routes.py for the two routes built on this
+# (POST /api/share creates one, GET /api/share/<share_id> reads one back) and
+# server.py's bare-path 404 handler for how a share_id ever reaches the SPA
+# shell in the first place.
+#
+# Tagged with its own schema version for the same reason chat_history's
+# payload is (see CHAT_HISTORY_SCHEMA_VERSION's own comment just above) - a
+# future change to what a shared turn looks like can tell an old row apart
+# from a new one, and a corrupt/foreign/future-schema row is simply treated
+# as "this link no longer resolves" rather than a hard error.
+SHARE_SCHEMA_VERSION = 1
+
+# Alphabet a share_id is drawn from - lowercase letters and digits only (so
+# a link is safe to read aloud or retype), with the visually ambiguous
+# '0'/'o'/'1'/'l'/'i' removed (a share link is meant to be copy-pasted, but
+# also sometimes typed by hand off a screenshot or a chat message - dropping
+# the characters most likely to be misread/mistyped for each other costs
+# only a little entropy and avoids a whole class of "the link doesn't work"
+# reports). 30 symbols.
+SHARE_ID_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"
+# 12 symbols from a 30-symbol alphabet is ~58 bits of entropy - nowhere near
+# guessable by brute force, and short enough to read/retype/paste into a
+# chat message comfortably (matches the example the feature was specced
+# with: "agent.datalect.xyz/abdcjhjhfidw").
+SHARE_ID_LENGTH = 12
+
+
+def generate_share_id():
+    """A fresh, random share_id - see SHARE_ID_ALPHABET/SHARE_ID_LENGTH's own
+    comments for the charset/length rationale. Uses `secrets` (not `random`)
+    since this is effectively an unguessability-dependent token, same
+    posture issue_session_token/compute_connection_key's own ID-ish values
+    take elsewhere in this app - collisions are checked (and this
+    regenerated) by each backend's own create_share() below, not here."""
+    return "".join(secrets.choice(SHARE_ID_ALPHABET) for _ in range(SHARE_ID_LENGTH))
+
+
+def _decode_share_payload(value, schema_version):
+    """Best-effort decode of one persisted share's payload - the same
+    "corrupt/future-schema/wrong-shape means silently unavailable, never a
+    hard error" posture _decode_chat_turns (just above) already established
+    for chat_history, applied to a single dict instead of a list of turns.
+    Returns None (never raises) if `schema_version` is newer than this
+    build's SHARE_SCHEMA_VERSION, or `value` is missing/corrupt/not
+    ultimately a dict - get_share() treats None as "this link no longer
+    resolves" (a 404 to the client), not a 500."""
+    if schema_version and schema_version > SHARE_SCHEMA_VERSION:
+        logger.warning(
+            "Ignoring a share with schema_version=%r - this build only "
+            "understands up to %d.",
+            schema_version, SHARE_SCHEMA_VERSION,
+        )
+        return None
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except Exception:
+            logger.warning("Failed to parse stored share payload JSON; ignoring it.")
+            return None
+    return value if isinstance(value, dict) else None
+
+
 class StateStore(ABC):
     """Backend-agnostic persistence for sessions, saved DB connections, and
     translation history/stats. Deliberately holds no notion of "the default
@@ -768,6 +852,34 @@ class StateStore(ABC):
         the user's separately-persisted connection/in-scope-mode selection
         (get_session/set_session above), which already recomputes the same
         bucket_key in the common case."""
+
+    # --- Public shares (see this module's own "Public shares" comment,
+    # just above the StateStore class, for why this is deliberately NOT
+    # partitioned by user_id the way everything else here is) -------------
+
+    @abstractmethod
+    def create_share(self, payload, created_by):
+        """Durably saves `payload` (an opaque, JSON-serializable dict - see
+        share_routes.py's build_share_payload() for its exact shape) under a
+        freshly generated share_id, tagged with the current
+        SHARE_SCHEMA_VERSION, and returns that share_id. `created_by` is the
+        creating session's own user_identity - stored purely for abuse-
+        triage/audit purposes (e.g. "which identity has been generating an
+        unusual number of these"), never read back by get_share() or shown
+        to a viewer. Generates a fresh id (generate_share_id()) and retries
+        on the astronomically unlikely chance it collides with an existing
+        row - never raises for that reason alone."""
+
+    @abstractmethod
+    def get_share(self, share_id):
+        """Returns the payload a prior create_share() call saved under
+        `share_id`, or None if nothing was ever saved under it (or it was
+        saved under a newer schema version than this build understands, or
+        its stored payload is corrupt - see _decode_share_payload). None
+        means exactly one thing to every caller: this link no longer
+        resolves, surfaced to the viewer as a 404, not a 500 - a share is
+        meant to work indefinitely for anyone holding the link, so the only
+        realistic way this happens is a never-valid/mistyped id."""
 
     # --- Durable schema cache (the ONLY layer schema_cache.py has - see
     # that module's own docstring for why it no longer keeps any
@@ -1231,6 +1343,26 @@ class SqliteStateStore(StateStore):
                         schema_version INTEGER NOT NULL DEFAULT 1,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         PRIMARY KEY (user_id, bucket_key)
+                    );
+                """)
+
+                # One row per share_id - NOT per (user_id, ...) the way
+                # chat_history just above is (see StateStore's own "Public
+                # shares" comment for why: a share must be readable by
+                # anyone holding the link, including a visitor with no
+                # identity of their own). "payload" is the shared turn,
+                # JSON-encoded (a SQLite TEXT column can't hold a native
+                # dict the way a Firestore field can - see
+                # _decode_share_payload). "created_by" is audit-only (see
+                # create_share's own docstring) - never read back by
+                # get_share().
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS shares (
+                        share_id TEXT PRIMARY KEY,
+                        payload TEXT NOT NULL,
+                        schema_version INTEGER NOT NULL DEFAULT 1,
+                        created_by TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     );
                 """)
 
@@ -1806,6 +1938,51 @@ class SqliteStateStore(StateStore):
         except Exception:
             logger.exception("Error saving active chat bucket to SQLite")
 
+    def create_share(self, payload, created_by):
+        encoded = json.dumps(payload or {})
+        for _ in range(5):
+            share_id = generate_share_id()
+            try:
+                with self._connect() as conn:
+                    cursor = conn.cursor()
+                    # INSERT OR IGNORE rather than a plain INSERT: a
+                    # share_id collision (astronomically unlikely at this
+                    # alphabet/length - see SHARE_ID_LENGTH's own comment)
+                    # should trigger a retry with a freshly generated id,
+                    # not a crashed request - rowcount == 0 is how this
+                    # tells "silently ignored a PK conflict" apart from "row
+                    # inserted".
+                    cursor.execute(
+                        "INSERT OR IGNORE INTO shares (share_id, payload, schema_version, created_by) "
+                        "VALUES (?, ?, ?, ?)",
+                        (share_id, encoded, SHARE_SCHEMA_VERSION, created_by or ""),
+                    )
+                    conn.commit()
+                    if cursor.rowcount == 1:
+                        return share_id
+            except Exception:
+                logger.exception("Error saving share to SQLite")
+                return None
+        logger.error("Failed to generate a unique share_id after 5 attempts")
+        return None
+
+    def get_share(self, share_id):
+        try:
+            with self._connect() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT payload, schema_version FROM shares WHERE share_id = ?",
+                    (share_id,),
+                )
+                row = cursor.fetchone()
+        except Exception:
+            logger.exception("Error fetching share from SQLite")
+            return None
+        if row is None:
+            return None
+        raw_payload, schema_version = row
+        return _decode_share_payload(raw_payload, schema_version)
+
     def get_cached_schema(self, cache_key):
         try:
             with self._connect() as conn:
@@ -2334,6 +2511,52 @@ class FirestoreStateStore(StateStore):
             )
         except Exception:
             logger.exception("Error saving active chat bucket to Firestore")
+
+    def create_share(self, payload, created_by):
+        # share_id (generate_share_id()) is drawn from SHARE_ID_ALPHABET,
+        # which contains no "/" - unlike _schema_cache_doc_id's cache_key,
+        # it's always safe to use directly as a Firestore document id, no
+        # hashing needed.
+        for _ in range(5):
+            share_id = generate_share_id()
+            try:
+                # .create() (not .set()) - raises AlreadyExists if a
+                # document already sits at this id instead of silently
+                # overwriting it, which is exactly the signal this needs to
+                # retry with a freshly generated id on the astronomically
+                # unlikely chance of a collision (see SHARE_ID_LENGTH's own
+                # comment on the odds) rather than ever clobbering an
+                # existing share.
+                self.client.collection("shares").document(share_id).create({
+                    "payload": payload or {},
+                    "schema_version": SHARE_SCHEMA_VERSION,
+                    "created_by": created_by or "",
+                    "created_at": firestore.SERVER_TIMESTAMP,
+                })
+                return share_id
+            except AlreadyExists:
+                continue
+            except Exception:
+                logger.exception("Error saving share to Firestore")
+                return None
+        logger.error("Failed to generate a unique share_id after 5 attempts")
+        return None
+
+    def get_share(self, share_id):
+        try:
+            doc = self.client.collection("shares").document(share_id).get()
+        except Exception:
+            logger.exception("Error fetching share from Firestore")
+            return None
+        if not doc.exists:
+            return None
+        data = doc.to_dict() or {}
+        # Stored as a native map (see create_share's own comment on why no
+        # JSON-string encoding is needed here, unlike SqliteStateStore's
+        # TEXT column) - _decode_share_payload still runs it through the
+        # same dict-shape/schema-version check get_share's SQLite sibling
+        # does, so both backends treat a corrupt/foreign row identically.
+        return _decode_share_payload(data.get("payload"), data.get("schema_version"))
 
     def _schema_cache_doc_id(self, cache_key):
         """Firestore document IDs are split on "/" into alternating

@@ -10,9 +10,9 @@ Each database's results block below is labeled with its own [index], starting at
 Respond with ONLY a single JSON object - no markdown code fences, no other text before or after it 
 - shaped exactly like this:
 
-{"label": "...", "per_database": {"0": "...", "1": "...", ...}, 
-"cross_database": "..." or null, "visualizations": {"1": {...}, ...}, 
-"suggested_searches": ["...", ...]}
+{"label": "...", "per_database": {"0": "...", "1": "...", ...},
+"cross_database": "..." or null, "visualizations": {"1": {...}, ...},
+"suggested_searches": ["...", ...], "general_knowledge_note": "..." or null}
 
 CRITICAL, before anything else: every string value in this JSON - the label, AND every per-database 
 paragraph, AND the cross_database paragraph if you write one - MUST be written in the SAME LANGUAGE 
@@ -56,11 +56,18 @@ anything from the actual result rows - the data-backed part of any paragraph com
 were given, never nudged to better match what you separately recall. Second, make the two kinds of 
 fact visually distinguishable at a glance, e.g. a trailing parenthetical or its own clause - never 
 phrased so it reads as if it also came from that database. Third, if what you're adding is the kind 
-of fact that changes over time (who currently holds an office, a live price, anything tied to "as of 
-now" rather than a stable fact like a capital city), say so plainly - e.g. "as of my last update - 
-worth confirming for anything recent" - rather than stating it as settled. If you aren't genuinely 
-confident in the general-knowledge part, leave it out rather than guessing; the data-backed part of 
+of fact that changes over time (who currently holds an office, a live price, anything tied to "as of
+now" rather than a stable fact like a capital city), say so plainly - e.g. "as of my last update -
+worth confirming for anything recent" - rather than stating it as settled. If you aren't genuinely
+confident in the general-knowledge part, leave it out rather than guessing; the data-backed part of
 the answer must never be held back by hesitation over the general-knowledge part.
+
+Whenever you DO add any such general-knowledge fact per the paragraph just above, ALSO set
+"general_knowledge_note" to one short, plain sentence (same language as everything else) naming what
+outside fact you added and to which database's point it belongs - e.g. "Added each country's current
+head of state from general knowledge to answer the population question." Set it to JSON null whenever
+"per_database"/"cross_database" is based entirely on the actual result rows, with nothing added from
+outside them.
 
 "visualizations" is an OBJECT deciding, INDEPENDENTLY for each eligible database result, 
 whether it's ALSO shown as a chart instead of only a table. THE CHART AND THE TEXT MUST NOT BE DISJOINT, 

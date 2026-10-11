@@ -19,7 +19,7 @@ guard, register each blueprint, serve the SPA shell, and run.
 import os
 import threading
 
-from flask import jsonify, send_from_directory
+from flask import jsonify, request, send_from_directory
 
 from app_config import app, state_store
 from auth import auth_bp, enforce_authentication, refresh_auth_session_cookie
@@ -30,6 +30,7 @@ from combine_routes import combine_bp
 from execute_routes import execute_bp
 from chat_history_routes import chat_history_bp
 from report_routes import report_bp
+from share_routes import share_bp, SHARE_ID_PATH_RE
 from db import prefetch_all_preset_schemas
 
 # Auth guard runs before every request (see EXEMPT_ENDPOINTS in auth.py
@@ -42,13 +43,46 @@ app.before_request(enforce_authentication)
 # alive. See auth.py's refresh_auth_session_cookie()/auth_session.py.
 app.after_request(refresh_auth_session_cookie)
 
-for bp in (auth_bp, config_bp, translate_bp, summarize_bp, combine_bp, execute_bp, chat_history_bp, report_bp):
+for bp in (auth_bp, config_bp, translate_bp, summarize_bp, combine_bp, execute_bp, chat_history_bp, report_bp, share_bp):
     app.register_blueprint(bp)
 
 
 @app.route('/')
 def index():
     return send_from_directory(app.static_folder, 'index.html')
+
+
+@app.errorhandler(404)
+def handle_not_found(e):
+    """A bare share link (agent.datalect.xyz/<share_id> - see share_routes.py's
+    own module docstring) has no real route of its own: static_url_path=''
+    (see the Flask app constructor above) means EVERY path under this app -
+    including a single-segment one like "/abCd2fgh9jkl" - is already
+    handled by Flask's own auto-registered static route before any view
+    function here even runs, and that route raises exactly this 404 the
+    instant it can't find a matching file under webClient/. Rather than
+    giving share links their own distinct URL prefix (which would just move
+    the same ambiguity - static_url_path='' means literally any path, not
+    just single-segment ones, is reachable via that auto-registered route),
+    this hooks the 404 that already happens for "no file by this name"
+    and - ONLY when the path looks like a real share_id, never for
+    anything under /api/ or a request that plainly names a file (has a
+    "." in it, e.g. a genuinely missing /doesnotexist.png) - serves the
+    exact same index.html "/" does. client.js's own boot sequence then
+    reads window.location.pathname itself and resolves it via
+    GET /api/share/<share_id> - this handler's only job is getting the SPA
+    shell in front of that code at all; it never looks the share_id up
+    itself. Anything else (a genuine typo, a missing asset) still falls
+    through to a normal 404, unchanged from before this handler existed."""
+    path = request.path.lstrip('/')
+    if (
+        request.method == 'GET'
+        and not request.path.startswith('/api/')
+        and path and '/' not in path and '.' not in path
+        and SHARE_ID_PATH_RE.match(path)
+    ):
+        return send_from_directory(app.static_folder, 'index.html')
+    return e
 
 
 @app.route('/health')

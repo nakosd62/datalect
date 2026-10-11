@@ -1003,7 +1003,7 @@ textarea:focus {
   margin-left: auto;
 }
 
-.gear-btn, .help-btn, .history-btn, .feedback-btn, .more-menu-btn {
+.gear-btn, .help-btn, .history-btn, .feedback-btn, .share-btn, .more-menu-btn {
   background: var(--overlay-2);
   border: 1px solid var(--bg-card-border);
   /* Was halved from 0.35rem alongside the circle's own width/height below
@@ -1037,7 +1037,7 @@ textarea:focus {
   color: var(--text-primary);
 }
 
-.gear-btn, .help-btn, .history-btn, .feedback-btn {
+.gear-btn, .help-btn, .history-btn, .feedback-btn, .share-btn {
   color: var(--accent-cyan);
 }
 
@@ -1049,7 +1049,7 @@ textarea:focus {
    scale - the surrounding circle (above) grew back to 29px the same way,
    so the icon still sits centered with the same proportion of breathing
    room around it as before. */
-.gear-btn svg, .help-btn svg, .history-btn svg, .feedback-btn svg, .more-menu-btn svg {
+.gear-btn svg, .help-btn svg, .history-btn svg, .feedback-btn svg, .share-btn svg, .more-menu-btn svg {
   width: 18px;
   height: 18px;
 }
@@ -1063,9 +1063,96 @@ textarea:focus {
 .help-btn:hover,
 .history-btn:hover,
 .feedback-btn:hover,
+.share-btn:hover,
 .more-menu-btn:hover {
   background: var(--overlay-4);
   color: var(--accent-cyan);
+}
+
+/* Wraps #shareBtn + #sharePopover together so the popover can be anchored
+   (position: absolute) directly under the button regardless of where it
+   sits in the header row - same "wrapper is the positioning context"
+   pattern .model-picker-wrapper already uses for #modelPickList. */
+.share-btn-wrapper {
+  position: relative;
+  display: inline-flex;
+  flex-shrink: 0;
+}
+
+.share-popover {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 8px);
+  background-color: var(--surface-1);
+  border: 1px solid var(--bg-card-border);
+  border-radius: 8px;
+  box-shadow: 0 10px 25px rgba(0, 0, 0, 0.4);
+  width: max(280px, 24vw);
+  max-width: min(360px, 90vw);
+  z-index: 100;
+  padding: 0.6rem;
+}
+
+.share-popover.hidden {
+  display: none !important;
+}
+
+.share-popover-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.share-popover-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  background: var(--overlay-2);
+  border: 1px solid var(--bg-card-border);
+  border-radius: 6px;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  padding: 0.35rem 0.5rem;
+}
+
+.share-popover-copy-btn {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  padding: 0.3rem 0.65rem;
+  font-size: 0.8rem;
+  font-weight: 500;
+  line-height: 1.4;
+  border-radius: 6px;
+  border: 1px solid rgba(var(--accent-cyan-rgb), 0.4);
+  background-color: var(--accent-cyan);
+  color: var(--on-accent-cyan);
+  cursor: pointer;
+}
+
+.share-popover-copy-btn:hover {
+  filter: brightness(1.1);
+}
+
+.share-popover-status {
+  margin-top: 0.35rem;
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  min-height: 1em;
+}
+
+/* "Nothing to share yet" / "failed to create a link" state (see client.js's
+   showShareError()) - the Share button is always visible now, so clicking
+   it with nothing shareable on screen needs somewhere to say so instead of
+   the button just refusing to do anything. Hides the (otherwise empty,
+   non-functional) link input + Copy button entirely rather than leaving
+   them sitting there uselessly next to the message. */
+.share-popover.share-popover-error .share-popover-row {
+  display: none;
+}
+
+.share-popover-status.share-popover-status-error {
+  color: var(--danger);
 }
 
 /* Triple-dot "more" menu - collapses Model/Help/History/Preferences/
@@ -1620,6 +1707,7 @@ textarea:focus {
   .header-actions > .history-btn,
   .header-actions > .gear-btn,
   .header-actions > .feedback-btn,
+  .header-actions > .share-btn-wrapper,
   .header-actions > .auth-container {
     display: none !important;
   }
@@ -1921,7 +2009,7 @@ textarea:focus {
   border: none !important;
   box-shadow: none !important;
   color: var(--prompt-text) !important;
-  font-family: var(--font-sans) !important;
+  font-family: var(--font-mono) !important;
   font-size: 0.85rem;
   line-height: 1.25;
   /* Top padding bumped from 0.25rem to 0.5rem to match #sqlQuery's own
@@ -3278,6 +3366,58 @@ textarea.report-issue-preview:focus {
   opacity: 1;
 }
 
+/* Shared-link viewing banner (see index.html's #sharedViewBanner and
+   client.js's maybeRenderSharedView()) - same mild-notice visual language
+   as .new-version-banner above (cyan, not --danger red: opening a shared
+   link isn't a problem). Unlike that banner's own hardcoded text, this
+   one's text is set dynamically by showSharedViewBanner() (client.js),
+   since the right wording depends on whether the share's own dataset could
+   actually be picked up for this viewer too. Dismissible, same as
+   .new-version-banner - opening a shared link no longer puts the page into
+   a special read-only mode this banner would need to keep describing for
+   as long as it's up; it's purely informational from the moment the turn
+   itself renders, so there's nothing misleading about letting the visitor
+   dismiss it early. */
+.shared-view-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.5rem 0.9rem;
+  margin: 0 0 0.75rem;
+  border-radius: 8px;
+  background: rgba(var(--accent-cyan-rgb), 0.1);
+  border: 1px solid rgba(var(--accent-cyan-rgb), 0.35);
+  color: var(--accent-cyan);
+  font-size: 0.85rem;
+}
+
+.shared-view-banner-text {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* Same circular "x" treatment as .new-version-banner-dismiss. */
+.shared-view-banner-dismiss {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.4rem;
+  height: 1.4rem;
+  border-radius: 50%;
+  border: none;
+  background: transparent;
+  color: var(--accent-cyan);
+  font-size: 1.1rem;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0.75;
+}
+
+.shared-view-banner-dismiss:hover {
+  opacity: 1;
+}
+
 /* "Report Error" (see client.js's setReportContext()/reportButtonHtml()) -
    rendered INLINE, directly beside the "Execution Error" title of
    whichever tab is actually showing an error (see .error-title-row below),
@@ -3642,7 +3782,7 @@ tr.report-issue-row td {
 .results-table-wrapper table {
   width: 100%;
   border-collapse: collapse;
-  font-family: var(--font-sans);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
   font-size: 0.8125rem;
   color: var(--text-table);
   text-align: left;
@@ -3714,7 +3854,7 @@ tr.report-issue-row td {
   white-space: pre-wrap !important;
   word-break: break-word;
   line-height: 1.5;
-  font-family: var(--font-sans);
+  font-family: var(--font-mono, monospace);
 }
 
 /* Table/Chart toggle (see client.js's renderTableResult()/
@@ -4523,9 +4663,149 @@ tr.report-issue-row td {
   padding: 1rem 1.25rem;
 }
 
+/* Tighter top padding specifically when the "Thoughts & Notes" accordion
+   is the first thing in this cell (see thoughtsNotesAccordionHtml()) -
+   the accordion's own compact header reads as "floating" with the full
+   1rem gap a plain response paragraph wants above it; :has() scopes this
+   down to just that one case instead of shrinking top padding for every
+   other response-cell (plain text, errors, etc.). */
+.response-cell:has(> .thoughts-notes-accordion:first-child) {
+  padding-top: 0.5rem;
+}
+
+/* "Thoughts & Notes" accordion - see client.js's thoughtsNotesAccordionHtml()
+   for the full story (the all-mode triage/routing message, kept
+   re-expandable instead of vanishing once Phase C's real answer lands).
+   Sits first inside .response-cell, so it's the top-most thing in the
+   Response tab regardless of what renders under it. Kept deliberately
+   tight (small margin, small padding, line-height: 1 on the header) so it
+   reads as a compact disclosure strip, not another full paragraph's worth
+   of space.
+   white-space: normal is load-bearing, not cosmetic: .response-cell sets
+   white-space: pre-wrap (so the real response text's own line breaks
+   render), which INHERITS onto this div. thoughtsNotesAccordionHtml()'s
+   own template literal is indented for readability, so this div's actual
+   DOM children include whitespace-only text nodes (the newlines/indent
+   between its tags) - under an inherited pre-wrap, a plain block element
+   renders those literally as blank lines instead of collapsing them,
+   which is what was actually producing the large empty gaps above/below
+   this accordion (confirmed directly in the live page's computed
+   layout - this div's own content box was ~75-95px taller than its real
+   children, matching exactly the number of stray newlines in the
+   template). .thoughts-notes-header below doesn't need the same override:
+   it's `display: flex`, and flex containers already suppress
+   whitespace-only text-node children regardless of `white-space`. */
+.thoughts-notes-accordion {
+  /* One blank line's worth of space below the drawer, matching how a
+     blank line between paragraphs actually renders in .response-text
+     just below it (font-size: 0.9rem * line-height: 1.5 = 1.35rem) -
+     requested explicitly, rather than the smaller purely-cosmetic gap
+     this used to have. */
+  margin-bottom: 1.35rem;
+  white-space: normal;
+}
+
+/* Same caret-rotates-on-.expanded convention as
+   .schema-viewer-group-header/.schema-viewer-group-caret (see that pair's
+   own comments) - reused here rather than invented fresh, so every
+   collapsible header in the app behaves identically. line-height: 1
+   (rather than inheriting body's default) keeps this button's own box no
+   taller than its padding + the caret/text actually need. white-space:
+   normal here too, defensively - see .thoughts-notes-accordion's own
+   comment: this is currently a no-op (flex already suppresses whitespace-
+   only text nodes) but costs nothing and guards against this ever being
+   true only by accident of `display: flex`. */
+.thoughts-notes-header {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  width: 100%;
+  padding: 0.25rem 0.5rem;
+  background: var(--overlay-2);
+  border: 1px solid var(--overlay-18);
+  border-radius: 6px;
+  color: var(--text-secondary);
+  font-weight: 600;
+  font-size: 0.75rem;
+  font-family: inherit;
+  line-height: 1;
+  white-space: normal;
+  text-align: left;
+  cursor: pointer;
+  transition: var(--transition);
+}
+
+.thoughts-notes-header:hover {
+  background-color: var(--overlay-3);
+  color: var(--text-primary);
+}
+
+.thoughts-notes-caret {
+  flex-shrink: 0;
+  transition: transform 0.15s ease;
+}
+
+/* Points right when collapsed, down when expanded - same convention as a
+   native <details> disclosure triangle. */
+.thoughts-notes-header.expanded .thoughts-notes-caret {
+  transform: rotate(90deg);
+}
+
+/* No wrapping <p> inside this (see thoughtsNotesAccordionHtml() -
+   `bodyHtml` is injected directly, same inline-HTML shape
+   renderMarkdownLiteSummaryTab() always returns) - white-space: pre-wrap
+   goes on the div itself so the triage message's own line breaks still
+   render, same convention .response-text uses for the main text. Margin/
+   padding kept small to match the header's own compact footprint above
+   it, rather than opening back up into a second full-size paragraph
+   block.*/
+.thoughts-notes-body {
+  margin-top: 0.3rem;
+  padding: 0.45rem 0.6rem;
+  background: var(--overlay-1);
+  border-left: 2px solid var(--overlay-18);
+  color: var(--text-secondary);
+  font-family: var(--font-sans);
+  font-size: 0.82rem;
+  line-height: 1.4;
+  white-space: pre-wrap;
+}
+
+/* The combine step's own note (see thoughtsNotesAccordionHtml()'s
+   `combineHtml`) - sits below the triage text inside the same drawer, so
+   margin-top (not padding-top) separates it from whatever triage text
+   came before it, same as a second paragraph would. The constructed
+   `<p>`/`<pre>` markup here is a single-line template literal (no
+   embedded newlines), unlike thoughtsNotesAccordionHtml()'s own top-level
+   return value - see that function's comment on why a leading newline in
+   HTML inserted under a pre-wrap ancestor renders as a literal blank
+   line - so this div needs no white-space override of its own; it simply
+   inherits .thoughts-notes-body's pre-wrap, which is exactly what the SQL
+   block below needs anyway. */
+.thoughts-notes-combine {
+  margin-top: 0.5rem;
+}
+
+.thoughts-notes-combine p {
+  margin: 0 0 0.35rem;
+}
+
+.thoughts-notes-combine-sql {
+  margin: 0;
+  padding: 0.4rem 0.55rem;
+  background: var(--overlay-2);
+  border-radius: 4px;
+  font-family: var(--font-mono, monospace);
+  font-size: 0.78rem;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-x: auto;
+}
+
 .response-text {
   color: var(--text-primary);
-  font-family: var(--font-sans);
+  font-family: var(--font-mono);
   font-size: 0.9rem;
   line-height: 1.5;
   white-space: pre-wrap;

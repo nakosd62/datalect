@@ -241,7 +241,16 @@ EXEMPT_ENDPOINTS = {
     'login',
     'google_login',
     'oauth_callback',
-    'auth_login'
+    'auth_login',
+    # A share link is meant to work for anyone holding it, including a
+    # visitor with no session/identity of their own at all (see
+    # share_routes.py's own module docstring) - listed here explicitly even
+    # though in practice step 4 below would already let an anonymous
+    # request through regardless (nothing this route needs is gated on
+    # anything MORE than "has some identity"). POST /api/share (creating a
+    # link) is deliberately NOT exempt - that one's fine requiring whatever
+    # identity a normal translate/execute call already does.
+    'share.get_share',
 }
 
 

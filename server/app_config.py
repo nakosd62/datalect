@@ -1356,6 +1356,18 @@ ISSUE_REPORTING_ENABLED = bool(
     ISSUE_REPORT_TO_EMAIL and ISSUE_REPORT_SMTP_HOST and ISSUE_REPORT_SMTP_FROM
 )
 
+# --- Public share links (the header "Share" button, see share_routes.py) ---
+# The scheme+host a generated share link is built under - e.g.
+# "https://agent.datalect.xyz". Left unset (the default), share_routes.py
+# falls back to request.host_url for each request, which is CORRECT for a
+# plain single-domain deployment but wrong the moment this app sits behind
+# a proxy/CNAME (e.g. Cloud Run's own *.run.app URL fronted by a custom
+# domain) - request.host_url would then bake the internal, not the public,
+# hostname into every link handed out. Set this explicitly whenever the
+# public-facing domain differs from whatever Flask itself sees the request
+# arrive on. No trailing slash (stripped below if one is given anyway).
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").strip().rstrip("/")
+
 # Model configuration for all three LLM providers (Google included) lives
 # in translate_routes.py now, not here - each provider's own single
 # *_MODELS env var (GOOGLE_MODELS/ANTHROPIC_MODELS/OPENAI_MODELS) is the

@@ -424,8 +424,13 @@ def generate_sql_for_connection(descriptor, prompt, history, provider, client, m
 
     Returns (via `return`, capturable by `yield from` or
     _drain_generation): (generated_sql, usage_info, duration_ms,
-    final_api_key, final_client) - generated_sql already has markdown
-    code-fences stripped. On total failure, raises the final classified-
+    final_api_key, final_client, knowledge_note) - generated_sql already
+    has markdown code-fences stripped. `knowledge_note` is the model's own
+    OPTIONAL note (see _parse_sql_generation_response/_SQL_GENERATION_
+    FORMAT_RULES) on a general-knowledge fact it resolved in order to
+    write real SQL - None for a "cannot_answer" outcome (there's no SQL to
+    have resolved anything for) or whenever the model simply didn't need
+    one. On total failure, raises the final classified-
     as-fatal (or retry-budget-exhausted) exception wrapped as
     LlmCallFailed (see its own docstring) - str() on it is already the
     full, categorized, user-facing message format_llm_error_for_user()
@@ -615,6 +620,7 @@ def generate_sql_for_connection(descriptor, prompt, history, provider, client, m
             # below at all, same scoping _no_sql_language_mismatch's own
             # docstring describes for its other call sites.
             generated_sql = parsed_generation["sql"]
+            generated_knowledge_note = parsed_generation.get("knowledge_note")
             break
 
         # "cannot_answer" - the closest surviving equivalent of the old
@@ -669,10 +675,11 @@ def generate_sql_for_connection(descriptor, prompt, history, provider, client, m
         # unchanged by this migration - see this function's own docstring
         # and the module-level comment above this retry loop.
         generated_sql = "*** NO SQL *** " + free_text
+        generated_knowledge_note = None
         break
     end_time = time.perf_counter()
 
-    return generated_sql, usage_info, round(1000 * (end_time - start_time)), api_key, client
+    return generated_sql, usage_info, round(1000 * (end_time - start_time)), api_key, client, generated_knowledge_note
 
 
 def _drain_generation(gen):
@@ -693,14 +700,14 @@ def _drain_generation(gen):
 
 def _classify_generation_outcome(entry, outcome):
     """Classifies one connection's raw Phase B outcome - either
-    ("ok", generated_sql, usage_info, duration_ms) or
+    ("ok", generated_sql, usage_info, duration_ms, knowledge_note) or
     ("failed", error_str, duration_ms), the exact tuple shapes
     _run_phase_b_fanout's ThreadPoolExecutor loop already produces - into
     the one shape both that function's per-completion streaming event AND
     its final original-order summary loop need, so the marker-prepend/
     note-strip logic is written exactly once instead of twice. Returns one
     of:
-      {"outcome": "sql", "sql": <marker-prepended text>}
+      {"outcome": "sql", "sql": <marker-prepended text>, "knowledge_note": <str> | None}
       {"outcome": "note", "text": <str, '*** NO SQL ***' prefix stripped -
         "" for the rare case where the model returned a blank response;
         _run_phase_b_fanout's own final loop intentionally still drops
@@ -715,17 +722,21 @@ def _classify_generation_outcome(entry, outcome):
     classification itself (it's what _run_phase_b_fanout's own final loop
     uses to log each connection's own translations-table row) - unpacked
     here only so this still works against the real tuple shape.
+    "knowledge_note" (see generate_sql_for_connection's own docstring) has
+    no equivalent for a "note"/"failed" outcome - no SQL was generated in
+    either case, so there's nothing for it to describe - so it's only ever
+    present (and only ever non-None) on a "sql" outcome.
     """
     if outcome[0] == "failed":
         return {"outcome": "failed", "error": outcome[1]}
-    _, generated_sql, _usage_info, _duration = outcome
+    _, generated_sql, _usage_info, _duration, knowledge_note = outcome
     stripped = (generated_sql or "").strip()
     if not stripped:
         return {"outcome": "note", "text": ""}
     if _NO_SQL_PREFIX_RE.match(stripped):
         return {"outcome": "note", "text": _strip_no_sql_prefix(stripped)}
     marked = f"-- database: {entry['kind']}:{entry['id']} ({entry['name']})\n{stripped}"
-    return {"outcome": "sql", "sql": marked}
+    return {"outcome": "sql", "sql": marked, "knowledge_note": knowledge_note}
 
 
 def _run_phase_b_fanout(selected_entries, prompts, histories, provider, model, user_identity, force_schema_refresh):
@@ -793,7 +804,7 @@ def _run_phase_b_fanout(selected_entries, prompts, histories, provider, model, u
     per-connection execution.
 
     Returns (sql_blocks, database_notes, generation_failures, usage_totals,
-    phase_b_log_entries):
+    phase_b_log_entries, database_knowledge_notes):
       sql_blocks: [(entry, marked_sql_text), ...] - one per entry that
         returned REAL SQL, marker-prepended here (mechanically, by this
         function - never by the model, which only ever sees ONE
@@ -828,6 +839,13 @@ def _run_phase_b_fanout(selected_entries, prompts, histories, provider, model, u
         (<error>)" sentinel - matching whichever of the three outcomes
         this specific connection had, the same conventions used elsewhere
         in this module for a non-SQL or failed translation.
+      database_knowledge_notes: [{"kind","id","name","note"}, ...] - a
+        STRICT SUBSET of the connections already in `sql_blocks` (one
+        entry only for those that ALSO came back with a "knowledge_note" -
+        see generate_sql_for_connection's/_classify_generation_outcome's
+        own docstrings - a general-knowledge fact the model had to resolve
+        in order to write that connection's own SQL), same original
+        order. Empty whenever no connection in this fan-out needed one.
 
     Resolves `user_identity`'s "Bring Your Own Key" value for `provider`
     (state_store.get_llm_byok_key) exactly ONCE here, up front - not
@@ -871,7 +889,7 @@ def _run_phase_b_fanout(selected_entries, prompts, histories, provider, model, u
             force_schema_refresh=force_schema_refresh,
             api_key=worker_api_key, tried_keys={worker_api_key}, using_byok=bool(byok_key),
         )
-        return _drain_generation(gen)  # (generated_sql, usage_info, duration_ms, _key, _client)
+        return _drain_generation(gen)  # (generated_sql, usage_info, duration_ms, _key, _client, knowledge_note)
 
     def _run_one_timed(entry, entry_prompt, entry_history):
         # Wraps _run_one with its OWN start_time, captured here rather than
@@ -886,9 +904,9 @@ def _run_phase_b_fanout(selected_entries, prompts, histories, provider, model, u
         # path and generate_sql_for_connection's own success path do.
         start_time = time.perf_counter()
         try:
-            generated_sql, usage_info, _duration, _key, _client = _run_one(entry, entry_prompt, entry_history)
+            generated_sql, usage_info, _duration, _key, _client, knowledge_note = _run_one(entry, entry_prompt, entry_history)
             duration = round(1000 * (time.perf_counter() - start_time))
-            return ("ok", generated_sql, usage_info, duration)
+            return ("ok", generated_sql, usage_info, duration, knowledge_note)
         except Exception as e:
             duration = round(1000 * (time.perf_counter() - start_time))
             return ("failed", str(e), duration)
@@ -924,6 +942,16 @@ def _run_phase_b_fanout(selected_entries, prompts, histories, provider, model, u
             yield entry, _classify_generation_outcome(entry, outcomes[index])
 
     sql_blocks, database_notes, generation_failures = [], [], []
+    # One entry per connection that returned real SQL AND had a
+    # "knowledge_note" to go with it (see generate_sql_for_connection's/
+    # _classify_generation_outcome's own docstrings) - i.e. a STRICT subset
+    # of sql_blocks, built alongside it in the loop below. Surfaced to the
+    # client as its own list (translate_routes.py's "route" outcome
+    # response - see that module) rather than folded into database_notes,
+    # which means something different ("this database had nothing to
+    # contribute") and is keyed by every noted connection, not just the
+    # ones with real SQL.
+    database_knowledge_notes = []
     usage_totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
                      "thinking_tokens": 0, "cached_content_tokens": 0}
     # One entry per connection in `selected_entries` (ORIGINAL order, same
@@ -960,7 +988,7 @@ def _run_phase_b_fanout(selected_entries, prompts, histories, provider, model, u
                 "usage": {},
             })
             continue
-        _, generated_sql, usage_info, duration = outcome
+        _, generated_sql, usage_info, duration, _knowledge_note = outcome
         for k in usage_totals:
             # `or 0` guards against a provider returning this key present
             # but explicitly None (e.g. real Gemini responses report
@@ -975,6 +1003,11 @@ def _run_phase_b_fanout(selected_entries, prompts, histories, provider, model, u
         if classified["outcome"] == "sql":
             sql_blocks.append((entry, classified["sql"]))
             log_sql_command = classified["sql"]
+            if classified.get("knowledge_note"):
+                database_knowledge_notes.append({
+                    "kind": entry["kind"], "id": entry["id"], "name": entry["name"],
+                    "note": classified["knowledge_note"],
+                })
         else:
             # "note" outcome - classified["text"] may legitimately be ""
             # (the model's response was blank after stripping); the
@@ -995,7 +1028,7 @@ def _run_phase_b_fanout(selected_entries, prompts, histories, provider, model, u
             "entry": entry, "prompt": entry_prompt, "duration": duration,
             "sql_command": log_sql_command, "usage": usage_info or {},
         })
-    return sql_blocks, database_notes, generation_failures, usage_totals, phase_b_log_entries
+    return sql_blocks, database_notes, generation_failures, usage_totals, phase_b_log_entries, database_knowledge_notes
 
 
 def _no_sql_language_mismatch(generated_sql, expected_language_code):
@@ -1168,9 +1201,15 @@ _SQL_GENERATION_FORMAT_RULES = load_prompt("sql_generation_format_rules.txt")
 def _parse_sql_generation_response(text):
     """Parses Call 2's raw response text (_SQL_GENERATION_FORMAT_RULES)
     into exactly one of:
-      {"outcome": "sql", "sql": <non-empty str>}
+      {"outcome": "sql", "sql": <non-empty str>, "knowledge_note": <str> | None}
       {"outcome": "cannot_answer", "reason": <non-empty str>}
       None  # unparseable, both populated, or neither populated - caller retries
+    "knowledge_note" is the model's own OPTIONAL note on a general-
+    knowledge fact it had to resolve in order to write this SQL (see
+    _SQL_GENERATION_FORMAT_RULES) - None whenever it's absent/blank, never
+    an empty string, so callers can tell "nothing to show" apart from "the
+    model wrote nothing" the same way every other optional field in this
+    app does.
     Never raises. "sql" is additionally passed through _clean_generated_
     sql's own fence-stripping as defense-in-depth only (that function's
     '*** NO SQL ***'-marker search is a harmless no-op here - real SQL has
@@ -1190,6 +1229,15 @@ def _parse_sql_generation_response(text):
     sql = sql.strip() if isinstance(sql, str) else ""
     reason = parsed.get("cannot_answer_reason")
     reason = reason.strip() if isinstance(reason, str) else ""
+    # Optional, "sql"-outcome-only field (see _SQL_GENERATION_FORMAT_RULES)
+    # - the model's own short note naming a general-knowledge fact it had
+    # to resolve (not present in the prompt or schema) in order to write
+    # this SQL, e.g. resolving "the current US president" to a real name
+    # before using it as a filter. `None` (not "") when absent/blank, same
+    # "a real None vs. an empty string are distinguishable" reasoning used
+    # elsewhere in this app for a similarly optional field.
+    knowledge_note = parsed.get("knowledge_note")
+    knowledge_note = knowledge_note.strip() if isinstance(knowledge_note, str) and knowledge_note.strip() else None
 
     if bool(sql) == bool(reason):
         # Neither populated, or both populated - the contract requires
@@ -1197,5 +1245,5 @@ def _parse_sql_generation_response(text):
         # doubt than a plain unparseable response would.
         return None
     if sql:
-        return {"outcome": "sql", "sql": _clean_generated_sql(sql)}
+        return {"outcome": "sql", "sql": _clean_generated_sql(sql), "knowledge_note": knowledge_note}
     return {"outcome": "cannot_answer", "reason": reason}

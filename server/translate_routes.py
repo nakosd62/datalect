@@ -873,7 +873,8 @@ def translate_query():
                                 **classified,
                             }) + "\n"
                     except StopIteration as stop:
-                        sql_blocks, database_notes, generation_failures, phase_b_usage, phase_b_log_entries = stop.value
+                        (sql_blocks, database_notes, generation_failures, phase_b_usage, phase_b_log_entries,
+                         database_knowledge_notes) = stop.value
 
                     generated_sql = "\n\n".join(marked for _, marked in sql_blocks)
                     # Per-database structured equivalent of the joined
@@ -930,6 +931,16 @@ def translate_query():
                         "database_notes": database_notes,
                         "generation_failures": generation_failures,
                         "sql_blocks": sql_by_database,
+                        # [{"kind","id","name","note"}, ...] - see
+                        # _run_phase_b_fanout's own docstring: one entry
+                        # per connection whose own Phase B call resolved a
+                        # general-knowledge fact (not in the prompt or
+                        # schema) in order to write its SQL, e.g. looking
+                        # up "the current US president" to use as a
+                        # filter. A strict subset of sql_blocks above, and
+                        # empty far more often than not. client.js surfaces
+                        # these in the "Thoughts & Notes" drawer.
+                        "database_knowledge_notes": database_knowledge_notes,
                         # Triage's own "needs_combination" (see
                         # connection_router.py's _parse_multi_candidate_
                         # triage_response) - tells the client whether to
@@ -1582,6 +1593,14 @@ def translate_query():
                 'status': 'done',
                 'success': True,
                 'sql': generated_sql,
+                # The model's own OPTIONAL note on a general-knowledge
+                # fact it had to resolve in order to write this SQL (see
+                # _SQL_GENERATION_FORMAT_RULES/_parse_sql_generation_
+                # response) - `parsed_generation` is still the dict Call 2's
+                # retry loop broke out of above with outcome "sql"; this
+                # route never reassigns it between there and here. None
+                # when the model didn't need one.
+                'knowledge_note': parsed_generation.get("knowledge_note"),
                 'input_tokens': input_tokens,
                 'output_tokens': output_tokens,
                 'total_tokens': total_tokens,

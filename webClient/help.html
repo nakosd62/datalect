@@ -1,68 +1,64 @@
     <p>
-    Welcome to the <strong>Datalect Agent</strong> that helps you understand the meaning of your data.
+    Welcome to the <strong>Datalect Agent</strong>.
     </p>
     <p>
     Use this link to get a walkthrough of the application:
     <a href="#" id="replayTourBtn">&#8635; Replay guided tour</a>
     </p>
     <p>
-    Or see the agent fetch a real answer from a real dataset, live:
+    Or see the agent fetch a real answer from a real datasource, live:
     <a href="#" id="replayLiveDemoBtn">&#8635; Replay live demo</a>
     </p>
     <p>
     Read the text below for further explanation of some of the concepts.
     </p>
     
-    <h3>Datasets</h3>
+    <h3>Datasources</h3>
     <p>
-    Your questions address Datasets. A Dataset is defined as a set of 'tables' in a database 
-    and selected or configured in the dataset selection dialog that comes up when clicking the 
-    database badge in the header. Out of the box, you're offered various demo datasets hosted 
-    in different supported database types. 
+    Your questions address Datasources. A Datasource is defined as a set of 'tables' in a database 
+    and selected or configured in the datasource selection dialog that comes up when clicking the 
+    database badge in the header. 
     </p>
     <p>
-    You may create your own dataset by connecting to your own database using the same dialog.
-    The application supports several database systems including: portgreSQL, mySQL, Oracle, 
+    Out of the box, you're offered various demo datasources hosted in different supported database 
+    types. You may create your own datasource by connecting to your own database using the same 
+    dialog. The application supports several database systems including: postgreSQL, mySQL, Oracle, 
     Microsoft SQL Server, Google BigQuery, Snowflake, Databricks, Amazon Redshift, MongoDB, and 
-    Google Sheets. 
-    </p>
-    <p>
-    Your custom database connections are kept private and secure. If you do not log in, your custom 
-    connections are scoped to your current browser session only - nobody else can see or use them. 
-    If you log in, your connections are scoped to your account instead, so they follow you across 
-    sessions and devices, but are still never visible to any other user. Sensitive fields 
-    - passwords, service-account keys, private keys, access tokens - are encrypted at rest in the 
-    App's state database, and are never sent back to your browser once saved. 
-    </p>
-    <p>
-    Datasets can be defined as groups of other datasets. Some such datasets are offered out of 
-    the box. In future versions, users will be able to define their own composite datasets. 
-    In composite datasets, the agent decides which constituent datasets to contact and may also 
-    'blend' results from datasets in its memory when that is necessary in order to answer the 
-    user prompt.
-    </p>
-    
-    <h3>Multi-Turn Conversations</h3>
-    <p>
-    The application remembers your last <strong>3 turns</strong>. Each turn contains the prompt, the SQL
-    it generated, the results that came back from the database, and any summarization. Use the 
-    <strong>&#9664; / &#9654;</strong> arrows in the NL prompt text box to step back and forward through 
-    previous turns. You may review past turns and delete them in the <strong>History Dialog</strong>. 
-    </p>
-    
-    <h3>User Authentication</h3>
-    <p>
-    If you log in, you will be able to carry your custom database connections and past translations history 
-    and preferences with you. Otherwise, custom database connections and past translation history stays 
-    with the browser session where they occurred.
+    Google Sheets. Your custom database connections are kept private and secure. If you do not 
+    log in, your custom connections are scoped to your current browser session only - nobody else 
+    can see or use them. If you log in, your connections are scoped to your account instead, so 
+    they follow you across sessions and devices, but are still never visible to any other user. 
+    Sensitive fields - passwords, service-account keys, private keys, access tokens - are encrypted 
+    at rest in the App's state database, and are never sent back to your browser once saved. 
     </p>
 
-    <h3>User-Specified LLM API Keys</h3>
+    <h3>Composite Datasources</h3>
     <p>
-    You may offer to use your own API key from Google, Anthropic or OpenAI for your own use ONLY of 
-    Datalect. Nobody else will see your keys or be able to use them. You may specify that key in the 
-    <strong>Preferences dialog</strong>. It will be much appreciated as it will reduce the cost of 
-    maintaining the Datalect. 
+    Datasources can be defined as groups of other datasources. Some such datasources are offered 
+    out of the box. In future versions, users will be able to define their own composite datasources. 
+    For composite datasources, the agent decides which constituent datasource(s) to contact and 
+    may also 'blend' (i.e. JOIN or UNION) results from different datasources in its memory when 
+    that is necessary in order to answer the user prompt.
+    </p>
+    
+    <h3>Datasources vs. General Knowledge</h3>
+    <p>
+    The agent always prefers to respond based on the information stored in the provided Datasource(s).
+    If that is not possible, the Agent is allowed to respond based on their general knowledge. 
+    When appropriate, the Agent 'blends' information from both the provided datasources and general 
+    knowledge. For example, responding to the question <i>'Is the current President of the USA 
+    one of my customers?'</i> against an E-Commerce Store datasource, requires this blending. This
+    blending may be 'pushed down' into the queries that fetch results from the related databases or 
+    take place as a 'widening' step after the results are back.
+    </p>
+
+    <h3>Multi-Turn Conversations</h3>
+    <p>
+    The application remembers your last <strong>3 turns</strong>. Each turn contains the prompt, 
+    the SQL it generated, the results that came back from the database, and any summarization. 
+    Use the <strong>&#9664; / &#9654;</strong> arrows in the NL prompt text box to step back and 
+    forward through previous turns. You may review past turns and delete them in the <strong>History 
+    Dialog</strong>. 
     </p>
 
     <h3>About Datalect Agent</h3>

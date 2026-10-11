@@ -52,6 +52,12 @@ document.addEventListener('DOMContentLoaded', async () => {
         history = history.slice(-maxEntries);
         future = [];
         if (onPersist) onPersist(history);
+        // Closes any share popover left open from a PREVIOUS turn (see
+        // closeSharePopoverOnTurnChange()'s own docstring) - harmless even
+        // when THIS push was onto some other, non-active bucket (all-mode's
+        // per-database history fan-out, which this same pushTurn() is also
+        // used for - see this method's own doc comment above).
+        closeSharePopoverOnTurnChange();
       },
       // Applies a new turn cap (from /api/config's history_max_turns) and
       // immediately re-trims `history` if it's now over the new, smaller
@@ -145,7 +151,14 @@ document.addEventListener('DOMContentLoaded', async () => {
       // later sibling turn showed their results; the newest turn in any
       // bucket always came back with none. Every call site that mutates an
       // already-pushed entry must call this afterward.
-      persistCurrent() { if (onPersist) onPersist(history); },
+      persistCurrent() {
+        if (onPersist) onPersist(history);
+        // Same as pushTurn()'s own call just above - this is the OTHER of
+        // the two ways the active bucket's last turn can change shape (see
+        // this method's own docstring above: results/summary/allMode data
+        // filled in AFTER the turn was already pushed).
+        closeSharePopoverOnTurnChange();
+      },
       // What gets sent to /api/translate as `history`.
       toPayload() { return history; },
       // Replaces this store's history wholesale with a previously-
@@ -568,8 +581,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   // same redaction posture as CONFIGURED_DBS above (only id/name/type for
   // a preset; here, the group's own id/name/member-id-list, never
   // anything about a member preset's own connection details). Rendered
-  // with a hardcoded "(Dataset Group)" parenthetical rather than a server-
-  // sent field, since a group has no dialect of its own to redact/display.
+  // with a hardcoded "(Composite)" parenthetical rather than a server-sent
+  // field, since a group has no dialect of its own to redact/display - the
+  // server's own field/JSON-key names ("dataset_group", "dataset_list",
+  // etc.) are unaffected by this display-only rename (matches help.html's
+  // own "Composite Datasources" section).
   let CONFIGURED_DB_GROUPS = [];
   // Multi-database question-answering (see server/translate_routes.py's
   // module docstring): the set of connections the user has marked "in
@@ -746,18 +762,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   // sign-in control when there's nothing there to point at (local/no-auth
   // deployments).
   let googleAuthEnabled = false;
-
-  // Mirrors GET/POST /api/config's own 'is_superuser' field (see auth.py's
-  // is_superuser()/config_routes.py's handle_config()) - UX only, never a
-  // security boundary of its own: lets the Schema Viewer disable (with an
-  // explanatory tooltip, rather than firing the request and getting back a
-  // confusing 403) its "Refresh Schema"/"Refresh Overview" button for a
-  // PRESET or dataset GROUP when this signed-in user isn't one. A custom
-  // connection's own Refresh Schema stays enabled regardless - that one's
-  // already scoped server-side to connections this user themselves saved
-  // (see POST /api/config/refresh-schema's own docstring), so there's
-  // nothing for this flag to additionally gate there.
-  let currentUserIsSuperuser = false;
 
   function getDatabaseNameFromUrl(urlStr) {
     if (!urlStr) return "Custom";
@@ -1484,6 +1488,17 @@ document.addEventListener('DOMContentLoaded', async () => {
   // DOM Elements - Server Down Banner (see markServerUnreachable()/
   // markServerReachable() below)
   const serverDownBanner = document.getElementById('serverDownBanner');
+
+  // DOM Elements - Share button/popover and shared-view banner (see the
+  // SHARE FEATURE section near closeSharePopoverOnTurnChange() below)
+  const shareBtn = document.getElementById('shareBtn');
+  const moreMenuShareBtn = document.getElementById('moreMenuShareBtn');
+  const sharePopover = document.getElementById('sharePopover');
+  const sharePopoverInput = document.getElementById('sharePopoverInput');
+  const sharePopoverCopyBtn = document.getElementById('sharePopoverCopyBtn');
+  const sharePopoverStatus = document.getElementById('sharePopoverStatus');
+  const sharedViewBanner = document.getElementById('sharedViewBanner');
+  const sharedViewDismissBtn = document.getElementById('sharedViewDismissBtn');
 
   // DOM Elements - Results Table & Tabs
   const resultsRetryStatus = document.getElementById('resultsRetryStatus');
@@ -3235,16 +3250,16 @@ document.addEventListener('DOMContentLoaded', async () => {
   // The header badge's own "(<type>)" suffix (per explicit request: "exactly
   // how it shows in the dataset selector dialog") - reuses the exact same
   // dialect_name/type fallback chain renderPresetOption() above already
-  // uses for that dialog's own "<name> (<type>)" rows, and "Dataset Group"
-  // for group mode matches renderGroupOption()'s own "(Dataset Group)"
-  // parenthetical there too, so the badge and the dialog never disagree on
-  // what a given selection is called. Returns '' (no parenthetical at all)
-  // for the legacy multi-select subset, which can mix presets of different
+  // uses for that dialog's own "<name> (<type>)" rows, and "Composite" for
+  // group mode matches renderGroupOption()'s own "(Composite)" parenthetical
+  // there too, so the badge and the dialog never disagree on what a given
+  // selection is called. Returns '' (no parenthetical at all) for the
+  // legacy multi-select subset, which can mix presets of different
   // dialects and custom connections - there's no single accurate type to
   // show for that case, unlike an admin-curated group (always presets only,
   // per summarizeInScopeConnections' own comment) or a single connection.
   function getBadgeTypeLabel(data, matchedPreset) {
-    if (data?.in_scope_mode === 'group') return 'Dataset Group';
+    if (data?.in_scope_mode === 'group') return 'Composite';
     const presetIds = data?.in_scope_preset_ids || [];
     const customKeys = data?.in_scope_custom_connection_keys || [];
     if (presetIds.length + customKeys.length > 1) return '';
@@ -3484,7 +3499,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         googleAuthEnabled = true;
         initGoogleAuth(data.google_client_id);
       }
-      currentUserIsSuperuser = Boolean(data.is_superuser);
 
       if (data.active_database_url) {
         ACTIVE_DB_URL = data.active_database_url;
@@ -3662,7 +3676,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   // Renders every entry in `customDatabases` (including in-progress blank
-  // rows added via "+ Add custom connection") as an editable row with a
+  // rows added via "+ Create new") as an editable row with a
   // dialect selector. Each row's inputs keep `customDatabases[index]` in
   // sync live via their own 'input' listeners, so by the time
   // triggerConfigSave() runs there's nothing left to harvest from the DOM.
@@ -3731,7 +3745,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       // A connection_key is only ever present on a row that came back from
       // the server (see config_routes.py's get_db_connections) - a row
-      // just added via "+ Add custom connection" this session never has
+      // just added via "+ Create new" this session never has
       // one. That's the signal for "previously configured and shown so it
       // can be selected": those default to collapsed (just type/name, an
       // expand toggle, and remove), since their details aren't needed to
@@ -4077,7 +4091,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       `;
     });
 
-    html += `<button type="button" id="addCustomDbBtn" class="btn btn-secondary custom-db-add-btn">+ Add custom connection</button>`;
+    html += `<button type="button" id="addCustomDbBtn" class="btn btn-secondary custom-db-add-btn">+ Create new</button>`;
 
     container.innerHTML = html;
 
@@ -4520,7 +4534,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const activeUrl = currentDbUrl || ACTIVE_DB_URL || DEFAULT_DB_URL;
     const groupSelected = isGroupModeSelected();
 
-    let html = `<div class="radio-group-heading">PRE-CONFIGURED DATASETS (PLAYGROUNDS)</div>`;
+    let html = `<div class="radio-group-heading">Public Datasources</div>`;
 
     const renderPresetOption = (db) => {
       // Encodes the preset's stable id (never a secret, unlike the real
@@ -4541,7 +4555,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       // so a never-touched session's one radio shows checked exactly as
       // before this feature existed.
       const isSelected = !groupSelected && IN_SCOPE_PRESET_IDS.includes(db.id);
-      // dialect_name (e.g. "PostgreSQL", "Google BigQuery") is a
+      // dialect_name (e.g. "PostgreSQL", "BigQuery Standard SQL") is a
       // display-only field added by config_routes.py's
       // _redact_preset_for_client() alongside the raw "type" key - shown in
       // parentheses so every preset in this list reads as "<name> (<type>)",
@@ -4578,16 +4592,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     const renderGroupOption = (group) => {
       const value = `group:${group.id}`;
       const isSelected = groupSelected && IN_SCOPE_GROUP_ID === group.id;
-      // "(Dataset Group)" mirrors the exact parenthetical the dataset-
-      // group Schema Viewer's own title already uses (see
-      // openGroupSchemaViewer()) - the same "type" a single preset's own
-      // dialect_name occupies in renderPresetOption() above, so every
-      // entry in this whole picker (single presets and groups alike)
-      // reads consistently as "<name> (<type>)".
+      // "(Composite)" mirrors the exact parenthetical the group Schema
+      // Viewer's own title already uses (see openGroupSchemaViewer()) and
+      // getBadgeTypeLabel()'s own header-badge suffix - the same "type" a
+      // single preset's own dialect_name occupies in renderPresetOption()
+      // above, so every entry in this whole picker (single presets and
+      // groups alike) reads consistently as "<name> (<type>)".
       return `
         <label class="radio-option all-databases-option" title="${GROUP_OPTION_HINT}">
           <input type="radio" name="db_connection_option" value="${value}" data-dbname="${group.name}" ${isSelected ? 'checked' : ''}>
-          <span class="radio-label">${group.name} (Dataset Group)</span>
+          <span class="radio-label">${group.name} (Composite)</span>
         </label>
       `;
     };
@@ -4623,32 +4637,12 @@ document.addEventListener('DOMContentLoaded', async () => {
       </div>
     `;
 
-    html += `<div class="radio-group-heading radio-group-heading-custom">Custom Database Connections</div>`;
-    // Short reassurance, not a full explanation - see help.html's "Database
-    // Connections"/"User Authentication" sections (opened via the link
-    // below) for the actual detail: encryption at rest, and exactly what
-    // "your own session" vs. "your account" scoping means.
-    html += `
-      <p class="custom-db-security-note">
-        Your custom connections are private and secure (<a href="#" id="customDbSecurityNoteHelpLink">see Documentation</a>).
-      </p>
-    `;
+    html += `<div class="radio-group-heading radio-group-heading-custom">Private Datasources</div>`;
     html += `<div id="customDbsContainer" class="custom-dbs-list"></div>`;
 
     radioGroup.innerHTML = html;
 
     renderCustomDbRows(activeUrl);
-
-    // Re-wired on every render, not just once at startup - the link above
-    // is recreated from scratch each time renderDbRadioButtons() rebuilds
-    // radioGroup.innerHTML, same as customDbsContainer's own inputs below.
-    const securityNoteHelpLink = document.getElementById('customDbSecurityNoteHelpLink');
-    if (securityNoteHelpLink) {
-      securityNoteHelpLink.addEventListener('click', (e) => {
-        e.preventDefault();
-        openHelpModal();
-      });
-    }
   }
 
   // ===========================================================================
@@ -5185,7 +5179,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     // for it.
     const isCompleteSimpleUrlDb = (db) => db && db.type !== 'bigquery' && db.type !== 'snowflake' && db.type !== 'databricks' && db.type !== 'oracle' && db.type !== 'redshift' && db.type !== 'mssql' && db.type !== 'sheets' && db.type !== 'MongoDB'
       && db.url && db.url.trim() !== "";
-    // MongoDB Atlas is a hybrid: a real url (like Postgres/MySQL)
+    // MongoDB Atlas SQL is a hybrid: a real url (like Postgres/MySQL)
     // PLUS separate structured config fields (like every dialect above)
     // - see backends/mongodb_sql.py's and config_routes.py's module
     // docstrings. Same "freshly entered, or already saved server-side"
@@ -5984,11 +5978,21 @@ document.addEventListener('DOMContentLoaded', async () => {
     // at them directly would spotlight a zero-size rect. Point at the
     // visible moreMenuBtn instead, with one combined step.
     const isNarrowHeader = !!(moreMenuWrapper && window.getComputedStyle(moreMenuWrapper).display !== 'none');
+    // Always visible now (clicking it with nothing to share surfaces an
+    // inline error instead of the button ever hiding - see
+    // handleShareButtonClick()'s own `!payload` branch), so unlike sqlWrapper
+    // above this needs no "only if actually visible" guard of its own - it's
+    // only ever referenced below inside the `!isNarrowHeader` branch, where
+    // the real #shareBtn (as opposed to its narrow-header moreMenuShareBtn
+    // twin) is genuinely on screen by construction.
+    const shareTarget = shareBtn || null;
     // Mirrors sendFeedbackBtn/moreMenuFeedbackBtn's own visibility gate
     // (fetchBackendConfig() toggles both on ISSUE_REPORTING_ENABLED) -
     // reused here so the tour never spotlights a feature-flagged-off button,
-    // wide header or narrow.
-    const feedbackMenuClause = ISSUE_REPORTING_ENABLED ? ', send feedback,' : ',';
+    // wide header or narrow. Built as a leading-comma fragment (rather than
+    // baked into the sentence directly) so it can be left out cleanly
+    // whenever it's disabled, without leaving a stray " ," behind.
+    const feedbackMenuClause = ISSUE_REPORTING_ENABLED ? ', send feedback' : '';
 
     const steps = [
       {
@@ -6013,25 +6017,30 @@ document.addEventListener('DOMContentLoaded', async () => {
       },
       {
         target: configTriggerBadge,
-        title: "This is the dataset you are addressing",
-        body: "Switch to any pre-configured dataset or connect to your own."
+        title: "This is the datasource you are addressing",
+        body: "Switch to any public datasource, connect your own private one, or pick a composite to let the agent figure out which of several to use."
       },
       {
         target: datasetSchemaViewerBtn,
-        title: 'Peek at the dataset description',
-        body: 'Review what the dataset is about, sample questions you may ask, and it\'s detailed schema.'
+        title: 'Peek at the datasource description',
+        body: 'Review what the datasource is about, sample questions you may ask, and its detailed schema.'
       },
       ...(isNarrowHeader ? [{
         target: moreMenuBtn,
         title: 'Model selector, help, history, preferences & sign-in live here',
         body: isAnonymousUser
-          ? `Tap this menu to switch the model, see the doc, your past translations, your preferences ${feedbackMenuClause} and to sign in.`
-          : `Tap this menu to switch the model, see the doc, your past translations, your preferences ${feedbackMenuClause} and to sign out.`
+          ? `Tap this menu to switch the model, see the doc, your past translations, your preferences, share a result${feedbackMenuClause}, and to sign in.`
+          : `Tap this menu to switch the model, see the doc, your past translations, your preferences, share a result${feedbackMenuClause}, and to sign out.`
       }] : [
       {
         target: modelTriggerBadge,
         title: "This is the model responding to your questions",
         body: "Switch between the available models from Google, Anthropic, and OpenAI."
+      },
+      {
+        target: shareTarget,
+        title: 'Share a result',
+        body: "Copy a link to this exact question, SQL, and results. Anyone who opens it sees it instantly, and can keep going from there themselves if it used a public or composite datasource."
       },
       {
         target: prefsBtn,
@@ -6041,7 +6050,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       {
         target: historyBtn,
         title: 'Reset your conversations',
-        body: 'Review and purge past conversation turns with any dataset.'
+        body: 'Review and purge past conversation turns with any datasource.'
       },
       {
         target: authContainer,
@@ -8465,19 +8474,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
-  // Group-mode counterpart to the connection-mode tree above - just two
-  // top-level rows: a pinned "Overview" (the whole group's own LLM-written
-  // summary, category 'group-overview') and a single collapsible
-  // "Datasets" group listing each member by name (category 'dataset' +
-  // index - clicking one shows THAT member's own cached overview, see
-  // selectSchemaViewerEntry()'s 'dataset' branch and
-  // renderGroupMemberOverviewDetail() below). A member with
-  // "available": false (its own schema fetch failed - see db.py's
-  // build_group_schema_summaries()) is still listed and clickable (it may
-  // still have its own overview cached from an earlier successful fetch -
-  // see that function's own docstring), just visually dimmed with an
-  // explanatory tooltip, the same treatment the old flat table's own
-  // renderGroupSchemaViewerRow() gave an unavailable row.
+  // Dataset-group counterpart to renderSchemaViewerEntryList() above - a
+  // pinned "Overview" row (the group's own LLM-written overview) plus one
+  // collapsible "Datasets" tree group listing each member by name, per an
+  // explicit request that the group dialog be organized just like the
+  // single-connection one (LHS nav with 2 nodes: Overview, Datasets).
+  // Clicking a member expands nothing further under it - selecting it
+  // directly shows that dataset's own overview in the RHS panel (see
+  // renderGroupMemberOverviewDetail() below), there's no per-member
+  // sub-tree the way a single connection's own Tables/Views/etc. groups
+  // have children.
   function renderGroupSchemaViewerEntryList() {
     const overviewItem = `
       <li>
@@ -8505,7 +8511,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           <svg class="schema-viewer-group-caret" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 6 15 12 9 18"></polyline></svg>
           <span>Datasets (${schemaViewerGroupDatasets.length})</span>
         </button>
-        ${expanded ? `<ul class="schema-viewer-group-children">${schemaViewerGroupDatasets.length > 0 ? children : '<li class="schema-viewer-entry-empty text-center text-muted py-8">This dataset group has no datasets in it.</li>'}</ul>` : ''}
+        ${expanded && schemaViewerGroupDatasets.length > 0 ? `<ul class="schema-viewer-group-children">${children}</ul>` : ''}
       </li>`;
 
     schemaViewerEntryList.innerHTML = overviewItem + datasetsGroupHtml;
@@ -8549,110 +8555,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       schemaViewerDetailText.textContent = text || '';
       schemaViewerDetailText.classList.toggle('hidden', !(text || '').trim());
     }
-  }
-
-  // Shared by every "Overview"-shaped detail pane (the single-connection
-  // Overview entry, the group's own Overview entry, and a member dataset's
-  // overview inside a group - renderSchemaViewerOverviewDetail()/
-  // renderGroupOverviewDetail()/renderGroupMemberOverviewDetail() below):
-  // builds the inner HTML for an {prose, questions} overview object (or
-  // the empty-state message when there isn't one yet), WITHOUT wiring up
-  // the suggested-question buttons - callers do that themselves afterward
-  // via wireSuggestedQuestionButtons() below, since what a click should
-  // actually do differs by caller (run against the active connection
-  // as-is vs. switch to a different member first). statsHtml is prepended
-  // verbatim when given (the single-connection caller's own limit-warnings
-  // block - see renderSchemaViewerStatsBlockHtml()); the group callers have
-  // no such block and pass '' for it.
-  function buildOverviewContentHtml(statsHtml, overview, emptyMessage) {
-    if (!overview) {
-      return `${statsHtml || ''}<p class="text-muted schema-viewer-overview-empty">${emptyMessage}</p>`;
-    }
-    const questions = overview.questions || [];
-    const questionsHtml = questions.map((q) => `
-      <li><button type="button" class="schema-viewer-suggested-question" data-question="${escapeHtml(q)}">${escapeHtml(q)}</button></li>
-    `).join('');
-    return `
-      ${statsHtml || ''}
-      <p class="schema-viewer-overview-prose">${escapeHtml(overview.prose || '')}</p>
-      ${questions.length > 0 ? `
-        <div class="schema-viewer-overview-questions-block">
-          <div class="schema-viewer-overview-questions-title">Questions you could ask</div>
-          <ul class="schema-viewer-overview-questions">${questionsHtml}</ul>
-        </div>` : ''}
-    `;
-  }
-
-  // Binds every ".schema-viewer-suggested-question" button currently inside
-  // `container` (freshly re-rendered via buildOverviewContentHtml() above,
-  // so there's nothing to unbind first) to `onPick(question)`. Split out
-  // from buildOverviewContentHtml() itself only because that function
-  // returns a plain HTML string (assigned via .innerHTML= by each caller)
-  // rather than live DOM nodes - the buttons have to actually exist in the
-  // document before addEventListener can run.
-  function wireSuggestedQuestionButtons(container, onPick) {
-    if (!container) return;
-    container.querySelectorAll('.schema-viewer-suggested-question').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        const question = btn.dataset.question || '';
-        if (!question) return;
-        onPick(question);
-      });
-    });
-  }
-
-  // Common up-front reset every Overview-shaped detail pane needs before
-  // filling in schemaViewerOverviewWrap with its own content - the same
-  // "hide every OTHER detail-pane piece" steps renderSchemaViewerOverviewDetail()
-  // used to do inline. Returns false (having done nothing further) when
-  // schemaViewerOverviewWrap itself isn't even in the DOM, matching that
-  // function's own original early return.
-  function resetSchemaViewerDetailPaneForOverview(heading) {
-    if (schemaViewerDetailHeading) {
-      schemaViewerDetailHeading.textContent = heading || '';
-      schemaViewerDetailHeading.title = '';
-    }
-    if (schemaViewerTableCommentText) schemaViewerTableCommentText.classList.add('hidden');
-    if (schemaViewerColumnsWrap) schemaViewerColumnsWrap.classList.add('hidden');
-    if (schemaViewerColumnsBody) schemaViewerColumnsBody.innerHTML = '';
-    if (schemaViewerDetailText) {
-      schemaViewerDetailText.textContent = '';
-      schemaViewerDetailText.classList.add('hidden');
-    }
-    if (!schemaViewerOverviewWrap) return false;
-    schemaViewerOverviewWrap.classList.remove('hidden');
-    return true;
-  }
-
-  // The suggested-question click behavior for any overview that describes
-  // the CURRENTLY ACTIVE connection or group as-is (the single-connection
-  // Overview entry, and the group's own Overview entry - a group-wide
-  // question is meant to run with the group itself as the active scope,
-  // same as before this tree existed) - exactly
-  // renderSchemaViewerOverviewDetail()'s original inline click handler,
-  // unchanged, just promoted to a shared function so
-  // renderGroupOverviewDetail() can reuse it too. A MEMBER dataset's own
-  // overview (renderGroupMemberOverviewDetail() below) does NOT use this -
-  // it switches the active connection first (see
-  // switchActiveConnectionToPreset()) since a member's question is about
-  // that member, not about the group as a whole.
-  function runSuggestedQuestionAgainstActiveScope(question) {
-    if (!aiPrompt) return;
-    // The Schema Viewer is now only ever opened for the ACTIVE
-    // connection/group (see datasetSchemaViewerBtn's and the "OPEN SCHEMA
-    // VIEWER" sentinel's own click handlers - the old per-row "?"
-    // buttons that could open it for a connection other than the
-    // active one are gone), so translatePrompt() below is guaranteed
-    // to run this question against the same scope the user was just
-    // looking at. closeConfigModal() is defensive/cheap insurance in
-    // case it happened to be open underneath - it used to be the
-    // actual cause of a second dialog blocking the results view back
-    // when this dialog could be launched from inside it.
-    closeSchemaViewer();
-    closeConfigModal();
-    aiPrompt.value = question;
-    setSqlQuery('');
-    translatePrompt();
   }
 
   // Fills the detail pane for the pinned "Overview" entry: the cached
@@ -8760,6 +8662,110 @@ document.addEventListener('DOMContentLoaded', async () => {
         ${warningsHtml}
       </div>
     `;
+  }
+
+  // Shared by every "Overview"-shaped detail pane (the single-connection
+  // Overview entry, the group's own Overview entry, and a member dataset's
+  // overview inside a group - renderSchemaViewerOverviewDetail()/
+  // renderGroupOverviewDetail()/renderGroupMemberOverviewDetail() below):
+  // builds the inner HTML for an {prose, questions} overview object (or
+  // the empty-state message when there isn't one yet), WITHOUT wiring up
+  // the suggested-question buttons - callers do that themselves afterward
+  // via wireSuggestedQuestionButtons() below, since what a click should
+  // actually do differs by caller (run against the active connection
+  // as-is vs. switch to a different member first). statsHtml is prepended
+  // verbatim when given (the single-connection caller's own limit-warnings
+  // block - see renderSchemaViewerStatsBlockHtml()); the group callers have
+  // no such block and pass '' for it.
+  function buildOverviewContentHtml(statsHtml, overview, emptyMessage) {
+    if (!overview) {
+      return `${statsHtml || ''}<p class="text-muted schema-viewer-overview-empty">${emptyMessage}</p>`;
+    }
+    const questions = overview.questions || [];
+    const questionsHtml = questions.map((q) => `
+      <li><button type="button" class="schema-viewer-suggested-question" data-question="${escapeHtml(q)}">${escapeHtml(q)}</button></li>
+    `).join('');
+    return `
+      ${statsHtml || ''}
+      <p class="schema-viewer-overview-prose">${escapeHtml(overview.prose || '')}</p>
+      ${questions.length > 0 ? `
+        <div class="schema-viewer-overview-questions-block">
+          <div class="schema-viewer-overview-questions-title">Questions you could ask</div>
+          <ul class="schema-viewer-overview-questions">${questionsHtml}</ul>
+        </div>` : ''}
+    `;
+  }
+
+  // Binds every ".schema-viewer-suggested-question" button currently inside
+  // `container` (freshly re-rendered via buildOverviewContentHtml() above,
+  // so there's nothing to unbind first) to `onPick(question)`. Split out
+  // from buildOverviewContentHtml() itself only because that function
+  // returns a plain HTML string (assigned via .innerHTML= by each caller)
+  // rather than live DOM nodes - the buttons have to actually exist in the
+  // document before addEventListener can run.
+  function wireSuggestedQuestionButtons(container, onPick) {
+    if (!container) return;
+    container.querySelectorAll('.schema-viewer-suggested-question').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const question = btn.dataset.question || '';
+        if (!question) return;
+        onPick(question);
+      });
+    });
+  }
+
+  // Common up-front reset every Overview-shaped detail pane needs before
+  // filling in schemaViewerOverviewWrap with its own content - the same
+  // "hide every OTHER detail-pane piece" steps renderSchemaViewerOverviewDetail()
+  // used to do inline. Returns false (having done nothing further) when
+  // schemaViewerOverviewWrap itself isn't even in the DOM, matching that
+  // function's own original early return.
+  function resetSchemaViewerDetailPaneForOverview(heading) {
+    if (schemaViewerDetailHeading) {
+      schemaViewerDetailHeading.textContent = heading || '';
+      schemaViewerDetailHeading.title = '';
+    }
+    if (schemaViewerTableCommentText) schemaViewerTableCommentText.classList.add('hidden');
+    if (schemaViewerColumnsWrap) schemaViewerColumnsWrap.classList.add('hidden');
+    if (schemaViewerColumnsBody) schemaViewerColumnsBody.innerHTML = '';
+    if (schemaViewerDetailText) {
+      schemaViewerDetailText.textContent = '';
+      schemaViewerDetailText.classList.add('hidden');
+    }
+    if (!schemaViewerOverviewWrap) return false;
+    schemaViewerOverviewWrap.classList.remove('hidden');
+    return true;
+  }
+
+  // The suggested-question click behavior for any overview that describes
+  // the CURRENTLY ACTIVE connection or group as-is (the single-connection
+  // Overview entry, and the group's own Overview entry - a group-wide
+  // question is meant to run with the group itself as the active scope,
+  // same as before this tree existed) - exactly
+  // renderSchemaViewerOverviewDetail()'s original inline click handler,
+  // unchanged, just promoted to a shared function so
+  // renderGroupOverviewDetail() can reuse it too. A MEMBER dataset's own
+  // overview (renderGroupMemberOverviewDetail() below) does NOT use this -
+  // it switches the active connection first (see
+  // switchActiveConnectionToPreset()) since a member's question is about
+  // that member, not about the group as a whole.
+  function runSuggestedQuestionAgainstActiveScope(question) {
+    if (!aiPrompt) return;
+    // The Schema Viewer is now only ever opened for the ACTIVE
+    // connection/group (see datasetSchemaViewerBtn's and the "OPEN SCHEMA
+    // VIEWER" sentinel's own click handlers - the old per-row "?"
+    // buttons that could open it for a connection other than the
+    // active one are gone), so translatePrompt() below is guaranteed
+    // to run this question against the same scope the user was just
+    // looking at. closeConfigModal() is defensive/cheap insurance in
+    // case it happened to be open underneath - it used to be the
+    // actual cause of a second dialog blocking the results view back
+    // when this dialog could be launched from inside it.
+    closeSchemaViewer();
+    closeConfigModal();
+    aiPrompt.value = question;
+    setSqlQuery('');
+    translatePrompt();
   }
 
   function renderSchemaViewerOverviewDetail() {
@@ -9200,19 +9206,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     schemaViewerPanesWrap?.classList.remove('hidden');
     if (schemaViewerFactsLine) schemaViewerFactsLine.classList.remove('hidden');
     if (schemaViewerRefreshBtnLabel) schemaViewerRefreshBtnLabel.textContent = 'Refresh Schema';
-    // A preset is a shared, admin-configured connection with no single
-    // owner - unlike a custom connection (always this user's own, so
-    // always refreshable), refreshing IT is a superuser-only action (see
-    // auth.py's is_superuser()/POST /api/config/refresh-schema's own
-    // "Authorization" docstring section) - disabled here with an
-    // explanatory tooltip rather than left enabled only to 403 after the
-    // request round-trips.
-    const presetRefreshBlocked = kind === 'preset' && !currentUserIsSuperuser;
     if (schemaViewerRefreshBtn) {
-      schemaViewerRefreshBtn.disabled = presetRefreshBlocked;
-      schemaViewerRefreshBtn.title = presetRefreshBlocked
-        ? 'Only a superuser can refresh schema for a preset dataset.'
-        : "Re-fetch this connection's schema (bypasses the cache)";
+      schemaViewerRefreshBtn.title = "Re-fetch this connection's schema (bypasses the cache)";
     }
     schemaViewerModal.classList.remove('hidden');
     bringModalToFront(schemaViewerModal);
@@ -9247,7 +9242,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (!schemaViewerModal || !groupId) return;
     trackEvent('schema_viewer_viewed', { kind: 'group' });
     if (schemaViewerModalTitleText) {
-      schemaViewerModalTitleText.textContent = groupName ? `${groupName} (Dataset Group)` : 'Dataset Group';
+      schemaViewerModalTitleText.textContent = groupName ? `${groupName} (Composite)` : 'Composite';
     }
     // No facts line for this variant - there's no single data-size/schema-
     // size pair for a whole group the way there is for one connection; each
@@ -9278,17 +9273,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (schemaViewerColumnsBody) schemaViewerColumnsBody.innerHTML = '';
     if (schemaViewerDetailText) schemaViewerDetailText.innerHTML = '';
     if (schemaViewerOverviewWrap) schemaViewerOverviewWrap.innerHTML = '';
-    // Same superuser-only gate as the single-connection Refresh Schema
-    // button above (openSchemaViewer()) - a dataset group is just as much
-    // a shared, admin-configured resource as a preset, with no single
-    // owner a per-user check could apply to.
-    const groupRefreshBlocked = !currentUserIsSuperuser;
     if (schemaViewerRefreshBtn) {
       schemaViewerRefreshBtn.classList.remove('hidden');
-      schemaViewerRefreshBtn.disabled = groupRefreshBlocked;
-      schemaViewerRefreshBtn.title = groupRefreshBlocked
-        ? 'Only a superuser can refresh schema for a dataset group.'
-        : "Generate (or regenerate) this dataset group's own AI-written overview (bypasses the cache)";
+      schemaViewerRefreshBtn.disabled = false;
+      schemaViewerRefreshBtn.title = "Generate (or regenerate) this dataset group's own AI-written overview (bypasses the cache)";
     }
     if (schemaViewerRefreshBtnLabel) schemaViewerRefreshBtnLabel.textContent = 'Refresh Overview';
     setSchemaViewerRefreshStatus('');
@@ -9327,7 +9315,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       // interim title and this response, however unlikely in the span of
       // one fetch.
       if (schemaViewerModalTitleText && data.name) {
-        schemaViewerModalTitleText.textContent = `${data.name} (Dataset Group)`;
+        schemaViewerModalTitleText.textContent = `${data.name} (Composite)`;
       }
       schemaViewerGroupDatasets = data.datasets || [];
       schemaViewerGroupOverview = data.overview || null;
@@ -9735,8 +9723,14 @@ document.addEventListener('DOMContentLoaded', async () => {
   // tints them, unlike an emoji glyph.
   function summaryFeedbackButtonsHtml() {
     if (!ISSUE_REPORTING_ENABLED) return '';
-    return `
-      <div class="summary-feedback-row">
+    // No leading newline before the opening <div> - see
+    // thoughtsNotesAccordionHtml()'s identical comment: this string is
+    // inserted directly into .response-cell (a <td>, which inherits
+    // white-space: pre-wrap from .results-table-wrapper td), so a leading
+    // "\n      " here lands as a literal rendered blank line between the
+    // response text above it and this row, not as whitespace any CSS rule
+    // on .summary-feedback-row itself could collapse.
+    return `<div class="summary-feedback-row">
         <span class="summary-feedback-label text-muted">Was this response helpful?</span>
         <span class="summary-feedback-btns">
           <button type="button" class="summary-feedback-btn summary-feedback-btn--up" data-summary-feedback-trigger="up" title="This summary was helpful">
@@ -9781,8 +9775,12 @@ document.addEventListener('DOMContentLoaded', async () => {
       .filter(Boolean)
       .join('');
     if (!links) return '';
-    return `
-      <div class="summary-suggested-searches">
+    // No leading newline before the opening <div> - see
+    // thoughtsNotesAccordionHtml()'s identical comment: inherited
+    // white-space: pre-wrap (from .results-table-wrapper td, via
+    // .response-cell) would otherwise render a leading "\n      " here as
+    // a literal blank line above this row.
+    return `<div class="summary-suggested-searches">
         <span class="summary-suggested-searches-label text-muted">Related searches:</span>
         ${links}
       </div>`;
@@ -10192,6 +10190,42 @@ document.addEventListener('DOMContentLoaded', async () => {
       const td = document.createElement('td');
       td.className = 'response-cell';
 
+      // "Thoughts & Notes" accordion - see thoughtsNotesAccordionHtml()'s
+      // own docstring. Inserted first, so it sits at the very top of the
+      // Response tab's content, above even the "Database: <name>" line.
+      // Only for the Response tab (a per-database "Note" tab never gets
+      // any of these fields in the first place). Shows whenever there's
+      // ANYTHING for it to hold - a triage routing message (all-mode
+      // only), a combine note, or either knowledge note (single- or
+      // all-mode) - not gated on whether Phase C's real answer has landed
+      // yet, because that content now lives EXCLUSIVELY inside this
+      // drawer (see `isPendingResponseTab` just below) for all-mode:
+      // while a turn is still in flight, this drawer IS the Response
+      // tab's entire visible content, which is exactly why it starts OPEN
+      // for a fresh turn (`result.thoughtsExpanded` - see
+      // renderAllModeCombinedResults'/startAllModeStreaming's own
+      // comments on that field) instead of collapsed-by-default the way a
+      // settled/restored turn's drawer is. Single-connection mode's
+      // Response tab is only ever created already fully formed (see
+      // prependSingleModeSummaryTab's own docstring), so its own drawer
+      // (knowledge notes only - it has no routing message or combine
+      // step) is simply collapsed-by-default from the start, same as any
+      // other already-settled turn. The moment the real answer lands for
+      // an all-mode turn, appendPhaseCSummaryToSummaryTab()/
+      // appendPhaseCErrorToSummaryTab()/settleSummaryTabPending() force
+      // `thoughtsExpanded` back to false, auto-closing it so attention
+      // moves onto the real answer below - the user can still click to
+      // reopen it afterward, same toggle as before.
+      const hasThoughtsContent = result.tabLabel === 'Response' && (
+        result.routingText || result.combineNote || result.preQueryKnowledgeNote || result.postQueryKnowledgeNote
+      );
+      if (hasThoughtsContent) {
+        td.insertAdjacentHTML('beforeend', thoughtsNotesAccordionHtml({
+          routingText: result.routingText, expanded: !!result.thoughtsExpanded, combineNote: result.combineNote,
+          preQueryKnowledgeNote: result.preQueryKnowledgeNote, postQueryKnowledgeNote: result.postQueryKnowledgeNote,
+        }));
+      }
+
       if (result.database && result.database.name) {
         const dbP = document.createElement('p');
         dbP.className = 'text-muted';
@@ -10199,38 +10233,53 @@ document.addEventListener('DOMContentLoaded', async () => {
         td.appendChild(dbP);
       }
 
-      const p = document.createElement('p');
-      p.className = 'response-text';
-      // The "Response" tab carries the leading-label convention (see
-      // renderMarkdownLiteSummaryTab()'s own docstring) - a "Note" tab
-      // (Phase B's own per-database '*** NO SQL ***' reply) never does,
-      // so it's rendered plain like any other free-text reply.
-      p.innerHTML = result.tabLabel === 'Response'
-        ? renderMarkdownLiteSummaryTab(result.text || '')
-        : renderMarkdownLite(result.text || '');
-      // Chart discoverability on the Response tab is just the model's own
-      // inline "[phrase](chart:N)" link, already turned into a clickable
-      // trigger by renderMarkdownLiteSummaryTab() -> applyInlineChartLinks()
-      // above (see that function's own docstring). This used to ALSO show a
-      // row of small preview charts underneath the text, one per chartable
-      // entry - removed per explicit request (they rendered poorly at that
-      // size and were redundant with the inline link: per
-      // chart_helpers.py's _clean_visualization, a result only ever reaches
-      // `result.visualization` at all BECAUSE the model already linked it
-      // inline, so every entry that would have gotten a preview already had
-      // a working link in the text above it, pointing at the exact same
-      // tab). Clicking that inline link still jumps straight to the
-      // result's own tab (see jumpToChartableResultTab()), where the full
-      // chart is one click away.
-      td.appendChild(p);
+      // While a Response tab turn is still in flight (`summaryPending`
+      // true - `.text` is still just triage's own routing message, not
+      // Phase C's real answer), that exact same text is already fully
+      // shown inside the now-open "Thoughts & Notes" drawer just above -
+      // rendering it AGAIN here, as a second, always-visible paragraph,
+      // would just duplicate it (confirmed live: this was the "note
+      // appeared while the triage message was still showing underneath
+      // it" bug from the previous version of this feature). A per-
+      // database "Note" tab has no `summaryPending` field at all (always
+      // falsy), so it's unaffected and always renders normally.
+      const isPendingResponseTab = result.tabLabel === 'Response' && !!result.summaryPending;
+      if (!isPendingResponseTab) {
+        const p = document.createElement('p');
+        p.className = 'response-text';
+        // The "Response" tab carries the leading-label convention (see
+        // renderMarkdownLiteSummaryTab()'s own docstring) - a "Note" tab
+        // (Phase B's own per-database '*** NO SQL ***' reply) never does,
+        // so it's rendered plain like any other free-text reply.
+        p.innerHTML = result.tabLabel === 'Response'
+          ? renderMarkdownLiteSummaryTab(result.text || '')
+          : renderMarkdownLite(result.text || '');
+        // Chart discoverability on the Response tab is just the model's
+        // own inline "[phrase](chart:N)" link, already turned into a
+        // clickable trigger by renderMarkdownLiteSummaryTab() ->
+        // applyInlineChartLinks() above (see that function's own
+        // docstring). This used to ALSO show a row of small preview
+        // charts underneath the text, one per chartable entry - removed
+        // per explicit request (they rendered poorly at that size and
+        // were redundant with the inline link: per chart_helpers.py's
+        // _clean_visualization, a result only ever reaches
+        // `result.visualization` at all BECAUSE the model already linked
+        // it inline, so every entry that would have gotten a preview
+        // already had a working link in the text above it, pointing at
+        // the exact same tab). Clicking that inline link still jumps
+        // straight to the result's own tab (see
+        // jumpToChartableResultTab()), where the full chart is one click
+        // away.
+        td.appendChild(p);
+      }
 
       // Suggested follow-up web searches (see suggestedSearchesHtml()'s
-      // own docstring) - shown on the RESPONSE tab only, same restriction
-      // as the feedback row just below, since a per-database "Note" tab's
-      // `.suggestedSearches` is never set in the first place (only the
-      // Response tab entry itself ever carries this field - see
-      // requestSingleModeResultsSummary()/requestAllModeResultsSummary()).
-      if (result.tabLabel === 'Response') {
+      // own docstring) - shown on the RESPONSE tab only, once settled
+      // (same `isPendingResponseTab` guard as the paragraph above - this
+      // field is never populated before Phase C settles anyway, since
+      // only requestSingleModeResultsSummary()/requestAllModeResultsSummary()
+      // ever set it).
+      if (result.tabLabel === 'Response' && !isPendingResponseTab) {
         td.insertAdjacentHTML('beforeend', suggestedSearchesHtml(result.suggestedSearches));
       }
 
@@ -10261,6 +10310,20 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       tr.appendChild(td);
       resultsBody.appendChild(tr);
+
+      // Toggles the accordion inserted above, if it's actually present -
+      // re-renders this SAME result entry (not a stale snapshot) so a
+      // later Phase C patch-in-place render, or re-selecting this tab,
+      // doesn't silently reset the user's own expand/collapse choice (see
+      // `result.thoughtsExpanded`, read at this function's very top).
+      const thoughtsHeader = td.querySelector('.thoughts-notes-header');
+      if (thoughtsHeader) {
+        thoughtsHeader.addEventListener('click', () => {
+          result.thoughtsExpanded = !result.thoughtsExpanded;
+          renderTableResult(result);
+        });
+      }
+
       setReportContext({
         category: 'wrong_result',
         databaseName: result.database && result.database.name,
@@ -10863,6 +10926,88 @@ document.addEventListener('DOMContentLoaded', async () => {
     return applyInlineMarkdown(html);
   }
 
+  // "Thoughts & Notes" accordion shown at the very top of the Response
+  // tab's own content (see renderTableResult's 'Response'-tab branch,
+  // below) - the all-mode triage/routing message used to be this tab's
+  // ENTIRE visible content until Phase C's real summary/error text landed
+  // and overwrote it outright (appendPhaseCSummaryToSummaryTab/
+  // appendPhaseCErrorToSummaryTab), at which point it was simply gone.
+  // Per explicit request, it's now kept around instead: collapsed by
+  // default under this heading, re-expandable on click, rather than
+  // disappearing. `expanded` is per-result state the caller tracks (see
+  // `result.thoughtsExpanded` at the call site) so it survives this tab
+  // being re-rendered (re-selected, or Phase C's own patch-in-place
+  // render) without snapping back closed.
+  function thoughtsNotesAccordionHtml({ routingText, expanded, combineNote, preQueryKnowledgeNote, postQueryKnowledgeNote }) {
+    // Reuses renderMarkdownLiteSummaryTab() - `routingText` carries the
+    // exact same "<label>\n\nbody" (or label-only) shape triage's own
+    // message always has (see SUMMARY_TAB_BLOCK_MARKER's own docstring),
+    // so it gets the identical treatment (label line dropped when there's
+    // a body, kept plain otherwise) as the main Response text itself
+    // always did with this same string. Single-connection mode never has
+    // a `routingText` at all (it has no triage routing message of its
+    // own) - this whole section is then simply empty, and the drawer
+    // falls through to showing only whichever knowledge note(s) it has.
+    const bodyHtml = (expanded && routingText)
+      ? renderMarkdownLiteSummaryTab(SUMMARY_TAB_BLOCK_MARKER + routingText)
+      : '';
+    // The combine step's own note (see buildCombineNote()/
+    // requestAllModeCombinedResults() below) - only set when "all
+    // databases" mode actually related 2+ real per-database results
+    // together via a JOIN/UNION-style query before Phase C ran. Shown
+    // directly under the triage text, inside this same collapsed drawer,
+    // rather than as its own separate UI element - it's one more "here's
+    // what happened before you got this answer" note, not a distinct
+    // feature. escapeHtml() on both pieces: `summary` is built from real
+    // database names (user-controlled connection names), `sql` is raw
+    // LLM-generated SQL text - neither should ever be interpreted as
+    // markup.
+    const combineHtml = (expanded && combineNote)
+      ? `<div class="thoughts-notes-combine"><p>${escapeHtml(combineNote.summary)}</p><pre class="thoughts-notes-combine-sql">${escapeHtml(combineNote.sql)}</pre></div>`
+      : '';
+    // General-knowledge notes - see buildPreQueryKnowledgeNote()/
+    // requestSingleModeResultsSummary()'s and requestAllModeResultsSummary()'s
+    // own `general_knowledge_note` handling. Two genuinely different
+    // moments, shown in the order they actually happen: `preQueryKnowledgeNote`
+    // is set when the model had to resolve a general-knowledge fact
+    // BEFORE running any query, to use as a literal/filter in the SQL
+    // itself (e.g. resolving "the current US president" to a real name);
+    // `postQueryKnowledgeNote` is set when the model blended a general-
+    // knowledge fact INTO the final answer AFTER the real results came
+    // back (e.g. adding each country's head of state alongside a
+    // population figure the query actually returned). Either, both, or
+    // neither may be present on a given turn - plain text, not raw HTML
+    // (unlike combineNote's SQL block, these are short natural-language
+    // sentences the model wrote in prose, nothing to format as code), so
+    // escapeHtml() alone is enough.
+    const preQueryKnowledgeHtml = (expanded && preQueryKnowledgeNote)
+      ? `<p class="thoughts-notes-knowledge">${escapeHtml(preQueryKnowledgeNote)}</p>`
+      : '';
+    const postQueryKnowledgeHtml = (expanded && postQueryKnowledgeNote)
+      ? `<p class="thoughts-notes-knowledge">${escapeHtml(postQueryKnowledgeNote)}</p>`
+      : '';
+    // No leading newline/indent before the opening <div> here (unlike the
+    // indentation inside it, which is harmless - see .thoughts-notes-
+    // accordion's own white-space: normal override in style.css): this
+    // whole string is inserted via insertAdjacentHTML('beforeend', ...)
+    // directly into .response-cell, which is a <td> and so (same as every
+    // cell in the real results table) inherits white-space: pre-wrap from
+    // .results-table-wrapper td - a leading "\n      " here would land as
+    // a literal, rendered blank line ABOVE this entire accordion, as a
+    // text-node sibling of it rather than a descendant, so no CSS rule
+    // scoped to .thoughts-notes-accordion itself could ever reach it.
+    // Confirmed directly against the live page: this exact leading
+    // whitespace text node was the entire remaining gap above the
+    // accordion once its own internal whitespace was already fixed.
+    return `<div class="thoughts-notes-accordion">
+        <button type="button" class="thoughts-notes-header${expanded ? ' expanded' : ''}" aria-expanded="${expanded}">
+          <svg class="thoughts-notes-caret" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 6 15 12 9 18"></polyline></svg>
+          <span>Thoughts &amp; Notes</span>
+        </button>
+        ${expanded ? `<div class="thoughts-notes-body">${bodyHtml}${preQueryKnowledgeHtml}${combineHtml}${postQueryKnowledgeHtml}</div>` : ''}
+      </div>`;
+  }
+
   // `hasLabel` - true when `rawText` is known to carry the "All databases"
   // mode leading-label convention (see renderMarkdownLiteSummaryTab()
   // above): the all-mode triage "answer" outcome. False for a plain
@@ -10944,8 +11089,68 @@ document.addEventListener('DOMContentLoaded', async () => {
     // hand this function an already-final routingMessage/no-further-Phase-
     // C-call-coming text - see summaryFeedbackButtonsHtml()'s own gating
     // on `!result.summaryPending`.
+    // `routingText` - the raw triage/routing message, kept distinct from
+    // `.text` (which Phase C overwrites in place once it settles - see
+    // appendPhaseCSummaryToSummaryTab/appendPhaseCErrorToSummaryTab) so
+    // renderTableResult's Response-tab branch can still offer it under the
+    // "Thoughts & Notes" accordion instead of it genuinely disappearing.
+    // Prefers `notes.triageMessage` - the ORIGINAL pre-Phase-C text,
+    // persisted separately by captureAllModeHistory() specifically because
+    // `routingMessage` itself gets overwritten with the FINAL text before
+    // history is ever saved (see those call sites' own comments) - so a
+    // turn restored after a page reload has nothing else to fall back on.
+    // Falls back to `routingMessage` itself for a live, still-in-flight
+    // turn, where `notes.triageMessage` hasn't been set yet (Phase C
+    // hasn't settled this notes object even once) - at that point
+    // `routingMessage` IS still the untouched triage text, same value
+    // either way.
+    const routingText = (notes && notes.triageMessage != null) ? notes.triageMessage : routingMessage;
+    // See buildCombineNote()/requestAllModeCombinedResults() below - only
+    // set once the combine step has actually run and related 2+ real
+    // per-database results together. `|| null`, same reasoning as
+    // triageMessage just above: restoreLatestTurn() hands this straight
+    // through from history, where it's `undefined` for every turn
+    // recorded before this feature existed.
+    const combineNote = (notes && notes.combineNote) || null;
+    // Phase B's own general-knowledge note(s) (see buildPreQueryKnowledgeNote's
+    // own docstring) - prefers `notes.preQueryKnowledgeNote` (already a
+    // plain string) when present, same "history restoration already has
+    // the final persisted value, a live notes object only has the raw
+    // per-connection array" split combineNote/routingText use their own
+    // equivalent fields for.
+    const preQueryKnowledgeNote = (notes && notes.preQueryKnowledgeNote != null)
+      ? notes.preQueryKnowledgeNote
+      : buildPreQueryKnowledgeNote(notes && notes.databaseKnowledgeNotes);
+    // Phase C's own general-knowledge note (see requestAllModeResultsSummary's
+    // own `general_knowledge_note` handling) - unlike preQueryKnowledgeNote/
+    // combineNote above, there's no "recompute it live from raw data"
+    // fallback here: it's the model's own one-shot sentence from the
+    // summarization call itself, nothing to derive it from ahead of that
+    // call resolving. `|| null`, same reasoning as every other optional
+    // field here.
+    const postQueryKnowledgeNote = (notes && notes.postQueryKnowledgeNote) || null;
+    // Per explicit request: the "Thoughts & Notes" drawer now starts OPEN
+    // for a turn that's still actually in flight (`summaryPending` true -
+    // the batched, non-streaming flow's own initial call; streaming's
+    // equivalent is startAllModeStreaming's own pending entry below), so
+    // the triage/blending content it holds is the ONLY thing shown until
+    // the real answer lands - see renderTableResult's 'Response'-tab
+    // branch, which now suppresses the plain response-text paragraph
+    // while pending for exactly this reason. `false` (closed, click to
+    // expand) for every other caller of this function - a restored
+    // history turn (restoreLatestTurn) or the "nothing to execute" case -
+    // both hand this an already-final routingMessage with no "waiting"
+    // period to hold a reader's attention through in the first place.
+    // appendPhaseCSummaryToSummaryTab()/appendPhaseCErrorToSummaryTab()/
+    // settleSummaryTabPending() force this back to `false` the moment the
+    // real answer actually lands, auto-closing it so attention moves onto
+    // the result - see those functions' own comments.
     const summaryTab = routingMessage
-      ? [{ isText: true, tabLabel: 'Response', text: SUMMARY_TAB_BLOCK_MARKER + routingMessage, summaryPending: !!summaryPending }]
+      ? [{
+          isText: true, tabLabel: 'Response', text: SUMMARY_TAB_BLOCK_MARKER + routingMessage,
+          summaryPending: !!summaryPending, routingText, combineNote, preQueryKnowledgeNote, postQueryKnowledgeNote,
+          thoughtsExpanded: !!summaryPending,
+        }]
       : [];
     const noteTabs = databaseNotes.map((n) => ({
       isText: true,
@@ -11068,6 +11273,82 @@ document.addEventListener('DOMContentLoaded', async () => {
   // runs over the per-database results exactly as it would have anyway,
   // same "honest failure, don't block the rest of the turn" posture
   // appendPhaseCErrorToSummaryTab already gives a failed Phase C itself.
+  //
+  // Builds the succinct "Thoughts & Notes" message for a successful
+  // combine step: which per-database results got related together, and
+  // the exact query that did it - per explicit request, with no mention
+  // of the in-memory DuckDB session that actually runs it (combine_routes.
+  // py never returns a natural-language rationale of its own - only
+  // `{success, sql}` - so this is built client-side from the SQL text
+  // itself plus the same `database_results` array combine_routes.py's own
+  // _build_combine_schema_block() indexed its "results_<i>" views against,
+  // i.e. the exact same index space, since both are keyed off the one
+  // buildAllModeSummaryPayload() call this function already made). Pulled
+  // out as its own function so the message logic is easy to follow
+  // independent of the fetch/stream plumbing around it.
+  function buildCombineNote(sql, databaseResults) {
+    const cleanSql = (sql || '').trim();
+    if (!cleanSql) return null;
+
+    // Every combinable entry is registered as a "results_<i>" view, where
+    // <i> is that entry's own index in `databaseResults` - collect the
+    // ones actually referenced, in the order they first appear in the
+    // SQL, so the note names them in the same order the query relates
+    // them (e.g. the left side of a JOIN first).
+    const seen = new Set();
+    const names = [];
+    const re = /results_(\d+)/gi;
+    let match;
+    while ((match = re.exec(cleanSql))) {
+      const idx = Number(match[1]);
+      if (seen.has(idx)) continue;
+      seen.add(idx);
+      const entry = databaseResults[idx];
+      names.push((entry && entry.name) || `result ${idx + 1}`);
+    }
+    const namesText = names.length === 0
+      ? 'the per-database results'
+      : names.length === 1
+        ? names[0]
+        : names.length === 2
+          ? `${names[0]} and ${names[1]}`
+          : `${names.slice(0, -1).join(', ')}, and ${names[names.length - 1]}`;
+
+    const isUnion = /\bunion\b/i.test(cleanSql);
+    const isJoin = /\bjoin\b/i.test(cleanSql);
+    const summary = isUnion
+      ? `Combined ${namesText} with a UNION so they appear as one result, using the query below.`
+      : isJoin
+        ? `Joined ${namesText} together, using the query below.`
+        : `Combined ${namesText} using the query below.`;
+
+    return { summary, sql: cleanSql };
+  }
+
+  // Builds the "Thoughts & Notes" message for Phase B's own general-
+  // knowledge note(s) (see _SQL_GENERATION_FORMAT_RULES/_run_phase_b_
+  // fanout's "knowledge_note"/"database_knowledge_notes" server-side) -
+  // one per connection that had to resolve a fact not present in the
+  // prompt or schema (e.g. "the current US president") in order to write
+  // its own SQL, BEFORE any query ever ran. `databaseKnowledgeNotes` is
+  // "all databases" mode's own array - [{kind,id,name,note}, ...], a
+  // strict subset of that turn's sql_blocks (see notes.databaseKnowledgeNotes'
+  // own comment at each of its two call sites) - almost always empty.
+  // Each entry's own `note` is already a complete, self-contained
+  // sentence the model wrote itself (see the prompt's own instruction),
+  // so this just prefixes each with its database's name (for the far
+  // more common case of 2+ selected connections, where it's otherwise
+  // ambiguous which one a lone sentence is even about) and joins them
+  // onto separate lines - never collapsed into one run-on paragraph.
+  // Returns null for an empty/absent list, same convention buildCombineNote
+  // uses, so callers can treat "nothing to show" uniformly.
+  function buildPreQueryKnowledgeNote(databaseKnowledgeNotes) {
+    const entries = (Array.isArray(databaseKnowledgeNotes) ? databaseKnowledgeNotes : [])
+      .filter((e) => e && e.note);
+    if (!entries.length) return null;
+    return entries.map((e) => (e.name ? `${e.name}: ${e.note}` : e.note)).join('\n');
+  }
+
   async function requestAllModeCombinedResults(notes, executeResults, executeFailures) {
     if (!notes || !notes.prompt || !notes.needsCombination) return;
     const databaseResults = buildAllModeSummaryPayload(notes, executeResults, executeFailures);
@@ -11103,6 +11384,25 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (r.truncated) combinedEntry.truncated = true;
         executeResults.push(combinedEntry);
         appendCombinedResultTab(combinedEntry);
+
+        // Attach the "Thoughts & Notes" combine message two places: onto
+        // `notes` itself, so captureAllModeHistory() (called by this
+        // function's own callers, after this await resolves) persists it
+        // the same way it already does `notes.triageMessage`; and onto the
+        // Response tab's own live entry via getSummaryTabEntry(), so it
+        // shows immediately if the user has that tab open right now,
+        // without waiting for Phase C's own re-render.
+        const combineNote = buildCombineNote(r.sql, databaseResults);
+        if (combineNote) {
+          notes.combineNote = combineNote;
+          const summaryEntry = getSummaryTabEntry();
+          if (summaryEntry) {
+            summaryEntry.combineNote = combineNote;
+            if (currentResultsList[activeResultIndex] === summaryEntry) {
+              renderTableResult(summaryEntry);
+            }
+          }
+        }
       } else if (data && data.error) {
         // Never shown as its own UI element - same posture this
         // function's own sibling (requestAllModeResultsSummary)'s catch
@@ -11159,6 +11459,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     // up until this exact point, not from the moment the Summary tab first
     // appeared with only triage's routing message.
     summaryEntry.summaryPending = false;
+    // Auto-close the "Thoughts & Notes" drawer the instant the real answer
+    // lands - it started open (see renderAllModeCombinedResults'/
+    // startAllModeStreaming's own `thoughtsExpanded: true`) purely to hold
+    // the triage/blending content while there was nothing else to show;
+    // now that there is, attention should move onto it, per explicit
+    // request. Runs exactly once per turn (this function itself only ever
+    // runs once Phase C settles), so it never re-stomps a later manual
+    // reopen via the drawer's own click handler.
+    summaryEntry.thoughtsExpanded = false;
     if (currentResultsList[activeResultIndex] === summaryEntry) {
       renderTableResult(summaryEntry);
     }
@@ -11187,6 +11496,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Phase C settled (with an apology instead of an answer, but settled
     // all the same), so the feedback prompt can appear now.
     summaryEntry.summaryPending = false;
+    // See appendPhaseCSummaryToSummaryTab's identical line just above -
+    // auto-close the drawer now that there's a real (if apologetic)
+    // answer to focus attention on instead.
+    summaryEntry.thoughtsExpanded = false;
     if (currentResultsList[activeResultIndex] === summaryEntry) {
       renderTableResult(summaryEntry);
     }
@@ -11251,6 +11564,20 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (evt.status === 'retrying') showRetryStatus(evt);
       });
       if (response.ok && data && data.success && data.summary) {
+        // Attached BEFORE appendPhaseCSummaryToSummaryTab() below, so its
+        // own re-render (which also auto-closes the "Thoughts & Notes"
+        // drawer - see that function's own comment) already has this
+        // value in place on its first render, rather than needing a
+        // second patch-and-rerender right after. See _clean_summary_
+        // response's own docstring server-side - the model's OPTIONAL
+        // note on a general-knowledge fact it blended into this summary
+        // beyond the actual result rows (e.g. each country's current head
+        // of state, added to answer a population question). null when it
+        // didn't need one.
+        const summaryTabEntryForKnowledgeNote = getSummaryTabEntry();
+        if (summaryTabEntryForKnowledgeNote) {
+          summaryTabEntryForKnowledgeNote.postQueryKnowledgeNote = data.general_knowledge_note || null;
+        }
         // The server prefixes this the same "*** NO SQL ***" way any
         // other non-SQL LLM reply is (see translate_routes.py's
         // /api/summarize-results docstring) - an internal convention,
@@ -11291,6 +11618,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           crossDatabaseSummary: data.cross_database_summary || null,
           visualizations: data.visualizations || {},
           suggestedSearches,
+          generalKnowledgeNote: data.general_knowledge_note || null,
         };
       } else if (data && data.error) {
         appendPhaseCErrorToSummaryTab(data.error);
@@ -11336,6 +11664,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     const summaryEntry = getSummaryTabEntry();
     if (!summaryEntry || !summaryEntry.summaryPending) return;
     summaryEntry.summaryPending = false;
+    // See appendPhaseCSummaryToSummaryTab's identical line - this turn's
+    // "final" text is triage's own routing message here (nothing from
+    // Phase C ever arrived to replace it - see this function's own
+    // docstring), but it's still the point this turn stops being "in
+    // flight", so the drawer closes the same way.
+    summaryEntry.thoughtsExpanded = false;
     if (currentResultsList[activeResultIndex] === summaryEntry) {
       renderTableResult(summaryEntry);
     }
@@ -11977,9 +12311,20 @@ document.addEventListener('DOMContentLoaded', async () => {
           // the model itself never runs; suggestedSearchesHtml() below is
           // what turns each one into a real clickable link.
           suggestedSearches: Array.isArray(data.suggested_searches) ? data.suggested_searches : [],
+          // Phase C's own "Thoughts & Notes" note - the post-query
+          // counterpart to the pre-query knowledge_note translatePrompt()
+          // already stashes as modelEntry.preQueryKnowledgeNote (see that
+          // comment) - mirrors all-mode's identical
+          // requestAllModeResultsSummary()'s generalKnowledgeNote field.
+          generalKnowledgeNote: data.general_knowledge_note || null,
         };
       } else if (data && data.error) {
-        return { summaryText: SUMMARY_TAB_BLOCK_MARKER + data.error, visualizations: {}, suggestedSearches: [] };
+        return {
+          summaryText: SUMMARY_TAB_BLOCK_MARKER + data.error,
+          visualizations: {},
+          suggestedSearches: [],
+          generalKnowledgeNote: null,
+        };
       }
       return null;
     } catch (err) {
@@ -11998,10 +12343,32 @@ document.addEventListener('DOMContentLoaded', async () => {
   // makes it the active tab - the "new leading Response tab" placement
   // this feature's design confirmed. Safe to call with a falsy
   // `summaryText` (no-op), so callers don't need their own guard.
-  function prependSingleModeSummaryTab(summaryText, suggestedSearches) {
+  //
+  // `preQueryKnowledgeNote`/`postQueryKnowledgeNote` are single-connection
+  // mode's own "Thoughts & Notes" fields (see translatePrompt()'s
+  // modelEntry.preQueryKnowledgeNote and requestSingleModeResultsSummary()'s
+  // generalKnowledgeNote above) - both optional/nullable, same as all-mode's
+  // identical fields on its own summaryTab entry (renderAllModeCombinedResults()).
+  // Stored directly on the tab entry so renderTableResult()'s
+  // hasThoughtsContent gate/thoughtsNotesAccordionHtml() pick them up with
+  // no further plumbing - this is the single place both call sites below
+  // funnel through.
+  function prependSingleModeSummaryTab(summaryText, suggestedSearches, preQueryKnowledgeNote, postQueryKnowledgeNote) {
     if (!summaryText || !currentResultsList) return;
     currentResultsList = [
-      { isText: true, tabLabel: 'Response', text: summaryText, suggestedSearches: suggestedSearches || [] },
+      {
+        isText: true,
+        tabLabel: 'Response',
+        text: summaryText,
+        suggestedSearches: suggestedSearches || [],
+        preQueryKnowledgeNote: preQueryKnowledgeNote || null,
+        postQueryKnowledgeNote: postQueryKnowledgeNote || null,
+        // Single-connection mode's Response tab is only ever created
+        // already-settled (see hasThoughtsContent's own comment) - never
+        // mid-turn - so the drawer always renders collapsed by default,
+        // same as every other single-mode Response tab today.
+        thoughtsExpanded: false,
+      },
       ...currentResultsList,
     ];
     activeResultIndex = 0;
@@ -12026,10 +12393,18 @@ document.addEventListener('DOMContentLoaded', async () => {
   // tab the user can click into if they want it, leaving the already-
   // rendered error exactly as it is. Safe to call with a falsy
   // `summaryText` (no-op), same as the function above.
-  function prependSingleModeSummaryTabPreservingActiveTab(summaryText, suggestedSearches) {
+  function prependSingleModeSummaryTabPreservingActiveTab(summaryText, suggestedSearches, preQueryKnowledgeNote, postQueryKnowledgeNote) {
     if (!summaryText || !currentResultsList) return;
     currentResultsList = [
-      { isText: true, tabLabel: 'Response', text: summaryText, suggestedSearches: suggestedSearches || [] },
+      {
+        isText: true,
+        tabLabel: 'Response',
+        text: summaryText,
+        suggestedSearches: suggestedSearches || [],
+        preQueryKnowledgeNote: preQueryKnowledgeNote || null,
+        postQueryKnowledgeNote: postQueryKnowledgeNote || null,
+        thoughtsExpanded: false,
+      },
       ...currentResultsList,
     ];
     activeResultIndex += 1;
@@ -12070,6 +12445,37 @@ document.addEventListener('DOMContentLoaded', async () => {
   function captureAllModeHistory(modelEntry, notes, executeFailures, summaryResult) {
     modelEntry.allMode = {
       routingMessage: (notes && notes.routingMessage) || null,
+      // The ORIGINAL, pre-Phase-C triage/routing text - captured onto
+      // `notes.triageMessage` right before each call site above overwrites
+      // `notes.routingMessage` with Phase C's final text (see those sites'
+      // own comments). Read back by restoreLatestTurn() so the "Thoughts &
+      // Notes" accordion (renderTableResult's 'Response'-tab branch) still
+      // has the original text to show even after a page reload - without
+      // this, a restored turn's `routingText` and `.text` would always be
+      // identical (both the persisted final text) and the accordion would
+      // never appear, even though it did live. `|| null`, not `|| ''`: an
+      // empty string and "never captured" need to stay distinguishable
+      // from each other for the `routingText !== currentRaw` comparison
+      // (an empty string IS a valid, if degenerate, triage message).
+      triageMessage: (notes && notes.triageMessage) != null ? notes.triageMessage : null,
+      // The combine step's "Thoughts & Notes" message (see
+      // buildCombineNote()/requestAllModeCombinedResults() above) - `||
+      // null`, same reasoning as triageMessage just above, so a turn
+      // where the combine step never ran (or ran and found nothing worth
+      // combining) persists a real `null` rather than `undefined`.
+      combineNote: (notes && notes.combineNote) || null,
+      // Phase B's general-knowledge note(s) (see buildPreQueryKnowledgeNote's
+      // own docstring) - `notes.preQueryKnowledgeNote` is already the
+      // computed string by this point for every call site (maybeFinalize()
+      // computes it directly; renderAllModeCombinedResults() computes it
+      // itself from notes.databaseKnowledgeNotes for the non-streaming
+      // fallback path), so this is a plain passthrough, same `|| null`
+      // reasoning as combineNote just above.
+      preQueryKnowledgeNote: (notes && notes.preQueryKnowledgeNote) || null,
+      // Phase C's general-knowledge note (see requestAllModeResultsSummary's
+      // own `generalKnowledgeNote` return field) - `|| null`, same
+      // reasoning as every other optional field here.
+      postQueryKnowledgeNote: (summaryResult && summaryResult.generalKnowledgeNote) || null,
       databaseNotes: (notes && notes.databaseNotes) || [],
       generationFailures: (notes && notes.generationFailures) || [],
       executeFailures: executeFailures || [],
@@ -12196,8 +12602,17 @@ document.addEventListener('DOMContentLoaded', async () => {
     // requestAllModeResultsSummary() call, and settleSummaryTabPending()
     // there catches even the case where Phase C ends up with nothing to
     // summarize - see that function's own docstring.
+    // routingText - see renderAllModeCombinedResults' identical field for
+    // the full reasoning (the "Thoughts & Notes" accordion in
+    // renderTableResult reads this once Phase C has replaced `.text`).
+    // Always just allModeStreamState.routingMessage itself here, never
+    // notes.triageMessage - this is a turn's FIRST render, before Phase C
+    // has ever had a chance to settle it even once.
+    // thoughtsExpanded: true - see renderAllModeCombinedResults' identical
+    // field; always pending here (see this block's own comment just
+    // above), so the drawer always starts open for a fresh streaming turn.
     const summaryTab = allModeStreamState.routingMessage
-      ? [{ isText: true, tabLabel: 'Response', text: SUMMARY_TAB_BLOCK_MARKER + allModeStreamState.routingMessage, summaryPending: true }]
+      ? [{ isText: true, tabLabel: 'Response', text: SUMMARY_TAB_BLOCK_MARKER + allModeStreamState.routingMessage, summaryPending: true, routingText: allModeStreamState.routingMessage, thoughtsExpanded: true }]
       : [];
     const placeholderTabs = connectionSelection.map((e) => ({
       isPending: true,
@@ -12637,6 +13052,17 @@ document.addEventListener('DOMContentLoaded', async () => {
       // line, already stashed here by translatePrompt()'s router_route
       // branch before this function could ever run.
       databaseSql: (state.terminalData && state.terminalData.sql_blocks) || [],
+      // Per-connection "Thoughts & Notes" knowledge notes (see
+      // _run_phase_b_fanout's own docstring server-side) - same "pulled
+      // straight off the terminal line" reasoning as databaseSql just
+      // above: translate_routes.py's "route" outcome only ever sends the
+      // full, final list once, on the terminal /api/translate line, never
+      // per-connection (unlike database_notes/generation_failures, which
+      // this turn's own per-connection phase_b_connection_done events DO
+      // accumulate live onto state.databaseNotes/state.generationFailures
+      // - see handlePhaseBConnectionDone()). A strict subset of
+      // databaseSql above - only connections that ALSO had one.
+      databaseKnowledgeNotes: (state.terminalData && state.terminalData.database_knowledge_notes) || [],
       // Per-database triage-rewritten questions - the SAME
       // connection_selection array startAllModeStreaming() stashed as
       // state.connectionOrder, now additionally carrying each entry's own
@@ -12652,6 +13078,24 @@ document.addEventListener('DOMContentLoaded', async () => {
       // since this turn started.
       needsCombination: !!(state.terminalData && state.terminalData.needs_combination),
     };
+    // Computed synchronously, unlike combineNote/postQueryKnowledgeNote
+    // below (both only known once their own async call resolves) -
+    // databaseKnowledgeNotes just above is already the complete, final
+    // list by the time this function runs at all (state.terminalData has
+    // already arrived - see the guard at the top of this function), so
+    // this can be attached onto the live Summary tab entry immediately,
+    // before either awaited call below even starts, rather than needing
+    // its own later patch-and-rerender.
+    notes.preQueryKnowledgeNote = buildPreQueryKnowledgeNote(notes.databaseKnowledgeNotes);
+    if (notes.preQueryKnowledgeNote) {
+      const summaryEntryForKnowledgeNote = getSummaryTabEntry();
+      if (summaryEntryForKnowledgeNote) {
+        summaryEntryForKnowledgeNote.preQueryKnowledgeNote = notes.preQueryKnowledgeNote;
+        if (currentResultsList[activeResultIndex] === summaryEntryForKnowledgeNote) {
+          renderTableResult(summaryEntryForKnowledgeNote);
+        }
+      }
+    }
 
     // Phase C - see requestAllModeResultsSummary's docstring. Awaited so
     // callers (translatePrompt()/executeSql()) keep their buttons
@@ -12672,7 +13116,20 @@ document.addEventListener('DOMContentLoaded', async () => {
     hideAllModeStreamStatus();
     settleSummaryTabPending();
     const summaryEntry = getSummaryTabEntry();
-    if (summaryEntry) notes.routingMessage = summaryEntry.text;
+    if (summaryEntry) {
+      // Capture the ORIGINAL triage text before it's overwritten just
+      // below - see captureAllModeHistory()'s `triageMessage` field and
+      // renderAllModeCombinedResults()'s `routingText` docstring: both
+      // need the pre-Phase-C text to still be available even after a
+      // page reload restores this turn from history, so the "Thoughts &
+      // Notes" accordion has something distinct to show instead of
+      // silently matching the final text and never appearing. Guarded so
+      // a second settle on the same notes object (shouldn't happen, but
+      // costs nothing to guard) can't clobber an already-captured value
+      // with the (by-then-already-final) routingMessage.
+      if (notes.triageMessage == null) notes.triageMessage = notes.routingMessage;
+      notes.routingMessage = summaryEntry.text;
+    }
 
     const modelEntry = state.modelEntry;
     if (modelEntry) {
@@ -12928,6 +13385,9 @@ document.addEventListener('DOMContentLoaded', async () => {
             // at all) - server-side, sql_blocks only ever contains entries
             // that actually got real SQL.
             databaseSql: data.sql_blocks || [],
+            // Per-connection "Thoughts & Notes" knowledge notes - see
+            // maybeFinalize()'s identical field for the full reasoning.
+            databaseKnowledgeNotes: data.database_knowledge_notes || [],
             // Per-database triage-rewritten questions - this fallback's own
             // terminal line already carries connection_selection (same
             // field phase_a_route's live event would have, for a turn that
@@ -12987,7 +13447,12 @@ document.addEventListener('DOMContentLoaded', async () => {
             hideAllModeStreamStatus();
             settleSummaryTabPending();
             const summaryEntry = getSummaryTabEntry();
-            if (summaryEntry) allModeNotes.routingMessage = summaryEntry.text;
+            // See maybeFinalize()'s identical lines for why triageMessage
+            // is captured before this overwrite.
+            if (summaryEntry) {
+              if (allModeNotes.triageMessage == null) allModeNotes.triageMessage = allModeNotes.routingMessage;
+              allModeNotes.routingMessage = summaryEntry.text;
+            }
             captureAllModeHistory(modelEntry, allModeNotes, [], summaryResult);
           }
         }
@@ -13004,6 +13469,18 @@ document.addEventListener('DOMContentLoaded', async () => {
         const isNoSql = trimmedSql.startsWith('*** NO SQL ***');
 
         const modelEntry = { role: 'model', text: data.sql };
+        // Single-connection mode's own Phase B "Thoughts & Notes" note
+        // (see _SQL_GENERATION_FORMAT_RULES/translate_routes.py's single-
+        // connection 'done' event) - null for a NO-SQL reply (isNoSql
+        // below), same as it is whenever the model simply didn't need to
+        // resolve one. Stashed directly on `modelEntry` (which becomes
+        // `pending.entry` via chatStore.setPending() a few lines down, and
+        // is read back from there by executeSql() once results/summary
+        // come in - see prependSingleModeSummaryTab's own call sites)
+        // rather than threaded through as its own parameter, since this is
+        // the one place both translatePrompt() and executeSql() already
+        // share a reference to the SAME object across that boundary.
+        modelEntry.preQueryKnowledgeNote = data.knowledge_note || null;
         pushActiveTurn(promptText, modelEntry);
         updateHistoryTurnsSubtitle();
 
@@ -13445,7 +13922,12 @@ document.addEventListener('DOMContentLoaded', async () => {
             hideAllModeStreamStatus();
             settleSummaryTabPending();
             const summaryEntry = getSummaryTabEntry();
-            if (summaryEntry) allModeNotes.routingMessage = summaryEntry.text;
+            // See maybeFinalize()'s identical lines for why triageMessage
+            // is captured before this overwrite.
+            if (summaryEntry) {
+              if (allModeNotes.triageMessage == null) allModeNotes.triageMessage = allModeNotes.routingMessage;
+              allModeNotes.routingMessage = summaryEntry.text;
+            }
           } else {
             renderMultiTurnResults(data.results);
           }
@@ -13464,6 +13946,19 @@ document.addEventListener('DOMContentLoaded', async () => {
           // before the Summary tab is actually ready.
           let singleModeSummary = null;
           let singleModeSuggestedSearches = [];
+          let singleModeGeneralKnowledgeNote = null;
+          // Peeked read-only (getPending()/isPendingCurrent() are both pure
+          // reads - see chatStore's own docstrings) ahead of the
+          // stale-pending-drop below, purely to carry the pre-query note
+          // translatePrompt() already stashed as modelEntry.preQueryKnowledgeNote
+          // through to prependSingleModeSummaryTab()'s call just below. Stays
+          // null for direct SQL entry/a rerun of an older turn (no pending
+          // entry from a fresh translate() call to read it off of), which
+          // matches those cases never having resolved a fresh knowledge_note
+          // in the first place.
+          const singleModePreQueryKnowledgeNote = (chatStore.isPendingCurrent() && chatStore.getPending().entry)
+            ? (chatStore.getPending().entry.preQueryKnowledgeNote || null)
+            : null;
           if (!allModeNotes && promptText !== "[Direct SQL Execution]" && Array.isArray(data.results) && data.results.length) {
             showAllModeSummarizingStatus();
             const summaryResult = await requestSingleModeResultsSummary(promptText, sql, data.results);
@@ -13471,6 +13966,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (summaryResult) {
               singleModeSummary = summaryResult.summaryText;
               singleModeSuggestedSearches = summaryResult.suggestedSearches || [];
+              singleModeGeneralKnowledgeNote = summaryResult.generalKnowledgeNote || null;
               // Tags whichever of THIS turn's own result tabs each
               // visualization actually belongs to (zero, one, or several) -
               // see attachVisualizationsToResultsList's own docstring.
@@ -13483,7 +13979,12 @@ document.addEventListener('DOMContentLoaded', async () => {
               attachVisualizationsToResultsList(data.results, summaryResult.visualizations);
               attachVisualizationsToResultsList(summarizedResults, summaryResult.visualizations);
             }
-            if (singleModeSummary) prependSingleModeSummaryTab(singleModeSummary, singleModeSuggestedSearches);
+            if (singleModeSummary) {
+              prependSingleModeSummaryTab(
+                singleModeSummary, singleModeSuggestedSearches,
+                singleModePreQueryKnowledgeNote, singleModeGeneralKnowledgeNote
+              );
+            }
           }
 
           if (chatStore.getPending() && !chatStore.isPendingCurrent()) {
@@ -13501,6 +14002,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (allModeNotes) captureAllModeHistory(pending.entry, allModeNotes, [], allModeSummaryResult);
             if (singleModeSummary) pending.entry.summary = singleModeSummary;
             if (singleModeSummary) pending.entry.suggestedSearches = singleModeSuggestedSearches;
+            if (singleModeSummary) pending.entry.postQueryKnowledgeNote = singleModeGeneralKnowledgeNote;
             // This turn was already pushed (as bare SQL, before it was
             // executed) - see chatStore.persistCurrent()'s own docstring
             // for why filling in its results afterward needs its own
@@ -13514,6 +14016,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (allModeNotes) captureAllModeHistory(modelEntry, allModeNotes, [], allModeSummaryResult);
             if (singleModeSummary) modelEntry.summary = singleModeSummary;
             if (singleModeSummary) modelEntry.suggestedSearches = singleModeSuggestedSearches;
+            if (singleModeSummary) modelEntry.postQueryKnowledgeNote = singleModeGeneralKnowledgeNote;
             pushActiveTurn(promptText, modelEntry);
             updateHistoryTurnsSubtitle();
           }
@@ -13589,7 +14092,12 @@ document.addEventListener('DOMContentLoaded', async () => {
           hideAllModeStreamStatus();
           settleSummaryTabPending();
           const summaryEntry = getSummaryTabEntry();
-          if (summaryEntry) allModeNotes.routingMessage = summaryEntry.text;
+          // See maybeFinalize()'s identical lines for why triageMessage is
+          // captured before this overwrite.
+          if (summaryEntry) {
+            if (allModeNotes.triageMessage == null) allModeNotes.triageMessage = allModeNotes.routingMessage;
+            allModeNotes.routingMessage = summaryEntry.text;
+          }
 
           // Persist history - mirrors the success branch's identical
           // pending-entry-vs-new-turn logic further up in this same
@@ -13662,6 +14170,11 @@ document.addEventListener('DOMContentLoaded', async () => {
           let singleModeSummary = null;
           let singleModeVisualizations = null;
           let singleModeSuggestedSearches = [];
+          let singleModeGeneralKnowledgeNote = null;
+          // Same read-only peek as the success branch above.
+          const singleModePreQueryKnowledgeNote = (chatStore.isPendingCurrent() && chatStore.getPending().entry)
+            ? (chatStore.getPending().entry.preQueryKnowledgeNote || null)
+            : null;
           if (promptText !== "[Direct SQL Execution]") {
             showAllModeSummarizingStatus();
             const summaryResult = await requestSingleModeResultsSummary(promptText, sql, statementResults);
@@ -13670,6 +14183,7 @@ document.addEventListener('DOMContentLoaded', async () => {
               singleModeSummary = summaryResult.summaryText;
               singleModeVisualizations = summaryResult.visualizations;
               singleModeSuggestedSearches = summaryResult.suggestedSearches || [];
+              singleModeGeneralKnowledgeNote = summaryResult.generalKnowledgeNote || null;
               // Tags whichever succeeded-before-the-failure statement(s)
               // each visualization belongs to (the failed statement itself
               // is never chartable - it's an {error} entry, so it can never
@@ -13687,7 +14201,12 @@ document.addEventListener('DOMContentLoaded', async () => {
             // focus to the new Summary tab - see that helper's own
             // docstring for why this differs from the success path's
             // prependSingleModeSummaryTab.
-            if (singleModeSummary) prependSingleModeSummaryTabPreservingActiveTab(singleModeSummary, singleModeSuggestedSearches);
+            if (singleModeSummary) {
+              prependSingleModeSummaryTabPreservingActiveTab(
+                singleModeSummary, singleModeSuggestedSearches,
+                singleModePreQueryKnowledgeNote, singleModeGeneralKnowledgeNote
+              );
+            }
           }
 
           // Persist history - previously this entire branch never called
@@ -13712,6 +14231,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             pending.entry.results = summarizedResults;
             if (singleModeSummary) pending.entry.summary = singleModeSummary;
             if (singleModeSummary) pending.entry.suggestedSearches = singleModeSuggestedSearches;
+            if (singleModeSummary) pending.entry.postQueryKnowledgeNote = singleModeGeneralKnowledgeNote;
             // Already-pushed turn, filled in afterward - see
             // chatStore.persistCurrent()'s own docstring.
             chatStore.persistCurrent();
@@ -13720,6 +14240,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             const modelEntry = { role: 'model', text: sql, results: summarizedResults };
             if (singleModeSummary) modelEntry.summary = singleModeSummary;
             if (singleModeSummary) modelEntry.suggestedSearches = singleModeSuggestedSearches;
+            if (singleModeSummary) modelEntry.postQueryKnowledgeNote = singleModeGeneralKnowledgeNote;
             pushActiveTurn(promptText, modelEntry);
             updateHistoryTurnsSubtitle();
           }
@@ -13756,6 +14277,11 @@ document.addEventListener('DOMContentLoaded', async () => {
           // addition to the existing "no real question" guard.
           let singleModeSummary = null;
           let singleModeSuggestedSearches = [];
+          let singleModeGeneralKnowledgeNote = null;
+          // Same read-only peek as the two branches above.
+          const singleModePreQueryKnowledgeNote = (chatStore.isPendingCurrent() && chatStore.getPending().entry)
+            ? (chatStore.getPending().entry.preQueryKnowledgeNote || null)
+            : null;
           if (reportable && promptText !== "[Direct SQL Execution]") {
             showAllModeSummarizingStatus();
             // No `.columns` anywhere in a bare `[{error}]` result set, so
@@ -13766,11 +14292,17 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (summaryResult) {
               singleModeSummary = summaryResult.summaryText;
               singleModeSuggestedSearches = summaryResult.suggestedSearches || [];
+              singleModeGeneralKnowledgeNote = summaryResult.generalKnowledgeNote || null;
             }
             // Preserves the active (error) tab - see that helper's own
             // docstring for why this differs from the success path's
             // prependSingleModeSummaryTab.
-            if (singleModeSummary) prependSingleModeSummaryTabPreservingActiveTab(singleModeSummary, singleModeSuggestedSearches);
+            if (singleModeSummary) {
+              prependSingleModeSummaryTabPreservingActiveTab(
+                singleModeSummary, singleModeSuggestedSearches,
+                singleModePreQueryKnowledgeNote, singleModeGeneralKnowledgeNote
+              );
+            }
           }
 
           // Persist history - previously this bare-failure branch never
@@ -13793,6 +14325,7 @@ document.addEventListener('DOMContentLoaded', async () => {
               pending.entry.results = summarizedResults;
               if (singleModeSummary) pending.entry.summary = singleModeSummary;
               if (singleModeSummary) pending.entry.suggestedSearches = singleModeSuggestedSearches;
+              if (singleModeSummary) pending.entry.postQueryKnowledgeNote = singleModeGeneralKnowledgeNote;
               // Already-pushed turn, filled in afterward - see
               // chatStore.persistCurrent()'s own docstring.
               chatStore.persistCurrent();
@@ -13801,6 +14334,7 @@ document.addEventListener('DOMContentLoaded', async () => {
               const modelEntry = { role: 'model', text: sql, results: summarizedResults };
               if (singleModeSummary) modelEntry.summary = singleModeSummary;
               if (singleModeSummary) modelEntry.suggestedSearches = singleModeSuggestedSearches;
+              if (singleModeSummary) modelEntry.postQueryKnowledgeNote = singleModeGeneralKnowledgeNote;
               pushActiveTurn(promptText, modelEntry);
               updateHistoryTurnsSubtitle();
             }
@@ -14001,10 +14535,26 @@ document.addEventListener('DOMContentLoaded', async () => {
             routingMessage: lastModelEntry.allMode.routingMessage,
             databaseNotes: lastModelEntry.allMode.databaseNotes,
             generationFailures: lastModelEntry.allMode.generationFailures,
+            // The original pre-Phase-C triage text, persisted by
+            // captureAllModeHistory() specifically so a restored turn's
+            // "Thoughts & Notes" accordion (see renderAllModeCombinedResults'
+            // own `routingText` field) still has the real triage message to
+            // show, not just a second copy of the final text above.
+            triageMessage: lastModelEntry.allMode.triageMessage,
+            // The combine step's "Thoughts & Notes" message, if the
+            // combine step ran on this turn - see captureAllModeHistory()'s
+            // own comment on this field.
+            combineNote: lastModelEntry.allMode.combineNote,
+            // Phase B's/Phase C's own general-knowledge notes, if either
+            // one fired on this turn - see captureAllModeHistory()'s own
+            // comments on these two fields.
+            preQueryKnowledgeNote: lastModelEntry.allMode.preQueryKnowledgeNote,
+            postQueryKnowledgeNote: lastModelEntry.allMode.postQueryKnowledgeNote,
           },
           executeResults: lastModelEntry.results || [],
           executeFailures: lastModelEntry.allMode.executeFailures || [],
         });
+        closeSharePopoverOnTurnChange();
         return;
       }
 
@@ -14038,7 +14588,12 @@ document.addEventListener('DOMContentLoaded', async () => {
             // executeSql()'s own `.summary` persist above) without a new
             // network call - same "no re-fetch on back/forward" posture
             // every other piece of a saved turn already has.
-            if (lastModelEntry.summary) prependSingleModeSummaryTab(lastModelEntry.summary, lastModelEntry.suggestedSearches);
+            if (lastModelEntry.summary) {
+              prependSingleModeSummaryTab(
+                lastModelEntry.summary, lastModelEntry.suggestedSearches,
+                lastModelEntry.preQueryKnowledgeNote, lastModelEntry.postQueryKnowledgeNote
+              );
+            }
           } else {
             // Genuinely still awaiting its first execution.
             chatStore.setPending(lastModelEntry, normalizeSqlForCompare(sqlText));
@@ -14055,6 +14610,413 @@ document.addEventListener('DOMContentLoaded', async () => {
       chatStore.clearPending();
       clearResultsDisplay();
     }
+    closeSharePopoverOnTurnChange();
+  }
+
+  // ===========================================================================
+  // SHARE FEATURE (header Share button + bare-path shared-view boot)
+  // ===========================================================================
+  //
+  // Two independent halves live in this section:
+  //   1. CREATING a share - buildSharePayload()/handleShareButtonClick()/
+  //      openSharePopoverWithUrl(), wired to #shareBtn/#moreMenuShareBtn
+  //      below. Freezes whatever turn is CURRENTLY on screen
+  //      (chatStore.lastTurn() - the exact same {userEntry, modelEntry}
+  //      shape restoreLatestTurn() above already knows how to re-render)
+  //      into a POST /api/share call, and shows the resulting short URL in
+  //      a small popover with a Copy button. The STORED snapshot never
+  //      changes once created and never carries a credential - see server/
+  //      share_routes.py's own module docstring for the full reasoning.
+  //   2. VIEWING a share - maybeRenderSharedView(), called once from this
+  //      file's own startup sequence (see the `await maybeRenderSharedView();`
+  //      call near the bottom of this file, right after the normal
+  //      `await fetchBackendConfig();` bootstrap) - reads
+  //      window.location.pathname itself (server.py's own 404 handler is
+  //      what gets the SPA shell in front of this code in the first place
+  //      for a bare agent.datalect.xyz/<share_id> visit - see that
+  //      handler's own docstring) and, if it looks like a share_id, fetches
+  //      GET /api/share/<id>. What happens next depends on the share's own
+  //      `dataset_ref` (see buildShareDatasetRef() above): for an admin
+  //      preset or dataset group - a shared, org-wide connection nobody
+  //      needs a personal credential for - this viewer's OWN session is
+  //      switched to that same dataset (selectSharedDataset() below, an
+  //      ordinary POST /api/config) before the turn is ever rendered; for a
+  //      private/custom connection, no such switch happens (and can't:
+  //      connections are looked up by this viewer's OWN user_id, which
+  //      never has the sharer's connection under it - see state_store.py's
+  //      db_connections table), so the turn renders against whatever
+  //      dataset the viewer already had active. Either way the turn is then
+  //      pushed into the viewer's OWN chatStore exactly like any turn
+  //      they'd typed and run themselves (pushActiveTurn(), then
+  //      restoreLatestTurn() - the SAME render path every other turn in
+  //      this file goes through, not a separate read-only copy of it) - so
+  //      it's immediately editable, re-runnable, undo/redo-able, and
+  //      persists into their own chat_history from this point on. This is a
+  //      genuinely regular turn from here on, not a special "shared view"
+  //      mode - the only lasting trace of how it got there is the dismissible
+  //      banner telling the viewer where it came from. Runs AFTER the normal
+  //      bootstrap completes (rather than trying to short-circuit it) so the
+  //      normal dataset/model badges, chat history, etc. all finish settling
+  //      first, then this overwrites the editor/results area with the shared
+  //      turn - a one-time thing at page load, not a mode that persists for
+  //      this one page load - the viewer can dismiss the banner
+  //      (#sharedViewDismissBtn) and otherwise just keep using the app
+  //      normally from here.
+
+  // True once a turn has actually finished - mirrors restoreLatestTurn()'s
+  // own "alreadyExecuted"/isNoSql reasoning, so the Share button never
+  // appears for a turn that's still mid-flight (SQL generated but not yet
+  // run) or a non-answer pseudo-turn (Help/Schema Viewer trigger - see
+  // translatePrompt()'s own isOpenHelp/isOpenSchema checks, neither of
+  // which ever sets `.results`, `.allMode`, or a "*** NO SQL ***"-prefixed
+  // `.text`).
+  function turnIsShareable(modelEntry) {
+    if (!modelEntry) return false;
+    if (modelEntry.allMode) return true;
+    if (typeof modelEntry.text !== 'string' || !modelEntry.text) return false;
+    if (modelEntry.text.startsWith('*** NO SQL ***')) return true;
+    return Array.isArray(modelEntry.results);
+  }
+
+  // Called from every place the ACTIVE bucket's last turn can change shape
+  // - see chatStore's own pushTurn()/persistCurrent() (both call this
+  // directly), restoreLatestTurn(), and startNewTurn(). The Share button
+  // itself is always visible now (per explicit request: "the button should
+  // always be there" - clicking it with nothing shareable yet surfaces an
+  // inline error instead, see handleShareButtonClick()'s own `!payload`
+  // branch) - this just closes any OPEN popover whenever the turn it was
+  // showing a link/error for stops being "the current turn", so a stale
+  // link or error from a previous turn never lingers behind whatever's on
+  // screen now. Cheap enough to call liberally/redundantly rather than
+  // trying to thread one single, perfectly precise call site through this
+  // file's many branches.
+  function closeSharePopoverOnTurnChange() {
+    closeSharePopover();
+  }
+
+  function closeSharePopover() {
+    if (sharePopover) sharePopover.classList.add('hidden');
+  }
+
+  function openSharePopoverWithUrl(url) {
+    if (!sharePopover || !sharePopoverInput) return;
+    // Clears whatever showShareError() below may have left behind from a
+    // PREVIOUS click on this same button (e.g. "nothing to share yet"
+    // followed, after asking a question, by a real link) - the link row
+    // and Copy button it hid are exactly what this call is about to need.
+    sharePopover.classList.remove('share-popover-error');
+    if (sharePopoverStatus) sharePopoverStatus.classList.remove('share-popover-status-error');
+    sharePopoverInput.value = url;
+    if (sharePopoverStatus) sharePopoverStatus.textContent = '';
+    sharePopover.classList.remove('hidden');
+    sharePopoverInput.focus();
+    sharePopoverInput.select();
+  }
+
+  // The Share button is always visible (see index.html's own comment on
+  // #shareBtn) - this is what a click shows INSTEAD of the button quietly
+  // doing nothing when there's nothing on screen worth sharing (no turn
+  // has completed, or the blank slate from #newTurnBtn is showing - see
+  // buildSharePayload()'s own docstring). Hides the link row/Copy button
+  // entirely (see style.css's `.share-popover-error .share-popover-row`)
+  // rather than leaving an empty, non-functional input sitting next to the
+  // message.
+  function showShareError(message) {
+    if (!sharePopover) return;
+    if (sharePopoverInput) sharePopoverInput.value = '';
+    sharePopover.classList.remove('hidden');
+    sharePopover.classList.add('share-popover-error');
+    if (sharePopoverStatus) {
+      sharePopoverStatus.classList.add('share-popover-status-error');
+      sharePopoverStatus.textContent = message;
+    }
+  }
+
+  // Which dataset this turn actually ran against, in the coarse shape
+  // server/share_routes.py's _sanitized_dataset_ref() expects - "preset" or
+  // "group" (an admin-curated, org-wide dataset - safe for ANY viewer's own
+  // session to switch to later, including an anonymous one) or "custom" (a
+  // private connection, identified only by ACTIVE_IS_CUSTOM, never by its
+  // own connection_key - a viewer has no business learning even that much
+  // about someone else's saved connection, and couldn't reach it either way
+  // - see share_routes.py's own module docstring). This is only ever a UI
+  // hint for the viewer's maybeRenderSharedView() to act on; the server
+  // re-validates it independently (and a stale/bogus id just resolves to
+  // nothing) rather than trusting this at all, so there's no harm in this
+  // being wrong - only a worse experience for whoever opens the link.
+  function buildShareDatasetRef() {
+    if (IN_SCOPE_MODE === 'group' && IN_SCOPE_GROUP_ID) {
+      return { kind: 'group', id: IN_SCOPE_GROUP_ID };
+    }
+    if (!ACTIVE_IS_CUSTOM && ACTIVE_PRESET_ID) {
+      return { kind: 'preset', id: ACTIVE_PRESET_ID };
+    }
+    return { kind: 'custom', id: null };
+  }
+
+  // Builds POST /api/share's whole request body from whatever turn is
+  // CURRENTLY on screen - the exact same {userEntry, modelEntry} shape
+  // chatStore.lastTurn() already hands restoreLatestTurn() to re-render a
+  // turn from. Returns null when there's nothing shareable right now -
+  // handleShareButtonClick() surfaces that as an inline error rather than
+  // the button ever being hidden/disabled (per explicit request: "the
+  // button should always be there"). The viewingBlankSlate check matters
+  // for its own reason, independent of that: the blank slate (#newTurnBtn
+  // was clicked, nothing asked yet) deliberately leaves chatStore's own
+  // last turn untouched on purpose (see startNewTurn()'s own docstring), so
+  // without this check a click here would quietly share the PREVIOUS turn
+  // while the screen shows an empty editor - a real mismatch bug, not just
+  // a missing nicety.
+  function buildSharePayload() {
+    const turn = !viewingBlankSlate ? chatStore.lastTurn() : null;
+    if (!turn || !turnIsShareable(turn.modelEntry)) return null;
+    return {
+      user_entry: turn.userEntry || null,
+      model_entry: turn.modelEntry,
+      database_name: connDbName ? connDbName.textContent : '',
+      database_type: getActiveDatabaseType(),
+      provider: ACTIVE_LLM_PROVIDER || '',
+      model: ACTIVE_LLM_MODEL || '',
+      in_scope_mode: IN_SCOPE_MODE === 'group' ? 'group' : 'single',
+      dataset_ref: buildShareDatasetRef(),
+    };
+  }
+
+  async function handleShareButtonClick() {
+    const payload = buildSharePayload();
+    if (!payload) {
+      showShareError("There's nothing to share yet - ask a question and get some results first.");
+      return;
+    }
+    // Deliberately NOT showShareError() here - this is the "in progress,
+    // about to succeed" state, not a failure, so the link row/Copy button
+    // stay visible (about to be filled in by openSharePopoverWithUrl()
+    // below) rather than hidden the way an actual error hides them.
+    if (sharePopover && sharePopoverInput) {
+      sharePopover.classList.remove('share-popover-error');
+      if (sharePopoverStatus) sharePopoverStatus.classList.remove('share-popover-status-error');
+      sharePopoverInput.value = '';
+      sharePopover.classList.remove('hidden');
+    }
+    if (sharePopoverStatus) sharePopoverStatus.textContent = 'Creating link…';
+    try {
+      const response = await fetch('/api/share', {
+        method: 'POST',
+        headers: getApiHeaders(),
+        credentials: 'same-origin',
+        body: JSON.stringify(payload),
+      });
+      const data = await response.json().catch(() => null);
+      if (response.ok && data && data.success && data.url) {
+        openSharePopoverWithUrl(data.url);
+        trackEvent('share_link_created', {
+          in_scope_mode: payload.in_scope_mode,
+          database_type: payload.database_type,
+        });
+      } else {
+        showShareError((data && data.error) || 'Failed to create a share link.');
+      }
+    } catch (err) {
+      showShareError('Network error - failed to create a share link.');
+    }
+  }
+
+  if (shareBtn) {
+    shareBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (sharePopover && !sharePopover.classList.contains('hidden')) {
+        closeSharePopover();
+        return;
+      }
+      handleShareButtonClick();
+    });
+  }
+
+  if (moreMenuShareBtn) {
+    // Forwards to the real button - same pattern every other moreMenu*Btn
+    // in this file already uses (see the MORE MENU section) - except this
+    // one also has to close the overflow dropdown first, since
+    // #sharePopover is anchored to #shareBtn, which sits hidden
+    // (display:none, inside the <=900px media query) while that dropdown
+    // is the visible form of the header actions.
+    moreMenuShareBtn.addEventListener('click', () => {
+      if (moreMenuDropdown) moreMenuDropdown.classList.add('hidden');
+      if (shareBtn) shareBtn.click();
+    });
+  }
+
+  if (sharePopoverCopyBtn) {
+    sharePopoverCopyBtn.addEventListener('click', async () => {
+      const url = sharePopoverInput ? sharePopoverInput.value : '';
+      if (!url) return;
+      try {
+        await navigator.clipboard.writeText(url);
+        if (sharePopoverStatus) sharePopoverStatus.textContent = 'Copied!';
+      } catch (err) {
+        // Clipboard API unavailable/denied - the input itself is already
+        // selected (see openSharePopoverWithUrl()), so Ctrl/Cmd+C still
+        // works even when this catch fires.
+        if (sharePopoverInput) sharePopoverInput.select();
+        if (sharePopoverStatus) sharePopoverStatus.textContent = 'Press Ctrl/Cmd+C to copy.';
+      }
+    });
+  }
+
+  // Click-outside-to-close / Escape-to-close, same idiom #modelPickList/
+  // #moreMenuDropdown already use elsewhere in this file.
+  document.addEventListener('click', (e) => {
+    if (!sharePopover || sharePopover.classList.contains('hidden')) return;
+    if (sharePopover.contains(e.target) || (shareBtn && shareBtn.contains(e.target))) return;
+    closeSharePopover();
+  });
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && sharePopover && !sharePopover.classList.contains('hidden')) {
+      closeSharePopover();
+    }
+  });
+
+  // --- Viewing a shared link ------------------------------------------------
+
+  // Deliberately a little more permissive than state_store.py's own
+  // SHARE_ID_ALPHABET/SHARE_ID_LENGTH - same "accept anything plausible,
+  // let the server lookup be the real authority" posture share_routes.py's
+  // own SHARE_ID_PATH_RE already takes, kept in sync with that pattern by
+  // hand (two different languages, no shared import possible).
+  const SHARE_ID_PATH_RE = /^[a-z0-9]{6,24}$/;
+
+  // Null unless the current page load's own path is plausibly a share_id -
+  // never true for "/" itself (empty path after stripping slashes) or for
+  // anything with a "/" or "." left in it (a real static asset request
+  // never reaches client.js at all - see server.py's 404 handler - so this
+  // only needs to rule out the client-side cases: a trailing slash, or a
+  // multi-segment path this app has no other route for anyway).
+  function getSharedViewIdFromLocation() {
+    const path = window.location.pathname.replace(/^\/+/, '').replace(/\/+$/, '');
+    if (!path || path.includes('/') || path.includes('.')) return null;
+    return SHARE_ID_PATH_RE.test(path) ? path : null;
+  }
+
+  // Shows (or updates) the dismissible "you opened a shared link" notice -
+  // the ONLY lasting trace of a shared-link visit left on screen once the
+  // turn itself has been rendered as an ordinary turn (see
+  // maybeRenderSharedView() below). Never disables anything; dismissing it
+  // just hides it, same as #newVersionBanner's own dismiss button.
+  function showSharedViewBanner(text) {
+    if (!sharedViewBanner) return;
+    const textEl = sharedViewBanner.querySelector('.shared-view-banner-text');
+    if (textEl) textEl.textContent = text;
+    sharedViewBanner.classList.remove('hidden');
+  }
+
+  if (sharedViewDismissBtn) {
+    sharedViewDismissBtn.addEventListener('click', () => {
+      if (sharedViewBanner) sharedViewBanner.classList.add('hidden');
+    });
+  }
+
+  // Switches THIS VIEWER's own session to the same dataset a shared turn
+  // used - only ever called for `datasetRef.kind` "preset"/"group" (see
+  // maybeRenderSharedView() below), both admin-curated, org-wide datasets
+  // nobody needs a personal credential for, so there's nothing unsafe about
+  // any viewer picking the same one. An ordinary POST /api/config - the
+  // EXACT payload shape triggerConfigSave() already sends for "pick this one
+  // specific preset"/"pick this one dataset group" (see that function's own
+  // in_scope_mode/in_scope_preset_ids/in_scope_group_id construction a bit
+  // above) - so this gets no special server-side treatment or privilege; a
+  // preset/group that's gone stale since the share was created just fails
+  // validation there exactly as it would for a manual pick, and this simply
+  // reports that back as `false` rather than throwing. On success, re-runs
+  // fetchBackendConfig() (same as any other config save) so every piece of
+  // client state that depends on the active connection - the dataset badge,
+  // IN_SCOPE_*, and which chatStore bucket is active - is fully resynced
+  // BEFORE the shared turn is pushed into history just below, so it lands
+  // in the right bucket rather than whatever was active before.
+  async function selectSharedDataset(datasetRef) {
+    try {
+      const payload = { in_scope_mode: datasetRef.kind === 'group' ? 'group' : 'single' };
+      if (datasetRef.kind === 'group') {
+        payload.in_scope_group_id = datasetRef.id;
+      } else {
+        payload.preset_id = datasetRef.id;
+        payload.in_scope_preset_ids = [datasetRef.id];
+        payload.in_scope_custom_connection_keys = [];
+      }
+      const response = await fetch('/api/config', {
+        method: 'POST',
+        headers: getApiHeaders(),
+        credentials: 'same-origin',
+        body: JSON.stringify(payload),
+      });
+      if (!response.ok) return false;
+      await fetchBackendConfig();
+      return true;
+    } catch (err) {
+      console.error('Failed to switch to a shared link\'s dataset:', err);
+      return false;
+    }
+  }
+
+  // Called once, near the end of this file's own startup sequence (see the
+  // `await maybeRenderSharedView();` call site below, right after the
+  // normal `await fetchBackendConfig();` bootstrap) - a no-op the instant
+  // this page load's own path isn't plausibly a share link at all, so it
+  // never affects a normal visit to "/".
+  async function maybeRenderSharedView() {
+    const shareId = getSharedViewIdFromLocation();
+    if (!shareId) return;
+    let data = null;
+    try {
+      const response = await fetch(`/api/share/${encodeURIComponent(shareId)}`, {
+        method: 'GET',
+        headers: getApiHeaders(),
+        credentials: 'same-origin',
+      });
+      data = await response.json().catch(() => null);
+      if (!response.ok || !data || !data.success) data = null;
+    } catch (err) {
+      console.error('Failed to load shared link:', err);
+      // Network error, not "this link doesn't exist" - falls through to
+      // whatever the normal bootstrap already rendered (this browser's own
+      // last turn, if any) rather than showing a misleading banner/blank
+      // page over what might just be a transient connectivity blip.
+      return;
+    }
+    if (!data) {
+      showSharedViewBanner("This shared link doesn't work anymore - it may have been mistyped, or no longer exists.");
+      trackEvent('share_link_opened', { outcome: 'not_found' });
+      return;
+    }
+
+    const datasetRef = (data.dataset_ref && typeof data.dataset_ref === 'object')
+      ? data.dataset_ref : { kind: 'custom', id: null };
+    let datasetSwitched = false;
+    if ((datasetRef.kind === 'preset' || datasetRef.kind === 'group') && datasetRef.id) {
+      datasetSwitched = await selectSharedDataset(datasetRef);
+    }
+
+    // From here on this is an entirely ordinary turn - pushed into THIS
+    // viewer's own chatStore (their own chat_history from now on, exactly
+    // as if they'd typed and run it themselves - see pushActiveTurn()'s own
+    // comment) and rendered via restoreLatestTurn(), the SAME function
+    // every other turn in this file renders through, not a separate
+    // read-only copy of it. Nothing is locked or disabled: the viewer can
+    // immediately edit the question, change the dataset, or hit Run again.
+    pushActiveTurn((data.user_entry && data.user_entry.text) || '', data.model_entry);
+    restoreLatestTurn();
+
+    let bannerText;
+    if (datasetRef.kind === 'custom') {
+      bannerText = "You opened a result someone shared with you. It used a private database you don't have access to, "
+        + "so editing and running this question will use your own current dataset instead.";
+    } else if (datasetSwitched) {
+      bannerText = "You opened a result someone shared with you - picked up the same dataset, so you can pick up right where they left off.";
+    } else {
+      bannerText = "You opened a result someone shared with you, but its dataset isn't available anymore, "
+        + "so this will use your own current dataset instead.";
+    }
+    showSharedViewBanner(bannerText);
+    trackEvent('share_link_opened', { dataset_kind: datasetRef.kind, dataset_switched: datasetSwitched });
   }
 
   // Thin wrapper around chatStore.pushTurn() for every "a real turn just
@@ -14087,6 +15049,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     PINNED_CONNECTIONS = [];
     viewingBlankSlate = true;
     updateHistoryTurnsSubtitle();
+    closeSharePopoverOnTurnChange();
     if (aiPrompt) aiPrompt.focus();
     trackEvent('new_turn_clicked', { turn_offset: chatStore.turnOffset() });
   }
@@ -14255,6 +15218,13 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   await fetchBackendConfig();
 
+  // Runs AFTER the normal bootstrap above fully settles (dataset/model
+  // badges, chat history hydration, etc.) - see the SHARE FEATURE section's
+  // own top comment for why this is a no-op for a normal "/" visit and,
+  // for an actual shared-link visit, deliberately overwrites what that
+  // bootstrap just rendered rather than trying to short-circuit it.
+  await maybeRenderSharedView();
+
   // Configurable via CLIENT_VERSION_CHECK_INTERVAL_MINUTES (app_config.py),
   // surfaced here as clientVersionCheckIntervalMinutes by the
   // fetchBackendConfig() call just above. 0 means "don't poll at all", so
@@ -14286,8 +15256,13 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // Brand-new session, nobody's told it what to do yet: walk them through
   // the UI with a short guided tour (prompt box -> SQL/Execute -> results ->
-  // DB config -> history -> help). Every later visit (once ONBOARDING_SEEN_KEY
-  // is set) leaves this alone.
+  // history nav -> datasource config -> schema viewer -> model -> share ->
+  // preferences -> history -> sign-in -> help -> feedback, with the last
+  // several collapsing into one combined step under the narrow-header
+  // breakpoint - see getTourSteps() for the real, visibility-filtered
+  // step list). Every later visit (once ONBOARDING_SEEN_KEY is set) leaves
+  // this alone - see wireHelpModalLinks()'s own "Replay guided tour" link
+  // for how it's re-run on demand after that.
   if (!hasSeenOnboarding()) {
     tourAutoStartedPendingLiveDemo = true;
     startGuidedTour();
