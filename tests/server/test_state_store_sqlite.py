@@ -13,6 +13,7 @@ from helpers import SERVER_DIR
 if SERVER_DIR not in sys.path:
     sys.path.insert(0, SERVER_DIR)
 
+import state_store
 from state_store import SqliteStateStore, compute_connection_key
 
 
@@ -924,6 +925,109 @@ def test_init_migrates_schema_cache_table_predating_fetch_status_columns(tmp_pat
     # And the new columns are fully usable going forward, not just present.
     store.mark_schema_fetch_pending("k1")
     assert store.get_schema_fetch_status("k1")["pending"] is True
+
+
+# --- shares (public share links - see share_routes.py's own module docstring
+# for the full feature) ---------------------------------------------------
+# Unlike every other table in this file, a share is NOT keyed by user_id -
+# it's a single global row per share_id, meant to be readable by anyone
+# holding the link (see get_share's own docstring) - so there's no
+# per-user-isolation test here the way sessions/db_connections/chat_history
+# each have one above.
+
+def _sample_share_payload():
+    return {
+        "user_entry": {"prompt": "Top 10 countries by GDP per capita"},
+        "model_entry": {"sql": "SELECT * FROM countries;"},
+        "database_name": "World Stats",
+        "database_type": "postgres",
+        "provider": "google",
+        "model": "gemini-3.6-flash",
+        "in_scope_mode": "single",
+        "dataset_ref": {"kind": "preset", "id": "postgres-world-stats"},
+    }
+
+
+def test_get_share_returns_none_for_unknown_id(tmp_path):
+    store = make_store(tmp_path)
+    assert store.get_share("doesnotexist1") is None
+
+
+def test_create_and_get_share_round_trips_payload(tmp_path):
+    store = make_store(tmp_path)
+    payload = _sample_share_payload()
+    share_id = store.create_share(payload, "alice@example.com")
+    assert isinstance(share_id, str) and share_id
+    assert store.get_share(share_id) == payload
+
+
+def test_create_share_generates_a_different_id_each_call(tmp_path):
+    store = make_store(tmp_path)
+    id_a = store.create_share(_sample_share_payload(), "alice")
+    id_b = store.create_share(_sample_share_payload(), "alice")
+    assert id_a != id_b
+    # Both remain independently readable - creating a second share never
+    # overwrites or displaces the first.
+    assert store.get_share(id_a) is not None
+    assert store.get_share(id_b) is not None
+
+
+def test_create_share_retries_on_id_collision(tmp_path, monkeypatch):
+    store = make_store(tmp_path)
+    first_id = store.create_share(_sample_share_payload(), "alice")
+
+    # Force generate_share_id() to hand back the already-taken id once,
+    # then a fresh one - create_share's own INSERT OR IGNORE + retry loop
+    # (see its docstring) must notice the silently-ignored PK conflict and
+    # try again, rather than returning a share_id that doesn't actually
+    # point at this new payload.
+    ids_to_return = iter([first_id, "freshuniqueid"])
+    monkeypatch.setattr(state_store, "generate_share_id", lambda: next(ids_to_return))
+
+    second_payload = _sample_share_payload()
+    second_payload["database_name"] = "Second Share"
+    second_id = store.create_share(second_payload, "bob")
+
+    assert second_id == "freshuniqueid"
+    assert store.get_share(first_id)["database_name"] == "World Stats"  # untouched
+    assert store.get_share(second_id)["database_name"] == "Second Share"
+
+
+def test_get_share_with_future_schema_version_returns_none(tmp_path):
+    # Mirrors test_chat_history_bucket_with_unrecognized_future_schema_version_is_omitted
+    # above - a share saved by a newer build than this one understands must
+    # resolve as "no such link" (a 404 to the viewer), never a crash or a
+    # half-decoded payload.
+    store = make_store(tmp_path)
+    share_id = store.create_share(_sample_share_payload(), "alice")
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE shares SET schema_version = ? WHERE share_id = ?",
+            (999, share_id),
+        )
+        conn.commit()
+    assert store.get_share(share_id) is None
+
+
+def test_get_share_with_corrupt_payload_returns_none_not_a_crash(tmp_path):
+    store = make_store(tmp_path)
+    share_id = store.create_share(_sample_share_payload(), "alice")
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE shares SET payload = ? WHERE share_id = ?",
+            ("not valid json{{{", share_id),
+        )
+        conn.commit()
+    assert store.get_share(share_id) is None
+
+
+def test_create_share_without_created_by_still_succeeds(tmp_path):
+    # created_by is audit-only (see create_share's own docstring) - never
+    # read back by get_share() - so a falsy value for it must not block
+    # creating or reading the share back.
+    store = make_store(tmp_path)
+    share_id = store.create_share(_sample_share_payload(), None)
+    assert store.get_share(share_id) is not None
 
 
 # --- init() migrations: legacy schema upgrade paths ----------------------------

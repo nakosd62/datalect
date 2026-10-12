@@ -247,11 +247,17 @@
      .speech-bubble-wrapper background - see that rule). */
   --prompt-text: #ffffff;
 
-  /* Shared by --modal-scrim below and the guided tour's spotlight cutout
-     (.tour-spotlight's box-shadow) - both are a full-page dimming scrim,
-     just applied via two different CSS mechanisms. */
+  /* Shared by --modal-scrim and --tour-scrim below - both are a full-page
+     dimming scrim, just applied via two different CSS mechanisms
+     (background-color behind a blurred modal card vs. a spotlight cutout's
+     box-shadow). Kept well under full-black alpha so whatever is still
+     visible behind the dimming (modal: the page edges; tour: the rest of
+     the app around the spotlighted element) stays legible rather than
+     crushing to near-black - see the tour-spotlight rule below for why this
+     matters there specifically. */
   --scrim-rgb: 3, 6, 12;
-  --modal-scrim: rgba(var(--scrim-rgb), 0.7);
+  --modal-scrim: rgba(var(--scrim-rgb), 0.25);
+  --tour-scrim: rgba(var(--scrim-rgb), 0.25);
 
   /* .table-responsive/.stats-card-vertical's own "recessed input-like
      panel" background - same rgb as --bg-input's dark-theme value (see
@@ -346,7 +352,8 @@
   --prompt-text: #0f172a;
 
   --scrim-rgb: 15, 23, 42;
-  --modal-scrim: rgba(var(--scrim-rgb), 0.4);
+  --modal-scrim: rgba(var(--scrim-rgb), 0.16);
+  --tour-scrim: rgba(var(--scrim-rgb), 0.16);
 
   --recessed-panel-bg: rgba(15, 23, 42, 0.05);
 }
@@ -2243,7 +2250,11 @@ textarea:focus {
   width: 100vw;
   height: 100vh;
   background-color: var(--modal-scrim);
-  backdrop-filter: blur(8px);
+  /* No backdrop-filter blur any more - it was compounding with the scrim
+     itself to make the page behind the modal read as "foggy and
+     unreadable" rather than just "dimmed." The lighter --modal-scrim alone
+     is enough to signal "inactive, a modal has focus" without blurring
+     text that's still meant to be legible back there. */
   display: flex;
   align-items: center;
   justify-content: center;
@@ -2325,7 +2336,17 @@ textarea:focus {
 .tour-spotlight {
   position: fixed;
   border-radius: 10px;
-  box-shadow: 0 0 0 9999px rgba(var(--scrim-rgb), 0.78);
+  /* Was a hardcoded 0.78 alpha regardless of theme, which crushed the rest
+     of the page to near-illegibility in both dark and light themes (0.78
+     of an already-dark/near-black color leaves almost nothing behind it
+     readable). --tour-scrim gives this its own, lighter, theme-aware
+     value instead - see the --tour-scrim definitions near the top of this
+     file. The non-zero blur radius (3rd value, before the 9999px spread)
+     feathers the edge of the cutout instead of a hard line - a spotlight
+     with a razor-sharp boundary between "full brightness" and "dimmed" is
+     what actually read as harsh/high-contrast, independent of how light the
+     dimmed alpha itself is. */
+  box-shadow: 0 0 60px 9999px var(--tour-scrim);
   border: 2px solid var(--accent-cyan);
   pointer-events: none;
   transition: top 0.3s ease, left 0.3s ease, width 0.3s ease, height 0.3s ease;
@@ -3005,7 +3026,18 @@ textarea.report-issue-preview:focus {
   display: flex;
   flex-direction: column;
   gap: 0.55rem;
-  padding: 0.75rem 0;
+  /* Tightened from 0.75rem 0 per explicit request: that padding plus the
+     border-bottom below put ~1.5rem of empty space between two collapsed
+     cards (each card is just its own .custom-db-header-row when
+     collapsed, so this padding IS the visible gap) - 3x as loose as the
+     Public Datasources list right above it, whose .preset-column rows
+     are only ever 0.5rem apart (see that rule's own `gap`). 0.25rem top
+     and bottom mirrors that same 0.5rem total gap between adjacent rows
+     here too, so collapsed Private Datasources rows read exactly as
+     tight as the Public ones - an expanded card (Name/type-specific/
+     timeout field rows showing) still gets its own internal 0.55rem
+     row-to-row spacing from this rule's `gap`, untouched. */
+  padding: 0.25rem 0;
   border-bottom: 1px solid var(--bg-card-border);
 }
 

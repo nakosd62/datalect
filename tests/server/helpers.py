@@ -47,6 +47,18 @@ _APP_MODULE_NAMES = [
     "translate_routes", "chat_history_routes", "report_routes",
     "db", "schema_cache", "state_store", "connection_router", "cancel_registry",
     "concurrency_guard", "rate_limiter",
+    # share_routes.py was missing from this list for a while - its own
+    # `from app_config import state_store, PUBLIC_BASE_URL` captures both
+    # at IMPORT TIME, so without being dropped here it kept referencing
+    # whichever test's app_config/state_store happened to import it FIRST
+    # in a given pytest run, not the fresh one each individual test's own
+    # app_factory()/fresh_import() call just built - a monkeypatch on
+    # `app_env.app_config.state_store` (the new instance) silently had no
+    # effect on what the route actually called, and PUBLIC_BASE_URL stayed
+    # pinned to whatever the first test's env happened to set it to. Same
+    # failure shape as the share_bp blueprint-registration gap this file's
+    # own fresh_import() docstring already explains, just one layer deeper.
+    "share_routes",
     # The combine step's own module (server/combine_routes.py) - dropped
     # here for the same reason summarize_routes is just below: it computes
     # its own env-derived constants (COMBINE_SAMPLE_ROWS/COMBINE_RESULTS_
@@ -265,9 +277,14 @@ def fresh_import(monkeypatch, tmp_path, env=None, register_blueprints=True, mock
     Returns a SimpleNamespace with at least `.app_config`; when
     register_blueprints=True (the default) also `.auth`, `.config_routes`,
     `.execute_routes`, `.translate_routes`, `.summarize_routes`,
-    `.combine_routes`, `.cancel_registry`, `.concurrency_guard`,
-    `.rate_limiter`, and `.client` (a Flask test client with
-    state_store.init() already called).
+    `.combine_routes`, `.report_routes`, `.share_routes`, `.cancel_registry`,
+    `.concurrency_guard`, `.rate_limiter`, and `.client` (a Flask test
+    client with state_store.init() already called). share_routes.share_bp
+    was missing from the blueprint-registration tuple below for a while
+    (this harness predates that blueprint, the same way utils/export_state.py's
+    VALID_TABLES predated the "shares" table) - every /api/share request a
+    test made against the `client` fixture 404'd silently until that was
+    fixed, same failure shape as a route that simply isn't implemented yet.
     """
     os.makedirs(tmp_path, exist_ok=True)
     monkeypatch.chdir(tmp_path)
@@ -330,6 +347,7 @@ def fresh_import(monkeypatch, tmp_path, env=None, register_blueprints=True, mock
         import combine_routes
         import chat_history_routes
         import report_routes
+        import share_routes
         import cancel_registry
         import concurrency_guard
         import rate_limiter
@@ -346,6 +364,7 @@ def fresh_import(monkeypatch, tmp_path, env=None, register_blueprints=True, mock
             translate_routes.translate_bp, summarize_routes.summarize_bp,
             combine_routes.combine_bp,
             chat_history_routes.chat_history_bp, report_routes.report_bp,
+            share_routes.share_bp,
         ):
             app_config.app.register_blueprint(bp)
 
@@ -357,6 +376,7 @@ def fresh_import(monkeypatch, tmp_path, env=None, register_blueprints=True, mock
         ns.summarize_routes = summarize_routes
         ns.combine_routes = combine_routes
         ns.report_routes = report_routes
+        ns.share_routes = share_routes
         ns.cancel_registry = cancel_registry
         ns.concurrency_guard = concurrency_guard
         ns.rate_limiter = rate_limiter

@@ -244,6 +244,24 @@ document.addEventListener('DOMContentLoaded', async () => {
   // turn actually lands, and by #goBackBtn's own handler once it's used to
   // reveal that real last turn.
   let viewingBlankSlate = false;
+  // Set by maybeRenderSharedView() below when a share link's own
+  // dataset_ref.kind is 'custom' - a private connection this viewer has no
+  // access to (see that function's own comment on why no dataset switch
+  // happens for that case). The shared prompt/SQL/results still render in
+  // full either way (that's what was explicitly shared, and it's fine for
+  // the recipient to view), but while this flag is set, translatePrompt()/
+  // executeSql() both refuse to run a NEW query - without it, a follow-up
+  // question would silently execute against whatever dataset this viewer's
+  // session already happened to have active (their own, unrelated to the
+  // shared one), which is confusing at best and looks like a data mix-up at
+  // worst - blocking outright is clearer than quietly swapping datasets out
+  // from under the viewer. Cleared the moment triggerConfigSave() succeeds
+  // (see its own `response.ok` branch below): an explicit Save is the
+  // viewer actually choosing a dataset of their own to continue with,
+  // exactly what the shared-view banner itself tells them to do - even
+  // re-saving the same connection they already had counts, since the point
+  // is the deliberate confirmation, not necessarily a change.
+  let sharedViewBlockedForPrivateDataset = false;
   // Mirrors whatever the last real /api/config response's history_max_turns
   // said (see fetchBackendConfig()'s own chatStore.setMaxTurns() call) - so
   // a bucket created well after startup (the first time a given connection
@@ -5681,6 +5699,15 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       if (response.ok) {
         const data = await response.json();
+        // An explicit, successful Save here is the viewer actually
+        // choosing a dataset of their own to continue with - exactly what
+        // the shared-view banner tells them to do when this was set (see
+        // sharedViewBlockedForPrivateDataset's own declaration comment) -
+        // so it's lifted unconditionally, even if they re-saved the same
+        // connection they already had rather than switching to a new one;
+        // the deliberate confirmation is the point, not necessarily a
+        // change.
+        sharedViewBlockedForPrivateDataset = false;
         // Unconditional, mirroring fetchBackendConfig()'s own
         // `data.active_database_url || DEFAULT_DB_URL` (config_routes.py
         // always sends this field, coalesced to '' rather than omitted -
@@ -8511,7 +8538,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           <svg class="schema-viewer-group-caret" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 6 15 12 9 18"></polyline></svg>
           <span>Datasets (${schemaViewerGroupDatasets.length})</span>
         </button>
-        ${expanded && schemaViewerGroupDatasets.length > 0 ? `<ul class="schema-viewer-group-children">${children}</ul>` : ''}
+        ${expanded ? `<ul class="schema-viewer-group-children">${schemaViewerGroupDatasets.length > 0 ? children : '<li class="schema-viewer-entry-empty text-center text-muted py-8">This dataset group has no datasets in it.</li>'}</ul>` : ''}
       </li>`;
 
     schemaViewerEntryList.innerHTML = overviewItem + datasetsGroupHtml;
@@ -13166,7 +13193,44 @@ document.addEventListener('DOMContentLoaded', async () => {
   // ===========================================================================
   // 9. TRANSLATE (NL -> SQL) AND EXECUTE SQL
   // ===========================================================================
+
+  // Shown instead of actually running a new query - see
+  // sharedViewBlockedForPrivateDataset's own declaration comment above for
+  // when/why - rather than translatePrompt()/executeSql() silently letting
+  // the request through against some other, unrelated dataset. Mirrors the
+  // plain error-tile markup those two functions' own "Translation Error"/
+  // execution-failure branches already use elsewhere in this file, just
+  // with a different heading/message and, crucially, no network call ever
+  // made - this fires before either function's own fetch().
+  function renderUnauthorizedAccessError() {
+    clearResultsDisplay();
+    trackEvent('error_shown', {
+      category: 'authorization',
+      database_name: connDbName ? connDbName.textContent : '',
+      database_type: getActiveDatabaseType(),
+      message: 'Unauthorized access (private shared datasource)',
+    });
+    if (resultsBody) {
+      resultsBody.innerHTML = `
+        <tr>
+          <td class="error-cell">
+            <div class="error-container">
+              <span class="error-icon">⚠️</span>
+              <div class="error-details">
+                <strong>Unauthorized Access</strong>
+                <p>You don't have access to the private datasource this shared result used, so a new question can't run against it. Pick one of your own datasources to keep going.</p>
+              </div>
+            </div>
+          </td>
+        </tr>`;
+    }
+  }
+
   async function translatePrompt() {
+    if (sharedViewBlockedForPrivateDataset) {
+      renderUnauthorizedAccessError();
+      return;
+    }
     // Synchronous re-entrancy guard - see uiActionBusy's declaration
     // comment above. Must be the very first thing this function does,
     // before the `await` below, so the check-and-set is atomic.
@@ -13737,6 +13801,17 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   async function executeSql(customSql = null, { internal = false } = {}) {
+    // Same block as translatePrompt()'s own, for the other way a NEW query
+    // can be issued - editing the SQL box directly and clicking Execute/
+    // #runBtn, with no translatePrompt() call in between at all. Skipped
+    // for `internal` calls (translatePrompt()'s own auto-execute call
+    // sites): those only ever run as a continuation of a translatePrompt()
+    // call that has already passed this same check itself, so re-checking
+    // here would be redundant, not an extra safety net.
+    if (!internal && sharedViewBlockedForPrivateDataset) {
+      renderUnauthorizedAccessError();
+      return;
+    }
     // Synchronous re-entrancy guard - see uiActionBusy's declaration
     // comment above. Skipped when `internal` is true: that's set only by
     // translatePrompt()'s own two `autoSqlExecuteEnabled` call sites
@@ -15000,15 +15075,31 @@ document.addEventListener('DOMContentLoaded', async () => {
     // as if they'd typed and run it themselves - see pushActiveTurn()'s own
     // comment) and rendered via restoreLatestTurn(), the SAME function
     // every other turn in this file renders through, not a separate
-    // read-only copy of it. Nothing is locked or disabled: the viewer can
-    // immediately edit the question, change the dataset, or hit Run again.
+    // read-only copy of it - the shared prompt/SQL/results are all fully
+    // visible either way (that's exactly what was shared, and it's fine
+    // for the recipient to view). For a preset/group share, or a custom
+    // one whose dataset no longer exists, nothing else is locked either:
+    // the viewer can immediately edit the question, change the dataset, or
+    // hit Run again. A custom (private) share is the one exception - see
+    // sharedViewBlockedForPrivateDataset's own declaration comment just
+    // below for why issuing a NEW query is blocked until the viewer
+    // explicitly picks a dataset of their own.
     pushActiveTurn((data.user_entry && data.user_entry.text) || '', data.model_entry);
     restoreLatestTurn();
 
     let bannerText;
     if (datasetRef.kind === 'custom') {
-      bannerText = "You opened a result someone shared with you. It used a private database you don't have access to, "
-        + "so editing and running this question will use your own current dataset instead.";
+      sharedViewBlockedForPrivateDataset = true;
+      bannerText = "You opened a result someone shared with you that uses a private datasource you don't have access to. "
+        + "You may continue using the agent against the datasources you have access to.";
+      // Names which datasource this came from (part of "what was shared"
+      // just as much as the prompt/SQL/results themselves) - the viewer's
+      // own header badge still shows THEIR current dataset, which is a
+      // different thing and, while this flag is set, not what a new query
+      // would even be allowed to run against yet.
+      if (data.database_name) {
+        bannerText += ` The shared result was generated against "${data.database_name}".`;
+      }
     } else if (datasetSwitched) {
       bannerText = "You opened a result someone shared with you - picked up the same dataset, so you can pick up right where they left off.";
     } else {

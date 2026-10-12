@@ -127,10 +127,10 @@ test.describe('first-run onboarding', () => {
     // Help/History/Preferences/sign-in/feedback).
     const title = page.locator('#tourTooltipTitle');
     for (let i = 0; i < 10; i++) {
-      if ((await title.textContent())?.includes('dataset description')) break;
+      if ((await title.textContent())?.includes('datasource description')) break;
       await page.locator('#tourNextBtn').click();
     }
-    await expect(title).toHaveText('Peek at the dataset description');
+    await expect(title).toHaveText('Peek at the datasource description');
     await expect(page.locator('#tourTooltipBody')).toContainText('sample questions you may ask');
 
     // The spotlight is actually positioned over the small standalone info

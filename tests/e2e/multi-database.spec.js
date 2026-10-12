@@ -205,7 +205,7 @@ test.describe('multi-database question answering', () => {
     // name, not just the primary's ("Sales Postgres") name, since showing
     // one name would hide that the other connection is also in play for
     // this session's questions.
-    await expect(page.locator('#connDbName')).toHaveText('Sales & Marketing (Dataset Group)');
+    await expect(page.locator('#connDbName')).toHaveText('Sales & Marketing (Composite)');
     await expect(page.locator('#configTriggerBadge')).toHaveAttribute(
       'title', 'In scope: Sales Postgres, Marketing Postgres (Click to configure)');
 
@@ -241,7 +241,7 @@ test.describe('multi-database question answering', () => {
     });
     await gotoApp(page);
 
-    await expect(page.locator('#connDbName')).toHaveText('Sales & Marketing (Dataset Group)');
+    await expect(page.locator('#connDbName')).toHaveText('Sales & Marketing (Composite)');
     await expect(page.locator('#configTriggerBadge')).toHaveAttribute(
       'title', 'In scope: Sales Postgres, Marketing Postgres (Click to configure)');
 
@@ -1388,17 +1388,26 @@ test.describe('multi-database question answering', () => {
     await page.locator('#aiPrompt').fill('total revenue');
     await page.locator('#aiPrompt').press('Enter');
 
-    // Triage's own routing message is up (the Summary tab has rendered),
-    // but Phase C hasn't resolved yet - the feedback prompt must NOT be
-    // showing at this point, which was exactly the bug.
-    const summaryText = page.locator('.response-text');
-    await expect(summaryText).toContainText('Checking Sales Postgres.');
+    // Triage's own routing message is up, but Phase C hasn't resolved yet -
+    // while a Response tab turn is still pending, that text lives
+    // EXCLUSIVELY inside the "Thoughts & Notes" drawer (see
+    // renderAllModeCombinedResults()'s own `isPendingResponseTab` comment
+    // in client.js: rendering it a second time as a standalone
+    // .response-text paragraph while pending was an earlier version of
+    // this exact bug, duplicating the text on screen) - so `.response-text`
+    // itself doesn't exist at all yet at this point, and the feedback
+    // prompt must NOT be showing either, which is the real regression this
+    // test guards.
+    await expect(page.locator('.thoughts-notes-body')).toContainText('Checking Sales Postgres.');
+    await expect(page.locator('.response-text')).toHaveCount(0);
     await expect(page.locator('.summary-feedback-btn--up')).toBeHidden();
     await expect(page.locator('.summary-feedback-btn--down')).toBeHidden();
 
     // Let Phase C resolve - only now, once the Results Summary text has
-    // actually rendered, should the feedback prompt appear.
+    // actually rendered as its own .response-text paragraph, should the
+    // feedback prompt appear.
     releaseSummarize();
+    const summaryText = page.locator('.response-text');
     await expect(summaryText).toContainText('Sales Postgres shows total revenue of $500.');
     await expect(page.locator('.summary-feedback-btn--up')).toBeVisible();
     await expect(page.locator('.summary-feedback-btn--down')).toBeVisible();
@@ -1500,7 +1509,7 @@ test.describe('multi-database question answering', () => {
     await page.locator('#aiPrompt').press('Enter');
 
     await expect(page.locator('#schemaViewerModal')).not.toHaveClass(/hidden/);
-    await expect(page.locator('#schemaViewerModalTitleText')).toHaveText('Sales & Marketing (Dataset Group)');
+    await expect(page.locator('#schemaViewerModalTitleText')).toHaveText('Sales & Marketing (Composite)');
     // Supersedes the old flat-table assertion - the group dialog now
     // shares the single-connection dialog's own Overview/Datasets tree
     // layout (see schema-viewer.spec.js's "dataset group schema viewer"
@@ -1649,18 +1658,25 @@ test.describe('multi-database question answering', () => {
     await page.locator('#runBtn').click();
 
     // Triage's own label ("Diagnóstico") never shows, only its body text -
-    // while Phase C is still held open.
-    const summaryText = page.locator('.response-text');
-    await expect(summaryText).toContainText('Comprobando Sales Postgres y Marketing Postgres.');
-    let rawText = await summaryText.evaluate((el) => el.textContent);
+    // while Phase C is still held open. That pending text lives
+    // exclusively inside the "Thoughts & Notes" drawer, not as its own
+    // .response-text paragraph (see the feedback-buttons test above, and
+    // renderAllModeCombinedResults()'s own `isPendingResponseTab` comment
+    // in client.js) - so .response-text doesn't exist yet at this point.
+    const thoughtsBody = page.locator('.thoughts-notes-body');
+    await expect(thoughtsBody).toContainText('Comprobando Sales Postgres y Marketing Postgres.');
+    let rawText = await thoughtsBody.evaluate((el) => el.textContent);
     expect(rawText).not.toContain('Diagnóstico');
-    await expect(summaryText.locator('strong u')).toHaveCount(0);
+    await expect(thoughtsBody.locator('strong u')).toHaveCount(0);
+    await expect(page.locator('.response-text')).toHaveCount(0);
 
     // Let Phase C resolve - its own label ("Resumen de resultados") never
     // shows either, and its body text REPLACES triage's routing message
     // entirely (appendPhaseCSummaryToSummaryTab's own "replace, don't
-    // append" behavior) rather than appearing underneath it.
+    // append" behavior) rather than appearing underneath it. This is the
+    // first point .response-text itself exists.
     releaseSummarize();
+    const summaryText = page.locator('.response-text');
     await expect(summaryText).toContainText('Los ingresos combinados son $700.');
     rawText = await summaryText.evaluate((el) => el.textContent);
     expect(rawText).not.toContain('Comprobando Sales Postgres y Marketing Postgres.');

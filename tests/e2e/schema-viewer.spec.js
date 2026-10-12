@@ -566,13 +566,13 @@ test.describe('dataset group schema viewer', () => {
     await expect(page.locator('#schemaViewerModal')).not.toHaveClass(/hidden/);
   }
 
-  test('title is "<group name> (Dataset Group)", with no data-size/schema-size subheader at all', async ({ page }) => {
+  test('title is "<group name> (Composite)", with no data-size/schema-size subheader at all', async ({ page }) => {
     await mockConfig(page);
     await mockGroupSchema(page);
     await gotoApp(page);
     await openSchemaViewerBtn(page);
 
-    await expect(page.locator('#schemaViewerModalTitleText')).toHaveText('Sales & Marketing (Dataset Group)');
+    await expect(page.locator('#schemaViewerModalTitleText')).toHaveText('Sales & Marketing (Composite)');
     await expect(page.locator('#schemaViewerFactsLine')).toHaveClass(/hidden/);
     await expect(page.locator('#schemaViewerFactsLine')).toBeEmpty();
   });
@@ -745,6 +745,12 @@ test.describe('dataset group schema viewer', () => {
     await expect(page.locator('#schemaViewerPanesWrap')).not.toHaveClass(/hidden/);
     await expect(page.locator('#schemaViewerModalTitleText')).toContainText('Sales Postgres in PostgreSQL');
     // No leftover "Datasets" tree group from the previous group-mode open.
-    await expect(page.locator('.schema-viewer-group-header')).toHaveCount(0);
+    // Scoped to data-group="datasets" specifically (not just any
+    // .schema-viewer-group-header) - a single connection legitimately
+    // renders its own collapsible groups with this same class (here, a
+    // single "Tables (1)" group for the one mocked table), so a bare
+    // toHaveCount(0) on the class alone would false-fail on that normal,
+    // unrelated group header every time this preset actually has a schema.
+    await expect(page.locator('.schema-viewer-group-header[data-group="datasets"]')).toHaveCount(0);
   });
 });

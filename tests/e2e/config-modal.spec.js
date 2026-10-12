@@ -56,7 +56,7 @@ async function openConfigModal(page) {
   await expect(page.locator('#configModal')).not.toHaveClass(/hidden/, { timeout: 15_000 });
 }
 
-/** Clicks "+ Add custom connection" and waits for the row to be genuinely
+/** Clicks "+ Create new" and waits for the row to be genuinely
  * ready before returning. client.js's addCustomDbBtn handler re-renders
  * the row synchronously but then schedules a requestAnimationFrame
  * callback that focuses its name input a frame later (a nicety for real
@@ -109,11 +109,11 @@ test.describe('config modal', () => {
     const radioGroup = page.locator('#modalDbRadioGroup');
     const headings = radioGroup.locator('.radio-group-heading');
     await expect(headings).toHaveText([
-      'PRE-CONFIGURED DATASETS (PLAYGROUNDS)', 'Custom Database Connections',
+      'Public Datasources', 'Private Datasources',
     ]);
 
     // Not just present - actually in this order: the two-column preset
-    // block comes before the "Custom Database Connections" heading, which
+    // block comes before the "Private Datasources" heading, which
     // itself comes before customDbsContainer (the add button/custom rows).
     // Presets themselves aren't direct children of #modalDbRadioGroup any
     // more (see the .preset-columns/.preset-column wrapper in
@@ -459,13 +459,13 @@ test.describe('config modal', () => {
     // block of their own (see renderDbRadioButtons()'s merge comment).
     await expect(page.locator('.preset-columns')).toHaveCount(1);
     await expect(page.locator('.all-databases-option')).toHaveCount(2);
-    await expect(page.locator('.all-databases-option .radio-label')).toHaveText(['Solo Group (Dataset Group)', 'Everything (Dataset Group)']);
+    await expect(page.locator('.all-databases-option .radio-label')).toHaveText(['Solo Group (Composite)', 'Everything (Composite)']);
   });
 
   test('single-db presets and dataset groups are merged into one combined list, each labeled "name (type)"', async ({ page }) => {
     // Single presets show their real dialect_name (config_routes.py's
     // _redact_preset_for_client()) in parentheses; a dataset group has no
-    // dialect of its own, so it's always labeled "(Dataset Group)" instead
+    // dialect of its own, so it's always labeled "(Composite)" instead
     // (see renderDbRadioButtons()'s renderGroupOption()) - both kinds of
     // entry now live in the exact same combined, balanced-column list
     // (there is no more separate "DATASET GROUPS" heading/column below the
@@ -522,46 +522,33 @@ test.describe('config modal', () => {
     // no groups are configured at all.
     const radioGroup = page.locator('#modalDbRadioGroup');
     await expect(radioGroup.locator('.radio-group-heading')).toHaveText([
-      'PRE-CONFIGURED DATASETS (PLAYGROUNDS)', 'Custom Database Connections',
+      'Public Datasources', 'Private Datasources',
     ]);
 
     const columns = page.locator('.preset-column');
     await expect(columns.nth(0).locator('.radio-label')).toHaveText([
       'Sales Postgres (PostgreSQL)', 'Marketing Warehouse (Google BigQuery)',
     ]);
-    await expect(columns.nth(1).locator('.radio-label')).toHaveText(['Sales & Marketing (Dataset Group)']);
-    await expect(page.locator('.all-databases-option .radio-label')).toHaveText(['Sales & Marketing (Dataset Group)']);
+    await expect(columns.nth(1).locator('.radio-label')).toHaveText(['Sales & Marketing (Composite)']);
+    await expect(page.locator('.all-databases-option .radio-label')).toHaveText(['Sales & Marketing (Composite)']);
   });
 
-  test('custom connections heading has a security note that opens the Help modal', async ({ page }) => {
-    await gotoApp(page);
-    await openConfigModal(page);
-
-    const note = page.locator('.custom-db-security-note');
-    await expect(note).toBeVisible();
-    await expect(note).toContainText('private and secure');
-
-    await note.locator('#customDbSecurityNoteHelpLink').click();
-    await expect(page.locator('#helpModal')).not.toHaveClass(/hidden/);
-    await expect(page.locator('#helpModalBody')).toContainText('encrypted at rest');
-
-    // Both modals are left open here (the link doesn't close #configModal
-    // first) - the regression this guards: every modal shares the same
-    // .modal-overlay z-index (see style.css), so without
-    // bringModalToFront() (client.js), #helpModal would render BEHIND
-    // #configModal (later in index.html's DOM order) and be invisible
-    // until #configModal was closed.
-    const [configZ, helpZ] = await Promise.all([
-      page.locator('#configModal').evaluate(el => parseInt(getComputedStyle(el).zIndex, 10)),
-      page.locator('#helpModal').evaluate(el => parseInt(getComputedStyle(el).zIndex, 10)),
-    ]);
-    expect(helpZ).toBeGreaterThan(configZ);
-  });
+  // NOTE: this used to also cover a "custom connections heading has a
+  // security note that opens the Help modal" case - that whole note
+  // (.custom-db-security-note/#customDbSecurityNoteHelpLink, "Your custom
+  // connections are private and secure (see Documentation).") was removed
+  // from index.html/client.js per explicit request during the Dataset ->
+  // Datasource terminology rename, and nothing else in the config modal
+  // opens the Help modal from inside it - there's no longer a way to get
+  // #configModal and #helpModal open at once through the real UI, so the
+  // bringModalToFront()/z-index regression this test guarded is untestable
+  // this way any more. This comment is left in its place rather than
+  // silently dropping the coverage with no trace.
 
   test('an anonymous Cloud Run visitor sees both the presets and custom-connections headings', async ({ page }) => {
     // Anonymous visitors can now save their own custom connections too
-    // (see config_routes.py's handle_config) - the "Custom Database
-    // Connections" heading and its "+ Add custom connection" control are no
+    // (see config_routes.py's handle_config) - the "Private Datasources"
+    // heading and its "+ Create new" control are no
     // longer hidden for this identity, even before they've saved one yet,
     // exactly like an authenticated user with zero saved connections still
     // sees the heading.
@@ -597,8 +584,8 @@ test.describe('config modal', () => {
     await gotoApp(page);
     await openConfigModal(page);
 
-    await expect(page.locator('.radio-group-heading', { hasText: 'PRE-CONFIGURED DATASETS (PLAYGROUNDS)' })).toBeVisible();
-    await expect(page.locator('.radio-group-heading', { hasText: 'Custom Database Connections' })).toBeVisible();
+    await expect(page.locator('.radio-group-heading', { hasText: 'Public Datasources' })).toBeVisible();
+    await expect(page.locator('.radio-group-heading', { hasText: 'Private Datasources' })).toBeVisible();
     await expect(page.locator('#addCustomDbBtn')).toBeVisible();
   });
 

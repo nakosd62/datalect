@@ -6,13 +6,15 @@ from datetime import datetime
 import pandas as pd
 
 
-# The six collections/tables this app actually uses (see
-# utils/migrate_firestore_to_default_db.py's own docstring, which lists
-# the same six as its own --collections default) - schema_cache was
-# missing here for a while (this utility predates that collection), so
-# "export everything" silently never included it even once the rest of
-# this file was pointed at the right database.
-VALID_TABLES = ["translations", "sessions", "db_connections", "chat_history", "llm_usage", "schema_cache"]
+# The seven collections/tables this app actually uses. The first six are
+# also utils/migrate_firestore_to_default_db.py's own --collections
+# default (see that docstring) - schema_cache was missing here for a
+# while (this utility predates that collection), so "export everything"
+# silently never included it even once the rest of this file was pointed
+# at the right database. "shares" is the newer public-share-link table
+# (see server/state_store.py's "Public shares" comment / server/share_routes.py)
+# and was missing from here the same way until this list was updated for it.
+VALID_TABLES = ["translations", "sessions", "db_connections", "chat_history", "llm_usage", "schema_cache", "shares"]
 
 
 # ==========================================
@@ -322,7 +324,7 @@ def main():
         "--table",
         choices=VALID_TABLES + ["all"],
         default="all",
-        help="Target table/collection to export (translations, sessions, db_connections, chat_history, llm_usage, or all). Default: 'all'."
+        help="Target table/collection to export (translations, sessions, db_connections, chat_history, llm_usage, schema_cache, shares, or all). Default: 'all'."
     )
 
     parser.add_argument(

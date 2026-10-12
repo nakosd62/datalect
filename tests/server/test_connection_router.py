@@ -1495,16 +1495,30 @@ def test_classify_generation_outcome_covers_sql_note_empty_and_failed_shapes(app
     classify = env.translate_routes._classify_generation_outcome
     entry = {"kind": "preset", "id": "pg-a", "name": "Sales Postgres"}
 
-    assert classify(entry, ("ok", "SELECT * FROM deals;", {}, 42)) == {
+    # The "ok" tuple shape carries a 5th element (knowledge_note - see
+    # generate_sql_for_connection's/_classify_generation_outcome's own
+    # docstrings) - only ever non-None/surfaced for a "sql" outcome, so
+    # these three use None except the dedicated case below.
+    assert classify(entry, ("ok", "SELECT * FROM deals;", {}, 42, None)) == {
         "outcome": "sql",
         "sql": "-- database: preset:pg-a (Sales Postgres)\nSELECT * FROM deals;",
+        "knowledge_note": None,
     }
-    assert classify(entry, ("ok", "*** NO SQL *** nothing relevant here", {}, 42)) == {
+    assert classify(entry, ("ok", "*** NO SQL *** nothing relevant here", {}, 42, None)) == {
         "outcome": "note",
         "text": "nothing relevant here",
     }
-    assert classify(entry, ("ok", "   ", {}, 42)) == {"outcome": "note", "text": ""}
+    assert classify(entry, ("ok", "   ", {}, 42, None)) == {"outcome": "note", "text": ""}
     assert classify(entry, ("failed", "boom", 42)) == {"outcome": "failed", "error": "boom"}
+
+    # A non-None knowledge_note round-trips onto the "sql" outcome only -
+    # confirms the 5th tuple element actually flows through rather than
+    # just being unpacked and discarded.
+    assert classify(entry, ("ok", "SELECT * FROM deals;", {}, 42, "A fiscal quarter here runs Jan-Mar.")) == {
+        "outcome": "sql",
+        "sql": "-- database: preset:pg-a (Sales Postgres)\nSELECT * FROM deals;",
+        "knowledge_note": "A fiscal quarter here runs Jan-Mar.",
+    }
 
 
 def test_group_mode_failed_outcome_returns_fixed_apology_text_not_candidate_zero_fallback(app_factory, tmp_path, monkeypatch):
@@ -2909,6 +2923,7 @@ def test_summarize_all_mode_results_includes_schema_for_each_in_scope_database(a
         "cross_database": None,
         "visualizations": {},
         "suggested_searches": [],
+        "general_knowledge_note": None,
     }
     schema_block = provider.calls[0]["llm_input"]["schema_block"]
     assert "Sales Postgres:\nTable: deals" in schema_block
@@ -2983,6 +2998,7 @@ def test_summarize_all_mode_results_returns_stripped_text_and_usage_on_success(a
         "cross_database": None,
         "visualizations": {},
         "suggested_searches": [],
+        "general_knowledge_note": None,
     }
     assert usage == {}
     assert error is None
@@ -3038,7 +3054,7 @@ def test_summarize_all_mode_results_retries_a_retryable_error_and_succeeds_on_a_
     ))
     assert parsed == {
         "label": "Results Summary", "per_database": {0: "Sales is up 10%."}, "cross_database": None,
-        "visualizations": {}, "suggested_searches": [],
+        "visualizations": {}, "suggested_searches": [], "general_knowledge_note": None,
     }
     assert error is None
     assert len(provider.calls) == 2
@@ -3075,7 +3091,7 @@ def test_summarize_all_mode_results_yields_a_retrying_line_for_key_rotation(app_
     parsed, usage, error = _drain(gen)
     assert parsed == {
         "label": "Results Summary", "per_database": {0: "Sales is up 10%."}, "cross_database": None,
-        "visualizations": {}, "suggested_searches": [],
+        "visualizations": {}, "suggested_searches": [], "general_knowledge_note": None,
     }
     assert error is None
 
@@ -3107,7 +3123,7 @@ def test_summarize_all_mode_results_yields_a_retrying_line_for_a_transient_error
     parsed, usage, error = _drain(gen)
     assert parsed == {
         "label": "Results Summary", "per_database": {0: "Sales is up 10%."}, "cross_database": None,
-        "visualizations": {}, "suggested_searches": [],
+        "visualizations": {}, "suggested_searches": [], "general_knowledge_note": None,
     }
     assert sleep_calls == [2.5]
 
@@ -3184,7 +3200,7 @@ def test_summarize_all_mode_results_retries_an_invalid_or_incomplete_json_respon
         ))
         assert parsed == {
         "label": "Results Summary", "per_database": {0: "Sales is up 10%."}, "cross_database": None,
-        "visualizations": {}, "suggested_searches": [],
+        "visualizations": {}, "suggested_searches": [], "general_knowledge_note": None,
     }
         assert error is None
         assert len(provider.calls) == 2
@@ -3199,7 +3215,7 @@ def test_summarize_all_mode_results_retries_an_invalid_or_incomplete_json_respon
     ))
     assert parsed == {
         "label": "Results Summary", "per_database": {0: "fenced, but otherwise valid"}, "cross_database": None,
-        "visualizations": {}, "suggested_searches": [],
+        "visualizations": {}, "suggested_searches": [], "general_knowledge_note": None,
     }
     assert len(provider.calls) == 1
 
@@ -3245,7 +3261,7 @@ def test_summarize_all_mode_results_wrong_language_is_retried_and_corrected(app_
     ))
     assert parsed == {
         "label": "Results Summary", "per_database": {0: "Sales are up 10%."}, "cross_database": None,
-        "visualizations": {}, "suggested_searches": [],
+        "visualizations": {}, "suggested_searches": [], "general_knowledge_note": None,
     }
     assert error is None
     assert len(provider.calls) == 2

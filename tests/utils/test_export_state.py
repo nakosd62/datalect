@@ -353,6 +353,22 @@ def test_fetch_firestore_all_includes_schema_cache_alongside_other_collections(m
     assert results["schema_cache"].iloc[0]["doc_id"] == "postgres+World Stats"
 
 
+def test_fetch_firestore_all_includes_shares_alongside_other_collections(monkeypatch):
+    # Same regression as schema_cache above, for the "shares" collection
+    # (public share links - see server/share_routes.py/state_store.py)
+    # added after this file originally shipped.
+    doc = _FakeDocSnapshot({"payload": "{}"}, doc_id="share-abc123")
+    _install_fake_firestore(monkeypatch, {
+        "translations": [_FakeDocSnapshot({"nl_prompt": "hi"}, doc_id="t1")],
+        "shares": [doc],
+    })
+
+    results = fetch_firestore("all")
+
+    assert set(results.keys()) == {"translations", "shares"}
+    assert results["shares"].iloc[0]["doc_id"] == "share-abc123"
+
+
 # ==========================================
 # export_union() - global alphabetical order across both sources
 # ==========================================
@@ -448,3 +464,11 @@ def test_valid_tables_includes_schema_cache():
     # own docstring for the full list of six collections this app
     # actually uses.
     assert "schema_cache" in VALID_TABLES
+
+
+def test_valid_tables_includes_shares():
+    # "shares" (public share links - see server/state_store.py's "Public
+    # shares" comment and server/share_routes.py) is a newer table than
+    # this utility, added the same way schema_cache was - so it needs the
+    # same explicit VALID_TABLES coverage rather than being assumed.
+    assert "shares" in VALID_TABLES

@@ -4530,7 +4530,10 @@ def test_parse_single_dataset_triage_response_returns_none_for_unparseable_or_em
 
 def test_parse_sql_generation_response_sql_outcome(app_env):
     parsed = app_env.translate_routes._parse_sql_generation_response('{"sql": "SELECT * FROM users;"}')
-    assert parsed == {"outcome": "sql", "sql": "SELECT * FROM users;"}
+    # "knowledge_note" is None here since this response carries no
+    # "knowledge_note" field at all - see the dedicated knowledge_note
+    # tests below for the non-None case.
+    assert parsed == {"outcome": "sql", "sql": "SELECT * FROM users;", "knowledge_note": None}
 
 
 def test_parse_sql_generation_response_strips_a_fence_nested_inside_the_sql_field(app_env):
@@ -4540,7 +4543,34 @@ def test_parse_sql_generation_response_strips_a_fence_nested_inside_the_sql_fiel
     parsed = app_env.translate_routes._parse_sql_generation_response(
         '{"sql": "```sql\\nSELECT * FROM users;\\n```"}'
     )
-    assert parsed == {"outcome": "sql", "sql": "SELECT * FROM users;"}
+    assert parsed == {"outcome": "sql", "sql": "SELECT * FROM users;", "knowledge_note": None}
+
+
+def test_parse_sql_generation_response_extracts_a_real_knowledge_note(app_env):
+    # The one case none of the tests above exercise: a response that DOES
+    # carry a "knowledge_note" - the model's own short note on a general-
+    # knowledge fact it had to resolve to write this SQL (see this
+    # function's own docstring). Blank/whitespace-only is treated as
+    # absent, same "None vs. empty string" convention every other optional
+    # field in this function already follows.
+    parsed = app_env.translate_routes._parse_sql_generation_response(
+        '{"sql": "SELECT * FROM presidents WHERE name = \'Jane Doe\';", '
+        '"knowledge_note": "Resolved \\"the current president\\" to Jane Doe."}'
+    )
+    assert parsed == {
+        "outcome": "sql",
+        "sql": "SELECT * FROM presidents WHERE name = 'Jane Doe';",
+        "knowledge_note": 'Resolved "the current president" to Jane Doe.',
+    }
+    assert app_env.translate_routes._parse_sql_generation_response(
+        '{"sql": "SELECT 1;", "knowledge_note": "   "}'
+    ) == {"outcome": "sql", "sql": "SELECT 1;", "knowledge_note": None}
+    # "cannot_answer" outcomes never carry one - no SQL was generated, so
+    # there's nothing for it to describe (see this function's own
+    # docstring on the full return-shape contract).
+    assert app_env.translate_routes._parse_sql_generation_response(
+        '{"cannot_answer_reason": "no matching table", "knowledge_note": "should be ignored"}'
+    ) == {"outcome": "cannot_answer", "reason": "no matching table"}
 
 
 def test_parse_sql_generation_response_cannot_answer_outcome(app_env):
@@ -4566,7 +4596,7 @@ def test_parse_sql_generation_response_rejects_neither_populated(app_env):
 def test_parse_sql_generation_response_tolerates_chatter_around_the_whole_envelope(app_env):
     raw = 'Here is the SQL you asked for:\n\n```json\n{"sql": "SELECT * FROM users;"}\n```\n\nEnjoy!'
     assert app_env.translate_routes._parse_sql_generation_response(raw) == {
-        "outcome": "sql", "sql": "SELECT * FROM users;",
+        "outcome": "sql", "sql": "SELECT * FROM users;", "knowledge_note": None,
     }
 
 
