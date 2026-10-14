@@ -29,7 +29,7 @@ def _two_preset_one_group_env(app_factory, tmp_path, extra_env=None):
 
 
 def _schema_fetch_by_url(mapping):
-    def _fetch(descriptor, deep=True):
+    def _fetch(descriptor):
         return mapping[descriptor.get("url")]
     return _fetch
 
@@ -115,7 +115,7 @@ def test_a_member_with_no_fetchable_schema_is_still_listed_by_name_not_dropped(a
 
     import db as db_module
 
-    def _fetch(descriptor, deep=True):
+    def _fetch(descriptor):
         if descriptor.get("url") == "postgresql://u:p@h/a":
             return db_module._SCHEMA_FETCH_FAILED
         return "Table: campaigns\n  id integer NOT NULL\n"

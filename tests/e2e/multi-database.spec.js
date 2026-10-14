@@ -217,7 +217,7 @@ test.describe('multi-database question answering', () => {
     await expect(page.locator('#configModal')).toHaveClass(/hidden/);
     expect(state.in_scope_preset_ids).toEqual(['p-b']);
 
-    await expect(page.locator('#connDbName')).toHaveText('Marketing Postgres (postgres)');
+    await expect(page.locator('#connDbName')).toHaveText('Marketing Postgres');
     await expect(page.locator('#configTriggerBadge')).toHaveAttribute(
       'title', 'Connected to: Marketing Postgres (Click to configure)');
   });

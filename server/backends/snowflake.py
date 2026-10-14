@@ -35,13 +35,17 @@ round-trip back to the frontend once saved is state_store.py's
 _CREDENTIAL_CONFIG_FIELDS' responsibility, mirrored from how it already
 handles bigquery.py's "credentials_json" - see that module's docstring.
 
-Schema introspection is split into two phases (see backends/base.py's
-Backend.get_schema()/get_schema_shallow() docstrings for the shared
+Schema introspection is split into two phases internally (see
+backends/base.py's Backend.get_schema() docstring for the shared
 rationale): _build_shallow_schema_parts() below runs every catalog-only
-("Phase 1") query exactly once, shared by both get_schema_shallow() (Phase
-1 only - used for connections db.py's all-dbs triage may not even route to)
-and get_schema() (Phase 1 + Phase 2's live queries - full/authoritative row
-counts, column value samples, naming-convention relationships).
+("Phase 1") query exactly once, and get_schema() appends Phase 2's live
+queries on top of it (full/authoritative row counts, column value
+samples, naming-convention relationships). There used to also be a
+public, Phase-1-only get_schema_shallow() entry point reading this same
+helper's output directly, for db.py's all-dbs triage to use without
+paying Phase 2's cost - it has since been removed (see that docstring's
+history); get_schema() is the only caller of _build_shallow_schema_parts()
+now.
 
 NOTE for reviewers: this module's get_schema()/execute()/identity_label()
 queries are written from Snowflake's documented INFORMATION_SCHEMA/session-
@@ -248,11 +252,10 @@ class SnowflakeBackend(Backend):
         return db_name, username
 
     def _build_shallow_schema_parts(self, connection):
-        """Phase 1 (catalog-only, no live queries): every query both
-        get_schema_shallow() and get_schema() (deep) need, run exactly once
-        here and shared by both - see the module-level docstring and
-        backends/base.py's Backend.get_schema()/get_schema_shallow()
-        docstrings for why this split exists at all.
+        """Phase 1 (catalog-only, no live queries), run exactly once here
+        and used as the base get_schema() appends Phase 2 onto - see the
+        module-level docstring and backends/base.py's Backend.get_schema()
+        docstring for why this split exists at all.
 
         Returns None if CURRENT_SCHEMA() has no BASE TABLE at all (mirrors
         get_schema()'s old "return None" for that case). Otherwise returns
@@ -438,9 +441,8 @@ class SnowflakeBackend(Backend):
             # per-table SYSTEM$CLUSTERING_INFORMATION(...) table-function
             # call because it's a single query against the same view this
             # section already reads, not up to len(kept_names) extra round
-            # trips, which matters a lot here since get_schema_shallow() is
-            # exactly the path db.py's all-dbs triage calls for every
-            # in-scope connection, not just ones actually selected.
+            # trips - keeping Phase 1 cheap regardless of how many tables
+            # a connection has.
             table_comments = {}
             row_count_estimates = {}
             clustering_keys = {}
@@ -572,15 +574,13 @@ class SnowflakeBackend(Backend):
             # (which table/column a given policy is actually attached to)
             # is only available via the POLICY_REFERENCES table function,
             # called once per table/column - too expensive to run
-            # unconditionally here (get_schema_shallow() is the exact path
-            # db.py's all-dbs triage calls for every in-scope connection,
-            # so a per-kept-table function call here would multiply
-            # Phase 1's query count by len(kept_names), defeating the point
-            # of a cheap shallow fetch). Instead this reports existence
-            # only, schema-wide, via SHOW ROW ACCESS POLICIES / SHOW
-            # MASKING POLICIES - two single, cheap queries, each wrapped in
-            # its own try/except since either feature (or the privilege to
-            # list it) may be unavailable independently of the other.
+            # unconditionally here, since a per-kept-table function call
+            # would multiply Phase 1's query count by len(kept_names).
+            # Instead this reports existence only, schema-wide, via SHOW
+            # ROW ACCESS POLICIES / SHOW MASKING POLICIES - two single,
+            # cheap queries, each wrapped in its own try/except since
+            # either feature (or the privilege to list it) may be
+            # unavailable independently of the other.
             policy_flags = []
             try:
                 cursor.execute("SHOW ROW ACCESS POLICIES IN SCHEMA;")
@@ -615,24 +615,14 @@ class SnowflakeBackend(Backend):
         }
         return schema_parts, table_columns, phase2_ctx
 
-    def get_schema_shallow(self, connection):
-        built = self._build_shallow_schema_parts(connection)
-        if built is None:
-            return None
-        schema_parts, _table_columns, _phase2_ctx = built
-        if not schema_parts:
-            return None
-        return cap_schema_text("\n\n".join(schema_parts))
-
     def get_schema(self, connection):
         """Deep fetch: Phase 1 (catalog-only, via
         _build_shallow_schema_parts()) plus Phase 2's live-query
         enrichment - full view/routine bodies, per-table live row counts
         with an APPROX_COUNT_DISTINCT-gated column-value-sample pass, and
         the shared naming-convention relationship heuristic. See
-        get_schema_shallow() above for the catalog-only subset this builds
-        on top of, and backends/base.py's Backend.get_schema() docstring
-        for the two-phase rationale."""
+        backends/base.py's Backend.get_schema() docstring for the
+        two-phase rationale."""
         built = self._build_shallow_schema_parts(connection)
         if built is None:
             return None

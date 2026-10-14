@@ -62,18 +62,6 @@ SCHEMA_MAX_TABLE_NAMES_SCANNED = int(os.environ.get("SCHEMA_MAX_TABLE_NAMES_SCAN
 # view definitions, more table entries than fit even after the caps above).
 SCHEMA_MAX_CHARS = int(os.environ.get("SCHEMA_MAX_SCHEMA_CHARS", 100_000))
 
-# When true, translate_routes.py feeds the LLM the "tables_only" schema
-# derivative (see derive_tables_only_schema_text below) instead of the full
-# deep schema text for every /api/translate (and related) call - identical
-# per-table detail (columns, types, everything else under a table's own
-# heading), but every OTHER top-level schema-object section (Constraints,
-# Indexes, Views, and so on) stripped out, purely to cut down input
-# token cost. Off by default, so an unset/blank/anything-other-than-"true"
-# value leaves every existing deployment's prompts byte-for-byte unchanged.
-# Read once at import time like every other SCHEMA_* flag here, so flipping
-# it requires a process restart, same as the numeric caps above.
-SCHEMA_TABLES_ONLY = os.environ.get("SCHEMA_TABLES_ONLY", "").strip().lower() == "true"
-
 # --- Frequent-value sampling threshold ---------------------------------------
 # Every backend's own Phase 2 "Column value samples" section picks each
 # categorical column's top FREQUENT_VALUES_LIMIT values by plain COUNT(*) -
@@ -953,7 +941,7 @@ def extract_entry_names_from_schema_text(schema_text, max_names=ROUTER_MAX_TABLE
 
 
 def split_schema_text_into_entries(schema_text):
-    """Splits a full get_schema()/get_schema_shallow() text into one entry
+    """Splits a full get_schema() text into one entry
     per table/table-family/tab, using the exact same heading convention
     extract_entry_names_from_schema_text (above) already recognizes -
     "Table: <name>", "Table family: <pattern> (...)", "Tab: <name> (...)"
@@ -1024,7 +1012,7 @@ def split_schema_text_into_entries(schema_text):
 # postgres.py's `f"  {col_name} {data_type} ..."`, mongodb_sql.py's
 # `f"  {col.column_name} {col.type_name} ..."`, bigquery.py's nested
 # column/struct lines) - by at least one leading space. The only other
-# kind of unindented line get_schema()/get_schema_shallow() ever emits is
+# kind of unindented line get_schema() ever emits is
 # a table/table-family/tab heading (_ENTRY_HEADING_RE above) or the
 # "[... N more table(s)/table-family(ies) not shown ...]" overflow notice
 # that can immediately follow the table loop - both excluded here via
@@ -1054,12 +1042,21 @@ def derive_tables_only_schema_text(schema_text):
     Partition columns) dropped entirely. This is the "tables_only" schema
     kind: a cheaper-to-send-to-an-LLM derivative of the already-cached
     deep schema, computed purely in memory - no new database round trip,
-    no new schema_cache entry (see translate_routes.py's
-    get_llm_schema_text, the only caller, gated by SCHEMA_TABLES_ONLY
-    above).
+    no new schema_cache entry. Used by both triage call sites
+    (sql_generation.py's get_triage_schema_text, dataset-group mode's
+    own build_router_candidate_summaries in db.py) and both
+    summarization call sites (summarize_routes.py's get_summary_
+    schema_text) - every one of them unconditionally, since triage and
+    summarization never need anything beyond table/column names and
+    types. Neither SQL-generation path (single-dataset mode's get_llm_
+    schema_text, dataset-group mode's Phase B generate_sql_for_
+    connection) calls this at all - both always send the model the full
+    deep schema instead, since that's the one place a constraint, an
+    index, or a likely-relationship hint can actually change what SQL
+    gets written.
 
     Relies on a structural fact confirmed across every backend's
-    get_schema()/get_schema_shallow(): the Tables-and-Columns loop always
+    get_schema(): the Tables-and-Columns loop always
     runs FIRST and appends every table/table-family entry as one
     contiguous block, before any other section is even queried, let
     alone appended (mssql.py even reorders explicitly - `schema_parts =
@@ -1199,34 +1196,19 @@ class Backend(ABC):
         None/empty if nothing could be introspected - the caller (db.py)
         owns deciding what fallback text to show and whether to cache it.
 
-        This is the "deep" fetch (Phase 1 catalog-only content plus Phase 2
+        This is the full fetch (Phase 1 catalog-only content plus Phase 2
         live-query enrichment - sampling, min/max, cardinality, live row
         counts, full view/routine bodies, naming-convention relationship
-        pass) - see get_schema_shallow() below for the catalog-only subset.
-        Every existing caller of get_schema() (single-connection mode, and
-        all-dbs Phase B generation for a connection the router actually
-        selected) wants this one, unchanged from before this split
-        existed."""
-
-    @abstractmethod
-    def get_schema_shallow(self, connection):
-        """Return the Phase 1 (catalog-only, no live queries) subset of
-        get_schema()'s text - same tables/columns/constraints/indexes plus
-        the new catalog-only attributes (identity markers, comments, row-
-        count estimates, routine existence+signature without bodies,
-        distribution/partition/clustering keys, session facts,
-        RLS/external flags), but view/routine bodies are named/
-        signatured only, never rendered in full here.
-
-        Used for connections that may not even be selected for SQL
-        generation - db.py's build_router_candidate_summaries() (all-dbs
-        Phase A triage) calls this instead of get_schema() specifically so
-        an all-dbs question against N connections doesn't pay Phase 2's
-        live-query cost for the N-1 connections the router never routes
-        to. get_schema() (deep) builds on top of the same catalog data
-        this returns rather than re-querying it - see each backend's
-        _build_shallow_schema_parts() private helper, which both this
-        method and get_schema() call."""
+        pass). Most backends implement this as Phase 1 (each one's own
+        private _build_shallow_schema_parts() helper) plus Phase 2 built
+        on top of it, in one method - there is no longer a separate
+        public Phase-1-only entry point (an earlier get_schema_shallow()
+        existed for db.py's build_router_candidate_summaries() to call for
+        all-dbs triage without paying Phase 2's live-query cost on every
+        in-scope connection; that function was later rewritten to derive
+        its compact summary straight from whichever deep entry is already
+        cached instead, which removed the only caller - see db.py's own
+        history for the full reasoning)."""
 
     @abstractmethod
     def execute(self, connection, sql_text):

@@ -110,7 +110,7 @@ def test_execute_reaches_the_resolved_spreadsheet_and_tab(app_env, sheets_harnes
     # sheets_harness queue) would non-deterministically let the priming
     # fetch consume the response meant for /api/execute instead. Waiting
     # for that background fetch's own request to land first (it always
-    # makes exactly one - see backends/sheets.py's get_schema_shallow())
+    # makes exactly one - see backends/sheets.py's get_schema())
     # removes that race, same fix applied to the equivalent
     # background-thread races in test_config_schema_refetch.py.
     import time

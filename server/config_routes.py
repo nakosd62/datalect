@@ -1665,23 +1665,19 @@ def handle_debug_schema_cache():
     cache_contents = schema_cache.dump()
     entries = {}
     total_bytes = 0
-    dataset_totals = {}  # dataset identifier -> summed bytes across its deep + shallow entries
+    dataset_totals = {}  # dataset identifier -> its entry's byte total
     for key, text in cache_contents.items():
         text = text or ""
         byte_length = len(text.encode('utf-8'))
         total_bytes += byte_length
         entries[key] = {"length": byte_length, "content": text}
 
-        # Group by dataset: db.py caches a deep entry under the plain
-        # connection identifier and a shallow entry under that same
-        # identifier + "::shallow" (db.py's own, module-private
-        # _SHALLOW_CACHE_KEY_SUFFIX - duplicated here as a literal rather
-        # than importing a leading-underscore name, since this is a debug
-        # view, not a load-bearing dependency on db.py's internals). One
-        # dataset can have up to two entries; this collapses them into a
-        # single per-dataset byte total.
-        dataset_key = key[:-len("::shallow")] if key.endswith("::shallow") else key
-        dataset_totals[dataset_key] = dataset_totals.get(dataset_key, 0) + byte_length
+        # One entry per dataset today (db.py's cache_key = get_conn_
+        # identifier(descriptor)) - this used to also collapse a second,
+        # independently-cached "shallow" entry (that same key +
+        # "::shallow") into the same per-dataset total; removed along with
+        # that cache tier, so `key` is already the dataset identifier.
+        dataset_totals[key] = dataset_totals.get(key, 0) + byte_length
 
     return jsonify({
         "count": len(entries),
@@ -1770,7 +1766,7 @@ def handle_get_schema():
     except Exception:
         dialect = "SQL"
 
-    schema_text, reason = get_database_schema_with_reason(descriptor, user_identity, deep=True)
+    schema_text, reason = get_database_schema_with_reason(descriptor, user_identity)
     if reason is not None:
         # Same EMPTY-vs-everything-else split /api/config/refresh-schema's
         # own error messaging already makes (see that route's docstring) -
@@ -1792,12 +1788,12 @@ def handle_get_schema():
     entries = split_schema_text_into_entries(schema_text)
     # Informational only (webClient's "Last refreshed: ..." display under
     # the Schema Viewer's own Refresh Schema button - see schema_cache.py's
-    # get_cached_at() docstring) - looked up under the same deep cache key
-    # get_database_schema_with_reason(deep=True) above just read from/wrote
-    # to (db.py's own cache_key = get_conn_identifier(descriptor), no
-    # shallow suffix for deep=True). None for a connection whose schema was
-    # cached before this field existed, or - vanishingly briefly - one
-    # whose entry was invalidated between the read above and this one.
+    # get_cached_at() docstring) - looked up under the same cache key
+    # get_database_schema_with_reason() above just read from/wrote to
+    # (db.py's own cache_key = get_conn_identifier(descriptor)). None for a
+    # connection whose schema was cached before this field existed, or -
+    # vanishingly briefly - one whose entry was invalidated between the
+    # read above and this one.
     cached_at = schema_cache.get_cached_at(get_conn_identifier(descriptor))
     # See this route's own docstring for the full "overview" shape/design -
     # None whenever nothing has been generated (or cached) for this
@@ -2415,11 +2411,8 @@ def handle_config():
                         # would have missed.
                         #
                         # invalidate_schema_cache() (not schema_cache.invalidate()
-                        # directly) - a connection can now have two independent
-                        # cache entries, deep and shallow (see db.py's
-                        # get_database_schema()); clearing only the plain key
-                        # would leave a stale shallow-fetched schema cached
-                        # indefinitely after this switch.
+                        # directly) purely for the more descriptive name - see
+                        # that function's own docstring.
                         #
                         # invalidate BEFORE attempting the refetch (not
                         # after, and not skipped in favor of relying on
@@ -2438,12 +2431,10 @@ def handle_config():
                         }
                         invalidate_schema_cache(get_conn_identifier(changed_descriptor))
                         # Backgrounded (was a plain synchronous call here
-                        # before this change) - a full deep schema fetch
-                        # (all-dbs triage now derives its own summary
-                        # straight from this same deep entry - see
-                        # build_router_candidate_summaries() in db.py - so
-                        # there's no separate shallow fetch here anymore)
-                        # plus the schema-overview LLM call
+                        # before this change) - a full schema fetch (all-dbs
+                        # triage derives its own summary straight from this
+                        # same cached entry - see build_router_candidate_
+                        # summaries() in db.py) plus the schema-overview LLM call
                         # (prime_schema_cache_with_reason() in db.py) can
                         # take several seconds, and this whole /api/config
                         # POST used to block on it, leaving the config

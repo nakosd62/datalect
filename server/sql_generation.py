@@ -77,7 +77,7 @@ import time
 
 from app_config import logger, state_store, MAX_TRANSLATION_ATTEMPTS
 from backends import get_backend
-from backends.base import SCHEMA_TABLES_ONLY, derive_tables_only_schema_text
+from backends.base import derive_tables_only_schema_text
 from connection_router import run_triage_call, _extract_json_object
 from db import resolve_dataset_identity
 from llm_providers import LlmCallFailed, format_llm_error_for_user
@@ -293,31 +293,34 @@ def get_llm_schema_text(descriptor, user_identity, force_refresh=False):
     to the LLM being asked to translate a prompt into SQL for a single,
     explicitly-identified dataset.
 
-    Wraps get_database_schema() with the SCHEMA_TABLES_ONLY reduction
-    (see backends/base.py's derive_tables_only_schema_text) so that, when
-    that flag is enabled, this one call site hands the LLM the cheaper
-    tables-only derivative instead of the full deep schema text -
-    exactly, and only, for this "translating NL to SQL in single-dataset
-    mode" case. get_database_schema() itself is completely untouched by
-    this (same cache key, same cached full deep text either way) - this
-    only trims what gets handed onward to the LLM from here.
+    Always hands the LLM the full deep schema text, unchanged - a thin
+    pass-through over get_database_schema() kept as its own named
+    function (rather than every caller just calling get_database_schema()
+    directly) so this mode's SQL-generation schema fetch reads as its own
+    deliberate call site, parallel to get_triage_schema_text below and to
+    dataset-group mode's own Phase B fanout (generate_sql_for_connection,
+    which fetches the full schema itself rather than going through this
+    function - see its own docstring). This used to be reducible to the
+    cheaper "tables_only" derivative (see backends/base.py's derive_
+    tables_only_schema_text) via a SCHEMA_TABLES_ONLY env flag - removed
+    because SQL generation is exactly the one place a constraint, an
+    index, or a likely-relationship hint in the schema text can change
+    what SQL actually gets written, and that reduction was gating ONLY
+    this single-dataset path while dataset-group mode's own Phase B
+    fanout always sent the full schema regardless - an asymmetry with no
+    principled reason to exist. Both SQL-generation paths now always get
+    the same thing: the full deep schema, every time.
 
     Deliberately NOT used anywhere else schema_text reaches an LLM: both
     triage call sites - this mode's own get_triage_schema_text below, and
-    dataset-group mode's Phase A (connection_router.py's build_router_
-    candidate_summaries) - and both summarization call sites (Phase C's
-    _build_all_mode_schema_block and /api/summarize-results's stream_
-    summarize_result, both via summarize_routes.py's get_summary_
-    schema_text) always reduce to the tables_only derivative
-    UNCONDITIONALLY, regardless of this flag. SCHEMA_TABLES_ONLY only
-    ever affects this one path - the one place that still sends the full
-    deep schema by default. Dataset-group mode's Phase B fanout
-    (_run_phase_b_fanout via generate_sql_for_connection below) always
-    sees the full deep schema too, same as this function's own default."""
-    schema = translate_routes.get_database_schema(descriptor, user_identity, force_refresh=force_refresh)
-    if SCHEMA_TABLES_ONLY:
-        schema = derive_tables_only_schema_text(schema)
-    return schema
+    dataset-group mode's Phase A (db.py's build_router_candidate_
+    summaries) - and both summarization call sites (Phase C's _build_
+    all_mode_schema_block and /api/summarize-results's stream_summarize_
+    result, both via summarize_routes.py's get_summary_schema_text)
+    always reduce to the tables_only derivative - triage and
+    summarization never need anything beyond table/column names and
+    types."""
+    return translate_routes.get_database_schema(descriptor, user_identity, force_refresh=force_refresh)
 
 
 def get_triage_schema_text(descriptor, user_identity, force_refresh=False):
@@ -333,12 +336,13 @@ def get_triage_schema_text(descriptor, user_identity, force_refresh=False):
     view/routine definitions, live row counts, column value samples,
     likely relationships) left out.
 
-    This used to send a catalog-only "shallow" fetch instead (deep=False
-    - dialect and table/tab names only, no columns at all) on the theory
-    that triage only needs to know a dataset's shape. In practice, plenty
-    of triage decisions need real column names to get right - deciding
-    whether "when did we last hear from this customer" is answerable from
-    this dataset at all, or which of several similarly-named tables a
+    This used to send a catalog-only "shallow" fetch instead (a dedicated
+    Backend.get_schema_shallow() method and cache tier - dialect and
+    table/tab names only, no columns at all) on the theory that triage
+    only needs to know a dataset's shape. In practice, plenty of triage
+    decisions need real column names to get right - deciding whether
+    "when did we last hear from this customer" is answerable from this
+    dataset at all, or which of several similarly-named tables a
     group-mode question is actually about, routinely turns on there being
     an email/customer_id/last_contacted_at column, not just a table
     called "customers" existing. tables_only is the right middle ground:
@@ -347,22 +351,20 @@ def get_triage_schema_text(descriptor, user_identity, force_refresh=False):
     SQL generation (get_llm_schema_text above) and summarization both
     already get.
 
-    Fetches and caches the full DEEP schema (deep=True, get_database_
-    schema()'s own default) - the SAME cache entry get_llm_schema_text
-    above and every other deep-schema caller shares, rather than the old,
-    independently-cached shallow (deep=False, "::shallow" suffix) entry
-    this function used to request. A triage call and a SQL-generation
-    call for the same connection now share one fetch: whichever runs
-    first pays the (one-time, durably-cached-forever - see get_database_
-    schema's own docstring) cost of the real Phase 1 + Phase 2
-    introspection, and the other reuses it for free from cache - there is
-    no longer a separate "triage-schema cache" to go cold or warm on its
-    own. The old deep=False/"::shallow" fetch path itself is untouched by
-    this change (see get_database_schema's own docstring and
-    get_schema_shallow() on each Backend subclass) - still implemented
-    and still tested, simply with no remaining production caller now that
-    this function no longer uses it, in case a genuinely independent
-    shallow fetch is ever needed again for something else."""
+    Fetches and caches the full schema (get_database_schema()) - the SAME
+    cache entry get_llm_schema_text above and every other schema caller
+    shares, rather than the old, independently-fetched-and-cached shallow
+    entry this function used to request. A triage call and a
+    SQL-generation call for the same connection now share one fetch:
+    whichever runs first pays the (one-time, durably-cached-forever - see
+    get_database_schema's own docstring) cost of the real Phase 1 + Phase
+    2 introspection, and the other reuses it for free from cache - there
+    is no longer a separate "triage-schema cache" to go cold or warm on
+    its own. The old independent shallow-fetch machinery itself
+    (Backend.get_schema_shallow(), db.py's deep=True/False parameter, and
+    the "::shallow" cache-key suffix) has since been removed entirely -
+    it had no remaining caller anywhere in the codebase once this function
+    stopped using it."""
     schema = translate_routes.get_database_schema(descriptor, user_identity, force_refresh=force_refresh)
     return derive_tables_only_schema_text(schema)
 

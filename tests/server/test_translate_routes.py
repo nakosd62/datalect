@@ -225,7 +225,7 @@ def test_success_strips_markdown_fences_and_returns_token_counts(app_factory, mo
 def test_success_streams_schema_triage_and_generating_sql_phase_status_before_done(app_factory, monkeypatch):
     """The single-connection path (see stream_translation()'s module
     docstring) emits THREE {"status": "phase_status", ...} lines ahead of
-    the terminal "done" line - one before the shallow schema lookup, one
+    the terminal "done" line - one before the schema lookup, one
     before Call 1 (triage), one before Call 2 (SQL generation) - so the
     client has something better than a bare spinner for the real waits
     that happen before any SQL comes back. None is a "retrying" line, so
@@ -252,20 +252,19 @@ def test_success_streams_schema_triage_and_generating_sql_phase_status_before_do
     assert events[-1]["success"] is True
 
 
-# --- SCHEMA_TABLES_ONLY: the "tables_only" schema kind, single-dataset mode --
+# --- The "tables_only" schema kind, and who actually gets it ---------------
 # A cheaper-to-send-to-an-LLM derivative of the already-cached deep schema
 # (see backends/base.py's derive_tables_only_schema_text) - full per-table
 # detail kept, every other schema-object section (Constraints, Indexes,
-# Views, ...) dropped, purely to cut input token cost. Scoped deliberately
-# narrowly: only stream_translation()'s own single-dataset-mode path (via
-# get_llm_schema_text below) is affected. Dataset-group mode's Phase A
-# triage (an unrelated, much smaller "shallow" candidate-summary
-# representation), Phase B fanout, Phase C summarization, and
-# /api/summarize-results all keep seeing the full deep schema regardless -
-# see test_connection_router.py's own SCHEMA_TABLES_ONLY scoping tests for
-# that half of the guarantee.
+# Views, ...) dropped. Used unconditionally by both triage call sites
+# (this mode's get_triage_schema_text, dataset-group mode's Phase A) and
+# both summarization call sites (get_summary_schema_text) - never by
+# either SQL-generation path (this mode's get_llm_schema_text, dataset-
+# group mode's Phase B fanout), which always get the full deep schema -
+# see test_connection_router.py's own tests covering the group-mode half
+# of that split.
 
-def test_get_llm_schema_text_returns_the_full_schema_by_default(app_factory, monkeypatch, tmp_path):
+def test_get_llm_schema_text_always_returns_the_full_schema(app_factory, monkeypatch, tmp_path):
     from helpers import write_database_presets_file
     presets_path = write_database_presets_file(tmp_path, [
         {"id": "pg-a", "name": "Postgres A", "type": "postgres", "url": "postgresql://u:p@h/a"},
@@ -280,44 +279,15 @@ def test_get_llm_schema_text_returns_the_full_schema_by_default(app_factory, mon
     descriptor = {"type": "postgres", "url": "postgresql://u:p@h/a"}
     schema_cache.set(db_module.get_conn_identifier(descriptor), deep_schema)
 
-    assert env.translate_routes.SCHEMA_TABLES_ONLY is False
     result = env.translate_routes.get_llm_schema_text(descriptor, None)
     assert result == deep_schema
 
 
-def test_get_llm_schema_text_reduces_to_tables_only_when_the_flag_is_set(app_factory, monkeypatch, tmp_path):
-    from helpers import write_database_presets_file
-    presets_path = write_database_presets_file(tmp_path, [
-        {"id": "pg-a", "name": "Postgres A", "type": "postgres", "url": "postgresql://u:p@h/a"},
-    ])
-    env = app_factory(env={"DATABASE_PRESETS_FILE": presets_path, "SCHEMA_TABLES_ONLY": "true"})
-    import db as db_module
-    import schema_cache
-    deep_schema = (
-        "Table: customers\n  id integer NOT NULL\n\n"
-        "Constraints:\n  none\n"
-    )
-    descriptor = {"type": "postgres", "url": "postgresql://u:p@h/a"}
-    schema_cache.set(db_module.get_conn_identifier(descriptor), deep_schema)
-
-    assert env.translate_routes.SCHEMA_TABLES_ONLY is True
-    result = env.translate_routes.get_llm_schema_text(descriptor, None)
-    assert result == "Table: customers\n  id integer NOT NULL"
-    assert "Constraints:" not in result
-
-    # get_database_schema() itself is untouched - still the full deep text
-    # under the same cache key, for any other caller (the schema viewer,
-    # etc.) regardless of this flag.
-    assert db_module.get_database_schema(descriptor) == deep_schema
-
-
-def test_get_summary_schema_text_always_reduces_to_tables_only_even_when_the_flag_is_off(app_factory, tmp_path):
+def test_get_summary_schema_text_always_reduces_to_tables_only(app_factory, tmp_path):
     # Both summarization call sites (stream_summarize_result and
     # _build_all_mode_schema_block) go through get_summary_schema_text
-    # instead of get_llm_schema_text - it ALWAYS reduces to the
-    # tables_only derivative, unconditionally, regardless of
-    # SCHEMA_TABLES_ONLY. Deliberately does NOT set that env var here, to
-    # prove this isn't just piggybacking on the flag.
+    # instead of get_llm_schema_text - it always reduces to the
+    # tables_only derivative, unlike either SQL-generation path.
     from helpers import write_database_presets_file
     presets_path = write_database_presets_file(tmp_path, [
         {"id": "pg-a", "name": "Postgres A", "type": "postgres", "url": "postgresql://u:p@h/a"},
@@ -332,7 +302,6 @@ def test_get_summary_schema_text_always_reduces_to_tables_only_even_when_the_fla
     descriptor = {"type": "postgres", "url": "postgresql://u:p@h/a"}
     schema_cache.set(db_module.get_conn_identifier(descriptor), deep_schema)
 
-    assert env.translate_routes.SCHEMA_TABLES_ONLY is False
     result = env.translate_routes.get_summary_schema_text(descriptor, None)
     assert result == "Table: customers\n  id integer NOT NULL"
     assert "Constraints:" not in result
@@ -341,18 +310,7 @@ def test_get_summary_schema_text_always_reduces_to_tables_only_even_when_the_fla
     assert db_module.get_database_schema(descriptor) == deep_schema
 
 
-def test_schema_tables_only_env_var_is_only_true_for_the_literal_string_true(app_factory):
-    env = app_factory(env={"SCHEMA_TABLES_ONLY": "1"})
-    assert env.translate_routes.SCHEMA_TABLES_ONLY is False
-
-    env = app_factory(env={"SCHEMA_TABLES_ONLY": "TRUE"})
-    assert env.translate_routes.SCHEMA_TABLES_ONLY is True
-
-    env = app_factory(env={})
-    assert env.translate_routes.SCHEMA_TABLES_ONLY is False
-
-
-def test_single_dataset_mode_translate_sends_the_full_schema_by_default(app_factory, monkeypatch, tmp_path):
+def test_single_dataset_mode_translate_sends_the_full_schema_to_call_2(app_factory, monkeypatch, tmp_path):
     from helpers import write_database_presets_file
     presets_path = write_database_presets_file(tmp_path, [
         {"id": "pg-a", "name": "Postgres A", "type": "postgres", "url": "postgresql://u:p@h/a"},
@@ -379,9 +337,8 @@ def test_single_dataset_mode_translate_sends_the_full_schema_by_default(app_fact
     # generate_calls[0] is Call 1 (triage), which always sees the
     # "tables_only" derivative (get_triage_schema_text) - full table/
     # column detail, but never anything deeper like "Constraints:".
-    # SCHEMA_TABLES_ONLY's own (flag-gated) reduction only ever applies to
-    # Call 2 (generate_calls[1], get_llm_schema_text), which is what the
-    # rest of this test is actually about.
+    # generate_calls[1] is Call 2 (get_llm_schema_text), which always gets
+    # the full deep schema, Constraints and all.
     triage_schema_text = harness.generate_calls[0]["contents"][0].parts[0].text
     assert "Table: customers" in triage_schema_text
     assert "Constraints:" not in triage_schema_text
@@ -389,41 +346,6 @@ def test_single_dataset_mode_translate_sends_the_full_schema_by_default(app_fact
     schema_text = harness.generate_calls[1]["contents"][0].parts[0].text
     assert "Table: customers" in schema_text
     assert "Constraints:" in schema_text
-
-
-def test_single_dataset_mode_translate_sends_only_tables_when_schema_tables_only_is_set(app_factory, monkeypatch, tmp_path):
-    from helpers import write_database_presets_file
-    presets_path = write_database_presets_file(tmp_path, [
-        {"id": "pg-a", "name": "Postgres A", "type": "postgres", "url": "postgresql://u:p@h/a"},
-    ])
-    env = app_factory(env={
-        "GEMINI_PRESET_KEYS": "fake-key-1",
-        "DATABASE_PRESETS_FILE": presets_path,
-        "SCHEMA_TABLES_ONLY": "true",
-    })
-    env.app_config.state_store.set_session("global", connection_id="pg-a", is_custom=False)
-    import db as db_module
-    import schema_cache
-    deep_schema = (
-        "Table: customers\n  id integer NOT NULL\n\n"
-        "Constraints:\n  none\n"
-    )
-    descriptor = {"type": "postgres", "url": "postgresql://u:p@h/a"}
-    schema_cache.set(db_module.get_conn_identifier(descriptor), deep_schema)
-
-    harness = GenaiHarness()
-    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
-    harness.queue_response(FakeGenaiResponse('{"action": "sql"}'))
-    harness.queue_response(FakeGenaiResponse('{"sql": "SELECT * FROM customers;"}'))
-
-    resp = env.client.post('/api/translate', json={'prompt': 'show customers'})
-    parse_translate_stream(resp)
-
-    # See the previous test's own comment - Call 2 (generate_calls[1]) is
-    # the one SCHEMA_TABLES_ONLY actually affects.
-    schema_text = harness.generate_calls[1]["contents"][0].parts[0].text
-    assert "Table: customers" in schema_text
-    assert "Constraints:" not in schema_text
 
 
 def test_success_records_translation_history(app_factory, monkeypatch):
@@ -556,9 +478,9 @@ def test_schema_precedes_history_and_is_not_glued_to_the_new_prompt(app_factory,
     resp = env.client.post('/api/translate', json={'prompt': 'now show orders', 'history': history})
     parse_translate_stream(resp)  # drains the stream - see this file's module docstring
 
-    # generate_calls[1] - Call 2's own input (the deep schema block, per
+    # generate_calls[1] - Call 2's own input (the full schema block, per
     # get_llm_schema_text). Call 1/triage (generate_calls[0]) gets the same
-    # ordering guarantee too, just prefixed with its own shallow schema
+    # ordering guarantee too, just prefixed with its own tables-only schema
     # block instead - not this test's concern.
     contents = harness.generate_calls[1]["contents"]
     assert contents[0].parts[0].text == "Database Schema:\nNo schema description available.\n\nshow users"
@@ -1903,9 +1825,9 @@ def test_claude_schema_precedes_history_and_is_not_glued_to_the_new_prompt(app_f
     resp = env.client.post('/api/translate', json={'prompt': 'now show orders', 'history': history})
     parse_translate_stream(resp)  # drains the stream - see this file's module docstring
 
-    # create_calls[1] - Call 2's own input (the deep schema block). Call 1
+    # create_calls[1] - Call 2's own input (the full schema block). Call 1
     # (create_calls[0]) gets the same ordering guarantee too, just prefixed
-    # with its own shallow schema block instead - not this test's concern.
+    # with its own tables-only schema block instead - not this test's concern.
     messages = harness.create_calls[1]["messages"]
     # A single-entry history means this message is both the first (schema
     # prepended) AND the last historical turn - content is a plain string
@@ -4609,19 +4531,19 @@ def test_parse_sql_generation_response_returns_none_for_unparseable_or_empty_tex
 
 # --- get_triage_schema_text ---------------------------------------------------
 
-def test_get_triage_schema_text_fetches_the_deep_schema_and_reduces_to_tables_only(app_env, monkeypatch):
+def test_get_triage_schema_text_fetches_the_full_schema_and_reduces_to_tables_only(app_env, monkeypatch):
     calls = []
-    deep_schema = (
+    full_schema = (
         "Table: customers\n  id integer NOT NULL\n\n"
         "Constraints:\n  none\n"
     )
 
-    def _fake_get_database_schema(descriptor, user_identity, force_refresh=False, deep=True):
+    def _fake_get_database_schema(descriptor, user_identity, force_refresh=False):
         calls.append({
             "descriptor": descriptor, "user_identity": user_identity,
-            "force_refresh": force_refresh, "deep": deep,
+            "force_refresh": force_refresh,
         })
-        return deep_schema
+        return full_schema
 
     monkeypatch.setattr(app_env.translate_routes, "get_database_schema", _fake_get_database_schema)
     result = app_env.translate_routes.get_triage_schema_text({"url": "sqlite:///x"}, "alice", force_refresh=True)
@@ -4635,10 +4557,6 @@ def test_get_triage_schema_text_fetches_the_deep_schema_and_reduces_to_tables_on
     assert calls[0]["descriptor"] == {"url": "sqlite:///x"}
     assert calls[0]["user_identity"] == "alice"
     assert calls[0]["force_refresh"] is True
-    # Fetches the SAME full deep schema get_llm_schema_text uses (no
-    # deep=False/shallow fetch of its own anymore) - deep defaults to
-    # True, so this wrapper doesn't even need to pass it explicitly.
-    assert calls[0]["deep"] is True
 
 
 # --- triage_single_dataset_question -------------------------------------------

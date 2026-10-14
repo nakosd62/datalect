@@ -117,15 +117,15 @@ def get_summary_schema_text(descriptor, user_identity):
     summarization, via summarize_all_mode_results) below.
 
     Always reduces to the "tables_only" schema derivative (see
-    backends/base.py's derive_tables_only_schema_text) - unconditionally,
-    regardless of SCHEMA_TABLES_ONLY. Unlike get_llm_schema_text above
-    (single-dataset mode's own SQL-GENERATION path, which only reduces
-    when that flag is explicitly turned on), summarizing an already-
-    executed query's results never needs anything beyond what each
-    table/column means - never constraints, indexes, views, or any of the
-    other schema-object sections a translate prompt can still carry when
-    SCHEMA_TABLES_ONLY is off - so this reduces every time,
-    independent of that flag's setting.
+    backends/base.py's derive_tables_only_schema_text) - unconditionally.
+    Unlike sql_generation.py's get_llm_schema_text/generate_sql_for_
+    connection (the actual SQL-GENERATION paths, both of which always get
+    the full deep schema, since a constraint/index/likely-relationship
+    hint there can change what SQL gets written), summarizing an
+    already-executed query's results never needs anything beyond what
+    each table/column means - never constraints, indexes, views, or any
+    of the other schema-object sections a translate prompt still carries
+    - so this reduces every time.
 
     get_database_schema() itself is completely untouched by this (same
     cache key, same cached full deep text either way, for any other
@@ -619,8 +619,8 @@ def _build_all_mode_schema_block(database_results, user_identity):
     credentials sent by the client) - then its schema is fetched via
     get_summary_schema_text() above, the SAME cached get_database_schema()
     Phase B/single-connection mode already use, but always reduced to the
-    "tables_only" derivative regardless of SCHEMA_TABLES_ONLY - Phase C
-    only ever needs to know what each table/column means, never
+    "tables_only" derivative - Phase C only ever needs to know what each
+    table/column means, never
     constraints/indexes/views/etc, and every database referenced here
     already got its full schema fetched (and cached) moments earlier in
     this same turn by Phase B, so this costs nothing beyond a cache

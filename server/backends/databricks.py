@@ -57,12 +57,11 @@ against the fake DB-API harness in tests/server/helpers.py, not a real
 Databricks workspace yet - treat the SQL/kwarg shapes here as a solid
 first draft, not as already battle-tested the way backends/postgres.py is.
 
---- Two-phase schema introspection (get_schema_shallow / get_schema) -------
-Like every other SQL backend here, schema introspection is split into a
-cheap, catalog-only Phase 1 (_build_shallow_schema_parts, shared by both
-entry points) and a richer, live-query Phase 2 (appended only by
-get_schema(), the "deep" fetch) - see backends/base.py's
-Backend.get_schema()/get_schema_shallow() docstrings for why this split
+--- Two-phase schema introspection ----------------------------------------
+Like every other SQL backend here, schema introspection is split
+internally into a cheap, catalog-only Phase 1 (_build_shallow_schema_parts)
+and a richer, live-query Phase 2 (appended only by get_schema()) - see
+backends/base.py's Backend.get_schema() docstring for why this split
 exists at all, and backends/postgres.py's own _build_shallow_schema_parts
 for the worked pattern this mirrors.
 
@@ -265,11 +264,11 @@ class DatabricksBackend(Backend):
         return db_name, username
 
     def _build_shallow_schema_parts(self, connection):
-        """Phase 1 (catalog-only, no live queries): every query both
-        get_schema_shallow() and get_schema() (deep) need, run exactly once
-        here and shared by both - see the module-level docstring's note on
-        the two-phase split and backends/base.py's Backend.get_schema()/
-        get_schema_shallow() docstrings for why this split exists at all.
+        """Phase 1 (catalog-only, no live queries), run exactly once here
+        and used as the base get_schema() appends Phase 2 onto - see the
+        module-level docstring's note on the two-phase split and
+        backends/base.py's Backend.get_schema() docstring for why this
+        split exists at all.
 
         Returns None if the connection's current_catalog()/current_schema()
         has no in-scope table at all (mirrors get_schema()'s old
@@ -601,15 +600,6 @@ class DatabricksBackend(Backend):
             "routines": routines,
         }
         return schema_parts, table_columns, phase2_ctx
-
-    def get_schema_shallow(self, connection):
-        built = self._build_shallow_schema_parts(connection)
-        if built is None:
-            return None
-        schema_parts, _table_columns, _phase2_ctx = built
-        if not schema_parts:
-            return None
-        return cap_schema_text("\n\n".join(schema_parts))
 
     def get_schema(self, connection):
         built = self._build_shallow_schema_parts(connection)

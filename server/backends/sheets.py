@@ -359,24 +359,22 @@ class SheetsBackend(Backend):
             raise ValueError(f"Invalid Google Sheets query: {detail}")
         return payload["table"]
 
-    def get_schema_shallow(self, connection):
+    def get_schema(self, connection):
         """Sheets has no real Phase 1/Phase 2 distinction: there's no
         catalog/information_schema to introspect at all - a spreadsheet
         "tab" has no metadata describing its own columns/types except by
         actually querying some rows (the sample query below), so even the
-        cheapest possible schema description here already requires exactly
-        the live query get_schema() (deep) would also run. None of the new
-        catalog-only attribute groups (identity markers, comments, row-
-        count estimates, routine signatures, distribution keys, session
-        facts, RLS/external flags) apply either - a single
-        tab has no comparable catalog to source any of them from. So this
-        IS the full get_schema_shallow()/get_schema() story for this
-        backend; get_schema() below is a thin alias, not a separate deep
-        layer. (db.py's all-dbs triage step - build_router_candidate_
-        summaries() - no longer calls get_schema_shallow() on any backend
-        at all, deep or otherwise; it derives its summary straight from
-        whatever deep entry is already cached, so this method's only real
-        caller today is get_schema() just below.)"""
+        cheapest possible schema description here already requires a live
+        query. None of the catalog-only attribute groups other backends
+        add (identity markers, comments, row-count estimates, routine
+        signatures, distribution keys, session facts, RLS/external flags)
+        apply either - a single tab has no comparable catalog to source
+        any of them from.
+        """
+        # Deliberately no "Estimated dataset size" line here (see
+        # backends/base.py's format_dataset_size_line()) - the GViz
+        # interface this backend talks to has no metadata endpoint to get
+        # row/byte totals from, cheaply or otherwise.
         try:
             table = self._fetch(connection, f"select * limit {SHEETS_SCHEMA_SAMPLE_ROWS}")
         except Exception:
@@ -411,15 +409,6 @@ class SheetsBackend(Backend):
             "by name."
         )
         return cap_schema_text("\n".join(lines))
-
-    def get_schema(self, connection):
-        """No separate deep layer for this backend - see
-        get_schema_shallow()'s docstring for why."""
-        # Deliberately no "Estimated dataset size" line here (see
-        # backends/base.py's format_dataset_size_line()) - the GViz
-        # interface this backend talks to has no metadata endpoint to get
-        # row/byte totals from, cheaply or otherwise.
-        return self.get_schema_shallow(connection)
 
     def execute(self, connection, sql_text):
         # Deliberately NOT sqlparse.split() - this grammar has no

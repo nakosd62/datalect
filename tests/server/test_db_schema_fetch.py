@@ -22,26 +22,14 @@ if SERVER_DIR not in sys.path:
 
 class _FakeBackend:
     """Stands in for a real dialect backend - only the methods
-    _fetch_database_schema/get_conn_identifier actually call.
+    _fetch_database_schema/get_conn_identifier actually call."""
 
-    get_schema_shallow returns a distinct, separately-controllable text
-    from get_schema (deep) - by default derived from the deep text so a
-    test that doesn't care about the shallow/deep distinction can still
-    tell, from the returned string alone, which method actually got
-    called (see the "deep=False dispatches to get_schema_shallow, not
-    get_schema" tests below)."""
-
-    def __init__(self, schema_text, raise_on_get_schema=None, shallow_schema_text=None):
+    def __init__(self, schema_text, raise_on_get_schema=None):
         self._schema_text = schema_text
         self._raise_on_get_schema = raise_on_get_schema
-        self._shallow_schema_text = (
-            shallow_schema_text if shallow_schema_text is not None
-            else (f"[shallow] {schema_text}" if schema_text else schema_text)
-        )
         self.connect_calls = []
         self.closed_connections = []
         self.get_schema_calls = 0
-        self.get_schema_shallow_calls = 0
         self.dialect_name = "SQL"
 
     def connect(self, descriptor):
@@ -54,12 +42,6 @@ class _FakeBackend:
             raise self._raise_on_get_schema
         return self._schema_text
 
-    def get_schema_shallow(self, connection):
-        self.get_schema_shallow_calls += 1
-        if self._raise_on_get_schema:
-            raise self._raise_on_get_schema
-        return self._shallow_schema_text
-
     def cache_key(self, descriptor):
         return "fake-user@fake-host/fake-db"
 
@@ -67,9 +49,9 @@ class _FakeBackend:
         self.closed_connections.append(connection)
 
 
-def _install_fake_backend(monkeypatch, schema_text=None, raise_on_get_schema=None, shallow_schema_text=None):
+def _install_fake_backend(monkeypatch, schema_text=None, raise_on_get_schema=None):
     import db as db_module
-    fake = _FakeBackend(schema_text, raise_on_get_schema=raise_on_get_schema, shallow_schema_text=shallow_schema_text)
+    fake = _FakeBackend(schema_text, raise_on_get_schema=raise_on_get_schema)
     monkeypatch.setattr(db_module, "get_backend", lambda descriptor: fake)
     return db_module, fake
 
@@ -260,117 +242,57 @@ def test_schema_text_with_both_kinds_of_truncation_logs_two_independent_warnings
     assert not any(r.levelname == "ERROR" for r in caplog.records)
 
 
-# --- deep/shallow schema-fetch split --------------------------------------------
+# --- single schema cache entry per connection ------------------------------------
 #
-# The two-phase schema-introspection architecture (see docs/schema_two_phase_proposal.md
-# and the backends/*.py get_schema_shallow() split): _fetch_database_schema
-# and get_database_schema both grew a `deep` parameter (default True, so
-# every pre-existing caller keeps getting exactly what it always got) that
-# picks between backend.get_schema() (deep - Phase 1 + Phase 2) and
-# backend.get_schema_shallow() (Phase 1 only) - and get_database_schema
-# caches the two under independent keys so a connection can have both
-# cached at once without one clobbering the other.
+# There used to be a two-phase schema-introspection architecture here: a
+# `deep` parameter on _fetch_database_schema/get_database_schema (default
+# True) picked between backend.get_schema() (Phase 1 + Phase 2) and a
+# backend.get_schema_shallow() (Phase 1 only), cached under independent
+# keys. That split was never actually used by any live caller - triage and
+# summarization always reduced the one full/deep entry down to a
+# tables-only derivative in memory (see derive_tables_only_schema_text())
+# rather than fetching/caching a separate shallow entry - so it was removed
+# entirely. Every fetch now goes through backend.get_schema() and is cached
+# under a single key per connection.
 
-def test_fetch_database_schema_deep_true_calls_get_schema_not_shallow(app_factory, monkeypatch):
+def test_fetch_database_schema_calls_get_schema(app_factory, monkeypatch):
     app_factory()
     db_module, fake = _install_fake_backend(monkeypatch, schema_text="Table: t\n  id integer NOT NULL")
 
-    result = db_module._fetch_database_schema({"type": "postgres", "url": "postgresql://u:p@host/db"}, deep=True)
+    result = db_module._fetch_database_schema({"type": "postgres", "url": "postgresql://u:p@host/db"})
 
     assert result == "Table: t\n  id integer NOT NULL"
     assert fake.get_schema_calls == 1
-    assert fake.get_schema_shallow_calls == 0
 
 
-def test_fetch_database_schema_deep_false_calls_get_schema_shallow_not_deep(app_factory, monkeypatch):
+def test_invalidate_schema_cache_clears_the_cached_entry(app_factory, monkeypatch):
     app_factory()
-    db_module, fake = _install_fake_backend(monkeypatch, schema_text="Table: t\n  id integer NOT NULL")
-
-    result = db_module._fetch_database_schema({"type": "postgres", "url": "postgresql://u:p@host/db"}, deep=False)
-
-    assert result == "[shallow] Table: t\n  id integer NOT NULL"
-    assert fake.get_schema_calls == 0
-    assert fake.get_schema_shallow_calls == 1
-
-
-def test_fetch_database_schema_defaults_to_deep(app_factory, monkeypatch):
-    # Every caller that existed before this split (single-connection mode,
-    # Phase B generation) calls _fetch_database_schema/get_database_schema
-    # with no `deep` argument at all - the default must still mean "deep",
-    # not silently switch anyone over to the cheaper shallow fetch.
-    app_factory()
-    db_module, fake = _install_fake_backend(monkeypatch, schema_text="Table: t\n  id integer NOT NULL")
-
-    db_module._fetch_database_schema({"type": "postgres", "url": "postgresql://u:p@host/db"})
-
-    assert fake.get_schema_calls == 1
-    assert fake.get_schema_shallow_calls == 0
-
-
-def test_get_database_schema_deep_and_shallow_cache_under_independent_keys(app_factory, monkeypatch):
-    # A deep fetch and a shallow fetch for the SAME connection must not
-    # share a cache slot - otherwise whichever one ran first would get
-    # served back to a caller that asked for the other (e.g. all-dbs
-    # triage's cheap shallow fetch silently answering a real generation
-    # call that needs the full deep text, or vice versa).
-    app_factory()
-    db_module, fake = _install_fake_backend(monkeypatch, schema_text="DEEP TEXT")
+    db_module, fake = _install_fake_backend(monkeypatch, schema_text="SCHEMA TEXT")
     descriptor = {"type": "postgres", "url": "postgresql://u:p@host/db"}
 
-    deep_result = db_module.get_database_schema(descriptor, deep=True)
-    shallow_result = db_module.get_database_schema(descriptor, deep=False)
-
-    assert deep_result == "DEEP TEXT"
-    assert shallow_result == "[shallow] DEEP TEXT"
-    # Each was actually fetched once (not served from the other's cache
-    # entry) - one get_schema call, one get_schema_shallow call.
+    db_module.get_database_schema(descriptor)
     assert fake.get_schema_calls == 1
-    assert fake.get_schema_shallow_calls == 1
-
-    # And each is independently cached from here on - calling either again
-    # doesn't trigger a second real fetch.
-    db_module.get_database_schema(descriptor, deep=True)
-    db_module.get_database_schema(descriptor, deep=False)
-    assert fake.get_schema_calls == 1
-    assert fake.get_schema_shallow_calls == 1
-
-
-def test_invalidate_schema_cache_clears_both_deep_and_shallow_entries(app_factory, monkeypatch):
-    app_factory()
-    db_module, fake = _install_fake_backend(monkeypatch, schema_text="DEEP TEXT")
-    descriptor = {"type": "postgres", "url": "postgresql://u:p@host/db"}
-
-    db_module.get_database_schema(descriptor, deep=True)
-    db_module.get_database_schema(descriptor, deep=False)
-    assert fake.get_schema_calls == 1
-    assert fake.get_schema_shallow_calls == 1
 
     db_module.invalidate_schema_cache(db_module.get_conn_identifier(descriptor))
 
-    # Both entries were dropped - the next call to either re-fetches live
-    # rather than serving stale cached text.
-    db_module.get_database_schema(descriptor, deep=True)
-    db_module.get_database_schema(descriptor, deep=False)
+    # The entry was dropped - the next call re-fetches live rather than
+    # serving stale cached text.
+    db_module.get_database_schema(descriptor)
     assert fake.get_schema_calls == 2
-    assert fake.get_schema_shallow_calls == 2
 
 
-def test_build_router_candidate_summaries_reads_only_the_cached_deep_entry_no_live_fetch(
+def test_build_router_candidate_summaries_reads_only_the_cached_entry_no_live_fetch(
         app_factory, monkeypatch):
     # build_router_candidate_summaries() must NEVER connect to or query a
-    # real database - not even the cheaper Phase-1-only introspection.
-    # There used to be a genuinely separate, independently-fetched
-    # "shallow" cache entry just for this - removed because the deep text
-    # was always a superset of it anyway (see db.py's own docstring). Now
-    # this reads ONLY whatever deep entry is already sitting in
+    # real database. It reads ONLY whatever entry is already sitting in
     # schema_cache, in memory, and reduces it via
     # derive_tables_only_schema_text - zero backend calls either way.
     app_factory()
-    deep_schema = (
+    schema_text = (
         "Table: customers\n  id integer NOT NULL\n\n"
         "Constraints:\n  none\n"
     )
-    db_module, fake = _install_fake_backend(monkeypatch, schema_text=deep_schema)
+    db_module, fake = _install_fake_backend(monkeypatch, schema_text=schema_text)
     descriptor = {"type": "postgres", "url": "postgresql://u:p@host/db"}
 
     # Nothing cached yet - degrades to an empty schema_text, still with no
@@ -380,11 +302,10 @@ def test_build_router_candidate_summaries_reads_only_the_cached_deep_entry_no_li
     )
     assert summaries == [{"name": "My DB", "dialect": "SQL", "schema_text": ""}]
     assert fake.get_schema_calls == 0
-    assert fake.get_schema_shallow_calls == 0
 
-    # Warm the deep cache the ordinary way (a ordinary generation call, or
-    # a prefetch/refresh would do this in real life) - now the SAME cached
-    # deep text is what triage's summary is derived from.
+    # Warm the cache the ordinary way (an ordinary generation call, or a
+    # prefetch/refresh would do this in real life) - now the SAME cached
+    # text is what triage's summary is derived from.
     db_module.get_database_schema(descriptor)
     assert fake.get_schema_calls == 1
 
@@ -397,9 +318,8 @@ def test_build_router_candidate_summaries_reads_only_the_cached_deep_entry_no_li
         "name": "My DB", "dialect": "SQL",
         "schema_text": "Table: customers\n  id integer NOT NULL",
     }]
-    # Still no shallow call, and no SECOND deep call either - this was a
-    # pure cache read, not a fetch of any kind.
-    assert fake.get_schema_shallow_calls == 0
+    # No SECOND fetch either - this was a pure cache read, not a fetch of
+    # any kind.
     assert fake.get_schema_calls == 1
 
 
@@ -454,29 +374,22 @@ def test_force_refresh_replaces_the_cached_entry_which_then_stays_cached(app_fac
     assert fake.get_schema_calls == 2
 
 
-def test_prime_schema_cache_fetches_and_caches_the_deep_entry_on_success(app_factory, monkeypatch):
-    # prime_schema_cache() used to also force-fetch a second, independent
-    # "shallow" cache entry here - removed (see db.py's own docstring):
-    # build_router_candidate_summaries() no longer reads (or needs) any
-    # shallow entry at all, it derives its summary straight from this same
-    # deep entry, so there's nothing left for prime_schema_cache to warm
-    # besides the deep one.
+def test_prime_schema_cache_fetches_and_caches_the_entry_on_success(app_factory, monkeypatch):
     app_factory()
-    db_module, fake = _install_fake_backend(monkeypatch, schema_text="DEEP TEXT")
+    db_module, fake = _install_fake_backend(monkeypatch, schema_text="SCHEMA TEXT")
     descriptor = {"type": "postgres", "url": "postgresql://u:p@host/db"}
 
     result = db_module.prime_schema_cache(descriptor)
 
     assert result is True
     assert fake.get_schema_calls == 1
-    assert fake.get_schema_shallow_calls == 0
-    # The deep entry is now cached - a plain get_database_schema call
-    # afterward is served from cache, not re-fetched.
-    assert db_module.get_database_schema(descriptor, deep=True) == "DEEP TEXT"
+    # The entry is now cached - a plain get_database_schema call afterward
+    # is served from cache, not re-fetched.
+    assert db_module.get_database_schema(descriptor) == "SCHEMA TEXT"
     assert fake.get_schema_calls == 1
 
 
-def test_prime_schema_cache_returns_false_when_deep_fetch_fails(app_factory, monkeypatch):
+def test_prime_schema_cache_returns_false_when_fetch_fails(app_factory, monkeypatch):
     # The caller (the refresh endpoint, or startup prefetch) must be able
     # to tell a failed fetch failed.
     app_factory()
@@ -487,7 +400,6 @@ def test_prime_schema_cache_returns_false_when_deep_fetch_fails(app_factory, mon
 
     assert result is False
     assert fake.get_schema_calls == 1
-    assert fake.get_schema_shallow_calls == 0
 
 
 def test_prime_schema_cache_with_reason_reports_empty_when_no_base_tables(app_factory, monkeypatch):
@@ -594,16 +506,12 @@ def test_prime_schema_cache_always_force_refreshes(app_factory, monkeypatch):
     db_module, fake = _install_fake_backend(monkeypatch, schema_text="FIRST")
     descriptor = {"type": "postgres", "url": "postgresql://u:p@host/db"}
 
-    db_module.get_database_schema(descriptor, deep=True)
+    db_module.get_database_schema(descriptor)
     assert fake.get_schema_calls == 1
 
     db_module.prime_schema_cache(descriptor)
 
     assert fake.get_schema_calls == 2
-    # prime_schema_cache only ever force-fetches the deep entry now - see
-    # this function's own docstring on the removed independent shallow
-    # fetch.
-    assert fake.get_schema_shallow_calls == 0
 
 
 def test_prefetch_all_preset_schemas_calls_prime_schema_cache_once_per_preset(app_factory, monkeypatch, tmp_path):

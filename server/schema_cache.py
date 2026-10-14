@@ -3,8 +3,8 @@ schema_cache.py
 
 A small, dependency-free cache for the (expensive) database schema
 introspection string used in Gemini prompts. Every successful schema
-fetch - deep or shallow, for an admin-configured preset or a user's own
-custom connection, whether it came from a plain lookup, the startup
+fetch - for an admin-configured preset or a user's own custom
+connection, whether it came from a plain lookup, the startup
 preset prefetch (db.py's prefetch_all_preset_schemas()), the "Refresh
 Schema" button, or /api/translate's own in-conversation refresh_schema
 checkbox - is cached here indefinitely. There is deliberately no TTL/

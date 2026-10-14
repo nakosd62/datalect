@@ -3,8 +3,9 @@ backends/postgres.py, driven entirely against a fake psycopg2-shaped
 connection/cursor (see helpers.make_fake_pg_connection) - no real Postgres
 needed.
 
-_build_shallow_schema_parts() (called by both get_schema_shallow() and
-get_schema()) issues its queries unconditionally and in a fixed order
+_build_shallow_schema_parts() (get_schema()'s own private Phase 1 helper -
+see _shallow_schema_text() below for how these tests exercise it directly)
+issues its queries unconditionally and in a fixed order
 (unlike BigQuery's try/except-guarded optional sections, though several of
 *these* new sections are individually try/except-wrapped for graceful
 degradation - see postgres.py itself), so responses are queued in the exact
@@ -38,8 +39,29 @@ if SERVER_DIR not in sys.path:
     sys.path.insert(0, SERVER_DIR)
 
 from backends.postgres import PostgresBackend
-from backends.base import DB_CONNECT_TIMEOUT_SECONDS, SqlExecutionError
+from backends.base import DB_CONNECT_TIMEOUT_SECONDS, SqlExecutionError, cap_schema_text
 from helpers import make_fake_pg_connection, install_fake_postgres_connect
+
+
+def _shallow_schema_text(backend, connection):
+    """Phase 1 only (catalog-only, no live queries) - exercises
+    _build_shallow_schema_parts() directly, the private helper get_schema()
+    itself calls before appending its own Phase 2 queries on top. There used
+    to be a public get_schema_shallow() entry point that returned exactly
+    this; it was removed once build_router_candidate_summaries() (db.py)
+    stopped needing an independently-fetched shallow schema at all (it now
+    derives its summary from whichever deep entry is already cached), which
+    left this helper with no remaining production caller. These tests still
+    exercise it directly since it's real, still-live rendering logic that
+    get_schema() depends on - same reasoning that keeps the helper itself
+    in postgres.py rather than inlining it into get_schema()."""
+    built = backend._build_shallow_schema_parts(connection)
+    if built is None:
+        return None
+    schema_parts = built[0]
+    if not schema_parts:
+        return None
+    return cap_schema_text("\n\n".join(schema_parts))
 
 
 def _pad_column_row(row):
@@ -400,7 +422,7 @@ def test_get_schema_scan_query_uses_configured_scan_cap():
     assert first_params[0] > 0  # SCHEMA_MAX_TABLE_NAMES_SCANNED
 
 
-def test_get_schema_shallow_every_query_is_scoped_via_current_schema_not_hardcoded_public():
+def test_get_schema_phase1_every_query_is_scoped_via_current_schema_not_hardcoded_public():
     """Regression guard for the "schema" descriptor feature (see
     backends/postgres.py's connect()): every one of
     _build_shallow_schema_parts()'s eleven catalog-only queries must follow
@@ -425,7 +447,7 @@ def test_get_schema_shallow_every_query_is_scoped_via_current_schema_not_hardcod
         triggers=[("orders", "trg", "INSERT", "EXECUTE FUNCTION f()")],
     ))
     backend = PostgresBackend()
-    backend.get_schema_shallow(conn)
+    _shallow_schema_text(backend, conn)
     assert len(cursor.calls) == 11
     session_settings_calls = [c for c in cursor.calls if "current_setting" in c[0]]
     assert len(session_settings_calls) == 1
@@ -438,7 +460,7 @@ def test_get_schema_shallow_every_query_is_scoped_via_current_schema_not_hardcod
 
 # --- Phase 1 (catalog-only, shallow) new attributes --------------------------
 
-def test_get_schema_shallow_identity_column_marker_renders():
+def test_get_schema_phase1_identity_column_marker_renders():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["users"],
         columns_rows=[
@@ -447,7 +469,7 @@ def test_get_schema_shallow_identity_column_marker_renders():
         ],
     ))
     backend = PostgresBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "id integer NOT NULL IDENTITY (ALWAYS)" in schema
     assert "email text NOT NULL" in schema
     # The non-identity column's own line must not pick up a marker.
@@ -455,7 +477,7 @@ def test_get_schema_shallow_identity_column_marker_renders():
     assert "IDENTITY" not in email_line
 
 
-def test_get_schema_shallow_identity_marker_absent_by_default():
+def test_get_schema_phase1_identity_marker_absent_by_default():
     """Old-style 5-tuple columns_rows (predating is_identity/
     identity_generation) must be padded to "not an identity column" -
     see _pad_column_row - so no existing test needs rewriting."""
@@ -464,22 +486,22 @@ def test_get_schema_shallow_identity_marker_absent_by_default():
         columns_rows=[("customers", "id", "integer", "NO", None)],
     ))
     backend = PostgresBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "IDENTITY" not in schema
 
 
-def test_get_schema_shallow_identity_marker_without_generation_type():
+def test_get_schema_phase1_identity_marker_without_generation_type():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["users"],
         columns_rows=[("users", "id", "integer", "NO", None, "YES", None)],
     ))
     backend = PostgresBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "id integer NOT NULL IDENTITY" in schema
     assert "IDENTITY (" not in schema
 
 
-def test_get_schema_shallow_comments_render_table_and_column():
+def test_get_schema_phase1_comments_render_table_and_column():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["orders"],
         columns_rows=[("orders", "status", "text", "NO", None)],
@@ -489,36 +511,36 @@ def test_get_schema_shallow_comments_render_table_and_column():
         ],
     ))
     backend = PostgresBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Comments:" in schema
     assert "[table] orders: Customer purchase orders." in schema
     assert "[column] orders.status: Order lifecycle state." in schema
 
 
-def test_get_schema_shallow_comments_section_absent_when_no_comments():
+def test_get_schema_phase1_comments_section_absent_when_no_comments():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["orders"],
         columns_rows=[("orders", "id", "integer", "NO", None)],
         comments=[("orders", None, None), ("orders", "id", "")],
     ))
     backend = PostgresBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Comments:" not in schema
 
 
-def test_get_schema_shallow_row_count_estimate_renders():
+def test_get_schema_phase1_row_count_estimate_renders():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["orders"],
         columns_rows=[("orders", "id", "integer", "NO", None)],
         row_count_estimates=[("orders", 1234.0)],
     ))
     backend = PostgresBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Row count estimates:" in schema
     assert "orders: ~1234 rows (estimate)" in schema
 
 
-def test_get_schema_shallow_row_count_estimate_skips_never_analyzed_table():
+def test_get_schema_phase1_row_count_estimate_skips_never_analyzed_table():
     """reltuples reports -1 (or a caller-crafted None) for a table that has
     never been ANALYZEd - rendering "~-1 rows" would be actively
     misleading, so that row is skipped rather than shown."""
@@ -528,35 +550,35 @@ def test_get_schema_shallow_row_count_estimate_skips_never_analyzed_table():
         row_count_estimates=[("fresh_table", -1.0)],
     ))
     backend = PostgresBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Row count estimates:" not in schema
 
 
-def test_get_schema_shallow_routines_render_name_and_signature_without_body():
+def test_get_schema_phase1_routines_render_name_and_signature_without_body():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["orders"],
         columns_rows=[("orders", "id", "integer", "NO", None)],
         routines=[("total_for_customer", "customer_id integer", "numeric", "SELECT SUM(amount) ...")],
     ))
     backend = PostgresBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Routines:" in schema
     assert "total_for_customer(customer_id integer) -> numeric" in schema
     assert "SELECT SUM(amount)" not in schema
 
 
-def test_get_schema_shallow_session_settings_render():
+def test_get_schema_phase1_session_settings_render():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["orders"],
         columns_rows=[("orders", "id", "integer", "NO", None)],
         session_settings=("America/New_York", "en_US.UTF-8"),
     ))
     backend = PostgresBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Session: timezone=America/New_York; default collation=en_US.UTF-8" in schema
 
 
-def test_get_schema_shallow_rls_and_foreign_table_flags_render_when_true():
+def test_get_schema_phase1_rls_and_foreign_table_flags_render_when_true():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["accounts", "remote_orders"],
         columns_rows=[
@@ -569,37 +591,37 @@ def test_get_schema_shallow_rls_and_foreign_table_flags_render_when_true():
         ],
     ))
     backend = PostgresBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Row-level security / federation:" in schema
     assert "accounts: [RLS enabled]" in schema
     assert "remote_orders: [foreign table]" in schema
 
 
-def test_get_schema_shallow_rls_enabled_with_no_policies_is_flagged_as_deny_all():
+def test_get_schema_phase1_rls_enabled_with_no_policies_is_flagged_as_deny_all():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["accounts"],
         columns_rows=[("accounts", "id", "integer", "NO", None)],
         rls_flags=[("accounts", True, "r", False)],
     ))
     backend = PostgresBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "accounts: [RLS enabled, no policies - effectively deny-all]" in schema
 
 
-def test_get_schema_shallow_rls_section_absent_when_all_flags_false():
+def test_get_schema_phase1_rls_section_absent_when_all_flags_false():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["accounts"],
         columns_rows=[("accounts", "id", "integer", "NO", None)],
         rls_flags=[("accounts", False, "r", False)],
     ))
     backend = PostgresBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Row-level security / federation:" not in schema
 
 
-# --- get_schema_shallow() must never include Phase 2 (deep-only) content -----
+# --- Phase 1 alone must never include Phase 2 (deep-only) content ------------
 
-def test_get_schema_shallow_excludes_full_view_and_routine_bodies_and_phase2_sections():
+def test_get_schema_phase1_excludes_full_view_and_routine_bodies_and_phase2_sections():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["orders"],
         columns_rows=[
@@ -610,7 +632,7 @@ def test_get_schema_shallow_excludes_full_view_and_routine_bodies_and_phase2_sec
         routines=[("get_total", "p1 integer", "integer", "SELECT 1;")],
     ))
     backend = PostgresBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "View v" in schema
     assert "SELECT 1 FROM orders" not in schema
     assert "View definitions:" not in schema
@@ -650,7 +672,7 @@ def _phase2_sampling_responses():
     ]
 
 
-def test_get_schema_deep_is_superset_of_shallow_plus_phase2_sampling():
+def test_get_schema_deep_is_superset_of_phase1_plus_phase2_sampling():
     conn, cursor = make_fake_pg_connection(_base_deep_responses() + _phase2_sampling_responses())
     backend = PostgresBackend()
     schema = backend.get_schema(conn)
@@ -722,7 +744,7 @@ def test_get_schema_deep_naming_convention_relationships_section():
             ("orders", "customer_id", "bytea", "NO", None),
         ],
     ))
-    shallow = backend.get_schema_shallow(conn2)
+    shallow = _shallow_schema_text(backend, conn2)
     assert "Likely relationships" not in shallow
 
 

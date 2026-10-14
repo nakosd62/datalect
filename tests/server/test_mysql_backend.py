@@ -3,8 +3,9 @@ backends/mysql.py, driven entirely against a fake PyMySQL-shaped
 connection/cursor (see helpers.make_fake_mysql_connection) - no real MySQL
 needed.
 
-_build_shallow_schema_parts() (called by both get_schema_shallow() and
-get_schema()) issues its queries unconditionally and in a fixed order
+_build_shallow_schema_parts() (get_schema()'s own private Phase 1 helper -
+see _shallow_schema_text() below for how these tests exercise it directly)
+issues its queries unconditionally and in a fixed order
 (several of the new sections are individually try/except-wrapped for
 graceful degradation - see mysql.py itself), so responses are queued in the
 exact order it issues them:
@@ -42,10 +43,31 @@ if SERVER_DIR not in sys.path:
     sys.path.insert(0, SERVER_DIR)
 
 from backends.mysql import MySQLBackend
-from backends.base import DB_CONNECT_TIMEOUT_SECONDS, SqlExecutionError
+from backends.base import DB_CONNECT_TIMEOUT_SECONDS, SqlExecutionError, cap_schema_text
 from helpers import (
     make_fake_mysql_connection, install_fake_pymysql_connect, make_self_signed_ca_cert_pem,
 )
+
+
+def _shallow_schema_text(backend, connection):
+    """Phase 1 only (catalog-only, no live queries) - exercises
+    _build_shallow_schema_parts() directly, the private helper get_schema()
+    itself calls before appending its own Phase 2 queries on top. There used
+    to be a public get_schema_shallow() entry point that returned exactly
+    this; it was removed once build_router_candidate_summaries() (db.py)
+    stopped needing an independently-fetched shallow schema at all (it now
+    derives its summary from whichever deep entry is already cached), which
+    left this helper with no remaining production caller. These tests still
+    exercise it directly since it's real, still-live rendering logic that
+    get_schema() depends on - same reasoning that keeps the helper itself
+    in mysql.py rather than inlining it into get_schema()."""
+    built = backend._build_shallow_schema_parts(connection)
+    if built is None:
+        return None
+    schema_parts = built[0]
+    if not schema_parts:
+        return None
+    return cap_schema_text("\n\n".join(schema_parts))
 
 
 def _pad_column_row(row):
@@ -208,7 +230,7 @@ def test_get_schema_scan_query_uses_configured_scan_cap():
 
 # --- Phase 1 (catalog-only, shallow) new attributes --------------------------
 
-def test_get_schema_shallow_auto_increment_marker_renders():
+def test_get_schema_phase1_auto_increment_marker_renders():
     conn, cursor = make_fake_mysql_connection(_schema_responses(
         table_names=["users"],
         columns_rows=[
@@ -217,14 +239,14 @@ def test_get_schema_shallow_auto_increment_marker_renders():
         ],
     ))
     backend = MySQLBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "id int NOT NULL AUTO_INCREMENT" in schema
     # The non-auto_increment column's own line must not pick up a marker.
     email_line = [l for l in schema.splitlines() if l.strip().startswith("email")][0]
     assert "AUTO_INCREMENT" not in email_line
 
 
-def test_get_schema_shallow_auto_increment_absent_by_default():
+def test_get_schema_phase1_auto_increment_absent_by_default():
     """Old-style 5-tuple columns_rows (predating EXTRA/COLUMN_COMMENT) must
     be padded to "not auto_increment, no comment" - see _pad_column_row - so
     no existing test needs rewriting."""
@@ -233,47 +255,47 @@ def test_get_schema_shallow_auto_increment_absent_by_default():
         columns_rows=[("customers", "id", "int", "NO", None)],
     ))
     backend = MySQLBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "AUTO_INCREMENT" not in schema
 
 
-def test_get_schema_shallow_comments_render_table_and_column():
+def test_get_schema_phase1_comments_render_table_and_column():
     conn, cursor = make_fake_mysql_connection(_schema_responses(
         table_names=["orders"],
         columns_rows=[("orders", "status", "varchar", "NO", None, "", "Order lifecycle state.")],
         table_meta=[("orders", "Customer purchase orders.", 500)],
     ))
     backend = MySQLBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Comments:" in schema
     assert "[table] orders: Customer purchase orders." in schema
     assert "[column] orders.status: Order lifecycle state." in schema
 
 
-def test_get_schema_shallow_comments_section_absent_when_no_comments():
+def test_get_schema_phase1_comments_section_absent_when_no_comments():
     conn, cursor = make_fake_mysql_connection(_schema_responses(
         table_names=["orders"],
         columns_rows=[("orders", "id", "int", "NO", None, "", "")],
         table_meta=[("orders", "", 500)],
     ))
     backend = MySQLBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Comments:" not in schema
 
 
-def test_get_schema_shallow_row_count_estimate_renders():
+def test_get_schema_phase1_row_count_estimate_renders():
     conn, cursor = make_fake_mysql_connection(_schema_responses(
         table_names=["orders"],
         columns_rows=[("orders", "id", "int", "NO", None)],
         table_meta=[("orders", None, 1234)],
     ))
     backend = MySQLBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Row count estimates:" in schema
     assert "orders: ~1234 rows (estimate" in schema
 
 
-def test_get_schema_shallow_row_count_estimate_renders_zero_not_skipped():
+def test_get_schema_phase1_row_count_estimate_renders_zero_not_skipped():
     """Unlike Postgres's reltuples (-1 sentinel for "never analyzed"), MySQL's
     TABLE_ROWS genuinely reports 0 for an empty (or not-yet-populated) InnoDB
     table - that's a real, if approximate, value and must still render, not
@@ -284,36 +306,36 @@ def test_get_schema_shallow_row_count_estimate_renders_zero_not_skipped():
         table_meta=[("fresh_table", None, 0)],
     ))
     backend = MySQLBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Row count estimates:" in schema
     assert "fresh_table: ~0 rows (estimate" in schema
 
 
-def test_get_schema_shallow_row_count_estimate_skips_null_table_rows():
+def test_get_schema_phase1_row_count_estimate_skips_null_table_rows():
     conn, cursor = make_fake_mysql_connection(_schema_responses(
         table_names=["mystery_table"],
         columns_rows=[("mystery_table", "id", "int", "NO", None)],
         table_meta=[("mystery_table", None, None)],
     ))
     backend = MySQLBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Row count estimates:" not in schema
 
 
-def test_get_schema_shallow_routines_render_name_and_signature_without_body():
+def test_get_schema_phase1_routines_render_name_and_signature_without_body():
     conn, cursor = make_fake_mysql_connection(_schema_responses(
         table_names=["orders"],
         columns_rows=[("orders", "id", "int", "NO", None)],
         routines=[("total_for_customer", "customer_id int", "decimal", "SELECT SUM(amount) ...")],
     ))
     backend = MySQLBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Routines:" in schema
     assert "total_for_customer(customer_id int) -> decimal" in schema
     assert "SELECT SUM(amount)" not in schema
 
 
-def test_get_schema_shallow_routines_procedure_with_no_return_type():
+def test_get_schema_phase1_routines_procedure_with_no_return_type():
     """A PROCEDURE (as opposed to a FUNCTION) has no return type - r.DATA_TYPE
     comes back NULL/empty for it, so the rendered line must omit the
     "-> ..." suffix entirely rather than showing "-> None"."""
@@ -323,25 +345,25 @@ def test_get_schema_shallow_routines_procedure_with_no_return_type():
         routines=[("archive_old_orders", "cutoff_date date", None, "DELETE FROM orders ...")],
     ))
     backend = MySQLBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "archive_old_orders(cutoff_date date)" in schema
     assert "->" not in schema
 
 
-def test_get_schema_shallow_session_settings_render():
+def test_get_schema_phase1_session_settings_render():
     conn, cursor = make_fake_mysql_connection(_schema_responses(
         table_names=["orders"],
         columns_rows=[("orders", "id", "int", "NO", None)],
         session_settings=("America/New_York", "utf8mb4_unicode_ci"),
     ))
     backend = MySQLBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Session: timezone=America/New_York; default collation=utf8mb4_unicode_ci" in schema
 
 
-# --- get_schema_shallow() must never include Phase 2 (deep-only) content -----
+# --- Phase 1 alone must never include Phase 2 (deep-only) content ------------
 
-def test_get_schema_shallow_excludes_full_view_and_routine_bodies_and_phase2_sections():
+def test_get_schema_phase1_excludes_full_view_and_routine_bodies_and_phase2_sections():
     conn, cursor = make_fake_mysql_connection(_schema_responses(
         table_names=["orders"],
         columns_rows=[
@@ -352,7 +374,7 @@ def test_get_schema_shallow_excludes_full_view_and_routine_bodies_and_phase2_sec
         routines=[("get_total", "p1 int", "int", "SELECT 1;")],
     ))
     backend = MySQLBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "View v" in schema
     assert "select 1 from orders" not in schema
     assert "View definitions:" not in schema
@@ -392,7 +414,7 @@ def _phase2_sampling_responses():
     ]
 
 
-def test_get_schema_deep_is_superset_of_shallow_plus_phase2_sampling():
+def test_get_schema_deep_is_superset_of_phase1_plus_phase2_sampling():
     conn, cursor = make_fake_mysql_connection(_base_deep_responses() + _phase2_sampling_responses())
     backend = MySQLBackend()
     schema = backend.get_schema(conn)
@@ -463,7 +485,7 @@ def test_get_schema_deep_naming_convention_relationships_section():
             ("orders", "customer_id", "varbinary", "NO", None),
         ],
     ))
-    shallow = backend.get_schema_shallow(conn2)
+    shallow = _shallow_schema_text(backend, conn2)
     assert "Likely relationships" not in shallow
 
 

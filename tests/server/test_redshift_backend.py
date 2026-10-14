@@ -6,15 +6,16 @@ backends/redshift.py, driven two ways:
     (never opt-in the way Oracle's "ssl" flag is), and the SET search_path
     call a "schema" descriptor field triggers, without opening a real
     connection.
-  - get_schema()/get_schema_shallow()/execute()/identity_label()/
+  - get_schema()/execute()/identity_label()/
     cache_key(): against the same fake psycopg2-shaped cursor/connection
     tests/test_postgres_backend.py uses (helpers.make_fake_pg_connection) -
     RedshiftBackend talks the exact same psycopg2 DB-API shape
     backends/postgres.py does, so no Redshift-specific fake is needed for
     these.
 
-_build_shallow_schema_parts() (called by both get_schema_shallow() and
-get_schema()) issues its Phase 1 queries unconditionally and in a fixed
+_build_shallow_schema_parts() (get_schema()'s own private Phase 1 helper -
+see _shallow_schema_text() below for how these tests exercise it directly)
+issues its Phase 1 queries unconditionally and in a fixed
 order (several of them individually try/except-wrapped for graceful
 degradation - see backends/redshift.py itself), so responses are queued in
 the exact order it issues them:
@@ -48,8 +49,29 @@ if SERVER_DIR not in sys.path:
     sys.path.insert(0, SERVER_DIR)
 
 from backends.redshift import RedshiftBackend, MAX_COLUMNS_FOR_SAMPLING
-from backends.base import DB_CONNECT_TIMEOUT_SECONDS, SqlExecutionError
+from backends.base import DB_CONNECT_TIMEOUT_SECONDS, SqlExecutionError, cap_schema_text
 from helpers import install_fake_redshift_connect, make_fake_pg_connection
+
+
+def _shallow_schema_text(backend, connection):
+    """Phase 1 only (catalog-only, no live queries) - exercises
+    _build_shallow_schema_parts() directly, the private helper get_schema()
+    itself calls before appending its own Phase 2 queries on top. There used
+    to be a public get_schema_shallow() entry point that returned exactly
+    this; it was removed once build_router_candidate_summaries() (db.py)
+    stopped needing an independently-fetched shallow schema at all (it now
+    derives its summary from whichever deep entry is already cached), which
+    left this helper with no remaining production caller. These tests still
+    exercise it directly since it's real, still-live rendering logic that
+    get_schema() depends on - same reasoning that keeps the helper itself
+    in redshift.py rather than inlining it into get_schema()."""
+    built = backend._build_shallow_schema_parts(connection)
+    if built is None:
+        return None
+    schema_parts = built[0]
+    if not schema_parts:
+        return None
+    return cap_schema_text("\n\n".join(schema_parts))
 
 
 def _rs(monkeypatch):
@@ -355,7 +377,7 @@ def test_get_schema_svv_table_info_query_failure_is_logged_not_swallowed(caplog)
     conn, cursor = make_fake_pg_connection(responses)
     backend = RedshiftBackend()
     with caplog.at_level("WARNING"):
-        schema = backend.get_schema_shallow(conn)
+        schema = _shallow_schema_text(backend, conn)
     assert "Table: orders" in schema
     assert "Distribution/Sort Keys" not in schema
     assert "Row count estimates:" not in schema
@@ -400,7 +422,7 @@ def test_get_schema_scopes_to_current_schema_not_hardcoded_public():
     assert "'public'" not in first_query
 
 
-def test_get_schema_shallow_every_query_is_scoped_via_current_schema_not_hardcoded_public():
+def test_get_schema_phase1_every_query_is_scoped_via_current_schema_not_hardcoded_public():
     """Regression guard for the "schema" descriptor feature (see
     backends/redshift.py's connect()): every one of
     _build_shallow_schema_parts()'s nine catalog-only queries must follow
@@ -418,7 +440,7 @@ def test_get_schema_shallow_every_query_is_scoped_via_current_schema_not_hardcod
         views=[("v", "SELECT 1")],
     ))
     backend = RedshiftBackend()
-    backend.get_schema_shallow(conn)
+    _shallow_schema_text(backend, conn)
     assert len(cursor.calls) == 9
     session_calls = [c for c in cursor.calls if "current_setting" in c[0]]
     assert len(session_calls) == 1
@@ -431,7 +453,7 @@ def test_get_schema_shallow_every_query_is_scoped_via_current_schema_not_hardcod
 
 # --- Phase 1 (catalog-only, shallow) new attributes --------------------------
 
-def test_get_schema_shallow_identity_column_marker_renders_with_seed_and_step():
+def test_get_schema_phase1_identity_column_marker_renders_with_seed_and_step():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["users"],
         columns_rows=[
@@ -440,7 +462,7 @@ def test_get_schema_shallow_identity_column_marker_renders_with_seed_and_step():
         ],
     ))
     backend = RedshiftBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "id integer NOT NULL IDENTITY(seed=1, step=1)" in schema
     # The raw internal identity-default expression must not be shown
     # verbatim once the human-readable marker already says the same thing.
@@ -449,7 +471,7 @@ def test_get_schema_shallow_identity_column_marker_renders_with_seed_and_step():
     assert "IDENTITY" not in email_line
 
 
-def test_get_schema_shallow_identity_marker_falls_back_to_bare_marker_when_seed_step_unparseable():
+def test_get_schema_phase1_identity_marker_falls_back_to_bare_marker_when_seed_step_unparseable():
     """A column_default that merely contains "identity" text without the
     documented "'<seed>,<step>'"-shaped substring still gets flagged as an
     identity column - see _identity_marker_from_column_default()'s
@@ -460,23 +482,23 @@ def test_get_schema_shallow_identity_marker_falls_back_to_bare_marker_when_seed_
         columns_rows=[("users", "id", "bigint", "NO", '"identity"(1, 0)')],
     ))
     backend = RedshiftBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "id bigint NOT NULL IDENTITY" in schema
     assert "IDENTITY(seed=" not in schema
 
 
-def test_get_schema_shallow_identity_marker_absent_for_plain_default():
+def test_get_schema_phase1_identity_marker_absent_for_plain_default():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["customers"],
         columns_rows=[("customers", "status", "character varying", "NO", "'active'::character varying")],
     ))
     backend = RedshiftBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "IDENTITY" not in schema
     assert "DEFAULT 'active'" in schema
 
 
-def test_get_schema_shallow_comments_render_table_and_column():
+def test_get_schema_phase1_comments_render_table_and_column():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["orders"],
         columns_rows=[("orders", "status", "character varying", "NO", None)],
@@ -486,31 +508,31 @@ def test_get_schema_shallow_comments_render_table_and_column():
         ],
     ))
     backend = RedshiftBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Comments:" in schema
     assert "[table] orders: Customer purchase orders." in schema
     assert "[column] orders.status: Order lifecycle state." in schema
 
 
-def test_get_schema_shallow_comments_section_absent_when_no_comments():
+def test_get_schema_phase1_comments_section_absent_when_no_comments():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["orders"],
         columns_rows=[("orders", "id", "integer", "NO", None)],
         comments=[("orders", None, None), ("orders", "id", "")],
     ))
     backend = RedshiftBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Comments:" not in schema
 
 
-def test_get_schema_shallow_row_count_estimate_renders_from_widened_svv_table_info_query():
+def test_get_schema_phase1_row_count_estimate_renders_from_widened_svv_table_info_query():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["orders"],
         columns_rows=[("orders", "id", "integer", "NO", None)],
         layout=[("orders", "KEY(customer_id)", "order_date", 1234, 0)],
     ))
     backend = RedshiftBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Row count estimates:" in schema
     assert "orders: ~1234 rows (estimate)" in schema
     assert "stats may be stale" not in schema
@@ -523,19 +545,19 @@ def test_get_schema_shallow_row_count_estimate_renders_from_widened_svv_table_in
     assert "stats_off" in layout_calls[0][0]
 
 
-def test_get_schema_shallow_row_count_estimate_flags_stale_stats():
+def test_get_schema_phase1_row_count_estimate_flags_stale_stats():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["orders"],
         columns_rows=[("orders", "id", "integer", "NO", None)],
         layout=[("orders", None, None, 500, 42)],
     ))
     backend = RedshiftBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Row count estimates:" in schema
     assert "orders: ~500 rows (estimate) (stats may be stale - 42% off since last ANALYZE)" in schema
 
 
-def test_get_schema_shallow_row_count_estimate_absent_when_tbl_rows_is_none():
+def test_get_schema_phase1_row_count_estimate_absent_when_tbl_rows_is_none():
     """Pre-existing layout tuples (table, diststyle, sortkey1) pad
     tbl_rows/stats_off to None - see _pad_layout_row - so no existing test
     needs rewriting, and no misleading "~None rows" text is ever rendered."""
@@ -545,24 +567,24 @@ def test_get_schema_shallow_row_count_estimate_absent_when_tbl_rows_is_none():
         layout=[("orders", "KEY(customer_id)", "order_date")],
     ))
     backend = RedshiftBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Row count estimates:" not in schema
 
 
-def test_get_schema_shallow_routines_render_name_and_signature_without_body():
+def test_get_schema_phase1_routines_render_name_and_signature_without_body():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["orders"],
         columns_rows=[("orders", "id", "integer", "NO", None)],
         routines=[("total_for_customer", "customer_id integer", "numeric", "SELECT SUM(amount) ...")],
     ))
     backend = RedshiftBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Routines:" in schema
     assert "total_for_customer(customer_id integer) -> numeric" in schema
     assert "SELECT SUM(amount)" not in schema
 
 
-def test_get_schema_shallow_routines_query_error_is_swallowed():
+def test_get_schema_phase1_routines_query_error_is_swallowed():
     """Whether information_schema.routines/parameters behaves the same way
     on Redshift as it does on Postgres could not be verified from this
     sandbox (see module docstring) - a cluster/version where it errors must
@@ -577,59 +599,59 @@ def test_get_schema_shallow_routines_query_error_is_swallowed():
     responses[routines_index] = RuntimeError("routines catalog not supported")
     conn, cursor = make_fake_pg_connection(responses)
     backend = RedshiftBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Table: t" in schema
     assert "Routines:" not in schema
 
 
-def test_get_schema_shallow_session_timezone_renders():
+def test_get_schema_phase1_session_timezone_renders():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["orders"],
         columns_rows=[("orders", "id", "integer", "NO", None)],
         session_settings=("America/New_York",),
     ))
     backend = RedshiftBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Session: timezone=America/New_York" in schema
 
 
-def test_get_schema_shallow_external_tables_render():
+def test_get_schema_phase1_external_tables_render():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["orders"],
         columns_rows=[("orders", "id", "integer", "NO", None)],
         external_tables=[("raw_events",)],
     ))
     backend = RedshiftBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "External tables (Redshift Spectrum):" in schema
     assert "raw_events: [external table - Redshift Spectrum]" in schema
 
 
-def test_get_schema_shallow_external_tables_absent_when_none():
+def test_get_schema_phase1_external_tables_absent_when_none():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["orders"],
         columns_rows=[("orders", "id", "integer", "NO", None)],
     ))
     backend = RedshiftBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "External tables" not in schema
 
 
-def test_get_schema_shallow_still_has_no_indexes_triggers_or_rls_sections():
+def test_get_schema_phase1_still_has_no_indexes_triggers_or_rls_sections():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["t"],
         columns_rows=[("t", "id", "integer", "NO", None)],
     ))
     backend = RedshiftBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Indexes:" not in schema
     assert "Triggers:" not in schema
     assert "Row-level security" not in schema
 
 
-# --- get_schema_shallow() must never include Phase 2 (deep-only) content -----
+# --- Phase 1 alone must never include Phase 2 (deep-only) content ------------
 
-def test_get_schema_shallow_excludes_full_view_and_routine_bodies_and_phase2_sections():
+def test_get_schema_phase1_excludes_full_view_and_routine_bodies_and_phase2_sections():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["orders"],
         columns_rows=[
@@ -640,7 +662,7 @@ def test_get_schema_shallow_excludes_full_view_and_routine_bodies_and_phase2_sec
         routines=[("get_total", "p1 integer", "integer", "SELECT 1;")],
     ))
     backend = RedshiftBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "View v" in schema
     assert "SELECT 1 FROM orders" not in schema
     assert "View definitions:" not in schema
@@ -680,7 +702,7 @@ def _phase2_sampling_responses():
     ]
 
 
-def test_get_schema_deep_is_superset_of_shallow_plus_phase2_sampling():
+def test_get_schema_deep_is_superset_of_phase1_plus_phase2_sampling():
     conn, cursor = make_fake_pg_connection(_base_deep_responses() + _phase2_sampling_responses())
     backend = RedshiftBackend()
     schema = backend.get_schema(conn)
@@ -751,7 +773,7 @@ def test_get_schema_deep_naming_convention_relationships_section():
             ("orders", "customer_id", "bigint", "NO", None),
         ],
     ))
-    shallow = backend.get_schema_shallow(conn2)
+    shallow = _shallow_schema_text(backend, conn2)
     assert "Likely relationships" not in shallow
 
 

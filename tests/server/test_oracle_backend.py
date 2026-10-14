@@ -76,8 +76,29 @@ from backends.oracle import (
     _split_oracle_script, _split_oracle_chunk,
     _DBMS_OUTPUT_CHUNK_SIZE,
 )
-from backends.base import DB_CONNECT_TIMEOUT_SECONDS, SqlExecutionError
+from backends.base import DB_CONNECT_TIMEOUT_SECONDS, SqlExecutionError, cap_schema_text
 from helpers import install_fake_oracle_connect, make_fake_pg_connection
+
+
+def _shallow_schema_text(backend, connection):
+    """Phase 1 only (catalog-only, no live queries) - exercises
+    _build_shallow_schema_parts() directly, the private helper get_schema()
+    itself calls before appending its own Phase 2 queries on top. There used
+    to be a public get_schema_shallow() entry point that returned exactly
+    this; it was removed once build_router_candidate_summaries() (db.py)
+    stopped needing an independently-fetched shallow schema at all (it now
+    derives its summary from whichever deep entry is already cached), which
+    left this helper with no remaining production caller. These tests still
+    exercise it directly since it's real, still-live rendering logic that
+    get_schema() depends on - same reasoning that keeps the helper itself
+    in oracle.py rather than inlining it into get_schema()."""
+    built = backend._build_shallow_schema_parts(connection)
+    if built is None:
+        return None
+    schema_parts = built[0]
+    if not schema_parts:
+        return None
+    return cap_schema_text("\n\n".join(schema_parts))
 
 
 def _ora(monkeypatch):
@@ -570,9 +591,9 @@ def test_get_schema_table_name_query_excludes_mview_iot_and_nested_tables():
     assert "FETCH FIRST" in table_names_sql  # Oracle has no LIMIT clause
 
 
-# --- get_schema_shallow() / get_schema() two-phase split: Phase 1 (new) ----------
+# --- Phase 1/Phase 2 split: Phase 1 (new) ---------------------------------
 
-def test_get_schema_shallow_identity_marker_renders_with_generation_type():
+def test_get_schema_phase1_identity_marker_renders_with_generation_type():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["USERS"],
         columns_rows=[
@@ -581,13 +602,13 @@ def test_get_schema_shallow_identity_marker_renders_with_generation_type():
         ],
     ))
     backend = OracleBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "ID NUMBER NOT NULL IDENTITY (ALWAYS)" in schema
     email_line = [l for l in schema.splitlines() if l.strip().startswith("EMAIL")][0]
     assert "IDENTITY" not in email_line
 
 
-def test_get_schema_shallow_identity_marker_absent_for_old_style_four_tuples():
+def test_get_schema_phase1_identity_marker_absent_for_old_style_four_tuples():
     """Old-style 4-tuple columns_rows (predating the identity-column
     feature) must be padded to "not an identity column" - see
     _pad_column_row - so no existing test needs rewriting."""
@@ -596,22 +617,22 @@ def test_get_schema_shallow_identity_marker_absent_for_old_style_four_tuples():
         columns_rows=[("CUSTOMERS", "ID", "NUMBER", "N")],
     ))
     backend = OracleBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "IDENTITY" not in schema
 
 
-def test_get_schema_shallow_identity_column_query_left_joins_all_tab_identity_cols():
+def test_get_schema_phase1_identity_column_query_left_joins_all_tab_identity_cols():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["USERS"],
         columns_rows=[("USERS", "ID", "NUMBER", "N", "ALWAYS")],
     ))
     backend = OracleBackend()
-    backend.get_schema_shallow(conn)
+    _shallow_schema_text(backend, conn)
     columns_sql, _ = cursor.calls[1]
     assert "all_tab_identity_cols" in columns_sql
 
 
-def test_get_schema_shallow_comments_render_table_and_column():
+def test_get_schema_phase1_comments_render_table_and_column():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["ORDERS"],
         columns_rows=[("ORDERS", "STATUS", "VARCHAR2", "N")],
@@ -621,35 +642,35 @@ def test_get_schema_shallow_comments_render_table_and_column():
         ],
     ))
     backend = OracleBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Comments:" in schema
     assert "[table] ORDERS: Customer purchase orders." in schema
     assert "[column] ORDERS.STATUS: Order lifecycle state." in schema
 
 
-def test_get_schema_shallow_comments_section_absent_when_no_comments():
+def test_get_schema_phase1_comments_section_absent_when_no_comments():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["ORDERS"],
         columns_rows=[("ORDERS", "ID", "NUMBER", "N")],
         comments=[("ORDERS", None, None), ("ORDERS", "ID", "")],
     ))
     backend = OracleBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Comments:" not in schema
 
 
-def test_get_schema_shallow_row_count_estimate_renders():
+def test_get_schema_phase1_row_count_estimate_renders():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=[("ORDERS", 1234)],
         columns_rows=[("ORDERS", "ID", "NUMBER", "N")],
     ))
     backend = OracleBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Row count estimates:" in schema
     assert "ORDERS: ~1234 rows (estimate)" in schema
 
 
-def test_get_schema_shallow_row_count_estimate_skips_when_num_rows_is_null():
+def test_get_schema_phase1_row_count_estimate_skips_when_num_rows_is_null():
     """ALL_TABLES.NUM_ROWS is NULL when DBMS_STATS has never gathered
     statistics for a table - rendering "~None rows" would be actively
     misleading, so that table is skipped rather than shown."""
@@ -658,11 +679,11 @@ def test_get_schema_shallow_row_count_estimate_skips_when_num_rows_is_null():
         columns_rows=[("FRESH_TABLE", "ID", "NUMBER", "N")],
     ))
     backend = OracleBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Row count estimates:" not in schema
 
 
-def test_get_schema_shallow_routines_render_signature_without_body():
+def test_get_schema_phase1_routines_render_signature_without_body():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["ORDERS"],
         columns_rows=[("ORDERS", "ID", "NUMBER", "N")],
@@ -672,12 +693,12 @@ def test_get_schema_shallow_routines_render_signature_without_body():
         ],
     ))
     backend = OracleBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Routines:" in schema
     assert "GET_TOTAL(P1 NUMBER) -> NUMBER" in schema
 
 
-def test_get_schema_shallow_procedure_routine_has_no_return_arrow():
+def test_get_schema_phase1_procedure_routine_has_no_return_arrow():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["ORDERS"],
         columns_rows=[("ORDERS", "ID", "NUMBER", "N")],
@@ -687,12 +708,12 @@ def test_get_schema_shallow_procedure_routine_has_no_return_arrow():
         ],
     ))
     backend = OracleBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "BUMP_COUNTER(P1 NUMBER, P2 VARCHAR2)" in schema
     assert "->" not in [l for l in schema.splitlines() if "BUMP_COUNTER" in l][0]
 
 
-def test_get_schema_shallow_routines_scoped_to_standalone_procedures():
+def test_get_schema_phase1_routines_scoped_to_standalone_procedures():
     """procedure_name IS NULL excludes package members - regression guard
     pinning that filter, since ALL_PROCEDURES also lists each package
     member with its own non-NULL PROCEDURE_NAME."""
@@ -701,37 +722,37 @@ def test_get_schema_shallow_routines_scoped_to_standalone_procedures():
         columns_rows=[("ORDERS", "ID", "NUMBER", "N")],
     ))
     backend = OracleBackend()
-    backend.get_schema_shallow(conn)
+    _shallow_schema_text(backend, conn)
     routines_sql, _ = cursor.calls[5]
     assert "procedure_name IS NULL" in routines_sql
     assert "all_procedures" in routines_sql
     assert "all_arguments" in routines_sql
 
 
-def test_get_schema_shallow_session_facts_render():
+def test_get_schema_phase1_session_facts_render():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["ORDERS"],
         columns_rows=[("ORDERS", "ID", "NUMBER", "N")],
         session_facts=("-05:00", "AMERICA", "BINARY_CI"),
     ))
     backend = OracleBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Session: timezone=-05:00; territory=AMERICA; sort=BINARY_CI" in schema
 
 
-def test_get_schema_shallow_external_tables_render():
+def test_get_schema_phase1_external_tables_render():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["EXT_LOGS"],
         columns_rows=[("EXT_LOGS", "ID", "NUMBER", "N")],
         external_tables=[("EXT_LOGS",)],
     ))
     backend = OracleBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "External tables:" in schema
     assert "EXT_LOGS: [external table]" in schema
 
 
-def test_get_schema_shallow_never_renders_an_rls_section():
+def test_get_schema_phase1_never_renders_an_rls_section():
     """Documents the deliberate skip: Oracle's RLS (VPD) is session/policy-
     based, not a simple catalog flag the way Postgres's
     pg_class.relrowsecurity is - see backends/oracle.py's External-tables
@@ -743,14 +764,14 @@ def test_get_schema_shallow_never_renders_an_rls_section():
         external_tables=[("ORDERS",)],
     ))
     backend = OracleBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "RLS" not in schema
     assert "Row-level security" not in schema
 
 
-# --- get_schema_shallow() must never include Phase 2 (deep-only) content ---------
+# --- Phase 1 alone must never include Phase 2 (deep-only) content ----------------
 
-def test_get_schema_shallow_excludes_full_view_body_and_phase2_sections():
+def test_get_schema_phase1_excludes_full_view_body_and_phase2_sections():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["ORDERS"],
         columns_rows=[
@@ -760,7 +781,7 @@ def test_get_schema_shallow_excludes_full_view_body_and_phase2_sections():
         views=[("CUSTOMER_ORDERS", "SELECT * FROM ORDERS JOIN CUSTOMERS ...")],
     ))
     backend = OracleBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "View CUSTOMER_ORDERS" in schema
     assert "SELECT * FROM ORDERS JOIN CUSTOMERS" not in schema
     assert "View definitions:" not in schema
@@ -803,7 +824,7 @@ def _phase2_sampling_responses():
     ]
 
 
-def test_get_schema_deep_is_superset_of_shallow_plus_phase2_sampling():
+def test_get_schema_deep_is_superset_of_phase1_plus_phase2_sampling():
     conn, cursor = make_fake_pg_connection(_base_deep_responses() + _phase2_sampling_responses())
     backend = OracleBackend()
     schema = backend.get_schema(conn)
@@ -874,7 +895,7 @@ def test_get_schema_deep_naming_convention_relationships_section():
             ("ORDERS", "CUSTOMER_ID", "NUMBER", "N"),
         ],
     ))
-    shallow = backend.get_schema_shallow(conn2)
+    shallow = _shallow_schema_text(backend, conn2)
     assert "Likely relationships" not in shallow
 
 

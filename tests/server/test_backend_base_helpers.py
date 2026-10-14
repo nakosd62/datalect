@@ -1103,10 +1103,12 @@ def test_split_schema_text_into_entries_empty_schema_text_returns_empty_list():
 
 
 # --- derive_tables_only_schema_text() -----------------------------------------
-# Backs the SCHEMA_TABLES_ONLY-gated "tables_only" schema kind (see
-# translate_routes.py's get_llm_schema_text): every table/table-family/tab
-# entry kept with its full per-table detail intact, every OTHER top-level
-# schema-object section (Constraints, Indexes, Views, ...) dropped.
+# Backs the "tables_only" schema kind used by both triage call sites and
+# both summarization call sites (see sql_generation.py's get_triage_
+# schema_text and summarize_routes.py's get_summary_schema_text): every
+# table/table-family/tab entry kept with its full per-table detail intact,
+# every OTHER top-level schema-object section (Constraints, Indexes,
+# Views, ...) dropped.
 # Deliberately NOT built on top of split_schema_text_into_entries - that
 # function's LAST entry runs all the way to len(schema_text), so it would
 # swallow every trailing non-table section into whichever table happened to

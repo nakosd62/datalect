@@ -850,14 +850,13 @@ def _schema_fetch_by_url(mapping):
     shape across the tests below that need per-connection full-schema
     control without a real database connection.
 
-    Accepts (and ignores) the real _fetch_database_schema's `deep`
-    keyword - these tests are about triage/routing behavior, not about
-    the shallow-vs-deep content difference itself (that's covered in
-    test_db_schema_fetch.py), so the same mapped text is returned either
-    way; every call site here (both build_router_candidate_summaries'
-    deep=False triage call and every real deep=True generation call)
-    keeps working unchanged."""
-    def _fetch(descriptor, deep=True):
+    The same mapped text is returned to every caller - both
+    build_router_candidate_summaries' triage reduction (which derives its
+    own tables-only summary in memory from this same full text) and every
+    real generation call - since there is only one schema fetch/cache tier
+    now (see test_db_schema_fetch.py for the history of the removed,
+    never-actually-used independent "shallow" tier)."""
+    def _fetch(descriptor):
         return mapping[descriptor.get("url")]
     return _fetch
 
@@ -1028,19 +1027,17 @@ def test_group_mode_triage_candidate_summaries_precede_history_and_are_not_glued
     assert "how large is this database" in last_text
 
 
-def test_group_mode_phase_b_ignores_schema_tables_only_and_always_sends_the_full_schema(
+def test_group_mode_phase_b_always_sends_the_full_schema(
     app_factory, tmp_path, monkeypatch,
 ):
-    # SCHEMA_TABLES_ONLY (see translate_routes.py's get_llm_schema_text)
-    # is scoped ONLY to single-dataset mode's own translate path - dataset-
-    # group mode's Phase B fanout (generate_sql_for_connection, run by
-    # _run_phase_b_fanout) calls get_database_schema() directly and must
-    # keep seeing the full deep schema regardless of this flag, same as
-    # before it existed.
-    env = _two_preset_env(app_factory, tmp_path, extra_env={"SCHEMA_TABLES_ONLY": "true"})
+    # Dataset-group mode's Phase B fanout (generate_sql_for_connection, run
+    # by _run_phase_b_fanout) calls get_database_schema() directly and
+    # always sees the full deep schema - the same SQL-generation guarantee
+    # single-dataset mode's own get_llm_schema_text gives (see
+    # test_translate_routes.py).
+    env = _two_preset_env(app_factory, tmp_path)
     login_as(env.client, "alice@example.com")
     _set_group_mode(env.client)
-    assert env.translate_routes.SCHEMA_TABLES_ONLY is True
 
     import db as db_module
     monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
@@ -2144,7 +2141,7 @@ def test_group_mode_excludes_a_configured_preset_not_listed_in_the_groups_datase
 def test_group_mode_triage_never_fetches_live_and_only_uses_already_cached_deep_schemas(
         app_factory, tmp_path, monkeypatch):
     # build_router_candidate_summaries() (db.py) must NEVER connect to or
-    # query a real database - it reads ONLY whatever deep schema entry is
+    # query a real database - it reads ONLY whatever schema entry is
     # already sitting in schema_cache for each in-scope connection, in
     # memory, and degrades to an empty schema_text for a connection
     # with nothing cached yet (as both start out here - a fresh
@@ -2175,7 +2172,7 @@ def test_group_mode_triage_never_fetches_live_and_only_uses_already_cached_deep_
 
     fetched_urls = []
 
-    def _fake_fetch(descriptor, deep=True):
+    def _fake_fetch(descriptor):
         fetched_urls.append(descriptor.get("url"))
         if descriptor.get("url") == "postgresql://u:p@host-a:5432/a":
             return "Table: deals\nid INTEGER\n"
@@ -3364,22 +3361,18 @@ def test_summarize_results_endpoint_returns_no_sql_prefixed_summary_and_is_never
     assert "SELECT * FROM deals;" in call_text
 
 
-def test_summarize_results_endpoint_always_uses_tables_only_schema_even_when_the_flag_is_off(
+def test_summarize_results_endpoint_always_uses_tables_only_schema(
     app_factory, tmp_path, monkeypatch,
 ):
-    # Unlike single-dataset mode's own SQL-GENERATION path (only reduced
-    # when SCHEMA_TABLES_ONLY is explicitly turned on - see
-    # test_translate_routes.py), both summarization call sites
+    # Unlike either SQL-generation path (single-dataset mode's get_llm_
+    # schema_text, dataset-group mode's Phase B fanout - both of which
+    # always get the full deep schema, see test_translate_routes.py and
+    # the Phase B test above), both summarization call sites
     # (stream_summarize_result here, and _build_all_mode_schema_block/
-    # Phase C below) go through get_summary_schema_text() instead of
-    # get_llm_schema_text()/get_database_schema() directly, which ALWAYS
-    # reduces to the "tables_only" derivative - unconditionally,
-    # regardless of SCHEMA_TABLES_ONLY. SCHEMA_TABLES_ONLY isn't even set
-    # in this env, so this specifically proves that unconditional
-    # behavior, not just that the flag happens to be respected.
+    # Phase C below) go through get_summary_schema_text() instead, which
+    # ALWAYS reduces to the "tables_only" derivative.
     env = _two_preset_env(app_factory, tmp_path)
     login_as(env.client, "alice@example.com")
-    assert env.translate_routes.SCHEMA_TABLES_ONLY is False
 
     import db as db_module
     monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
@@ -3409,7 +3402,7 @@ def test_summarize_results_endpoint_always_uses_tables_only_schema_even_when_the
     assert "Constraints:" not in call_text
 
 
-def test_summarize_all_mode_results_always_uses_tables_only_schema_even_when_the_flag_is_off(
+def test_summarize_all_mode_results_always_uses_tables_only_schema(
     app_factory, tmp_path, monkeypatch,
 ):
     # Phase C's own half of the same unconditional-reduction guarantee -
@@ -3420,7 +3413,6 @@ def test_summarize_all_mode_results_always_uses_tables_only_schema_even_when_the
         "postgresql://u:p@host-a:5432/a": "Table: deals\nid INTEGER\n\nConstraints:\n  none\n",
         "postgresql://u:p@host-b:5432/b": "Table: campaigns\nid INTEGER\n",
     }))
-    assert env.translate_routes.SCHEMA_TABLES_ONLY is False
 
     provider = _SchemaCapturingFakeProvider([
         _summary_json({0: "Sales is up 10%.", 1: "Marketing had no data."}),

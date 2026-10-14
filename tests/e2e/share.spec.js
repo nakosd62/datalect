@@ -36,7 +36,8 @@ const { testShowSqlVisible: test, expect, gotoApp, mockTranslate, mockExecute } 
  * validates and persists the descriptor), but real enough to flip
  * ACTIVE_IS_CUSTOM server-side, which is what makes buildShareDatasetRef()
  * share this turn as dataset_ref.kind 'custom' below. Leaves the modal
- * closed and #connDbName reading `${name} (postgres)`. */
+ * closed and #connDbName reading just `${name}` (no "(<type>)" suffix -
+ * see updateConnectionDetails()'s own comment on why that was dropped). */
 async function addAndSaveCustomPostgresConnection(page, name) {
   await page.locator('#configTriggerBadge').click();
   await expect(page.locator('#configModal')).not.toHaveClass(/hidden/, { timeout: 15_000 });
@@ -47,7 +48,7 @@ async function addAndSaveCustomPostgresConnection(page, name) {
   await page.locator('.custom-db-url-input').last().fill('postgresql://user:pass@localhost:5432/mydb');
   await page.locator('#configSaveBtn').click();
   await expect(page.locator('#configModal')).toHaveClass(/hidden/);
-  await expect(page.locator('#connDbName')).toHaveText(`${name} (postgres)`);
+  await expect(page.locator('#connDbName')).toHaveText(name);
 }
 
 /** Directly seeds the SQL box, bypassing translate entirely - same
@@ -337,7 +338,7 @@ test.describe('sharing', () => {
         "You opened a result someone shared with you that uses a private datasource you don't have access to. "
         + "You may continue using the agent against the datasources you have access to."
       );
-      await expect(banner.locator('.shared-view-banner-text')).toContainText('My Private DB (postgres)');
+      await expect(banner.locator('.shared-view-banner-text')).toContainText('My Private DB');
 
       // The shared question, SQL, and results are still fully visible -
       // viewing what was explicitly shared is fine even though the

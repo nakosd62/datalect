@@ -4,14 +4,15 @@ backends/databricks.py, driven two ways:
     (helpers.install_fake_databricks_connect) - verifies the access_token
     requirement and the catalog/schema kwarg dispatch without opening a
     real connection.
-  - get_schema()/get_schema_shallow()/execute()/identity_label()/cache_key():
+  - get_schema()/execute()/identity_label()/cache_key():
     against the same fake psycopg2-shaped cursor/connection
     tests/test_postgres_backend.py uses (helpers.make_fake_pg_connection) -
     databricks-sql-connector implements the same PEP 249 DB-API cursor
     shape, so no Databricks-specific fake is needed for these.
 
-_build_shallow_schema_parts() (called by both get_schema_shallow() and
-get_schema()) issues its queries unconditionally and in a fixed order for
+_build_shallow_schema_parts() (get_schema()'s own private Phase 1 helper -
+see _shallow_schema_text() below for how these tests exercise it directly)
+issues its queries unconditionally and in a fixed order for
 tables/columns, then best-effort (try/except) for the rest - see
 backends/databricks.py:
   1. table names (+ table_type, comment)   2. columns (+ is_identity,
@@ -52,8 +53,29 @@ if SERVER_DIR not in sys.path:
     sys.path.insert(0, SERVER_DIR)
 
 from backends.databricks import DatabricksBackend
-from backends.base import SqlExecutionError, format_dataset_size_line
+from backends.base import SqlExecutionError, format_dataset_size_line, cap_schema_text
 from helpers import install_fake_databricks_connect, make_fake_pg_connection
+
+
+def _shallow_schema_text(backend, connection):
+    """Phase 1 only (catalog-only, no live queries) - exercises
+    _build_shallow_schema_parts() directly, the private helper get_schema()
+    itself calls before appending its own Phase 2 queries on top. There used
+    to be a public get_schema_shallow() entry point that returned exactly
+    this; it was removed once build_router_candidate_summaries() (db.py)
+    stopped needing an independently-fetched shallow schema at all (it now
+    derives its summary from whichever deep entry is already cached), which
+    left this helper with no remaining production caller. These tests still
+    exercise it directly since it's real, still-live rendering logic that
+    get_schema() depends on - same reasoning that keeps the helper itself
+    in databricks.py rather than inlining it into get_schema()."""
+    built = backend._build_shallow_schema_parts(connection)
+    if built is None:
+        return None
+    schema_parts = built[0]
+    if not schema_parts:
+        return None
+    return cap_schema_text("\n\n".join(schema_parts))
 
 
 def _dbx(monkeypatch):
@@ -405,7 +427,7 @@ def test_get_schema_foreign_table_counts_toward_schema_max_tables_cap():
 
 # --- Phase 1 (catalog-only, shallow) new attributes --------------------------
 
-def test_get_schema_shallow_identity_column_marker_renders():
+def test_get_schema_phase1_identity_column_marker_renders():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["users"],
         columns_rows=[
@@ -414,14 +436,14 @@ def test_get_schema_shallow_identity_column_marker_renders():
         ],
     ))
     backend = DatabricksBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "id bigint NOT NULL IDENTITY" in schema
     assert "email string NOT NULL" in schema
     email_line = [l for l in schema.splitlines() if l.strip().startswith("email")][0]
     assert "IDENTITY" not in email_line
 
 
-def test_get_schema_shallow_identity_marker_absent_by_default():
+def test_get_schema_phase1_identity_marker_absent_by_default():
     """Old-style 4-tuple columns_rows (predating is_identity/comment/
     partition_index) must be padded to "not an identity column, no
     comment, not a partition column" - see _pad_column_row - so no
@@ -431,34 +453,34 @@ def test_get_schema_shallow_identity_marker_absent_by_default():
         columns_rows=[("customers", "id", "int", "NO")],
     ))
     backend = DatabricksBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "IDENTITY" not in schema
 
 
-def test_get_schema_shallow_comments_render_table_and_column():
+def test_get_schema_phase1_comments_render_table_and_column():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["orders"],
         columns_rows=[("orders", "status", "string", "NO", "NO", "Order lifecycle state.", None)],
         table_comments={"orders": "Customer purchase orders."},
     ))
     backend = DatabricksBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Comments:" in schema
     assert "[table] orders: Customer purchase orders." in schema
     assert "[column] orders.status: Order lifecycle state." in schema
 
 
-def test_get_schema_shallow_comments_section_absent_when_no_comments():
+def test_get_schema_phase1_comments_section_absent_when_no_comments():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["orders"],
         columns_rows=[("orders", "id", "int", "NO")],
     ))
     backend = DatabricksBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Comments:" not in schema
 
 
-def test_get_schema_shallow_routines_render_name_and_signature_without_body():
+def test_get_schema_phase1_routines_render_name_and_signature_without_body():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["orders"],
         columns_rows=[("orders", "id", "int", "NO")],
@@ -466,13 +488,13 @@ def test_get_schema_shallow_routines_render_name_and_signature_without_body():
         routine_params=[("total_for_customer_1", "customer_id", "bigint", 1)],
     ))
     backend = DatabricksBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Routines:" in schema
     assert "total_for_customer(customer_id bigint) -> double" in schema
     assert "SELECT SUM(amount)" not in schema
 
 
-def test_get_schema_shallow_routines_survive_when_parameters_query_fails():
+def test_get_schema_phase1_routines_survive_when_parameters_query_fails():
     class RaisingCursor:
         def __init__(self):
             self.calls = []
@@ -503,12 +525,12 @@ def test_get_schema_shallow_routines_survive_when_parameters_query_fails():
             return RaisingCursor()
 
     backend = DatabricksBackend()
-    schema = backend.get_schema_shallow(RaisingConnection())
+    schema = _shallow_schema_text(backend, RaisingConnection())
     assert "Table: orders" in schema
     assert "Routines:" not in schema
 
 
-def test_get_schema_shallow_partition_columns_render_ordered_by_partition_index():
+def test_get_schema_phase1_partition_columns_render_ordered_by_partition_index():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["events"],
         columns_rows=[
@@ -518,24 +540,24 @@ def test_get_schema_shallow_partition_columns_render_ordered_by_partition_index(
         ],
     ))
     backend = DatabricksBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Partition columns:" in schema
     assert "events: event_date, region" in schema
 
 
-def test_get_schema_shallow_partition_columns_section_absent_when_none():
+def test_get_schema_phase1_partition_columns_section_absent_when_none():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["orders"],
         columns_rows=[("orders", "id", "int", "NO")],
     ))
     backend = DatabricksBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Partition columns:" not in schema
 
 
-# --- get_schema_shallow() must never include Phase 2 (deep-only) content -----
+# --- Phase 1 alone must never include Phase 2 (deep-only) content ------------
 
-def test_get_schema_shallow_excludes_full_view_and_routine_bodies_and_phase2_sections():
+def test_get_schema_phase1_excludes_full_view_and_routine_bodies_and_phase2_sections():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["orders"],
         columns_rows=[
@@ -546,7 +568,7 @@ def test_get_schema_shallow_excludes_full_view_and_routine_bodies_and_phase2_sec
         routines=[("get_total_1", "get_total", "int", "SELECT 1;")],
     ))
     backend = DatabricksBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "View v" in schema
     assert "SELECT 1 FROM orders" not in schema
     assert "View definitions:" not in schema
@@ -575,7 +597,7 @@ def _base_deep_responses():
     )
 
 
-def test_get_schema_deep_is_superset_of_shallow_plus_phase2_sampling():
+def test_get_schema_deep_is_superset_of_phase1_plus_phase2_sampling():
     responses = _base_deep_responses() + [
         ([(42,)], None, -1),                                     # live count for orders
         ([(1, 100)], None, -1),                                  # min/max for id
@@ -655,7 +677,7 @@ def test_get_schema_deep_naming_convention_relationships_section():
             ("orders", "customer_id", "binary", "NO"),
         ],
     ))
-    shallow = backend.get_schema_shallow(conn2)
+    shallow = _shallow_schema_text(backend, conn2)
     assert "Likely relationships" not in shallow
 
 

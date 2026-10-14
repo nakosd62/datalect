@@ -3135,9 +3135,9 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   // Poll cadence for pollSchemaFetchStatus() below - tentative values chosen
-  // to comfortably cover a full deep+shallow schema fetch plus the schema-
-  // overview LLM call (prime_schema_cache_with_reason() in db.py) for a
-  // normal-sized connection, while still noticing quickly once it's done.
+  // to comfortably cover a full schema fetch plus the schema-overview LLM
+  // call (prime_schema_cache_with_reason() in db.py) for a normal-sized
+  // connection, while still noticing quickly once it's done.
   const SCHEMA_FETCH_POLL_INTERVAL_MS = 1500;
   const SCHEMA_FETCH_POLL_MAX_ATTEMPTS = 40; // ~60s ceiling before giving up
 
@@ -3265,41 +3265,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     return { count, label: 'Multiple databases', names };
   }
 
-  // The header badge's own "(<type>)" suffix (per explicit request: "exactly
-  // how it shows in the dataset selector dialog") - reuses the exact same
-  // dialect_name/type fallback chain renderPresetOption() above already
-  // uses for that dialog's own "<name> (<type>)" rows, and "Composite" for
-  // group mode matches renderGroupOption()'s own "(Composite)" parenthetical
-  // there too, so the badge and the dialog never disagree on what a given
-  // selection is called. Returns '' (no parenthetical at all) for the
-  // legacy multi-select subset, which can mix presets of different
-  // dialects and custom connections - there's no single accurate type to
-  // show for that case, unlike an admin-curated group (always presets only,
-  // per summarizeInScopeConnections' own comment) or a single connection.
-  function getBadgeTypeLabel(data, matchedPreset) {
-    if (data?.in_scope_mode === 'group') return 'Composite';
-    const presetIds = data?.in_scope_preset_ids || [];
-    const customKeys = data?.in_scope_custom_connection_keys || [];
-    if (presetIds.length + customKeys.length > 1) return '';
-    if (data?.active_is_custom) {
-      // Custom connections never get a server-computed dialect_name (that's
-      // a preset-only field added by config_routes.py's
-      // _redact_preset_for_client() - see renderPresetOption()'s own
-      // comment) - data.active_database_type is the closest (raw, e.g.
-      // "postgres" rather than "PostgreSQL") equivalent still on hand.
-      return data?.active_database_type || '';
-    }
-    return matchedPreset?.dialect_name || matchedPreset?.type || '';
-  }
-
   async function updateConnectionDetails(data) {
     const badge = document.getElementById('configTriggerBadge');
     const inScopeSummary = summarizeInScopeConnections(data);
     // Computed up here (rather than only in the authenticated-user path
     // below, where this used to live) so the anonymous-user branch just
-    // below can also use it for its own badge type suffix - CONFIGURED_DBS
-    // (redacted, but dialect_name/type survive redaction) and
-    // data.active_preset_id are both available for anonymous sessions too.
+    // below can also use its own "name" fallback - CONFIGURED_DBS (redacted,
+    // but name survives redaction) and data.active_preset_id are both
+    // available for anonymous sessions too.
     const matchedPreset = CONFIGURED_DBS.find(db => db.id === data?.active_preset_id);
 
     if (isAnonymousUser && !data?.active_is_custom) {
@@ -3314,8 +3287,12 @@ document.addEventListener('DOMContentLoaded', async () => {
       // path an authenticated user gets, below.
       if (badge) badge.style.display = '';
       const anonDbLabel = inScopeSummary.label || data?.database_name || 'Database';
-      const anonTypeLabel = getBadgeTypeLabel(data, matchedPreset);
-      const anonBadgeText = anonTypeLabel ? `${anonDbLabel} (${anonTypeLabel})` : anonDbLabel;
+      // "(Composite)" - not a database type (the "(<type>)" suffix dropped
+      // elsewhere in this function per explicit request), but the same
+      // group-vs-single-connection marker renderGroupOption() shows in the
+      // dataset selector dialog, so the badge and the dialog still agree
+      // on what a dataset GROUP selection is called.
+      const anonBadgeText = data?.in_scope_mode === 'group' ? `${anonDbLabel} (Composite)` : anonDbLabel;
       if (connDbName) {
         connDbName.textContent = data?.active_connection_missing ? `⚠ ${anonBadgeText}` : anonBadgeText;
       }
@@ -3385,16 +3362,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         : `Connected to: ${dbDisplayName} (Click to configure)`;
     }
 
-    // Badge type suffix (per explicit request: "(Postgres)" etc., exactly
-    // matching the dataset selector dialog's own "<name> (<type>)" rows -
-    // see getBadgeTypeLabel()'s own comment above) - appended only when
-    // there's an actual single type to show; the legacy multi-select
-    // subset (mixed dialects/custom connections, no single accurate type)
-    // shows just the plain name, same as before this feature existed.
-    const typeLabel = getBadgeTypeLabel(data, matchedPreset);
-
+    // "(Composite)" - not a database type (no "(<type>)" suffix shown any
+    // more, per explicit request), but the same group-vs-single-connection
+    // marker renderGroupOption() shows in the dataset selector dialog, so
+    // the badge and the dialog still agree on what a dataset GROUP
+    // selection is called.
     if (connDbName) {
-      connDbName.textContent = typeLabel ? `${dbDisplayName} (${typeLabel})` : dbDisplayName;
+      connDbName.textContent = data?.in_scope_mode === 'group' ? `${dbDisplayName} (Composite)` : dbDisplayName;
     }
 
     document.title = `Datalect`;
@@ -3774,13 +3748,20 @@ document.addEventListener('DOMContentLoaded', async () => {
       // re-renders since it lives on the object itself rather than index.
       const isExpanded = db._expanded !== undefined ? db._expanded : !db.connection_key;
 
-      // Row 1 (all types): selection radio, dialect select, and Name -
-      // dialect-specific fields live on their own dedicated rows below,
-      // never crowding this first line.
+      // Row 1 (all types): selection radio, Name, and dialect select - per
+      // explicit request, Name comes first (reads left-to-right as "what
+      // it's called, then what kind of thing it is") with the dialect
+      // select after it, reversed from this row's original order. Dialect-
+      // specific fields live on their own dedicated rows below, never
+      // crowding this first line.
       html += `
         <div class="custom-db-card">
           <div class="custom-db-header-row">
             <input type="radio" name="db_connection_option" value="custom-${index}" data-dbname="${db.name || ''}" ${isSelected ? 'checked' : ''}>
+            <div class="custom-db-field">
+              <label class="custom-db-field-label" for="custom-db-name-${index}">Name:</label>
+              <input type="text" id="custom-db-name-${index}" class="config-input custom-db-name-input" data-index="${index}" placeholder="e.g. My Database" value="${db.name || ''}" autocomplete="off">
+            </div>
             <select class="config-input custom-db-type-select" data-index="${index}">
               <option value="postgres" ${(!isBigQuery && !isSnowflake && !isMySQL && !isDatabricks && !isOracle && !isRedshift && !isSqlServer && !isSheets && !isMongoSql) ? 'selected' : ''}>PostgreSQL</option>
               <option value="mysql" ${isMySQL ? 'selected' : ''}>MySQL</option>
@@ -3793,10 +3774,6 @@ document.addEventListener('DOMContentLoaded', async () => {
               <option value="sheets" ${isSheets ? 'selected' : ''}>Google Sheets</option>
               <option value="MongoDB" ${isMongoSql ? 'selected' : ''}>MongoDB</option>
             </select>
-            <div class="custom-db-field">
-              <label class="custom-db-field-label" for="custom-db-name-${index}">Name:</label>
-              <input type="text" id="custom-db-name-${index}" class="config-input custom-db-name-input" data-index="${index}" placeholder="e.g. My Database" value="${db.name || ''}" autocomplete="off">
-            </div>
             <button type="button" class="btn btn-secondary custom-db-toggle-btn" data-index="${index}" aria-expanded="${isExpanded}" title="${isExpanded ? 'Hide connection details' : 'Show connection details'}">${isExpanded ? '▾' : '▸'}</button>
             <button type="button" class="btn btn-secondary custom-db-remove-btn" data-index="${index}" title="Remove this connection">&times;</button>
           </div>
@@ -4573,19 +4550,14 @@ document.addEventListener('DOMContentLoaded', async () => {
       // so a never-touched session's one radio shows checked exactly as
       // before this feature existed.
       const isSelected = !groupSelected && IN_SCOPE_PRESET_IDS.includes(db.id);
-      // dialect_name (e.g. "PostgreSQL", "BigQuery Standard SQL") is a
-      // display-only field added by config_routes.py's
-      // _redact_preset_for_client() alongside the raw "type" key - shown in
-      // parentheses so every preset in this list reads as "<name> (<type>)",
-      // matching the same "<name> in <dialect>" terminology the Schema
-      // Viewer already uses for a single connection. Falls back to the raw
-      // "type" string itself on the off chance an older cached /api/config
-      // response (or a test double) doesn't carry dialect_name yet.
-      const dialectLabel = db.dialect_name || db.type || 'SQL';
+      // Just the name - per explicit request, no "(<type>)" parenthetical
+      // any more (this used to show db.dialect_name/db.type, e.g.
+      // "<name> (PostgreSQL)"). The name alone is enough to pick a preset
+      // from this list.
       return `
         <label class="radio-option">
           <input type="radio" name="db_connection_option" value="${value}" data-dbname="${db.name}" ${isSelected ? 'checked' : ''}>
-          <span class="radio-label">${db.name} (${dialectLabel})</span>
+          <span class="radio-label">${db.name}</span>
         </label>
       `;
     };
@@ -4611,11 +4583,11 @@ document.addEventListener('DOMContentLoaded', async () => {
       const value = `group:${group.id}`;
       const isSelected = groupSelected && IN_SCOPE_GROUP_ID === group.id;
       // "(Composite)" mirrors the exact parenthetical the group Schema
-      // Viewer's own title already uses (see openGroupSchemaViewer()) and
-      // getBadgeTypeLabel()'s own header-badge suffix - the same "type" a
-      // single preset's own dialect_name occupies in renderPresetOption()
-      // above, so every entry in this whole picker (single presets and
-      // groups alike) reads consistently as "<name> (<type>)".
+      // Viewer's own title already uses (see openGroupSchemaViewer()) - this
+      // one stays even though renderPresetOption() above no longer shows a
+      // "(<type>)" suffix of its own, since "Composite" isn't a database
+      // type - it's what tells a group apart from an ordinary single
+      // connection in this same list.
       return `
         <label class="radio-option all-databases-option" title="${GROUP_OPTION_HINT}">
           <input type="radio" name="db_connection_option" value="${value}" data-dbname="${group.name}" ${isSelected ? 'checked' : ''}>
@@ -7648,7 +7620,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // Matches one column's rendered line, in the "  {name} {type} {NULL|NOT
   // NULL}[ {whatever the dialect appends next}]" shape essentially every
-  // SQL-family backend's get_schema()/get_schema_shallow() commits to for
+  // SQL-family backend's get_schema() commits to for
   // every column it emits (see e.g. backends/postgres.py, backends/
   // mysql.py, backends/mssql.py, and so on - confirmed the same across
   // every dialect that isn't backends/sheets.py's spreadsheet-column

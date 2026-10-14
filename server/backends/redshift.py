@@ -77,14 +77,13 @@ to respect whatever search_path that override left in effect, not assume
 'public' unconditionally the way Postgres's simpler (no schema-override
 field) descriptor can get away with.
 
-Two-phase split (get_schema_shallow() / get_schema()): see backends/base.py's
-Backend.get_schema()/get_schema_shallow() docstrings for the general shape.
+Two-phase split, internal to get_schema(): see backends/base.py's
+Backend.get_schema() docstring for the general shape.
 _build_shallow_schema_parts() below runs every Phase 1 (catalog-only) query
-once; get_schema_shallow() joins/caps that directly, and get_schema() (deep)
-appends Phase 2's live-query sections (full view/routine body text, per-table
-sampling, live row counts, the naming-convention pass) before joining/capping
-once. New Phase 1 additions on top of the original tables/columns/
-constraints/layout/views:
+once, and get_schema() appends Phase 2's live-query sections (full
+view/routine body text, per-table sampling, live row counts, the
+naming-convention pass) before joining/capping once. New Phase 1 additions
+on top of the original tables/columns/constraints/layout/views:
   - Identity-column marker: NOT sourced from information_schema.columns'
     is_identity/identity_generation the way backends/postgres.py's does.
     Those two columns are a PostgreSQL 10+ addition (GENERATED ALWAYS AS
@@ -348,11 +347,10 @@ class RedshiftBackend(Backend):
         return db_name, username
 
     def _build_shallow_schema_parts(self, connection):
-        """Phase 1 (catalog-only, no live queries): every query both
-        get_schema_shallow() and get_schema() (deep) need, run exactly once
-        here and shared by both - see the module docstring's two-phase
-        section and backends/base.py's Backend.get_schema()/
-        get_schema_shallow() docstrings for why this split exists.
+        """Phase 1 (catalog-only, no live queries), run exactly once here
+        and used as the base get_schema() appends Phase 2 onto - see the
+        module docstring's two-phase section and backends/base.py's
+        Backend.get_schema() docstring for why this split exists.
 
         Returns None if the connection's current_schema() has no BASE TABLE
         at all (mirrors get_schema()'s old "return None" for that case).
@@ -716,15 +714,6 @@ class RedshiftBackend(Backend):
             "routines": routines,
         }
         return schema_parts, table_columns, phase2_ctx
-
-    def get_schema_shallow(self, connection):
-        built = self._build_shallow_schema_parts(connection)
-        if built is None:
-            return None
-        schema_parts, _table_columns, _phase2_ctx = built
-        if not schema_parts:
-            return None
-        return cap_schema_text("\n\n".join(schema_parts))
 
     def get_schema(self, connection):
         built = self._build_shallow_schema_parts(connection)

@@ -494,12 +494,11 @@ class OracleBackend(Backend):
         return db_name, username
 
     def _build_shallow_schema_parts(self, connection):
-        """Phase 1 (catalog-only, no live queries): every query both
-        get_schema_shallow() and get_schema() (deep) need, run exactly once
-        here and shared by both - mirrors backends/postgres.py's own
-        _build_shallow_schema_parts (see its docstring for the general
-        shape) and backends/base.py's Backend.get_schema()/
-        get_schema_shallow() docstrings for why this split exists at all.
+        """Phase 1 (catalog-only, no live queries), run exactly once here
+        and used as the base get_schema() appends Phase 2 onto - mirrors
+        backends/postgres.py's own _build_shallow_schema_parts (see its
+        docstring for the general shape) and backends/base.py's
+        Backend.get_schema() docstring for why this split exists at all.
 
         Returns None if the connection's current schema/owner has no table
         at all (mirrors the pre-split get_schema()'s "return None" for that
@@ -890,15 +889,6 @@ class OracleBackend(Backend):
             "views": views,
         }
         return schema_parts, table_columns, phase2_ctx
-
-    def get_schema_shallow(self, connection):
-        built = self._build_shallow_schema_parts(connection)
-        if built is None:
-            return None
-        schema_parts, _table_columns, _phase2_ctx = built
-        if not schema_parts:
-            return None
-        return cap_schema_text("\n\n".join(schema_parts))
 
     def get_schema(self, connection):
         """Phase 1 (catalog-only, via _build_shallow_schema_parts) plus

@@ -17,11 +17,32 @@ if SERVER_DIR not in sys.path:
     sys.path.insert(0, SERVER_DIR)
 
 from backends.bigquery import BigQueryBackend
-from backends.base import SqlExecutionError, format_dataset_size_line
+from backends.base import SqlExecutionError, format_dataset_size_line, cap_schema_text
 from helpers import (
     install_fake_bigquery, schema_query_handler, make_service_account_key_json,
     FakeBQQueryJob,
 )
+
+
+def _shallow_schema_text(backend, connection):
+    """Phase 1 only (catalog-only, no live queries) - exercises
+    _build_shallow_schema_parts() directly, the private helper get_schema()
+    itself calls before appending its own Phase 2 queries on top. There used
+    to be a public get_schema_shallow() entry point that returned exactly
+    this; it was removed once build_router_candidate_summaries() (db.py)
+    stopped needing an independently-fetched shallow schema at all (it now
+    derives its summary from whichever deep entry is already cached), which
+    left this helper with no remaining production caller. These tests still
+    exercise it directly since it's real, still-live rendering logic that
+    get_schema() depends on - same reasoning that keeps the helper itself
+    in bigquery.py rather than inlining it into get_schema()."""
+    built = backend._build_shallow_schema_parts(connection)
+    if built is None:
+        return None
+    schema_parts = built[0]
+    if not schema_parts:
+        return None
+    return cap_schema_text("\n\n".join(schema_parts))
 
 
 def _bq(monkeypatch):
@@ -195,21 +216,21 @@ def test_get_schema_survives_constraints_query_failure(monkeypatch):
     assert "Constraints:" not in schema
 
 
-def test_get_schema_shallow_returns_none_when_no_tables(monkeypatch):
+def test_get_schema_phase1_returns_none_when_no_tables(monkeypatch):
     backend, harness = _bq(monkeypatch)
     harness.set_handler(schema_query_handler(tables=[]))
     conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
-    assert backend.get_schema_shallow(conn) is None
+    assert _shallow_schema_text(backend, conn) is None
 
 
-def test_get_schema_shallow_lists_plain_table_with_columns(monkeypatch):
+def test_get_schema_phase1_lists_plain_table_with_columns(monkeypatch):
     backend, harness = _bq(monkeypatch)
     harness.set_handler(schema_query_handler(
         tables=["customers"],
         columns=[("customers", "id", "INT64", "NO"), ("customers", "name", "STRING", "YES")],
     ))
     conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Table: customers" in schema
     assert "id INT64 NOT NULL" in schema
     assert "name STRING NULL" in schema
@@ -217,7 +238,7 @@ def test_get_schema_shallow_lists_plain_table_with_columns(monkeypatch):
 
 # --- Phase 1: table/column comments -------------------------------------------
 
-def test_get_schema_shallow_includes_table_comment(monkeypatch):
+def test_get_schema_phase1_includes_table_comment(monkeypatch):
     backend, harness = _bq(monkeypatch)
     harness.set_handler(schema_query_handler(
         tables=["customers"],
@@ -225,18 +246,18 @@ def test_get_schema_shallow_includes_table_comment(monkeypatch):
         table_comments={"customers": "Customer master table"},
     ))
     conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Table comments:" in schema
     assert "customers: Customer master table" in schema
 
 
-def test_get_schema_shallow_omits_table_comments_section_when_none_present(monkeypatch):
+def test_get_schema_phase1_omits_table_comments_section_when_none_present(monkeypatch):
     backend, harness = _bq(monkeypatch)
     harness.set_handler(schema_query_handler(
         tables=["customers"], columns=[("customers", "id", "INT64", "NO")],
     ))
     conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Table comments:" not in schema
 
 
@@ -276,7 +297,7 @@ def test_get_schema_survives_table_options_query_failure(monkeypatch):
 
 # --- Phase 1: row-count estimate (INFORMATION_SCHEMA.TABLE_STORAGE) -----------
 
-def test_get_schema_shallow_includes_row_count_estimate(monkeypatch):
+def test_get_schema_phase1_includes_row_count_estimate(monkeypatch):
     backend, harness = _bq(monkeypatch)
     harness.set_handler(schema_query_handler(
         tables=["customers"],
@@ -284,7 +305,7 @@ def test_get_schema_shallow_includes_row_count_estimate(monkeypatch):
         table_storage={"customers": 12345},
     ))
     conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Row count estimates:" in schema
     assert "customers: ~12345 rows (estimate)" in schema
 
@@ -481,7 +502,7 @@ def test_get_schema_deep_survives_dataset_size_not_found_for_a_cross_project_dat
 
 # --- Phase 1: routines (existence + signature, no body) -----------------------
 
-def test_get_schema_shallow_includes_routine_signature_without_body(monkeypatch):
+def test_get_schema_phase1_includes_routine_signature_without_body(monkeypatch):
     backend, harness = _bq(monkeypatch)
     harness.set_handler(schema_query_handler(
         tables=["orders"],
@@ -490,13 +511,13 @@ def test_get_schema_shallow_includes_routine_signature_without_body(monkeypatch)
         routine_params=[("total_rev_1", "region", "STRING", 1)],
     ))
     conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Routines:" in schema
     assert "total_rev(region STRING) -> FLOAT64" in schema
     assert "SELECT SUM(amount) FROM orders" not in schema
 
 
-def test_get_schema_includes_routine_body_in_deep_but_not_shallow(monkeypatch):
+def test_get_schema_includes_routine_body_in_deep_but_not_phase1(monkeypatch):
     backend, harness = _bq(monkeypatch)
     handler = schema_query_handler(
         tables=["orders"],
@@ -505,7 +526,7 @@ def test_get_schema_includes_routine_body_in_deep_but_not_shallow(monkeypatch):
     )
     harness.set_handler(handler)
     conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
-    shallow = backend.get_schema_shallow(conn)
+    shallow = _shallow_schema_text(backend, conn)
     deep = backend.get_schema(conn)
     assert "total_rev() -> FLOAT64" in shallow
     assert "SELECT SUM(amount) FROM orders" not in shallow
@@ -546,7 +567,7 @@ def test_get_schema_routine_signature_survives_parameters_query_failure(monkeypa
 
     harness.set_handler(handler)
     conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "total_rev() -> FLOAT64" in schema
 
 
@@ -582,7 +603,7 @@ def test_get_schema_survives_routines_query_failure(monkeypatch):
 
 # --- Phase 1: distribution/clustering/partition columns (free COLUMNS add) ----
 
-def test_get_schema_shallow_includes_partitioning_and_clustering_markers(monkeypatch):
+def test_get_schema_phase1_includes_partitioning_and_clustering_markers(monkeypatch):
     backend, harness = _bq(monkeypatch)
     harness.set_handler(schema_query_handler(
         tables=["events"],
@@ -595,7 +616,7 @@ def test_get_schema_shallow_includes_partitioning_and_clustering_markers(monkeyp
         clustering_columns={"events": ["user_id", "country"]},
     ))
     conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "event_date DATE NOT NULL [PARTITION]" in schema
     assert "user_id STRING NOT NULL [CLUSTER #1]" in schema
     assert "country STRING NULL [CLUSTER #2]" in schema
@@ -603,7 +624,7 @@ def test_get_schema_shallow_includes_partitioning_and_clustering_markers(monkeyp
 
 # --- Phase 1: require_partition_filter (correctness-gating) -------------------
 
-def test_get_schema_shallow_flags_require_partition_filter(monkeypatch):
+def test_get_schema_phase1_flags_require_partition_filter(monkeypatch):
     backend, harness = _bq(monkeypatch)
     harness.set_handler(schema_query_handler(
         tables=["events"],
@@ -612,11 +633,11 @@ def test_get_schema_shallow_flags_require_partition_filter(monkeypatch):
         require_partition_filter={"events": True},
     ))
     conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "REQUIRES PARTITION FILTER on event_date" in schema
 
 
-def test_get_schema_shallow_omits_partition_filter_flag_when_false(monkeypatch):
+def test_get_schema_phase1_omits_partition_filter_flag_when_false(monkeypatch):
     backend, harness = _bq(monkeypatch)
     harness.set_handler(schema_query_handler(
         tables=["customers"],
@@ -624,13 +645,13 @@ def test_get_schema_shallow_omits_partition_filter_flag_when_false(monkeypatch):
         require_partition_filter={"customers": False},
     ))
     conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "REQUIRES PARTITION FILTER" not in schema
 
 
 # --- Phase 1: external tables --------------------------------------------------
 
-def test_get_schema_shallow_flags_external_table(monkeypatch):
+def test_get_schema_phase1_flags_external_table(monkeypatch):
     backend, harness = _bq(monkeypatch)
     harness.set_handler(schema_query_handler(
         tables=["ext_data"],
@@ -638,14 +659,14 @@ def test_get_schema_shallow_flags_external_table(monkeypatch):
         table_types={"ext_data": "EXTERNAL"},
     ))
     conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Table: ext_data [external table]" in schema
 
 
 # --- Phase 1 vs Phase 2: shallow excludes Phase 2 / full bodies; deep is a ----
 # --- superset -------------------------------------------------------------
 
-def test_get_schema_shallow_excludes_phase2_content_and_full_bodies(monkeypatch):
+def test_get_schema_phase1_excludes_phase2_content_and_full_bodies(monkeypatch):
     backend, harness = _bq(monkeypatch)
     harness.set_handler(schema_query_handler(
         tables=["customers"],
@@ -654,7 +675,7 @@ def test_get_schema_shallow_excludes_phase2_content_and_full_bodies(monkeypatch)
         routines=[("total", "total_1", "INT64", "SELECT 1")],
     ))
     conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
-    shallow = backend.get_schema_shallow(conn)
+    shallow = _shallow_schema_text(backend, conn)
     assert "Views:" in shallow
     assert "customer_orders" in shallow
     assert "SELECT * FROM orders" not in shallow
@@ -667,7 +688,7 @@ def test_get_schema_shallow_excludes_phase2_content_and_full_bodies(monkeypatch)
     assert "Column value samples:" not in shallow
 
 
-def test_get_schema_deep_is_superset_of_shallow(monkeypatch):
+def test_get_schema_deep_is_superset_of_phase1(monkeypatch):
     backend, harness = _bq(monkeypatch)
     handler = schema_query_handler(
         tables=["customers"],
@@ -676,7 +697,7 @@ def test_get_schema_deep_is_superset_of_shallow(monkeypatch):
     )
     harness.set_handler(handler)
     conn = backend.connect({"type": "bigquery", "project_id": "p", "dataset": "d"})
-    shallow = backend.get_schema_shallow(conn)
+    shallow = _shallow_schema_text(backend, conn)
     deep = backend.get_schema(conn)
     assert deep.startswith(shallow)
     assert "View definitions:" in deep

@@ -283,14 +283,13 @@ class BigQueryBackend(Backend):
         return connection.query(sql_text, job_config=job_config)
 
     def _build_shallow_schema_parts(self, connection):
-        """Phase 1 (catalog-only, no live queries): every query both
-        get_schema_shallow() and get_schema() (deep) need, run exactly once
-        here and shared by both - see backends/base.py's Backend.get_schema()/
-        get_schema_shallow() docstrings for why this split exists at all,
-        and backends/postgres.py's own _build_shallow_schema_parts for the
-        structural pattern this mirrors (BigQuery's own optional-section
-        try/except style is unchanged from before this split - see each
-        section below).
+        """Phase 1 (catalog-only, no live queries), run exactly once here
+        and used as the base get_schema() appends Phase 2 onto - see
+        backends/base.py's Backend.get_schema() docstring for why this
+        split exists at all, and backends/postgres.py's own
+        _build_shallow_schema_parts for the structural pattern this
+        mirrors (BigQuery's own optional-section try/except style is
+        unchanged from before this split - see each section below).
 
         Returns None if the dataset has no BASE TABLE/EXTERNAL table at all
         (mirrors the old get_schema()'s "return None" for that case).
@@ -695,15 +694,6 @@ class BigQueryBackend(Backend):
         }
         return schema_parts, table_columns, phase2_ctx
 
-    def get_schema_shallow(self, connection):
-        built = self._build_shallow_schema_parts(connection)
-        if built is None:
-            return None
-        schema_parts, _table_columns, _phase2_ctx = built
-        if not schema_parts:
-            return None
-        return cap_schema_text("\n\n".join(schema_parts))
-
     def get_schema(self, connection):
         built = self._build_shallow_schema_parts(connection)
         if built is None:
@@ -772,12 +762,11 @@ class BigQueryBackend(Backend):
         if routine_body_lines:
             schema_parts.append("Routine definitions:\n" + "\n".join(routine_body_lines))
 
-        # Phase 2 (deep-only, live queries): frequent values/min-max,
+        # Phase 2 (live queries, appended only by get_schema(), never
+        # _build_shallow_schema_parts() alone): frequent values/min-max,
         # cardinality gating, live row counts - per kept table. Real
-        # BigQuery cost/billing implications (unlike the free
-        # INFORMATION_SCHEMA metadata queries above), so this whole block
-        # is reachable only from get_schema() (deep), never from
-        # get_schema_shallow().
+        # BigQuery cost/billing implications, unlike the free
+        # INFORMATION_SCHEMA metadata queries above.
         live_count_lines = []
         sample_blocks = []
         for table_name in kept_names:

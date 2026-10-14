@@ -31,8 +31,27 @@ if SERVER_DIR not in sys.path:
     sys.path.insert(0, SERVER_DIR)
 
 from backends.mongodb_sql import MongoSqlBackend
-from backends.base import DB_CONNECT_TIMEOUT_SECONDS, SqlExecutionError
+from backends.base import DB_CONNECT_TIMEOUT_SECONDS, SqlExecutionError, cap_schema_text
 import backends.mongodb_sql as mongodb_sql_module
+
+
+def _shallow_schema_text(backend, connection):
+    """Phase 1 only (catalog-only, no live queries) - exercises
+    _build_shallow_schema_parts() directly, the private helper get_schema()
+    itself calls before appending its own Phase 2 (the shared naming-
+    convention relationship pass - this backend has no live-query content
+    of its own, see get_schema()'s own docstring). There used to be a
+    public get_schema_shallow() entry point that returned exactly this; it
+    was removed once build_router_candidate_summaries() (db.py) stopped
+    needing an independently-fetched shallow schema at all (it now derives
+    its summary from whichever deep entry is already cached), which left
+    this helper with no remaining production caller. These tests still
+    exercise it directly since it's real, still-live rendering logic that
+    get_schema() depends on."""
+    schema_parts, _table_columns = backend._build_shallow_schema_parts(connection)
+    if not schema_parts:
+        return None
+    return cap_schema_text("\n\n".join(schema_parts))
 
 
 # --- fakes -------------------------------------------------------------------
@@ -400,25 +419,26 @@ def test_get_schema_caps_at_schema_max_tables(monkeypatch):
     assert "1 more table(s) not shown" in schema
 
 
-# --- get_schema_shallow() / get_schema() two-phase split ------------------------
+# --- Phase 1/Phase 2 split -----------------------------------------------------
 #
 # mongodb_sql.py has no Phase 2 live-query content of its own (see
-# get_schema_shallow()'s own docstring) - the only difference between the
-# two methods is the shared naming-convention relationship pass, so that's
-# what these tests pin down.
+# get_schema()'s own docstring) - the only difference between Phase 1 alone
+# and get_schema()'s full output is the shared naming-convention
+# relationship pass, so that's what these tests pin down.
 
-def test_get_schema_shallow_matches_get_schema_when_no_relationships_found():
+def test_get_schema_phase1_matches_get_schema_when_no_relationships_found():
     conn = _FakeConnection(
         tables_rows=[_FakeRow(table_name="widgets")],
         columns_by_table={"widgets": [_FakeRow(column_name="_id", type_name="VARCHAR", is_nullable="NO")]},
     )
-    shallow = MongoSqlBackend().get_schema_shallow(conn)
-    deep = MongoSqlBackend().get_schema(conn)
+    backend = MongoSqlBackend()
+    shallow = _shallow_schema_text(backend, conn)
+    deep = backend.get_schema(conn)
     assert shallow == deep
     assert "Likely Relationships" not in deep
 
 
-def test_get_schema_deep_adds_naming_convention_section_that_shallow_omits():
+def test_get_schema_deep_adds_naming_convention_section_that_phase1_omits():
     conn = _FakeConnection(
         tables_rows=[_FakeRow(table_name="orders"), _FakeRow(table_name="customers")],
         columns_by_table={
@@ -431,17 +451,18 @@ def test_get_schema_deep_adds_naming_convention_section_that_shallow_omits():
             ],
         },
     )
-    shallow = MongoSqlBackend().get_schema_shallow(conn)
-    deep = MongoSqlBackend().get_schema(conn)
+    backend = MongoSqlBackend()
+    shallow = _shallow_schema_text(backend, conn)
+    deep = backend.get_schema(conn)
     assert "Likely Relationships" not in shallow
     assert "Likely Relationships" in deep
     assert "orders.customer_id" in deep
     assert "customers" in deep
 
 
-def test_get_schema_shallow_returns_none_with_no_tables():
+def test_get_schema_phase1_returns_none_with_no_tables():
     conn = _FakeConnection(tables_rows=[])
-    assert MongoSqlBackend().get_schema_shallow(conn) is None
+    assert _shallow_schema_text(MongoSqlBackend(), conn) is None
 
 
 # --- execute(): read-only enforcement -----------------------------------------

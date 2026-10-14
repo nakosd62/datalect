@@ -157,8 +157,9 @@ def _is_near_unique_distinct_count(distinct_count, row_count):
     engine operations - not reliable enough to gate on for an arbitrary
     categorical column that may have no index at all. A live COUNT(DISTINCT)
     is used instead: this is acceptable here specifically because gating
-    only ever runs from get_schema() (deep, Phase 2, already a live-query
-    context) - get_schema_shallow() (Phase 1) never reaches this function.
+    only ever runs from get_schema()'s Phase 2 section, already a
+    live-query context - Phase 1 (_build_shallow_schema_parts) never
+    reaches this function.
 
     `distinct_count is None` (the COUNT(DISTINCT) query itself failed, e.g.
     a permissions gap) is treated as "not near-unique" - permissive by
@@ -368,12 +369,13 @@ class MySQLBackend(Backend):
         return db_name, username
 
     def _build_shallow_schema_parts(self, connection):
-        """Phase 1 (catalog-only, no live queries): every query both
-        get_schema_shallow() and get_schema() (deep) need, run exactly once
-        here and shared by both - see backends/postgres.py's own
-        _build_shallow_schema_parts() for the identical shape this mirrors,
-        and backends/base.py's Backend.get_schema()/get_schema_shallow()
-        docstrings for why this split exists at all.
+        """Phase 1 (catalog-only, no live queries), run exactly once here
+        and used as the base get_schema() appends Phase 2 onto - see
+        backends/postgres.py's own _build_shallow_schema_parts() for the
+        identical shape this mirrors, and backends/base.py's
+        Backend.get_schema() docstring for why this split exists at all
+        (including the history of the now-removed get_schema_shallow()
+        public entry point this helper used to also back).
 
         Returns None if the connection's database has no BASE TABLE at all
         (mirrors get_schema()'s old "return None" for that case). Otherwise
@@ -702,20 +704,10 @@ class MySQLBackend(Backend):
         }
         return schema_parts, table_columns, phase2_ctx
 
-    def get_schema_shallow(self, connection):
-        built = self._build_shallow_schema_parts(connection)
-        if built is None:
-            return None
-        schema_parts, _table_columns, _phase2_ctx = built
-        if not schema_parts:
-            return None
-        return cap_schema_text("\n\n".join(schema_parts))
-
     def get_schema(self, connection):
         """Deep fetch: Phase 1 (catalog-only, via _build_shallow_schema_parts)
-        plus Phase 2 (live-query enrichment) - see get_schema_shallow() for
-        the catalog-only subset, and the module-level constants above for
-        the sampling caps this section respects."""
+        plus Phase 2 (live-query enrichment) - see the module-level
+        constants above for the sampling caps this section respects."""
         built = self._build_shallow_schema_parts(connection)
         if built is None:
             return None

@@ -81,7 +81,7 @@ from db import (
     resolve_descriptor_by_reference, resolve_dataset_identity, resolve_group_identity,
 )
 from backends import get_backend
-from backends.base import SCHEMA_TABLES_ONLY, derive_tables_only_schema_text
+from backends.base import derive_tables_only_schema_text
 from connection_router import (
     run_triage_call, is_label_only_response, strip_markdown_fence,
     _build_candidate_schema_block, _extract_json_object,

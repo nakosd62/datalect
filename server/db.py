@@ -403,14 +403,13 @@ def build_router_candidate_summaries(in_scope_entries, user_id):
 
     There used to be a genuinely separate, independently-fetched-and-
     cached "shallow" cache entry (cache_key + "::shallow") for this
-    function, back when it only needed table/tab names - removed because
-    the deep text was always a superset of that Phase 1-only text anyway.
-    See get_schema_shallow() on each Backend subclass (still implemented,
-    still exercised by real tests) and the old ::shallow cache-key suffix
-    handling in get_database_schema()/get_database_schema_with_reason()
-    below - both left in place, unused by this function, in case a
-    genuinely independent shallow fetch is ever needed again for
-    something else."""
+    function, back when it only needed table/tab names, plus a
+    per-backend get_schema_shallow() method and a deep=True/False
+    parameter threaded through get_database_schema()/
+    get_database_schema_with_reason() to fetch it - all since removed:
+    the deep text was always a superset of that Phase 1-only text anyway,
+    so there was nothing a genuinely independent shallow fetch bought
+    once this function stopped needing one of its own."""
     if not in_scope_entries:
         return []
 
@@ -540,7 +539,7 @@ def build_group_schema_summaries(group_id, user_id):
             dialect = get_backend(entry["descriptor"]).dialect_name
         except Exception:
             dialect = "SQL"
-        schema_text = get_database_schema(entry["descriptor"], user_id, deep=True)
+        schema_text = get_database_schema(entry["descriptor"], user_id)
         if not schema_text or schema_text == _SCHEMA_FETCH_FAILED:
             return {
                 "id": entry["id"], "name": entry["name"], "type": dialect,
@@ -695,18 +694,7 @@ def get_db_connection(conn_str=None, user_id=None):
     return get_backend(descriptor).connect(descriptor)
 
 
-# Suffix appended to a connection's cache_key for the shallow (Phase 1
-# only, catalog-only) schema-cache entry - kept independent of the plain
-# cache_key (the deep/full-schema entry, unchanged from before this split
-# existed) so a connection can have both cached at once, and so
-# invalidating one doesn't accidentally read/clear the other. See
-# invalidate_schema_cache() below, which clears both together - the only
-# correct way to invalidate a connection's schema, now that there can be
-# two entries for it.
-_SHALLOW_CACHE_KEY_SUFFIX = "::shallow"
-
-
-def get_database_schema(conn_str=None, user_id=None, force_refresh=False, deep=True):
+def get_database_schema(conn_str=None, user_id=None, force_refresh=False):
     """
     Returns the schema introspection text for the resolved connection,
     using a durable cache (see schema_cache.py, backed by state_store.py -
@@ -728,14 +716,15 @@ def get_database_schema(conn_str=None, user_id=None, force_refresh=False, deep=T
     other successful fetch - there's no "temporary" cache tier to fall
     back to.
 
-    deep=True (default - every pre-existing caller keeps getting exactly
-    this) returns the full Phase 1 + Phase 2 ("deep") schema text, cached
-    under this connection's plain cache_key exactly as before this
-    parameter existed. deep=False returns the Phase 1-only ("shallow")
-    text instead, cached separately under cache_key + "::shallow" - used
-    by build_router_candidate_summaries() so an all-dbs triage pass over
-    every in-scope connection doesn't pay Phase 2's live-query cost for
-    connections the router may never actually select.
+    This used to take a deep=True/False parameter, caching a second,
+    independent "shallow" (Phase 1-only, catalog-only) entry under
+    cache_key + "::shallow" for build_router_candidate_summaries() to use
+    for all-dbs triage without paying Phase 2's live-query cost on every
+    in-scope connection - removed because that function no longer fetches
+    anything of its own at all: it derives its compact summary straight
+    from whichever deep entry is already cached, in-memory, with no fetch
+    or cache write of its own (see that function's own docstring). There
+    is now exactly one schema entry per connection, always the full fetch.
 
     Deliberately calls _fetch_database_schema() (the plain-text function),
     NOT _fetch_database_schema_with_reason() - this keeps
@@ -753,15 +742,13 @@ def get_database_schema(conn_str=None, user_id=None, force_refresh=False, deep=T
     """
     descriptor = resolve_conn_str(conn_str, user_id)
     cache_key = get_conn_identifier(descriptor)
-    if not deep:
-        cache_key += _SHALLOW_CACHE_KEY_SUFFIX
 
     if not force_refresh:
         cached = schema_cache.get(cache_key)
         if cached is not None:
             return cached
 
-    schema_text = _fetch_database_schema(descriptor, deep=deep)
+    schema_text = _fetch_database_schema(descriptor)
     # Don't cache the failure fallback - a transient connection hiccup
     # shouldn't get "frozen in" as the answer forever just because the DB
     # happened to be unreachable at the moment of this one fetch; the
@@ -771,31 +758,28 @@ def get_database_schema(conn_str=None, user_id=None, force_refresh=False, deep=T
     return schema_text
 
 
-def get_database_schema_with_reason(conn_str=None, user_id=None, force_refresh=False, deep=True):
+def get_database_schema_with_reason(conn_str=None, user_id=None, force_refresh=False):
     """
     Same caching behavior get_database_schema() above documents (see its
-    docstring - identical cache-key/TTL/deep-vs-shallow semantics), but
-    also returns WHY a failed fetch failed, as a (schema_text, reason)
-    pair: reason is None on a cache hit or a successful fetch, else
-    SCHEMA_FETCH_FAILURE_REASON_EMPTY, _TIMEOUT, or _FATAL
-    (see _fetch_database_schema_with_reason()'s own docstring for exactly
-    what each means). Only prime_schema_cache_with_reason() below currently
-    calls this - every other caller uses the plain get_database_schema()
-    above, which goes through the separate, reason-less
-    _fetch_database_schema() seam instead (see that function's own comment
-    on why these two aren't just one delegating to the other).
+    docstring), but also returns WHY a failed fetch failed, as a
+    (schema_text, reason) pair: reason is None on a cache hit or a
+    successful fetch, else SCHEMA_FETCH_FAILURE_REASON_EMPTY, _TIMEOUT, or
+    _FATAL (see _fetch_database_schema_with_reason()'s own docstring for
+    exactly what each means). Only prime_schema_cache_with_reason() below
+    currently calls this - every other caller uses the plain
+    get_database_schema() above, which goes through the separate,
+    reason-less _fetch_database_schema() seam instead (see that function's
+    own comment on why these two aren't just one delegating to the other).
     """
     descriptor = resolve_conn_str(conn_str, user_id)
     cache_key = get_conn_identifier(descriptor)
-    if not deep:
-        cache_key += _SHALLOW_CACHE_KEY_SUFFIX
 
     if not force_refresh:
         cached = schema_cache.get(cache_key)
         if cached is not None:
             return cached, None
 
-    schema_text, reason = _fetch_database_schema_with_reason(descriptor, deep=deep)
+    schema_text, reason = _fetch_database_schema_with_reason(descriptor)
     # Don't cache the failure fallback - same reasoning as
     # get_database_schema() above.
     if schema_text != _SCHEMA_FETCH_FAILED:
@@ -877,7 +861,7 @@ def prime_schema_cache_with_reason(descriptor, user_id=None):
     # exceptions from its own two schema calls; that's unchanged).
     fetch_error = SCHEMA_FETCH_FAILURE_REASON_FATAL
     try:
-        deep_text, reason = get_database_schema_with_reason(descriptor, user_id, force_refresh=True, deep=True)
+        deep_text, reason = get_database_schema_with_reason(descriptor, user_id, force_refresh=True)
         success = deep_text != _SCHEMA_FETCH_FAILED
         if success:
             _generate_and_cache_schema_overview(descriptor, user_id, deep_text)
@@ -1226,7 +1210,7 @@ def _generate_and_cache_group_schema_overview(group_id, user_id):
             dialect = get_backend(descriptor).dialect_name
         except Exception:
             dialect = "SQL"
-        schema_text = get_database_schema(descriptor, user_id, deep=True)
+        schema_text = get_database_schema(descriptor, user_id)
         tables_only = (
             derive_tables_only_schema_text(schema_text)
             if schema_text and schema_text != _SCHEMA_FETCH_FAILED else ""
@@ -1474,23 +1458,17 @@ def prefetch_all_preset_schemas():
 
 
 def invalidate_schema_cache(cache_key):
-    """Drops BOTH of a connection's schema-cache entries (deep and
-    shallow) for the given plain cache_key (i.e. get_conn_identifier's
-    return value, with no "::shallow" suffix - callers always pass the
-    plain form, this function adds the suffix itself). Use this instead
-    of calling schema_cache.invalidate(cache_key) directly wherever a
-    connection's schema is known to have changed (e.g.
-    config_routes.py's own-connection-edited path) - invalidating only
-    the plain key would leave a stale shallow entry cached, now
-    indefinitely (schema_cache.py has no TTL/expiry at all - see its own
-    module docstring), rather than just for a bounded window, since the
-    two entries are otherwise completely independent (see
-    get_database_schema()'s own cache_key suffixing above)."""
+    """Drops a connection's cached schema entry for the given cache_key
+    (i.e. get_conn_identifier's return value). Use this instead of calling
+    schema_cache.invalidate(cache_key) directly only for callers that want
+    the more descriptive name - this is a thin pass-through today; it used
+    to also need to drop a second, independently-cached "shallow" entry
+    under cache_key + "::shallow" (see get_database_schema()'s own history)
+    before that cache tier was removed entirely."""
     schema_cache.invalidate(cache_key)
-    schema_cache.invalidate(cache_key + _SHALLOW_CACHE_KEY_SUFFIX)
 
 
-def _fetch_database_schema(descriptor, deep=True):
+def _fetch_database_schema(descriptor):
     """The actual DB-hitting introspection logic - thin wrapper around
     _fetch_database_schema_with_reason() (below) for every caller that
     only wants the schema text itself and doesn't care why a failed fetch
@@ -1499,16 +1477,14 @@ def _fetch_database_schema(descriptor, deep=True):
     _SCHEMA_FETCH_FAILED placeholder either way). Always fetches live -
     call get_database_schema() instead unless you specifically need to
     bypass the cache layer."""
-    schema_text, _reason = _fetch_database_schema_with_reason(descriptor, deep=deep)
+    schema_text, _reason = _fetch_database_schema_with_reason(descriptor)
     return schema_text
 
 
-def _fetch_database_schema_with_reason(descriptor, deep=True):
+def _fetch_database_schema_with_reason(descriptor):
     """Same introspection logic _fetch_database_schema() above documents
-    (deep=True: full Phase 1 + Phase 2 backend.get_schema(); deep=False:
-    Phase 1-only backend.get_schema_shallow(), used by
-    build_router_candidate_summaries() below) but also returns WHY a
-    failed fetch failed, as a (schema_text, reason) pair: reason is None
+    (the full Phase 1 + Phase 2 backend.get_schema()) but also returns WHY
+    a failed fetch failed, as a (schema_text, reason) pair: reason is None
     on success, else SCHEMA_FETCH_FAILURE_REASON_EMPTY (connected and
     queried fine, there's just nothing to describe - e.g. a views-only
     schema, a genuinely empty database, or a role with no table-level
@@ -1533,7 +1509,7 @@ def _fetch_database_schema_with_reason(descriptor, deep=True):
     connection = None
     try:
         connection = backend.connect(descriptor)
-        schema_text = backend.get_schema(connection) if deep else backend.get_schema_shallow(connection)
+        schema_text = backend.get_schema(connection)
         if not schema_text:
             # get_schema() returning None/"" is a normal, NON-exceptional
             # return value for every backend (see e.g. backends/postgres.py's

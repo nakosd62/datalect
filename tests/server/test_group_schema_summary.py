@@ -11,7 +11,7 @@ Deliberately mirrors test_connection_router.py's own
 _schema_fetch_by_url()/monkeypatch-db_module._fetch_database_schema
 pattern for controlling each member's schema text without a real database
 connection - build_group_schema_summaries() calls the same
-get_database_schema() (deep=True) real /api/translate calls and GET
+get_database_schema() real /api/translate calls and GET
 /api/schema already use, so this is the one real seam to fake underneath
 it (see backends/base.py's parse_dataset_size_line()/
 SCHEMA_SIZE_CHARS_PER_TOKEN for exactly how "data_size"/"schema_size_
@@ -36,7 +36,7 @@ def _schema_fetch_by_url(mapping):
     """Same shape as test_connection_router.py's own helper of this name -
     duplicated rather than imported across test modules (no shared load-
     order dependency between the two files)."""
-    def _fetch(descriptor, deep=True):
+    def _fetch(descriptor):
         return mapping[descriptor.get("url")]
     return _fetch
 
@@ -83,7 +83,7 @@ def test_build_group_schema_summaries_marks_a_failed_member_unavailable_without_
 
     import db as db_module
 
-    def _fetch(descriptor, deep=True):
+    def _fetch(descriptor):
         if descriptor.get("url") == "postgresql://u:p@h/a":
             return db_module._SCHEMA_FETCH_FAILED
         return "Table: campaigns\n  id integer NOT NULL\n"

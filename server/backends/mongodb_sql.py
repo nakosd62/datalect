@@ -388,27 +388,16 @@ class MongoSqlBackend(Backend):
         cursor.close()
         return schema_parts, table_columns
 
-    def get_schema_shallow(self, connection):
-        """Phase 1 only. See _build_shallow_schema_parts - MongoDB's ODBC
-        catalog surface has no Phase 2 live-query content worth adding
-        (row counts/sampling would need a live query against a document
-        store, not a cheap catalog stat the way pg_class.reltuples is), so
-        this and get_schema() below differ only by the naming-convention
-        pass, not by any live query."""
-        schema_parts, _table_columns = self._build_shallow_schema_parts(connection)
-        if not schema_parts:
-            return None
-        return cap_schema_text("\n\n".join(schema_parts))
-
     def get_schema(self, connection):
         """Phase 1 + Phase 2. Phase 2 here is just the shared, query-free
         naming-convention relationship pass (backends/base.py's
-        find_naming_convention_relationships) - see get_schema_shallow()'s
-        own docstring for why nothing else in the Phase 2 attribute list
-        (sampling, min/max, cardinality, live row counts, full view/
-        routine bodies) applies to this backend at all (no views/routines
-        concept, and a live per-collection scan isn't worth adding given
-        how narrow this ODBC surface already is)."""
+        find_naming_convention_relationships) - nothing else in the Phase
+        2 attribute list (sampling, min/max, cardinality, live row counts,
+        full view/routine bodies) applies to this backend at all (no
+        views/routines concept, and a live per-collection scan isn't
+        worth adding given how narrow this ODBC surface already is), so
+        this differs from Phase 1's own _build_shallow_schema_parts()
+        output only by that one added pass."""
         # Deliberately no "Estimated dataset size" line here (see
         # backends/base.py's format_dataset_size_line()) - this ODBC-based
         # connection to MongoDB Atlas SQL has no metadata catalog for

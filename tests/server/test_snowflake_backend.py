@@ -3,14 +3,15 @@ backends/snowflake.py, driven two ways:
   - connect(): against the fake snowflake.connector.connect harness
     (helpers.install_fake_snowflake_connect) - verifies the
     password-vs-key-pair kwarg dispatch without opening a real connection.
-  - get_schema()/get_schema_shallow()/execute()/identity_label()/cache_key():
+  - get_schema()/execute()/identity_label()/cache_key():
     against the same fake psycopg2-shaped cursor/connection
     tests/test_postgres_backend.py uses (helpers.make_fake_pg_connection) -
     snowflake-connector-python implements the same PEP 249 DB-API cursor
     shape, so no Snowflake-specific fake is needed for these.
 
-_build_shallow_schema_parts() (called by both get_schema_shallow() and
-get_schema()) issues its queries unconditionally for tables/columns, then
+_build_shallow_schema_parts() (get_schema()'s own private Phase 1 helper -
+see _shallow_schema_text() below for how these tests exercise it directly)
+issues its queries unconditionally for tables/columns, then
 best-effort (try/except) for every other section, in this fixed order:
   1. table names          2. columns             3. constraints (best-effort)
   4. views (best-effort)  5. table metadata: comment/row_count/clustering_key
@@ -55,8 +56,29 @@ if SERVER_DIR not in sys.path:
     sys.path.insert(0, SERVER_DIR)
 
 from backends.snowflake import SnowflakeBackend
-from backends.base import DB_CONNECT_TIMEOUT_SECONDS, SqlExecutionError
+from backends.base import DB_CONNECT_TIMEOUT_SECONDS, SqlExecutionError, cap_schema_text
 from helpers import install_fake_snowflake_connect, make_fake_pg_connection
+
+
+def _shallow_schema_text(backend, connection):
+    """Phase 1 only (catalog-only, no live queries) - exercises
+    _build_shallow_schema_parts() directly, the private helper get_schema()
+    itself calls before appending its own Phase 2 queries on top. There used
+    to be a public get_schema_shallow() entry point that returned exactly
+    this; it was removed once build_router_candidate_summaries() (db.py)
+    stopped needing an independently-fetched shallow schema at all (it now
+    derives its summary from whichever deep entry is already cached), which
+    left this helper with no remaining production caller. These tests still
+    exercise it directly since it's real, still-live rendering logic that
+    get_schema() depends on - same reasoning that keeps the helper itself
+    in snowflake.py rather than inlining it into get_schema()."""
+    built = backend._build_shallow_schema_parts(connection)
+    if built is None:
+        return None
+    schema_parts = built[0]
+    if not schema_parts:
+        return None
+    return cap_schema_text("\n\n".join(schema_parts))
 
 
 def _sf(monkeypatch):
@@ -211,7 +233,7 @@ def test_identity_label_returns_db_and_user():
     assert username == "ALICE"
 
 
-# --- get_schema / get_schema_shallow: existing baseline behavior --------------
+# --- get_schema(): existing baseline behavior ---------------------------------
 
 def test_get_schema_returns_none_when_no_tables():
     conn, cursor = make_fake_pg_connection([([], None, -1)])
@@ -219,10 +241,10 @@ def test_get_schema_returns_none_when_no_tables():
     assert backend.get_schema(conn) is None
 
 
-def test_get_schema_shallow_returns_none_when_no_tables():
+def test_get_schema_phase1_returns_none_when_no_tables():
     conn, cursor = make_fake_pg_connection([([], None, -1)])
     backend = SnowflakeBackend()
-    assert backend.get_schema_shallow(conn) is None
+    assert _shallow_schema_text(backend, conn) is None
 
 
 def test_get_schema_lists_plain_table_with_columns():
@@ -349,7 +371,7 @@ def test_get_schema_uses_current_schema_not_a_hardcoded_name():
 
 # --- Phase 1 (catalog-only, shallow) new attributes --------------------------
 
-def test_get_schema_shallow_identity_column_marker_renders():
+def test_get_schema_phase1_identity_column_marker_renders():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["USERS"],
         columns_rows=[
@@ -358,14 +380,14 @@ def test_get_schema_shallow_identity_column_marker_renders():
         ],
     ))
     backend = SnowflakeBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "ID NUMBER NOT NULL IDENTITY (AUTOINCREMENT)" in schema
     assert "EMAIL TEXT NOT NULL" in schema
     email_line = [l for l in schema.splitlines() if l.strip().startswith("EMAIL")][0]
     assert "IDENTITY" not in email_line
 
 
-def test_get_schema_shallow_identity_marker_absent_by_default():
+def test_get_schema_phase1_identity_marker_absent_by_default():
     """Old-style 4-tuple columns_rows (predating is_identity/
     identity_generation/comment) must be padded to "not an identity
     column, no comment" by the backend itself - see
@@ -376,58 +398,58 @@ def test_get_schema_shallow_identity_marker_absent_by_default():
         columns_rows=[("CUSTOMERS", "ID", "NUMBER", "NO")],
     ))
     backend = SnowflakeBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "IDENTITY" not in schema
 
 
-def test_get_schema_shallow_identity_marker_without_generation_type():
+def test_get_schema_phase1_identity_marker_without_generation_type():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["USERS"],
         columns_rows=[("USERS", "ID", "NUMBER", "NO", "YES", None, None)],
     ))
     backend = SnowflakeBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "ID NUMBER NOT NULL IDENTITY" in schema
     assert "IDENTITY (" not in schema
 
 
-def test_get_schema_shallow_comments_render_table_and_column():
+def test_get_schema_phase1_comments_render_table_and_column():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["ORDERS"],
         columns_rows=[("ORDERS", "STATUS", "TEXT", "NO", "NO", None, "Order lifecycle state.")],
         table_metadata=[("ORDERS", "Customer purchase orders.", None, None)],
     ))
     backend = SnowflakeBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Comments:" in schema
     assert "[table] ORDERS: Customer purchase orders." in schema
     assert "[column] ORDERS.STATUS: Order lifecycle state." in schema
 
 
-def test_get_schema_shallow_comments_section_absent_when_no_comments():
+def test_get_schema_phase1_comments_section_absent_when_no_comments():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["ORDERS"],
         columns_rows=[("ORDERS", "ID", "NUMBER", "NO", "NO", None, None)],
         table_metadata=[("ORDERS", None, None, None)],
     ))
     backend = SnowflakeBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Comments:" not in schema
 
 
-def test_get_schema_shallow_row_count_estimate_renders():
+def test_get_schema_phase1_row_count_estimate_renders():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["ORDERS"],
         columns_rows=[("ORDERS", "ID", "NUMBER", "NO")],
         table_metadata=[("ORDERS", None, 1234, None)],
     ))
     backend = SnowflakeBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Row count estimates:" in schema
     assert "ORDERS: ~1234 rows (estimate)" in schema
 
 
-def test_get_schema_shallow_row_count_estimate_absent_when_null():
+def test_get_schema_phase1_row_count_estimate_absent_when_null():
     """ROW_COUNT legitimately comes back NULL for a table Snowflake hasn't
     computed statistics for yet - skipped rather than rendered as a
     misleading "~None rows"."""
@@ -437,56 +459,56 @@ def test_get_schema_shallow_row_count_estimate_absent_when_null():
         table_metadata=[("FRESH_TABLE", None, None, None)],
     ))
     backend = SnowflakeBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Row count estimates:" not in schema
 
 
-def test_get_schema_shallow_clustering_key_renders_when_present():
+def test_get_schema_phase1_clustering_key_renders_when_present():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["EVENTS"],
         columns_rows=[("EVENTS", "ID", "NUMBER", "NO")],
         table_metadata=[("EVENTS", None, None, "LINEAR(EVENT_DATE)")],
     ))
     backend = SnowflakeBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Clustering keys:" in schema
     assert "EVENTS: LINEAR(EVENT_DATE)" in schema
 
 
-def test_get_schema_shallow_clustering_key_section_absent_when_no_table_has_one():
+def test_get_schema_phase1_clustering_key_section_absent_when_no_table_has_one():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["EVENTS"],
         columns_rows=[("EVENTS", "ID", "NUMBER", "NO")],
         table_metadata=[("EVENTS", None, None, None)],
     ))
     backend = SnowflakeBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Clustering keys:" not in schema
 
 
-def test_get_schema_shallow_external_tables_render_when_present():
+def test_get_schema_phase1_external_tables_render_when_present():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["ORDERS"],
         columns_rows=[("ORDERS", "ID", "NUMBER", "NO")],
         external_tables=["RAW_S3_LOGS"],
     ))
     backend = SnowflakeBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "External tables:" in schema
     assert "RAW_S3_LOGS" in schema
 
 
-def test_get_schema_shallow_external_tables_section_absent_when_none():
+def test_get_schema_phase1_external_tables_section_absent_when_none():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["ORDERS"],
         columns_rows=[("ORDERS", "ID", "NUMBER", "NO")],
     ))
     backend = SnowflakeBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "External tables:" not in schema
 
 
-def test_get_schema_shallow_routines_render_procedures_and_functions_without_body():
+def test_get_schema_phase1_routines_render_procedures_and_functions_without_body():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["ORDERS"],
         columns_rows=[("ORDERS", "ID", "NUMBER", "NO")],
@@ -494,7 +516,7 @@ def test_get_schema_shallow_routines_render_procedures_and_functions_without_bod
         functions=[("TOTAL_FOR_CUSTOMER", "CUSTOMER_ID NUMBER", "NUMBER", "SELECT SUM(AMOUNT)...")],
     ))
     backend = SnowflakeBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Routines:" in schema
     assert "[procedure] SYNC_TOTALS(CUSTOMER_ID NUMBER) -> NULL" in schema
     assert "[function] TOTAL_FOR_CUSTOMER(CUSTOMER_ID NUMBER) -> NUMBER" in schema
@@ -502,24 +524,24 @@ def test_get_schema_shallow_routines_render_procedures_and_functions_without_bod
     assert "SELECT SUM(AMOUNT)" not in schema
 
 
-def test_get_schema_shallow_routines_section_absent_when_none():
+def test_get_schema_phase1_routines_section_absent_when_none():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["ORDERS"],
         columns_rows=[("ORDERS", "ID", "NUMBER", "NO")],
     ))
     backend = SnowflakeBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Routines:" not in schema
 
 
-def test_get_schema_shallow_session_timezone_renders():
+def test_get_schema_phase1_session_timezone_renders():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["ORDERS"],
         columns_rows=[("ORDERS", "ID", "NUMBER", "NO")],
         session_timezone="America/Los_Angeles",
     ))
     backend = SnowflakeBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Session: timezone=America/Los_Angeles" in schema
     # No fabricated collation fact - see backends/snowflake.py's own
     # comment on why Snowflake has no single session-wide collation to
@@ -527,7 +549,7 @@ def test_get_schema_shallow_session_timezone_renders():
     assert "collation" not in schema.lower()
 
 
-def test_get_schema_shallow_rls_and_masking_flags_render_when_present():
+def test_get_schema_phase1_rls_and_masking_flags_render_when_present():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["ORDERS"],
         columns_rows=[("ORDERS", "ID", "NUMBER", "NO")],
@@ -535,25 +557,25 @@ def test_get_schema_shallow_rls_and_masking_flags_render_when_present():
         masking_policies=[("SSN_MASK",)],
     ))
     backend = SnowflakeBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Row-level security / masking:" in schema
     assert "row access polic(ies)" in schema
     assert "masking polic(ies)" in schema
 
 
-def test_get_schema_shallow_rls_and_masking_section_absent_when_none_defined():
+def test_get_schema_phase1_rls_and_masking_section_absent_when_none_defined():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["ORDERS"],
         columns_rows=[("ORDERS", "ID", "NUMBER", "NO")],
     ))
     backend = SnowflakeBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Row-level security / masking:" not in schema
 
 
-# --- get_schema_shallow() must never include Phase 2 (deep-only) content -----
+# --- Phase 1 alone must never include Phase 2 (deep-only) content ------------
 
-def test_get_schema_shallow_excludes_full_view_and_routine_bodies_and_phase2_sections():
+def test_get_schema_phase1_excludes_full_view_and_routine_bodies_and_phase2_sections():
     conn, cursor = make_fake_pg_connection(_schema_responses(
         table_names=["ORDERS"],
         columns_rows=[
@@ -564,7 +586,7 @@ def test_get_schema_shallow_excludes_full_view_and_routine_bodies_and_phase2_sec
         functions=[("GET_TOTAL", "P1 NUMBER", "NUMBER", "SELECT 1;")],
     ))
     backend = SnowflakeBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "View V" in schema
     assert "SELECT 1 FROM ORDERS" not in schema
     assert "View definitions:" not in schema
@@ -599,7 +621,7 @@ def _base_deep_responses():
     ]
 
 
-def test_get_schema_deep_is_superset_of_shallow_plus_phase2_sampling():
+def test_get_schema_deep_is_superset_of_phase1_plus_phase2_sampling():
     phase2_responses = [
         ([(42, 2)], None, -1),                            # COUNT(*), APPROX_COUNT_DISTINCT(STATUS)
         ([(1, 100)], None, -1),                            # min/max for ID
@@ -675,7 +697,7 @@ def test_get_schema_deep_naming_convention_relationships_section():
             ("ORDERS", "CUSTOMER_ID", "NUMBER", "NO"),
         ],
     ))
-    shallow = backend.get_schema_shallow(conn2)
+    shallow = _shallow_schema_text(backend, conn2)
     assert "Likely relationships" not in shallow
 
 

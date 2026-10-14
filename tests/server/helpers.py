@@ -113,7 +113,7 @@ _ENV_VARS_TO_CLEAR = [
     "GOOGLE_CLIENT_ID", "DATABASE_PRESETS_FILE", "GEMINI_API_KEY", "GOOGLE_API_KEY",
     "GEMINI_PRESET_KEYS", "GOOGLE_MODELS",
     "SCHEMA_MAX_TABLES", "SCHEMA_MAX_TABLE_NAMES_SCANNED",
-    "SCHEMA_MAX_SCHEMA_CHARS", "SCHEMA_SHARD_MIN_GROUP_SIZE", "SCHEMA_TABLES_ONLY", "LOG_LEVEL",
+    "SCHEMA_MAX_SCHEMA_CHARS", "SCHEMA_SHARD_MIN_GROUP_SIZE", "LOG_LEVEL",
     "CRBOT_HOSTNAME", "CRBOT_PORT", "MAX_TRANSLATION_ATTEMPTS", "TRANSLATION_RETRY_DELAY_SECONDS",
     "TRANSLATION_TIMEOUT_SECONDS", "SQL_EXECUTE_TIMEOUT_SECONDS",
     "HISTORY_RESULT_MAX_ROWS", "HISTORY_MAX_TURNS", "GEMINI_THINKING_BUDGET",
@@ -761,9 +761,9 @@ def schema_query_handler(tables=(), columns=(), views=(), constraints=(),
                           require_partition_filter=None, table_storage=None,
                           routines=(), routine_params=()):
     """Builds a handler for install_fake_bigquery()'s harness.set_handler()
-    that answers backends/bigquery.py's get_schema()/get_schema_shallow()
-    query sequence based on matching a marker substring in the SQL text -
-    good enough for schema tests without needing to hardcode call order.
+    that answers backends/bigquery.py's get_schema() query sequence based
+    on matching a marker substring in the SQL text - good enough for
+    schema tests without needing to hardcode call order.
 
     - tables: list of table-name strings (INFORMATION_SCHEMA.TABLES)
     - columns: list of (table_name, column_name, data_type, is_nullable)

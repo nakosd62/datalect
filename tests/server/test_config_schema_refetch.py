@@ -66,9 +66,6 @@ class _FakeBackend:
         self.get_schema_calls += 1
         return self._schema_text
 
-    def get_schema_shallow(self, connection):
-        return self._schema_text
-
     def cache_key(self, descriptor):
         # Mirrors backends/postgres.py's real cache_key shape closely
         # enough for these tests: identical url -> identical cache_key,

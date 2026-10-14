@@ -6,7 +6,7 @@ backends/mssql.py, driven two ways:
     descriptor's "schema" value is stashed on the returned connection
     (mssql_schema) rather than applied via any session-level statement -
     without opening a real connection.
-  - _build_shallow_schema_parts()/get_schema_shallow()/get_schema()/
+  - _build_shallow_schema_parts()/get_schema()/
     execute()/identity_label()/cache_key(): against the same psycopg2-shaped
     fake cursor/connection tests/test_postgres_backend.py uses
     (helpers.make_fake_mssql_connection, itself built on FakePgCursor) -
@@ -14,8 +14,9 @@ backends/mssql.py, driven two ways:
     mssql-specific cursor fake is needed for these, just a connection
     wrapper that also carries the mssql_schema attribute get_schema() reads.
 
-_build_shallow_schema_parts() (called by both get_schema_shallow() and
-get_schema()) issues its queries unconditionally for tables/columns, then
+_build_shallow_schema_parts() (get_schema()'s own private Phase 1 helper -
+see _shallow_schema_text() below for how these tests exercise it directly)
+issues its queries unconditionally for tables/columns, then
 best-effort (try/except) for every other section - see backends/mssql.py:
   1. table names        2. columns             3. constraints (best-effort)
   4. views (best-effort) 5. identity (new)      6. comments (new)
@@ -61,8 +62,29 @@ if SERVER_DIR not in sys.path:
 
 import backends.mssql as mssql_module
 from backends.mssql import MssqlBackend
-from backends.base import DB_CONNECT_TIMEOUT_SECONDS, SqlExecutionError
+from backends.base import DB_CONNECT_TIMEOUT_SECONDS, SqlExecutionError, cap_schema_text
 from helpers import install_fake_mssql_connect, make_fake_mssql_connection
+
+
+def _shallow_schema_text(backend, connection):
+    """Phase 1 only (catalog-only, no live queries) - exercises
+    _build_shallow_schema_parts() directly, the private helper get_schema()
+    itself calls before appending its own Phase 2 queries on top. There used
+    to be a public get_schema_shallow() entry point that returned exactly
+    this; it was removed once build_router_candidate_summaries() (db.py)
+    stopped needing an independently-fetched shallow schema at all (it now
+    derives its summary from whichever deep entry is already cached), which
+    left this helper with no remaining production caller. These tests still
+    exercise it directly since it's real, still-live rendering logic that
+    get_schema() depends on - same reasoning that keeps the helper itself
+    in mssql.py rather than inlining it into get_schema()."""
+    built = backend._build_shallow_schema_parts(connection)
+    if built is None:
+        return None
+    schema_parts = built[0]
+    if not schema_parts:
+        return None
+    return cap_schema_text("\n\n".join(schema_parts))
 
 
 def _ms(monkeypatch):
@@ -666,7 +688,7 @@ def test_get_schema_table_name_query_uses_top_not_limit():
 
 # --- Phase 1 (catalog-only, shallow) new attributes --------------------------
 
-def test_get_schema_shallow_identity_column_marker_renders():
+def test_get_schema_phase1_identity_column_marker_renders():
     conn, cursor = make_fake_mssql_connection(_schema_responses(
         table_names=["users"],
         columns_rows=[
@@ -676,24 +698,24 @@ def test_get_schema_shallow_identity_column_marker_renders():
         identity_columns=[("users", "id")],
     ))
     backend = MssqlBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "id int NOT NULL IDENTITY" in schema
     # The non-identity column's own line must not pick up a marker.
     email_line = [l for l in schema.splitlines() if l.strip().startswith("email")][0]
     assert "IDENTITY" not in email_line
 
 
-def test_get_schema_shallow_identity_marker_absent_by_default():
+def test_get_schema_phase1_identity_marker_absent_by_default():
     conn, cursor = make_fake_mssql_connection(_schema_responses(
         table_names=["customers"],
         columns_rows=[("customers", "id", "int", "NO", None)],
     ))
     backend = MssqlBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "IDENTITY" not in schema
 
 
-def test_get_schema_shallow_comments_render_table_and_column():
+def test_get_schema_phase1_comments_render_table_and_column():
     conn, cursor = make_fake_mssql_connection(_schema_responses(
         table_names=["orders"],
         columns_rows=[("orders", "status", "varchar", "NO", None)],
@@ -703,36 +725,36 @@ def test_get_schema_shallow_comments_render_table_and_column():
         ],
     ))
     backend = MssqlBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Comments:" in schema
     assert "[table] orders: Customer purchase orders." in schema
     assert "[column] orders.status: Order lifecycle state." in schema
 
 
-def test_get_schema_shallow_comments_section_absent_when_no_comments():
+def test_get_schema_phase1_comments_section_absent_when_no_comments():
     conn, cursor = make_fake_mssql_connection(_schema_responses(
         table_names=["orders"],
         columns_rows=[("orders", "id", "int", "NO", None)],
         comments=[("orders", None, None), ("orders", "id", "")],
     ))
     backend = MssqlBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Comments:" not in schema
 
 
-def test_get_schema_shallow_row_count_estimate_renders():
+def test_get_schema_phase1_row_count_estimate_renders():
     conn, cursor = make_fake_mssql_connection(_schema_responses(
         table_names=["orders"],
         columns_rows=[("orders", "id", "int", "NO", None)],
         row_count_estimates=[("orders", 1234)],
     ))
     backend = MssqlBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Row count estimates:" in schema
     assert "orders: ~1234 rows (estimate)" in schema
 
 
-def test_get_schema_shallow_row_count_estimate_skips_null_sum():
+def test_get_schema_phase1_row_count_estimate_skips_null_sum():
     """SUM(ps.row_count) comes back NULL when a table has no
     sys.dm_db_partition_stats rows at all (shouldn't normally happen for a
     real table, but a caller-crafted None must not render "~None rows")."""
@@ -742,11 +764,11 @@ def test_get_schema_shallow_row_count_estimate_skips_null_sum():
         row_count_estimates=[("fresh_table", None)],
     ))
     backend = MssqlBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Row count estimates:" not in schema
 
 
-def test_get_schema_shallow_routines_render_name_and_signature_without_body():
+def test_get_schema_phase1_routines_render_name_and_signature_without_body():
     conn, cursor = make_fake_mssql_connection(_schema_responses(
         table_names=["orders"],
         columns_rows=[("orders", "id", "int", "NO", None)],
@@ -756,13 +778,13 @@ def test_get_schema_shallow_routines_render_name_and_signature_without_body():
         ],
     ))
     backend = MssqlBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Routines:" in schema
     assert "total_for_customer(customer_id int) [SQL_SCALAR_FUNCTION]" in schema
     assert "SELECT SUM(amount)" not in schema
 
 
-def test_get_schema_shallow_routines_aggregates_multiple_parameters():
+def test_get_schema_phase1_routines_aggregates_multiple_parameters():
     conn, cursor = make_fake_mssql_connection(_schema_responses(
         table_names=["orders"],
         columns_rows=[("orders", "id", "int", "NO", None)],
@@ -772,25 +794,25 @@ def test_get_schema_shallow_routines_aggregates_multiple_parameters():
         ],
     ))
     backend = MssqlBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "adjust_price(p_id int, p_amount money) [SQL_STORED_PROCEDURE]" in schema
 
 
-def test_get_schema_shallow_session_facts_render_collation():
+def test_get_schema_phase1_session_facts_render_collation():
     conn, cursor = make_fake_mssql_connection(_schema_responses(
         table_names=["orders"],
         columns_rows=[("orders", "id", "int", "NO", None)],
         session_collation=("Latin1_General_100_CI_AS_SC",),
     ))
     backend = MssqlBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Session: default collation=Latin1_General_100_CI_AS_SC" in schema
     # No fabricated timezone value - see backends/mssql.py's module
     # docstring on why this dialect has no real session-timezone concept.
     assert "timezone" not in schema.lower()
 
 
-def test_get_schema_shallow_rls_and_external_table_flags_render_when_true():
+def test_get_schema_phase1_rls_and_external_table_flags_render_when_true():
     conn, cursor = make_fake_mssql_connection(_schema_responses(
         table_names=["accounts", "remote_orders"],
         columns_rows=[
@@ -801,25 +823,25 @@ def test_get_schema_shallow_rls_and_external_table_flags_render_when_true():
         external_tables=[("remote_orders",)],
     ))
     backend = MssqlBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Row-level security / external tables:" in schema
     assert "accounts: [RLS enabled]" in schema
     assert "remote_orders: [external table]" in schema
 
 
-def test_get_schema_shallow_rls_section_absent_when_all_flags_false():
+def test_get_schema_phase1_rls_section_absent_when_all_flags_false():
     conn, cursor = make_fake_mssql_connection(_schema_responses(
         table_names=["accounts"],
         columns_rows=[("accounts", "id", "int", "NO", None)],
     ))
     backend = MssqlBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "Row-level security / external tables:" not in schema
 
 
-# --- get_schema_shallow() must never include Phase 2 (deep-only) content -----
+# --- Phase 1 alone must never include Phase 2 (deep-only) content ------------
 
-def test_get_schema_shallow_excludes_full_view_and_routine_bodies_and_phase2_sections():
+def test_get_schema_phase1_excludes_full_view_and_routine_bodies_and_phase2_sections():
     conn, cursor = make_fake_mssql_connection(_schema_responses(
         table_names=["orders"],
         columns_rows=[
@@ -830,7 +852,7 @@ def test_get_schema_shallow_excludes_full_view_and_routine_bodies_and_phase2_sec
         routines=[("get_total", "SQL_SCALAR_FUNCTION", "p1", 1, "int", "SELECT 1;")],
     ))
     backend = MssqlBackend()
-    schema = backend.get_schema_shallow(conn)
+    schema = _shallow_schema_text(backend, conn)
     assert "View v" in schema
     assert "SELECT 1 FROM orders" not in schema
     assert "View definitions:" not in schema
@@ -874,7 +896,7 @@ def _phase2_sampling_responses():
     ]
 
 
-def test_get_schema_deep_is_superset_of_shallow_plus_phase2_sampling():
+def test_get_schema_deep_is_superset_of_phase1_plus_phase2_sampling():
     conn, cursor = make_fake_mssql_connection(_base_deep_responses() + _phase2_sampling_responses())
     backend = MssqlBackend()
     schema = backend.get_schema(conn)
@@ -952,7 +974,7 @@ def test_get_schema_deep_naming_convention_relationships_section():
             ("orders", "customer_id", "varbinary", "NO", None),
         ],
     ))
-    shallow = backend.get_schema_shallow(conn2)
+    shallow = _shallow_schema_text(backend, conn2)
     assert "Likely relationships" not in shallow
 
 
