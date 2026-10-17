@@ -21,7 +21,7 @@
 // it directly: each test gets its own random crbot_user_id cookie set
 // before it ever navigates, giving it a genuinely private slice of server
 // state - the same isolation the real app gives two different signed-in
-// users. Without this, config-modal.spec.js's custom BigQuery connections
+// users. Without this, dataset-picker.spec.js's custom BigQuery connections
 // (real fake keys) could still be "active" server-side when a completely
 // unrelated, parallel-running test's page loads and checkDbStatus() pings
 // the real /api/ping in the background - which is exactly what the
@@ -142,7 +142,7 @@ const test = isolatedTest.extend({
     // out not to be valid across every dialect, see execute_routes.py's
     // /api/ping docstring - the mock here moved with it.) Left unmocked, a
     // spec that saves a custom BigQuery connection (even with a throwaway
-    // fake key, e.g. config-modal.spec.js) would have this background ping
+    // fake key, e.g. dataset-picker.spec.js) would have this background ping
     // attempt a real token exchange with Google before Postgres's much
     // faster local connection-refused failure would apply instead - on a
     // network that blocks that exchange, it hangs Flask's single-threaded
@@ -297,10 +297,10 @@ const testShowSqlVisible = test.extend({
  * checkDbStatus() (a GET /api/ping ping - mocked by default, see the
  * `test` fixture above) before the outer fetchBackendConfig() promise
  * actually resolves. A test that only waited for the badge text and then
- * immediately interacted with the page (e.g. opening the config modal,
- * which itself calls fetchBackendConfig() again) could overlap with that
- * still-in-flight initial call - whichever response arrives *last*
- * re-renders the DB radio group/custom-connection list from its own
+ * immediately interacted with the page (e.g. opening the dataset picker
+ * dropdown, which itself calls fetchBackendConfig() again) could overlap
+ * with that still-in-flight initial call - whichever response arrives
+ * *last* re-renders the dataset picker's own option list from its own
  * (possibly now-stale) data, silently discarding anything the test just
  * did in between. Waiting for the initial checkDbStatus() ping to
  * complete here closes that window. */
@@ -318,8 +318,11 @@ async function gotoApp(page) {
 
 /** Intercept POST /api/translate at the browser network layer. Pass either
  * `sql` for a successful translation or `error`+`status` for a failure -
- * mirrors the shapes translate_routes.py actually returns. */
-async function mockTranslate(page, { sql, error, status } = {}) {
+ * mirrors the shapes translate_routes.py actually returns. `extra` merges
+ * additional top-level fields into a successful response body - e.g.
+ * `{ invite_action: 'schema' }` for a triage "schema"/"help" outcome (see
+ * translate_routes.py's own `invite_action` field). */
+async function mockTranslate(page, { sql, error, status, extra } = {}) {
   await page.route('**/api/translate', async (route) => {
     if (route.request().method() !== 'POST') return route.fallback();
     if (error !== undefined) {
@@ -332,7 +335,7 @@ async function mockTranslate(page, { sql, error, status } = {}) {
       await route.fulfill({
         status: status || 200,
         contentType: 'application/json',
-        body: JSON.stringify({ sql }),
+        body: JSON.stringify({ sql, ...(extra || {}) }),
       });
     }
   });

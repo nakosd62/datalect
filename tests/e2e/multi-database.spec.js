@@ -3,7 +3,7 @@
 // Multi-database question-answering (see server/translate_routes.py's
 // module docstring): the connection picker's binary single-select choice
 // (one specific connection, or a named dataset group spanning several -
-// see renderDbRadioButtons() in client.js), the per-tab database labeling and
+// see renderDatasetPickList() in client.js), the per-tab database labeling and
 // '-- database: ...' SQL comments a multi-connection /api/translate
 // response drives (its own disclosure mechanism - there is no separate
 // banner), a follow-up request echoing back the prior turn's pin, and
@@ -119,15 +119,36 @@ async function mockConfig(page, initial) {
   return state;
 }
 
-async function openConfigModal(page) {
+async function openDatasetPickList(page) {
   await page.locator('#configTriggerBadge').click();
-  // See config-modal.spec.js's own openConfigModal() for why this needs a
-  // longer-than-default timeout: the click handler awaits a real, unmocked
-  // fetch('/api/config') before revealing the modal, and the default 8s
-  // expect timeout can occasionally be too tight for that one real
-  // round trip under a loaded/constrained environment even though nothing
-  // is actually stuck.
-  await expect(page.locator('#configModal')).not.toHaveClass(/hidden/, { timeout: 15_000 });
+  // See dataset-picker.spec.js's own openDatasetPickList() for why this
+  // needs a longer-than-default timeout: the click handler awaits a real,
+  // unmocked fetch('/api/config') before revealing the dropdown, and the
+  // default 8s expect timeout can occasionally be too tight for that one
+  // real round trip under a loaded/constrained environment even though
+  // nothing is actually stuck.
+  await expect(page.locator('#datasetPickList')).not.toHaveClass(/hidden/, { timeout: 15_000 });
+}
+
+/** Clicks the option matching `selector` (relative to #datasetPickOptions) -
+ * selecting it AND saving immediately, no separate Save step (see
+ * client.js's selectDataset()) - and waits for the dropdown to close again
+ * on success. */
+async function selectDatasetOption(page, selector) {
+  await page.locator(selector).click();
+  await expect(page.locator('#datasetPickList')).toHaveClass(/hidden/);
+}
+
+/** Opens the "Composites" flyout (#datasetPickCompositeSubmenu) from inside
+ * an already-open dataset picker dropdown and waits for it to actually be
+ * showing - see client.js's openDatasetPickCompositeSubmenu(). A dataset
+ * group's own option (data-value="group:...") only exists inside this
+ * flyout now, not inline among the ordinary presets, so any test that needs
+ * to see or click one calls this first. Hovers (not clicks) - opening on
+ * hover alone, no click needed, is the real, documented behavior now. */
+async function openCompositeSubmenu(page) {
+  await page.locator('#datasetPickCompositeToggle').hover();
+  await expect(page.locator('#datasetPickCompositeSubmenu')).not.toHaveClass(/hidden/);
 }
 
 function currentSql(page) {
@@ -154,43 +175,53 @@ async function normalizedSql(page) {
 }
 
 test.describe('multi-database question answering', () => {
-  test('a dataset group and a specific preset are mutually exclusive radios, each saving the right scope', async ({ page }) => {
+  test('a dataset group and a specific preset are mutually exclusive options, each saving the right scope', async ({ page }) => {
     const state = await mockConfig(page, {
       ...buildConfigState(), in_scope_preset_ids: ['p-a'], in_scope_custom_connection_keys: [], in_scope_mode: 'single',
       in_scope_group_id: '',
     });
     await gotoApp(page);
-    await openConfigModal(page);
+    await openDatasetPickList(page);
 
-    // The "Sales & Marketing" dataset group (merged into the same
-    // playgrounds list as the presets themselves, no separate "DATASET
-    // GROUPS" heading/column of its own - see renderDbRadioButtons() in
-    // client.js) + the two presets (p-a, p-b) - a true single-select radio
-    // group, not the checkbox picker this replaced.
-    const groupRadio = page.locator('input[name="db_connection_option"][value="group:grp-ab"]');
-    const boxes = page.locator('input[name="db_connection_option"]');
-    const presetA = page.locator('input[name="db_connection_option"][value="preset:p-a"]');
-    const presetB = page.locator('input[name="db_connection_option"][value="preset:p-b"]');
-    await expect(boxes).toHaveCount(3);
-    await expect(groupRadio).not.toBeChecked();
-    await expect(presetA).toBeChecked(); // p-a, today's only in-scope preset
+    // The "Sales & Marketing" dataset group now lives inside its own
+    // "Composites" flyout (#datasetPickCompositeSubmenu, opened via
+    // #datasetPickCompositeToggle - see client.js's
+    // openDatasetPickCompositeSubmenu()) rather than merged inline with the
+    // two presets (p-a, p-b) - still a true single-select choice either
+    // way, not the checkbox picker this replaced. Clicking any one of them
+    // selects AND saves immediately (client.js's selectDataset()) - there's
+    // no separate check-then-Save step any more, so exclusivity is observed
+    // across two separate opens rather than two checks before one shared
+    // Save.
+    const groupOption = page.locator('.dataset-pick-option[data-value="group:grp-ab"]');
+    const presetOptions = page.locator('#datasetPickOptions .dataset-pick-option');
+    const presetA = page.locator('.dataset-pick-option[data-value="preset:p-a"]');
+    const presetB = page.locator('.dataset-pick-option[data-value="preset:p-b"]');
+    // Just the two presets now - the "Composites" row is a
+    // .dataset-pick-submenu-toggle, not a .dataset-pick-option, specifically
+    // so it's never mistaken for a selectable value of its own.
+    await expect(presetOptions).toHaveCount(2);
+    await expect(page.locator('#datasetPickCompositeToggle')).toBeVisible();
+    await expect(groupOption).not.toHaveClass(/selected/);
+    await expect(presetA).toHaveClass(/selected/); // p-a, today's only in-scope preset
 
-    // Picking the group unchecks whichever specific preset was selected -
-    // plain native radio exclusivity, no client bookkeeping involved.
-    await groupRadio.check();
-    await expect(presetA).not.toBeChecked();
-    await page.locator('#configSaveBtn').click();
-    await expect(page.locator('#configModal')).toHaveClass(/hidden/);
+    await openCompositeSubmenu(page);
+    await groupOption.click();
+    await expect(page.locator('#datasetPickList')).toHaveClass(/hidden/);
     expect(state._lastPostBody.in_scope_mode).toBe('group');
     expect(state._lastPostBody.in_scope_group_id).toBe('grp-ab');
 
     // Picking a specific preset again narrows straight back down to just
     // that one - in_scope_mode flips back to 'single' and the in-scope
-    // arrays are sent as exactly that one connection.
-    await openConfigModal(page);
-    await presetB.check();
-    await page.locator('#configSaveBtn').click();
-    await expect(page.locator('#configModal')).toHaveClass(/hidden/);
+    // arrays are sent as exactly that one connection. Reopening also shows
+    // the group now selected and presetA no longer so - plain "whichever
+    // was saved last is the one selected" state, no client bookkeeping of
+    // its own to go stale.
+    await openDatasetPickList(page);
+    await expect(groupOption).toHaveClass(/selected/);
+    await expect(presetA).not.toHaveClass(/selected/);
+    await presetB.click();
+    await expect(page.locator('#datasetPickList')).toHaveClass(/hidden/);
     expect(state._lastPostBody.in_scope_mode).toBe('single');
     expect(state.in_scope_preset_ids).toEqual(['p-b']);
     expect(state.in_scope_custom_connection_keys).toEqual([]);
@@ -207,19 +238,17 @@ test.describe('multi-database question answering', () => {
     // this session's questions.
     await expect(page.locator('#connDbName')).toHaveText('Sales & Marketing (Composite)');
     await expect(page.locator('#configTriggerBadge')).toHaveAttribute(
-      'title', 'In scope: Sales Postgres, Marketing Postgres (Click to configure)');
+      'title', 'In scope: Sales Postgres, Marketing Postgres (Click to choose)');
 
     // Picking a specific preset (p-b) narrows scope back down to just that
     // one connection and reverts the badge to its actual name.
-    await openConfigModal(page);
-    await page.locator('input[name="db_connection_option"][value="preset:p-b"]').check();
-    await page.locator('#configSaveBtn').click();
-    await expect(page.locator('#configModal')).toHaveClass(/hidden/);
+    await openDatasetPickList(page);
+    await selectDatasetOption(page, '.dataset-pick-option[data-value="preset:p-b"]');
     expect(state.in_scope_preset_ids).toEqual(['p-b']);
 
     await expect(page.locator('#connDbName')).toHaveText('Marketing Postgres');
     await expect(page.locator('#configTriggerBadge')).toHaveAttribute(
-      'title', 'Connected to: Marketing Postgres (Click to configure)');
+      'title', 'Connected to: Marketing Postgres (Click to choose)');
   });
 
   test('the badge reads the dataset group\'s own name for a real in_scope_mode "group" session even when the leftover in-scope arrays are short', async ({ page }) => {
@@ -243,11 +272,11 @@ test.describe('multi-database question answering', () => {
 
     await expect(page.locator('#connDbName')).toHaveText('Sales & Marketing (Composite)');
     await expect(page.locator('#configTriggerBadge')).toHaveAttribute(
-      'title', 'In scope: Sales Postgres, Marketing Postgres (Click to configure)');
+      'title', 'In scope: Sales Postgres, Marketing Postgres (Click to choose)');
 
-    await openConfigModal(page);
-    const groupRadio = page.locator('input[name="db_connection_option"][value="group:grp-ab"]');
-    await expect(groupRadio).toBeChecked();
+    await openDatasetPickList(page);
+    const groupOption = page.locator('.dataset-pick-option[data-value="group:grp-ab"]');
+    await expect(groupOption).toHaveClass(/selected/);
   });
 
   test('a mocked multi-connection translate response labels result tabs by database and tags the SQL with database comments', async ({ page }) => {
@@ -482,8 +511,8 @@ test.describe('multi-database question answering', () => {
     // (/api/summarize-results, plural, mocked elsewhere in this file for
     // the genuinely-multi-connection tests). Left unmocked, that's a real,
     // unmocked LLM call that keeps #configTriggerBadge disabled until it
-    // settles - the openConfigModal() click below would silently no-op if
-    // it lands while that's still in flight.
+    // settles - the openDatasetPickList() click below would silently no-op
+    // if it lands while that's still in flight.
     await page.route('**/api/summarize-result', async (route) => {
       if (route.request().method() !== 'POST') return route.fallback();
       await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ success: true }) });
@@ -499,10 +528,8 @@ test.describe('multi-database question answering', () => {
     // Now pick p-a specifically, narrowing scope away from "All" down to
     // just p-a - the pin from above (p-b) no longer describes an in-scope
     // connection.
-    await openConfigModal(page);
-    await page.locator('input[name="db_connection_option"][value="preset:p-a"]').check();
-    await page.locator('#configSaveBtn').click();
-    await expect(page.locator('#configModal')).toHaveClass(/hidden/);
+    await openDatasetPickList(page);
+    await selectDatasetOption(page, '.dataset-pick-option[data-value="preset:p-a"]');
     expect(state.in_scope_preset_ids).toEqual(['p-a']);
 
     await expect(page.locator('#aiPrompt')).toHaveValue('');
@@ -1471,14 +1498,16 @@ test.describe('multi-database question answering', () => {
   // New outcome for "all databases" mode (connection_router.py's
   // run_triage_call merge - see its own docstring): triage can now
   // resolve to "schema" for a group-mode prompt too, exactly like single-
-  // connection mode already could - the server marks it with the same
-  // '*** NO SQL *** OPEN SCHEMA VIEWER ***' sentinel, and client.js's
-  // /api/translate response handler opens the GROUP's own Schema Viewer
+  // connection mode already could. This outcome used to clear the results
+  // area and pop the group's own Schema Viewer open immediately and
+  // unannounced; it now renders a short text answer (the group's own
+  // already-generated overview prose, or a fixed fallback sentence - see
+  // translate_routes.py's `invite_action` field) with a clickable
+  // invitation that opens the group's own Schema Viewer
   // (openGroupSchemaViewer(), the same one the dataset badge's "i" icon
   // already opens - see schema-viewer.spec.js's "dataset group schema
-  // viewer" tests) rather than rendering the sentinel as text or trying
-  // (and failing) to open a single-connection viewer.
-  test('an "all databases" mode "OPEN SCHEMA VIEWER" reply opens the group\'s own Schema Viewer, not a text reply', async ({ page }) => {
+  // viewer" tests) only once the user actually clicks it.
+  test('an "all databases" mode "schema" outcome renders a short answer with an invitation that opens the group\'s own Schema Viewer', async ({ page }) => {
     await mockConfig(page);
     await gotoApp(page);
 
@@ -1487,7 +1516,11 @@ test.describe('multi-database question answering', () => {
       await route.fulfill({
         status: 200,
         contentType: 'application/json',
-        body: JSON.stringify({ success: true, sql: '*** NO SQL *** OPEN SCHEMA VIEWER ***' }),
+        body: JSON.stringify({
+          success: true,
+          sql: "*** NO SQL *** This group covers Sales and Marketing data across two Postgres datasets.",
+          invite_action: 'schema',
+        }),
       });
     });
     await page.route('**/api/schema/group*', async (route) => {
@@ -1508,6 +1541,14 @@ test.describe('multi-database question answering', () => {
     await page.locator('#aiPrompt').fill('what can I ask about these databases?');
     await page.locator('#aiPrompt').press('Enter');
 
+    // The short text answer renders first - nothing pops open on its own.
+    await expect(page.locator('.response-text')).toContainText('This group covers Sales and Marketing data');
+    await expect(page.locator('#schemaViewerModal')).toHaveClass(/hidden/);
+
+    const invite = page.locator('[data-open-invite-trigger="schema"]');
+    await expect(invite).toBeVisible();
+    await invite.click();
+
     await expect(page.locator('#schemaViewerModal')).not.toHaveClass(/hidden/);
     await expect(page.locator('#schemaViewerModalTitleText')).toHaveText('Sales & Marketing (Composite)');
     // Supersedes the old flat-table assertion - the group dialog now
@@ -1518,7 +1559,43 @@ test.describe('multi-database question answering', () => {
     await expect(page.locator('#schemaViewerGroupTableWrap')).toHaveClass(/hidden/);
     await expect(page.locator('#schemaViewerPanesWrap')).not.toHaveClass(/hidden/);
     await expect(page.locator('.schema-viewer-group-header')).toContainText('Datasets (2)');
-    await expect(page.locator('.response-text')).toHaveCount(0);
+  });
+
+  // Same reasoning as the "schema" outcome test just above, for the
+  // group-mode "help" outcome - previously UNTESTED at the e2e level
+  // entirely (single-connection mode's own "help" outcome was the only
+  // one with coverage, in translate-execute.spec.js). "help" is mode-
+  // agnostic (see translate_routes.py's own comment on _HELP_SHORT_ANSWER),
+  // so this is the same short-answer-plus-invitation behavior, just
+  // triggered from "all databases" mode.
+  test('an "all databases" mode "help" outcome renders a short answer with an invitation that opens the Help modal', async ({ page }) => {
+    await mockConfig(page);
+    await gotoApp(page);
+
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          sql: '*** NO SQL *** Datalect Agent answers your questions about a connected datasource by translating them into SQL.',
+          invite_action: 'help',
+        }),
+      });
+    });
+
+    await page.locator('#aiPrompt').fill('how do I use this app?');
+    await page.locator('#aiPrompt').press('Enter');
+
+    await expect(page.locator('.response-text')).toContainText('Datalect Agent answers your questions');
+    await expect(page.locator('#helpModal')).toHaveClass(/hidden/);
+
+    const invite = page.locator('[data-open-invite-trigger="help"]');
+    await expect(invite).toBeVisible();
+    await invite.click();
+
+    await expect(page.locator('#helpModal')).not.toHaveClass(/hidden/);
   });
 
   // Regression guard for a real bug report: an "all databases" mode
@@ -2189,6 +2266,206 @@ test.describe('multi-database question answering', () => {
     await expect(tabs.nth(2)).toContainText('Marketing Postgres');
   });
 
+  // --- cross-dataset semi-join / filter pushdown (server/semi_join_routes.py,
+  // connection_router.py's "semi_join" triage field, translate_routes.py's
+  // "semi_join_pending"/"pending_semi_join" fields, client.js's
+  // runAllModeSemiJoinIfPending()): triage flags one connection ("driving")
+  // whose real, already-executed rows should filter another connection's
+  // ("dependent") own query BEFORE it ever runs - the dependent connection
+  // is excluded from the ordinary Phase B fan-out entirely, and the client
+  // calls the new /api/generate-semi-join-sql endpoint once the driving
+  // connection's own /api/execute has resolved. ---
+
+  test('a semi_join turn excludes the dependent connection from Phase B, waits for the driving connection\'s real execute, then generates and executes its filtered SQL', async ({ page }) => {
+    await mockConfig(page, { ...buildConfigState(), auto_sql_execute: true });
+    await gotoApp(page);
+
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      const ndjson = [
+        {
+          status: 'phase_a_route', routing_message: 'Checking Olympics Postgres and Economic Indicators Postgres.',
+          connection_selection: [
+            { kind: 'preset', id: 'p-a', name: 'Olympics Postgres' },
+            // Flagged pending_semi_join - excluded from this round's Phase
+            // B fan-out, so no phase_b_connection_done event for it below.
+            { kind: 'preset', id: 'p-b', name: 'Economic Indicators Postgres', pending_semi_join: true },
+          ],
+        },
+        {
+          status: 'phase_b_connection_done', kind: 'preset', id: 'p-a', name: 'Olympics Postgres',
+          outcome: 'sql', sql: '-- database: preset:p-a (Olympics Postgres)\nSELECT host_country, year FROM olympics;',
+        },
+        {
+          status: 'done', success: true, router_route: true,
+          routing_message: 'Checking Olympics Postgres and Economic Indicators Postgres.',
+          sql: '-- database: preset:p-a (Olympics Postgres)\nSELECT host_country, year FROM olympics;',
+          database_notes: [], generation_failures: [],
+          connection_selection: [
+            { kind: 'preset', id: 'p-a', name: 'Olympics Postgres', pending_semi_join: false },
+            { kind: 'preset', id: 'p-b', name: 'Economic Indicators Postgres', pending_semi_join: true },
+          ],
+          needs_combination: false,
+          semi_join_pending: {
+            driving: { kind: 'preset', id: 'p-a', name: 'Olympics Postgres' },
+            dependent: { kind: 'preset', id: 'p-b', name: 'Economic Indicators Postgres', prompt: 'GDP of each hosting country/year' },
+            filter_description: 'the hosting country and year',
+            max_filter_rows: 200,
+          },
+        },
+      ].map((e) => JSON.stringify(e)).join('\n') + '\n';
+      await route.fulfill({ status: 200, contentType: 'application/x-ndjson', body: ndjson });
+    });
+
+    const executeCalls = [];
+    await page.route('**/api/execute', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      const body = route.request().postDataJSON();
+      executeCalls.push(body);
+      const isDriving = body.sql.includes('preset:p-a');
+      await route.fulfill({
+        status: 200, contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          results: [
+            isDriving
+              ? { statement: 'SELECT host_country, year FROM olympics', columns: ['host_country', 'year'],
+                  rows: [{ host_country: 'France', year: 1900 }, { host_country: 'USA', year: 1904 }], rowCount: 2,
+                  database: { kind: 'preset', id: 'p-a', name: 'Olympics Postgres' } }
+              : { statement: 'SELECT country, year, value FROM gdp WHERE (country, year) IN ((\'France\', 1900), (\'USA\', 1904))',
+                  columns: ['country', 'year', 'value'], rows: [{ country: 'France', year: 1900, value: 10 }], rowCount: 1,
+                  database: { kind: 'preset', id: 'p-b', name: 'Economic Indicators Postgres' } },
+          ],
+        }),
+      });
+    });
+
+    const semiJoinCalls = [];
+    await page.route('**/api/generate-semi-join-sql', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      semiJoinCalls.push(route.request().postDataJSON());
+      const line = {
+        status: 'done', success: true, outcome: 'sql',
+        sql: '-- database: preset:p-b (Economic Indicators Postgres)\n' +
+          'SELECT country, year, value FROM gdp WHERE (country, year) IN ((\'France\', 1900), (\'USA\', 1904));',
+        knowledge_note: null, filter_applied: true, filter_row_count: 2, filter_capped: false,
+      };
+      await route.fulfill({ status: 200, contentType: 'application/x-ndjson', body: JSON.stringify(line) + '\n' });
+    });
+    await page.route('**/api/summarize-results', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ success: true, summary: '' }) });
+    });
+
+    await page.locator('#aiPrompt').fill('GDP of each country that hosted the Olympics the year of the Olympics');
+    await page.locator('#aiPrompt').press('Enter');
+
+    // Three tabs total: Response, Olympics Postgres (driving), Economic
+    // Indicators Postgres (dependent) - the dependent one starts as a
+    // distinct "Waiting for filter…" placeholder (see startAllModeStreaming()'s
+    // own pending_semi_join branch) and ends up as a real result tab, with
+    // no separate round trip visible other than the one
+    // /api/generate-semi-join-sql call asserted below.
+    const tabs = page.locator('#resultsTabsNav .result-tab-btn');
+    await expect(tabs).toHaveCount(3);
+    await expect(tabs.nth(1)).toContainText('Olympics Postgres');
+    await expect(tabs.nth(2)).toContainText('Economic Indicators Postgres');
+
+    await expect.poll(() => semiJoinCalls.length).toBe(1);
+    // The real, already-executed driving rows actually reached the
+    // endpoint - not a re-derived or guessed filter.
+    expect(semiJoinCalls[0].filter_description).toBe('the hosting country and year');
+    expect(semiJoinCalls[0].driving_result.rows).toEqual([
+      { host_country: 'France', year: 1900 }, { host_country: 'USA', year: 1904 },
+    ]);
+    expect(semiJoinCalls[0].kind).toBe('preset');
+    expect(semiJoinCalls[0].id).toBe('p-b');
+
+    // Exactly two /api/execute calls: the driving connection's own
+    // (auto-executed the moment its SQL arrived) and the dependent
+    // connection's own (only after /api/generate-semi-join-sql returned
+    // its filtered SQL) - never a third, and never the dependent one
+    // before the driving one.
+    await expect.poll(() => executeCalls.length).toBe(2);
+    expect(executeCalls[0].sql).toContain('preset:p-a');
+    expect(executeCalls[1].sql).toContain('preset:p-b');
+
+    // The dependent connection's own tab rendered real results, not a
+    // stuck placeholder or an error.
+    await tabs.nth(2).click();
+    await expect(page.locator('#resultsTableWrapper')).toContainText('France');
+  });
+
+  test('when the driving connection\'s own execute fails, the dependent connection settles as an honest note instead of hanging on "Waiting for filter…"', async ({ page }) => {
+    await mockConfig(page, { ...buildConfigState(), auto_sql_execute: true });
+    await gotoApp(page);
+
+    await page.route('**/api/translate', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      const ndjson = [
+        {
+          status: 'phase_a_route', routing_message: 'Checking both.',
+          connection_selection: [
+            { kind: 'preset', id: 'p-a', name: 'Olympics Postgres' },
+            { kind: 'preset', id: 'p-b', name: 'Economic Indicators Postgres', pending_semi_join: true },
+          ],
+        },
+        {
+          status: 'phase_b_connection_done', kind: 'preset', id: 'p-a', name: 'Olympics Postgres',
+          outcome: 'sql', sql: '-- database: preset:p-a (Olympics Postgres)\nSELECT host_country, year FROM olympics;',
+        },
+        {
+          status: 'done', success: true, router_route: true, routing_message: 'Checking both.',
+          sql: '-- database: preset:p-a (Olympics Postgres)\nSELECT host_country, year FROM olympics;',
+          database_notes: [], generation_failures: [],
+          connection_selection: [
+            { kind: 'preset', id: 'p-a', name: 'Olympics Postgres' },
+            { kind: 'preset', id: 'p-b', name: 'Economic Indicators Postgres', pending_semi_join: true },
+          ],
+          needs_combination: false,
+          semi_join_pending: {
+            driving: { kind: 'preset', id: 'p-a', name: 'Olympics Postgres' },
+            dependent: { kind: 'preset', id: 'p-b', name: 'Economic Indicators Postgres', prompt: 'GDP of each hosting country/year' },
+            filter_description: 'the hosting country and year',
+            max_filter_rows: 200,
+          },
+        },
+      ].map((e) => JSON.stringify(e)).join('\n') + '\n';
+      await route.fulfill({ status: 200, contentType: 'application/x-ndjson', body: ndjson });
+    });
+
+    const semiJoinCalls = [];
+    await page.route('**/api/generate-semi-join-sql', async (route) => {
+      semiJoinCalls.push(route.request().postDataJSON());
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ success: true }) });
+    });
+    // The driving connection's own execute call fails outright - nothing
+    // for the dependent connection to filter by.
+    await page.route('**/api/execute', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({
+        status: 200, contentType: 'application/json',
+        body: JSON.stringify({ success: false, error: 'connection refused', failures: [{ error: 'connection refused', failedStatement: 'SELECT host_country, year FROM olympics;' }] }),
+      });
+    });
+    await page.route('**/api/summarize-results', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ success: true, summary: '' }) });
+    });
+
+    await page.locator('#aiPrompt').fill('GDP of each hosting country/year');
+    await page.locator('#aiPrompt').press('Enter');
+
+    const tabs = page.locator('#resultsTabsNav .result-tab-btn');
+    await expect(tabs).toHaveCount(3);
+    // Never even called - the honest "couldn't filter" note is settled
+    // locally, without ever asking the endpoint for SQL that would have
+    // nothing real to filter by.
+    expect(semiJoinCalls.length).toBe(0);
+    await expect(tabs.nth(2)).toContainText('Economic Indicators Postgres');
+    await expect(tabs.nth(2)).toContainText('Note');
+  });
+
   // --- combine step (server/combine_routes.py): JOIN/UNION over already-
   // fetched result sets, inserted between /api/execute and /api/summarize-
   // results whenever triage's own terminal "done" line set
@@ -2853,10 +3130,8 @@ test.describe('multi-database question answering', () => {
     // fan-out used to land it here) - reconcileActiveHistoryBucket()
     // (triggered by saving) finds a genuinely empty bucket and restores a
     // blank slate, exactly as if p-a had never been asked anything.
-    await openConfigModal(page);
-    await page.locator('input[name="db_connection_option"][value="preset:p-a"]').check();
-    await page.locator('#configSaveBtn').click();
-    await expect(page.locator('#configModal')).toHaveClass(/hidden/);
+    await openDatasetPickList(page);
+    await selectDatasetOption(page, '.dataset-pick-option[data-value="preset:p-a"]');
 
     await expect(page.locator('#aiPrompt')).toHaveValue('');
     expect(await currentSql(page)).toBe('');
@@ -2909,10 +3184,8 @@ test.describe('multi-database question answering', () => {
     // (no SQL ever generated/run for it at all) - is equally untouched: it
     // was never visited directly, and its own note is no longer fanned
     // out into it either, so switching to it also lands on a blank slate.
-    await openConfigModal(page);
-    await page.locator('input[name="db_connection_option"][value="preset:p-b"]').check();
-    await page.locator('#configSaveBtn').click();
-    await expect(page.locator('#configModal')).toHaveClass(/hidden/);
+    await openDatasetPickList(page);
+    await selectDatasetOption(page, '.dataset-pick-option[data-value="preset:p-b"]');
 
     await expect(page.locator('#aiPrompt')).toHaveValue('');
     expect(await currentSql(page)).toBe('');
@@ -3001,10 +3274,8 @@ test.describe('multi-database question answering', () => {
     // Switch to Sales Postgres (p-a) directly and ask it a genuinely
     // single-connection-mode question - the ONLY turn that will ever land
     // in p-a's own bucket.
-    await openConfigModal(page);
-    await page.locator('input[name="db_connection_option"][value="preset:p-a"]').check();
-    await page.locator('#configSaveBtn').click();
-    await expect(page.locator('#configModal')).toHaveClass(/hidden/);
+    await openDatasetPickList(page);
+    await selectDatasetOption(page, '.dataset-pick-option[data-value="preset:p-a"]');
 
     await page.route('**/api/translate', async (route) => {
       if (route.request().method() !== 'POST') return route.fallback();
@@ -3035,10 +3306,9 @@ test.describe('multi-database question answering', () => {
 
     // Switch back to the "Sales & Marketing" dataset group and ask a third,
     // new combined question - capture exactly what THIS request sends.
-    await openConfigModal(page);
-    await page.locator('input[name="db_connection_option"][value="group:grp-ab"]').check();
-    await page.locator('#configSaveBtn').click();
-    await expect(page.locator('#configModal')).toHaveClass(/hidden/);
+    await openDatasetPickList(page);
+    await openCompositeSubmenu(page);
+    await selectDatasetOption(page, '.dataset-pick-option[data-value="group:grp-ab"]');
 
     let thirdRequestBody = null;
     await page.route('**/api/translate', async (route) => {

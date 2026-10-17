@@ -631,20 +631,6 @@ textarea:focus {
   cursor: not-allowed;
 }
 
-/* While a config-modal save is in flight (see configSaveBtn's own click
-   handler in client.js), every field/button in the form is disabled so
-   nothing changes out from under the request - .btn-secondary and the
-   plain <input>/<select> fields have no disabled look of their own
-   otherwise (unlike .btn-primary above), so without this they'd just stop
-   responding to clicks with no visual sign anything is locked. */
-#configForm button:disabled,
-#configForm input:disabled,
-#configForm select:disabled,
-#configForm textarea:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
-}
-
 .btn-secondary {
   background-color: var(--overlay-2);
   color: var(--text-primary);
@@ -945,8 +931,8 @@ textarea:focus {
    #modelTriggerBadge's own .model-badge-caret (see that rule's own
    comment for the full reasoning): marks the badge as a dropdown-style
    selector rather than plain status text. Flips to point up while
-   #configModal is open, tracking the same aria-expanded attribute
-   client.js's configTriggerBadge click handler/closeConfigModal() now
+   #datasetPickList is open, tracking the same aria-expanded attribute
+   client.js's configTriggerBadge click handler/closeDatasetPickList() now
    toggle, the same pattern already used for the model pick list. */
 .dataset-badge-caret {
   color: var(--text-muted);
@@ -1434,6 +1420,37 @@ textarea:focus {
 }
 
 .more-menu-model-btn:disabled:hover {
+  background: transparent;
+}
+
+/* Persistent (not transient) lock for a non-superuser session - see
+   IS_SUPERUSER/updateModelBadge() in client.js. Kept as its own class
+   rather than reusing .badge-disabled/:disabled above because those are
+   toggled on and off by setButtonsDisabled() for the transient in-flight-
+   query case; this one must stay applied the whole session for anyone who
+   isn't a superuser, regardless of query state, so the two reasons for
+   "looking disabled" can't clobber each other. Same grayed-out/not-allowed
+   visual language as the transient case for consistency. */
+.status-badge.model-restricted > *:not(.status-dot) {
+  opacity: 0.45;
+  filter: grayscale(1);
+}
+
+.status-badge.model-restricted {
+  cursor: not-allowed;
+}
+
+.status-badge.model-restricted:hover {
+  background: var(--overlay-1);
+}
+
+.more-menu-model-btn.model-restricted {
+  opacity: 0.45;
+  filter: grayscale(1);
+  cursor: not-allowed;
+}
+
+.more-menu-model-btn.model-restricted:hover {
   background: transparent;
 }
 
@@ -2312,9 +2329,9 @@ textarea:focus {
   opacity: 1;
 }
 
-/* Same "locked while saving" treatment as #configForm's own controls (see
-   that rule's comment) - modalCloseBtn lives in .modal-header, a sibling
-   of #configForm, so it isn't covered by that selector and needs its own. */
+/* Covers modals whose own JS disables the close button while a request is
+   in flight (e.g. schemaViewerModalCloseBtn while /api/schema is loading) -
+   modalCloseBtn lives in .modal-header, so no other rule reaches it. */
 .modal-close-btn:disabled {
   opacity: 0.4;
   cursor: not-allowed;
@@ -2441,7 +2458,7 @@ textarea:focus {
    of overflowing the locked 100dvh viewport and getting clipped.
 
    z-index: 2100 is there so the banner keeps showing - sharp, un-blurred,
-   above the dimmed/blurred scrim - while a modal (#configModal,
+   above the dimmed/blurred scrim - while a modal (#preferencesModal,
    #schemaViewerModal, etc.) is open over it, rather than being greyed out
    underneath. Flex items respect z-index even at their default
    `position: static` (per the flexbox spec), so this works without also
@@ -2524,43 +2541,6 @@ textarea:focus {
    gives every other modal that reuses that same class. */
 .modal-body-spacious {
   gap: 2rem;
-}
-
-/* configModal's form needs its Save button pinned below a scrolling list
-   of DB connections (which can grow arbitrarily tall as custom connections
-   are added) rather than scrolling away with everything else - overrides
-   the generic .modal-body padding/scroll behavior above, scoped to just
-   this one modal via #configForm so every other modal (.modal-body used
-   directly, no split-scroll wrapper markup) keeps its original layout. */
-#configForm.modal-body {
-  padding: 0;
-  gap: 0;
-  overflow: hidden;
-  min-height: 0;
-}
-
-/* The scrolling region - min-height: 0 lets it shrink within modal-card's
-   capped height instead of pushing the footer off-screen; overflow-y:
-   auto is what actually scrolls once content exceeds that shrunk height. */
-#configForm .modal-scroll-content {
-  flex: 1 1 auto;
-  min-height: 0;
-  overflow-y: auto;
-  padding: 1.25rem;
-  display: flex;
-  flex-direction: column;
-  gap: 1.25rem;
-}
-
-/* Stays outside the scrolling region above, so it (and the Save button it
-   holds) is always visible without scrolling. */
-#configForm .modal-footer-fixed {
-  flex-shrink: 0;
-  padding: 1rem 1.25rem 1.25rem;
-  display: flex;
-  flex-direction: column;
-  gap: 0.75rem;
-  border-top: 1px solid var(--bg-card-border);
 }
 
 .help-dialog-body {
@@ -2786,73 +2766,43 @@ textarea.report-issue-preview:focus {
   gap: 1.5rem;
 }
 
-/* Sub-group headings inside #modalDbRadioGroup ("Pre-configured Database
-   Playgrounds" over the CONFIGURED_DBS presets, "Custom Database
-   Connections" over customDbsContainer) - a plain label, not a button or
-   input, so it's excluded from .radio-group's own flex gap sizing that
-   the radio/custom-connection rows use for click targets. */
-.radio-group-heading {
-  font-size: 0.7rem;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  color: var(--text-muted);
+/* Datasource picker's own empty state for "Private" (see
+   renderDatasetPickList() in client.js) - shown instead of the plain
+   option list when the user has no private datasources saved yet,
+   pointing at where to actually add one (the Preferences dialog's "Bring
+   Your Own Data" section, since this dropdown is select-only, same as
+   every other option here - creating/editing/deleting a custom connection
+   lives there, not here). */
+.custom-dbs-empty-hint {
+  font-size: 0.82rem;
+  margin: 0;
 }
 
-/* No border-top of its own here for the "Custom Database Connections"
-   heading, even though it visually starts a new group - #customDbsContainer
-   right below it already draws that exact divider line itself (see
-   .custom-dbs-list:not(:empty) below), so adding one here too would just
-   double it up. */
-.radio-group-heading:not(:first-child) {
-  margin-top: 0.3rem;
+/* A button meant to read as inline text, not as a bordered control - used
+   where a click needs to run script (so a real <a href> would be
+   misleading) but the control itself should look like a plain link inside
+   a sentence, e.g. the "add one in Settings" prompt above. */
+.link-button {
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  color: var(--link-color);
+  text-decoration: underline;
+  cursor: pointer;
 }
 
-/* Extra breathing room specifically above "Custom Database Connections" -
-   more than a plain sub-group heading gets from the rule just above, since
-   this one visually starts a whole new section (custom connections), not
-   just another sub-group under the same one. Same specificity as that
-   rule (two classes each) - declared after it so this wins the tie on
-   source order, rather than relying on a specificity difference. */
-.radio-group-heading.radio-group-heading-custom {
-  margin-top: 1.1rem;
+.link-button:hover {
+  color: var(--link-color-hover);
 }
 
-/* Two-column layout for the preset radio options (see renderDbRadioButtons()
-   in client.js) - purely visual grouping, wraps in the same .radio-group
-   flow as everything else. min-width: 0 lets each column's own content
-   (radio-option's flex row) shrink below its natural width instead of
-   overflowing/forcing the modal wider when a preset name is long. */
-.preset-columns {
-  display: flex;
-  gap: 1rem;
-}
-
-.preset-column {
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
-  flex: 1;
-  min-width: 0;
-}
-
-/* Short reassurance line under the "Custom Database Connections" heading
-   (see renderDbRadioButtons() in client.js) - deliberately smaller/quieter
-   than .radio-group-heading itself, since it's a one-liner pointing at
-   help.html for the real explanation, not a heading of its own. */
-.custom-db-security-note {
-  font-size: 0.72rem;
-  line-height: 1.35;
-  color: var(--text-muted);
-  margin: -0.1rem 0 0.15rem;
-}
-
-.custom-db-security-note a {
-  color: inherit;
-  opacity: 0.85;
-  text-decoration: underline dotted;
-}
-
+/* Now used only by Preferences' Theme radios (Dark/Light) - the datasource
+   picker (presets/groups/private connections) moved off plain radio inputs
+   entirely into its own dropdown (see the DATASET PICK LIST section in
+   client.js and .dataset-pick-option below), so this no longer needs to
+   handle a long preset/connection name inside a flex column; kept simple
+   for its one remaining short-label use. */
 .radio-option {
   display: flex;
   align-items: center;
@@ -2862,32 +2812,9 @@ textarea.report-issue-preview:focus {
   cursor: pointer;
   user-select: none;
   white-space: nowrap;
-  /* Needed now that this is a direct flex item of .preset-column (column
-     flex-direction) rather than nested inside the old .radio-option-row
-     wrapper, which used to carry this for it - without it, a flex item's
-     default min-width:auto would size to its content and defeat the
-     ellipsis truncation on .radio-option span below for a long name. */
-  min-width: 0;
 }
 
-/* Also applies to the radio inside .custom-db-header-row (each custom
-   connection card's own selector radio, right below the preset list in
-   #modalDbRadioGroup - see renderCustomDbRows()) - that one isn't wrapped
-   in a .radio-option label the way a preset's is (its row has a type
-   select/name input/toggle/remove button alongside it, not just a label),
-   so without this it rendered as a bare, unstyled native browser radio -
-   a different size/color than every preset's right above it, even though
-   both are options in the same db_connection_option radio group.
-   flex-shrink: 0 (new) fixes a real bug: .radio-option is a flex row whose
-   default flex-shrink: 1 let this radio be squeezed smaller than every
-   other one in the list, but only for whichever preset happened to have
-   the longest label (e.g. "US Sensus (Google Visualization API Qu...)") -
-   the browser was shrinking the radio itself, alongside the label's own
-   ellipsis truncation, to make that one row fit its column. A fixed
-   width/height alone doesn't protect against that in a flex container;
-   only flex-shrink: 0 does. */
-.radio-option input[type="radio"],
-.custom-db-header-row input[type="radio"] {
+.radio-option input[type="radio"] {
   accent-color: var(--accent-cyan);
   width: 1rem;
   height: 1rem;
@@ -2960,20 +2887,201 @@ textarea.report-issue-preview:focus {
   border-color: var(--surface-3);
 }
 
-/* Dataset groups (see renderDbRadioButtons() in client.js) - each admin-
-   curated group renders as its own radio, merged into the very same
-   two-column playgrounds list as every single preset (no separate
-   section/heading of its own any more). No longer bolded (per explicit
-   request - it read as visually heavier than every ordinary preset beside
-   it, not just "distinct"); it's still set apart from an ordinary preset
-   by its own on-hover tooltip and "(Dataset Group)" suffix instead. The
-   explanation of what this option does lives in its own `title` attribute
-   (a plain on-hover tooltip, no custom CSS needed) rather than as visible
-   text in the dialog body - see renderDbRadioButtons()'s
-   GROUP_OPTION_HINT. */
-.all-databases-option {
+/* ===========================================================================
+   DATASET PICK LIST - an in-place dropdown anchored under
+   #configTriggerBadge (see client.js's DATASET PICK LIST section),
+   replacing the old #configModal popup dialog per explicit request, same
+   pattern as - and visually modeled on - the MODEL PICK LIST above (see
+   that section's own comment): picking a datasource should feel like
+   choosing from a list right there, not opening a separate dialog. Options
+   are grouped under two headings, "Public" (every CONFIGURED_DBS preset
+   and CONFIGURED_DB_GROUPS dataset group, merged into one flat list, groups
+   trailing the presets they're built from) and "Private" (this user's own
+   saved custom connections, or an empty-state hint pointing at Settings if
+   they have none yet) - reusing .model-pick-group-heading/.model-pick-
+   option/.model-pick-check/.model-pick-error wholesale rather than
+   inventing parallel classes, since the row shape (a directly-clickable
+   option, click = select AND save immediately) is identical either way.
+   =========================================================================== */
+.dataset-picker-wrapper {
+  position: relative;
+  display: inline-flex;
+  flex-shrink: 0;
+  min-width: 0;
+}
+
+/* Anchored to the LEFT edge of the wrapper (unlike .model-pick-list's own
+   right: 0) - #modelPickerWrapper sits inside the right-aligned
+   .header-actions, where right: 0 keeps the flyout from running off the
+   header's own right edge, but #datasetPickerWrapper sits inside the
+   centered .crbot-dataset-center instead, immediately followed by its own
+   sibling #datasetSchemaViewerBtn (not part of this wrapper) - left: 0
+   keeps the flyout aligned under the badge itself regardless of where
+   that sibling button ends up. */
+.dataset-pick-list {
+  position: absolute;
+  left: 0;
+  top: calc(100% + 8px);
+  background-color: var(--surface-1);
+  border: 1px solid var(--bg-card-border);
+  border-radius: 8px;
+  box-shadow: 0 10px 25px rgba(0, 0, 0, 0.4);
+  min-width: 240px;
+  max-width: min(360px, 90vw);
+  max-height: min(400px, 70vh);
+  overflow-y: auto;
+  z-index: 100;
+  padding: 0.5rem 0;
+}
+
+.dataset-pick-list.hidden {
+  display: none !important;
+}
+
+.dataset-pick-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  width: 100%;
+  background: transparent;
+  border: none;
+  color: var(--text-primary);
+  padding: 0.5rem 1rem;
+  font-size: 0.85rem;
+  font-family: var(--font-sans);
+  text-align: left;
+  cursor: pointer;
+  transition: var(--transition);
+}
+
+.dataset-pick-option:hover {
+  background-color: var(--overlay-2);
+}
+
+.dataset-pick-option.selected {
+  color: var(--accent-cyan);
+  font-weight: 600;
+}
+
+/* Reserves the checkmark's width on every row (not just the selected one),
+   same reasoning as .model-pick-option's own rule right above. */
+.dataset-pick-option .model-pick-check {
+  visibility: hidden;
+  flex-shrink: 0;
+}
+
+.dataset-pick-option.selected .model-pick-check {
+  visibility: visible;
+}
+
+/* A dataset GROUP's own option, rendered inside the "Composites" flyout
+   (#datasetPickCompositeSubmenu, see client.js's renderGroupOption()) rather
+   than inline in the Public section any more - no longer bolded (per
+   earlier explicit request - it read as visually heavier than every
+   ordinary preset beside it, not just "distinct"); no on-hover tooltip of
+   its own either (dropped per a later explicit request - the flyout is
+   already what marks these apart from an ordinary preset, so the extra
+   explanation was redundant), and no "(Composite)" suffix on the name
+   needing extra wrap room the way it used to - this still allows wrapping
+   since a group's plain name can still run long on its own in a flyout
+   this narrow. */
+.dataset-pick-option.all-databases-option {
   white-space: normal;
-  margin-bottom: 0.15rem;
+}
+
+/* The "Composites" row itself, inline among the Public section's regular
+   .dataset-pick-option buttons in #datasetPickOptions - shares their exact
+   row padding/font/hover language via this combined selector (rather than
+   literally being a .dataset-pick-option, which would make it match the
+   delegated click listener's own select-and-save handling - see client.js,
+   which checks for this class FIRST specifically to avoid that). Never
+   gets a .selected/.model-pick-check of its own since it doesn't represent
+   a choice by itself - see .dataset-pick-submenu-caret below for how its
+   open/closed state actually shows. Opens its flyout on hover alone (per
+   explicit request - see client.js's openDatasetPickCompositeSubmenu()),
+   not just on click, so :hover below doubles as this row's real affordance,
+   not just a cosmetic nicety the way it is on an ordinary
+   .dataset-pick-option (clicking one of those is still required there). */
+.dataset-pick-submenu-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  width: 100%;
+  background: transparent;
+  border: none;
+  color: var(--text-primary);
+  padding: 0.5rem 1rem;
+  font-size: 0.85rem;
+  font-family: var(--font-sans);
+  text-align: left;
+  cursor: pointer;
+  transition: var(--transition);
+}
+
+.dataset-pick-submenu-toggle:hover {
+  background-color: var(--overlay-2);
+}
+
+/* Static right-pointing arrow (the universal "opens a submenu" glyph,
+   unlike #datasetPickList's own down-pointing .dataset-badge-caret which
+   flips with aria-expanded) - the SAME chevron glyph as every other
+   open/close caret in this file, just rotated -90deg rather than drawn as
+   a separate icon, so it stays visually consistent with
+   .dataset-badge-caret/.model-badge-caret/.more-menu-model-caret. Doesn't
+   itself rotate further on open/close the way those do - a nested menu's
+   own "has a submenu" arrow conventionally stays put; the flyout's own
+   visibility is indication enough that it's open. */
+.dataset-pick-submenu-caret {
+  color: var(--text-muted);
+  flex-shrink: 0;
+  transform: rotate(-90deg);
+}
+
+/* The "Composites" flyout itself (#datasetPickCompositeSubmenu in
+   index.html) - a sibling of .dataset-pick-list, not nested inside it (see
+   that element's own comment in index.html for why), positioned with
+   inline top/left client.js's openDatasetPickCompositeSubmenu() computes
+   fresh on every open rather than a fixed offset here, since the
+   "Composites" toggle row's own vertical position moves depending on how
+   many presets render above it. Same visual language as .dataset-pick-list
+   itself (same surface/border/shadow/radius/scroll treatment) so the two
+   panels read as one system despite being separate elements. */
+.dataset-pick-submenu {
+  position: absolute;
+  background-color: var(--surface-1);
+  border: 1px solid var(--bg-card-border);
+  border-radius: 8px;
+  box-shadow: 0 10px 25px rgba(0, 0, 0, 0.4);
+  min-width: 200px;
+  max-width: min(320px, 90vw);
+  max-height: min(360px, 70vh);
+  overflow-y: auto;
+  z-index: 100;
+  padding: 0.5rem 0;
+}
+
+.dataset-pick-submenu.hidden {
+  display: none !important;
+}
+
+/* Disabled/busy while a selection is being saved (see client.js's
+   selectDataset()) - a fresh custom connection's first activation can take
+   several seconds (real schema introspection server-side, not just a
+   preference flip the way picking a model is), so every other option is
+   blocked from being clicked out from under that in-flight request rather
+   than just visually implying it. The badge's own connDbDot already shows
+   a "checking" pulse for the same duration (see checkDbStatus()'s own
+   convention) - this is the dropdown-side half of that same feedback.
+   Covers both .dataset-pick-list and its own .dataset-pick-submenu flyout
+   - client.js's selectDataset() applies this class to whichever of the two
+   a selection was actually made from, but either can be the one visibly
+   open and interactive while the other request is in flight. */
+.dataset-pick-list.dataset-pick-list-busy,
+.dataset-pick-submenu.dataset-pick-list-busy {
+  pointer-events: none;
+  opacity: 0.6;
 }
 
 .checkbox-option {
@@ -3007,7 +3115,9 @@ textarea.report-issue-preview:focus {
 }
 
 /* ===========================================================================
-   CUSTOM DB CONNECTION CARDS (config modal)
+   CUSTOM DB CONNECTION CARDS (Preferences dialog's "Bring Your Own Data"
+   section - relocated here from the datasource selector's config modal;
+   see renderCustomDbRows() in client.js)
    Each saved custom connection is enclosed between two horizontal lines
    (the list's own top border plus each card's bottom border, so adjacent
    cards share one line rather than doubling up), with its fields laid out
@@ -3030,11 +3140,12 @@ textarea.report-issue-preview:focus {
      border-bottom below put ~1.5rem of empty space between two collapsed
      cards (each card is just its own .custom-db-header-row when
      collapsed, so this padding IS the visible gap) - 3x as loose as the
-     Public Datasources list right above it, whose .preset-column rows
-     are only ever 0.5rem apart (see that rule's own `gap`). 0.25rem top
-     and bottom mirrors that same 0.5rem total gap between adjacent rows
-     here too, so collapsed Private Datasources rows read exactly as
-     tight as the Public ones - an expanded card (Name/type-specific/
+     dataset picker dropdown above it, whose .dataset-pick-option rows
+     sit only 1rem apart (each option's own 0.5rem top/bottom padding,
+     back to back). 0.25rem top and bottom mirrors that same 0.5rem-per-
+     side rhythm here too, so collapsed Private Datasources rows read
+     exactly as tight as the dropdown's own option rows - an expanded
+     card (Name/type-specific/
      timeout field rows showing) still gets its own internal 0.55rem
      row-to-row spacing from this rule's `gap`, untouched. */
   padding: 0.25rem 0;
@@ -3074,7 +3185,13 @@ textarea.report-issue-preview:focus {
   align-items: center;
   gap: 0.5rem 1rem;
   flex-wrap: wrap;
-  padding-left: 1.9rem;
+  /* No left indent any more - this used to align each field row under
+     the header row's Name input, past the selection radio that used to
+     sit before it (radio width + gap). The relocation to the Preferences
+     dialog's "Bring Your Own Data" section removed that radio entirely
+     (selection now lives only in the read-only list in the datasource
+     selector - see renderDbRadioButtons() in client.js), so Name is now
+     the header row's own first element and needs no offset to match. */
 }
 
 .custom-db-field-row.align-start {
@@ -3551,6 +3668,41 @@ textarea.report-issue-preview:focus {
 }
 
 .summary-suggested-search-link:hover {
+  color: var(--link-color-hover);
+  border-color: var(--link-color-hover);
+}
+
+/* client.js's renderNoSqlResponse()'s own inviteActionHtml() - the
+   clickable "Open the Help guide"/"Open the Schema Viewer" invitation
+   appended under a triage "help"/"schema" outcome's short text answer
+   (see that function's own docstring: this replaces the old behavior of
+   popping the Help modal/Schema Viewer open immediately and unannounced).
+   A <button>, not an <a> (there's no URL - clicking it runs
+   openInviteAction() in place), so font/background/border are reset here
+   before being styled identically to .summary-suggested-search-link just
+   above, for the same "small bordered pill, not plain prose-like inline
+   text" visual language every other in-page invitation link in this file
+   already uses. */
+.nosql-invite-row {
+  margin-top: 0.75rem;
+}
+
+.nosql-invite-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.2rem 0.6rem;
+  border: 1px solid var(--bg-card-border);
+  border-radius: 999px;
+  font: inherit;
+  font-size: 0.75rem;
+  background: none;
+  color: var(--link-color);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.nosql-invite-link:hover {
   color: var(--link-color-hover);
   border-color: var(--link-color-hover);
 }
@@ -4678,9 +4830,13 @@ tr.report-issue-row td {
 
 /* Shown the instant a liveness check (checkDbStatus()/api/ping) starts,
    for however long it takes to actually resolve - the check itself now
-   runs in the background rather than blocking the config modal's open/
-   Save flow (see client.js), so this is the only visual cue that a check
-   is in flight rather than the dot just sitting on a stale prior state. */
+   runs in the background rather than blocking the datasource picker's
+   open/select flow (see client.js), so this is the only visual cue that a
+   check is in flight rather than the dot just sitting on a stale prior
+   state. Also set explicitly by selectDataset() the moment a selection is
+   clicked, for the same reason - a fresh custom connection's first
+   activation can take several real seconds (schema introspection), not
+   just the near-instant preference flip a preset switch normally is. */
 .status-dot.checking {
   background-color: var(--text-muted);
   animation: status-dot-checking-pulse 1.2s ease-in-out infinite;
@@ -4952,12 +5108,11 @@ tr.report-issue-row td {
    maintained "for display only" introspection pass.
    =========================================================================== */
 
-/* Same #configForm.modal-body override pattern used elsewhere in this file
-   (see that rule's own comment): the generic .modal-body's own padding/
-   flex/scroll behavior would scroll the WHOLE body (toolbar included) as
-   one unit once the entry list/detail text grows tall - this pins the
-   toolbar and notice in place and hands scrolling to the two panes below
-   instead, each independently. */
+/* Overrides the generic .modal-body padding/flex/scroll behavior, which
+   would otherwise scroll the WHOLE body (toolbar included) as one unit
+   once the entry list/detail text grows tall - this pins the toolbar and
+   notice in place and hands scrolling to the two panes below instead,
+   each independently. */
 #schemaViewerModal .modal-body.schema-viewer-body {
   padding: 1.25rem;
   gap: 0.75rem;

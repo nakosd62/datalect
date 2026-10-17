@@ -1283,6 +1283,27 @@ else:
 # none of them.
 MAX_IN_SCOPE_CONNECTIONS = int(os.environ.get("MAX_IN_SCOPE_CONNECTIONS", 20))
 
+# Cross-dataset semi-join / filter pushdown (see connection_router.py's
+# "semi_join" triage field and semi_join_routes.py): the cap on how many
+# distinct rows of a "driving" connection's own real, already-executed
+# result get rendered into the "filter context" block appended to a
+# "dependent" connection's own Phase B prompt (see
+# semi_join_routes.py::_build_filter_context). Deliberately its OWN
+# constant, not a reuse of EXECUTE_RESULTS_MAX_ROWS (backends/base.py) or
+# COMBINE_RESULTS_MAX_ROWS (combine_routes.py) - both of those bound a
+# RESULT SET'S OWN size for this app's "reasonable bounded size"
+# convention, a materially different concern from "how many distinct
+# filter values is it still reasonable to inline into one WHERE/IN clause
+# in a prompt." A filter list that's actually useful to a dependent
+# connection's own query is typically much smaller in practice (tens of
+# values, not hundreds) - keeping this separate also means tuning one
+# doesn't silently change the other. Exceeding this cap doesn't fail the
+# turn: the dependent connection's own generation call simply runs
+# without a filter (same as if semi_join had never been detected),
+# surfaced to the end user as an honest caveat rather than a wrong or
+# silently-truncated filter.
+SEMI_JOIN_MAX_FILTER_ROWS = int(os.environ.get("SEMI_JOIN_MAX_FILTER_ROWS", 200))
+
 # Shared LLM-call retry policy - originated in translate_routes.py (its
 # single-connection retry loop and generate_sql_for_connection both use
 # these), moved here for the exact same reason MAX_IN_SCOPE_CONNECTIONS

@@ -239,6 +239,53 @@ def _clean_database_prompts(raw, valid_indices):
     return cleaned
 
 
+def _clean_semi_join(raw, valid_indices):
+    """Validates a "sql" response's untrusted "semi_join" value against the
+    (already-cleaned) `valid_indices` list, returning a plain
+    {"driving_index": int, "dependent_index": int, "filter_description": str}
+    dict when it checks out, or None otherwise - never raises, and a
+    malformed/missing "semi_join" is simply treated as "no semi-join for
+    this turn" rather than failing the whole triage attempt (same lenient
+    posture as _clean_database_prompts: one optional field's own
+    validation is never a reason to discard an otherwise-good routing
+    decision).
+
+    Mirrors _clean_indices/_clean_database_prompts' own defensiveness:
+    `raw` must be a dict with "driving_index"/"dependent_index" both
+    coercible to int and both present in `valid_indices` (i.e. connections
+    actually picked by this same response's "indices"), the two indices
+    must be DIFFERENT (a connection can't filter itself), and
+    "filter_description" must be a non-empty string - the whole point of
+    this field is naming a specific restriction to thread into the
+    driving connection's own database_prompts rewrite and later into the
+    dependent connection's own filter context, so an empty/missing
+    description makes the field useless regardless of how well-formed the
+    indices are. Returns None (not a partial dict) on any single
+    validation failure - unlike database_prompts' per-entry leniency, a
+    semi_join relationship is only meaningful as a whole unit; there's no
+    sensible "half a semi-join"."""
+    if not isinstance(raw, dict):
+        return None
+    valid = set(valid_indices)
+    try:
+        driving_index = int(raw.get("driving_index"))
+        dependent_index = int(raw.get("dependent_index"))
+    except (TypeError, ValueError):
+        return None
+    if driving_index not in valid or dependent_index not in valid:
+        return None
+    if driving_index == dependent_index:
+        return None
+    filter_description = raw.get("filter_description")
+    if not (isinstance(filter_description, str) and filter_description.strip()):
+        return None
+    return {
+        "driving_index": driving_index,
+        "dependent_index": dependent_index,
+        "filter_description": filter_description.strip(),
+    }
+
+
 def is_label_only_response(text):
     """True when `text` is a known failure mode of the "<label line>
     \\n\\n<body>" shape both _MULTI_CANDIDATE_TRIAGE_SYSTEM_INSTRUCTION
@@ -436,9 +483,21 @@ def _parse_multi_candidate_triage_response(text, num_candidates, max_connections
         # combine-results step) can treat a missing/malformed value the same as an explicit
         # False, never a crash on an unexpected type.
         needs_combination = bool(parsed.get("needs_combination")) and len(indices) > 1
+        # See _clean_semi_join's own docstring - None whenever the field is
+        # absent, malformed, or len(indices) <= 1 (nothing to relate a
+        # single picked connection to). Mutually exclusive with
+        # needs_combination is a MODELING convention (the prompt asks for
+        # one or the other, never both, for the same pair) enforced by
+        # triage_multi_candidate.txt's own instructions, not re-validated
+        # here - a response that set both anyway is passed through as-is
+        # rather than silently dropping one; the caller (translate_routes.
+        # py's router_only_group_mode branch) decides precedence if that
+        # ever actually happens.
+        semi_join = _clean_semi_join(parsed.get("semi_join"), indices) if len(indices) > 1 else None
         return {
             "outcome": "sql", "indices": indices, "message": message,
             "database_prompts": database_prompts, "needs_combination": needs_combination,
+            "semi_join": semi_join,
         }
 
     return None
@@ -500,7 +559,8 @@ def run_triage_call(num_candidates, schema_block, prompt, provider, client, mode
       {"outcome": "sql", "usage": <dict|None>}  # num_candidates == 1 only
       {"outcome": "sql", "indices": [...], "message": <str|None>,
        "database_prompts": {int_index: str, ...}, "needs_combination": <bool>,
-       "usage": <dict|None>}  # num_candidates > 1 only
+       "semi_join": {"driving_index": int, "dependent_index": int,
+       "filter_description": str} | None, "usage": <dict|None>}  # num_candidates > 1 only
       {"outcome": "failed", "api_error": <bool>, "error": <exception|None>,
        "language_mismatch_text": <str|None>}
 

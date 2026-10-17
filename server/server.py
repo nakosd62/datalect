@@ -8,6 +8,8 @@ Thin entrypoint. All the actual logic lives in focused modules:
     db.py                  - connection resolution, schema introspection
     translate_routes.py    - /api/translate (Gemini NL -> SQL)
     summarize_routes.py     - /api/summarize-results, /api/summarize-result
+    combine_routes.py      - /api/combine-results (cross-dataset JOIN/UNION over already-fetched results)
+    semi_join_routes.py    - /api/generate-semi-join-sql (cross-dataset filter pushdown)
     execute_routes.py      - /api/execute (run SQL, return results)
     config_routes.py       - /api/config (session DB/model selection)
     report_routes.py       - /api/report-issue (email an error/wrong-result report)
@@ -27,6 +29,7 @@ from config_routes import config_bp
 from translate_routes import translate_bp
 from summarize_routes import summarize_bp
 from combine_routes import combine_bp
+from semi_join_routes import semi_join_bp
 from execute_routes import execute_bp
 from chat_history_routes import chat_history_bp
 from report_routes import report_bp
@@ -43,7 +46,7 @@ app.before_request(enforce_authentication)
 # alive. See auth.py's refresh_auth_session_cookie()/auth_session.py.
 app.after_request(refresh_auth_session_cookie)
 
-for bp in (auth_bp, config_bp, translate_bp, summarize_bp, combine_bp, execute_bp, chat_history_bp, report_bp, share_bp):
+for bp in (auth_bp, config_bp, translate_bp, summarize_bp, combine_bp, semi_join_bp, execute_bp, chat_history_bp, report_bp, share_bp):
     app.register_blueprint(bp)
 
 

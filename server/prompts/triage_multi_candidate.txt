@@ -64,13 +64,51 @@ as the same prompt, only reworded if needed to drop any reference to picking/ide
 - e.g. "how large is this database" -> "how large is this database?" is fine verbatim once only 
 one connection is being asked. Every index you put in "indices" needs its own entry here - do not omit any.
 
-When "needs_combination" is true, make sure every affected connection's own "database_prompts" rewrite 
-still asks for whatever shared column a later join/union will actually need (a shared id, email, name, 
-or date to match rows on, or - for a union - simply the same kind of row from each side), even if that 
-connection's own slice of the question, read in isolation, would not otherwise think to select it. A 
-rewritten prompt that drops the one column the combination depends on makes the later step impossible 
-no matter how good its own reasoning is, so err on the side of explicitly naming that shared column in 
+When "needs_combination" is true, make sure every affected connection's own "database_prompts" rewrite
+still asks for whatever shared column a later join/union will actually need (a shared id, email, name,
+or date to match rows on, or - for a union - simply the same kind of row from each side), even if that
+connection's own slice of the question, read in isolation, would not otherwise think to select it. A
+rewritten prompt that drops the one column the combination depends on makes the later step impossible
+no matter how good its own reasoning is, so err on the side of explicitly naming that shared column in
 each affected connection's own rewritten instruction.
+
+Separately, some two-connection questions have a narrower, more specific shape worth its own field: one
+connection's answer should be used to RESTRICT what another connection is even asked for, before that
+other connection's own query runs - e.g. "show me the GDP of each country that hosted the Olympics, and
+the year" when one connection tracks Olympic host history and a different connection tracks GDP by
+country and year. Naively answering this by asking the GDP connection for "GDP by country and year" on
+its own would mean every country, every year - an enormous, mostly-irrelevant result that gets capped
+long before it ever reaches the specific handful of (host country, year) pairs that actually matter. The
+right move is: get the real (country, year) pairs from the Olympics connection first, then use those
+REAL values to filter the GDP connection's own query.
+
+Watch for this specific shape, not the broader "does this question need a filter resolved from somewhere"
+question (that's already handled perfectly well, for free, by that connection's own SQL-generation step
+resolving a filter from its own general knowledge when it safely can - e.g. "GDP of South American
+countries" needs no special handling at all here, since "which countries are in South America" is a
+stable fact a single connection can already recite and filter on by itself, with no need to query another
+connection for it). The narrower question this field is for: does the restrictive part of this question
+name something that one of the OTHER in-scope connections tracks as real, queryable rows, rather than
+something stable and well-known enough to just recite? If reciting it from general knowledge risks being
+wrong, incomplete, or simply isn't something you can be confident about (which countries hosted the
+Olympics in which exact year is exactly this kind of fact - unlike "the capital of France"), and one of
+the OTHER connections you picked genuinely tracks it as real data, prefer getting the real answer from
+that connection over reciting one from training.
+
+When (and only when) this shape applies, set "semi_join" (see the JSON contract below) to an object
+naming which connection's result should be used as the filter ("driving_index") and which connection's
+own query should be restricted by it ("dependent_index") - both must be entries you already picked in
+"indices", and must be two DIFFERENT indices - plus a short "filter_description" phrase naming what's
+being filtered on (e.g. "the hosting country and year"). Leave "semi_join" out entirely for the ordinary
+case (true for the overwhelming majority of multi-connection questions) where no connection's result
+needs to restrict another connection's own query before it runs. "semi_join" and "needs_combination" are
+mutually exclusive for the SAME pair of connections - a question either needs one connection's real
+results to filter another's query (semi_join) or needs two independently-fetched result sets related to
+each other afterward (needs_combination), not both at once for the same two connections. Same as
+"needs_combination"'s own instruction just above: make sure the DRIVING connection's own "database_prompts"
+rewrite explicitly asks for whatever column(s) "filter_description" refers to, even if its own slice of
+the question, read in isolation, wouldn't otherwise think to select them - the later filtering step can
+only use what that connection's own query actually returns.
 
 A question can mix a part these connections can genuinely answer with a separate part that's 
 really just general knowledge - e.g. "list countries with the highest GDP and their head of state" 
@@ -116,11 +154,14 @@ for the end user: name the real database name(s) you're about to check, AND brie
 e.g. (for an English prompt) 'Triage\n\nChecking Sales Postgres, since it has an orders table and 
 the prompt asks about recent purchases.' A message whose second part only names the database(s) 
 with no reason is NOT acceptable - always include the brief why.>", 
-"needs_combination": <true iff the question genuinely requires relating rows ACROSS the picked 
-connections rather than each independently answering its own slice - see outcome 4's own description 
-above; false (or simply omit this field) for the ordinary case>, 
-"database_prompts": {"<index as a string>": "<that connection's own self-contained rewritten prompt 
-- plain text, no "Triage" line, this one is never shown to the end user>", ...one entry per index 
+"needs_combination": <true iff the question genuinely requires relating rows ACROSS the picked
+connections rather than each independently answering its own slice - see outcome 4's own description
+above; false (or simply omit this field) for the ordinary case>,
+"semi_join": <OPTIONAL - omit entirely unless the narrower shape described above applies -
+{"driving_index": <int, one of "indices">, "dependent_index": <int, one of "indices", different from
+"driving_index">, "filter_description": "<short phrase naming what's being filtered on>"}>,
+"database_prompts": {"<index as a string>": "<that connection's own self-contained rewritten prompt
+- plain text, no "Triage" line, this one is never shown to the end user>", ...one entry per index
 in "indices"...}}
 
 Outcomes 2 and 3 need no other fields - the app itself handles what happens next for those.

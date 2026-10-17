@@ -256,7 +256,7 @@ from sheets_util import extract_spreadsheet_id
 # circular import risk: translate_routes.py doesn't import config_routes.py
 # (or anything that transitively does).
 from translate_routes import (
-    HISTORY_MAX_TURNS, get_llm_provider, list_llm_providers_info,
+    HISTORY_MAX_TURNS, get_llm_provider, list_llm_providers_info, _default_fleet_provider,
 )
 
 config_bp = Blueprint('config', __name__)
@@ -1153,6 +1153,38 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
     if custom_databases_in is None:
         return None
 
+    # Reusing an already-saved row's OWN connection_key (rather than always
+    # recomputing one fresh from name/identity/credential, as every branch
+    # below used to do unconditionally) keeps that identity stable across
+    # an edit - in particular, renaming a connection no longer changes its
+    # key. That matters once this function can be reached from a request
+    # that ISN'T also actively selecting/renaming that same connection as
+    # the session's active one (see handle_config's "is_custom" branch,
+    # which reconciles connection_id to a freshly computed key in the SAME
+    # request when it IS - this merge-only path has no equivalent
+    # reconciliation): the Preferences dialog's "Bring Your Own Data"
+    # section (client.js) saves this list on its own, with no active-
+    # connection fields in the same POST at all, so a rename that changed
+    # the key here would silently orphan the session's stored connection_id/
+    # in_scope_custom_connection_keys pointer - the user's active connection
+    # would quietly fall back to the default on the very next request, with
+    # no error anywhere. The frontend already knows each existing row's own
+    # connection_key (GET's own get_db_connections() response includes it)
+    # and resends it unchanged on every save (see client.js's
+    # buildCustomDatabasesPayload()); reused here only when it matches a
+    # row this exact user already has saved - a brand new row (no key yet)
+    # or a stale/forged value falls through to a fresh compute, same as
+    # before this existed.
+    existing_keys = {
+        c.get("connection_key") for c in (state_store.get_db_connections(user_identity) or [])
+    }
+
+    def _stable_key(incoming_row, name, identity, credential):
+        incoming_key = (incoming_row.get("connection_key") or "").strip()
+        if incoming_key and incoming_key in existing_keys:
+            return incoming_key
+        return compute_connection_key(name, identity, credential)
+
     merged = []
     for db in custom_databases_in:
         db_type = (db.get('type') or 'postgres').strip().lower()
@@ -1185,7 +1217,7 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
             }
             name = db.get("name") or dataset or "Custom BigQuery"
             merged.append({
-                "connection_key": compute_connection_key(name, identity, credentials_json),
+                "connection_key": _stable_key(db, name, identity, credentials_json),
                 "name": name,
                 "type": "bigquery",
                 # None, not "" - BigQuery has no real url of its own (see
@@ -1229,7 +1261,7 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
                     config["private_key_passphrase"] = private_key_passphrase
             name = db.get("name") or database or "Custom Snowflake"
             merged.append({
-                "connection_key": compute_connection_key(name, identity, password or private_key),
+                "connection_key": _stable_key(db, name, identity, password or private_key),
                 "name": name,
                 "type": "snowflake",
                 "url": None,  # None, not "" - see _snowflake_identity above (and this module's docstring).
@@ -1260,7 +1292,7 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
                 config["schema"] = schema
             name = db.get("name") or http_path or "Custom Databricks"
             merged.append({
-                "connection_key": compute_connection_key(name, identity, access_token),
+                "connection_key": _stable_key(db, name, identity, access_token),
                 "name": name,
                 "type": "databricks",
                 "url": None,  # None, not "" - see _databricks_identity above (and this module's docstring).
@@ -1301,7 +1333,7 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
             config["password"] = password
             name = db.get("name") or service_name_or_sid or "Custom Oracle"
             merged.append({
-                "connection_key": compute_connection_key(name, identity, password),
+                "connection_key": _stable_key(db, name, identity, password),
                 "name": name,
                 "type": "oracle",
                 "url": None,  # None, not "" - see _oracle_identity above (and this module's docstring).
@@ -1333,7 +1365,7 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
             config["password"] = password
             name = db.get("name") or database or "Custom Redshift"
             merged.append({
-                "connection_key": compute_connection_key(name, identity, password),
+                "connection_key": _stable_key(db, name, identity, password),
                 "name": name,
                 "type": "redshift",
                 "url": None,  # None, not "" - see _redshift_identity above (and this module's docstring).
@@ -1368,7 +1400,7 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
             config["password"] = password
             name = db.get("name") or database or "Custom SQL Server"
             merged.append({
-                "connection_key": compute_connection_key(name, identity, password),
+                "connection_key": _stable_key(db, name, identity, password),
                 "name": name,
                 "type": "mssql",
                 "url": None,  # None, not "" - see _mssql_identity above (and this module's docstring).
@@ -1400,7 +1432,7 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
             # overwriting each other - same reasoning as the password-
             # folding calls above.
             merged.append({
-                "connection_key": compute_connection_key(name, identity, credentials_json),
+                "connection_key": _stable_key(db, name, identity, credentials_json),
                 "name": name,
                 "type": "sheets",
                 "url": None,  # None, not "" - see _sheets_identity above (and this module's docstring).
@@ -1431,7 +1463,7 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
                 # which carries no credential of its own for this
                 # dialect - see _resolve_mongodb_sql_credentials above),
                 # same as Redshift's/SQL Server's calls above.
-                "connection_key": compute_connection_key(name, url, password),
+                "connection_key": _stable_key(db, name, url, password),
                 "name": name,
                 "type": "MongoDB",
                 "url": url,
@@ -1472,7 +1504,7 @@ def _parse_incoming_custom_databases(custom_databases_in, user_identity):
                 if schema:
                     config["schema"] = schema
             merged.append({
-                "connection_key": compute_connection_key(name, url, None),
+                "connection_key": _stable_key(db, name, url, None),
                 "name": name,
                 "type": resolved_type,
                 "url": url,
@@ -2017,6 +2049,20 @@ def handle_config():
             if not (isinstance(new_llm_model, str) and new_llm_model in provider_for_validation.preset_models):
                 new_llm_model = None
         else:
+            new_llm_provider = None
+            new_llm_model = None
+
+        # Only a superuser (auth.py's is_superuser()) may actually change
+        # which model a session uses - everyone else stays locked to the
+        # app's one fleet-wide default (see translate_routes.py's
+        # translate_query() for the matching server-side enforcement at
+        # the actual call sites). Silently ignored here too, same
+        # left-as-None "don't change this" convention as an invalid
+        # provider/model above, rather than a 403 - this whole block is
+        # just one of several independent fields a single /api/config POST
+        # can bundle together, and the rest of that request should still
+        # go through normally.
+        if not is_superuser(user_identity):
             new_llm_provider = None
             new_llm_model = None
 
@@ -2566,9 +2612,23 @@ def handle_config():
     # hardcoded default (Google), exactly like translate_query()'s own
     # resolution (see that function's comment) - the badge/modal always
     # shows the model that would actually be used, never a raw blank.
-    active_llm_provider_obj = get_llm_provider(session_data.get("llm_provider"))
-    active_llm_provider = active_llm_provider_obj.name
-    active_llm_model = session_data.get("llm_model") or active_llm_provider_obj.default_model
+    #
+    # For a non-superuser this is forced to the app's one fleet-wide
+    # default outright, bypassing session_data entirely - not just because
+    # they can no longer ever SET anything else going forward (see the
+    # new_llm_provider/new_llm_model gate above), but because a session
+    # that saved a non-default choice before this restriction existed (or
+    # while this user was still a superuser) must not keep showing a badge
+    # that's now inconsistent with what translate_query() et al. actually
+    # use for every real call this session makes.
+    if is_superuser(user_identity):
+        active_llm_provider_obj = get_llm_provider(session_data.get("llm_provider"))
+        active_llm_provider = active_llm_provider_obj.name
+        active_llm_model = session_data.get("llm_model") or active_llm_provider_obj.default_model
+    else:
+        active_llm_provider_obj = _default_fleet_provider()
+        active_llm_provider = active_llm_provider_obj.name
+        active_llm_model = active_llm_provider_obj.default_model
 
     # Bring Your Own Key (Preferences dialog): booleans only, never the
     # actual saved key - see StateStore.get_session's docstring on

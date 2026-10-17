@@ -12,7 +12,10 @@ established precedent those classes' own docstrings already state).
 import json
 import types as pytypes
 
-from helpers import parse_translate_stream, write_database_presets_file
+from helpers import (
+    parse_translate_stream, write_database_presets_file, login_as,
+    FAKE_DB_CONFIG_ENCRYPTION_KEY, FAKE_SESSION_SIGNING_KEY,
+)
 
 
 def _drain(gen):
@@ -432,6 +435,82 @@ def test_combine_results_route_succeeds_end_to_end_with_a_real_join(app_factory,
     assert data['result']['columns'] == ['name', 'campaign']
     assert data['result']['rows'] == [{'name': 'Bob', 'campaign': 'Spring Sale'}]
     assert data['result']['rowCount'] == 1
+
+
+def _presets_env_cloud_run(app_factory, tmp_path, superuser_emails):
+    """Same two Postgres presets as _presets_env above, but running as a
+    Cloud Run deployment with an explicit SUPERUSER_EMAILS allowlist -
+    see test_refresh_schema_authorization.py's _cloud_run_env for the
+    identical pattern this mirrors."""
+    presets_path = write_database_presets_file(tmp_path, [
+        {"id": "pg-a", "name": "Sales Postgres", "type": "postgres", "url": "postgresql://u:p@host-a:5432/a"},
+        {"id": "pg-b", "name": "Marketing Postgres", "type": "postgres", "url": "postgresql://u:p@host-b:5432/b"},
+    ])
+    return app_factory(env={
+        "DATABASE_PRESETS_FILE": presets_path, "GEMINI_PRESET_KEYS": "fake-key-1",
+        "K_SERVICE": "ydyl-service",
+        "DB_CONFIG_ENCRYPTION_KEY": FAKE_DB_CONFIG_ENCRYPTION_KEY,
+        "SESSION_SIGNING_KEY": FAKE_SESSION_SIGNING_KEY,
+        "GOOGLE_CLIENT_ID": "fake.apps.googleusercontent.com",
+        "GCP_PROJECT_ID": "fake-project",
+        "SUPERUSER_EMAILS": superuser_emails,
+    }, mock_firestore=True)
+
+
+def test_combine_results_pins_a_non_superuser_to_the_fleet_wide_default_model(app_factory, tmp_path, monkeypatch):
+    """Security boundary, not just a UI nicety (see client.js's IS_SUPERUSER/
+    updateModelBadge()): a non-superuser's request-body 'model' override AND
+    their own previously-saved session model are both ignored outright for
+    this route - only is_superuser(user_identity) decides, same gate as
+    translate_routes.py's translate_query() and summarize_routes.py's two
+    routes."""
+    env = _presets_env_cloud_run(app_factory, tmp_path, superuser_emails="alice@example.com")
+    login_as(env.client, "bob@example.com")
+    env.app_config.state_store.set_session(
+        "bob@example.com", llm_provider="google", llm_model="bobs-saved-model",
+    )
+    harness = _GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(_gemini_ok(_combine_json(
+        "SELECT r0.name, r1.campaign FROM results_0 r0 JOIN results_1 r1 ON r0.customer_id = r1.cust_id"
+    )))
+
+    resp = env.client.post('/api/combine-results', json={
+        'prompt': 'which customers are in both',
+        'database_results': [dict(_SALES), dict(_MARKETING)],
+        'model': 'request-override-model',
+    })
+    assert resp.status_code == 200
+    _retry_events, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    # Neither "request-override-model" (the request body) nor
+    # "bobs-saved-model" (this session's own saved choice) - the app's one
+    # fleet-wide default, exactly as a fresh install with zero configuration
+    # would use.
+    assert harness.generate_calls[0]["model"] == "gemini-3.6-flash"
+
+
+def test_combine_results_still_honors_a_superusers_own_model_choice(app_factory, tmp_path, monkeypatch):
+    """Regression guard alongside the pin above: a superuser's own request-
+    body override must still work exactly as before - this feature only
+    restricts everyone ELSE."""
+    env = _presets_env_cloud_run(app_factory, tmp_path, superuser_emails="alice@example.com")
+    login_as(env.client, "alice@example.com")
+    harness = _GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(_gemini_ok(_combine_json(
+        "SELECT r0.name, r1.campaign FROM results_0 r0 JOIN results_1 r1 ON r0.customer_id = r1.cust_id"
+    )))
+
+    resp = env.client.post('/api/combine-results', json={
+        'prompt': 'which customers are in both',
+        'database_results': [dict(_SALES), dict(_MARKETING)],
+        'model': 'request-override-model',
+    })
+    assert resp.status_code == 200
+    _retry_events, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    assert harness.generate_calls[0]["model"] == "request-override-model"
 
 
 def test_combine_results_route_surfaces_an_honest_failure_without_a_500(app_factory, tmp_path, monkeypatch):

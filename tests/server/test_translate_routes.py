@@ -99,6 +99,7 @@ from helpers import (
     install_fake_bigquery, install_fake_mssql_connect, parse_translate_stream,
     parse_translate_stream_events, write_database_presets_file, login_as,
     select_llm_provider, set_llm_byok_key, normalize_prompt_whitespace,
+    FAKE_DB_CONFIG_ENCRYPTION_KEY, FAKE_SESSION_SIGNING_KEY,
 )
 
 
@@ -635,6 +636,98 @@ def test_plain_sql_response_never_triggers_a_language_check(app_factory, monkeyp
     # prompt up front) - never a third time, since real SQL never enters
     # either call's own language-mismatch branch.
     assert detect_calls == ['show all users', 'show all users']
+
+
+# --- "schema"/"help" outcomes: short server-written answer + invite_action
+# (replacing the old immediate-popup "OPEN SCHEMA VIEWER"/"OPEN HELP POPUP"
+# marker design) -----------------------------------------------------------
+#
+# Each of these two outcomes used to pop the Schema Viewer/Help modal open
+# immediately and unannounced (client.js's old isOpenSchema/isOpenHelp
+# branches, driven by a literal marker string translate_routes.py used to
+# build). That surprised users, so both now answer directly with a short,
+# server-written text - the datasource's own already-generated schema
+# overview prose (falling back to a fixed sentence when none has been
+# generated yet), or a fixed one-sentence app description for "help" - and
+# set `invite_action` ("schema"/"help") so client.js can render a clickable
+# invitation to open the fuller dialog instead. These tests cover the
+# single-connection branch (translate_routes.py's own outcome-handling
+# block, not connection_router.py's triage-parsing layer, which already has
+# its own dedicated coverage above/elsewhere in this file).
+
+def test_schema_outcome_answers_with_the_cached_overview_prose_and_sets_invite_action(app_factory, monkeypatch):
+    env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+
+    import schema_cache
+    conn_str = env.translate_routes.resolve_conn_str(None, None)
+    schema_cache.set_overview(
+        env.translate_routes.get_conn_identifier(conn_str),
+        {"prose": "This datasource tracks e-commerce orders and customers.",
+         "questions": ["q1"], "generated_at": "2024-01-01T00:00:00+00:00"},
+    )
+
+    harness.queue_response(FakeGenaiResponse(json.dumps({"action": "schema"})))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'what is in this dataset?'})
+    assert resp.status_code == 200
+    retry_events, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    assert data['sql'] == "*** NO SQL *** This datasource tracks e-commerce orders and customers."
+    assert data['invite_action'] == 'schema'
+    # Call 2 never runs for this outcome - same "complete on its own"
+    # invariant as "general"/"help"/"failed".
+    assert len(harness.generate_calls) == 1
+
+
+def test_schema_outcome_falls_back_to_a_fixed_sentence_when_nothing_is_cached_yet(app_factory, monkeypatch):
+    env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+
+    harness.queue_response(FakeGenaiResponse(json.dumps({"action": "schema"})))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'what is in this dataset?'})
+    assert resp.status_code == 200
+    retry_events, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    assert data['sql'] == "*** NO SQL *** " + env.translate_routes._SCHEMA_FALLBACK_TEXT_SINGLE
+    assert data['invite_action'] == 'schema'
+
+
+def test_help_outcome_answers_with_the_fixed_app_description_and_sets_invite_action(app_factory, monkeypatch):
+    env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+
+    harness.queue_response(FakeGenaiResponse(json.dumps({"action": "help"})))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'how do I use this app?'})
+    assert resp.status_code == 200
+    retry_events, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    assert data['sql'] == "*** NO SQL *** " + env.translate_routes._HELP_SHORT_ANSWER
+    assert data['invite_action'] == 'help'
+
+
+def test_general_outcome_never_sets_invite_action(app_factory, monkeypatch):
+    # Regression guard: only "schema"/"help" ever set invite_action -
+    # a plain "general" answer (or a triage failure) must leave it absent/
+    # null so client.js never renders an invitation link for those.
+    env = app_factory(env={"GEMINI_PRESET_KEYS": "fake-key-1"})
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+
+    harness.queue_response(FakeGenaiResponse(
+        json.dumps({"action": "general", "answer": "You have 3 databases configured."})
+    ))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'how many databases do I have?'})
+    assert resp.status_code == 200
+    retry_events, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    assert not data.get('invite_action')
 
 
 def test_429_rotates_key_and_retries_immediately_with_no_delay(app_factory, monkeypatch):
@@ -3047,6 +3140,99 @@ def test_translate_request_body_model_override_still_wins_over_persisted_session
     assert harness.generate_calls[0]["model"] == "request-override-model"
 
 
+# --- Model selection locked to the fleet-wide default for a non-superuser ---
+#
+# Only a superuser (auth.py's is_superuser()) may actually pick a model -
+# everyone else is pinned to the app's one fleet-wide default
+# (_default_fleet_provider() + its own default_model), regardless of what a
+# request body or this session's own saved llm_provider/llm_model say. This
+# is a server-side security boundary, not just a client-side UI lock (see
+# client.js's IS_SUPERUSER/updateModelBadge()) - a request-body field is
+# trivially spoofable by anyone driving the API directly, and the session
+# field could predate this restriction (or predate this user losing
+# superuser status). Mirrors test_refresh_schema_authorization.py's own
+# Cloud Run + SUPERUSER_EMAILS pattern for the identical is_superuser() gate
+# on a totally different action.
+
+def _cloud_run_env(superuser_emails):
+    return {
+        "K_SERVICE": "ydyl-service",
+        "DB_CONFIG_ENCRYPTION_KEY": FAKE_DB_CONFIG_ENCRYPTION_KEY,
+        "SESSION_SIGNING_KEY": FAKE_SESSION_SIGNING_KEY,
+        "GOOGLE_CLIENT_ID": "fake.apps.googleusercontent.com",
+        "GCP_PROJECT_ID": "fake-project",
+        "SUPERUSER_EMAILS": superuser_emails,
+    }
+
+
+def test_translate_pins_a_non_superuser_to_the_fleet_wide_default_model(app_factory, monkeypatch):
+    env = app_factory(
+        env={**_cloud_run_env("alice@example.com"), "GEMINI_PRESET_KEYS": "fake-key-1",
+             "ANTHROPIC_API_KEY": "fake-key-1"},
+        mock_firestore=True,
+    )
+    login_as(env.client, "bob@example.com")
+    env.app_config.state_store.set_session(
+        "bob@example.com", llm_provider="anthropic", llm_model="claude-sonnet-5",
+    )
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(FakeGenaiResponse('{"action": "sql"}'))
+    harness.queue_response(FakeGenaiResponse('{"sql": "SELECT 1;"}'))
+
+    resp = env.client.post('/api/translate', json={
+        'prompt': 'hi', 'model': 'request-override-model', 'claude_model': 'also-ignored',
+    })
+    _, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    # Neither the request override, nor bob's own saved anthropic/claude-
+    # sonnet-5 choice - pinned to the app's one fleet-wide default
+    # (Google/gemini-3.6-flash, same hardcoded fallback-of-last-resort
+    # every other "nothing saved yet" test in this file asserts against).
+    assert harness.generate_calls[0]["model"] == "gemini-3.6-flash"
+
+
+def test_translate_still_honors_a_superusers_own_model_choice(app_factory, monkeypatch):
+    """Regression guard alongside the pin above: a superuser's own
+    persisted session choice must still work exactly as before - this
+    feature only restricts everyone ELSE."""
+    env = app_factory(
+        env={**_cloud_run_env("alice@example.com"), "ANTHROPIC_API_KEY": "fake-key-1"},
+        mock_firestore=True,
+    )
+    login_as(env.client, "alice@example.com")
+    env.app_config.state_store.set_session(
+        "alice@example.com", llm_provider="anthropic", llm_model="claude-sonnet-5",
+    )
+    harness = ClaudeHarness()
+    monkeypatch.setattr(env.translate_routes.anthropic, "Anthropic", harness.make_client_class())
+    harness.queue_response(FakeClaudeResponse('{"action": "sql"}'))
+    harness.queue_response(FakeClaudeResponse('{"sql": "SELECT 1;"}'))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'hi'})
+    parse_translate_stream(resp)
+    assert harness.create_calls[0]["model"] == "claude-sonnet-5"
+
+
+def test_translate_pins_an_anonymous_cloud_run_visitor_to_the_fleet_wide_default_model(app_factory, monkeypatch):
+    """An anonymous visitor (Cloud Run, no verified login at all) is just as
+    firmly not-a-superuser as a signed-in non-superuser - is_superuser()
+    short-circuits to False before SUPERUSER_EMAILS is even consulted (see
+    its own docstring)."""
+    env = app_factory(env={**_cloud_run_env("alice@example.com"), "GEMINI_PRESET_KEYS": "fake-key-1"},
+                       mock_firestore=True)
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(FakeGenaiResponse('{"action": "sql"}'))
+    harness.queue_response(FakeGenaiResponse('{"sql": "SELECT 1;"}'))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'hi', 'model': 'request-override-model'})
+    _, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    assert harness.generate_calls[0]["model"] == "gemini-3.6-flash"
+
+
 def test_translate_falls_back_to_provider_default_model_when_only_provider_persisted(app_factory, monkeypatch):
     # A session that saved a provider but somehow has no model saved (e.g.
     # an old/partial write) falls back to that provider's own default_model,
@@ -3871,6 +4057,31 @@ def test_summarize_result_endpoint_uses_byok_key_instead_of_env_configured_key(a
     assert resp.status_code == 200
     assert parse_translate_stream(resp)[1]['success'] is True
     assert harness.client_api_keys == ["alices-own-key"]
+
+
+def test_summarize_result_endpoint_pins_a_non_superuser_to_the_fleet_wide_default_model(app_factory, monkeypatch):
+    """Same is_superuser() gate and reasoning as /api/translate's own pin
+    above (see that section's module comment) - the request-body model
+    override AND this session's own saved model are both ignored for
+    anyone who isn't a superuser."""
+    env = app_factory(env={**_cloud_run_env("alice@example.com"), "GEMINI_PRESET_KEYS": "fake-key-1"},
+                       mock_firestore=True)
+    login_as(env.client, "bob@example.com")
+    env.app_config.state_store.set_session(
+        "bob@example.com", llm_provider="google", llm_model="bobs-saved-model",
+    )
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(FakeGenaiResponse(json.dumps({"summary": "All good here.", "visualizations": {}})))
+
+    resp = env.client.post('/api/summarize-result', json={
+        'prompt': 'q', 'sql': 'SELECT 1;', 'results': [{"columns": [], "rows": [], "rowCount": 0}],
+        'model': 'request-override-model',
+    })
+    assert resp.status_code == 200
+    assert parse_translate_stream(resp)[1]['success'] is True
+    assert harness.generate_calls[0]["model"] == "gemini-3.6-flash"
 
 
 def test_summarize_result_endpoint_requires_prompt_sql_and_results(app_env):

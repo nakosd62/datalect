@@ -371,7 +371,8 @@ def get_triage_schema_text(descriptor, user_identity, force_refresh=False):
 
 def generate_sql_for_connection(descriptor, prompt, history, provider, client, model,
                                  user_identity, force_schema_refresh=False,
-                                 api_key=None, tried_keys=None, using_byok=False):
+                                 api_key=None, tried_keys=None, using_byok=False,
+                                 filter_context=None):
     """Generates SQL for exactly ONE connection - behaviorally identical to
     what happens today when a user has that one connection selected and
     submits `prompt`: fetches its full (TTL-cached) schema via
@@ -441,6 +442,23 @@ def generate_sql_for_connection(descriptor, prompt, history, provider, client, m
     with no further changes. Never swallows anything; the caller decides
     how to handle it.
 
+    `filter_context` (new - see semi_join_routes.py and connection_router.
+    py's own "semi_join" triage field): an OPTIONAL, already-rendered block
+    of plain text, prepended ahead of "User Request" in this call's own
+    prompt content when given - real rows another connection's own query
+    already fetched this same turn, framed as a filter this connection's
+    own SQL should apply. This is deliberately just MORE PROMPT CONTENT,
+    not a new response shape or a second code path: it's the same move
+    _SQL_GENERATION_FORMAT_RULES already asks this call to make for a
+    general-knowledge filter value (see that prompt's own "knowledge_note"
+    paragraph - "the current US president," "the capital of France") -
+    resolve a concrete literal/filter value and bake it into the SQL -
+    just handed in as already-known real data instead of left for the
+    model to recall from training. None (the default, and the ordinary
+    case for every connection this isn't specifically being generated
+    for) leaves this call's prompt content byte-identical to before this
+    parameter existed.
+
     Also verifies the language of a "cannot_answer_reason" free-text reply
     (this connection couldn't confidently generate SQL, and said why)
     against `prompt`'s own detected language - see _no_sql_language_
@@ -463,6 +481,13 @@ def generate_sql_for_connection(descriptor, prompt, history, provider, client, m
     system_instruction = dialect_intro + _SQL_GENERATION_FORMAT_RULES
     schema_block = f"Database Schema:\n{schema}\n\n"
     new_prompt_content = f"User Request: {prompt}\n\nJSON response:"
+    if filter_context:
+        # Prepended ahead of "User Request", mirroring where schema_block
+        # itself sits relative to the new prompt turn (see
+        # provider.build_llm_input()'s own docstring on this ordering) -
+        # context the model needs before it reasons about the request
+        # itself, not folded into the request text.
+        new_prompt_content = f"{filter_context}\n\n{new_prompt_content}"
 
     if api_key is None:
         api_key = provider.pick_api_key()

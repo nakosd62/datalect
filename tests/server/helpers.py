@@ -66,6 +66,12 @@ _APP_MODULE_NAMES = [
     # cached copy from a previous test's env would otherwise silently leak
     # into this one.
     "combine_routes",
+    # Cross-dataset semi-join/filter pushdown's own module (server/
+    # semi_join_routes.py) - dropped here for the same reason combine_
+    # routes is just above: it reads SEMI_JOIN_MAX_FILTER_ROWS (via
+    # app_config) at import time, so a stale cached copy from a previous
+    # test's env would otherwise silently leak into this one.
+    "semi_join_routes",
     # Shared by translate_routes.py and connection_router.py (see its own
     # module docstring for why it's a separate module rather than living in
     # either one) - dropped here for the exact same reason translate_routes.py
@@ -190,7 +196,7 @@ _ENV_VARS_TO_CLEAR = [
     # here closes the actual symptom regardless of which module happens to
     # trigger the real load_dotenv() first.
     "EXECUTE_RESULTS_MAX_ROWS", "SUMMARY_RESULTS_MAX_ROWS", "DB_CONNECT_TIMEOUT_SECONDS",
-    "MAX_IN_SCOPE_CONNECTIONS", "DATABASE_DEFAULT", "ROUTER_MAX_TABLE_NAMES_PER_CONNECTION",
+    "MAX_IN_SCOPE_CONNECTIONS", "SEMI_JOIN_MAX_FILTER_ROWS", "DATABASE_DEFAULT", "ROUTER_MAX_TABLE_NAMES_PER_CONNECTION",
     "SCHEMA_FREQUENT_VALUES_LIMIT", "SCHEMA_FREQUENT_VALUE_MIN_FRACTION",
     "SHEETS_SERVICE_ACCOUNT_CREDENTIALS_FILE", "SHEETS_READ_TIMEOUT_SECONDS",
     "SHEETS_SCHEMA_SAMPLE_ROWS", "CLIENT_VERSION_CHECK_INTERVAL_MINUTES",
@@ -277,7 +283,7 @@ def fresh_import(monkeypatch, tmp_path, env=None, register_blueprints=True, mock
     Returns a SimpleNamespace with at least `.app_config`; when
     register_blueprints=True (the default) also `.auth`, `.config_routes`,
     `.execute_routes`, `.translate_routes`, `.summarize_routes`,
-    `.combine_routes`, `.report_routes`, `.share_routes`, `.cancel_registry`,
+    `.combine_routes`, `.semi_join_routes`, `.report_routes`, `.share_routes`, `.cancel_registry`,
     `.concurrency_guard`, `.rate_limiter`, and `.client` (a Flask test
     client with state_store.init() already called). share_routes.share_bp
     was missing from the blueprint-registration tuple below for a while
@@ -345,6 +351,7 @@ def fresh_import(monkeypatch, tmp_path, env=None, register_blueprints=True, mock
         import translate_routes
         import summarize_routes
         import combine_routes
+        import semi_join_routes
         import chat_history_routes
         import report_routes
         import share_routes
@@ -362,7 +369,7 @@ def fresh_import(monkeypatch, tmp_path, env=None, register_blueprints=True, mock
         for bp in (
             auth.auth_bp, config_routes.config_bp, execute_routes.execute_bp,
             translate_routes.translate_bp, summarize_routes.summarize_bp,
-            combine_routes.combine_bp,
+            combine_routes.combine_bp, semi_join_routes.semi_join_bp,
             chat_history_routes.chat_history_bp, report_routes.report_bp,
             share_routes.share_bp,
         ):
@@ -375,6 +382,7 @@ def fresh_import(monkeypatch, tmp_path, env=None, register_blueprints=True, mock
         ns.translate_routes = translate_routes
         ns.summarize_routes = summarize_routes
         ns.combine_routes = combine_routes
+        ns.semi_join_routes = semi_join_routes
         ns.report_routes = report_routes
         ns.share_routes = share_routes
         ns.cancel_registry = cancel_registry

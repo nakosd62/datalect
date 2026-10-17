@@ -187,17 +187,65 @@
         -->
         <div class="crbot-dataset-center">
           <span class="dataset-center-label">Datasource:</span>
-          <div id="configTriggerBadge" class="status-badge connected clickable-badge header-badge-prominent" title="Connection Info (Click to configure)" aria-haspopup="dialog" aria-expanded="false">
-            <span id="connDbDot" class="status-dot"></span>
-            <span id="connDbName" class="conn-badge-text"></span>
-            <!-- Chevron affordance, same glyph/rotate-on-open language as
-                 #modelTriggerBadge's own .model-badge-caret - marks this as
-                 a "click to choose" control rather than plain status text.
-                 client.js flips aria-expanded on open/close of #configModal
-                 the same way it already does for the model pick list. -->
-            <svg class="dataset-badge-caret" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <polyline points="6 9 12 15 18 9"></polyline>
-            </svg>
+          <!-- In-place pick list (see .dataset-pick-list in style.css and the
+               DATASET PICK LIST section in client.js), same pattern as
+               #modelPickerWrapper/#modelPickList below - replacing the old
+               #configModal popup dialog per explicit request: clicking the
+               badge drops a Public/Private-grouped list right below it;
+               clicking an option selects and saves immediately, no separate
+               Save step. Dataset groups ("Composite" datasources) are tucked
+               under their own "Composites" row inside the Public section,
+               which opens on hover alone (no click needed) as a real flyout
+               to the side - #datasetPickCompositeSubmenu below (see that
+               element's own comment) - rather than listing every group
+               inline, and closes again the moment the pointer moves onto a
+               different datasource. Per explicit request, those entries
+               also drop the "(Composite)" name suffix and on-hover tooltip
+               they used to need to stand out inline, since the flyout
+               itself is now what tells them apart from an ordinary
+               preset. -->
+          <div id="datasetPickerWrapper" class="dataset-picker-wrapper">
+            <div id="configTriggerBadge" class="status-badge connected clickable-badge header-badge-prominent" title="Datasource (Click to choose)" aria-haspopup="listbox" aria-expanded="false">
+              <span id="connDbDot" class="status-dot"></span>
+              <span id="connDbName" class="conn-badge-text"></span>
+              <!-- Chevron affordance, same glyph/rotate-on-open language as
+                   #modelTriggerBadge's own .model-badge-caret - marks this as
+                   a "click to choose" control rather than plain status text.
+                   client.js flips aria-expanded on open/close of
+                   #datasetPickList the same way it already does for the
+                   model pick list. -->
+              <svg class="dataset-badge-caret" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <polyline points="6 9 12 15 18 9"></polyline>
+              </svg>
+            </div>
+            <div id="datasetPickList" class="dataset-pick-list hidden" role="listbox" aria-label="Datasource">
+              <div id="datasetPickOptions"></div>
+              <div id="datasetPickError" class="model-pick-error"></div>
+            </div>
+            <!-- The "Composites" row's own flyout, opening to the side of
+                 #datasetPickList rather than inline under it - a SIBLING of
+                 #datasetPickList (not nested inside it) on purpose, since
+                 #datasetPickList's own overflow-y: auto would otherwise clip
+                 a panel that opens out past its right (or, on a narrow
+                 viewport, left) edge. Opens on hover (client.js's
+                 openDatasetPickCompositeSubmenu(), fired on the toggle row's
+                 own mouseenter) and closes again on a short delay after the
+                 pointer leaves both it and this flyout, or immediately if
+                 the pointer lands on a different datasource instead - see
+                 scheduleCloseDatasetPickCompositeSubmenu()/the delegated
+                 mouseover listener on #datasetPickList, both in client.js.
+                 top/left are set inline on every open, measured from the
+                 "Composites" toggle row's own on-screen position (which
+                 moves depending on how many presets scroll above it, and
+                 flips to the left side instead when there isn't room on the
+                 right) rather than a fixed CSS offset the way
+                 #datasetPickList's own position can be. Only populated/shown
+                 at all when at least one
+                 CONFIGURED_DB_GROUPS entry exists - see
+                 renderDatasetPickList(). -->
+            <div id="datasetPickCompositeSubmenu" class="dataset-pick-submenu hidden" role="listbox" aria-label="Composite datasources">
+              <div id="datasetPickCompositeOptions"></div>
+            </div>
           </div>
           <!--
             Opens the Schema Viewer for whichever connection is CURRENTLY
@@ -216,7 +264,9 @@
             against, and opened it on top of the config dialog besides. A
             single button tied to "whatever is active right now" can't have
             either problem: there is no other connection it could mean, and
-            it's not launched from inside another modal. The glyph itself
+            it's not launched from inside another modal (the datasource
+            picker itself isn't one any more either - see
+            #datasetPickerWrapper above). The glyph itself
             is Feather's "info" icon (a circle, a vertical stroke, a dot
             above it - reading as a lowercase "i") rather than "help-circle"
             (a circle with a curved "?" stroke) - "?" reads as "get help/
@@ -748,29 +798,6 @@
     </div>
   </div>
 
-  <div id="configModal" class="modal-overlay hidden">
-    <div class="modal-card">
-      <div class="modal-header">
-        <h2 class="modal-title"></h2>
-        <button id="modalCloseBtn" class="modal-close-btn" type="button">&times;</button>
-      </div>
-      <form id="configForm" class="modal-body" onsubmit="event.preventDefault();">
-        <div class="modal-scroll-content">
-          <div class="config-section">
-            <span class="config-label">Select or create a Datasource</span>
-            <div class="radio-group" id="modalDbRadioGroup"></div>
-          </div>
-        </div>
-        <div class="modal-footer-fixed">
-          <div id="configSaveError" class="config-error-message" style="display: none; color: var(--danger); font-size: 0.85rem;"></div>
-          <div class="modal-actions" style="display: flex; gap: 0.5rem; justify-content: flex-end; align-items: center;">
-            <button type="button" id="configSaveBtn" class="btn btn-primary">Save Changes</button>
-          </div>
-        </div>
-      </form>
-    </div>
-  </div>
-
   <div id="preferencesModal" class="modal-overlay hidden">
     <div class="modal-card" style="max-width: 540px;">
       <div class="modal-header">
@@ -811,6 +838,11 @@
             <span class="checkbox-label">Show SQL</span>
           </label>
           <p id="showSqlLockedNote" class="text-muted hidden" style="font-size: 0.78rem; margin: 0;">SQL must stay visible while automatic execution is off.</p>
+        </div>
+        <div class="config-section">
+          <span class="config-label">Bring Your Own Data</span>
+          <p class="text-muted" style="font-size: 0.8rem; margin: 0;">Create your own private datasource by specifying database connection details. See the <a href="#" id="byodHelpLink">Help</a> page for details.</p>
+          <div id="customDbsContainer" class="custom-dbs-list"></div>
         </div>
         <div class="config-section">
           <span class="config-label">Bring Your Own Key</span>

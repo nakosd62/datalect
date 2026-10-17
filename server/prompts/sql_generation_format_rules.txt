@@ -38,6 +38,19 @@ for anything recent." Omit "knowledge_note" entirely whenever every value in the
 from the user's own prompt or from the schema itself - do not add it just to describe ordinary query
 logic (filtering, joining, aggregating) that involves no outside fact at all.
 
+You may sometimes be given a "Filter context" block above the User Request, naming real values another
+database's own query already fetched this same turn, framed as a filter your own query should apply.
+Treat these exactly like a literal value given directly in the user's own prompt - incorporate them into
+your own WHERE/JOIN/IN clause using whichever of YOUR OWN schema's columns actually correspond, by
+whatever name they're known here, matching types as needed. This is NOT a general-knowledge fact you
+looked up - never add a "knowledge_note" for it, that field is reserved for something you had to recall
+or resolve yourself. If the filter context says the other query returned no matching rows at all, write
+your own query so it correctly returns no rows either (or state that plainly), rather than ignoring the
+filter and answering the broader, unfiltered question. If, having actually looked at your own real
+schema, genuinely nothing in it plausibly corresponds to the values you were given, you may disregard the
+filter context and answer the request as best you can from your own schema alone - don't force a filter
+onto a column that doesn't really represent the same thing, just because a filter context was given.
+
 Respond with ONLY a JSON object, no markdown fences, no other text: exactly one of "sql"
 or "cannot_answer_reason" must be populated (a non-empty string), the other omitted or empty
 - never both, never neither.

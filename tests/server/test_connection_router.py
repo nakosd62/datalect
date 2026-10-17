@@ -29,6 +29,7 @@ import types as pytypes
 from helpers import (
     login_as, normalize_prompt_whitespace, parse_translate_stream, parse_translate_stream_events,
     set_llm_byok_key, write_database_presets_file,
+    FAKE_DB_CONFIG_ENCRYPTION_KEY, FAKE_SESSION_SIGNING_KEY,
 )
 
 
@@ -238,7 +239,7 @@ def test_parse_triage_response_downgrades_a_message_of_just_a_label_line_to_none
     )
     assert parsed == {
         "outcome": "sql", "indices": [0], "message": None, "database_prompts": {},
-        "needs_combination": False,
+        "needs_combination": False, "semi_join": None,
     }
 
 
@@ -395,6 +396,136 @@ def test_clean_database_prompts_returns_empty_dict_for_non_dict_input():
     assert _clean_database_prompts(["not", "a", "dict"], [0, 1]) == {}
     assert _clean_database_prompts(None, [0, 1]) == {}
     assert _clean_database_prompts("also not a dict", [0, 1]) == {}
+
+
+# --- cross-dataset semi-join / filter pushdown's "semi_join" field - direct unit tests ---
+
+
+def test_clean_semi_join_accepts_a_well_formed_object():
+    from connection_router import _clean_semi_join
+
+    assert _clean_semi_join(
+        {"driving_index": 0, "dependent_index": 1, "filter_description": "the hosting country and year"},
+        [0, 1],
+    ) == {"driving_index": 0, "dependent_index": 1, "filter_description": "the hosting country and year"}
+
+
+def test_clean_semi_join_returns_none_for_non_dict_input():
+    from connection_router import _clean_semi_join
+
+    assert _clean_semi_join(["not", "a", "dict"], [0, 1]) is None
+    assert _clean_semi_join(None, [0, 1]) is None
+    assert _clean_semi_join("also not a dict", [0, 1]) is None
+
+
+def test_clean_semi_join_rejects_an_index_outside_the_picked_connections():
+    from connection_router import _clean_semi_join
+
+    # Only indices the SAME response's own "indices" already picked count -
+    # a semi_join pointing at a connection that wasn't even selected this
+    # turn is meaningless (and untrusted model output besides).
+    assert _clean_semi_join(
+        {"driving_index": 0, "dependent_index": 2, "filter_description": "x"}, [0, 1],
+    ) is None
+    assert _clean_semi_join(
+        {"driving_index": 2, "dependent_index": 1, "filter_description": "x"}, [0, 1],
+    ) is None
+
+
+def test_clean_semi_join_rejects_driving_and_dependent_being_the_same_index():
+    from connection_router import _clean_semi_join
+
+    assert _clean_semi_join(
+        {"driving_index": 1, "dependent_index": 1, "filter_description": "x"}, [0, 1],
+    ) is None
+
+
+def test_clean_semi_join_rejects_a_missing_or_empty_filter_description():
+    from connection_router import _clean_semi_join
+
+    assert _clean_semi_join({"driving_index": 0, "dependent_index": 1}, [0, 1]) is None
+    assert _clean_semi_join(
+        {"driving_index": 0, "dependent_index": 1, "filter_description": "   "}, [0, 1],
+    ) is None
+    assert _clean_semi_join(
+        {"driving_index": 0, "dependent_index": 1, "filter_description": 123}, [0, 1],
+    ) is None
+
+
+def test_clean_semi_join_rejects_non_coercible_indices():
+    from connection_router import _clean_semi_join
+
+    assert _clean_semi_join(
+        {"driving_index": "not a number", "dependent_index": 1, "filter_description": "x"}, [0, 1],
+    ) is None
+    assert _clean_semi_join(
+        {"driving_index": 0, "dependent_index": None, "filter_description": "x"}, [0, 1],
+    ) is None
+
+
+def test_parse_triage_response_carries_a_well_formed_semi_join():
+    from connection_router import _parse_multi_candidate_triage_response
+
+    parsed = _parse_multi_candidate_triage_response(
+        json.dumps({
+            "action": "sql", "indices": [0, 1], "message": "Triage\n\nChecking both.",
+            "semi_join": {
+                "driving_index": 0, "dependent_index": 1,
+                "filter_description": "the hosting country and year",
+            },
+        }),
+        num_candidates=2, max_connections=20,
+    )
+    assert parsed["semi_join"] == {
+        "driving_index": 0, "dependent_index": 1,
+        "filter_description": "the hosting country and year",
+    }
+
+
+def test_parse_triage_response_drops_a_malformed_semi_join_without_failing_the_whole_attempt():
+    from connection_router import _parse_multi_candidate_triage_response
+
+    # Same lenient posture as a malformed database_prompts entry - one
+    # optional field's own validation failure never discards an otherwise-
+    # good routing decision (indices/message/database_prompts still come
+    # through fine).
+    parsed = _parse_multi_candidate_triage_response(
+        json.dumps({
+            "action": "sql", "indices": [0, 1], "message": "Triage\n\nChecking both.",
+            "semi_join": {"driving_index": 0, "dependent_index": 0, "filter_description": "x"},
+        }),
+        num_candidates=2, max_connections=20,
+    )
+    assert parsed is not None
+    assert parsed["semi_join"] is None
+    assert parsed["indices"] == [0, 1]
+
+
+def test_parse_triage_response_omits_semi_join_entirely_for_a_single_connection_pick():
+    from connection_router import _parse_multi_candidate_triage_response
+
+    # Nothing to relate a single picked connection to - semi_join is always
+    # None when only one connection was picked, regardless of what the
+    # model put in the "semi_join" field (there's no valid index pair it
+    # COULD have meant with only one entry in "indices").
+    parsed = _parse_multi_candidate_triage_response(
+        json.dumps({
+            "action": "sql", "indices": [0], "message": "Triage\n\nChecking one.",
+            "semi_join": {"driving_index": 0, "dependent_index": 0, "filter_description": "x"},
+        }),
+        num_candidates=2, max_connections=20,
+    )
+    assert parsed["semi_join"] is None
+
+
+def test_parse_triage_response_defaults_semi_join_to_none_when_absent():
+    from connection_router import _parse_multi_candidate_triage_response
+
+    parsed = _parse_multi_candidate_triage_response(
+        json.dumps({"action": "sql", "indices": [0, 1], "message": "Triage\n\nChecking both."}),
+        num_candidates=2, max_connections=20,
+    )
+    assert parsed["semi_join"] is None
 
 
 # --- triage_all_mode_question's language verification - direct unit tests -
@@ -886,6 +1017,82 @@ def test_group_mode_answer_outcome_returns_no_sql_text_and_never_calls_phase_b(a
     assert 'database_notes' not in data
     assert 'generation_failures' not in data
     assert 'sql_blocks' not in data
+    # Only "schema"/"help" ever set invite_action - a plain "general"
+    # answer must not.
+    assert 'invite_action' not in data
+
+
+def test_group_mode_schema_outcome_answers_with_the_cached_group_overview_and_sets_invite_action(
+    app_factory, tmp_path, monkeypatch,
+):
+    """Mirrors test_translate_routes.py's single-connection equivalent -
+    this outcome used to pop the group's own Schema Viewer open
+    immediately and unannounced (the old '*** NO SQL *** OPEN SCHEMA
+    VIEWER ***' marker); it now answers directly with the group's own
+    already-generated overview prose (get_cached_group_overview()) and
+    sets invite_action so client.js can offer a clickable invitation to
+    open the fuller dialog instead."""
+    env = _two_preset_env(app_factory, tmp_path)
+    login_as(env.client, "alice@example.com")
+    _set_group_mode(env.client)
+
+    import schema_cache
+    schema_cache.set_overview(
+        "group::grp-ab",
+        {"prose": "This group blends Sales and Marketing Postgres data.",
+         "questions": ["q1"], "generated_at": "2024-01-01T00:00:00+00:00"},
+    )
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(_gemini_ok('{"action": "schema"}'))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'what can I ask about these databases?'})
+    _, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    assert len(harness.generate_calls) == 1  # triage only - Phase B never runs
+    assert data['sql'] == '*** NO SQL *** This group blends Sales and Marketing Postgres data.'
+    assert data['invite_action'] == 'schema'
+
+
+def test_group_mode_schema_outcome_falls_back_to_a_fixed_sentence_when_nothing_is_cached_yet(
+    app_factory, tmp_path, monkeypatch,
+):
+    env = _two_preset_env(app_factory, tmp_path)
+    login_as(env.client, "alice@example.com")
+    _set_group_mode(env.client)
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(_gemini_ok('{"action": "schema"}'))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'what can I ask about these databases?'})
+    _, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    assert data['sql'] == "*** NO SQL *** " + env.translate_routes._SCHEMA_FALLBACK_TEXT_GROUP
+    assert data['invite_action'] == 'schema'
+
+
+def test_group_mode_help_outcome_answers_with_the_fixed_app_description_and_sets_invite_action(
+    app_factory, tmp_path, monkeypatch,
+):
+    # "help" is mode-agnostic (same fixed sentence single-connection mode
+    # uses - see translate_routes.py's _HELP_SHORT_ANSWER) - this is the
+    # group-mode side of the single-connection coverage in
+    # test_translate_routes.py.
+    env = _two_preset_env(app_factory, tmp_path)
+    login_as(env.client, "alice@example.com")
+    _set_group_mode(env.client)
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(_gemini_ok('{"action": "help"}'))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'how do I use this app?'})
+    _, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    assert data['sql'] == "*** NO SQL *** " + env.translate_routes._HELP_SHORT_ANSWER
+    assert data['invite_action'] == 'help'
 
 
 def test_group_mode_triage_call_receives_conversation_history_so_a_followup_can_resolve_which_database(app_factory, tmp_path, monkeypatch):
@@ -1114,9 +1321,9 @@ def test_group_mode_route_outcome_runs_phase_b_in_parallel_for_both_selected_con
     # routes.py).
     assert data['connection_selection'] == [
         {"kind": "preset", "id": "pg-a", "name": "Sales Postgres", "type": "postgres",
-         "prompt": "how is everything performing across the board"},
+         "prompt": "how is everything performing across the board", "pending_semi_join": False},
         {"kind": "preset", "id": "pg-b", "name": "Marketing Postgres", "type": "postgres",
-         "prompt": "how is everything performing across the board"},
+         "prompt": "how is everything performing across the board", "pending_semi_join": False},
     ]
     assert data['database_notes'] == []
     assert data['generation_failures'] == []
@@ -1133,6 +1340,87 @@ def test_group_mode_route_outcome_runs_phase_b_in_parallel_for_both_selected_con
         {"kind": "preset", "id": "pg-b", "name": "Marketing Postgres",
          "sql": "-- database: preset:pg-b (Marketing Postgres)\nSELECT * FROM campaigns;"},
     ]
+
+
+def test_group_mode_route_outcome_excludes_the_dependent_connection_from_phase_b_when_semi_join_is_set(
+    app_factory, tmp_path, monkeypatch,
+):
+    """Cross-dataset semi-join / filter pushdown's own orchestration
+    wiring (translate_routes.py's router_only_group_mode "sql" branch):
+    when triage's response carries "semi_join", the DEPENDENT connection
+    (pg-b/Marketing here) must NOT get a Phase B call this round at all -
+    its own SQL can only be generated later, via /api/generate-semi-join-sql,
+    once the driving connection's (pg-a/Sales) real execute result is in
+    hand (see semi_join_routes.py's own module docstring). Proven here the
+    same robust way the "parallel for both" test just above proves its own
+    opposite case: by NOT registering a marker response for "campaigns" at
+    all - if Phase B tried to call pg-b anyway, GenaiHarness would raise
+    "no queued response and no marker matched" and this test would fail
+    with that error, not a silent false pass."""
+    env = _two_preset_env(app_factory, tmp_path)
+    login_as(env.client, "alice@example.com")
+    _set_group_mode(env.client)
+
+    import db as db_module
+    monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
+        "postgresql://u:p@host-a:5432/a": "Table: olympics\nhost_country TEXT\nyear INTEGER\n",
+        "postgresql://u:p@host-b:5432/b": "Table: gdp\ncountry TEXT\nyear INTEGER\nvalue NUMERIC\n",
+    }))
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(_gemini_ok(json.dumps({
+        "action": "sql", "indices": [0, 1], "message": "Checking Sales Postgres and Marketing Postgres.",
+        "semi_join": {
+            "driving_index": 0, "dependent_index": 1,
+            "filter_description": "the hosting country and year",
+        },
+    })))
+    # Only the driving connection (pg-a/olympics) gets a Phase B call this
+    # round - deliberately NO marker registered for "gdp"/"campaigns"-style
+    # dependent-side text, so a stray call to pg-b fails loudly instead of
+    # silently returning a plausible-looking response.
+    harness.register_marker("olympics", _gemini_ok('{"sql": "SELECT host_country, year FROM olympics;"}'))
+
+    resp = env.client.post('/api/translate', json={'prompt': 'GDP of each Olympic host, by year'})
+    _, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    assert len(harness.generate_calls) == 2  # triage + exactly ONE Phase B call (pg-a only)
+
+    assert data['router_route'] is True
+    assert "-- database: preset:pg-a (Sales Postgres)\nSELECT host_country, year FROM olympics;" in data['sql']
+    # pg-b never got a Phase B call, so it has no sql_block/note/failure
+    # entry at all this round - not an empty-string SQL, not a note, just
+    # absent, same as any connection Phase B was never asked about.
+    assert data['sql_blocks'] == [
+        {"kind": "preset", "id": "pg-a", "name": "Sales Postgres",
+         "sql": "-- database: preset:pg-a (Sales Postgres)\nSELECT host_country, year FROM olympics;"},
+    ]
+    assert data['database_notes'] == []
+    assert data['generation_failures'] == []
+
+    # Both connections still get a placeholder tab (connection_selection
+    # covers the WHOLE triage pick, not just what Phase B actually ran this
+    # round) - pg-b is flagged pending_semi_join so the client knows to
+    # render a placeholder instead of waiting on a Phase B result that was
+    # never requested, and not to submit it to /api/execute until
+    # /api/generate-semi-join-sql has supplied its SQL.
+    assert data['connection_selection'] == [
+        {"kind": "preset", "id": "pg-a", "name": "Sales Postgres", "type": "postgres",
+         "prompt": "GDP of each Olympic host, by year", "pending_semi_join": False},
+        {"kind": "preset", "id": "pg-b", "name": "Marketing Postgres", "type": "postgres",
+         "prompt": "GDP of each Olympic host, by year", "pending_semi_join": True},
+    ]
+    assert data['semi_join_pending'] == {
+        "driving": {"kind": "preset", "id": "pg-a", "name": "Sales Postgres"},
+        "dependent": {
+            "kind": "preset", "id": "pg-b", "name": "Marketing Postgres",
+            "prompt": "GDP of each Olympic host, by year",
+        },
+        "filter_description": "the hosting country and year",
+        "max_filter_rows": env.app_config.SEMI_JOIN_MAX_FILTER_ROWS,
+    }
+    assert data['needs_combination'] is False
 
 
 def test_group_mode_route_outcome_falls_back_to_a_triage_labeled_message_when_the_model_omits_one(
@@ -1406,9 +1694,9 @@ def test_group_mode_route_outcome_streams_phase_a_route_then_phase_b_connection_
     # response either, so both fall back to the original question.
     assert route_event['connection_selection'] == [
         {"kind": "preset", "id": "pg-a", "name": "Sales Postgres", "type": "postgres",
-         "prompt": "first database question, plus something else"},
+         "prompt": "first database question, plus something else", "pending_semi_join": False},
         {"kind": "preset", "id": "pg-b", "name": "Marketing Postgres", "type": "postgres",
-         "prompt": "first database question, plus something else"},
+         "prompt": "first database question, plus something else", "pending_semi_join": False},
     ]
 
     connection_done_events = [e for e in events if e['status'] == 'phase_b_connection_done']
@@ -1968,7 +2256,7 @@ def test_group_mode_with_only_one_configured_connection_still_runs_triage_and_ca
     assert "-- database: preset:pg-a (Sales Postgres)\nSELECT * FROM deals;" in data['sql']
     assert data['connection_selection'] == [
         {"kind": "preset", "id": "pg-a", "name": "Sales Postgres", "type": "postgres",
-         "prompt": "how many deals do we have"},
+         "prompt": "how many deals do we have", "pending_semi_join": False},
     ]
 
 
@@ -2080,7 +2368,7 @@ def test_group_mode_never_includes_a_newly_saved_custom_connection(app_factory, 
     # never the custom connection Alice just saved.
     assert data3['connection_selection'] == [
         {"kind": "preset", "id": "pg-a", "name": "Sales Postgres", "type": "postgres",
-         "prompt": "sales figures please"},
+         "prompt": "sales figures please", "pending_semi_join": False},
     ]
 
     triage_call = harness.generate_calls[0]
@@ -2129,7 +2417,7 @@ def test_group_mode_excludes_a_configured_preset_not_listed_in_the_groups_datase
     # because this group's own dataset_list never named it.
     assert data['connection_selection'] == [
         {"kind": "preset", "id": "pg-a", "name": "Sales Postgres", "type": "postgres",
-         "prompt": "sales figures please"},
+         "prompt": "sales figures please", "pending_semi_join": False},
     ]
 
     triage_call = harness.generate_calls[0]
@@ -3359,6 +3647,60 @@ def test_summarize_results_endpoint_returns_no_sql_prefixed_summary_and_is_never
     call_text = harness.generate_calls[0]["contents"][0].parts[0].text
     assert "Table: deals" in call_text
     assert "SELECT * FROM deals;" in call_text
+
+
+def test_summarize_results_endpoint_pins_a_non_superuser_to_the_fleet_wide_default_model(
+    app_factory, tmp_path, monkeypatch,
+):
+    """Same is_superuser() gate as /api/translate and /api/summarize-result
+    (see test_translate_routes.py's own section on this) - Phase C's
+    all-databases summarization call site needed the identical fix, since
+    it resolves its own provider/model from this exact request body +
+    session pattern independently of the other three call sites."""
+    presets_path = write_database_presets_file(tmp_path, [
+        {"id": "pg-a", "name": "Sales Postgres", "type": "postgres", "url": "postgresql://u:p@host-a:5432/a"},
+        {"id": "pg-b", "name": "Marketing Postgres", "type": "postgres", "url": "postgresql://u:p@host-b:5432/b"},
+    ])
+    env = app_factory(env={
+        "DATABASE_PRESETS_FILE": presets_path, "GEMINI_PRESET_KEYS": "fake-key-1",
+        "K_SERVICE": "ydyl-service",
+        "DB_CONFIG_ENCRYPTION_KEY": FAKE_DB_CONFIG_ENCRYPTION_KEY,
+        "SESSION_SIGNING_KEY": FAKE_SESSION_SIGNING_KEY,
+        "GOOGLE_CLIENT_ID": "fake.apps.googleusercontent.com",
+        "GCP_PROJECT_ID": "fake-project",
+        "SUPERUSER_EMAILS": "alice@example.com",
+    }, mock_firestore=True)
+    login_as(env.client, "bob@example.com")
+    env.app_config.state_store.set_session(
+        "bob@example.com", llm_provider="google", llm_model="bobs-saved-model",
+    )
+
+    import db as db_module
+    monkeypatch.setattr(db_module, "_fetch_database_schema", _schema_fetch_by_url({
+        "postgresql://u:p@host-a:5432/a": "Table: deals\nid INTEGER\n",
+        "postgresql://u:p@host-b:5432/b": "Table: campaigns\nid INTEGER\n",
+    }))
+
+    harness = GenaiHarness()
+    monkeypatch.setattr(env.translate_routes.genai, "Client", harness.make_client_class())
+    harness.queue_response(_gemini_ok(_summary_json(
+        {0: "Sales revenue is $500.", 1: "Marketing had nothing relevant."},
+    )))
+
+    resp = env.client.post('/api/summarize-results', json={
+        'prompt': 'how is everything performing across the board',
+        'model': 'request-override-model',
+        'database_results': [
+            {"kind": "preset", "id": "pg-a", "name": "Sales Postgres",
+             "sql": "SELECT * FROM deals;",
+             "columns": ["total"], "rows": [{"total": 500}], "rowCount": 1},
+            {"kind": "preset", "id": "pg-b", "name": "Marketing Postgres", "note": "Nothing relevant."},
+        ],
+    })
+    assert resp.status_code == 200
+    _retry_events, data = parse_translate_stream(resp)
+    assert data['success'] is True
+    assert harness.generate_calls[0]["model"] == "gemini-3.6-flash"
 
 
 def test_summarize_results_endpoint_always_uses_tables_only_schema(

@@ -732,10 +732,9 @@ test.describe('analytics: connection/model/nav', () => {
     await gotoApp(page);
 
     await page.locator('#configTriggerBadge').click();
-    await expect(page.locator('#configModal')).not.toHaveClass(/hidden/);
-    await page.locator('#modalDbRadioGroup input[name="db_connection_option"][value^="preset:"]').first().check();
-    await page.locator('#configSaveBtn').click();
-    await expect(page.locator('#configModal')).toHaveClass(/hidden/);
+    await expect(page.locator('#datasetPickList')).not.toHaveClass(/hidden/);
+    await page.locator('#datasetPickOptions .dataset-pick-option[data-value^="preset:"]').first().click();
+    await expect(page.locator('#datasetPickList')).toHaveClass(/hidden/);
 
     const events = await trackedEvents(page, 'database_selected');
     expect(events.length).toBe(1);

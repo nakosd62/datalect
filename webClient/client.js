@@ -5,7 +5,7 @@
 //   2. DOM element references + small modal wiring (login-required, help)
 //   3. Speech recognition (mic button)
 //   4. Shared UI helpers (button state, SQL formatting/display, DB status)
-//   5. Backend config sync + database connection config modal
+//   5. Backend config sync + database connection picker dropdown
 //   6. Help button onboarding (auto-open once, pulsing ring)
 //   7. History modal: tabs, stats charts, load/purge
 //   8. Results rendering helpers
@@ -551,8 +551,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   // URL can collide with a preset's (same postgresql://... string) - in that
   // case matching by URL alone can't tell "the preset" from "my custom
   // connection that happens to point at the same database" apart. See its
-  // use in renderDbRadioButtons()/renderCustomDbRows() (which radio actually
-  // ends up checked) and updateConnectionDetails() (which name the badge
+  // use in renderDatasetPickList()/renderCustomDbRows() (which option actually
+  // ends up selected) and updateConnectionDetails() (which name the badge
   // shows). Always trust the freshest /api/config response's
   // active_is_custom over recomputing this from URLs.
   let ACTIVE_IS_CUSTOM = false;
@@ -581,13 +581,13 @@ document.addEventListener('DOMContentLoaded', async () => {
   // connection string - see the redacted configured_databases below) and
   // survives the admin reordering/adding/removing presets between
   // deployments - so both anonymous and signed-in users now match presets
-  // by this one field uniformly (see renderDbRadioButtons()). null when the
+  // by this one field uniformly (see renderDatasetPickList()). null when the
   // active connection isn't a preset at all (a custom connection instead).
   let ACTIVE_PRESET_ID = null;
   // Each entry is {"id", "name", "type", "dialect_name"} - "type" is the
   // raw dialect key (e.g. "postgres"), "dialect_name" is config_routes.py's
   // own display-only addition (e.g. "PostgreSQL") that
-  // renderDbRadioButtons() shows in parentheses next to the preset's name.
+  // renderDatasetPickList() shows in parentheses next to the preset's name.
   // Never a secret either way - only ever id/name/type/dialect_name, never
   // a preset's real connection string (see config_routes.py's
   // _redact_preset_for_client()).
@@ -609,9 +609,9 @@ document.addEventListener('DOMContentLoaded', async () => {
   // module docstring): the set of connections the user has marked "in
   // scope". Populated straight from /api/config's in_scope_preset_ids/
   // in_scope_custom_connection_keys (see fetchBackendConfig()). The
-  // connection picker is a single-select radio group again (see
-  // renderDbRadioButtons()) - EITHER one specific connection OR one of the
-  // "DATASET GROUPS" options, and which one is checked is decided by
+  // connection picker is a single-select dropdown again (see
+  // renderDatasetPickList()) - EITHER one specific connection OR one of the
+  // "DATASET GROUPS" options, and which one is selected is decided by
   // IN_SCOPE_MODE/IN_SCOPE_GROUP_ID (below), not by how many entries these
   // two arrays happen to sum to - see isGroupModeSelected(). A single
   // in-scope connection behaves exactly as before any of this
@@ -672,6 +672,20 @@ document.addEventListener('DOMContentLoaded', async () => {
   let LLM_PROVIDERS = [];
   let ACTIVE_LLM_PROVIDER = "";
   let ACTIVE_LLM_MODEL = "";
+  // Whether THIS user may pick a model at all (see auth.py's is_superuser()
+  // and config_routes.py's GET /api/config 'is_superuser' field) - anyone
+  // else is locked to the app's one fleet-wide default and the picker is
+  // shown but non-interactive (see updateModelBadge()/the modelTriggerBadge
+  // and moreMenuModelBtn click listeners below). Starts true (matches local-
+  // deployment's own default, where is_superuser() is unconditionally true)
+  // so there's no flash of a locked-looking badge before the first
+  // /api/config response actually resolves this; a non-superuser's own
+  // first fetch corrects it immediately after. This is a UX nicety only,
+  // same as the server's own 'is_superuser' field - every route that
+  // actually resolves a model for a real LLM call re-checks is_superuser()
+  // itself server-side regardless of what this flag (or anything else the
+  // client sends) says.
+  let IS_SUPERUSER = true;
   // "Bring Your Own Key" (Preferences dialog's third section) - the GET
   // response's 'llm_byok_key_set' verbatim: {google: bool, anthropic: bool,
   // openai: bool}, reporting whether THIS user has a saved key for each
@@ -770,8 +784,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   // nothing is gated behind sign-in anymore. This flag still matters for
   // the UI, though: an anonymous visitor's admin-configured presets are
   // never sent their real connection strings/credentials (unlike their own
-  // custom connections), so the config modal never shows a preset's URL to
-  // them - see renderDbRadioButtons(), which now matches presets by id
+  // custom connections), so the datasource picker never shows a preset's
+  // URL to them - see renderDatasetPickList(), which now matches presets by id
   // (ACTIVE_PRESET_ID) for anonymous and signed-in users alike.
   let isAnonymousUser = false;
 
@@ -1156,16 +1170,15 @@ document.addEventListener('DOMContentLoaded', async () => {
   //    wiring for the help button lives further down, in section 6)
   // ===========================================================================
 
-  // Every modal (#configModal, #helpModal, #historyModal, #confirmModal,
-  // #loginRequiredModal) shares the exact same .modal-overlay z-index (see
-  // style.css) - fine when only one is ever open at a time, but two CAN
-  // legitimately be open together now (e.g. the "See Help & Documentation"
-  // link inside the DB connection dialog opens #helpModal without closing
-  // #configModal first). With z-index tied, stacking falls back to DOM
-  // order, which has nothing to do with which modal the user actually
-  // opened most recently - #configModal happens to sit later in
-  // index.html than #helpModal, so it always won and visually buried Help
-  // behind it. bringModalToFront() fixes that generally, for any modal
+  // Every modal (#preferencesModal, #helpModal, #historyModal,
+  // #confirmModal, #loginRequiredModal) shares the exact same
+  // .modal-overlay z-index (see style.css) - fine when only one is ever
+  // open at a time, but two CAN legitimately be open together now (e.g.
+  // the "Bring Your Own Data" section's own Help link inside
+  // #preferencesModal opens #helpModal without closing #preferencesModal
+  // first - see #byodHelpLink). With z-index tied, stacking falls back to
+  // DOM order, which has nothing to do with which modal the user actually
+  // opened most recently. bringModalToFront() fixes that generally, for any modal
   // opened on top of any other: each call hands out a fresh, strictly
   // increasing inline z-index, so whichever modal was shown/clicked-into
   // last is always the one on top - call it right alongside every
@@ -1271,12 +1284,16 @@ document.addEventListener('DOMContentLoaded', async () => {
   // in lockstep.
   const reportSqlGoodBtn = document.getElementById('reportSqlGoodBtn');
 
-  // DOM Elements - Config Modal & Connection Status
-  const configModal = document.getElementById('configModal');
+  // DOM Elements - Dataset Pick List & Connection Status (an in-place
+  // dropdown, not a modal - see the DATASET PICK LIST section below for
+  // renderDatasetPickList()/selectDataset()/closeDatasetPickList() -
+  // mirroring #modelPickerWrapper/#modelPickList's own pattern just below).
+  const datasetPickerWrapper = document.getElementById('datasetPickerWrapper');
   const configTriggerBadge = document.getElementById('configTriggerBadge');
-  const modalCloseBtn = document.getElementById('modalCloseBtn');
-  const configForm = document.getElementById('configForm');
-  const configSaveBtn = document.getElementById('configSaveBtn');
+  const datasetPickList = document.getElementById('datasetPickList');
+  // The "Composite" row's own flyout - a sibling of datasetPickList above,
+  // not a child of it (see its own comment in index.html).
+  const datasetPickCompositeSubmenu = document.getElementById('datasetPickCompositeSubmenu');
   const connDbName = document.getElementById('connDbName');
   const connDbDot = document.getElementById('connDbDot');
   const datasetSchemaViewerBtn = document.getElementById('datasetSchemaViewerBtn');
@@ -1374,16 +1391,16 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   // The DB config badge is fully clickable for anonymous users - they may
-  // open the dialog, switch between admin-configured presets, AND save
-  // their own custom connections (see isAnonymousUser's comment above).
-  // Nothing is gated behind sign-in here anymore, so the badge's tooltip no
-  // longer needs to differ by identity - kept as a function (rather than
-  // inlined at the call site) in case a future gated feature needs it
-  // again. Called whenever isAnonymousUser changes (i.e. every time
+  // open the dropdown, switch between admin-configured presets, AND switch
+  // to their own saved custom connections (see isAnonymousUser's comment
+  // above). Nothing is gated behind sign-in here anymore, so the badge's
+  // tooltip no longer needs to differ by identity - kept as a function
+  // (rather than inlined at the call site) in case a future gated feature
+  // needs it again. Called whenever isAnonymousUser changes (i.e. every time
   // fetchBackendConfig() resolves).
   function updateAnonymousRestrictions() {
     if (configTriggerBadge) {
-      configTriggerBadge.title = 'Connection Info (Click to configure)';
+      configTriggerBadge.title = 'Connection Info (Click to choose)';
     }
   }
 
@@ -2508,6 +2525,19 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
+  // "Bring Your Own Data" section's own inline "Help" link (see
+  // index.html) - same forwarding pattern as moreMenuHelpBtn just above,
+  // rather than calling openHelpModal() directly, so this still gets
+  // help_viewed tracking/markOnboardingSeen()/dismissHelpPulse() exactly
+  // like every other way of opening Help.
+  const byodHelpLink = document.getElementById('byodHelpLink');
+  if (byodHelpLink) {
+    byodHelpLink.addEventListener('click', (e) => {
+      e.preventDefault();
+      helpBtn?.click();
+    });
+  }
+
   // Forwards to the real header button rather than duplicating its
   // ISSUE_REPORTING_ENABLED visibility gate or its click wiring - see
   // fetchBackendConfig(), which toggles both this item and #sendFeedbackBtn
@@ -3055,11 +3085,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   // whatever database is active - see /api/ping's own docstring) and
   // updates the header dot whenever it resolves. Deliberately called
   // WITHOUT awaiting it from every call site below (updateConnectionDetails())
-  // - a slow/unreachable connection used to make the config modal's open
-  // and Save actions hang for however long /api/ping took (up to
+  // - a slow/unreachable connection used to make the dataset picker's open
+  // and select actions hang for however long /api/ping took (up to
   // DB_CONNECT_TIMEOUT_SECONDS, ~10s by default, per statement), since
-  // those flows used to `await` this before letting the modal become
-  // visible/closing it. Now the modal opens/closes immediately and this
+  // those flows used to `await` this before letting the picker become
+  // visible/closing it. Now the picker opens/closes immediately and this
   // keeps running in the background, updating the dot in place once it's
   // done - same end result, just never blocking the UI on it.
   // Shared race-guard between checkDbStatus() (the pre-existing /api/ping
@@ -3151,7 +3181,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   // comment for how the two are kept from clobbering each other when both
   // are in flight around the same Save. `kind`/`id` address the connection
   // to watch the same {kind, id} way datasetSchemaViewerBtn's click handler
-  // and the chat "OPEN SCHEMA VIEWER" dispatch already do.
+  // and the chat invitation link's own dispatch (openInviteAction()'s
+  // "schema" branch) already do.
   async function pollSchemaFetchStatus(kind, id) {
     if (!connDbDot || !id) return;
     const myToken = ++dbDotStateToken;
@@ -3290,8 +3321,8 @@ document.addEventListener('DOMContentLoaded', async () => {
       // "(Composite)" - not a database type (the "(<type>)" suffix dropped
       // elsewhere in this function per explicit request), but the same
       // group-vs-single-connection marker renderGroupOption() shows in the
-      // dataset selector dialog, so the badge and the dialog still agree
-      // on what a dataset GROUP selection is called.
+      // dataset picker's own dropdown, so the badge and the dropdown still
+      // agree on what a dataset GROUP selection is called.
       const anonBadgeText = data?.in_scope_mode === 'group' ? `${anonDbLabel} (Composite)` : anonDbLabel;
       if (connDbName) {
         connDbName.textContent = data?.active_connection_missing ? `⚠ ${anonBadgeText}` : anonBadgeText;
@@ -3300,8 +3331,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         configTriggerBadge.title = data?.active_connection_missing
           ? (data.active_connection_missing_message || anonDbLabel)
           : inScopeSummary.count > 1
-            ? `In scope: ${inScopeSummary.names.join(', ')} (Click to configure)`
-            : `Connected to: ${anonDbLabel} (Click to configure)`;
+            ? `In scope: ${inScopeSummary.names.join(', ')} (Click to choose)`
+            : `Connected to: ${anonDbLabel} (Click to choose)`;
       }
       document.title = `Datalect`;
       // Deliberately not awaited - see checkDbStatus()'s own comment on
@@ -3343,7 +3374,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     // active_connection_missing/_message).
     if (data.active_connection_missing) {
       if (configTriggerBadge) {
-        configTriggerBadge.title = data.active_connection_missing_message || `Connected to: ${dbDisplayName} (Click to configure)`;
+        configTriggerBadge.title = data.active_connection_missing_message || `Connected to: ${dbDisplayName} (Click to choose)`;
       }
       if (connDbName) {
         connDbName.textContent = `⚠ ${dbDisplayName}`;
@@ -3358,15 +3389,15 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     if (configTriggerBadge) {
       configTriggerBadge.title = inScopeSummary.count > 1
-        ? `In scope: ${inScopeSummary.names.join(', ')} (Click to configure)`
-        : `Connected to: ${dbDisplayName} (Click to configure)`;
+        ? `In scope: ${inScopeSummary.names.join(', ')} (Click to choose)`
+        : `Connected to: ${dbDisplayName} (Click to choose)`;
     }
 
     // "(Composite)" - not a database type (no "(<type>)" suffix shown any
     // more, per explicit request), but the same group-vs-single-connection
-    // marker renderGroupOption() shows in the dataset selector dialog, so
-    // the badge and the dialog still agree on what a dataset GROUP
-    // selection is called.
+    // marker renderGroupOption() shows in the dataset picker's own
+    // dropdown, so the badge and the dropdown still agree on what a
+    // dataset GROUP selection is called.
     if (connDbName) {
       connDbName.textContent = data?.in_scope_mode === 'group' ? `${dbDisplayName} (Composite)` : dbDisplayName;
     }
@@ -3388,9 +3419,17 @@ document.addEventListener('DOMContentLoaded', async () => {
     // glance, same one-value-only spirit as the DB badge's connDbName.
     modelBadgeName.textContent = ACTIVE_LLM_MODEL || "Model";
     if (modelTriggerBadge) {
-      modelTriggerBadge.title = ACTIVE_LLM_MODEL
-        ? `Using model: ${ACTIVE_LLM_MODEL} (Click to choose)`
-        : 'Model Info (Click to choose)';
+      modelTriggerBadge.title = IS_SUPERUSER
+        ? (ACTIVE_LLM_MODEL ? `Using model: ${ACTIVE_LLM_MODEL} (Click to choose)` : 'Model Info (Click to choose)')
+        : (ACTIVE_LLM_MODEL ? `Using model: ${ACTIVE_LLM_MODEL} (fixed - only an admin can change the model)` : 'Model Info (fixed - only an admin can change the model)');
+      // Persistent "locked" look, independent of setButtonsDisabled()'s own
+      // transient badge-disabled toggle (see that function's own comment) -
+      // a different class so the two reasons for looking non-interactive
+      // (an in-flight query vs. this user simply isn't allowed to change
+      // the model at all) can't clobber each other; re-applied on every
+      // config fetch so it never goes stale across a page's lifetime (e.g.
+      // signing into/out of a superuser account in the same tab).
+      modelTriggerBadge.classList.toggle('model-restricted', !IS_SUPERUSER);
     }
     // The more-menu's own current-selection display (see
     // #moreMenuModelBtn's comment in index.html) - kept in sync with the
@@ -3399,12 +3438,20 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (moreMenuModelCurrent) {
       moreMenuModelCurrent.textContent = ACTIVE_LLM_MODEL || "Model";
     }
+    // Same persistent lock as modelTriggerBadge above, for the narrow-
+    // header twin surface - see its own click listener for why this can't
+    // just be the native `disabled` property (setButtonsDisabled() already
+    // owns that for the transient in-flight case).
+    if (moreMenuModelBtn) {
+      moreMenuModelBtn.classList.toggle('model-restricted', !IS_SUPERUSER);
+      moreMenuModelBtn.title = IS_SUPERUSER ? '' : 'Only an admin can change the model';
+    }
   }
 
   // ===========================================================================
-  // 5. BACKEND CONFIG SYNC + DATABASE CONNECTION CONFIG MODAL
-  //    (fetch /api/config, render preset/custom DB radio options, save
-  //    connection + auto-execute preference, config modal open/close)
+  // 5. BACKEND CONFIG SYNC + DATABASE CONNECTION PICKER DROPDOWN
+  //    (fetch /api/config, render preset/custom dataset pick-list options,
+  //    save connection + auto-execute preference, dataset picker open/close)
   // ===========================================================================
   async function fetchBackendConfig() {
     try {
@@ -3506,6 +3553,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       LLM_PROVIDERS = data.llm_providers || [];
       ACTIVE_LLM_PROVIDER = data.active_llm_provider || "";
       ACTIVE_LLM_MODEL = data.active_llm_model || "";
+      IS_SUPERUSER = Boolean(data.is_superuser);
       LLM_BYOK_KEY_SET = data.llm_byok_key_set || { google: false, anthropic: false, openai: false };
 
       // No re-render needed here for the inline Report buttons -
@@ -3556,7 +3604,13 @@ document.addEventListener('DOMContentLoaded', async () => {
       // this makes before/after each translate/execute).
       reconcileActiveHistoryBucket();
 
-      renderDbRadioButtons();
+      renderDatasetPickList();
+      // Settings/Preferences dialog's own "Bring Your Own Data" editor -
+      // no longer rendered as a side effect of renderDatasetPickList()
+      // (that function only renders the read-only selection list), so
+      // it needs its own explicit call here to stay in sync with whatever
+      // fetchBackendConfig() just loaded.
+      renderCustomDbRows(ACTIVE_DB_URL || DEFAULT_DB_URL);
       loadConfigIntoUI();
 
       await updateConnectionDetails(data);
@@ -3667,21 +3721,238 @@ document.addEventListener('DOMContentLoaded', async () => {
     };
   }
 
+  // --- Custom-connection "completeness" checks + save-payload shape ------
+  // Hoisted to module scope (originally local to triggerConfigSave()) now
+  // that TWO independent save paths need them: triggerConfigSave() (the
+  // datasource selector's Save, which only picks an EXISTING complete row
+  // to activate - see its own isCustomOption branch) and savePreferences()
+  // (the Preferences dialog's "Bring Your Own Data" section, which is now
+  // the only place that can create/edit/delete a row - see
+  // buildCustomDatabasesPayload() below). A row counts as "complete"/
+  // saveable/selectable once it has every field its own dialect genuinely
+  // requires - a credential may count as satisfied either by having just
+  // been typed, or by already being saved server-side (has_custom_credentials),
+  // since a credential is never redisplayed once saved (see
+  // get_db_connections() in state_store.py) - so re-selecting/renaming an
+  // already-complete row without retyping its secret must still count as
+  // complete.
+  const isCompleteBigQuery = (db) => db && db.type === 'bigquery' && db.config
+    && db.config.project_id && db.config.dataset
+    && db.config.billing_project_id
+    && (db.config.credentials_json || db.has_custom_credentials);
+  const isCompleteSnowflake = (db) => db && db.type === 'snowflake' && db.config
+    && db.config.account && db.config.user && db.config.warehouse && db.config.database
+    && (db.config.password || db.config.private_key || db.has_custom_credentials);
+  const isCompleteDatabricks = (db) => db && db.type === 'databricks' && db.config
+    && db.config.server_hostname && db.config.http_path
+    && (db.config.access_token || db.has_custom_credentials);
+  const isCompleteOracle = (db) => db && db.type === 'oracle' && db.config
+    && db.config.host && db.config.user && (db.config.service_name || db.config.sid)
+    && (db.config.password || db.has_custom_credentials);
+  const isCompleteRedshift = (db) => db && db.type === 'redshift' && db.config
+    && db.config.host && db.config.database && db.config.user
+    && (db.config.password || db.has_custom_credentials);
+  const isCompleteMssql = (db) => db && db.type === 'mssql' && db.config
+    && db.config.host && db.config.database && db.config.user
+    && (db.config.password || db.has_custom_credentials);
+  const isCompleteSheets = (db) => db && db.type === 'sheets' && db.config
+    && db.config.spreadsheet_url && db.config.tab_name;
+  const isCompleteSimpleUrlDb = (db) => db && db.type !== 'bigquery' && db.type !== 'snowflake' && db.type !== 'databricks' && db.type !== 'oracle' && db.type !== 'redshift' && db.type !== 'mssql' && db.type !== 'sheets' && db.type !== 'MongoDB'
+    && db.url && db.url.trim() !== "";
+  const isCompleteMongo = (db) => db && db.type === 'MongoDB' && db.url && db.url.trim() !== ""
+    && db.config && db.config.database && db.config.user
+    && (db.config.password || db.has_custom_credentials);
+  // Combined "is this custom row saveable/selectable at all" check - used
+  // both to filter buildCustomDatabasesPayload()'s own array below and by
+  // triggerConfigSave() to decide whether a selected custom row (or the
+  // first complete fallback row, if the selected one isn't itself
+  // complete) can actually be activated.
+  const isCompleteCustomDb = (d) => isCompleteBigQuery(d) || isCompleteSnowflake(d) || isCompleteDatabricks(d) || isCompleteOracle(d) || isCompleteRedshift(d) || isCompleteMssql(d) || isCompleteSheets(d) || isCompleteMongo(d) || isCompleteSimpleUrlDb(d);
+
+  // Dialect-agnostic tail applied to every per-dialect payload object
+  // buildCustomDatabasesPayload() below builds: the two optional per-
+  // connection timeout overrides (see customDbTimeoutFieldsHtml()), and -
+  // critically - `d`'s own already-known connection_key, when it has one.
+  // Resending an existing row's own connection_key (rather than leaving
+  // the server to always recompute one fresh from name/identity/
+  // credential) is what keeps that identity STABLE across a rename -
+  // config_routes.py's _parse_incoming_custom_databases() reuses it as-is
+  // instead of deriving a new one, which matters once this save can run
+  // with no active-connection-selection fields in the same request at all
+  // (see this function's own call site in savePreferences() below) - see
+  // that server-side function's own comment for the full "why" (a changed
+  // key would otherwise silently orphan the session's stored
+  // connection_id/in_scope_custom_connection_keys pointer for whichever
+  // connection was active). A brand-new row (added via "+ Create new" this
+  // session) has no connection_key yet, so this is simply omitted for it,
+  // same as before - the server computes its first one fresh.
+  function withTimeoutOverrides(obj, d) {
+    if (d.config && d.config.connect_timeout_seconds != null) obj.connect_timeout_seconds = d.config.connect_timeout_seconds;
+    if (d.config && d.config.execute_timeout_seconds != null) obj.execute_timeout_seconds = d.config.execute_timeout_seconds;
+    if (d.connection_key) obj.connection_key = d.connection_key;
+    return obj;
+  }
+
+  // Builds the `custom_databases` payload array savePreferences() sends on
+  // every save of the "Bring Your Own Data" section - every entry in
+  // `customDatabases` that's actually complete/saveable, mapped into the
+  // server's flat per-dialect shape (config_routes.py's
+  // _parse_incoming_custom_databases()). An incomplete row (e.g. a
+  // freshly-added blank "+ Create new" row not yet filled in) is simply
+  // left out - not an error, just not ready to persist yet; it stays in
+  // `customDatabases`/the UI for the user to keep editing, and will be
+  // included once it's complete on a later save.
+  function buildCustomDatabasesPayload() {
+    return customDatabases
+      .filter(isCompleteCustomDb)
+      .map((d) => {
+        if (isCompleteBigQuery(d)) {
+          return withTimeoutOverrides({
+            type: 'bigquery',
+            name: d.name,
+            project_id: d.config.project_id,
+            dataset: d.config.dataset,
+            billing_project_id: d.config.billing_project_id,
+            credentials_json: d.config.credentials_json || undefined
+          }, d);
+        }
+        if (isCompleteSnowflake(d)) {
+          return withTimeoutOverrides({
+            type: 'snowflake',
+            name: d.name,
+            account: d.config.account,
+            user: d.config.user,
+            warehouse: d.config.warehouse,
+            database: d.config.database,
+            schema: d.config.schema || undefined,
+            role: d.config.role || undefined,
+            password: d.config.password || undefined,
+            private_key: d.config.private_key || undefined,
+            private_key_passphrase: d.config.private_key_passphrase || undefined,
+          }, d);
+        }
+        if (isCompleteDatabricks(d)) {
+          return withTimeoutOverrides({
+            type: 'databricks',
+            name: d.name,
+            server_hostname: d.config.server_hostname,
+            http_path: d.config.http_path,
+            catalog: d.config.catalog || undefined,
+            schema: d.config.schema || undefined,
+            access_token: d.config.access_token || undefined,
+          }, d);
+        }
+        if (isCompleteOracle(d)) {
+          return withTimeoutOverrides({
+            type: 'oracle',
+            name: d.name,
+            host: d.config.host,
+            port: d.config.port || undefined,
+            service_name: d.config.service_name || undefined,
+            sid: d.config.sid || undefined,
+            user: d.config.user,
+            schema: d.config.schema || undefined,
+            password: d.config.password || undefined,
+            ssl: d.config.ssl || undefined,
+          }, d);
+        }
+        if (isCompleteRedshift(d)) {
+          return withTimeoutOverrides({
+            type: 'redshift',
+            name: d.name,
+            host: d.config.host,
+            port: d.config.port || undefined,
+            database: d.config.database,
+            user: d.config.user,
+            schema: d.config.schema || undefined,
+            password: d.config.password || undefined,
+          }, d);
+        }
+        if (isCompleteMssql(d)) {
+          return withTimeoutOverrides({
+            type: 'mssql',
+            name: d.name,
+            host: d.config.host,
+            port: d.config.port || undefined,
+            database: d.config.database,
+            user: d.config.user,
+            schema: d.config.schema || undefined,
+            password: d.config.password || undefined,
+            // Unlike every other optional field above (omitted via
+            // "|| undefined" when blank), "encrypt" is always sent
+            // explicitly as true/false - it's a meaningful boolean where
+            // an explicit false and an absent value are different things
+            // (see backends/mssql.py's module docstring: connect()
+            // itself defaults to True only when the key is missing
+            // entirely) - so this must never collapse to undefined.
+            encrypt: d.config.encrypt !== false,
+          }, d);
+        }
+        if (isCompleteSheets(d)) {
+          return withTimeoutOverrides({
+            type: 'sheets',
+            name: d.name,
+            spreadsheet_url: d.config.spreadsheet_url,
+            tab_name: d.config.tab_name,
+            // Optional, and only ever sent when the user actually typed
+            // one in this editing session - omitted (not sent as an
+            // empty string) so a blank textarea never clobbers an
+            // already-saved key server-side (_resolve_sheets_credentials
+            // falls back to the saved one only when nothing is provided).
+            credentials_json: d.config.credentials_json || undefined,
+          }, d);
+        }
+        if (isCompleteMongo(d)) {
+          return withTimeoutOverrides({
+            type: 'MongoDB',
+            name: d.name,
+            url: d.url,
+            database: d.config.database,
+            user: d.config.user,
+            password: d.config.password || undefined,
+          }, d);
+        }
+        const simpleUrlType = d.type === 'mysql' ? 'mysql' : 'postgres';
+        const simpleUrlOut = { type: simpleUrlType, name: d.name, url: d.url };
+        // Shared by Postgres/MySQL (see backends/postgres.py's and
+        // backends/mysql.py's module docstrings) - not a credential, so
+        // it's just carried through as-is like BigQuery's
+        // billing_project_id, not resolved via a "leave blank to keep
+        // the saved one" helper the way passwords are.
+        if (d.config && d.config.ca_cert_pem) {
+          simpleUrlOut.ca_cert_pem = d.config.ca_cert_pem;
+        }
+        // schema is Postgres-only (optional) - MySQL has no separate
+        // schema concept of its own (see backends/mysql.py's module
+        // docstring).
+        if (simpleUrlType === 'postgres' && d.config && d.config.schema) {
+          simpleUrlOut.schema = d.config.schema;
+        }
+        return withTimeoutOverrides(simpleUrlOut, d);
+      });
+  }
+
   // Renders every entry in `customDatabases` (including in-progress blank
   // rows added via "+ Create new") as an editable row with a
-  // dialect selector. Each row's inputs keep `customDatabases[index]` in
-  // sync live via their own 'input' listeners, so by the time
-  // triggerConfigSave() runs there's nothing left to harvest from the DOM.
+  // dialect selector, into the "Bring Your Own Data" section of the
+  // Preferences/Settings dialog. Each row's inputs keep
+  // `customDatabases[index]` in sync live via their own 'input' listeners,
+  // so by the time savePreferences() runs (via buildCustomDatabasesPayload(),
+  // a module-level function) there's nothing left to harvest from the DOM.
+  // Selecting which saved custom connection is active no longer happens
+  // here at all - that's now the plain read-only "Private" section of
+  // renderDatasetPickList()'s own dropdown.
   function renderCustomDbRows(activeUrl) {
     const container = document.getElementById('customDbsContainer');
     if (!container) return;
 
-    const groupSelected = isGroupModeSelected();
-
-    // Focusing/editing a custom row's own field checks that row's radio -
-    // true radio semantics (this is a single-select group again, see
-    // renderDbRadioButtons()) mean that alone is enough to uncheck
-    // whatever else was checked, so there's nothing else to track here.
+    // Historically this checked a row's own selection radio (true radio
+    // semantics meant that alone was enough to uncheck whatever else was
+    // checked). This card no longer has a selection radio - selection
+    // lives exclusively in renderDatasetPickList()'s dropdown now - so
+    // every call site below is a harmless no-op (`radio` is always
+    // null). Left in place rather than stripped from each of its ~26 call
+    // sites, to keep this relocation's edit surface small.
     function selectDbConnectionRow(radio) {
       if (radio) radio.checked = true;
     }
@@ -3724,16 +3995,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       const isSheets = db.type === 'sheets';
       const isMongoSql = db.type === 'MongoDB';
       const sfAuthMethod = cfg.auth_method || (cfg.private_key ? 'private_key' : 'password');
-      // Checked state comes from the in-scope set (see IN_SCOPE_CUSTOM_KEYS'
-      // docstring) matched by connection_key - but, same as a preset
-      // option above, only when a dataset group isn't the current
-      // selection (see isGroupModeSelected()). Falls back to the legacy
-      // single-active-connection URL match only for a row with no
-      // connection_key at all (saved before that field existed on
-      // individual rows).
-      const isSelected = !groupSelected && (db.connection_key
-        ? IN_SCOPE_CUSTOM_KEYS.includes(db.connection_key)
-        : (ACTIVE_IS_CUSTOM && !ACTIVE_CUSTOM_CONNECTION_KEY && Boolean(db.url) && activeUrl === db.url));
 
       // A connection_key is only ever present on a row that came back from
       // the server (see config_routes.py's get_db_connections) - a row
@@ -3748,19 +4009,19 @@ document.addEventListener('DOMContentLoaded', async () => {
       // re-renders since it lives on the object itself rather than index.
       const isExpanded = db._expanded !== undefined ? db._expanded : !db.connection_key;
 
-      // Row 1 (all types): selection radio, Name, and dialect select - per
-      // explicit request, Name comes first (reads left-to-right as "what
-      // it's called, then what kind of thing it is") with the dialect
-      // select after it, reversed from this row's original order. Dialect-
-      // specific fields live on their own dedicated rows below, never
-      // crowding this first line.
+      // Row 1 (all types): Name and dialect select - per explicit request,
+      // Name comes first (reads left-to-right as "what it's called, then
+      // what kind of thing it is") with the dialect select after it,
+      // reversed from this row's original order. Dialect-specific fields
+      // live on their own dedicated rows below, never crowding this first
+      // line. This card is purely an editor now (see renderDatasetPickList()
+      // for the read-only selection dropdown shown in the header instead)
+      // so there's no selection radio here any more.
       html += `
         <div class="custom-db-card">
           <div class="custom-db-header-row">
-            <input type="radio" name="db_connection_option" value="custom-${index}" data-dbname="${db.name || ''}" ${isSelected ? 'checked' : ''}>
             <div class="custom-db-field">
-              <label class="custom-db-field-label" for="custom-db-name-${index}">Name:</label>
-              <input type="text" id="custom-db-name-${index}" class="config-input custom-db-name-input" data-index="${index}" placeholder="e.g. My Database" value="${db.name || ''}" autocomplete="off">
+              <input type="text" id="custom-db-name-${index}" class="config-input custom-db-name-input" data-index="${index}" placeholder="Datasource Name" value="${db.name || ''}" autocomplete="off">
             </div>
             <select class="config-input custom-db-type-select" data-index="${index}">
               <option value="postgres" ${(!isBigQuery && !isSnowflake && !isMySQL && !isDatabricks && !isOracle && !isRedshift && !isSqlServer && !isSheets && !isMongoSql) ? 'selected' : ''}>PostgreSQL</option>
@@ -4509,7 +4770,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   // module docstring) is scoped to a binary choice, not an arbitrary
   // subset: either ONE specific connection is in scope (today's original,
   // unchanged behavior) or one admin-curated DATASET GROUP is (see
-  // renderDbRadioButtons()' group radio options below). Which one is true
+  // renderDatasetPickList()' group options below). Which one is true
   // is read straight from the server-persisted IN_SCOPE_MODE (see its
   // declaration above for why this is more reliable than inferring it
   // from the in-scope arrays' combined length) - so this stays correct
@@ -4522,14 +4783,32 @@ document.addEventListener('DOMContentLoaded', async () => {
     return IN_SCOPE_MODE === 'group';
   }
 
-  function renderDbRadioButtons(currentDbUrl) {
-    const radioGroup = document.getElementById('modalDbRadioGroup');
-    if (!radioGroup) return;
+  // Renders #datasetPickOptions (and, when any dataset group is
+  // configured, #datasetPickCompositeOptions too - see that element's own
+  // comment in index.html) - the datasource picker's own in-place dropdown
+  // list (see #datasetPickList in index.html and the DATASET PICK LIST
+  // section further down), replacing the old #configModal popup dialog's
+  // #modalDbRadioGroup radio list per explicit request: a flat, directly-
+  // clickable option list grouped under two headings, "Public" (every
+  // CONFIGURED_DBS preset, plus a "Composite" row that opens a flyout
+  // submenu listing every CONFIGURED_DB_GROUPS dataset group - see that
+  // row's own comment below) and "Private" (this user's own saved custom
+  // connections) - same two-heading shape the old radio list used ("Public
+  // Datasources"/"Private Datasources"), just shorter headings and real
+  // buttons instead of radio inputs, mirroring renderModelPickList()'s own
+  // provider-grouped button list below. The former two-column layout is
+  // dropped - a dropdown this narrow has no room for it, and
+  // renderModelPickList() never needed one either even with several
+  // providers' worth of models to show, thanks to this same list's own
+  // scroll (.dataset-pick-list's max-height/overflow-y).
+  function renderDatasetPickList(currentDbUrl) {
+    const optionsEl = document.getElementById('datasetPickOptions');
+    if (!optionsEl) return;
 
     const activeUrl = currentDbUrl || ACTIVE_DB_URL || DEFAULT_DB_URL;
     const groupSelected = isGroupModeSelected();
 
-    let html = `<div class="radio-group-heading">Public Datasources</div>`;
+    let html = `<div class="model-pick-group-heading">Public</div>`;
 
     const renderPresetOption = (db) => {
       // Encodes the preset's stable id (never a secret, unlike the real
@@ -4539,26 +4818,26 @@ document.addEventListener('DOMContentLoaded', async () => {
       // CONFIGURED_DBS entries are redacted (see fetchBackendConfig()).
       // Resolved server-side via payload.preset_id (see triggerConfigSave()).
       const value = `preset:${db.id}`;
-      // Checked state comes from the in-scope set (see IN_SCOPE_PRESET_IDS'
+      // Selected state comes from the in-scope set (see IN_SCOPE_PRESET_IDS'
       // docstring), not ACTIVE_PRESET_ID directly, but is only ever true
       // for this SPECIFIC preset when a dataset group isn't the current
-      // selection (see isGroupModeSelected()) - the radio group is
-      // single-select again, so exactly one of a group or one specific
-      // connection is checked at a time. A session that's never explicitly
-      // saved an in-scope set has this array lazily derived server-side
-      // from the single active connection (state_store.py's get_session),
-      // so a never-touched session's one radio shows checked exactly as
-      // before this feature existed.
+      // selection (see isGroupModeSelected()) - this list is single-select,
+      // so exactly one of a group or one specific connection is selected at
+      // a time. A session that's never explicitly saved an in-scope set
+      // has this array lazily derived server-side from the single active
+      // connection (state_store.py's get_session), so a never-touched
+      // session's one option shows selected exactly as before this feature
+      // existed.
       const isSelected = !groupSelected && IN_SCOPE_PRESET_IDS.includes(db.id);
-      // Just the name - per explicit request, no "(<type>)" parenthetical
-      // any more (this used to show db.dialect_name/db.type, e.g.
-      // "<name> (PostgreSQL)"). The name alone is enough to pick a preset
-      // from this list.
+      // Just the name - per earlier explicit request, no "(<type>)"
+      // parenthetical any more (this used to show db.dialect_name/db.type,
+      // e.g. "<name> (PostgreSQL)"). The name alone is enough to pick a
+      // preset from this list.
       return `
-        <label class="radio-option">
-          <input type="radio" name="db_connection_option" value="${value}" data-dbname="${db.name}" ${isSelected ? 'checked' : ''}>
-          <span class="radio-label">${db.name}</span>
-        </label>
+        <button type="button" class="dataset-pick-option${isSelected ? ' selected' : ''}" data-value="${value}" role="option" aria-selected="${isSelected}">
+          <span class="model-pick-option-label">${db.name}</span>
+          <span class="model-pick-check" aria-hidden="true">&check;</span>
+        </button>
       `;
     };
 
@@ -4567,72 +4846,134 @@ document.addEventListener('DOMContentLoaded', async () => {
     // presets/custom connections: a fixed subset of this file's own
     // presets, never a dynamic "every configured dataset" pool (that
     // notion doesn't exist any more - a dataset only ever joins a group by
-    // being explicitly listed in some group's own "dataset_list"). Used to
-    // render as its own separate "DATASET GROUPS" heading/column below the
-    // preset list - merged into this SAME playgrounds list instead (one
-    // heading, one balanced-column split) per explicit request: a group is
-    // just one more way to pick a scope, not a fundamentally different
-    // kind of thing that deserves visual separation from the presets that
-    // make it up. Still visually distinguished from an ordinary preset via
-    // the bold `.all-databases-option` styling and its own on-hover
-    // tooltip (GROUP_OPTION_HINT), same as before the merge.
-    const GROUP_OPTION_HINT = "Ask a question without picking a database first - the app figures out which of "
-      + "this group's own datasets it applies to, and can query more than one at once when a question genuinely "
-      + "needs it.";
+    // being explicitly listed in some group's own "dataset_list"). Tucked
+    // under their own "Composite" flyout submenu rather than listed inline
+    // in the Public section per explicit request (see
+    // openDatasetPickCompositeSubmenu()/#datasetPickCompositeSubmenu in
+    // index.html) - the submenu itself is what tells a group apart from an
+    // ordinary preset now, so neither the "(Composite)" name suffix nor the
+    // explanatory on-hover tooltip these used to need to stand out inline
+    // (back when they were mixed in with ordinary presets) are needed any
+    // more - both dropped per explicit request once the flyout shipped.
     const renderGroupOption = (group) => {
       const value = `group:${group.id}`;
       const isSelected = groupSelected && IN_SCOPE_GROUP_ID === group.id;
-      // "(Composite)" mirrors the exact parenthetical the group Schema
-      // Viewer's own title already uses (see openGroupSchemaViewer()) - this
-      // one stays even though renderPresetOption() above no longer shows a
-      // "(<type>)" suffix of its own, since "Composite" isn't a database
-      // type - it's what tells a group apart from an ordinary single
-      // connection in this same list.
       return `
-        <label class="radio-option all-databases-option" title="${GROUP_OPTION_HINT}">
-          <input type="radio" name="db_connection_option" value="${value}" data-dbname="${group.name}" ${isSelected ? 'checked' : ''}>
-          <span class="radio-label">${group.name} (Composite)</span>
-        </label>
+        <button type="button" class="dataset-pick-option all-databases-option${isSelected ? ' selected' : ''}" data-value="${value}" role="option" aria-selected="${isSelected}">
+          <span class="model-pick-option-label">${group.name}</span>
+          <span class="model-pick-check" aria-hidden="true">&check;</span>
+        </button>
       `;
     };
 
-    // One combined list - every preset, THEN every dataset group (groups
-    // trail the specific connections they're built from, matching this
-    // section's pre-merge top-to-bottom order) - split into two visual
-    // columns purely as a layout grouping (no change to what's selectable
-    // or how - db_connection_option/preset:<id>/group:<id> all work exactly
-    // the same either way), straight down the middle by COUNT, not by
-    // dialect type or entry kind: an earlier version grouped the 4 "simple
-    // credential" dialects (Postgres/MySQL/Oracle/SQL Server/MongoDB) on
-    // the left and the structured/cloud ones (BigQuery/Snowflake/
-    // Databricks/Redshift/Sheets) on the right, but that left a whole
-    // column empty whenever an admin's presets happened to cluster on one
-    // side (e.g. two Postgres presets and nothing else - exactly what
-    // "balanced, half on the left and half on the right" was reported
-    // against). The first (ceil half) of this combined order goes left, the
-    // rest go right, so an odd count leans left by one rather than leaving
-    // a column short by more than that.
-    const allEntries = [
-      ...CONFIGURED_DBS.map((db) => ({ html: renderPresetOption(db) })),
-      ...CONFIGURED_DB_GROUPS.map((group) => ({ html: renderGroupOption(group) })),
-    ];
-    const leftCount = Math.ceil(allEntries.length / 2);
-    const leftColumnHtml = allEntries.slice(0, leftCount).map((entry) => entry.html).join('');
-    const rightColumnHtml = allEntries.slice(leftCount).map((entry) => entry.html).join('');
+    // Every preset, in CONFIGURED_DBS order.
+    html += CONFIGURED_DBS.map(renderPresetOption).join('');
 
-    html += `
-      <div class="preset-columns">
-        <div class="preset-column">${leftColumnHtml}</div>
-        <div class="preset-column">${rightColumnHtml}</div>
-      </div>
-    `;
+    // The "Composite" toggle row itself lives inline here, right after the
+    // presets - but the actual group buttons it reveals render into
+    // #datasetPickCompositeOptions, a SIBLING of #datasetPickList entirely
+    // (see that element's own comment in index.html), not into this same
+    // #datasetPickOptions container. Omitted completely when no groups are
+    // configured, same as the old inline rendering's empty case.
+    let compositeOptionsHtml = '';
+    if (CONFIGURED_DB_GROUPS.length) {
+      // No .selected/aria-selected of its own - unlike an ordinary
+      // .dataset-pick-option, this row never directly represents "the
+      // active choice" (one of the group buttons inside the submenu it
+      // opens does that instead); it's purely a toggle, which is also why
+      // the delegated click/hover handling below checks for this class
+      // BEFORE falling through to the "select and save" .dataset-pick-
+      // option handling - hovering or clicking it must never call
+      // selectDataset(). Labeled "Composites" (plural) - it's a category of
+      // several, not a single choice the way every other row here is.
+      html += `
+        <button type="button" class="dataset-pick-submenu-toggle" id="datasetPickCompositeToggle" aria-haspopup="listbox" aria-expanded="false">
+          <span class="model-pick-option-label">Composites</span>
+          <svg class="dataset-pick-submenu-caret" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <polyline points="6 9 12 15 18 9"></polyline>
+          </svg>
+        </button>
+      `;
+      compositeOptionsHtml = CONFIGURED_DB_GROUPS.map(renderGroupOption).join('');
+    }
+    const datasetPickCompositeOptionsEl = document.getElementById('datasetPickCompositeOptions');
+    if (datasetPickCompositeOptionsEl) datasetPickCompositeOptionsEl.innerHTML = compositeOptionsHtml;
+    // Collapsed back on every (re-)render - every open of the main dropdown
+    // calls fetchBackendConfig() then this function (see the
+    // configTriggerBadge click handler further down), so a flyout left
+    // open from a previous visit never reappears already expanded.
+    closeDatasetPickCompositeSubmenu();
 
-    html += `<div class="radio-group-heading radio-group-heading-custom">Private Datasources</div>`;
-    html += `<div id="customDbsContainer" class="custom-dbs-list"></div>`;
+    // Private (custom) datasources - a plain, select-only picker, same
+    // shape as the preset/group options above (just a name + a button),
+    // never an editable form: creating/editing/deleting a custom
+    // connection lives in the Preferences dialog's "Bring Your Own Data"
+    // section (see renderCustomDbRows(), rendered there - and
+    // savePreferences(), which persists it) per earlier explicit request -
+    // popping a credential form open from inside this picker surprised
+    // users who just wanted to pick which datasource to ask questions
+    // against. `customDatabases` is still fetched here (see
+    // fetchBackendConfig()) purely so this list of NAMES can be shown and
+    // selected, exactly like any public datasource.
+    html += `<div class="model-pick-group-heading">Private</div>`;
+    if (customDatabases.length) {
+      const renderCustomOption = (db, index) => {
+        // Same "selected" rule renderCustomDbRows() used for its own
+        // header-row radio before the "Bring Your Own Data" relocation
+        // removed it from there - moved here verbatim, not re-derived,
+        // since this is the only place a custom connection is ever
+        // selected from.
+        const isSelected = !groupSelected && (db.connection_key
+          ? IN_SCOPE_CUSTOM_KEYS.includes(db.connection_key)
+          : (ACTIVE_IS_CUSTOM && !ACTIVE_CUSTOM_CONNECTION_KEY && Boolean(db.url) && activeUrl === db.url));
+        const value = `custom-${index}`;
+        return `
+          <button type="button" class="dataset-pick-option${isSelected ? ' selected' : ''}" data-value="${value}" data-dbname="${db.name || ''}" role="option" aria-selected="${isSelected}">
+            <span class="model-pick-option-label">${db.name || 'Untitled'}</span>
+            <span class="model-pick-check" aria-hidden="true">&check;</span>
+          </button>
+        `;
+      };
+      html += customDatabases.map(renderCustomOption).join('');
+    } else {
+      // Empty state - points at where to actually add one, since this
+      // dropdown can only ever select an existing one, never create one.
+      html += `
+        <p class="text-muted custom-dbs-empty-hint">
+          None yet - <button type="button" id="openSettingsForByodBtn" class="link-button">add one in Settings</button>.
+        </p>
+      `;
+    }
 
-    radioGroup.innerHTML = html;
+    optionsEl.innerHTML = html;
 
-    renderCustomDbRows(activeUrl);
+    const openSettingsForByodBtn = document.getElementById('openSettingsForByodBtn');
+    if (openSettingsForByodBtn && prefsBtn) {
+      openSettingsForByodBtn.addEventListener('click', () => {
+        closeDatasetPickList();
+        prefsBtn.click();
+      });
+    }
+
+    // The "Composites" toggle is recreated by the innerHTML assignment
+    // above on every render, so its own hover listeners need re-attaching
+    // here each time too (same reasoning as openSettingsForByodBtn's own
+    // listener just above) - opens on hover alone per explicit request, no
+    // click needed (see openDatasetPickCompositeSubmenu()'s own comment);
+    // leaving on a real click handler too purely as a touch/keyboard
+    // fallback, where hover never fires at all.
+    const datasetPickCompositeToggle = document.getElementById('datasetPickCompositeToggle');
+    if (datasetPickCompositeToggle) {
+      datasetPickCompositeToggle.addEventListener('mouseenter', () => {
+        openDatasetPickCompositeSubmenu(datasetPickCompositeToggle);
+      });
+      datasetPickCompositeToggle.addEventListener('mouseleave', () => {
+        scheduleCloseDatasetPickCompositeSubmenu();
+      });
+      datasetPickCompositeToggle.addEventListener('click', () => {
+        openDatasetPickCompositeSubmenu(datasetPickCompositeToggle);
+      });
+    }
   }
 
   // ===========================================================================
@@ -4678,7 +5019,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     // "organized by llm_provider", same grouping the old radio list gave,
     // just rendered as directly-clickable rows instead of radio inputs.
     // Provider/model names are server-configured (env vars an admin sets),
-    // never raw end-user input - same trust level renderDbRadioButtons()
+    // never raw end-user input - same trust level renderDatasetPickList()
     // extends to db.name elsewhere in this file, so this interpolates them
     // unescaped too, consistent with that existing convention.
     let html = '';
@@ -4775,6 +5116,11 @@ document.addEventListener('DOMContentLoaded', async () => {
       // just visually grayed out (the div has no native `disabled` to rely
       // on for that).
       if (modelTriggerBadge.classList.contains('badge-disabled')) return;
+      // This user isn't allowed to change the model at all (see
+      // IS_SUPERUSER's own declaration comment) - same no-op-click
+      // treatment as the in-flight case above, just for a different
+      // (persistent, not transient) reason.
+      if (!IS_SUPERUSER) return;
       e.stopPropagation();
       // Toggle: a second click on the badge while the list is already open
       // closes it again, same as the more-menu/auth-avatar dropdowns.
@@ -4823,6 +5169,12 @@ document.addEventListener('DOMContentLoaded', async () => {
   // edge would risk running off-screen.
   if (moreMenuModelBtn && moreMenuModelSubmenu) {
     moreMenuModelBtn.addEventListener('click', async (e) => {
+      // Same persistent lock as modelTriggerBadge's own click listener
+      // above (see IS_SUPERUSER's declaration comment) - native `disabled`
+      // isn't used for this since setButtonsDisabled() already owns that
+      // property for the transient in-flight case and would otherwise
+      // clobber it back to enabled once a query finishes.
+      if (!IS_SUPERUSER) return;
       e.stopPropagation();
       // Toggle: a second click while the submenu is already open collapses
       // it again, without closing the rest of the more-menu around it.
@@ -4966,6 +5318,16 @@ document.addEventListener('DOMContentLoaded', async () => {
       preferencesPayload.llm_byok_keys = llmByokKeys;
     }
 
+    // Bring Your Own Data - the "Bring Your Own Data" section's own save,
+    // independent of whichever connection is currently active (see
+    // config_routes.py's handle_config(): custom_databases and the
+    // active-selection fields are deliberately orthogonal, so omitting the
+    // latter here - this payload never touches is_custom/database_name/etc
+    // - leaves the active connection exactly as it was). Always included,
+    // even as an empty array, so deleting every custom connection here
+    // actually persists as "none left" rather than being silently dropped.
+    preferencesPayload.custom_databases = buildCustomDatabasesPayload();
+
     try {
       const response = await fetch('/api/config', {
         method: 'POST',
@@ -5042,7 +5404,21 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   });
 
-  async function triggerConfigSave({ closeModal = false } = {}) {
+  // Does the actual POST /api/config for a datasource selection, given the
+  // selected option's own encoded value (one of
+  // renderDatasetPickList()'s own `preset:<id>`/`group:<id>`/`custom-<index>`
+  // values - see that function's own option-rendering for where these come
+  // from) - no longer read from a checked radio input (there isn't one any
+  // more; see the DATASET PICK LIST section's selectDataset(), the sole
+  // caller reached through the dropdown itself, and
+  // switchActiveConnectionToPreset(), the other caller, reached from the
+  // Schema Viewer). Returns true on a successful save, false on any
+  // failure (a validation error from the server, or a network/fetch
+  // exception) - callers use this to decide whether to close the dropdown
+  // (success) or leave it open with the error already shown right there
+  // (failure), the same close-on-success/stay-open-on-error rule
+  // selectModel() follows for the model pick list.
+  async function triggerConfigSave(value) {
     let dbType = 'postgres';
     let dbUrlValue = null;
     let dbNameValue = null;
@@ -5089,7 +5465,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     let dbExecuteTimeoutSeconds = null;
     let isCustomOption = false;
     // Set only for anonymous users picking a preset by its stable id (see
-    // renderDbRadioButtons()) - the server resolves the real connection
+    // renderDatasetPickList()) - the server resolves the real connection
     // from this id itself, since anonymous users never receive one. Signed-
     // in users' preset selections are still matched by their real field
     // values in _parse_incoming_connection (see its own comments), not by
@@ -5097,100 +5473,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     // encodes an id for both user types.
     let presetId = null;
 
-    // A custom BigQuery connection is only "complete"/selectable/saveable
-    // once it has BOTH its own billing project ID and its own key - either
-    // freshly entered, or (for the key only, since it's never redisplayed)
-    // already saved server-side (has_custom_credentials). Billing project
-    // isn't a secret and IS always redisplayed as-is, so it has no
-    // equivalent "already saved" bypass - it must actually be filled in.
-    // See config_routes.py's module docstring for why neither field ever
-    // falls back to a preset's or this app's own billing project for a
-    // custom connection.
-    const isCompleteBigQuery = (db) => db && db.type === 'bigquery' && db.config
-      && db.config.project_id && db.config.dataset
-      && db.config.billing_project_id
-      && (db.config.credentials_json || db.has_custom_credentials);
-    // Same idea for Snowflake, minus the billing dimension (Snowflake has
-    // no BigQuery-style separate billing project) but with a credential
-    // that's one of two mutually-exclusive shapes - either counts as
-    // "has a credential", freshly entered or (since neither is ever
-    // redisplayed) already saved server-side.
-    const isCompleteSnowflake = (db) => db && db.type === 'snowflake' && db.config
-      && db.config.account && db.config.user && db.config.warehouse && db.config.database
-      && (db.config.password || db.config.private_key || db.has_custom_credentials);
-    // Same idea for Databricks - no billing dimension, and exactly one
-    // credential shape (an access token) rather than Snowflake's two, but
-    // otherwise the same "freshly entered, or already saved server-side"
-    // rule (see backends/databricks.py's module docstring - PAT-only for
-    // this first pass).
-    const isCompleteDatabricks = (db) => db && db.type === 'databricks' && db.config
-      && db.config.server_hostname && db.config.http_path
-      && (db.config.access_token || db.has_custom_credentials);
-    // Same idea for Oracle - core identifying fields (host, user, and one
-    // of service_name/sid) plus a single credential shape (password),
-    // same "freshly entered, or already saved server-side" rule as every
-    // other structured dialect above (see backends/oracle.py's module
-    // docstring - plain username/password only for this first pass).
-    const isCompleteOracle = (db) => db && db.type === 'oracle' && db.config
-      && db.config.host && db.config.user && (db.config.service_name || db.config.sid)
-      && (db.config.password || db.has_custom_credentials);
-    // Same idea for Redshift - core identifying fields (host, database,
-    // user) plus a single credential shape (password), same "freshly
-    // entered, or already saved server-side" rule as every other
-    // structured dialect above (see backends/redshift.py's module
-    // docstring - plain username/password only for this first pass).
-    const isCompleteRedshift = (db) => db && db.type === 'redshift' && db.config
-      && db.config.host && db.config.database && db.config.user
-      && (db.config.password || db.has_custom_credentials);
-    // Same idea for SQL Server - core identifying fields (host, database,
-    // user) plus a single credential shape (password), same "freshly
-    // entered, or already saved server-side" rule as every other
-    // structured dialect above (see backends/mssql.py's module docstring -
-    // plain SQL Login username/password only for this first pass).
-    // "encrypt" isn't part of completeness - it has its own always-present
-    // default (true) at the backend layer, so it's never a blocking field.
-    const isCompleteMssql = (db) => db && db.type === 'mssql' && db.config
-      && db.config.host && db.config.database && db.config.user
-      && (db.config.password || db.has_custom_credentials);
-    // Same idea for Google Sheets - but credentials_json is deliberately
-    // NOT part of this completeness check, unlike every credentialed
-    // dialect above: it's optional (see backends/sheets.py's module
-    // docstring), so a row with just these two non-secret fields filled in
-    // is already a fully valid (public-sheet) connection.
-    const isCompleteSheets = (db) => db && db.type === 'sheets' && db.config
-      && db.config.spreadsheet_url && db.config.tab_name;
-    // Postgres and MySQL are both "simple URL" dialects (see
-    // backends/mysql.py's module docstring) - a single non-blank url is
-    // all either needs to be selectable/saveable. Named generically
-    // (not isCompletePostgres) since it now covers both. MongoDB is
-    // explicitly excluded here (unlike before this dialect had its own
-    // database/user/password fields) and gets its own isCompleteMongo
-    // check below instead, since a bare url alone is no longer enough
-    // for it.
-    const isCompleteSimpleUrlDb = (db) => db && db.type !== 'bigquery' && db.type !== 'snowflake' && db.type !== 'databricks' && db.type !== 'oracle' && db.type !== 'redshift' && db.type !== 'mssql' && db.type !== 'sheets' && db.type !== 'MongoDB'
-      && db.url && db.url.trim() !== "";
-    // MongoDB Atlas SQL is a hybrid: a real url (like Postgres/MySQL)
-    // PLUS separate structured config fields (like every dialect above)
-    // - see backends/mongodb_sql.py's and config_routes.py's module
-    // docstrings. Same "freshly entered, or already saved server-side"
-    // credential rule as the rest.
-    const isCompleteMongo = (db) => db && db.type === 'MongoDB' && db.url && db.url.trim() !== ""
-      && db.config && db.config.database && db.config.user
-      && (db.config.password || db.has_custom_credentials);
-    // Combined "is this custom row saveable/selectable at all" check,
-    // hoisted out of the custom-connection branch below so the "All"
-    // synthesis just above it can reuse the exact same definition of
-    // "complete" when there are no presets configured at all.
-    const isCompleteCustomDb = (d) => isCompleteBigQuery(d) || isCompleteSnowflake(d) || isCompleteDatabricks(d) || isCompleteOracle(d) || isCompleteRedshift(d) || isCompleteMssql(d) || isCompleteSheets(d) || isCompleteMongo(d) || isCompleteSimpleUrlDb(d);
+    // isCompleteBigQuery/isCompleteSnowflake/.../isCompleteCustomDb are
+    // module-level now (see their own declaration comment, right before
+    // buildCustomDatabasesPayload()) - savePreferences()'s own "Bring Your
+    // Own Data" save needs the exact same definitions, so they're no
+    // longer local to this function.
 
-    // The radio group is single-select again (see renderDbRadioButtons()),
-    // so exactly one input is ever checked - no more "most recently
-    // focused row" tiebreaking needed among several simultaneously-checked
-    // boxes the way the old checkbox-based picker required.
-    const selectedDbRadio = document.querySelector('input[name="db_connection_option"]:checked');
-
-    // A dataset group (see renderDbRadioButtons()'s dataset-group entries,
-    // merged into the same playgrounds list as every single preset) has no
+    // A dataset group (see renderDatasetPickList()'s dataset-group entries,
+    // merged into the same "Public" list as every single preset) has no
     // dedicated preset/custom fields of its own - the
     // single PRIMARY connection (today's pre-existing connection_id/
     // is_custom fields) is still just whichever connection would be
@@ -5204,7 +5494,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     // validation guarantees this at load time), never a custom
     // connection, so there's no custom-<index> fallback to synthesize here
     // the way the old "all configured databases" option needed.
-    let effectiveSelectionValue = selectedDbRadio ? selectedDbRadio.value : null;
+    let effectiveSelectionValue = value || null;
     if (effectiveSelectionValue && effectiveSelectionValue.startsWith('group:')) {
       const groupId = effectiveSelectionValue.slice('group:'.length);
       const group = CONFIGURED_DB_GROUPS.find(g => g.id === groupId);
@@ -5362,7 +5652,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         customDbUrl = dbUrlValue;
       } else if (effectiveSelectionValue.startsWith('preset:')) {
         // Both anonymous and signed-in users select a preset purely by its
-        // stable, non-secret id (see renderDbRadioButtons()) - never by
+        // stable, non-secret id (see renderDatasetPickList()) - never by
         // resending its own fields, let alone its credentials. The server
         // resolves the preset's actual connection details fresh from
         // CONFIGURED_DBS every time it's actually used (see db.py's
@@ -5386,148 +5676,21 @@ document.addEventListener('DOMContentLoaded', async () => {
       dbNameValue = "Default DB";
     }
 
-    // Dialect-agnostic (see customDbTimeoutFieldsHtml() and its wiring
-    // above) - applied once here to whichever dialect-specific object
-    // literal each branch below just built, rather than repeating
-    // "connect_timeout_seconds: d.config.connect_timeout_seconds ||
-    // undefined" in all nine of those branches individually.
-    function withTimeoutOverrides(obj, d) {
-      if (d.config && d.config.connect_timeout_seconds != null) obj.connect_timeout_seconds = d.config.connect_timeout_seconds;
-      if (d.config && d.config.execute_timeout_seconds != null) obj.execute_timeout_seconds = d.config.execute_timeout_seconds;
-      return obj;
-    }
-
+    // No `custom_databases` key in this payload at all, unlike before the
+    // "Bring Your Own Data" relocation - the datasource picker can no
+    // longer create/edit/delete a custom connection (see renderDatasetPickList()'s
+    // own "Private" section, a plain select-only dropdown), so
+    // there's nothing here for it to persist about the saved list itself;
+    // omitting the key entirely means config_routes.py's handle_config()
+    // leaves that list exactly as it is (see _parse_incoming_custom_databases()'s
+    // own "None means leave the saved list alone" docstring) - only the
+    // active-connection-selection fields below are this request's concern
+    // now. savePreferences() (webClient's Preferences dialog) is the only
+    // place that still sends `custom_databases`, via buildCustomDatabasesPayload().
     const payload = {
       database_name: dbNameValue,
       database_type: dbType,
       is_custom: isCustomOption,
-      custom_databases: customDatabases
-        .filter(d => isCompleteBigQuery(d) || isCompleteSnowflake(d) || isCompleteDatabricks(d) || isCompleteOracle(d) || isCompleteRedshift(d) || isCompleteMssql(d) || isCompleteSheets(d) || isCompleteMongo(d) || isCompleteSimpleUrlDb(d))
-        .map(d => {
-          if (isCompleteBigQuery(d)) {
-            return withTimeoutOverrides({
-              type: 'bigquery',
-              name: d.name,
-              project_id: d.config.project_id,
-              dataset: d.config.dataset,
-              billing_project_id: d.config.billing_project_id,
-              credentials_json: d.config.credentials_json || undefined
-            }, d);
-          }
-          if (isCompleteSnowflake(d)) {
-            return withTimeoutOverrides({
-              type: 'snowflake',
-              name: d.name,
-              account: d.config.account,
-              user: d.config.user,
-              warehouse: d.config.warehouse,
-              database: d.config.database,
-              schema: d.config.schema || undefined,
-              role: d.config.role || undefined,
-              password: d.config.password || undefined,
-              private_key: d.config.private_key || undefined,
-              private_key_passphrase: d.config.private_key_passphrase || undefined,
-            }, d);
-          }
-          if (isCompleteDatabricks(d)) {
-            return withTimeoutOverrides({
-              type: 'databricks',
-              name: d.name,
-              server_hostname: d.config.server_hostname,
-              http_path: d.config.http_path,
-              catalog: d.config.catalog || undefined,
-              schema: d.config.schema || undefined,
-              access_token: d.config.access_token || undefined,
-            }, d);
-          }
-          if (isCompleteOracle(d)) {
-            return withTimeoutOverrides({
-              type: 'oracle',
-              name: d.name,
-              host: d.config.host,
-              port: d.config.port || undefined,
-              service_name: d.config.service_name || undefined,
-              sid: d.config.sid || undefined,
-              user: d.config.user,
-              schema: d.config.schema || undefined,
-              password: d.config.password || undefined,
-              ssl: d.config.ssl || undefined,
-            }, d);
-          }
-          if (isCompleteRedshift(d)) {
-            return withTimeoutOverrides({
-              type: 'redshift',
-              name: d.name,
-              host: d.config.host,
-              port: d.config.port || undefined,
-              database: d.config.database,
-              user: d.config.user,
-              schema: d.config.schema || undefined,
-              password: d.config.password || undefined,
-            }, d);
-          }
-          if (isCompleteMssql(d)) {
-            return withTimeoutOverrides({
-              type: 'mssql',
-              name: d.name,
-              host: d.config.host,
-              port: d.config.port || undefined,
-              database: d.config.database,
-              user: d.config.user,
-              schema: d.config.schema || undefined,
-              password: d.config.password || undefined,
-              // Unlike every other optional field above (omitted via
-              // "|| undefined" when blank), "encrypt" is always sent
-              // explicitly as true/false - it's a meaningful boolean where
-              // an explicit false and an absent value are different things
-              // (see backends/mssql.py's module docstring: connect()
-              // itself defaults to True only when the key is missing
-              // entirely) - so this must never collapse to undefined.
-              encrypt: d.config.encrypt !== false,
-            }, d);
-          }
-          if (isCompleteSheets(d)) {
-            return withTimeoutOverrides({
-              type: 'sheets',
-              name: d.name,
-              spreadsheet_url: d.config.spreadsheet_url,
-              tab_name: d.config.tab_name,
-              // Optional, and only ever sent when the user actually typed
-              // one in this editing session - omitted (not sent as an
-              // empty string) so a blank textarea never clobbers an
-              // already-saved key server-side (_resolve_sheets_credentials
-              // falls back to the saved one only when nothing is provided).
-              credentials_json: d.config.credentials_json || undefined,
-            }, d);
-          }
-          if (isCompleteMongo(d)) {
-            return withTimeoutOverrides({
-              type: 'MongoDB',
-              name: d.name,
-              url: d.url,
-              database: d.config.database,
-              user: d.config.user,
-              password: d.config.password || undefined,
-            }, d);
-          }
-          const simpleUrlType = d.type === 'mysql' ? 'mysql' : 'postgres';
-          const simpleUrlOut = { type: simpleUrlType, name: d.name, url: d.url };
-          // Shared by Postgres/MySQL (see backends/postgres.py's and
-          // backends/mysql.py's module docstrings) - not a credential, so
-          // it's just carried through as-is like BigQuery's
-          // billing_project_id, not resolved via a "leave blank to keep
-          // the saved one" helper the way passwords are.
-          if (d.config && d.config.ca_cert_pem) {
-            simpleUrlOut.ca_cert_pem = d.config.ca_cert_pem;
-          }
-          // schema is Postgres-only (optional) - MySQL has no separate
-          // schema concept of its own (see backends/mysql.py's module
-          // docstring).
-          if (simpleUrlType === 'postgres' && d.config && d.config.schema) {
-            simpleUrlOut.schema = d.config.schema;
-          }
-          return withTimeoutOverrides(simpleUrlOut, d);
-        }),
     };
     if (presetId !== null) {
       payload.preset_id = presetId;
@@ -5616,11 +5779,11 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (dbExecuteTimeoutSeconds != null) payload.execute_timeout_seconds = dbExecuteTimeoutSeconds;
     }
 
-    const configSaveErrorEl = document.getElementById('configSaveError');
+    const datasetPickErrorEl = document.getElementById('datasetPickError');
 
     // Multi-database question-answering (see server/translate_routes.py's
     // module docstring): the picker is a binary single-select choice again
-    // (see renderDbRadioButtons()) - one specific connection, or one
+    // (see renderDatasetPickList()) - one specific connection, or one
     // admin-curated dataset group. in_scope_mode is what the server
     // actually keys its behavior off of (see db.py's
     // resolve_in_scope_descriptors/_resolve_group_configured_descriptors):
@@ -5630,10 +5793,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     // SPECIFIC connection still narrows scope back down to exactly that
     // one immediately, below, which is what keeps a single in-scope
     // connection's behavior byte-identical to before this feature existed.
-    const groupMode = selectedDbRadio && selectedDbRadio.value.startsWith('group:');
+    const groupMode = Boolean(value) && value.startsWith('group:');
     payload.in_scope_mode = groupMode ? 'group' : 'single';
     if (groupMode) {
-      payload.in_scope_group_id = selectedDbRadio.value.slice('group:'.length);
+      payload.in_scope_group_id = value.slice('group:'.length);
     }
 
     if (!groupMode) {
@@ -5762,9 +5925,9 @@ document.addEventListener('DOMContentLoaded', async () => {
           PINNED_CONNECTIONS = [];
         }
 
-        if (configSaveErrorEl) {
-          configSaveErrorEl.style.display = 'none';
-          configSaveErrorEl.textContent = '';
+        if (datasetPickErrorEl) {
+          datasetPickErrorEl.style.display = 'none';
+          datasetPickErrorEl.textContent = '';
         }
 
         await updateConnectionDetails(data);
@@ -5772,7 +5935,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           // The connection this save just switched to is having its schema
           // (re)fetched on the server in the background right now (see
           // config_routes.py's handle_config() - this no longer blocks the
-          // save itself, so this response/the modal dismissal below/the
+          // save itself, so this response/the dropdown closing below/the
           // dataset selection above all already happened). Track that
           // fetch to completion via the SAME {kind, id} addressing the
           // Schema Viewer's own "?" button and the chat "OPEN SCHEMA
@@ -5799,22 +5962,24 @@ document.addEventListener('DOMContentLoaded', async () => {
           database_type: dbType,
           is_custom: isCustomOption,
         });
+        return true;
       } else {
         // e.g. a custom BigQuery connection missing its required billing
         // project ID / service-account key (see config_routes.py's
         // _CUSTOM_BIGQUERY_MISSING_FIELDS_ERROR) - surfaced here rather
-        // than silently doing nothing, and the modal is kept open (see
-        // below) so the user can actually fix it.
+        // than silently doing nothing, and the dropdown is kept open (see
+        // this function's own docstring - callers only close it on a true
+        // return) so the user can actually see it.
         let errorMessage = 'Failed to save configuration.';
         try {
           const errData = await response.json();
           if (errData && errData.error) errorMessage = errData.error;
         } catch (parseErr) { /* non-JSON error body - keep the generic message */ }
-        if (configSaveErrorEl) {
-          configSaveErrorEl.textContent = errorMessage;
-          configSaveErrorEl.style.display = '';
+        if (datasetPickErrorEl) {
+          datasetPickErrorEl.textContent = errorMessage;
+          datasetPickErrorEl.style.display = '';
         }
-        closeModal = false;
+        return false;
       }
     } catch (err) {
       console.error("Failed to save backend configuration:", err);
@@ -5825,22 +5990,11 @@ document.addEventListener('DOMContentLoaded', async () => {
         // badge can't confirm it's reachable either.
         trackDbConnectionError(err && err.message);
       }
-      // Previously silent here (console.error only) other than the badge
-      // going red behind this modal - the user would see the dialog just
-      // close on them (closeModal defaults true and nothing below reset
-      // it for this path) with no clue the save actually failed. Now shown
-      // the same way an ordinary !response.ok failure already is (see the
-      // sibling `else` branch above), and the modal is kept open so
-      // there's something to actually retry against.
-      if (configSaveErrorEl) {
-        configSaveErrorEl.textContent = 'Failed to save configuration: could not reach the server.';
-        configSaveErrorEl.style.display = '';
+      if (datasetPickErrorEl) {
+        datasetPickErrorEl.textContent = 'Failed to save configuration: could not reach the server.';
+        datasetPickErrorEl.style.display = '';
       }
-      closeModal = false;
-    }
-
-    if (closeModal) {
-      closeConfigModal();
+      return false;
     }
   }
 
@@ -5852,57 +6006,251 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   function loadConfigIntoUI() {
     const config = loadConfig();
-    renderDbRadioButtons(config.dbUrl);
+    renderDatasetPickList(config.dbUrl);
     updateHistoryTurnsSubtitle();
   }
 
-  function closeConfigModal() {
-    if (configModal) configModal.classList.add('hidden');
+  // ===========================================================================
+  // DATASET PICK LIST (fetch already covered by fetchBackendConfig() - see
+  // CONFIGURED_DBS/CONFIGURED_DB_GROUPS/customDatabases/IN_SCOPE_*). An
+  // in-place dropdown anchored under #configTriggerBadge, replacing the old
+  // #configModal popup dialog per explicit request - same "click the badge,
+  // pick straight off the list, no separate Save step" pattern as the MODEL
+  // PICK LIST above, just reusing its own renderModelPickList()-adjacent
+  // CSS/markup conventions (.model-pick-group-heading/.model-pick-check/
+  // .model-pick-error) rather than its functions, since this list's own
+  // options are built from entirely different data (renderDatasetPickList()
+  // above) and its own save can be genuinely slow (see selectDataset()'s own
+  // "busy" handling below) in a way a model switch never is.
+  // ===========================================================================
+
+  function closeDatasetPickList() {
+    if (!datasetPickList || datasetPickList.classList.contains('hidden')) return;
+    datasetPickList.classList.add('hidden');
     // Chevron affordance (see .dataset-badge-caret in style.css) - every
-    // path that hides this modal runs through this one function, so
+    // path that hides this dropdown runs through this one function, so
     // setting it back to false here (rather than in each individual close
     // trigger) covers all of them in one place.
     configTriggerBadge?.setAttribute('aria-expanded', 'false');
+    // The "Composites" flyout is logically part of this same dropdown (see
+    // its own comment in index.html) even though it's a separate sibling
+    // element - closing the dropdown it hangs off of should always close
+    // it too, rather than leaving it open and orphaned behind a hidden
+    // parent.
+    closeDatasetPickCompositeSubmenu();
   }
 
-  if (configTriggerBadge && configModal) {
-    configTriggerBadge.addEventListener('click', async () => {
+  // Short grace period before a hover-driven close actually takes effect -
+  // see scheduleCloseDatasetPickCompositeSubmenu()'s own comment below for
+  // why this can't just close immediately on every mouseleave.
+  let datasetPickCompositeCloseTimer = null;
+
+  // Opens #datasetPickCompositeSubmenu as a real flyout beside
+  // #datasetPickList, positioned with inline top/left computed from
+  // `toggleBtn`'s (the "Composites" row's) own on-screen position - it has
+  // to be computed in JS rather than fixed in CSS because that row's
+  // vertical position depends on how many presets render above it, and a
+  // flyout nested inside #datasetPickList's own overflow-y: auto would get
+  // clipped the moment it tried to extend past that box's edge (see
+  // #datasetPickCompositeSubmenu's own comment in index.html for why it's
+  // a sibling instead of a child in the first place).
+  function openDatasetPickCompositeSubmenu(toggleBtn) {
+    if (!datasetPickCompositeSubmenu || !datasetPickerWrapper || !datasetPickList) return;
+    // Cancels any pending hover-triggered close from a moment ago (e.g. the
+    // pointer briefly left the toggle on its way INTO the flyout) - opening
+    // is always the "I actually want this" signal, so it always wins over
+    // a close that hasn't happened yet.
+    clearTimeout(datasetPickCompositeCloseTimer);
+    // Revealed off-screen-invisible first so the getBoundingClientRect()
+    // calls below report its real rendered size - a `display: none`
+    // element (its `.hidden` state) always measures 0x0, and flipping
+    // `visibility` back on only after the position is set below means the
+    // user never sees it jump from a wrong spot to the right one.
+    datasetPickCompositeSubmenu.classList.remove('hidden');
+    datasetPickCompositeSubmenu.style.visibility = 'hidden';
+
+    const wrapperRect = datasetPickerWrapper.getBoundingClientRect();
+    const listRect = datasetPickList.getBoundingClientRect();
+    const toggleRect = toggleBtn.getBoundingClientRect();
+    const submenuRect = datasetPickCompositeSubmenu.getBoundingClientRect();
+    const gap = 6;
+
+    // Prefers opening to the right of the main list (the requested "opens
+    // to the right" behavior) but flips to its left side instead when
+    // there genuinely isn't room - same "flip near a viewport edge" idea
+    // every native nested menu uses, since the dataset badge can sit
+    // anywhere across the header's width.
+    const fitsRight = listRect.right + gap + submenuRect.width <= window.innerWidth;
+    const left = fitsRight
+      ? listRect.right - wrapperRect.left + gap
+      : listRect.left - wrapperRect.left - gap - submenuRect.width;
+
+    // Vertically anchored to the toggle row itself (so it reads as "coming
+    // from" that row), clamped so a row near the bottom of a tall preset
+    // list doesn't push the flyout below the viewport's own bottom edge.
+    const maxTop = window.innerHeight - wrapperRect.top - submenuRect.height - gap;
+    const top = Math.max(0, Math.min(toggleRect.top - wrapperRect.top, maxTop));
+
+    datasetPickCompositeSubmenu.style.left = `${left}px`;
+    datasetPickCompositeSubmenu.style.top = `${top}px`;
+    datasetPickCompositeSubmenu.style.visibility = '';
+    toggleBtn.setAttribute('aria-expanded', 'true');
+  }
+
+  function closeDatasetPickCompositeSubmenu() {
+    clearTimeout(datasetPickCompositeCloseTimer);
+    if (!datasetPickCompositeSubmenu) return;
+    datasetPickCompositeSubmenu.classList.add('hidden');
+    const toggleBtn = document.getElementById('datasetPickCompositeToggle');
+    toggleBtn?.setAttribute('aria-expanded', 'false');
+  }
+
+  // Closing on every mouseleave of the toggle/flyout would fire the instant
+  // the pointer crosses the small gap between them (they're two separate
+  // elements, side by side, not one continuous shape) - this short delay
+  // gives it time to land back on either one before the close actually
+  // happens, canceled by openDatasetPickCompositeSubmenu()'s own
+  // clearTimeout() the moment it does. Same "grace period before closing a
+  // hover-driven flyout" idea every native nested menu uses.
+  function scheduleCloseDatasetPickCompositeSubmenu() {
+    clearTimeout(datasetPickCompositeCloseTimer);
+    datasetPickCompositeCloseTimer = setTimeout(closeDatasetPickCompositeSubmenu, 200);
+  }
+
+  // Guards against a double-click re-entering triggerConfigSave() while the
+  // first request is still in flight (that function has no re-entrancy
+  // guard of its own) - the old #configSaveBtn click handler needed the
+  // exact same guard (see its own now-removed "Saving..." treatment), just
+  // keyed off a button's native `disabled` there instead of this flag.
+  let datasetSelectInFlight = false;
+
+  // The dropdown's own click-to-select-and-save, mirroring selectModel()'s
+  // shape (select AND save immediately, close on success, stay open with
+  // the error shown on failure) but built on triggerConfigSave() rather
+  // than a hand-rolled fetch, since a dataset selection's own payload-
+  // building/dialect-completeness/session-save plumbing is both heavier
+  // and already fully implemented there (see that function's own
+  // docstring). Unlike selectModel(), this also shows a "busy" state while
+  // the request is in flight: activating a custom connection for the first
+  // time can take several real seconds (schema introspection server-side -
+  // see .dataset-pick-list-busy's own comment in style.css), not the
+  // near-instant preference flip a model switch always is.
+  async function selectDataset(value) {
+    if (!value || datasetSelectInFlight) return;
+    datasetSelectInFlight = true;
+    if (datasetPickList) datasetPickList.classList.add('dataset-pick-list-busy');
+    // The flyout gets the exact same busy treatment as the main list when
+    // it's the one a selection was actually made from - a selection there
+    // can be just as slow (same triggerConfigSave() underneath) and the
+    // flyout stays open and interactive on its own otherwise.
+    if (datasetPickCompositeSubmenu) datasetPickCompositeSubmenu.classList.add('dataset-pick-list-busy');
+    if (connDbDot) connDbDot.className = 'status-dot checking';
+    try {
+      const ok = await triggerConfigSave(value);
+      if (ok) closeDatasetPickList();
+    } finally {
+      datasetSelectInFlight = false;
+      if (datasetPickList) datasetPickList.classList.remove('dataset-pick-list-busy');
+      if (datasetPickCompositeSubmenu) datasetPickCompositeSubmenu.classList.remove('dataset-pick-list-busy');
+    }
+  }
+
+  if (configTriggerBadge && datasetPickList && datasetPickerWrapper) {
+    configTriggerBadge.addEventListener('click', async (e) => {
       // See setButtonsDisabled()'s own comment on badge-disabled - a query
-      // is in flight, so opening this modal is blocked entirely rather
+      // is in flight, so opening this dropdown is blocked entirely rather
       // than just visually grayed out (the div has no native `disabled`
       // to rely on for that).
       if (configTriggerBadge.classList.contains('badge-disabled')) return;
-      // Anonymous users may open this dialog too - they can switch between
-      // admin-configured presets AND save their own custom connections
+      e.stopPropagation();
+      // Toggle: a second click on the badge while the list is already open
+      // closes it again, same as the model pick list/more-menu/auth-avatar
+      // dropdowns.
+      if (!datasetPickList.classList.contains('hidden')) {
+        closeDatasetPickList();
+        return;
+      }
+      // Anonymous users may open this too - they can switch between
+      // admin-configured presets AND their own saved custom connections
       // (see isAnonymousUser's comment above and config_routes.py's
       // handle_config).
       await fetchBackendConfig();
-      const configSaveErrorEl = document.getElementById('configSaveError');
-      if (configSaveErrorEl) {
-        configSaveErrorEl.style.display = 'none';
-        configSaveErrorEl.textContent = '';
+      const datasetPickErrorEl = document.getElementById('datasetPickError');
+      if (datasetPickErrorEl) {
+        datasetPickErrorEl.style.display = 'none';
+        datasetPickErrorEl.textContent = '';
       }
-      configModal.classList.remove('hidden');
+      datasetPickList.classList.remove('hidden');
       configTriggerBadge.setAttribute('aria-expanded', 'true');
-      bringModalToFront(configModal);
     });
-  }
 
-  if (modalCloseBtn && configModal) {
-    modalCloseBtn.addEventListener('click', closeConfigModal);
+    // Same "click outside closes it" idiom as #modelPickList/
+    // #moreMenuDropdown elsewhere in this file.
+    document.addEventListener('click', (e) => {
+      if (!datasetPickList.classList.contains('hidden') && !datasetPickerWrapper.contains(e.target)) {
+        closeDatasetPickList();
+      }
+    });
+
+    // One delegated listener for every option button, rather than
+    // re-binding per-button on each renderDatasetPickList() call (which
+    // fully replaces #datasetPickOptions' innerHTML on every open). The
+    // "Composites" toggle's own hover/click handling is wired separately,
+    // right after it's (re-)created - see renderDatasetPickList() - since
+    // it opens the flyout rather than ever calling selectDataset().
+    datasetPickList.addEventListener('click', (e) => {
+      const optionBtn = e.target.closest('.dataset-pick-option');
+      if (!optionBtn) return;
+      selectDataset(optionBtn.dataset.value);
+    });
+
+    // Per explicit request: hovering any OTHER datasource closes the
+    // "Composites" flyout immediately (no grace period, unlike leaving the
+    // toggle/flyout itself - see scheduleCloseDatasetPickCompositeSubmenu()'s
+    // own comment) - moving onto a real option is an unambiguous "I'm
+    // choosing something else now" signal, not a brief hop across a gap.
+    // Scoped to #datasetPickOptions specifically (not .dataset-pick-submenu-
+    // toggle, which isn't a .dataset-pick-option) so hovering the toggle
+    // itself is never mistaken for "another" datasource.
+    datasetPickList.addEventListener('mouseover', (e) => {
+      if (e.target.closest('.dataset-pick-option')) closeDatasetPickCompositeSubmenu();
+    });
+
+    // The flyout's own options live outside #datasetPickList entirely (see
+    // #datasetPickCompositeSubmenu's own comment in index.html), so they
+    // need this second delegated listener rather than being reachable from
+    // the one above - same .dataset-pick-option/selectDataset() handling,
+    // just on a different container. It's also where hovering keeps the
+    // flyout open (canceling the toggle's own scheduled close while the
+    // pointer crosses into it) and where leaving it schedules the close
+    // that actually hides it again - this element is static in index.html
+    // (unlike the toggle), so these only need binding once, here.
+    if (datasetPickCompositeSubmenu) {
+      datasetPickCompositeSubmenu.addEventListener('click', (e) => {
+        const optionBtn = e.target.closest('.dataset-pick-option');
+        if (!optionBtn) return;
+        selectDataset(optionBtn.dataset.value);
+      });
+      datasetPickCompositeSubmenu.addEventListener('mouseenter', () => {
+        clearTimeout(datasetPickCompositeCloseTimer);
+      });
+      datasetPickCompositeSubmenu.addEventListener('mouseleave', () => {
+        scheduleCloseDatasetPickCompositeSubmenu();
+      });
+    }
   }
 
   // Opens the Schema Viewer for whichever connection is currently ACTIVE -
   // same {kind, id} addressing, and the same active-connection fields, as
-  // the "OPEN SCHEMA VIEWER" chat sentinel's own dispatch (see its comment
-  // a bit further down in this file). This button sits BESIDE
+  // the chat invitation link's own dispatch (openInviteAction()'s "schema"
+  // branch, further down in this file). This button sits BESIDE
   // configTriggerBadge, inside .crbot-dataset-center (see index.html's own
   // comment on it), as its own separately-sized control rather than
-  // inside the config modal on purpose: it replaced that modal's old
+  // inside the dataset picker on purpose: it replaced that picker's old
   // per-row "?" buttons, which could open the Schema Viewer for a
   // connection other than the active one (so a suggested-question prompt
   // fired from it could run against the wrong dataset) and always opened
-  // on top of the config modal (so the user had to dismiss two dialogs to
+  // on top of the dataset picker (so the user had to dismiss two dialogs to
   // see their results). A button that only ever means "the active
   // connection" can't have either problem - and sitting right next to the
   // dataset badge (rather than floating somewhere unrelated) still makes
@@ -6017,7 +6365,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       {
         target: configTriggerBadge,
         title: "This is the datasource you are addressing",
-        body: "Switch to any public datasource, connect your own private one, or pick a composite to let the agent figure out which of several to use."
+        body: "Switch to any public or private datasource, or pick a composite to let the agent figure out which of several to use."
       },
       {
         target: datasetSchemaViewerBtn,
@@ -6387,16 +6735,16 @@ document.addEventListener('DOMContentLoaded', async () => {
         clearResultsDisplay();
         break;
       case 'open_connection_picker': {
-        if (!configTriggerBadge || !configModal) return;
+        if (!configTriggerBadge || !datasetPickList) return;
         configTriggerBadge.click();
-        await liveDemoWaitFor(() => !configModal.classList.contains('hidden'));
+        await liveDemoWaitFor(() => !datasetPickList.classList.contains('hidden'));
         break;
       }
       case 'select_connection': {
         if (script.connectionId) {
           await switchActiveConnectionToPreset(script.connectionId);
         }
-        closeConfigModal();
+        closeDatasetPickList();
         break;
       }
       case 'open_schema_viewer': {
@@ -6618,7 +6966,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   // OK-only variant of showConfirmDialog() above, for the failure case -
-  // this app otherwise shows errors inline (e.g. #configSaveError), but
+  // this app otherwise shows errors inline (e.g. #datasetPickError), but
   // some flows are specified to show a real popup on failure instead.
   // Nothing to confirm/cancel here, only to acknowledge, so OK, the close
   // button, and clicking outside the modal all just dismiss it the same way.
@@ -7080,6 +7428,13 @@ document.addEventListener('DOMContentLoaded', async () => {
       // own docstring for how the two differ).
       const viewResultTrigger = e.target.closest('[data-view-result-trigger]');
       if (viewResultTrigger) jumpToResultTab(viewResultTrigger.dataset.viewResultTrigger);
+      // renderNoSqlResponse()'s own "Open the Help guide"/"Open the Schema
+      // Viewer" invitation (see inviteActionHtml()/openInviteAction()'s own
+      // docstrings) - same delegated-listener reasoning as every other
+      // trigger here (rebuilt fresh on every render, including on history
+      // replay via restoreLatestTurn()).
+      const openInviteTrigger = e.target.closest('[data-open-invite-trigger]');
+      if (openInviteTrigger) openInviteAction(openInviteTrigger.dataset.openInviteTrigger);
     });
   }
   // The header's "Send Feedback" button - a persistent element (unlike the
@@ -8756,12 +9111,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     // buttons that could open it for a connection other than the
     // active one are gone), so translatePrompt() below is guaranteed
     // to run this question against the same scope the user was just
-    // looking at. closeConfigModal() is defensive/cheap insurance in
-    // case it happened to be open underneath - it used to be the
-    // actual cause of a second dialog blocking the results view back
-    // when this dialog could be launched from inside it.
+    // looking at. closeDatasetPickList() is defensive/cheap insurance in
+    // case it happened to be open underneath - the dropdown used to be a
+    // real modal dialog that could actually block the results view back
+    // when the Schema Viewer was launched from inside it.
     closeSchemaViewer();
-    closeConfigModal();
+    closeDatasetPickList();
     aiPrompt.value = question;
     setSqlQuery('');
     translatePrompt();
@@ -9205,8 +9560,26 @@ document.addEventListener('DOMContentLoaded', async () => {
     schemaViewerPanesWrap?.classList.remove('hidden');
     if (schemaViewerFactsLine) schemaViewerFactsLine.classList.remove('hidden');
     if (schemaViewerRefreshBtnLabel) schemaViewerRefreshBtnLabel.textContent = 'Refresh Schema';
+    // A preset is a shared, admin-configured resource with no single owner
+    // (see POST /api/config/refresh-schema's own "Authorization" docstring
+    // section in config_routes.py) - refreshing it is superuser-only, same
+    // gate as a dataset group's own "Refresh Overview" button below. This
+    // disables the button WITH an explanatory tooltip up front instead of
+    // letting a non-superuser click it and only then see the 403 - see GET
+    // /api/config's own 'is_superuser' field comment (config_routes.py),
+    // which is what this is actually for; the server's own 403 is what
+    // enforces this regardless of what this button's disabled state says,
+    // so this is a UX nicety only, never itself a security boundary. A
+    // custom connection (kind === 'custom') is always this user's own, so
+    // it's never gated here.
     if (schemaViewerRefreshBtn) {
-      schemaViewerRefreshBtn.title = "Re-fetch this connection's schema (bypasses the cache)";
+      if (kind === 'preset' && !IS_SUPERUSER) {
+        schemaViewerRefreshBtn.disabled = true;
+        schemaViewerRefreshBtn.title = 'Only a superuser can refresh schema for a preset dataset.';
+      } else {
+        schemaViewerRefreshBtn.disabled = false;
+        schemaViewerRefreshBtn.title = "Re-fetch this connection's schema (bypasses the cache)";
+      }
     }
     schemaViewerModal.classList.remove('hidden');
     bringModalToFront(schemaViewerModal);
@@ -9272,10 +9645,21 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (schemaViewerColumnsBody) schemaViewerColumnsBody.innerHTML = '';
     if (schemaViewerDetailText) schemaViewerDetailText.innerHTML = '';
     if (schemaViewerOverviewWrap) schemaViewerOverviewWrap.innerHTML = '';
+    // A dataset group is just as much a shared, admin-configured resource
+    // as a preset (kind === 'group' is always superuser-gated server-side -
+    // see POST /api/config/refresh-schema's own "Authorization" docstring
+    // section) - same disable-with-tooltip treatment as openSchemaViewer()'s
+    // own preset case above, for the same reason (GET /api/config's
+    // 'is_superuser' field comment in config_routes.py).
     if (schemaViewerRefreshBtn) {
       schemaViewerRefreshBtn.classList.remove('hidden');
-      schemaViewerRefreshBtn.disabled = false;
-      schemaViewerRefreshBtn.title = "Generate (or regenerate) this dataset group's own AI-written overview (bypasses the cache)";
+      if (!IS_SUPERUSER) {
+        schemaViewerRefreshBtn.disabled = true;
+        schemaViewerRefreshBtn.title = 'Only a superuser can refresh schema for a dataset group.';
+      } else {
+        schemaViewerRefreshBtn.disabled = false;
+        schemaViewerRefreshBtn.title = "Generate (or regenerate) this dataset group's own AI-written overview (bypasses the cache)";
+      }
     }
     if (schemaViewerRefreshBtnLabel) schemaViewerRefreshBtnLabel.textContent = 'Refresh Overview';
     setSchemaViewerRefreshStatus('');
@@ -9343,27 +9727,20 @@ document.addEventListener('DOMContentLoaded', async () => {
   // question is about that one member, not the group as a whole, so the
   // active scope needs to actually become that member before
   // runSuggestedQuestionAgainstActiveScope() runs it. Reuses the exact same
-  // triggerConfigSave() the dataset picker's own radio buttons call, rather
-  // than hand-building a new POST /api/config payload here - that function
+  // triggerConfigSave() the dataset picker's own options call, rather than
+  // hand-building a new POST /api/config payload here - that function
   // already handles every dialect's own payload-building, completeness
   // checks, and session-save plumbing, so reimplementing any slice of that
   // for just this one case would risk subtly diverging from it (e.g. for a
-  // structured dialect's credential-reuse rules). Finds the matching radio
-  // input among renderDbRadioButtons()'s own rendered options (always
-  // present in the DOM once fetchBackendConfig() has run at least once -
-  // see that function's own docstring - even while the config modal itself
-  // is hidden) and only triggers a save if it wasn't already the checked
-  // one (switching among members and back is a no-op, not a redundant
-  // save). Silently does nothing if no matching radio exists (shouldn't
-  // normally happen - every preset a group can show a member for is also
-  // one of renderDbRadioButtons()'s own entries), since there's no good way
-  // to surface an error from inside a suggested-question click.
+  // structured dialect's credential-reuse rules). Only triggers a save if
+  // this preset wasn't already the active single selection (same
+  // isSelected condition renderDatasetPickList()'s own renderPresetOption()
+  // checks - switching among members and back is a no-op, not a redundant
+  // save).
   async function switchActiveConnectionToPreset(presetId) {
     if (!presetId) return;
-    const radio = document.querySelector(`input[name="db_connection_option"][value="preset:${CSS.escape(presetId)}"]`);
-    if (!radio || radio.checked) return;
-    radio.checked = true;
-    await triggerConfigSave({ closeModal: false });
+    if (!isGroupModeSelected() && IN_SCOPE_PRESET_IDS.includes(presetId)) return;
+    await triggerConfigSave(`preset:${presetId}`);
   }
 
   // Visible, non-modal "the active dataset just changed" cue for
@@ -9580,40 +9957,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         schemaViewerRefreshBtn.disabled = false;
         if (schemaViewerModalCloseBtn) schemaViewerModalCloseBtn.disabled = false;
         if (schemaViewerRefreshBtnLabel) schemaViewerRefreshBtnLabel.textContent = finishedLabel;
-      }
-    });
-  }
-
-  if (configSaveBtn) {
-    configSaveBtn.addEventListener('click', async () => {
-      // Saving a freshly-added custom connection now does real, deeper
-      // schema introspection server-side before responding (see
-      // prime_schema_cache_with_reason()'s deep fetch in db.py) - it can
-      // take several seconds where it used to be near-instant, and until
-      // now the button just sat there with no feedback for that whole
-      // stretch. Guard against a double-click re-entering triggerConfigSave()
-      // while the first request is still in flight (it has no re-entrancy
-      // guard of its own), disable every field/button in the form so
-      // nothing else can change out from under the in-flight save, and
-      // swap the button's own label to "Saving..." so it's obvious
-      // something is happening. Restored in `finally` regardless of
-      // outcome - on success the modal is about to close anyway (closeModal:
-      // true), but on a validation error (see triggerConfigSave()'s own
-      // configSaveErrorEl handling, right above this button in the DOM) the
-      // modal stays open and the user needs everything usable again to fix
-      // and retry.
-      if (configSaveBtn.disabled) return;
-      const originalLabel = configSaveBtn.textContent;
-      const formControls = configForm ? Array.from(configForm.querySelectorAll('input, select, textarea, button')) : [];
-      formControls.forEach((el) => { el.disabled = true; });
-      if (modalCloseBtn) modalCloseBtn.disabled = true;
-      configSaveBtn.textContent = 'Saving...';
-      try {
-        await triggerConfigSave({ closeModal: true });
-      } finally {
-        configSaveBtn.textContent = originalLabel;
-        formControls.forEach((el) => { el.disabled = false; });
-        if (modalCloseBtn) modalCloseBtn.disabled = false;
       }
     });
   }
@@ -10217,11 +10560,13 @@ document.addEventListener('DOMContentLoaded', async () => {
       // reopen it afterward, same toggle as before.
       const hasThoughtsContent = result.tabLabel === 'Response' && (
         result.routingText || result.combineNote || result.preQueryKnowledgeNote || result.postQueryKnowledgeNote
+        || result.semiJoinNote
       );
       if (hasThoughtsContent) {
         td.insertAdjacentHTML('beforeend', thoughtsNotesAccordionHtml({
           routingText: result.routingText, expanded: !!result.thoughtsExpanded, combineNote: result.combineNote,
           preQueryKnowledgeNote: result.preQueryKnowledgeNote, postQueryKnowledgeNote: result.postQueryKnowledgeNote,
+          semiJoinNote: result.semiJoinNote,
         }));
       }
 
@@ -10937,7 +11282,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   // `result.thoughtsExpanded` at the call site) so it survives this tab
   // being re-rendered (re-selected, or Phase C's own patch-in-place
   // render) without snapping back closed.
-  function thoughtsNotesAccordionHtml({ routingText, expanded, combineNote, preQueryKnowledgeNote, postQueryKnowledgeNote }) {
+  function thoughtsNotesAccordionHtml({ routingText, expanded, combineNote, preQueryKnowledgeNote, postQueryKnowledgeNote, semiJoinNote }) {
     // Reuses renderMarkdownLiteSummaryTab() - `routingText` carries the
     // exact same "<label>\n\nbody" (or label-only) shape triage's own
     // message always has (see SUMMARY_TAB_BLOCK_MARKER's own docstring),
@@ -10963,6 +11308,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     // markup.
     const combineHtml = (expanded && combineNote)
       ? `<div class="thoughts-notes-combine"><p>${escapeHtml(combineNote.summary)}</p><pre class="thoughts-notes-combine-sql">${escapeHtml(combineNote.sql)}</pre></div>`
+      : '';
+    // Cross-dataset semi-join / filter pushdown's own caveat (see
+    // runAllModeSemiJoinIfPending()'s own comment, and this function's own
+    // `semiJoinNote` param) - a plain sentence the client itself built
+    // (not raw LLM/SQL text), same treatment as the two knowledge-note
+    // paragraphs below: escapeHtml() alone, no <pre> block.
+    const semiJoinHtml = (expanded && semiJoinNote)
+      ? `<p class="thoughts-notes-knowledge">${escapeHtml(semiJoinNote)}</p>`
       : '';
     // General-knowledge notes - see buildPreQueryKnowledgeNote()/
     // requestSingleModeResultsSummary()'s and requestAllModeResultsSummary()'s
@@ -11003,15 +11356,34 @@ document.addEventListener('DOMContentLoaded', async () => {
           <svg class="thoughts-notes-caret" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 6 15 12 9 18"></polyline></svg>
           <span>Thoughts &amp; Notes</span>
         </button>
-        ${expanded ? `<div class="thoughts-notes-body">${bodyHtml}${preQueryKnowledgeHtml}${combineHtml}${postQueryKnowledgeHtml}</div>` : ''}
+        ${expanded ? `<div class="thoughts-notes-body">${bodyHtml}${preQueryKnowledgeHtml}${semiJoinHtml}${combineHtml}${postQueryKnowledgeHtml}</div>` : ''}
       </div>`;
   }
 
   // `hasLabel` - true when `rawText` is known to carry the "All databases"
   // mode leading-label convention (see renderMarkdownLiteSummaryTab()
   // above): the all-mode triage "answer" outcome. False for a plain
-  // single-connection NO-SQL reply, which was never asked to include one.
-  function renderNoSqlResponse(rawText, { hasLabel = false } = {}) {
+  // single-connection NO-SQL reply, which was never asked to include one -
+  // and also false for a "help"/"schema" outcome's short text EVEN in
+  // group mode, since that text is server-written (either the fixed help
+  // sentence or already-generated overview prose - see translate_routes.py's
+  // _HELP_SHORT_ANSWER/_SCHEMA_FALLBACK_TEXT_* and the "schema"/"help"
+  // branches that build `generated_sql` from them), never an LLM answer
+  // shaped "<label>\n\nbody" the way triage's own "general" outcome always
+  // is - there's no disposable leading label line here for the marker
+  // convention to correctly strip (and for the overview prose case, in
+  // particular, treating its own first line as a throwaway label would
+  // wrongly cut off real content whenever that prose happens to contain an
+  // early blank line).
+  //
+  // `inviteAction` - 'help'|'schema'|null/undefined. Set (by the triage
+  // "help"/"schema" outcome branches in translatePrompt()'s /api/translate
+  // response handler, and by restoreLatestTurn() on history replay) when
+  // this reply should end with a clickable invitation to open the fuller
+  // Help modal/Schema Viewer (see inviteActionHtml()/openInviteAction()
+  // above) - absent for every other NO-SQL reply, which ends with the
+  // usual feedback/report row only, same as before this option existed.
+  function renderNoSqlResponse(rawText, { hasLabel = false, inviteAction = null } = {}) {
     const cleanText = stripNoSqlPrefix(rawText) || rawText || '';
 
     if (resultsTabsNav) resultsTabsNav.classList.add('hidden');
@@ -11034,6 +11406,12 @@ document.addEventListener('DOMContentLoaded', async () => {
         : renderMarkdownLite(cleanText);
 
       td.appendChild(p);
+      // The "Open the Help guide"/"Open the Schema Viewer" invitation (see
+      // inviteActionHtml()'s own docstring) - placed right after the short
+      // text answer it refers to, before the feedback/report row below, so
+      // it reads as part of the same answer rather than as unrelated
+      // boilerplate underneath it.
+      td.insertAdjacentHTML('beforeend', inviteActionHtml(inviteAction));
       // Same thumbs-up/down feedback prompt the Summary tab shows once
       // Phase C's real answer has rendered (see summaryFeedbackButtonsHtml()'s
       // own docstring) - a "*** NO SQL ***" reply IS the model's complete,
@@ -11058,6 +11436,60 @@ document.addEventListener('DOMContentLoaded', async () => {
       sql: getSqlQuery(),
       content: cleanText,
     });
+  }
+
+  // The clickable invitation renderNoSqlResponse() appends under a triage
+  // "help"/"schema" outcome's short text answer (see that function's own
+  // docstring) - a <button>, not a real link, since clicking it runs
+  // openInviteAction() in place rather than navigating anywhere. Returns ''
+  // for any other/absent `inviteAction` (a plain NO-SQL reply never gets
+  // this row at all), same "nothing rendered when there's nothing to show"
+  // convention reportButtonHtml()/suggestedSearchesHtml() already use.
+  function inviteActionHtml(inviteAction) {
+    if (inviteAction !== 'help' && inviteAction !== 'schema') return '';
+    const label = inviteAction === 'help'
+      ? 'Open the Help guide'
+      : (IN_SCOPE_MODE === 'group' ? "Open this group's Schema Viewer" : 'Open the Schema Viewer');
+    // No leading newline before the opening <div> - see
+    // thoughtsNotesAccordionHtml()'s identical comment: inherited
+    // white-space: pre-wrap would otherwise render a leading "\n      "
+    // here as a literal blank line above this row.
+    return `<div class="nosql-invite-row">
+        <button type="button" class="nosql-invite-link" data-open-invite-trigger="${inviteAction}">${escapeHtml(label)} →</button>
+      </div>`;
+  }
+
+  // Resolves and opens the dialog a NO-SQL reply's invitation link (see
+  // inviteActionHtml()/the `[data-open-invite-trigger]` delegated listener
+  // below) points at - "help" always opens the (mode-agnostic) Help modal;
+  // "schema" opens whichever Schema Viewer matches the mode THIS reply was
+  // rendered under (dataset-group mode's own group viewer, or the active
+  // single connection's own viewer), using the exact same addressing each
+  // viewer's other existing open-call sites already use (CONFIGURED_DB_
+  // GROUPS/IN_SCOPE_GROUP_ID for a group; ACTIVE_IS_CUSTOM/ACTIVE_PRESET_ID/
+  // ACTIVE_CUSTOM_CONNECTION_KEY for a single connection). Silently no-ops
+  // when nothing addressable is found (an ad hoc custom connection typed
+  // as a raw URL, never saved, or a group that's no longer configured) -
+  // the short text answer has already fully rendered by the time this can
+  // ever run, so there's no "stuck with nothing at all" risk the way the
+  // old immediate-popup design had.
+  function openInviteAction(inviteAction) {
+    if (inviteAction === 'help') {
+      if (helpModal) openHelpModal();
+      return;
+    }
+    if (inviteAction === 'schema') {
+      if (IN_SCOPE_MODE === 'group') {
+        const group = CONFIGURED_DB_GROUPS.find((g) => g.id === IN_SCOPE_GROUP_ID);
+        if (group) openGroupSchemaViewer(group.id, group.name);
+      } else {
+        const schemaKind = ACTIVE_IS_CUSTOM ? 'custom' : 'preset';
+        const schemaId = ACTIVE_IS_CUSTOM ? ACTIVE_CUSTOM_CONNECTION_KEY : ACTIVE_PRESET_ID;
+        if (schemaKind && schemaId) {
+          openSchemaViewer(schemaKind, schemaId, connDbName ? connDbName.textContent : '');
+        }
+      }
+    }
   }
 
   // "All databases" mode's own combined renderer - used for history
@@ -11111,6 +11543,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     // through from history, where it's `undefined` for every turn
     // recorded before this feature existed.
     const combineNote = (notes && notes.combineNote) || null;
+    // Cross-dataset semi-join / filter pushdown's own caveat - same `|| null`
+    // reasoning as combineNote just above (see maybeFinalize()'s/
+    // captureAllModeHistory()'s own `semiJoinNote` field).
+    const semiJoinNote = (notes && notes.semiJoinNote) || null;
     // Phase B's own general-knowledge note(s) (see buildPreQueryKnowledgeNote's
     // own docstring) - prefers `notes.preQueryKnowledgeNote` (already a
     // plain string) when present, same "history restoration already has
@@ -11148,6 +11584,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       ? [{
           isText: true, tabLabel: 'Response', text: SUMMARY_TAB_BLOCK_MARKER + routingMessage,
           summaryPending: !!summaryPending, routingText, combineNote, preQueryKnowledgeNote, postQueryKnowledgeNote,
+          semiJoinNote,
           thoughtsExpanded: !!summaryPending,
         }]
       : [];
@@ -11801,6 +12238,76 @@ document.addEventListener('DOMContentLoaded', async () => {
     return result;
   }
 
+  // If every one of `xLabels` looks like a point in time - at any
+  // resolution: a bare year, a year-quarter, a year-month, a full date, or
+  // a date-time - returns them re-sorted into ascending chronological
+  // order; otherwise returns them unchanged. Used specifically for a
+  // bar/line chart's x-axis (see buildResultsChartConfig() below), never
+  // for series values (uniqueValuesInOrder's own first-seen order is
+  // right for those) - a time-based x-axis is the one case re-ordering is
+  // unambiguously correct, since SQL itself gives no guarantee the rows
+  // for a GROUP BY/JOIN query come back already sorted by it (a
+  // "one line per country" query, for instance, naturally arrives grouped
+  // by country first, with each country's own year range appended as a
+  // whole block - exactly the jumbled x-axis this function exists to fix).
+  // Anything else - a bar chart ranked by value, categories in whatever
+  // order the query's own ORDER BY or GROUP BY produced - is left exactly
+  // as uniqueValuesInOrder() found it, since forcing chronological (or any
+  // other) order onto genuinely non-temporal categories would be wrong far
+  // more often than it would help.
+  function chronologicallyOrderedXLabels(xLabels) {
+    if (xLabels.length < 2) return xLabels;
+
+    // The single most common case (see this function's own docstring
+    // example): a plain numeric year, or any other already-numeric time
+    // value (a unix timestamp, a numeric year-month like 202001, ...).
+    if (xLabels.every((v) => typeof v === 'number' && Number.isFinite(v))) {
+      return [...xLabels].sort((a, b) => a - b);
+    }
+
+    // On the off chance a row value ever arrives as a real JS Date rather
+    // than a serialized string.
+    if (xLabels.every((v) => v instanceof Date)) {
+      return [...xLabels].sort((a, b) => a.getTime() - b.getTime());
+    }
+
+    if (!xLabels.every((v) => typeof v === 'string')) return xLabels;
+
+    // String forms covering every resolution SQL commonly returns a
+    // time-ish column as. Each one is turned into a single, directly-
+    // comparable sort key (year*10000 + month*100 + day, a quarter folded
+    // onto its first month) - deliberately NOT Date.parse(), which is
+    // inconsistent across browsers for anything but a full ISO date and
+    // would silently mis-order (or NaN-and-bail) a bare year or a
+    // year-quarter.
+    const FULL_DATE = /^(\d{4})-(\d{2})-(\d{2})/; // also matches a date-time's own date prefix
+    const YEAR_MONTH = /^(\d{4})-(\d{2})$/;
+    const YEAR_QUARTER = /^(\d{4})[-\s]?Q([1-4])$/i;
+    const YEAR = /^(\d{4})$/;
+    const keyFor = (v) => {
+      let m = v.match(FULL_DATE);
+      if (m) return Number(m[1]) * 10000 + Number(m[2]) * 100 + Number(m[3]);
+      m = v.match(YEAR_MONTH);
+      if (m) return Number(m[1]) * 10000 + Number(m[2]) * 100;
+      m = v.match(YEAR_QUARTER);
+      if (m) return Number(m[1]) * 10000 + (Number(m[2]) - 1) * 300 + 1;
+      m = v.match(YEAR);
+      if (m) return Number(m[1]) * 10000;
+      return null;
+    };
+    const keys = xLabels.map(keyFor);
+    // Every label has to parse under this same scheme - one stray non-
+    // temporal value (a real category string that just happens to sit in
+    // this column) means the whole axis isn't confidently temporal, so
+    // nothing gets reordered rather than guessing wrong for everyone else.
+    if (keys.some((k) => k === null)) return xLabels;
+
+    return xLabels
+      .map((label, i) => ({ label, key: keys[i] }))
+      .sort((a, b) => a.key - b.key)
+      .map((e) => e.label);
+  }
+
   // Builds a Chart.js config object ({type, data, options}) from one
   // executed result's real rows plus its validated `visualization`
   // decision. `chart_type` is always one of "bar"/"line"/"scatter" by this
@@ -11935,8 +12442,17 @@ document.addEventListener('DOMContentLoaded', async () => {
     // dataset's values looked up per label (a row missing from a given
     // series/label combination - e.g. a region with no data for one day -
     // becomes a `null` point, which Chart.js simply skips/gaps over via
-    // spanGaps rather than plotting as a false zero).
-    const xLabels = uniqueValuesInOrder(rows.map((r) => r[viz.x_column]));
+    // spanGaps rather than plotting as a false zero). Re-sorted into
+    // ascending chronological order when the column turns out to be a time
+    // axis (see chronologicallyOrderedXLabels()'s own docstring) - plain
+    // first-seen order (what uniqueValuesInOrder alone gives you) reflects
+    // whatever the rows' own GROUP BY/JOIN order happened to be, which for
+    // a "one series per category" query is almost always grouped by that
+    // category FIRST and by time only within each one - e.g. every one of
+    // country A's years, in order, followed by every one of country B's,
+    // rather than every year in order across both - exactly the jumbled
+    // x-axis a time-series line/bar chart must never show.
+    const xLabels = chronologicallyOrderedXLabels(uniqueValuesInOrder(rows.map((r) => r[viz.x_column])));
     const lookup = new Map();
     rows.forEach((r) => {
       lookup.set(`${r[viz.x_column]}␟${viz.series_column ? r[viz.series_column] : ''}`, r);
@@ -12463,6 +12979,11 @@ document.addEventListener('DOMContentLoaded', async () => {
       // where the combine step never ran (or ran and found nothing worth
       // combining) persists a real `null` rather than `undefined`.
       combineNote: (notes && notes.combineNote) || null,
+      // Cross-dataset semi-join / filter pushdown's own caveat (see
+      // runAllModeSemiJoinIfPending()/maybeFinalize()'s own
+      // `notes.semiJoinNote`) - same `|| null` reasoning as combineNote
+      // just above.
+      semiJoinNote: (notes && notes.semiJoinNote) || null,
       // Phase B's general-knowledge note(s) (see buildPreQueryKnowledgeNote's
       // own docstring) - `notes.preQueryKnowledgeNote` is already the
       // computed string by this point for every call site (maybeFinalize()
@@ -12536,8 +13057,19 @@ document.addEventListener('DOMContentLoaded', async () => {
     // GA fan-out tracking (see trackAllModeFanoutTranslate's own comment) -
     // one real translate call is about to happen (or has just been kicked
     // off server-side) per connection here, regardless of how each one
-    // eventually turns out (sql/note/failed).
-    trackAllModeFanoutTranslate(connectionSelection);
+    // eventually turns out (sql/note/failed). EXCLUDES any connection
+    // flagged `pending_semi_join` (see connection_selection's own comment
+    // in translate_routes.py) - that connection's own Phase B call was
+    // deliberately NOT submitted this round (it's excluded from
+    // _run_phase_b_fanout entirely - see that module's docstring), so
+    // counting it here would be firing a "translate call submitted" event
+    // for a call that doesn't happen until (and unless)
+    // runAllModeSemiJoinIfPending() below actually makes it, later in this
+    // same turn. That function fires its own 'translate_submitted' event
+    // immediately before it actually calls /api/generate-semi-join-sql,
+    // so this still counts exactly once per real call, just at the real
+    // moment instead of guessing one will happen here.
+    trackAllModeFanoutTranslate(connectionSelection.filter((e) => !e.pending_semi_join));
     allModeStreamState = {
       prompt: promptText,
       routingMessage: evt.routing_message || null,
@@ -12613,9 +13145,17 @@ document.addEventListener('DOMContentLoaded', async () => {
     const summaryTab = allModeStreamState.routingMessage
       ? [{ isText: true, tabLabel: 'Response', text: SUMMARY_TAB_BLOCK_MARKER + allModeStreamState.routingMessage, summaryPending: true, routingText: allModeStreamState.routingMessage, thoughtsExpanded: true }]
       : [];
+    // A `pending_semi_join` connection (see connection_selection's own
+    // comment server-side) gets a distinct label - it genuinely isn't
+    // being fetched yet (its own Phase B call was never even submitted
+    // this round), it's waiting on another connection's real results
+    // before runAllModeSemiJoinIfPending() below can even ask for its SQL.
+    // Found by (kind, id), same lookup findAllModePendingIndex() already
+    // uses everywhere else - no separate flag needed on the tab object
+    // itself.
     const placeholderTabs = connectionSelection.map((e) => ({
       isPending: true,
-      tabLabel: 'Fetching…',
+      tabLabel: e.pending_semi_join ? 'Waiting for filter…' : 'Fetching…',
       database: { kind: e.kind, id: e.id, name: e.name },
     }));
     currentResultsList = [...summaryTab, ...placeholderTabs];
@@ -13020,6 +13560,252 @@ document.addEventListener('DOMContentLoaded', async () => {
     rerenderAllModeStream();
   }
 
+  // Cross-dataset semi-join / filter pushdown (see connection_router.py's
+  // "semi_join" triage field, translate_routes.py's own
+  // `semi_join_pending`/`pending_semi_join` fields, and
+  // semi_join_routes.py's module docstring for the full picture). Called
+  // from translatePrompt()'s router_route branch, after every auto-
+  // executed connection's own /api/execute has already resolved
+  // (state.pendingExecutions) but BEFORE maybeFinalize() - see that call
+  // site's own comment for why the ordering matters.
+  //
+  // No-ops instantly (and costs nothing) for the overwhelmingly common
+  // case where this turn had no semi_join at all
+  // (state.terminalData.semi_join_pending is null). When it's set, exactly
+  // ONE connection - `pending.dependent` - was excluded from this turn's
+  // ordinary Phase B fan-out, so it will NEVER receive its own
+  // "phase_b_connection_done" event (handlePhaseBConnectionDone() simply
+  // never runs for it); this function is the only thing that ever settles
+  // its placeholder tab and increments state.settledCount/
+  // generationSettledCount for it, one way or another, every exit path
+  // below settles it exactly once before returning.
+  //
+  // `pending.driving`'s own real, already-executed result is looked up
+  // from state.executeResults (by kind/id) - NOT re-fetched - the whole
+  // point of this design is that the driving connection's query already
+  // ran once, for real, earlier in this same turn (either via auto-execute
+  // above, or - see the early-return below - not at all, if auto-execute
+  // was off). A driving connection with more than one statement/result is
+  // rare for the kind of single, countable "the hosting country and year"
+  // style query this feature targets - the FIRST matching result is used,
+  // same simplifying assumption the design doc itself makes.
+  async function runAllModeSemiJoinIfPending(state) {
+    const pending = state && state.terminalData && state.terminalData.semi_join_pending;
+    if (!pending) return;
+    const { driving, dependent, filter_description: filterDescription } = pending;
+    const dbRef = { kind: dependent.kind, id: dependent.id, name: dependent.name };
+
+    // Settles the dependent connection's placeholder as a plain "Note"
+    // tab, same shape handlePhaseBConnectionDone()'s own 'note' branch
+    // builds - used both for an honest "couldn't filter" explanation (the
+    // early-return below) and for the generation call itself coming back
+    // with a '*** NO SQL ***'-style answer instead of real SQL.
+    const settleAsNote = (text) => {
+      const tab = {
+        isText: true, tabLabel: 'Note',
+        text: text || 'No response was returned for this database.',
+        database: dbRef,
+      };
+      replaceAllModePlaceholder({ kind: dependent.kind, id: dependent.id }, tab);
+      if (text) state.databaseNotes.push({ kind: dependent.kind, id: dependent.id, name: dependent.name, text });
+      state.generationSettledCount += 1;
+      state.settledCount += 1;
+      rerenderAllModeStream();
+    };
+    const settleAsFailure = (error) => {
+      const tab = {
+        isError: true, error: error || 'An error occurred generating SQL for this database.',
+        database: dbRef,
+      };
+      replaceAllModePlaceholder({ kind: dependent.kind, id: dependent.id }, tab);
+      state.generationFailures.push({ kind: dependent.kind, id: dependent.id, name: dependent.name, error });
+      state.generationSettledCount += 1;
+      state.settledCount += 1;
+      rerenderAllModeStream();
+    };
+
+    // The driving connection's own real rows have to have actually been
+    // fetched for this to mean anything. Two cases land here: auto-execute
+    // was off for this turn (the driving connection, like every other
+    // real-SQL connection, is just sitting in its own "Ready to execute"
+    // placeholder - see handlePhaseBConnectionDone()'s own `!state.autoExecute`
+    // branch - nothing fetches it until the user clicks Execute, which
+    // this function is never in the call path for); or auto-execute WAS on
+    // but the driving connection's own execute failed outright (no entry
+    // in state.executeResults at all - see executeOneAllModeConnection()'s
+    // own failure branches, which push to state.executeFailures instead).
+    // Either way, rather than leaving the dependent connection's "Waiting
+    // for filter…" placeholder stuck forever, settle it honestly right
+    // here with a plain explanation - a full manual-execute integration
+    // (re-triggering this same sequence once the user manually executes
+    // the driving connection) is left as a future improvement, per the
+    // design doc's own "first version" scope.
+    const drivingResult = (state.executeResults || []).find(
+      (r) => r.database && r.database.kind === driving.kind && r.database.id === driving.id
+    );
+    if (!state.autoExecute || !drivingResult) {
+      settleAsNote(
+        `Couldn't filter this database by ${filterDescription} - ` +
+        `${driving.name || 'the other database'}'s own results weren't available ` +
+        (state.autoExecute
+          ? 'this turn (its own query failed), so this database was left unanswered.'
+          : 'yet (auto-execute is off), so this database was left unanswered. ' +
+            'Turn on auto-execute, or execute both databases manually, to use this.')
+      );
+      return;
+    }
+
+    // GA fan-out tracking (see trackAllModeFanoutTranslate's own comment,
+    // and startAllModeStreaming()'s own filtered call above) - fired here,
+    // right before the real call, rather than at phase_a_route time like
+    // every other connection's, since this is the first point this
+    // connection's own translate call is actually about to happen at all.
+    const dependentType = findConnectionType(state.connectionOrder, dependent.kind, dependent.id);
+    trackEvent('translate_submitted', {
+      mode: 'group',
+      database_name: dependent.name || '',
+      database_type: dependentType,
+      provider: ACTIVE_LLM_PROVIDER || '',
+      model: ACTIVE_LLM_MODEL || '',
+    });
+
+    const identity = CURRENT_USER_IDENTITY || 'global';
+    const bucketKeySuffix = connectionBucketKey(dependent.kind, dependent.id);
+    const historyStore = chatStoresByBucket.get(`${identity}::${bucketKeySuffix}`);
+
+    let genData;
+    try {
+      const response = await fetch('/api/generate-semi-join-sql', {
+        method: 'POST',
+        headers: getApiHeaders(),
+        credentials: 'same-origin',
+        signal: currentAbortController ? currentAbortController.signal : undefined,
+        body: JSON.stringify({
+          prompt: dependent.prompt || state.prompt,
+          kind: dependent.kind,
+          id: dependent.id,
+          filter_description: filterDescription,
+          driving_result: { columns: drivingResult.columns || [], rows: drivingResult.rows || [] },
+          history: historyStore ? historyStore.toPayload() : [],
+        }),
+      });
+      genData = await readNdjsonStream(response, (evt) => {
+        if (evt.status === 'retrying') showRetryStatus(evt);
+      });
+      hideRetryStatus();
+      markServerReachable('generate_semi_join');
+      if (!response.ok || !genData || !genData.success) {
+        settleAsFailure((genData && genData.error) || 'Failed to generate SQL for this database.');
+        return;
+      }
+    } catch (err) {
+      if (err && err.name === 'AbortError') return;
+      markServerUnreachable('generate_semi_join');
+      settleAsFailure(err.message || 'Failed to reach the execution backend server.');
+      return;
+    }
+
+    if (genData.outcome !== 'sql' || !genData.sql) {
+      settleAsNote(genData.text || '');
+      return;
+    }
+
+    // Per-connection "Thoughts & Notes" general-knowledge note, if this
+    // call resolved one - folded directly into state.terminalData's own
+    // database_knowledge_notes array (mutated in place) so maybeFinalize()'s
+    // existing `notes.databaseKnowledgeNotes = (state.terminalData &&
+    // state.terminalData.database_knowledge_notes) || []` line picks it up
+    // with no changes of its own needed.
+    if (genData.knowledge_note) {
+      if (!Array.isArray(state.terminalData.database_knowledge_notes)) {
+        state.terminalData.database_knowledge_notes = [];
+      }
+      state.terminalData.database_knowledge_notes.push({
+        kind: dependent.kind, id: dependent.id, name: dependent.name, note: genData.knowledge_note,
+      });
+    }
+
+    // Honest filter-applied/filter-capped caveat (see
+    // _build_filter_context's own docstring server-side for why a capped
+    // filter falls back to a fully unfiltered query rather than a
+    // silently-truncated one) - stashed the same way onto state.terminalData
+    // so maybeFinalize() can read it into `notes.semiJoinNote`, shown in
+    // the Response tab's "Thoughts & Notes" drawer alongside the combine
+    // step's and the general-knowledge notes' own entries there.
+    if (genData.filter_capped) {
+      state.terminalData.semi_join_caveat =
+        `Couldn't filter ${dependent.name || 'this database'} by ${filterDescription} - ` +
+        `too many distinct values came back from ${driving.name || 'the other database'} ` +
+        `(${genData.filter_row_count}), so this ran as an independent, unfiltered query instead.`;
+    } else if (genData.filter_applied) {
+      state.terminalData.semi_join_caveat =
+        `Filtered ${dependent.name || 'this database'} by the real ${filterDescription} ` +
+        `${driving.name ? `${driving.name} ` : ''}returned (${genData.filter_row_count} row(s)), ` +
+        `instead of fetching it unfiltered.`;
+    }
+
+    // Slot this connection's marked SQL into its ORIGINAL position (same
+    // "keep the editor box in original connection order regardless of
+    // completion order" reasoning as handlePhaseBConnectionDone()'s own
+    // 'sql' branch) and rebuild both the editor box's text AND this turn's
+    // own persisted modelEntry.text from it - state.modelEntry.text was
+    // set from the terminal line's own `data.sql` before this connection's
+    // SQL even existed (translate_routes.py's own sql_blocks never
+    // included it - see this function's own module-level docstring), so
+    // without this, this connection's own SQL would never appear in the
+    // SQL editor or in this turn's persisted history at all.
+    const orderIndex = state.connectionOrder.findIndex(
+      (e) => e.kind === dependent.kind && e.id === dependent.id
+    );
+    if (orderIndex >= 0) state.sqlByIndex[orderIndex] = genData.sql;
+    updateSqlEditorFromAllModeState(state);
+    if (state.modelEntry) state.modelEntry.text = state.sqlByIndex.filter(Boolean).join('\n\n');
+
+    // Execute the returned SQL exactly like any other connection's own
+    // generated SQL - same /api/execute call, same result/failure shapes,
+    // same tab-splicing - executeOneAllModeConnection() above is the
+    // template this mirrors (it isn't reused directly since it's built
+    // around a "phase_b_connection_done" event object, which this
+    // connection never has one of).
+    trackAllModeFanoutExecute({ name: dependent.name, type: dependentType }, 'auto');
+    try {
+      const execResponse = await fetch('/api/execute', {
+        method: 'POST',
+        headers: getApiHeaders(),
+        credentials: 'same-origin',
+        signal: currentAbortController ? currentAbortController.signal : undefined,
+        body: JSON.stringify({ sql: genData.sql, pinned_connections: PINNED_CONNECTIONS }),
+      });
+      const execData = await execResponse.json();
+      markServerReachable('execute_all_mode');
+      const succeeded = Array.isArray(execData.results) ? execData.results : [];
+      succeeded.forEach((r) => { if (!r.database) r.database = dbRef; });
+
+      if (execResponse.ok && execData.success && succeeded.length) {
+        replaceAllModePlaceholderWithMany(dbRef, succeeded);
+        state.executeResults.push(...succeeded);
+      } else {
+        const failureInfo = (Array.isArray(execData.failures) && execData.failures[0]) || null;
+        const errMsg = (execData && execData.error) || (failureInfo && failureInfo.error)
+          || 'An error occurred during SQL execution.';
+        const failedStatement = (failureInfo && failureInfo.failedStatement) || genData.sql || '';
+        const errorTab = { isError: true, error: errMsg, statement: failedStatement, database: dbRef };
+        replaceAllModePlaceholderWithMany(dbRef, [...succeeded, errorTab]);
+        state.executeResults.push(...succeeded);
+        state.executeFailures.push({ database: dbRef, error: errMsg, failedStatement });
+      }
+    } catch (err) {
+      if (err && err.name === 'AbortError') return;
+      markServerUnreachable('execute_all_mode');
+      const errMsg = err.message || 'Failed to reach the execution backend server.';
+      replaceAllModePlaceholder(dbRef, { isError: true, error: errMsg, database: dbRef });
+      state.executeFailures.push({ database: dbRef, error: errMsg, failedStatement: genData.sql || '' });
+    }
+    state.generationSettledCount += 1;
+    state.settledCount += 1;
+    rerenderAllModeStream();
+  }
+
   // Runs once every selected connection has settled (note, generation
   // failure, or executed-or-failed) AND the terminal /api/translate line
   // has arrived (translatePrompt() stashes it onto
@@ -13076,6 +13862,13 @@ document.addEventListener('DOMContentLoaded', async () => {
       // was called with, so it's read from there rather than carried
       // since this turn started.
       needsCombination: !!(state.terminalData && state.terminalData.needs_combination),
+      // Cross-dataset semi-join / filter pushdown's own caveat (see
+      // runAllModeSemiJoinIfPending()'s own comment) - a plain sentence
+      // stashed directly onto state.terminalData by that function (if it
+      // ran at all - most turns have no semi_join, in which case this is
+      // simply absent), read here the same "pulled straight off the
+      // terminal line" way as databaseKnowledgeNotes just above.
+      semiJoinNote: (state.terminalData && state.terminalData.semi_join_caveat) || null,
     };
     // Computed synchronously, unlike combineNote/postQueryKnowledgeNote
     // below (both only known once their own async call resolves) -
@@ -13394,6 +14187,17 @@ document.addEventListener('DOMContentLoaded', async () => {
           allModeStreamState.terminalData = data;
           allModeStreamState.modelEntry = modelEntry;
           await Promise.all(allModeStreamState.pendingExecutions);
+          // Cross-dataset semi-join / filter pushdown (see
+          // data.semi_join_pending's own docstring server-side) - must run
+          // (and fully settle, one way or another) BEFORE maybeFinalize(),
+          // since that function's own guard (state.settledCount >=
+          // state.expectedTotal) can never be satisfied otherwise: the
+          // dependent connection named here was deliberately excluded from
+          // this turn's ordinary Phase B fan-out, so no
+          // "phase_b_connection_done" event (the only other thing that
+          // ever increments settledCount/generationSettledCount) will ever
+          // arrive for it.
+          await runAllModeSemiJoinIfPending(allModeStreamState);
           await maybeFinalize();
         } else {
           // No live "phase_a_route"/"phase_b_connection_done" events ever
@@ -13494,14 +14298,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
       } else if (response && response.ok && data && data.sql) {
         const trimmedSql = data.sql.trim();
-        const isOpenHelp = trimmedSql.toUpperCase().includes('OPEN HELP POPUP');
-        // Same convention as isOpenHelp/OPEN HELP POPUP above (see
-        // _COMMON_FORMAT_RULES in translate_routes.py) - a metadata
-        // question about the currently configured dataset itself ("what's
-        // in here?", "what data do you have?") now opens the Schema
-        // Viewer instead of asking the model to describe the schema back
-        // in free text/ASCII-art.
-        const isOpenSchema = trimmedSql.toUpperCase().includes('OPEN SCHEMA VIEWER');
         const isNoSql = trimmedSql.startsWith('*** NO SQL ***');
 
         const modelEntry = { role: 'model', text: data.sql };
@@ -13517,75 +14313,40 @@ document.addEventListener('DOMContentLoaded', async () => {
         // the one place both translatePrompt() and executeSql() already
         // share a reference to the SAME object across that boundary.
         modelEntry.preQueryKnowledgeNote = data.knowledge_note || null;
+        // 'help'|'schema'|null - set only for a triage "help"/"schema"
+        // outcome (see translate_routes.py's own branches for those
+        // outcomes, both in single-connection and dataset-group mode).
+        // Persisted on `modelEntry` (same pattern as preQueryKnowledgeNote
+        // just above) so restoreLatestTurn() can thread it back through to
+        // renderNoSqlResponse() on history replay too - see this field's
+        // own read site there.
+        modelEntry.inviteAction = data.invite_action || null;
         pushActiveTurn(promptText, modelEntry);
         updateHistoryTurnsSubtitle();
 
-        if (isOpenHelp) {
-          setSqlQuery('');
-          chatStore.clearPending();
-          clearResultsDisplay();
-
-          if (helpModal) {
-            openHelpModal();
-          }
-        } else if (isOpenSchema) {
-          setSqlQuery('');
-          chatStore.clearPending();
-          clearResultsDisplay();
-
-          if (IN_SCOPE_MODE === 'group') {
-            // Dataset-group mode's own "OPEN SCHEMA VIEWER" outcome (new -
-            // group-mode triage can now resolve to "schema" the same way
-            // single-connection mode already could, see connection_
-            // router.py's run_triage_call docstring) - opens the group's
-            // own Schema Viewer (the same one the dataset badge's "i" icon
-            // already opens - see openGroupSchemaViewer()'s own comment
-            // and its identical CONFIGURED_DB_GROUPS lookup elsewhere in
-            // this file), addressed by IN_SCOPE_GROUP_ID rather than
-            // ACTIVE_PRESET_ID/ACTIVE_CUSTOM_CONNECTION_KEY (those still
-            // point at the group's own synthesized primary/first member
-            // for query execution purposes, not the group as a whole).
-            const group = CONFIGURED_DB_GROUPS.find((g) => g.id === IN_SCOPE_GROUP_ID);
-            if (group) {
-              openGroupSchemaViewer(group.id, group.name);
-            } else {
-              renderNoSqlResponse(data.sql, { hasLabel: true });
-            }
-          } else {
-            // Same {kind, id} addressing the Schema Viewer's own "?" buttons
-            // use (see openSchemaViewer()'s own comment) - sourced from the
-            // active connection's own fields (kept in sync by
-            // fetchBackendConfig(); the same ones getActiveDatabaseType()/
-            // trackDbConnectionError() already read), not from anything this
-            // response itself carries, since "OPEN SCHEMA VIEWER" is about
-            // whichever connection this prompt was just asked against.
-            // Falls back to the plain NO-SQL text render when there's no
-            // addressable connection (an ad hoc custom connection typed as a
-            // raw URL, never saved - see ACTIVE_CUSTOM_CONNECTION_KEY's own
-            // declaration comment) - openSchemaViewer() itself no-ops on a
-            // missing kind/id, which would otherwise silently leave the user
-            // with no response at all.
-            const schemaKind = ACTIVE_IS_CUSTOM ? 'custom' : 'preset';
-            const schemaId = ACTIVE_IS_CUSTOM ? ACTIVE_CUSTOM_CONNECTION_KEY : ACTIVE_PRESET_ID;
-            if (schemaKind && schemaId) {
-              openSchemaViewer(schemaKind, schemaId, connDbName ? connDbName.textContent : '');
-            } else {
-              renderNoSqlResponse(data.sql, { hasLabel: false });
-            }
-          }
-        } else if (isNoSql) {
+        if (isNoSql) {
           setSqlQuery('');
           chatStore.clearPending();
           // "All databases" mode's own triage "answer" outcome (no
           // real data needed) shares this exact branch with a plain
           // single-connection reply - `data.router_route` is only ever
           // set for a "route" outcome (see the branch above) - but ONLY
-          // the all-mode case carries the leading-label convention (see
-          // renderMarkdownLiteSummaryTab()'s docstring); a single-
-          // connection reply never does. IN_SCOPE_MODE reflects the mode
-          // this very request was just sent under, which is what decides
-          // which of the two this is.
-          renderNoSqlResponse(data.sql, { hasLabel: IN_SCOPE_MODE === 'group' });
+          // the all-mode "answer" outcome carries the leading-label
+          // convention (see renderMarkdownLiteSummaryTab()'s docstring);
+          // neither a single-connection reply nor a "help"/"schema"
+          // outcome's own server-written short text ever does (see
+          // renderNoSqlResponse()'s own `hasLabel` docstring for why).
+          // IN_SCOPE_MODE reflects the mode this very request was just
+          // sent under. A "help"/"schema" outcome also used to clear the
+          // results area and pop the Help modal/Schema Viewer open
+          // immediately and unannounced here - that's gone now; it
+          // instead renders exactly like any other NO-SQL reply, with an
+          // inviteAction-driven clickable invitation to open the fuller
+          // dialog appended underneath (see inviteActionHtml()).
+          renderNoSqlResponse(data.sql, {
+            hasLabel: IN_SCOPE_MODE === 'group' && !modelEntry.inviteAction,
+            inviteAction: modelEntry.inviteAction,
+          });
         } else {
           setSqlQuery(data.sql);
           chatStore.setPending(modelEntry, normalizeSqlForCompare(data.sql));
@@ -14597,6 +15358,10 @@ document.addEventListener('DOMContentLoaded', async () => {
             // comments on these two fields.
             preQueryKnowledgeNote: lastModelEntry.allMode.preQueryKnowledgeNote,
             postQueryKnowledgeNote: lastModelEntry.allMode.postQueryKnowledgeNote,
+            // Cross-dataset semi-join / filter pushdown's own caveat, if it
+            // ran on this turn - see captureAllModeHistory()'s own comment
+            // on this field.
+            semiJoinNote: lastModelEntry.allMode.semiJoinNote,
           },
           executeResults: lastModelEntry.results || [],
           executeFailures: lastModelEntry.allMode.executeFailures || [],
@@ -14620,8 +15385,17 @@ document.addEventListener('DOMContentLoaded', async () => {
           // here: a turn recorded under a mode the user has since
           // switched away from would guess wrong, a pre-existing class of
           // minor cosmetic edge case this history-restoration code
-          // already accepts elsewhere.
-          renderNoSqlResponse(sqlText, { hasLabel: IN_SCOPE_MODE === 'group' });
+          // already accepts elsewhere. `inviteAction` replays the exact
+          // same persisted field translatePrompt() stashed on this turn's
+          // `modelEntry` when it first rendered (see that field's own
+          // comment there) - a saved "help"/"schema" outcome turn
+          // restores with its short text AND its working invitation link,
+          // rather than the pre-redesign behavior of just showing raw
+          // marker text with no link at all.
+          renderNoSqlResponse(sqlText, {
+            hasLabel: IN_SCOPE_MODE === 'group' && !lastModelEntry.inviteAction,
+            inviteAction: lastModelEntry.inviteAction || null,
+          });
         } else {
           setSqlQuery(sqlText);
 
@@ -14713,10 +15487,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   // True once a turn has actually finished - mirrors restoreLatestTurn()'s
   // own "alreadyExecuted"/isNoSql reasoning, so the Share button never
   // appears for a turn that's still mid-flight (SQL generated but not yet
-  // run) or a non-answer pseudo-turn (Help/Schema Viewer trigger - see
-  // translatePrompt()'s own isOpenHelp/isOpenSchema checks, neither of
-  // which ever sets `.results`, `.allMode`, or a "*** NO SQL ***"-prefixed
-  // `.text`).
+  // run). A triage "help"/"schema" outcome counts as shareable too, same
+  // as any other NO-SQL reply - it's a real, complete short-text answer
+  // now (see translate_routes.py's/renderNoSqlResponse()'s own
+  // `inviteAction` comments), not the old silent modal-popup it used to
+  // be.
   function turnIsShareable(modelEntry) {
     if (!modelEntry) return false;
     if (modelEntry.allMode) return true;

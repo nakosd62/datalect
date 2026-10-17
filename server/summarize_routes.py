@@ -66,7 +66,7 @@ import time
 from flask import Blueprint, request, jsonify, Response, stream_with_context
 
 from app_config import logger, state_store, MAX_TRANSLATION_ATTEMPTS
-from auth import get_or_create_session_id, get_current_user_identity, apply_session_cookie
+from auth import get_or_create_session_id, get_current_user_identity, apply_session_cookie, is_superuser
 from db import (
     resolve_conn_str, get_database_schema, resolve_descriptor_by_reference,
     resolve_dataset_identity, resolve_group_identity,
@@ -99,7 +99,7 @@ import cancel_registry
 from concurrency_guard import TRANSLATE_GUARD, busy_response
 from rate_limiter import summarize_rate_limit
 from prompt_loader import load_prompt
-from llm_providers import format_results_table_text, format_llm_error_for_user, get_llm_provider
+from llm_providers import format_results_table_text, format_llm_error_for_user, get_llm_provider, _default_fleet_provider
 from chart_helpers import _pick_chartable_results, _describe_chartable_results, _clean_visualizations
 
 summarize_bp = Blueprint('summarize', __name__)
@@ -1010,12 +1010,23 @@ def summarize_results():
     user_identity = get_current_user_identity(session_id)
     data = request.get_json() or {}
 
+    # session_data is resolved unconditionally either way - it's also used
+    # further down below (in_scope_group_id etc.) for things unrelated to
+    # the model choice. See translate_routes.py's translate_query() for the
+    # full reasoning on the is_superuser() gate itself (same reason here: a
+    # non-superuser's request body and session-saved model are never
+    # trusted for the actual model used, only the app's one fleet-wide
+    # default is).
     session_data = state_store.get_session(user_identity)
-    provider = get_llm_provider(session_data.get('llm_provider'))
-    llm_model = (
-        data.get(provider.request_model_key) or data.get('model')
-        or session_data.get('llm_model') or provider.default_model
-    )
+    if is_superuser(user_identity):
+        provider = get_llm_provider(session_data.get('llm_provider'))
+        llm_model = (
+            data.get(provider.request_model_key) or data.get('model')
+            or session_data.get('llm_model') or provider.default_model
+        )
+    else:
+        provider = _default_fleet_provider()
+        llm_model = provider.default_model
     byok_key = state_store.get_llm_byok_key(user_identity, provider.name)
     api_key = byok_key or provider.pick_api_key()
     if not api_key:
@@ -1482,12 +1493,23 @@ def summarize_result():
     user_identity = get_current_user_identity(session_id)
     data = request.get_json() or {}
 
+    # session_data is resolved unconditionally either way - it's also used
+    # further down below (in_scope_group_id etc.) for things unrelated to
+    # the model choice. See translate_routes.py's translate_query() for the
+    # full reasoning on the is_superuser() gate itself (same reason here: a
+    # non-superuser's request body and session-saved model are never
+    # trusted for the actual model used, only the app's one fleet-wide
+    # default is).
     session_data = state_store.get_session(user_identity)
-    provider = get_llm_provider(session_data.get('llm_provider'))
-    llm_model = (
-        data.get(provider.request_model_key) or data.get('model')
-        or session_data.get('llm_model') or provider.default_model
-    )
+    if is_superuser(user_identity):
+        provider = get_llm_provider(session_data.get('llm_provider'))
+        llm_model = (
+            data.get(provider.request_model_key) or data.get('model')
+            or session_data.get('llm_model') or provider.default_model
+        )
+    else:
+        provider = _default_fleet_provider()
+        llm_model = provider.default_model
     byok_key = state_store.get_llm_byok_key(user_identity, provider.name)
     api_key = byok_key or provider.pick_api_key()
     if not api_key:

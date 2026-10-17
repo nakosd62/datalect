@@ -338,38 +338,51 @@ test.describe('translate + execute', () => {
     await expect.poll(() => currentSql(page)).toBe('');
   });
 
-  // The "OPEN HELP POPUP"/"OPEN SCHEMA VIEWER" marker conventions
-  // (client.js's isOpenHelp/isOpenSchema branches, just above the plain
-  // isNoSql branch the test above covers) had no e2e coverage at all
-  // before this pair of tests - discovered while reviewing this exact
-  // area for translate_routes.py's own two-call single-connection
-  // redesign (see that file's module-level section comment above
-  // _SINGLE_DATASET_TRIAGE_SYSTEM_INSTRUCTION): Call 1 now DECIDES the
-  // "schema"/"help" outcome via a JSON "action" field rather than a model
-  // free-typing one of these marker strings itself, but the server still
-  // constructs the exact same marker text for client.js to consume - so
-  // client.js's own handling of it is completely unchanged and, like the
-  // rest of this file, exercised here purely through mockTranslate()'s
-  // network-layer mock, independent of anything server-side.
-  test('an "OPEN HELP POPUP" reply opens the real Help modal instead of rendering as text', async ({ page }) => {
-    await mockTranslate(page, { sql: '*** NO SQL *** OPEN HELP POPUP ***' });
+  // Triage's "help"/"schema" outcomes (translate_routes.py's own
+  // `invite_action` field, built server-side from the already-generated
+  // schema overview or a fixed one-sentence app description - see that
+  // module's "short, server-written answers" comment) used to clear the
+  // results area and pop the Help modal/Schema Viewer open immediately
+  // and unannounced (client.js's old isOpenHelp/isOpenSchema branches).
+  // That surprised users, so both outcomes now render exactly like any
+  // other NO-SQL reply - the short text answer, plus a clickable
+  // invitation link (`[data-open-invite-trigger]`) that opens the fuller
+  // dialog only when the user actually clicks it. Exercised here purely
+  // through mockTranslate()'s network-layer mock (its `extra` option sets
+  // `invite_action`), independent of anything server-side.
+  test('a "help" outcome renders a short answer with a clickable invitation to open the Help modal', async ({ page }) => {
+    await mockTranslate(page, {
+      sql: '*** NO SQL *** Datalect Agent answers your questions about a connected datasource by translating them into SQL.',
+      extra: { invite_action: 'help' },
+    });
     await gotoApp(page);
 
     await page.locator('#aiPrompt').fill('how do I use this app?');
     await page.locator('#aiPrompt').press('Enter');
 
+    // The short text answer itself renders, same as any other NO-SQL
+    // reply - nothing pops open on its own.
+    await expect(page.locator('.response-text')).toContainText('Datalect Agent answers your questions');
+    await expect(page.locator('#helpModal')).toHaveClass(/hidden/);
+
+    const invite = page.locator('[data-open-invite-trigger="help"]');
+    await expect(invite).toBeVisible();
+    await invite.click();
+
     await expect(page.locator('#helpModal')).not.toHaveClass(/hidden/);
-    // Never falls through to the plain NO-SQL text render alongside it.
-    await expect(page.locator('.response-text')).toHaveCount(0);
     await expect.poll(() => currentSql(page)).toBe('');
   });
 
-  test('an "OPEN SCHEMA VIEWER" reply opens the real Schema Viewer modal instead of rendering as text', async ({ page }) => {
-    await mockTranslate(page, { sql: '*** NO SQL *** OPEN SCHEMA VIEWER ***' });
-    // openSchemaViewer() (client.js) fetches the real Schema Viewer's own
-    // data source - mocked here the same minimal way schema-viewer.spec.js
-    // does for its own tests, since this spec only cares that client.js
-    // actually reaches the modal, not what the modal then renders from it.
+  test('a "schema" outcome renders a short answer with a clickable invitation to open the Schema Viewer', async ({ page }) => {
+    await mockTranslate(page, {
+      sql: "*** NO SQL *** I don't have a generated overview of this datasource's schema yet, but you can browse its tables and columns directly.",
+      extra: { invite_action: 'schema' },
+    });
+    // openSchemaViewer() (client.js), reached once the invitation link
+    // below is clicked, fetches the real Schema Viewer's own data source -
+    // mocked here the same minimal way schema-viewer.spec.js does for its
+    // own tests, since this spec only cares that client.js actually
+    // reaches the modal, not what the modal then renders from it.
     await page.route('**/api/schema*', async (route) => {
       if (route.request().method() !== 'GET') return route.fallback();
       await route.fulfill({
@@ -394,8 +407,14 @@ test.describe('translate + execute', () => {
     await page.locator('#aiPrompt').fill('what is in this dataset?');
     await page.locator('#aiPrompt').press('Enter');
 
+    await expect(page.locator('.response-text')).toContainText("I don't have a generated overview");
+    await expect(page.locator('#schemaViewerModal')).toHaveClass(/hidden/);
+
+    const invite = page.locator('[data-open-invite-trigger="schema"]');
+    await expect(invite).toBeVisible();
+    await invite.click();
+
     await expect(page.locator('#schemaViewerModal')).not.toHaveClass(/hidden/);
-    await expect(page.locator('.response-text')).toHaveCount(0);
     await expect.poll(() => currentSql(page)).toBe('');
   });
 
@@ -529,7 +548,7 @@ test.describe('translate + execute', () => {
     // Not just visually grayed out - actually inert. Clicking either while
     // disabled must not open its modal/pick list.
     await dbBadge.click();
-    await expect(page.locator('#configModal')).toHaveClass(/hidden/);
+    await expect(page.locator('#datasetPickList')).toHaveClass(/hidden/);
     await modelBadge.click();
     await expect(page.locator('#modelPickList')).toHaveClass(/hidden/);
     // An unrelated icon (history) stays fully enabled the whole time - its

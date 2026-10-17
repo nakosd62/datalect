@@ -452,26 +452,17 @@ test.describe('chart dual y-axes for wildly different scales', () => {
 // Chart discoverability: the Summary tab takes over focus the instant a
 // turn's results arrive (see prependSingleModeSummaryTab()), so a chart
 // sitting on the other, now-inactive data tab is otherwise invisible unless
-// the user happens to click around the tab strip. The model plants its own
-// "[<phrase>](chart:<index>)" link inline in its summary prose wherever it
-// wants to point at a chart (see server/prompts/summary_single_connection.txt's
-// "visualizations" paragraph and chart_helpers.py's _clean_visualization) -
-// client.js turns that into a clickable `.summary-chart-inline-link` (see
-// applyInlineChartLinks()) that jumps to the chartable tab via
-// jumpToChartableResultTab(). There's deliberately no automatic, always-on
-// mini chart rendered inline in the Summary tab any more - see style.css's
-// own comment above .summary-chart-inline-link for why that (the old
-// .summary-chart-inline-preview/.summary-chart-preview-grid) was removed:
-// it rendered poorly at that size and never showed anything the inline
-// link next to it didn't already say. Discoverability now rides entirely
-// on the model choosing to link the phrase that earned the chart, not a
-// bolted-on preview widget.
-test.describe('single-connection mode: chart discoverability (Summary inline chart link)', () => {
-  test('a chartable result\'s summary link jumps to the chart tab, rendering the full chart on click', async ({ page }) => {
+// the user happens to click around the tab strip. See client.js's
+// buildResultsTabsNav() (the tab-strip badge) and renderSummaryInlineChart()/
+// jumpToChartableResultTab() (the Summary tab's own small, clickable chart
+// preview - rendered directly under the summary text, not a separate boxed
+// callout elsewhere on the page).
+test.describe('single-connection mode: chart discoverability (Summary inline chart preview)', () => {
+  test('a chartable result gets a small chart preview at the end of the Summary text', async ({ page }) => {
     await mockTranslate(page, { sql: 'SELECT day, signups FROM daily_signups;' });
     await mockExecute(page, { results: CHARTABLE_RESULTS });
     await mockSummarizeResult(page, {
-      summary: '*** NO SQL *** Results Summary\n\n[Signups trended upward](chart:0) this week.',
+      summary: '*** NO SQL *** Results Summary\n\nSignups trended upward this week.',
       visualization: CHARTABLE_VISUALIZATION,
     });
     await gotoApp(page);
@@ -480,33 +471,50 @@ test.describe('single-connection mode: chart discoverability (Summary inline cha
     await page.locator('#aiPrompt').press('Enter');
     await expect(page.locator('.response-text')).toContainText('Signups trended upward', { timeout: 10000 });
 
-    // The model's own inline link, planted mid-sentence - not a separate
-    // boxed preview, and nothing is rendered onto a live canvas yet (the
-    // chartable tab itself hasn't been visited).
-    const link = page.locator('.summary-chart-inline-link');
-    await expect(link).toBeVisible();
-    await expect(link).toHaveText('Signups trended upward');
-    expect(await page.evaluate(() => window.__chartInstanceCount)).toBe(0);
-
-    await link.click();
-
-    await expect(page.locator('#resultsTabsNav .result-tab-btn').nth(1)).toHaveClass(/active/);
-    await expect(page.locator('#resultsChartWrapper')).not.toHaveClass(/hidden/);
-    const config = await page.evaluate(() => window.__lastChartConfig);
-    expect(config.type).toBe('line');
-    expect(config.data.labels).toEqual(['Mon', 'Tue', 'Wed']);
+    // Summary tab is active by default - the mini chart preview must
+    // already be rendered right here, with no click needed to discover the
+    // chart. It's a live Chart.js instance (the fake `Chart` from
+    // fixtures.js's CHART.JS NETWORK ISOLATION setup), built from the exact
+    // same visualization data the full-tab chart would use.
+    const preview = page.locator('.summary-chart-inline-preview');
+    await expect(preview).toBeVisible();
+    await expect(page.locator('.summary-chart-inline-preview-canvas')).toHaveCount(1);
+    expect(await page.evaluate(() => window.__lastChartConfig.type)).toBe('line');
+    expect(await page.evaluate(() => window.__lastChartConfig.data.labels)).toEqual(['Mon', 'Tue', 'Wed']);
     expect(await page.evaluate(() => window.__chartInstanceCount)).toBe(1);
-    // The tab's own full chart, not a stripped-down preview variant - axis
-    // titles show, same as this file's other Table/Chart toggle tests.
-    expect(config.options.scales.x.title.display).toBe(true);
-    expect(config.options.scales.y.title.display).toBe(true);
   });
 
-  test('clicking the chart link jumps to the chartable tab and forces chart view even if it was switched to table', async ({ page }) => {
+  test('the compact preview drops axis titles that the full-tab chart shows', async ({ page }) => {
     await mockTranslate(page, { sql: 'SELECT day, signups FROM daily_signups;' });
     await mockExecute(page, { results: CHARTABLE_RESULTS });
     await mockSummarizeResult(page, {
-      summary: '*** NO SQL *** Results Summary\n\n[Signups trended upward](chart:0) this week.',
+      summary: '*** NO SQL *** Results Summary\n\nSignups trended upward this week.',
+      visualization: CHARTABLE_VISUALIZATION,
+    });
+    await gotoApp(page);
+
+    await page.locator('#aiPrompt').fill('how did signups trend this week');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect(page.locator('.response-text')).toContainText('Signups trended upward', { timeout: 10000 });
+
+    // Summary tab's own compact preview, still on screen right now.
+    const previewConfig = await page.evaluate(() => window.__lastChartConfig);
+    expect(previewConfig.options.scales.x.title.display).toBe(false);
+    expect(previewConfig.options.scales.y.title.display).toBe(false);
+    expect(previewConfig.options.events).toEqual([]);
+
+    // The full-tab chart for the very same data keeps its axis titles.
+    await page.locator('#resultsTabsNav .result-tab-btn').nth(1).click();
+    const fullConfig = await page.evaluate(() => window.__lastChartConfig);
+    expect(fullConfig.options.scales.x.title.display).toBe(true);
+    expect(fullConfig.options.scales.y.title.display).toBe(true);
+  });
+
+  test('clicking the chart preview jumps to the chartable tab, already showing the chart', async ({ page }) => {
+    await mockTranslate(page, { sql: 'SELECT day, signups FROM daily_signups;' });
+    await mockExecute(page, { results: CHARTABLE_RESULTS });
+    await mockSummarizeResult(page, {
+      summary: '*** NO SQL *** Results Summary\n\nSignups trended upward this week.',
       visualization: CHARTABLE_VISUALIZATION,
     });
     await gotoApp(page);
@@ -516,16 +524,16 @@ test.describe('single-connection mode: chart discoverability (Summary inline cha
     await expect(page.locator('.response-text')).toContainText('Signups trended upward', { timeout: 10000 });
 
     // Manually flip the (as-yet-unvisited) data tab to Table first, so the
-    // link's own "force chart view" behavior (see jumpToChartableResultTab()'s
-    // comment) is actually exercised rather than coincidentally matching the
-    // model's own Chart-by-default choice.
+    // preview's own "force chart view" behavior (see
+    // jumpToChartableResultTab()'s comment) is actually exercised rather
+    // than coincidentally matching the model's own Chart-by-default choice.
     await page.locator('#resultsTabsNav .result-tab-btn').nth(1).click();
     await page.locator('.results-view-toggle-btn[data-view="table"]').click();
     await expect(page.locator('#resultsTableWrapper')).not.toHaveClass(/hidden/);
 
-    // Back to the Summary tab, then click its chart link.
+    // Back to the Summary tab, then click its chart preview.
     await page.locator('#resultsTabsNav .result-tab-btn').nth(0).click();
-    await page.locator('.summary-chart-inline-link').click();
+    await page.locator('.summary-chart-inline-preview').click();
 
     await expect(page.locator('#resultsTabsNav .result-tab-btn').nth(1)).toHaveClass(/active/);
     await expect(page.locator('#resultsChartWrapper')).not.toHaveClass(/hidden/);
@@ -534,7 +542,7 @@ test.describe('single-connection mode: chart discoverability (Summary inline cha
     expect(await page.evaluate(() => window.__chartInstanceCount)).toBe(1);
   });
 
-  test('no inline chart link at all when the result is not chartable', async ({ page }) => {
+  test('no inline chart preview at all when the result is not chartable', async ({ page }) => {
     await mockTranslate(page, { sql: 'SELECT COUNT(*) AS n FROM signups;' });
     await mockExecute(page, { results: [{ columns: ['n'], rows: [{ n: 42 }], rowCount: 1 }] });
     await mockSummarizeResult(page, {
@@ -547,19 +555,17 @@ test.describe('single-connection mode: chart discoverability (Summary inline cha
     await page.locator('#aiPrompt').press('Enter');
     await expect(page.locator('.response-text')).toContainText('42 signups', { timeout: 10000 });
 
+    await expect(page.locator('.summary-chart-inline-preview')).toHaveCount(0);
     await expect(page.locator('.summary-chart-inline-link')).toHaveCount(0);
   });
 
-  test('a multi-statement script with two independently chartable results gets its own inline link for each, each jumping to its own tab', async ({ page }) => {
+  test('a multi-statement script with two independently chartable results gets its own captioned preview for each, each jumping to its own tab', async ({ page }) => {
     // Regression coverage for the core multi-chart fix (see chart_helpers.
     // py's _pick_chartable_results): a two-statement script where BOTH
-    // statements' results independently qualify for a chart must let the
-    // model link BOTH of them inline, each with its own caption phrase - and
-    // each link must jump to ITS OWN tab, not always the first (see
-    // jumpToChartableResultTab()'s own `index` param, and
-    // attachVisualizationsToResultsList()'s `visualizationIndex` tagging
-    // that makes that lookup exact regardless of the Summary tab's own
-    // +1 position shift).
+    // statements' results independently qualify for a chart must show TWO
+    // previews on the Summary tab, not just one - and each preview must
+    // jump to ITS OWN tab, not always the first (see
+    // jumpToChartableResultTab()'s own `index` param).
     await mockTranslate(page, { sql: 'SELECT day, signups FROM daily_signups; SELECT region, revenue FROM regional_revenue;' });
     await mockExecute(page, {
       results: [
@@ -574,7 +580,7 @@ test.describe('single-connection mode: chart discoverability (Summary inline cha
         contentType: 'application/json',
         body: JSON.stringify({
           success: true,
-          summary: '*** NO SQL *** [Signups trended upward](chart:0), and [revenue split evenly across regions](chart:1).',
+          summary: '*** NO SQL *** Signups trended upward, and revenue split evenly across regions.',
           visualizations: {
             '0': { chart_type: 'line', x_column: 'day', y_columns: ['signups'], series_column: null },
             '1': { chart_type: 'bar', x_column: 'region', y_columns: ['revenue'], series_column: null },
@@ -588,25 +594,131 @@ test.describe('single-connection mode: chart discoverability (Summary inline cha
     await page.locator('#aiPrompt').press('Enter');
     await expect(page.locator('.response-text')).toContainText('Signups trended upward', { timeout: 10000 });
 
-    // Two distinct inline links on the Summary tab, each the model's own
-    // caption phrase, not an auto-generated "Query 1"/"Query 2" label.
-    const links = page.locator('.summary-chart-inline-link');
-    await expect(links).toHaveCount(2);
-    await expect(links.nth(0)).toHaveText('Signups trended upward');
-    await expect(links.nth(1)).toHaveText('revenue split evenly across regions');
+    // Two previews on the Summary tab, each with its own distinguishing
+    // caption (only shown at all once there's more than one preview).
+    const previews = page.locator('.summary-chart-inline-preview');
+    await expect(previews).toHaveCount(2);
+    await expect(page.locator('.summary-chart-inline-preview-caption')).toHaveCount(2);
+    await expect(previews.nth(0).locator('.summary-chart-inline-preview-caption')).toHaveText('Query 1');
+    await expect(previews.nth(1).locator('.summary-chart-inline-preview-caption')).toHaveText('Query 2');
 
-    // Clicking the SECOND link jumps to the SECOND data tab (index 2:
+    // Clicking the SECOND preview jumps to the SECOND data tab (index 2:
     // Summary, Query 1, Query 2), not the first.
-    await links.nth(1).click();
+    await previews.nth(1).click();
     await expect(page.locator('#resultsTabsNav .result-tab-btn').nth(2)).toHaveClass(/active/);
     expect(await page.evaluate(() => window.__lastChartConfig.type)).toBe('bar');
     await expect(page.locator('#resultsChartWrapper')).not.toHaveClass(/hidden/);
 
-    // Back to the Summary tab, then the FIRST link jumps to the FIRST data
-    // tab instead.
+    // Back to the Summary tab, then the FIRST preview jumps to the FIRST
+    // data tab instead.
     await page.locator('#resultsTabsNav .result-tab-btn').nth(0).click();
-    await links.nth(0).click();
+    await previews.nth(0).click();
     await expect(page.locator('#resultsTabsNav .result-tab-btn').nth(1)).toHaveClass(/active/);
     expect(await page.evaluate(() => window.__lastChartConfig.type)).toBe('line');
+  });
+});
+
+test.describe('chart x-axis chronological ordering', () => {
+  test('a numeric-year x-axis is sorted into ascending chronological order even when the underlying rows arrive grouped by series first, not already time-ordered', async ({ page }) => {
+    // Regression coverage for buildResultsChartConfig()'s
+    // chronologicallyOrderedXLabels() step. Mirrors the exact shape that
+    // produces a jumbled axis in practice: a "one series per category" query
+    // naturally comes back as one contiguous block of rows per series (here,
+    // per country), with that series' own years in whatever order THAT block
+    // happened to list them in (not necessarily ascending) - so the first-seen
+    // order alone (year 2022, then 2020, then 2021, from country A's block)
+    // is what the x-axis would show without this fix, and a second series'
+    // (country B's) own years arrive later but are already-seen duplicates
+    // that add nothing to that first-seen order.
+    await mockTranslate(page, { sql: 'SELECT country, year, population FROM country_population;' });
+    await mockExecute(page, {
+      results: [{
+        columns: ['country', 'year', 'population'],
+        rows: [
+          { country: 'A', year: 2022, population: 100 },
+          { country: 'A', year: 2020, population: 90 },
+          { country: 'A', year: 2021, population: 95 },
+          { country: 'B', year: 2020, population: 50 },
+          { country: 'B', year: 2021, population: 55 },
+          { country: 'B', year: 2022, population: 60 },
+        ],
+        rowCount: 6,
+      }],
+    });
+    await mockSummarizeResult(page, {
+      summary: '*** NO SQL *** Results Summary\n\nPopulation grew in both countries.',
+      visualization: { chart_type: 'line', x_column: 'year', y_columns: ['population'], series_column: 'country' },
+    });
+    await gotoApp(page);
+
+    await page.locator('#aiPrompt').fill('how did population change by country');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect(page.locator('.response-text')).toContainText('Population grew', { timeout: 10000 });
+    await page.locator('#resultsTabsNav .result-tab-btn').nth(1).click();
+    await expect(page.locator('#resultsChartWrapper')).not.toHaveClass(/hidden/);
+
+    const config = await page.evaluate(() => window.__lastChartConfig);
+    expect(config.data.labels).toEqual([2020, 2021, 2022]);
+  });
+
+  test('an ISO date-string x-axis (any sub-day resolution) is likewise sorted into ascending chronological order', async ({ page }) => {
+    await mockTranslate(page, { sql: "SELECT month, revenue FROM monthly_revenue;" });
+    await mockExecute(page, {
+      results: [{
+        columns: ['month', 'revenue'],
+        rows: [
+          { month: '2023-03', revenue: 300 },
+          { month: '2023-01', revenue: 100 },
+          { month: '2023-02', revenue: 200 },
+        ],
+        rowCount: 3,
+      }],
+    });
+    await mockSummarizeResult(page, {
+      summary: '*** NO SQL *** Results Summary\n\nRevenue rose steadily.',
+      visualization: { chart_type: 'bar', x_column: 'month', y_columns: ['revenue'], series_column: null },
+    });
+    await gotoApp(page);
+
+    await page.locator('#aiPrompt').fill('how did monthly revenue trend');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect(page.locator('.response-text')).toContainText('Revenue rose', { timeout: 10000 });
+    await page.locator('#resultsTabsNav .result-tab-btn').nth(1).click();
+    await expect(page.locator('#resultsChartWrapper')).not.toHaveClass(/hidden/);
+
+    const config = await page.evaluate(() => window.__lastChartConfig);
+    expect(config.data.labels).toEqual(['2023-01', '2023-02', '2023-03']);
+  });
+
+  test('a genuinely categorical (non-temporal) x-axis is left in its original, unsorted order - no over-eager reordering', async ({ page }) => {
+    // Regression guard: the chronological re-sort must not fire for a column
+    // that merely happens to look like it could be ranked/categorical. Using
+    // region names here (not remotely date-like) so there is no ambiguity.
+    await mockTranslate(page, { sql: 'SELECT region, revenue FROM regional_revenue;' });
+    await mockExecute(page, {
+      results: [{
+        columns: ['region', 'revenue'],
+        rows: [
+          { region: 'west', revenue: 500 },
+          { region: 'east', revenue: 480 },
+          { region: 'north', revenue: 300 },
+        ],
+        rowCount: 3,
+      }],
+    });
+    await mockSummarizeResult(page, {
+      summary: '*** NO SQL *** Results Summary\n\nWest led in revenue.',
+      visualization: { chart_type: 'bar', x_column: 'region', y_columns: ['revenue'], series_column: null },
+    });
+    await gotoApp(page);
+
+    await page.locator('#aiPrompt').fill('how did revenue break down by region');
+    await page.locator('#aiPrompt').press('Enter');
+    await expect(page.locator('.response-text')).toContainText('West led', { timeout: 10000 });
+    await page.locator('#resultsTabsNav .result-tab-btn').nth(1).click();
+    await expect(page.locator('#resultsChartWrapper')).not.toHaveClass(/hidden/);
+
+    const config = await page.evaluate(() => window.__lastChartConfig);
+    expect(config.data.labels).toEqual(['west', 'east', 'north']);
   });
 });

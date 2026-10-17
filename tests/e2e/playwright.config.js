@@ -117,7 +117,7 @@ module.exports = {
       // dependency deterministic) silently changes the default active
       // connection and schema-viewer/dataset-group behavior for EVERY
       // OTHER spec too - broke 14 previously-passing tests across
-      // config-modal.spec.js, chat-history-persistence.spec.js, and
+      // dataset-picker.spec.js, chat-history-persistence.spec.js, and
       // schema-viewer.spec.js, all of which assume the single-synthetic-
       // "Default DB" fallback this comment describes. There is no
       // per-spec-file override of this shared server's env in this

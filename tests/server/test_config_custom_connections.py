@@ -216,6 +216,74 @@ def test_authenticated_user_still_never_sees_an_anonymous_visitors_custom_connec
     assert data['custom_databases'] == []
 
 
+# --- connection_key stability across a Settings-only rename --------------------
+
+def test_settings_only_rename_preserves_connection_key_and_stays_active(app_env):
+    """Phase 1 of the "Bring Your Own Data" relocation: savePreferences()
+    (webClient's Preferences dialog) now sends a POST with ONLY
+    `custom_databases` - no database_name/database_type/is_custom/other
+    active-selection field at all (see config_routes.py's handle_config():
+    the saved-connection LIST and "which connection is active this
+    request" are fully independent concerns). Renaming the CURRENTLY
+    ACTIVE custom connection through exactly that payload shape must reuse
+    its own already-saved connection_key (see
+    _parse_incoming_custom_databases()'s _stable_key()) rather than
+    recomputing a fresh one from the new name - otherwise the session's
+    stored connection_id (and in_scope_custom_connection_keys) would
+    silently point at a connection_key that no longer exists in the saved
+    list, orphaning the active connection the moment a GET is made, with
+    no error anywhere. Contrast with
+    test_connection_scope.py's test_post_config_reconciles_stale_in_scope_key_when_renaming_the_scoped_custom_connection,
+    which covers the OLD combined-request shape (rename bundled with
+    database_name/is_custom in the SAME POST, and no connection_key on the
+    custom_databases row) - there, a fresh key is expected and the in-scope
+    array is reconciled to it. Here, the row resends its own connection_key
+    (exactly as client.js's buildCustomDatabasesPayload() does for an
+    already-saved row - see its own "connection_key" comment), so the key
+    must NOT change at all."""
+    login_as(app_env.client, "alice@example.com")
+
+    # Step (a): create AND activate a custom Postgres connection - plain
+    # test setup, via an ordinary combined save.
+    resp = app_env.client.post('/api/config', json={
+        "database_type": "postgres", "database_url": "postgresql://u:p@h/db",
+        "database_name": "Original Name", "is_custom": True,
+        "custom_databases": [
+            {"name": "Original Name", "type": "postgres", "url": "postgresql://u:p@h/db", "config": {}},
+        ],
+    })
+    assert resp.status_code == 200
+    before = app_env.client.get('/api/config').get_json()
+    old_key = before["active_custom_connection_key"]
+    assert old_key
+    assert before["custom_database_name"] == "Original Name"
+    assert before["active_is_custom"] is True
+
+    # Step (b): a Settings-only rename - ONLY `custom_databases`, resending
+    # this row's own connection_key, exactly what savePreferences() sends
+    # now. No database_name/database_type/is_custom/auto_sql_execute/
+    # in_scope_* field anywhere in this payload.
+    resp2 = app_env.client.post('/api/config', json={
+        "custom_databases": [
+            {"connection_key": old_key, "name": "Renamed In Settings", "type": "postgres",
+             "url": "postgresql://u:p@h/db", "config": {}},
+        ],
+    })
+    assert resp2.status_code == 200
+
+    # Step (c): the connection_key is unchanged, and it's still resolvable
+    # as the active connection - not orphaned, not silently fallen back to
+    # the default.
+    after = app_env.client.get('/api/config').get_json()
+    assert len(after["custom_databases"]) == 1
+    assert after["custom_databases"][0]["connection_key"] == old_key
+    assert after["custom_databases"][0]["name"] == "Renamed In Settings"
+    assert after["active_custom_connection_key"] == old_key
+    assert after["active_is_custom"] is True
+    assert after["custom_database_name"] == "Renamed In Settings"
+    assert after["in_scope_custom_connection_keys"] == [old_key]
+
+
 # NOTE: the GET-side redaction of OTHER PEOPLE's preset connection strings
 # (configured_databases without URLs, etc.) for anonymous visitors is gated
 # on IS_CLOUD_RUN specifically, not just an anonymous identity, and stays in

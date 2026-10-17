@@ -30,24 +30,43 @@ const { testShowSqlVisible: test, expect, gotoApp, mockTranslate, mockExecute } 
  * actual results, not just generated SQL, before Share will do anything but
  * show its "nothing to share yet" error). Mirrors translate-execute.spec.js's
  * own "running the generated SQL renders a results table" test. */
-/** Adds and saves a real custom Postgres connection through the config
- * modal (mirrors config-modal.spec.js's own addCustomDbRow()/save flow) -
- * never actually connected to (config_routes.py's POST handler only
- * validates and persists the descriptor), but real enough to flip
- * ACTIVE_IS_CUSTOM server-side, which is what makes buildShareDatasetRef()
- * share this turn as dataset_ref.kind 'custom' below. Leaves the modal
- * closed and #connDbName reading just `${name}` (no "(<type>)" suffix -
- * see updateConnectionDetails()'s own comment on why that was dropped). */
+/** Adds, saves, AND activates a real custom Postgres connection - never
+ * actually connected to (config_routes.py's POST handler only validates
+ * and persists the descriptor), but real enough to flip ACTIVE_IS_CUSTOM
+ * server-side, which is what makes buildShareDatasetRef() share this turn
+ * as dataset_ref.kind 'custom' below.
+ *
+ * Creating/editing a custom connection's own fields lives in the
+ * Preferences dialog's "Bring Your Own Data" section (see
+ * tests/e2e/preferences-byod.spec.js's own module docstring for the full
+ * mechanics) - the dataset picker dropdown's own "Private" section is a
+ * plain, select-only list of names. So this is a genuine TWO-STEP flow,
+ * mirroring what a real user now has to do: (1) open Preferences, add the
+ * row, fill its name/url, and save there (this persists the connection but
+ * does NOT change which one is active); (2) separately open the dataset
+ * picker dropdown, and click the newly-saved connection by name - this
+ * selects AND saves (activates) it immediately, no separate Save step.
+ * Leaves both dialogs closed and #connDbName reading just `${name}` (no
+ * "(<type>)" suffix - see updateConnectionDetails()'s own comment on why
+ * that was dropped). */
 async function addAndSaveCustomPostgresConnection(page, name) {
-  await page.locator('#configTriggerBadge').click();
-  await expect(page.locator('#configModal')).not.toHaveClass(/hidden/, { timeout: 15_000 });
+  // Step 1: create + persist the connection's own fields via Preferences.
+  await page.locator('#prefsBtn').click();
+  await expect(page.locator('#preferencesModal')).not.toHaveClass(/hidden/, { timeout: 15_000 });
   await page.locator('#addCustomDbBtn').click();
   const nameInput = page.locator('.custom-db-name-input').last();
   await expect(nameInput).toBeFocused();
   await nameInput.fill(name);
   await page.locator('.custom-db-url-input').last().fill('postgresql://user:pass@localhost:5432/mydb');
-  await page.locator('#configSaveBtn').click();
-  await expect(page.locator('#configModal')).toHaveClass(/hidden/);
+  await page.locator('#preferencesSaveBtn').click();
+  await expect(page.locator('#preferencesModal')).toHaveClass(/hidden/);
+
+  // Step 2: click it by name in the dataset picker dropdown - this selects
+  // AND activates it immediately.
+  await page.locator('#configTriggerBadge').click();
+  await expect(page.locator('#datasetPickList')).not.toHaveClass(/hidden/, { timeout: 15_000 });
+  await page.locator(`.dataset-pick-option[data-dbname="${name}"]`).click();
+  await expect(page.locator('#datasetPickList')).toHaveClass(/hidden/);
   await expect(page.locator('#connDbName')).toHaveText(name);
 }
 
@@ -387,9 +406,13 @@ test.describe('sharing', () => {
         });
       });
       await visitorPage.locator('#configTriggerBadge').click();
-      await expect(visitorPage.locator('#configModal')).not.toHaveClass(/hidden/, { timeout: 15_000 });
-      await visitorPage.locator('#configSaveBtn').click();
-      await expect(visitorPage.locator('#configModal')).toHaveClass(/hidden/);
+      await expect(visitorPage.locator('#datasetPickList')).not.toHaveClass(/hidden/, { timeout: 15_000 });
+      // Re-clicking the already-active option (there's no separate Save
+      // button any more - clicking an option selects AND saves immediately,
+      // even when it's the one already selected) is the explicit "pick a
+      // dataset of my own" confirmation the banner asks for.
+      await visitorPage.locator('.dataset-pick-option.selected').first().click();
+      await expect(visitorPage.locator('#datasetPickList')).toHaveClass(/hidden/);
 
       await visitorPage.locator('#aiPrompt').fill('a totally different question');
       await visitorPage.locator('#aiPrompt').press('Enter');

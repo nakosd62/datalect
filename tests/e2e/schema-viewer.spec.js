@@ -457,6 +457,96 @@ test.describe('schema viewer', () => {
     resolveRefresh();
     await expect(refreshBtn).toBeEnabled();
   });
+
+  // A preset is a shared, admin-configured resource with no single owner -
+  // refreshing it is superuser-only server-side (POST /api/config/
+  // refresh-schema's own "Authorization" docstring section in
+  // config_routes.py), and the button now reflects that up front (disabled,
+  // explanatory tooltip) instead of letting a non-superuser click it and
+  // only then see the 403 - see openSchemaViewer()'s own IS_SUPERUSER
+  // check in client.js, driven by GET /api/config's 'is_superuser' field.
+  // Regression coverage: this was previously unexercised at the e2e layer
+  // entirely (every other test above runs against the real local-dev
+  // server, where is_superuser() is unconditionally true - see auth.py's
+  // own docstring - so none of them could have caught this).
+  test('the Refresh Schema button is disabled with an explanatory tooltip for a non-superuser viewing a preset', async ({ page }) => {
+    await page.route('**/api/config', async (route) => {
+      if (route.request().method() !== 'GET') return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          auth_enabled: true,
+          session_id: 'e2e-session',
+          user_id: 'bob@example.com',
+          authenticated: true,
+          is_cloud_run: true,
+          is_superuser: false,
+          configured_databases: [{ id: 'default', name: 'Default DB', type: 'postgres' }],
+          active_preset_id: 'default',
+          default_database_url: '',
+          active_database_url: '',
+          active_database_type: 'postgres',
+          active_is_custom: false,
+          active_custom_connection_key: '',
+          active_uses_custom_credentials: false,
+          database_name: 'Default DB',
+          custom_database_name: '',
+          custom_database_url: '',
+          custom_databases: [],
+          auto_sql_execute: false,
+        }),
+      });
+    });
+    await gotoApp(page);
+    await mockSchema(page);
+    await openSchemaViewer(page);
+
+    const refreshBtn = page.locator('#schemaViewerRefreshBtn');
+    await expect(refreshBtn).toBeDisabled();
+    await expect(refreshBtn).toHaveAttribute('title', 'Only a superuser can refresh schema for a preset dataset.');
+  });
+
+  test("a non-superuser's own custom connection keeps its Refresh Schema button enabled - the superuser gate only applies to presets/groups", async ({ page }) => {
+    await page.route('**/api/config', async (route) => {
+      if (route.request().method() !== 'GET') return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          auth_enabled: true,
+          session_id: 'e2e-session',
+          user_id: 'bob@example.com',
+          authenticated: true,
+          is_cloud_run: true,
+          is_superuser: false,
+          configured_databases: [{ id: 'default', name: 'Default DB', type: 'postgres' }],
+          active_preset_id: '',
+          default_database_url: '',
+          active_database_url: 'postgresql://u:p@host/bob',
+          active_database_type: 'postgres',
+          active_is_custom: true,
+          active_custom_connection_key: 'bob-db-1',
+          active_uses_custom_credentials: true,
+          database_name: "Bob's DB",
+          custom_database_name: '',
+          custom_database_url: '',
+          custom_databases: [{
+            name: "Bob's DB", type: 'postgres', url: 'postgresql://u:p@host/bob',
+            connection_key: 'bob-db-1', config: {},
+          }],
+          auto_sql_execute: false,
+        }),
+      });
+    });
+    await gotoApp(page);
+    await mockSchema(page, { name: "Bob's DB" });
+    await openSchemaViewer(page);
+
+    const refreshBtn = page.locator('#schemaViewerRefreshBtn');
+    await expect(refreshBtn).toBeEnabled();
+    await expect(refreshBtn).toHaveAttribute('title', "Re-fetch this connection's schema (bypasses the cache)");
+  });
 });
 
 // The dataset-group variant (client.js's openGroupSchemaViewer()/
@@ -478,6 +568,14 @@ test.describe('dataset group schema viewer', () => {
       user_id: 'global',
       authenticated: false,
       is_cloud_run: false,
+      // Matches the real local-dev server every OTHER describe block in
+      // this file runs against (auth.py's is_superuser() is unconditionally
+      // true there - see its own docstring) - a test that wants the
+      // non-superuser-disabled Refresh Overview button overrides this to
+      // false explicitly instead (see below), rather than every ordinary
+      // test in this block silently getting a disabled button just because
+      // this field was left out of the mock.
+      is_superuser: true,
       configured_databases: [
         { id: 'p-a', name: 'Sales Postgres', type: 'postgres' },
         { id: 'p-b', name: 'Marketing Postgres', type: 'postgres' },
@@ -509,8 +607,9 @@ test.describe('dataset group schema viewer', () => {
   /** Same stateful GET+POST /api/config mock multi-database.spec.js's own
    * mockConfig() uses (see that file's docstring on it) - a plain GET-only
    * mock would work for every test below except the last one, which saves
-   * a new selection through the real config-modal Save flow and needs
-   * that POST to actually be reflected back, not silently fall through to
+   * a new selection through the real dataset picker's select-and-save flow
+   * and needs that POST to actually be reflected back, not silently fall
+   * through to
    * the real (group-less) local-dev server. Returns the live `state`
    * object in case a test wants to inspect what was last saved. */
   async function mockConfig(page, initial) {
@@ -678,6 +777,23 @@ test.describe('dataset group schema viewer', () => {
     await expect(page.locator('#schemaViewerRefreshStatus')).toHaveText('');
   });
 
+  // Same superuser-only gate as a preset's own Refresh Schema button (see
+  // the top "schema viewer" describe block's own non-superuser test) - a
+  // dataset group is just as much a shared, admin-configured resource,
+  // and kind === 'group' is unconditionally superuser-gated server-side
+  // (POST /api/config/refresh-schema's "Authorization" docstring section).
+  test('the Refresh Overview button is disabled with an explanatory tooltip for a non-superuser', async ({ page }) => {
+    await mockConfig(page, buildGroupConfigState({ is_superuser: false }));
+    await mockGroupSchema(page);
+    await gotoApp(page);
+    await openSchemaViewerBtn(page);
+
+    const refreshBtn = page.locator('#schemaViewerRefreshBtn');
+    await expect(refreshBtn).toBeVisible();
+    await expect(refreshBtn).toBeDisabled();
+    await expect(refreshBtn).toHaveAttribute('title', 'Only a superuser can refresh schema for a dataset group.');
+  });
+
   test('clicking "Refresh Overview" regenerates the group\'s overview and reloads the tree', async ({ page }) => {
     await mockConfig(page);
     await mockGroupSchema(page);
@@ -714,17 +830,22 @@ test.describe('dataset group schema viewer', () => {
     await mockSchema(page, { name: 'Sales Postgres', dialect: 'PostgreSQL' });
     await gotoApp(page);
 
-    // Switches into group mode via the real config-modal Save flow (the
-    // same path a real user takes), rather than poking at client.js's
-    // module-scoped state directly (IN_SCOPE_MODE/IN_SCOPE_GROUP_ID aren't
-    // reachable from the page's own `window`, and this test is about the
-    // shared modal's own layout bookkeeping either way, not about how
-    // group mode gets selected in the first place - covered above).
+    // Switches into group mode via the real dataset picker's select-and-save
+    // flow (the same path a real user takes), rather than poking at
+    // client.js's module-scoped state directly (IN_SCOPE_MODE/IN_SCOPE_
+    // GROUP_ID aren't reachable from the page's own `window`, and this test
+    // is about the shared modal's own layout bookkeeping either way, not
+    // about how group mode gets selected in the first place - covered
+    // above).
     await page.locator('#configTriggerBadge').click();
-    await expect(page.locator('#configModal')).not.toHaveClass(/hidden/, { timeout: 15_000 });
-    await page.locator('input[name="db_connection_option"][value="group:grp-ab"]').check();
-    await page.locator('#configSaveBtn').click();
-    await expect(page.locator('#configModal')).toHaveClass(/hidden/);
+    await expect(page.locator('#datasetPickList')).not.toHaveClass(/hidden/, { timeout: 15_000 });
+    // The dataset group now lives inside its own "Composites" flyout (see
+    // client.js's openDatasetPickCompositeSubmenu()), not inline among the
+    // ordinary presets - opened by hovering the toggle, no click needed.
+    await page.locator('#datasetPickCompositeToggle').hover();
+    await expect(page.locator('#datasetPickCompositeSubmenu')).not.toHaveClass(/hidden/);
+    await page.locator('.dataset-pick-option[data-value="group:grp-ab"]').click();
+    await expect(page.locator('#datasetPickList')).toHaveClass(/hidden/);
 
     await openSchemaViewerBtn(page);
     await expect(page.locator('#schemaViewerGroupTableWrap')).toHaveClass(/hidden/);
@@ -735,10 +856,9 @@ test.describe('dataset group schema viewer', () => {
 
     // Switch to the specific preset, then reopen the "i" icon.
     await page.locator('#configTriggerBadge').click();
-    await expect(page.locator('#configModal')).not.toHaveClass(/hidden/, { timeout: 15_000 });
-    await page.locator('input[name="db_connection_option"][value="preset:p-a"]').check();
-    await page.locator('#configSaveBtn').click();
-    await expect(page.locator('#configModal')).toHaveClass(/hidden/);
+    await expect(page.locator('#datasetPickList')).not.toHaveClass(/hidden/, { timeout: 15_000 });
+    await page.locator('.dataset-pick-option[data-value="preset:p-a"]').click();
+    await expect(page.locator('#datasetPickList')).toHaveClass(/hidden/);
 
     await openSchemaViewerBtn(page);
     await expect(page.locator('#schemaViewerGroupTableWrap')).toHaveClass(/hidden/);

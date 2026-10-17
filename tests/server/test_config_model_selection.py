@@ -10,7 +10,9 @@ independent, badge-triggered session preference, save-then-reload round
 trip, isolation per user) but for the model-selection feature specifically.
 """
 
-from helpers import login_as, select_llm_provider
+from helpers import (
+    login_as, select_llm_provider, FAKE_DB_CONFIG_ENCRYPTION_KEY, FAKE_SESSION_SIGNING_KEY,
+)
 
 
 def test_get_config_exposes_llm_providers_organized_by_provider(app_env):
@@ -224,3 +226,100 @@ def test_post_config_byok_key_selection_is_isolated_per_user(app_env):
     login_as(app_env.client, "bob@example.com")
     data = app_env.client.get('/api/config').get_json()
     assert data["llm_byok_key_set"] == {"google": False, "anthropic": False, "openai": False}
+
+
+# --- Model selection restricted to superusers --------------------------------
+#
+# Only a superuser (auth.py's is_superuser()) may change which model a
+# session uses - everyone else is pinned to the app's one fleet-wide default
+# (see translate_routes.py/summarize_routes.py/combine_routes.py's matching
+# server-side enforcement at the actual LLM call sites, where a non-
+# superuser's model choice is ignored regardless of what got saved here).
+# is_superuser() is gated on IS_CLOUD_RUN specifically (see its own
+# docstring) - every one of these needs a real Cloud Run + SUPERUSER_EMAILS
+# environment to exercise the restricted side at all; mirrors
+# test_refresh_schema_authorization.py's own _cloud_run_env pattern for the
+# identical gate on a different action.
+
+def _cloud_run_env(superuser_emails):
+    return {
+        "K_SERVICE": "ydyl-service",
+        "DB_CONFIG_ENCRYPTION_KEY": FAKE_DB_CONFIG_ENCRYPTION_KEY,
+        "SESSION_SIGNING_KEY": FAKE_SESSION_SIGNING_KEY,
+        "GOOGLE_CLIENT_ID": "fake.apps.googleusercontent.com",
+        "GCP_PROJECT_ID": "fake-project",
+        "SUPERUSER_EMAILS": superuser_emails,
+    }
+
+
+def test_post_config_silently_ignores_a_non_superusers_model_selection(app_factory):
+    env = app_factory(env=_cloud_run_env("alice@example.com"), mock_firestore=True)
+    login_as(env.client, "bob@example.com")
+
+    resp = env.client.post('/api/config', json={"llm_provider": "anthropic", "llm_model": "claude-sonnet-5"})
+    assert resp.status_code == 200  # silently ignored, not a 403 - see config_routes.py's own comment
+
+    data = env.client.get('/api/config').get_json()
+    assert data["active_llm_provider"] == "google"
+    assert data["active_llm_model"] == "gemini-3.6-flash"
+
+
+def test_post_config_still_honors_a_superusers_own_model_selection(app_factory):
+    env = app_factory(env=_cloud_run_env("alice@example.com"), mock_firestore=True)
+    login_as(env.client, "alice@example.com")
+
+    resp = env.client.post('/api/config', json={"llm_provider": "anthropic", "llm_model": "claude-sonnet-5"})
+    assert resp.status_code == 200
+
+    data = env.client.get('/api/config').get_json()
+    assert data["active_llm_provider"] == "anthropic"
+    assert data["active_llm_model"] == "claude-sonnet-5"
+
+
+def test_get_config_forces_the_fleet_wide_default_for_a_non_superuser_with_a_stale_saved_model(app_factory):
+    """A session can end up with a non-default llm_model saved from before
+    this restriction existed, or from while this same user was still a
+    superuser (SUPERUSER_EMAILS shrank since). Either way, GET /api/config's
+    own badge/modal display must never show something inconsistent with
+    what every real LLM call for this user now actually uses - so this is
+    forced to the default too, not just the POST save path above."""
+    env = app_factory(env=_cloud_run_env("alice@example.com"), mock_firestore=True)
+    login_as(env.client, "bob@example.com")
+    env.app_config.state_store.set_session(
+        "bob@example.com", llm_provider="anthropic", llm_model="claude-sonnet-5",
+    )
+
+    data = env.client.get('/api/config').get_json()
+    assert data["active_llm_provider"] == "google"
+    assert data["active_llm_model"] == "gemini-3.6-flash"
+
+
+def test_get_config_still_reflects_a_superusers_own_stale_saved_model(app_factory):
+    env = app_factory(env=_cloud_run_env("alice@example.com"), mock_firestore=True)
+    login_as(env.client, "alice@example.com")
+    env.app_config.state_store.set_session(
+        "alice@example.com", llm_provider="anthropic", llm_model="claude-sonnet-5",
+    )
+
+    data = env.client.get('/api/config').get_json()
+    assert data["active_llm_provider"] == "anthropic"
+    assert data["active_llm_model"] == "claude-sonnet-5"
+
+
+def test_post_config_non_superuser_model_selection_does_not_clobber_other_fields_in_the_same_request(app_factory):
+    # Same "silently dropped, not a hard error" convention an invalid
+    # provider/model already gets (test_post_config_rejects_unregistered_
+    # provider_name) - the rest of a bundled /api/config POST must still go
+    # through normally even though the model fields in it are discarded.
+    env = app_factory(env=_cloud_run_env("alice@example.com"), mock_firestore=True)
+    login_as(env.client, "bob@example.com")
+
+    resp = env.client.post('/api/config', json={
+        "llm_provider": "anthropic", "llm_model": "claude-sonnet-5", "auto_sql_execute": False,
+    })
+    assert resp.status_code == 200
+
+    data = env.client.get('/api/config').get_json()
+    assert data["active_llm_provider"] == "google"
+    assert data["active_llm_model"] == "gemini-3.6-flash"
+    assert data["auto_sql_execute"] is False

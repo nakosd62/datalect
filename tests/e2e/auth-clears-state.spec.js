@@ -15,14 +15,14 @@
 // decides what appears on screen now: a BLANK slate if this identity has
 // no bucket yet on this page load, or that identity's own last turn,
 // restored, if it does. Neither sign-in nor sign-out clears anything
-// directly any more. (See config-modal.spec.js's
+// directly any more. (See dataset-picker.spec.js's
 // "switching the active db connection..." and "switching away from a
 // connection and back restores..." tests for the sibling behavior on the
 // connection-change axis rather than the identity axis.)
 //
 // This never drives a real Google OAuth flow or a real Cloud Run /
 // Firestore backend (both impractical to run hermetically here - see
-// config-modal.spec.js's Snowflake-coverage comment for the same
+// preferences-byod.spec.js's Snowflake-coverage comment for the same
 // real-network-risk reasoning). Instead:
 //   - GET /api/config is mocked to report auth as enabled (matching what
 //     a real Cloud Run deployment with GOOGLE_CLIENT_ID set would return),
